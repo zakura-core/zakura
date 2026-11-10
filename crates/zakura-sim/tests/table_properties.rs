@@ -411,6 +411,49 @@ fn emptying_a_cadence_bucket_is_never_punished() {
     ));
 }
 
+/// mut-7.4: a rate-limit close after a conformant frame that emptied its
+/// row's cadence bucket violates `cadence-never-closes`. The close is
+/// neutral, so `conformant-never-closes` holds. Without an exhausting frame,
+/// `cadence-never-closes` doesn't apply.
+#[test]
+fn a_rate_limit_close_after_an_exhausting_frame_breaks_cadence() {
+    let sent = |exhausted| Observation::PeerFrame {
+        connection: 1,
+        stream: id(TEST_STREAM),
+        quic_stream: None,
+        seq: 0,
+        row: Some("status".to_owned()),
+        rule_stream: id(TEST_STREAM),
+        label: Label::Conformant,
+        exhausted,
+        exchange: None,
+        payload: 0,
+    };
+    let script = |exhausted| {
+        vec![
+            vec![sent(exhausted), judged(TEST_STREAM, 0)],
+            vec![closed("ordered_rate_limited")],
+        ]
+    };
+    let throttled = run_script(script(true));
+    let violation = throttled
+        .end
+        .violation
+        .as_ref()
+        .expect("the rate limit is unjustified");
+    assert_eq!(violation.property, "test/s65v2/status/cadence-never-closes");
+    assert!(held(outcome(
+        &throttled,
+        "test/s65v2/conformant-never-closes"
+    )));
+    let unexhausted = run_script(script(false));
+    assert_eq!(unexhausted.end.violation, None);
+    assert_eq!(
+        *outcome(&unexhausted, "test/s65v2/status/cadence-never-closes"),
+        PropertyOutcome::NotApplicable
+    );
+}
+
 /// Review P3b-1: a judged frame with no label, or with two, fails the run
 /// as a harness failure instead of dropping out of the checks.
 #[test]

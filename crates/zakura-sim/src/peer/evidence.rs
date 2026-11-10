@@ -78,7 +78,7 @@ use zakura_storage::header::Outcome;
 
 use super::{
     adapter::SenderAdapter,
-    discovery::DiscoverySender,
+    discovery::{Asked, DiscoverySender},
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
@@ -152,6 +152,9 @@ pub(crate) enum RecordBody {
         /// it. The node judges such a page when it prepares that header,
         /// not when it reads it. Not logged.
         prepares: Option<InvalidPage>,
+        /// What the frame asks for, if it's a discovery request, which
+        /// bounds the node's answer. Not logged.
+        asks: Option<Asked>,
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
@@ -436,9 +439,15 @@ impl WireEvidence {
                 exchange,
                 payload,
                 prepares,
+                asks,
             } => {
                 let key = (connection, quic_stream, seq);
                 self.labels.insert(key, label);
+                if let (Some(sender), Some(asks)) = (self.discovery_sender.as_mut(), asks) {
+                    if Some(stream) == self.discovery {
+                        sender.asked(connection, quic_stream, seq, asks);
+                    }
+                }
                 if let Some(page) = prepares {
                     self.invalid.insert(key, page);
                 }
@@ -1199,6 +1208,7 @@ mod tests {
                 exchange: None,
                 payload: 0,
                 prepares: None,
+                asks: None,
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]);
@@ -1572,6 +1582,7 @@ mod tests {
                 exchange: Some(seq),
                 payload: 6,
                 prepares: None,
+                asks: None,
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]).with_discovery(stream);

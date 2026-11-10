@@ -271,6 +271,8 @@ const GET_PEERS_ACTS: &str = "get_peers_acts_apply_in_their_witnesses";
 const PEERS_ACTS: &str = "peers_acts_apply_in_their_witnesses";
 /// The `get-services` act witnesses, and the node's `services` answers.
 const GET_SERVICES_ACTS: &str = "get_services_acts_apply_in_their_witnesses";
+/// The node's answers to requests that ask for less than everything.
+const OWED_ANSWERS: &str = "answers_within_their_requests_hold_sender_within_owed";
 /// The `services` act witnesses.
 const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
 
@@ -883,6 +885,20 @@ pub static COVERAGE: &[Coverage] = &[
         "discovery/s4v2/services/sender-ends-once",
         GET_SERVICES_ACTS,
         Bypass::Planted("answer-services-twice"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/sender-within-owed",
+        OWED_ANSWERS,
+        Bypass::Pending(
+            "every simulated peer binds an RFC 1918 address, which `is_sample_eligible` refuses, \
+             so the node answers every GetPeers with no records and no limit bug can reach this \
+             check yet",
+        ),
+    ),
+    discovery(
+        "discovery/s4v2/services/sender-within-owed",
+        OWED_ANSWERS,
+        Bypass::Planted("ignore-wanted-services"),
     ),
     discovery_unreachable(
         "discovery/s4v2/services/over-owed-closes",

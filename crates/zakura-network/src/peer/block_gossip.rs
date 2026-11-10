@@ -57,15 +57,15 @@ pub(crate) enum BlockAdvertError {
     Connection(#[from] SharedPeerError),
 }
 
-/// Selects the initial peer count and the remaining peers' delay from the block size.
+/// Selects the initial peer count from the block size, and the delay before announcing to the
+/// remaining peers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdvertFanout {
     full_block_window: usize,
     small_block_window: usize,
     small_size_bytes: u64,
     full_size_bytes: u64,
-    delay_min: Duration,
-    delay_max: Duration,
+    delay: Duration,
 }
 
 impl AdvertFanout {
@@ -76,8 +76,7 @@ impl AdvertFanout {
             small_block_window: config.advert_window_small_block,
             small_size_bytes: config.advert_window_small_size_bytes,
             full_size_bytes: config.advert_window_full_size_bytes,
-            delay_min: config.advert_delay_min,
-            delay_max: config.advert_delay_max,
+            delay: config.advert_delay,
         }
     }
 
@@ -115,29 +114,9 @@ impl AdvertFanout {
 
     /// Returns the delay before announcing to peers outside the initial group.
     ///
-    /// Unknown sizes use the maximum. Known sizes interpolate between the configured
-    /// thresholds, with nanosecond precision and no floating-point rounding.
-    pub(crate) fn delay(&self, size: Option<u32>) -> Duration {
-        let Some(size) = size else {
-            return self.delay_max;
-        };
-        let range = self
-            .full_size_bytes
-            .saturating_sub(self.small_size_bytes)
-            .max(1);
-        let above_small = u64::from(size)
-            .saturating_sub(self.small_size_bytes)
-            .min(range);
-        let span = self.delay_max.saturating_sub(self.delay_min).as_nanos();
-        // Divide before multiplying: Duration::MAX nanoseconds times u64::MAX can overflow.
-        let range = u128::from(range);
-        let fraction = u128::from(above_small);
-        let nanos = (span / range) * fraction + (span % range) * fraction / range;
-        let seconds =
-            u64::try_from(nanos / 1_000_000_000).expect("the interpolated delay fits in Duration");
-        let subsecond =
-            u32::try_from(nanos % 1_000_000_000).expect("subsecond nanoseconds fit in u32");
-        self.delay_min + Duration::new(seconds, subsecond)
+    /// Every block size uses the same delay. The size sets only the initial group.
+    pub(crate) fn delay(&self) -> Duration {
+        self.delay
     }
 }
 
@@ -568,7 +547,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         let refresh = self.refresh.clone();
         let mut peers = self.peers.clone();
         let window = self.fanout.window(block.size);
-        let delayed_at = Instant::now() + self.fanout.delay(block.size);
+        let delayed_at = Instant::now() + self.fanout.delay();
         async move {
             loop {
                 if let Some(refresh) = &refresh {
@@ -1205,14 +1184,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_sized_initial_groups_without_delay() {
+    fn defaults_use_sized_initial_groups_and_one_delay() {
         let fanout = AdvertFanout::from_config(&Config::default());
         assert_eq!(fanout.window(Some(102_400)), 64);
         assert_eq!(fanout.window(Some(1_572_864)), 32);
         assert_eq!(fanout.window(None), 32);
-        for size in [Some(0), Some(102_401), Some(u32::MAX), None] {
-            assert_eq!(fanout.delay(size), Duration::ZERO);
-        }
+        assert_eq!(fanout.delay(), Duration::from_millis(500));
     }
 
     /// The window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
@@ -1258,35 +1235,20 @@ mod tests {
     }
 
     #[test]
-    fn advert_delay_interpolates_and_clamps() {
-        let fanout = AdvertFanout::from_config(&Config {
-            advert_delay_min: Duration::from_millis(100),
-            advert_delay_max: Duration::from_millis(500),
-            advert_window_small_size_bytes: 100,
-            advert_window_full_size_bytes: 1_000,
-            ..sized_window_config()
-        });
-        for size in [0, 99, 100] {
-            assert_eq!(fanout.delay(Some(size)), Duration::from_millis(100));
+    fn advert_delay_is_the_configured_value() {
+        for delay in [Duration::ZERO, Duration::from_millis(500), Duration::MAX] {
+            let fanout = AdvertFanout::from_config(&Config {
+                advert_delay: delay,
+                ..sized_window_config()
+            });
+            assert_eq!(fanout.delay(), delay);
         }
-        assert!(fanout.delay(Some(101)) > Duration::from_millis(100));
-        assert_eq!(fanout.delay(Some(550)), Duration::from_millis(300));
-        for size in [Some(1_000), Some(u32::MAX), None] {
-            assert_eq!(fanout.delay(size), Duration::from_millis(500));
-        }
-        let extreme = AdvertFanout::from_config(&Config {
-            advert_delay_max: Duration::MAX,
-            advert_window_full_size_bytes: u64::MAX,
-            ..sized_window_config()
-        });
-        assert!(extreme.delay(Some(u32::MAX)) < Duration::MAX);
-        assert_eq!(extreme.delay(None), Duration::MAX);
     }
 
     /// Silent peers cannot create repeated request-timeout waves, regardless of block size,
     /// peer count, or whether the block was mined locally.
     #[tokio::test(start_paused = true)]
-    async fn all_peers_are_announced_by_one_size_dependent_deadline() {
+    async fn all_peers_are_announced_by_one_deadline() {
         for mined in [false, true] {
             for count in [16, 100, 300, 1_001] {
                 for size in [
@@ -1299,14 +1261,13 @@ mod tests {
                     None,
                 ] {
                     let fanout = AdvertFanout::from_config(&Config {
-                        advert_delay_min: Duration::from_millis(100),
-                        advert_delay_max: Duration::from_millis(500),
+                        advert_delay: Duration::from_millis(500),
                         ..sized_window_config()
                     });
                     let (peers, mut writes) = connected_peers(count);
                     let hash = block::Hash([0xd1; 32]);
                     let start = Instant::now();
-                    let delay = fanout.delay(size);
+                    let delay = fanout.delay();
                     let task = tokio::spawn(broadcast_block(
                         peers,
                         hash,
@@ -1343,7 +1304,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_delay_announces_every_size_immediately() {
         for size in [Some(102_400), Some(102_401), Some(1_572_864), None] {
-            let fanout = AdvertFanout::from_config(&sized_window_config());
+            let fanout = AdvertFanout::from_config(&Config {
+                advert_delay: Duration::ZERO,
+                ..sized_window_config()
+            });
             let (peers, mut writes) = connected_peers(300);
             let start = Instant::now();
             let task = tokio::spawn(broadcast_block(
@@ -1351,7 +1315,7 @@ mod tests {
                 block::Hash([0xd2; 32]),
                 fanout.window(size),
                 false,
-                start + fanout.delay(size),
+                start + fanout.delay(),
             ));
             for _ in 0..300 {
                 writes.recv().await.unwrap();
@@ -1372,16 +1336,15 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         for count in [64, 300, 1_001] {
             for size in [102_400, 102_401, 1_572_864] {
-                for (min, max) in [(0, 0), (100, 500)] {
+                for delay_ms in [0, 500] {
                     let fanout = AdvertFanout::from_config(&Config {
-                        advert_delay_min: Duration::from_millis(min),
-                        advert_delay_max: Duration::from_millis(max),
+                        advert_delay: Duration::from_millis(delay_ms),
                         ..sized_window_config()
                     });
                     let (peers, mut writes, bodies) =
                         requesting_peers(count, Some(Duration::from_secs(2)));
                     let start = Instant::now();
-                    let delay = fanout.delay(Some(size));
+                    let delay = fanout.delay();
                     let initial = fanout.window(Some(size));
                     let task = tokio::spawn(broadcast_block(
                         peers,
@@ -1408,7 +1371,7 @@ mod tests {
                     // usize fits in u128 on every supported target.
                     let payload_bytes = u128::from(size) * count as u128;
                     eprintln!(
-                        "peers={count} size={size} delays={min}/{max}ms last={last:?} requested_payload={payload_bytes}B peak_bodies={count}"
+                        "peers={count} size={size} delay={delay_ms}ms last={last:?} requested_payload={payload_bytes}B peak_bodies={count}"
                     );
                 }
             }
@@ -1921,8 +1884,7 @@ mod tests {
                     advert_window_small_block: 2,
                     advert_window_small_size_bytes: 0,
                     advert_window_full_size_bytes: 100,
-                    advert_delay_min: Duration::from_secs(1),
-                    advert_delay_max: Duration::from_secs(1),
+                    advert_delay: Duration::from_secs(1),
                     ..Config::default()
                 }),
                 peers,
@@ -1979,8 +1941,7 @@ mod tests {
                 fanout: AdvertFanout::from_config(&Config {
                     advert_window_full_block: 1,
                     advert_window_small_block: 1,
-                    advert_delay_min: Duration::from_secs(1),
-                    advert_delay_max: Duration::from_secs(1),
+                    advert_delay: Duration::from_secs(1),
                     ..Config::default()
                 }),
                 peers,

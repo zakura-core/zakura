@@ -36,6 +36,11 @@ use zakura_sim::{
 /// pause in their handoffs, so floor requests charge past `M`.
 const PAUSED_HANDOFFS_INPUT: &[u8] = include_bytes!("fixtures/block-sync-paused-handoffs.bin");
 
+/// The committed input whose paused-handoffs run races two routines for the
+/// floor's next height: one probes it, another takes it first, and the
+/// first routine's floor take starts above it.
+const FLOOR_LANE_RACE_INPUT: &[u8] = include_bytes!("fixtures/block-sync-floor-lane-race.bin");
+
 /// The committed input that picks the stuck-floor scenario: the commit
 /// window fills while height 3 never arrives.
 const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stuck-floor.bin");
@@ -76,6 +81,17 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
 #[test]
 fn the_paused_handoffs_input_holds_reserved_byte_bound() {
     holds(committed(PAUSED_HANDOFFS_INPUT), RESERVED_BYTE_BOUND);
+}
+
+/// The floor-lane race input holds the reserved bound. The node refuses the
+/// losing routine's take above the floor for capacity. With
+/// `qa/native-mutations/bounds/wide-floor-lane`, that take counts as a
+/// floor request and charges past `M`, and the same input violates it.
+#[test]
+fn the_floor_lane_race_input_holds_reserved_byte_bound() {
+    let witness = committed(FLOOR_LANE_RACE_INPUT);
+    assert_eq!(witness.scenario, BlockScenario::paused_handoffs());
+    holds(witness, RESERVED_BYTE_BOUND);
 }
 
 /// The production node captures every runtime payload through receipt and teardown.

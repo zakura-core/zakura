@@ -997,7 +997,7 @@ fn fuzz_build_failed(
 
 /// Why a build failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum BuildFailure {
+pub(super) enum BuildFailure {
     /// The source is invalid: the compiler rejected it with an error at a
     /// source location, or a mutant's patch doesn't apply or changes files
     /// it doesn't declare. For a mutant, it's an invalid mutant.
@@ -1695,7 +1695,7 @@ fn build_sim(
 /// cargo exited with a code, rather than a signal, and rustc reported an
 /// error at a source location in a path package. A full disk, a killed
 /// compiler or a failed link reports no source location.
-fn sim_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
+pub(super) fn sim_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
     let located = log
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -1807,7 +1807,7 @@ fn check_interrupt(interrupt: &AtomicBool) -> Result<(), BoxError> {
 
 /// Checks out `rev` in a new detached worktree at `path`, replacing any
 /// earlier one there.
-fn add_worktree(repo_root: &Path, path: &Path, rev: &str) -> Result<(), BoxError> {
+pub(super) fn add_worktree(repo_root: &Path, path: &Path, rev: &str) -> Result<(), BoxError> {
     remove_worktree(repo_root, path)?;
     run_command(git(repo_root).args(["worktree", "prune"]))?;
     if let Some(parent) = path.parent() {
@@ -1855,7 +1855,7 @@ fn only_entry(dir: &Path) -> Result<Option<String>, BoxError> {
 
 /// Creates `dir`, or fails if it already holds anything: a run never
 /// overwrites an earlier result.
-fn fresh_dir(dir: &Path) -> Result<(), BoxError> {
+pub(super) fn fresh_dir(dir: &Path) -> Result<(), BoxError> {
     if dir.exists() && fs::read_dir(dir)?.next().is_some() {
         return Err(format!(
             "{} already holds results; a run never overwrites an earlier one",
@@ -1868,18 +1868,18 @@ fn fresh_dir(dir: &Path) -> Result<(), BoxError> {
 }
 
 /// `HEAD`'s commit in `repo_root`.
-fn head(repo_root: &Path) -> Result<String, BoxError> {
+pub(super) fn head(repo_root: &Path) -> Result<String, BoxError> {
     let output = git(repo_root).args(["rev-parse", "HEAD"]).output()?;
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 /// The lowercase hex SHA-256 of `path`'s contents.
-fn file_sha256(path: &Path) -> Result<String, BoxError> {
+pub(super) fn file_sha256(path: &Path) -> Result<String, BoxError> {
     Ok(hex(&Sha256::digest(fs::read(path)?)))
 }
 
 /// `bytes` in lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

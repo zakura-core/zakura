@@ -258,6 +258,28 @@ fn call(method: &str, params: &str, id: &str) -> String {
 }
 
 #[tokio::test]
+async fn legacy_overflow_ids_return_parse_errors() {
+    let _init_guard = zakura_test::init();
+    let addr = start_server(local_config()).await;
+
+    for version in ["", r#""jsonrpc":"1.0","#] {
+        for id in ["1e400", "-1e400"] {
+            let request =
+                format!(r#"{{{version}"method":"getstandardfee","id":{id},"params":[]}}"#);
+            let response = send(addr, &Case::post("overflow numeric ID", request), None).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK\n"), "{response}");
+            let (_, body) = response
+                .split_once("\n\n")
+                .expect("HTTP response has a body");
+            assert_eq!(
+                body,
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#,
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn json_rpc_requests() {
     let _init_guard = zakura_test::init();
     let addr = start_server(local_config()).await;

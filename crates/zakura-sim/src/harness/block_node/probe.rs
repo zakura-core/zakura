@@ -70,6 +70,16 @@ pub enum ProbeFrame {
         /// The most body bytes the probe sends per range.
         max_response_bytes: u32,
     },
+    /// A status like [`ProbeFrame::Status`], with `flags` in its header. A
+    /// flag bit is its only fault.
+    FlaggedStatus {
+        /// The lowest servable height.
+        servable_low: u32,
+        /// The highest servable height, whose hash the status carries.
+        servable_high: u32,
+        /// The header's flags.
+        flags: u16,
+    },
     /// A frame the codec never writes: `message_type` and `flags` in its
     /// header, and a payload of `len` bytes, the first of them the type's
     /// low byte and the rest zero.
@@ -109,6 +119,18 @@ impl ProbeFrame {
                     payload,
                 }
             }
+            ProbeFrame::FlaggedStatus {
+                servable_low,
+                servable_high,
+                flags,
+            } => Frame {
+                flags,
+                ..ProbeFrame::Status {
+                    servable_low,
+                    servable_high,
+                }
+                .frame(genesis, chain)
+            },
             frame => frame
                 .message(genesis, chain)
                 .encode_frame()
@@ -137,6 +159,11 @@ impl ProbeFrame {
             ProbeFrame::Status {
                 servable_low,
                 servable_high,
+            }
+            | ProbeFrame::FlaggedStatus {
+                servable_low,
+                servable_high,
+                ..
             } => BlockSyncMessage::Status(BlockSyncStatus {
                 servable_low: block::Height(servable_low),
                 servable_high: block::Height(servable_high),

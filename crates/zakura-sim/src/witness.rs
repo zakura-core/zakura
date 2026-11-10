@@ -15,6 +15,7 @@ use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
     property::{HasView, Status, TriggerHistory},
     record::Record,
+    trace::end_records::{self, TriggerState, WitnessRecord},
     MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
     RunEnd, RunReport,
 };
@@ -160,6 +161,31 @@ impl fmt::Display for WitnessError {
 
 impl std::error::Error for WitnessError {}
 
+impl WitnessError {
+    /// The error's name, as an end record writes it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WitnessError::Unregistered => "unregistered",
+            WitnessError::NoTriggerHistory => "no-trigger-history",
+            WitnessError::UnsupportedScenario(_) => "unsupported-scenario",
+            WitnessError::HarnessEnd(_) => "harness-end",
+            WitnessError::NoEnd => "no-end",
+            WitnessError::MissingReport => "missing-report",
+            WitnessError::Outcome(PropertyOutcome::Held { .. }) => "held",
+            WitnessError::Outcome(PropertyOutcome::NotApplicable) => "not-applicable",
+            WitnessError::Outcome(PropertyOutcome::Inconclusive { .. }) => "inconclusive",
+            WitnessError::Outcome(PropertyOutcome::Violated { .. }) => "violated",
+            WitnessError::Unrelated { .. } => "unrelated",
+            WitnessError::LostTriggerHistory => "lost-trigger-history",
+            WitnessError::ActSkipped { .. } => "act-skipped",
+            WitnessError::ActNotRun { .. } => "act-not-run",
+            WitnessError::NoView => "no-view",
+            WitnessError::ChangedFailure => "changed-failure",
+            WitnessError::Fixed { .. } => "fixed",
+        }
+    }
+}
+
 /// Runs `scenario` and checks `property`'s report against `expect`.
 ///
 /// # Panics
@@ -236,15 +262,43 @@ fn witness_judged<S: Subsystem>(
     also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    let registered = Registered::<S>::of(property, expect)?;
+    let (judged, trigger) = witness_run::<S>(
+        scenario,
+        prepared,
+        input,
+        property,
+        expect,
+        also_violates,
+        sink,
+    );
+    write_witness(property, expect, &judged, trigger);
+    judged
+}
+
+/// [`witness_judged`]'s run and judgement, with whether the run reached the
+/// property's trigger history when the end-record hook asks for it.
+fn witness_run<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    property: &str,
+    expect: Expect,
+    also_violates: &[String],
+    sink: &mut dyn RecordSink,
+) -> (Result<(), WitnessError>, TriggerState) {
+    let registered = match Registered::<S>::of(property, expect) {
+        Ok(registered) => registered,
+        Err(error) => return (Err(error), TriggerState::None),
+    };
     let mut sink = EndSeen { sink, ended: false };
     // Judged once the run's end is final and before shutdown, which can
     // still change the view.
     let id = property.to_owned();
     let also_violates = also_violates.to_vec();
+    let hooked = end_records::dir().is_some();
     let judge =
         move |harness: &S, end: &RunEnd, reports: &[PropertyReport], log: &ObservationLog| {
-            registered.judge(
+            let judged = registered.judge(
                 end,
                 reports,
                 log,
@@ -252,19 +306,50 @@ fn witness_judged<S: Subsystem>(
                 &id,
                 expect,
                 &also_violates,
-            )
+            );
+            let trigger = if hooked {
+                registered.trigger(end, log, Some(harness))
+            } else {
+                TriggerState::None
+            };
+            (judged, trigger)
         };
-    let (_, judged) = match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, judge) {
-        Ok(run) => run,
-        Err(HarnessError::Run { failure, .. }) => {
-            return Err(WitnessError::HarnessEnd(failure.to_string()))
-        }
-        Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
-    };
+    let (_, (judged, trigger)) =
+        match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, judge) {
+            Ok(run) => run,
+            Err(HarnessError::Run { failure, .. }) => {
+                return (
+                    Err(WitnessError::HarnessEnd(failure.to_string())),
+                    TriggerState::NoView,
+                )
+            }
+            Err(error) => {
+                return (
+                    Err(WitnessError::UnsupportedScenario(error.to_string())),
+                    TriggerState::None,
+                )
+            }
+        };
     if !sink.ended {
-        return Err(WitnessError::NoEnd);
+        return (Err(WitnessError::NoEnd), trigger);
     }
-    judged
+    (judged, trigger)
+}
+
+/// Writes one witness judgement of `property` to the end-record hook, if
+/// [`end_records::END_RECORDS_VAR`] names a directory.
+fn write_witness(
+    property: &str,
+    expect: Expect,
+    judged: &Result<(), WitnessError>,
+    trigger_history: TriggerState,
+) {
+    end_records::write_witness(&WitnessRecord {
+        property: property.to_owned(),
+        expect: expect.name(),
+        error: judged.as_ref().err().map(WitnessError::kind),
+        trigger_history,
+    });
 }
 
 /// Checks `report`, a complete run of `S`, against `expect` for
@@ -276,15 +361,23 @@ pub fn judge_report<S: Subsystem>(
     property: &str,
     expect: Expect,
 ) -> Result<(), WitnessError> {
-    Registered::<S>::of(property, expect)?.judge(
-        &report.end,
-        &report.properties,
-        &report.log,
-        None,
-        property,
-        expect,
-        &[],
-    )
+    let (judged, trigger) = match Registered::<S>::of(property, expect) {
+        Err(error) => (Err(error), TriggerState::None),
+        Ok(registered) => (
+            registered.judge(
+                &report.end,
+                &report.properties,
+                &report.log,
+                None,
+                property,
+                expect,
+                &[],
+            ),
+            registered.trigger(&report.end, &report.log, None),
+        ),
+    };
+    write_witness(property, expect, &judged, trigger);
+    judged
 }
 
 /// What a witness test reads from a property's registration.
@@ -330,20 +423,37 @@ impl<S: Subsystem> Registered<S> {
     ) -> Result<(), WitnessError> {
         judge_end(end, reports, property, self.status, expect, also_violates)?;
         acts_ran(end, log)?;
-        let reached = match self.trigger_history {
-            None => true,
-            Some(TriggerHistory::Log(history)) => history(log),
-            Some(TriggerHistory::View(history)) => match harness {
-                Some(harness) if harness.captured().fresh_at(end.steps) => {
-                    history(&harness.view(), log)
-                }
-                _ => return Err(WitnessError::NoView),
-            },
+        match self.trigger(end, log, harness) {
+            TriggerState::None | TriggerState::Reached => Ok(()),
+            TriggerState::Lost => Err(WitnessError::LostTriggerHistory),
+            TriggerState::NoView => Err(WitnessError::NoView),
+        }
+    }
+
+    /// Whether the run that ended at `end` with `log` reached the
+    /// property's trigger history. A view trigger reads `harness`'s view
+    /// only if the run ended without a harness failure and the view shows
+    /// its last step.
+    fn trigger(&self, end: &RunEnd, log: &ObservationLog, harness: Option<&S>) -> TriggerState {
+        let reached = |reached: bool| {
+            if reached {
+                TriggerState::Reached
+            } else {
+                TriggerState::Lost
+            }
         };
-        if reached {
-            Ok(())
-        } else {
-            Err(WitnessError::LostTriggerHistory)
+        match self.trigger_history {
+            None => TriggerState::None,
+            Some(TriggerHistory::Log(history)) => reached(history(log)),
+            Some(TriggerHistory::View(history)) => match harness {
+                Some(harness)
+                    if end.outcome != Outcome::Harness
+                        && harness.captured().fresh_at(end.steps) =>
+                {
+                    reached(history(&harness.view(), log))
+                }
+                _ => TriggerState::NoView,
+            },
         }
     }
 }

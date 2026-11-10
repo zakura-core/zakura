@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
-use zakura_network::zakura::ZakuraBlockSyncConfig;
+use zakura_network::zakura::{ZakuraBlockSyncConfig, ZAKURA_STREAM_BLOCK_SYNC};
 
 use crate::{
     model::is_fault_cause,
-    observe::{BlockSyncFact, Entry, TransportFact},
+    observe::{BlockSyncFact, Entry, SessionStepFact, TransportFact},
     peer::peer_of,
     property::{
         Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory,
@@ -139,9 +139,11 @@ fn remote_of(entries: &[Entry], connection: u64) -> Option<&str> {
 /// entry.
 pub const REPLACEMENT_PRESERVES_AUTHORIZATION: &str = "session/replacement-preserves-authorization";
 
-/// A block-sync request that waits on its peer closes no shared connection:
-/// the node decides no close with a recorded cause on the request's
-/// connection while the request waits within its request timeout. Only
+/// A block-sync request that waits on its peer closes no shared connection
+/// and ends no other service's session on it: while the request waits
+/// within its request timeout, the node decides no close with a recorded
+/// cause on the request's connection, and no header-sync or discovery
+/// session generation on it exits unless a close was decided first. Only
 /// the request's first body, a reset, a skipped or failed write, or the
 /// timeout ends the wait: a request whose routine drops it unanswered still
 /// waits, since its peer may still answer.
@@ -163,8 +165,9 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
             id: PropertyId::new(STALLED_SERVICE_ISOLATED),
             claim: "while a block-sync request waits on its peer, from its publication until its \
                     first body arrives, block sync resets it, or its request timeout passes, the \
-                    node decides no close with a recorded cause on the request's connection, so \
-                    header sync and discovery keep the sessions they share it with",
+                    node decides no close with a recorded cause on the request's connection, and \
+                    header sync and discovery keep the sessions they share it with: no session \
+                    generation of theirs on it exits before a close is decided",
             kind: Kind::Safety,
             // A wire harness's mirrors all serve honestly, so no recorded
             // cause justifies a close while one of their requests waits.
@@ -187,10 +190,11 @@ fn replacement_preserves_authorization<S: HasView>() -> Property<S> {
                 earlier connection to the same peer carries a session ID that no session on \
                 an earlier connection carried, so no frame, credit or completion keyed by a \
                 replaced session names its replacement or another service's session; and no \
-                generation-gated peer-registry write from a block-sync routine lands on an \
-                entry another generation owns, so a superseded routine that writes after its \
-                replacement's admission, matching the entry by peer ID alone, changes nothing \
-                the replacement owns",
+                block-sync routine's write through one of the peer registry's \
+                generation-gated writers, each of which reports its attempts and landings, \
+                lands on an entry another generation owns, so a superseded routine that \
+                writes after its replacement's admission, matching the entry by peer ID \
+                alone, changes nothing the replacement owns",
         kind: Kind::Safety,
         assumes: &[],
         // The transport tap's session rows, which only a harness on the
@@ -254,77 +258,42 @@ fn block_fact(obs: &Observation) -> Option<&BlockSyncFact> {
     }
 }
 
-/// Each peer's newest block-sync routine generation, from the admission
-/// rows.
-#[derive(Default)]
-struct Generations(BTreeMap<String, u64>);
-
-impl Generations {
-    /// Folds `fact`. Returns true if it shows a routine's generation-gated
-    /// registry write meeting an entry that a newer generation owns: a
-    /// stale registry write, or the last snapshot of a routine whose peer's
-    /// newer generation block sync admitted first. The routine takes that
-    /// snapshot in its drop, after it withdrew its registry claims, so those
-    /// writes came after its replacement's admission.
-    fn fold(&mut self, fact: &BlockSyncFact) -> bool {
-        match fact {
-            BlockSyncFact::SessionAdmitted {
-                peer, generation, ..
-            } => {
-                let newest = self.0.entry(peer.clone()).or_default();
-                *newest = (*newest).max(*generation);
-                false
-            }
-            BlockSyncFact::Routine {
-                peer,
-                generation,
-                ended: true,
-                ..
-            } => self.0.get(peer).is_some_and(|newest| newest > generation),
-            BlockSyncFact::StaleRegistryWrite { .. } => true,
-            _ => false,
-        }
-    }
+/// Whether `fact` shows a routine's generation-gated registry write meeting
+/// an entry another generation owns: the write's attempt, which each gated
+/// writer reports before its gate, or its landing.
+fn stale_registry_write(fact: &BlockSyncFact) -> bool {
+    matches!(fact, BlockSyncFact::StaleRegistryWrite { .. })
 }
 
 /// Checks [`REPLACEMENT_PRESERVES_AUTHORIZATION`] at each step with a
-/// session row, a routine's last snapshot or a stale registry write. A
-/// session row applies on a connection that replaces an earlier one to the
-/// same peer. A last snapshot applies once its peer's replacement was
-/// admitted first. Each stale registry write is a violation. It folds the
-/// log's earlier rows each time, since a run admits only a few dozen
-/// sessions.
+/// session row or a stale registry write. A session row applies on a
+/// connection that replaces an earlier one to the same peer. A stale
+/// registry write's attempt applies, and its landing is a violation. It
+/// folds the log's earlier rows each time, since a run admits only a few
+/// dozen sessions.
 fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let step = cx.step;
     let judged_row = |obs: &Observation| {
-        session_row(obs).is_some()
-            || matches!(
-                block_fact(obs),
-                Some(
-                    BlockSyncFact::StaleRegistryWrite { .. }
-                        | BlockSyncFact::Routine { ended: true, .. }
-                )
-            )
+        session_row(obs).is_some() || block_fact(obs).is_some_and(stale_registry_write)
     };
     if !cx.observations().any(judged_row) {
         return Verdict::NotApplicable;
     }
     let mut sessions = Sessions::default();
-    let mut generations = Generations::default();
     let mut judged = false;
     let mut findings = Vec::new();
     for entry in cx.log.entries() {
         if let Some(fact) = block_fact(&entry.obs) {
-            let superseded = generations.fold(fact);
             if entry.step != step {
                 continue;
             }
-            judged |= superseded;
+            judged |= stale_registry_write(fact);
             if let BlockSyncFact::StaleRegistryWrite {
                 peer,
                 writer,
                 generation,
                 entry_generation,
+                landed: true,
             } = fact
             {
                 findings.push((
@@ -379,18 +348,15 @@ fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S
 /// [`REPLACEMENT_PRESERVES_AUTHORIZATION`]'s trigger history: either half
 /// of its claim met its condition. The node admitted a session on a
 /// connection that replaces an earlier one to the same peer, or a
-/// block-sync routine's registry writes met an entry its peer's newer
-/// generation owns: the routine ended after block sync admitted that
-/// generation, or one of its writes landed on the entry. A violation of
-/// one half can end a run before the other half's condition arrives, so
-/// each suffices.
+/// block-sync routine attempted a generation-gated registry write on an
+/// entry another generation owns. A violation of one half can end a run
+/// before the other half's condition arrives, so each suffices.
 fn replaced_or_superseded_wrote(log: &ObservationLog) -> bool {
     let mut sessions = Sessions::default();
-    let mut generations = Generations::default();
     log.entries()
         .iter()
         .any(|entry| match block_fact(&entry.obs) {
-            Some(fact) => generations.fold(fact),
+            Some(fact) => stale_registry_write(fact),
             None => session_row(&entry.obs).is_some_and(|row| sessions.fold(row).is_some()),
         })
 }
@@ -479,9 +445,10 @@ impl Waits {
 }
 
 /// Checks [`STALLED_SERVICE_ISOLATED`] at each step that ends a request's
-/// wait or decides a close with a recorded cause. A wait that ends holds.
-/// A close with a recorded cause on a connection with a waiting request
-/// violates it. A waiting request whose routine no admission row names is
+/// wait, decides a close with a recorded cause, or exits a session
+/// generation. A wait that ends holds. A close with a recorded cause on a
+/// connection with a waiting request violates it, and so does a header-sync
+/// or discovery generation's exit there before any close was decided. A waiting request whose routine no admission row names is
 /// missing evidence. It folds the log's earlier rows each time, since a run
 /// publishes only a few dozen requests.
 fn check_stalled_service_isolated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
@@ -493,7 +460,11 @@ fn check_stalled_service_isolated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdi
                 event: BlockSyncFact::HandoffStarted { .. } | BlockSyncFact::Request { .. },
                 ..
             } | Observation::Transport {
-                event: TransportFact::CloseDecided { cause: Some(_) },
+                event: TransportFact::CloseDecided { cause: Some(_) }
+                    | TransportFact::SessionLifecycle {
+                        step: SessionStepFact::GenerationExited { .. },
+                        ..
+                    },
                 ..
             }
         )
@@ -502,16 +473,57 @@ fn check_stalled_service_isolated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdi
         return Verdict::NotApplicable;
     }
     let mut waits = Waits::default();
+    // The node's connections a close was decided on, with or without a
+    // recorded cause: their sessions end with them.
+    let mut closing = BTreeSet::new();
     let mut verdict = Verdict::NotApplicable;
     let mut findings = Vec::new();
     let mut unmapped = None;
     for entry in cx.log.entries() {
         let ended = waits.fold(&entry.obs);
+        if let Observation::Transport {
+            instance: 0,
+            connection: Some(connection),
+            event: TransportFact::CloseDecided { .. },
+            ..
+        } = &entry.obs
+        {
+            closing.insert(*connection);
+        }
         if entry.step != step {
             continue;
         }
         if ended {
             verdict = Verdict::Holds;
+        }
+        if let Observation::Transport {
+            instance: 0,
+            connection: Some(connection),
+            event:
+                TransportFact::SessionLifecycle {
+                    kind,
+                    step: SessionStepFact::GenerationExited { generation, .. },
+                },
+            ..
+        } = &entry.obs
+        {
+            let waiting = waits.on(*connection);
+            if *kind != ZAKURA_STREAM_BLOCK_SYNC
+                && !closing.contains(connection)
+                && !waiting.is_empty()
+            {
+                findings.push((
+                    "header sync and discovery keep their sessions on a connection while a \
+                     block-sync request on it waits"
+                        .to_owned(),
+                    format!(
+                        "kind {kind}'s session generation {generation} on connection \
+                         {connection} exited while requests {} waited on it",
+                        waiting.join(", ")
+                    ),
+                ));
+            }
+            continue;
         }
         let Observation::Transport {
             connection: Some(connection),

@@ -55,7 +55,8 @@ pub(super) struct PeerTable {
 }
 
 /// Reports a generation-gated write from `generation` that is about to land
-/// on `entry`, if another generation owns the entry.
+/// on `entry`, if another generation owns the entry. Each gated writer calls
+/// it from the statement that writes, past its gate.
 #[cfg(any(test, zakura_sim))]
 fn report_stale_write(
     observer: &ObserverSlot,
@@ -72,6 +73,7 @@ fn report_stale_write(
                 writer,
                 generation,
                 entry_generation: entry.generation,
+                landed: true,
             }
         );
     }
@@ -82,6 +84,27 @@ impl PeerTable {
     #[cfg(any(test, zakura_sim))]
     pub(super) fn set_observer(&mut self, observer: ObserverSlot) {
         self.observer = observer;
+    }
+
+    /// Reports a generation-gated write from `generation` that `writer`
+    /// attempts on the peer's entry, before its gate, if another generation
+    /// owns the entry. A gate that refuses it leaves this the only report.
+    #[cfg(any(test, zakura_sim))]
+    fn report_stale_attempt(&self, peer: &ZakuraPeerId, writer: RegistryWriter, generation: u64) {
+        if let Some(entry) = self.peers.get(peer) {
+            if entry.generation != generation {
+                observe!(
+                    self.observer,
+                    BlockEvent::StaleRegistryWrite {
+                        peer: peer.clone(),
+                        writer,
+                        generation,
+                        entry_generation: entry.generation,
+                        landed: false,
+                    }
+                );
+            }
+        }
     }
 
     pub(super) fn get(&self, peer: &ZakuraPeerId) -> Option<&Entry> {
@@ -101,6 +124,8 @@ impl PeerTable {
         generation: u64,
         outbound: crate::zakura::regulation::SlotBudget,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::AttachOutbound, generation);
         if let Some(entry) = self
             .peers
             .get_mut(peer)
@@ -161,6 +186,8 @@ impl PeerTable {
 
     /// Mark `generation`'s session closed. A newer generation is left open.
     pub(super) fn close_session(&mut self, peer: &ZakuraPeerId, generation: u64) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::CloseSession, generation);
         if let Some(entry) = self
             .peers
             .get_mut(peer)
@@ -205,6 +232,8 @@ impl PeerTable {
         generation: u64,
         status: BlockSyncStatus,
     ) -> bool {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::UpsertStatus, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return false;
         };
@@ -239,6 +268,8 @@ impl PeerTable {
         generation: u64,
         claims: impl IntoIterator<Item = (block::Height, OutstandingMeta)>,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::InsertOutstanding, generation);
         if let Some(entry) = self.peers.get_mut(peer) {
             if entry.generation == generation {
                 #[cfg(any(test, zakura_sim))]
@@ -263,6 +294,8 @@ impl PeerTable {
         owner: BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::RemoveOutstanding, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return;
         };
@@ -290,6 +323,8 @@ impl PeerTable {
         peer: &ZakuraPeerId,
         generation: u64,
     ) -> Option<BTreeMap<block::Height, OutstandingMeta>> {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::TakeOutstanding, generation);
         self.peers
             .get_mut(peer)
             .filter(|entry| entry.generation == generation)
@@ -315,6 +350,8 @@ impl PeerTable {
         generation: u64,
         slots: SlotDiagnostics,
     ) -> bool {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::PublishSlots, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return false;
         };

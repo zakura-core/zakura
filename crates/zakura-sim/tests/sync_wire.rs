@@ -164,6 +164,26 @@ fn superseded_after_replacement(log: &ObservationLog) -> BTreeMap<String, Vec<u6
     superseded
 }
 
+/// The generation of each gated registry write the log shows refused on an
+/// entry another generation owns.
+fn refused_stale_writes(log: &ObservationLog) -> Vec<u64> {
+    log.entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::StaleRegistryWrite {
+                        generation,
+                        landed: false,
+                        ..
+                    },
+                ..
+            } => Some(*generation),
+            _ => None,
+        })
+        .collect()
+}
+
 /// xsync-3: the node's connection to the mirror it dials closes once it
 /// has asked storage to admit four bodies, and the node redials. The
 /// replacement carries all three services' sessions again, each under a
@@ -172,8 +192,8 @@ fn superseded_after_replacement(log: &ObservationLog) -> BTreeMap<String, Vec<u6
 ///
 /// The scenario holds the closed connection's block-sync routine until
 /// block sync admits the replacement's session, so exactly one routine, the
-/// superseded one, ends after its replacement's admission, and its drop's
-/// registry writes land on nothing the replacement owns.
+/// superseded one, ends after its replacement's admission. Its drop's gated
+/// registry writes meet the replacement's entry, and the gates refuse them.
 #[test]
 fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
     let committed = Plan::from_fuzz(&[]);
@@ -191,6 +211,15 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
             superseded.values().map(Vec::len).sum::<usize>(),
             1,
             "{superseded:?}"
+        );
+        let attempts = refused_stale_writes(&report.log);
+        assert!(
+            !attempts.is_empty()
+                && attempts
+                    .iter()
+                    .all(|generation| superseded.values().flatten().any(|g| g == generation)),
+            "the superseded routine's gated writes met its replacement's entry: \
+             {attempts:?} {superseded:?}"
         );
         assert!(
             matches!(

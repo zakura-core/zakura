@@ -73,10 +73,11 @@ pub enum BlockEvent {
         /// The connection's direction.
         direction: ServicePeerDirection,
     },
-    /// A generation-gated peer-registry write landed on an entry that another
-    /// routine generation owns. Each gated writer reports this from inside its
-    /// write, under the registry lock, so the report follows the write and
-    /// not its gate. A write the gate refuses reports nothing.
+    /// A generation-gated peer-registry write met an entry that another
+    /// routine generation owns. Each gated writer reports the attempt before
+    /// its gate, and, if the write lands, again from inside the write, under
+    /// the registry lock, so the second report follows the write and not its
+    /// gate.
     StaleRegistryWrite {
         /// The entry's peer.
         peer: ZakuraPeerId,
@@ -86,6 +87,9 @@ pub enum BlockEvent {
         generation: u64,
         /// The generation that owns the entry.
         entry_generation: u64,
+        /// Whether the write landed: false for the attempt's report, true
+        /// for the write's.
+        landed: bool,
     },
     /// A routine took a frame from its stream and is about to judge it. Every
     /// check the routine, its regulated session and the sequencer run on the
@@ -169,10 +173,11 @@ pub enum BlockEvent {
         /// body, or `None` before it had one.
         scope_epoch: Option<BodyWorkEpoch>,
     },
-    /// The sequencer took a new body-work epoch. It reports this before it
+    /// The sequencer took a new body-work epoch. It reports this after it
     /// runs the transition's operations, which reset the work queue above
-    /// `verified_tip` and reauthorize its queued work without yielding, so
-    /// every request or submission reported after this one follows them.
+    /// `verified_tip` and reauthorize its queued work, and before it submits
+    /// any body, so every request or submission reported after this one
+    /// follows them.
     EpochApplied {
         /// The new epoch.
         epoch: BodyWorkEpoch,

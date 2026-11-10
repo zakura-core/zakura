@@ -1375,8 +1375,8 @@ pub enum BlockSyncFact {
         /// `inbound` or `outbound`.
         direction: String,
     },
-    /// A generation-gated peer-registry write landed on an entry another
-    /// routine generation owns.
+    /// A generation-gated peer-registry write met an entry another routine
+    /// generation owns: its attempt, before the gate, or its landing.
     StaleRegistryWrite {
         /// The entry's peer.
         peer: String,
@@ -1386,6 +1386,8 @@ pub enum BlockSyncFact {
         generation: u64,
         /// The generation that owns the entry.
         entry_generation: u64,
+        /// Whether the write landed.
+        landed: bool,
     },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
@@ -1467,7 +1469,7 @@ pub enum BlockSyncFact {
         /// body, or `None` before it had one.
         scope_epoch: Option<u64>,
     },
-    /// The sequencer took a new body-work epoch, before it reset the work
+    /// The sequencer took a new body-work epoch, after it reset the work
     /// queue above the verified tip and reauthorized its queued work.
     EpochApplied {
         /// The new epoch.

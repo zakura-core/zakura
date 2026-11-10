@@ -890,11 +890,12 @@ impl SequencerIO {
             _ => None,
         };
         let outputs = self.state.on_control_input(input, wall_now);
+        let needs_reaction = self.apply_control_outputs(outputs).await;
         #[cfg(any(test, zakura_sim))]
         if let Some(event) = applied {
             observe!(self.observer, event);
         }
-        self.apply_control_outputs(outputs).await
+        needs_reaction
     }
 
     /// Record one control transition's diagnostics and run its operations.

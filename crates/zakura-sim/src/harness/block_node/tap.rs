@@ -500,11 +500,13 @@ impl BlockTap {
                 writer,
                 generation,
                 entry_generation,
+                landed,
             } => BlockSyncFact::StaleRegistryWrite {
                 peer: peer(written),
                 writer: writer.name().to_owned(),
                 generation: *generation,
                 entry_generation: *entry_generation,
+                landed: *landed,
             },
             BlockEvent::FrameJudged {
                 peer: sender,

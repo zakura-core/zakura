@@ -32,7 +32,7 @@ use zakura_sim::{
     model::Label,
     observe::{RowAt, StorageFact, StorageRequest, StreamId},
     table::{GeneratedId, Template},
-    MemorySink, Observation, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Stream 6 at the regulated version.
@@ -287,6 +287,30 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
+/// The committed reset-mid-flight input: a 2-byte scenario prefix, then
+/// Plan bytes.
+const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-mid-flight.bin");
+
+/// A reset while old-chain bodies are on the wire credits none of them to
+/// the fork's work. The reset-mid-flight scenario resets once the mirrors
+/// have completed 14 range reads instead of at the third submission, so
+/// bodies of heights past the fork that the old epoch asked for cross after
+/// the node's new epoch reserves those heights. Under the reset-mid-flight
+/// input's plan, one such body reaches its routine after the routine
+/// dropped its request, so first-completion-wins must refuse its hash.
+#[test]
+fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
+    let mut scenario = BlockScenario::reset_mid_flight();
+    scenario.control[0].when = Some(Trigger::Completed(Select::nth(BlockKind::MirrorRead, 14)));
+    let (report, _) = run(&scenario, Plan::from_fuzz(&RESET_MID_FLIGHT_INPUT[2..]));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert!(
+        held(&report, &id("block/receiver-work-authorized")),
+        "{:?}",
+        report.properties
+    );
+}
+
 /// Each probe fault the node judges outside any exchange of its own, by the
 /// ID it reaches: undeclared types, flags, short and long payloads on every
 /// row, bad content on the rows the codec checks, unsolicited responses,
@@ -367,6 +391,17 @@ fn probe_faults() -> Vec<(&'static str, BlockScenario)> {
             probe(vec![raw(message_type, 0, long)]),
         ));
     }
+    // Each raw flagged frame above also breaks a content or solicitation
+    // rule, which closes the connection without the flag check. This
+    // status breaks the flag rule only.
+    cases.push((
+        "status/reserved-flags-closes",
+        probe(vec![ProbeFrame::FlaggedStatus {
+            servable_low: 0,
+            servable_high: 0,
+            flags: 1,
+        }]),
+    ));
     // The node's read for the first request stays held until the probe's
     // connection closes, so the overlap is certain.
     let mut overlap = probe(vec![get_blocks(1, 1), get_blocks(1, 1)]);

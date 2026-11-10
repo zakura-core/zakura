@@ -20,7 +20,8 @@
 //! its peers. A committed input's two-byte prefix picks one of its
 //! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers discovery's
 //! generated receiver and sender properties ([`wire_properties`],
-//! disc-3.1), each a `Draft` until its planted case lands. A peer's
+//! disc-3.1), each `Active` once its planted case or scripted bypass
+//! lands, and `discovery/late-response-admitted` (disc-3.4). A peer's
 //! [`PeerAction::Discover`](crate::peer::PeerAction::Discover) acts reach
 //! the receiver ones ([`act_scenario`]), and the node's own exchange
 //! reaches the sender ones.
@@ -37,8 +38,8 @@ use zakura_network::zakura::{
     wire_codec::WireMessage,
     DiscoveryMessage, DiscoveryService, Service, Stream, TransportObserver, ZakuraDiscoveryConfig,
     ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraServiceId,
-    DEFAULT_DISCOVERY_CONNECTION_HEADROOM, ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION,
-    ZAKURA_STREAM_DISCOVERY,
+    DEFAULT_DISCOVERY_CONNECTION_HEADROOM, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+    ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use zakura_quic::sim::{SeededInputs, SimNet};
 
@@ -48,6 +49,9 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
+    domain::discovery::late_response_admitted,
+    model::Label,
+    observe::StreamId,
     peer::{
         discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
         key_index,
@@ -55,9 +59,12 @@ use crate::{
         peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
         PeerTask, NODE_ADDR,
     },
-    property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
-    table::{sender_properties, table_properties},
-    RunConfig, Sim,
+    property::{
+        Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status,
+        TriggerHistory,
+    },
+    table::{sender_properties, table_properties, GeneratedId, Template},
+    Observation, ObservationLog, RunConfig, Sim,
 };
 
 /// The discovery node's own config.
@@ -234,13 +241,15 @@ fn spawn_with(
         .collect();
     let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
     let dials = tap.dials();
+    let shared_ids = tap.shared_ids();
     sim.add_source(Box::new(tap));
     spawn_node(sim, spec, &network, net.sim(), seed, observer, dials, node);
     // Read before any task runs, since building it draws from the run.
     let stream = discovery_stream();
     let failure = PeerFailure::default();
     let records = PeerRecords::default();
-    let mut control = PeerControl::new(failure.clone(), records.clone()).with_discovery(&stream);
+    let mut control =
+        PeerControl::new(failure.clone(), records.clone(), shared_ids).with_discovery(&stream);
     for ((index, peer), name) in peers.iter().enumerate().zip(names) {
         assert!(
             peer.honest.is_none(),
@@ -334,6 +343,11 @@ pub enum SavedPlan {
     Verification,
     /// The node dials a listening peer it holds as a static candidate.
     StaticDial,
+    /// A peer dials the node and holds its `Peers` until the node's initial
+    /// exchange wait times out. The Plan delivers the `Peers` after the
+    /// node's wait timed out and before its session ends, so the node reads
+    /// a late answer (`discovery/late-response-admitted`).
+    LateResponse,
 }
 
 /// The records [`SavedPlan::Verification`]'s peer relays.
@@ -341,11 +355,12 @@ pub const RELAYED: u8 = 3;
 
 impl SavedPlan {
     /// Every saved Plan.
-    pub const ALL: [SavedPlan; 4] = [
+    pub const ALL: [SavedPlan; 5] = [
         SavedPlan::Exchange,
         SavedPlan::TimedOut,
         SavedPlan::Verification,
         SavedPlan::StaticDial,
+        SavedPlan::LateResponse,
     ];
 
     /// The fixture's name, `discovery-wire-<name>.bin`.
@@ -355,6 +370,7 @@ impl SavedPlan {
             SavedPlan::TimedOut => "timed-out",
             SavedPlan::Verification => "verification",
             SavedPlan::StaticDial => "static-dial",
+            SavedPlan::LateResponse => "late-response",
         }
     }
 
@@ -409,6 +425,16 @@ impl SavedPlan {
                     ..base
                 }
             }
+            // The node admits the session at the run's start, so the
+            // `Peers` goes as its initial wait times out.
+            SavedPlan::LateResponse => dialed(DiscoveryScript {
+                relays: 1,
+                holds: vec![Hold {
+                    answer: Answer::Peers,
+                    // Two seconds fit a u64 of milliseconds.
+                    until_ms: DISCOVERY_INITIAL_EXCHANGE_TIMEOUT.as_millis() as u64,
+                }],
+            }),
         }
     }
 }
@@ -489,8 +515,14 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
-/// until its planted case lands (disc-3.2, disc-3.3).
+/// properties, 31 IDs, then its sender properties, 7 IDs. An ID is a
+/// `Draft` until its planted case lands. An ID with a planted case checks
+/// that case's trigger history ([`planted_trigger`]). An ID no planted case
+/// violates alone, one of [`SCRIPTED`], is `Active` with the scripted
+/// bypass in `tests/discovery_wire_witness.rs`, as header sync's are.
+/// Then comes `discovery/late-response-admitted` (disc-3.4), a
+/// hand-written `Active` property with its own planted case and trigger
+/// history.
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault
@@ -509,11 +541,247 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         });
     receiver
         .chain(sender_properties(FAMILY, &STREAMS))
-        .map(|property| Property {
-            status: Status::Draft,
-            ..property
+        .map(|property| match planted_trigger(property.id.as_str()) {
+            Some(trigger) => Property {
+                witness: Some(TriggerHistory::Log(trigger)),
+                ..property
+            },
+            None if SCRIPTED.contains(&property.id.as_str()) => property,
+            None => Property {
+                status: Status::Draft,
+                ..property
+            },
         })
+        .chain([late_response_admitted()])
         .collect()
+}
+
+/// The generated IDs no scenario reaches, which a scripted bypass violates
+/// instead of a planted case (disc-3.2). The node asks for every service,
+/// so its `GetServices` owes the row's largest `Services`, and a larger one
+/// is `long-payload`.
+pub const SCRIPTED: [&str; 1] = ["discovery/s4v2/services/over-owed-closes"];
+
+/// True if the generated ID `id` has a planted case under `qa/planted/`,
+/// so it isn't a `Draft`.
+pub fn has_planted_case(id: &str) -> bool {
+    planted_trigger(id).is_some()
+}
+
+/// A trigger history over the run's observation log.
+type Trigger = fn(&ObservationLog) -> bool;
+
+/// The trigger history of the generated ID `id`'s planted case, if it has
+/// one. Only discovery's own IDs on its stream have one.
+///
+/// - The stateless `<label>-closes` IDs (disc-3.3): the shared frame reader
+///   skips the check for one row of discovery's table, and discovery drops
+///   that frame instead of closing.
+/// - The IDs whose guard is discovery's own (disc-3.2): a patch bypasses
+///   that guard for one row.
+///
+/// A `<label>-closes` ID's trigger is the node judging a frame with the ID's
+/// label on its row, and `conformant-never-closes`'s is the node judging a
+/// conformant frame on any row ([`judged_label`]). A `cadence-never-closes`
+/// ID's is the node judging a frame on its row that found the row's
+/// cadence bucket empty ([`judged_exhausted`]). A sender ID's trigger is the
+/// node sending a frame of its row ([`sent_row`]).
+fn planted_trigger(id: &str) -> Option<Trigger> {
+    let id = GeneratedId::parse(id)?;
+    if id.family != FAMILY || id.stream != stream_id() {
+        return None;
+    }
+    let row = || {
+        <DiscoveryMessage as WireMessage>::RULES
+            .iter()
+            .position(|rule| Some(rule.name) == id.row)
+    };
+    match id.template {
+        Template::ConformantNeverCloses => Some(judged_label::<CONFORMANT, ANY_ROW>),
+        Template::Closes(label) => {
+            match (LABELS.iter().position(|judged| *judged == label)?, row()) {
+                (0, _) => Some(judged_label::<0, ANY_ROW>),
+                (at @ 1..=3, Some(row)) => Some(ROW_TRIGGERS[at - 1][row]),
+                (5, Some(1)) => Some(judged_label::<5, 1>),
+                (5, Some(3)) => Some(judged_label::<5, 3>),
+                (6, Some(2)) => Some(judged_label::<6, 2>),
+                (6, Some(4)) => Some(judged_label::<6, 4>),
+                (7, Some(2)) => Some(judged_label::<7, 2>),
+                (8, Some(row)) => BAD_CONTENT_TRIGGERS.get(row).copied(),
+                _ => None,
+            }
+        }
+        Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
+        Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
+            SENT_TRIGGERS.get(row()?).copied()
+        }
+        _ => None,
+    }
+}
+
+/// The kind and version of discovery's one stream ([`STREAMS`]).
+fn stream_id() -> StreamId {
+    let [stream] = STREAMS;
+    StreamId {
+        kind: stream.kind,
+        version: stream.version,
+    }
+}
+
+/// The labels of the judged frames that trigger a planted case, as
+/// [`judged_label`] numbers them: first the four the shared frame reader
+/// judges from a header alone, then the conformant label and the four
+/// whose guard is discovery's own.
+const LABELS: [Label; 9] = [
+    Label::UndeclaredType,
+    Label::ReservedFlags,
+    Label::ShortPayload,
+    Label::LongPayload,
+    Label::Conformant,
+    Label::OverMargin,
+    Label::Unsolicited,
+    Label::OverOwed,
+    Label::BadContent,
+];
+
+/// `Label::Conformant`'s index in [`LABELS`].
+const CONFORMANT: usize = 4;
+
+/// [`judged_label`]'s `ROW` for a frame on any row.
+const ANY_ROW: usize = usize::MAX;
+
+/// [`judged_label`] of each row-level stateless label, `LABELS[1..=3]`, by
+/// label, then by row in table order.
+const ROW_TRIGGERS: [[Trigger; 5]; 3] = [
+    [
+        judged_label::<1, 0>,
+        judged_label::<1, 1>,
+        judged_label::<1, 2>,
+        judged_label::<1, 3>,
+        judged_label::<1, 4>,
+    ],
+    [
+        judged_label::<2, 0>,
+        judged_label::<2, 1>,
+        judged_label::<2, 2>,
+        judged_label::<2, 3>,
+        judged_label::<2, 4>,
+    ],
+    [
+        judged_label::<3, 0>,
+        judged_label::<3, 1>,
+        judged_label::<3, 2>,
+        judged_label::<3, 3>,
+        judged_label::<3, 4>,
+    ],
+];
+
+/// [`judged_label`] of `Label::BadContent` by row in table order.
+const BAD_CONTENT_TRIGGERS: [Trigger; 5] = [
+    judged_label::<8, 0>,
+    judged_label::<8, 1>,
+    judged_label::<8, 2>,
+    judged_label::<8, 3>,
+    judged_label::<8, 4>,
+];
+
+/// [`judged_exhausted`] by row in table order.
+const CADENCE_TRIGGERS: [Trigger; 5] = [
+    judged_exhausted::<0>,
+    judged_exhausted::<1>,
+    judged_exhausted::<2>,
+    judged_exhausted::<3>,
+    judged_exhausted::<4>,
+];
+
+/// [`sent_row`] by row in table order.
+const SENT_TRIGGERS: [Trigger; 5] = [
+    sent_row::<0>,
+    sent_row::<1>,
+    sent_row::<2>,
+    sent_row::<3>,
+    sent_row::<4>,
+];
+
+/// True if `log` holds a frame the node judged on discovery's stream that
+/// the peer labelled `LABELS[LABEL]`, on the row at `ROW` in discovery's
+/// table, or on any row for [`ANY_ROW`]. A trigger history is a plain
+/// function, so each ID takes its own instance.
+fn judged_label<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> bool {
+    let label = LABELS[LABEL];
+    let row = <DiscoveryMessage as WireMessage>::RULES
+        .get(ROW)
+        .map(|rule| rule.name);
+    let stream = stream_id();
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream: judged,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        judged == stream
+            && entries[..at].iter().any(|sent| {
+                matches!(&sent.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    row: r,
+                    label: l,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq)
+                    && *l == label
+                    && (row.is_none() || r.as_deref() == row))
+            })
+    })
+}
+
+/// True if `log` holds a frame the node judged on discovery's stream, on
+/// the row at `ROW` in discovery's table, that the peer sent into an empty
+/// cadence bucket.
+fn judged_exhausted<const ROW: usize>(log: &ObservationLog) -> bool {
+    let row = <DiscoveryMessage as WireMessage>::RULES[ROW].name;
+    let stream = stream_id();
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream: judged,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        judged == stream
+            && entries[..at].iter().any(|sent| {
+                matches!(&sent.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    row: Some(r),
+                    exhausted: true,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq) && r == row)
+            })
+    })
+}
+
+/// True if `log` holds a frame the node sent on discovery's stream on the
+/// row at `ROW` in discovery's table.
+fn sent_row<const ROW: usize>(log: &ObservationLog) -> bool {
+    let row = <DiscoveryMessage as WireMessage>::RULES[ROW].name;
+    let stream = stream_id();
+    log.entries().iter().any(|entry| {
+        matches!(&entry.obs, Observation::NodeFrame { stream: s, row: Some(r), .. }
+            if *s == stream && r == row)
+    })
 }
 
 /// The discovery node behind its real transport on simulated QUIC, named

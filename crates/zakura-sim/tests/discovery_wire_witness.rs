@@ -3,8 +3,11 @@
 //! in its witness, a run of the harness with one peer taking one
 //! [`DiscoveryAct`], and no other ID is violated there. Conformant controls
 //! show that `conformant-never-closes` and `cadence-never-closes` apply and
-//! hold on frames the node must not punish.
+//! hold on frames the node must not punish. `discovery/late-response-admitted`
+//! applies and holds in the `late-response` saved Plan (disc-3.4).
 #![cfg(zakura_sim)]
+
+mod support;
 
 use std::{
     collections::BTreeSet,
@@ -13,18 +16,23 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::{
+    domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
-        discovery_service::{act_scenario, DiscoveryWire, NodeHandle, WireScenario, FAMILY},
+        discovery_service::{
+            act_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan, WireScenario,
+            FAMILY, SCRIPTED,
+        },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
     peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule},
-    table::GeneratedId,
+    table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
 };
@@ -183,11 +191,16 @@ fn run(scenario: &WireScenario) -> RunReport {
 
 /// Runs `scenario` as [`run`] does, and also returns the node's handle.
 fn run_node(scenario: &WireScenario) -> (RunReport, NodeHandle) {
+    run_plan(scenario, &[])
+}
+
+/// Runs `scenario` under the Plan `plan`, as [`run_node`] does.
+fn run_plan(scenario: &WireScenario, plan: &[u8]) -> (RunReport, NodeHandle) {
     let node = DiscoveryWire::prepare(scenario);
     let ran = run_prepared::<DiscoveryWire>(
         scenario,
         node.clone(),
-        Plan::from_fuzz(&[]),
+        Plan::from_fuzz(plan),
         &mut MemorySink::default(),
         None,
     );
@@ -232,9 +245,9 @@ fn generated() -> Vec<String> {
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`, as
 /// `applicable` witness tests judge them, and so does the stream's
-/// `conformant-never-closes`. Every registered property is a `Draft`,
-/// whose violation doesn't stop the run, so this also requires that no
-/// property is violated. The [`UNREACHED`] ID stays `NotApplicable`.
+/// `conformant-never-closes`. A `Draft` property's violation doesn't stop
+/// the run, so this also requires that no property is violated. The
+/// [`UNREACHED`] ID stays `NotApplicable`.
 fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) {
     assert_eq!(report.end.harness, None, "{witness:?}: {:?}", report.end);
     assert_eq!(report.end.violation, None, "{witness:?}: {:?}", report.end);
@@ -293,7 +306,8 @@ fn apply_on_row(row: DiscoveryRow) {
 /// #2114's audit: the node checks a `Peers` against its own request's cap,
 /// `peers_cap(limit)`, which is under the row's maximum when its limit is
 /// under 32. In the over-owed witness, a node asking for [`LIMIT`] record
-/// gets a `Peers` one byte over that cap and under the row's maximum. The
+/// gets a `Peers` one byte over that cap and under the row's maximum, two
+/// validly signed records that decode. The
 /// peer's models label it `over-owed`, not `Conformant` and not
 /// `long-payload`. The node reads it, its claim of the answer refuses it,
 /// and the node closes the connection with a fault cause.
@@ -477,4 +491,75 @@ fn conformant_controls_hold_conformant_never_closes() {
             .collect();
         assert_eq!(labels, BTreeSet::from(["conformant"]), "{control:?}");
     }
+}
+
+/// The scripted history that violates `id` on connection 1, one batch per
+/// step: a fault the node never punishes.
+fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
+    let peer = |label: Label| Observation::PeerFrame {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+        row: id.row.map(str::to_owned),
+        rule_stream: STREAM,
+        label,
+        exhausted: false,
+        exchange: None,
+        payload: 9,
+    };
+    let judged = Observation::FrameJudged {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+    };
+    match id.template {
+        Template::Closes(label) => vec![vec![peer(label)], vec![judged]],
+        template => panic!("no scripted bypass covers {template:?}"),
+    }
+}
+
+/// Each [`SCRIPTED`] ID fails on a scripted history that bypasses its
+/// rule.
+#[test]
+fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
+    for name in SCRIPTED {
+        let parsed = GeneratedId::parse(name).expect("a generated ID parses back");
+        let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+        assert!(
+            matches!(outcome(&report, name), PropertyOutcome::Violated { .. }),
+            "{name}: {:?}",
+            report.properties
+        );
+    }
+}
+
+/// The `late-response` saved Plan's committed input: its tag, then its
+/// Plan.
+const LATE_RESPONSE: &[u8] = include_bytes!("fixtures/discovery-wire-late-response.bin");
+
+/// `discovery/late-response-admitted` applies and holds in the
+/// `late-response` saved Plan, where the node reads the held `Peers` after
+/// its initial wait timed out (`discovery_wire_lifecycle.rs` checks that
+/// history). No property is violated, and the honest exchange, whose
+/// answers come before the timeout, leaves it `NotApplicable`.
+///
+/// This fails if the node punishes a late answer, or if the Plan stops
+/// delivering the `Peers` after the timeout.
+#[test]
+fn late_response_admitted_applies_in_its_saved_plan() {
+    let (prefix, plan) = LATE_RESPONSE.split_at(DiscoveryWire::SCENARIO_BYTES);
+    assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
+    let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);
+    witnessed(
+        &report,
+        "late-response",
+        &[LATE_RESPONSE_ADMITTED.to_owned()],
+    );
+    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(
+        *outcome(&run(&WireScenario::default()), LATE_RESPONSE_ADMITTED),
+        PropertyOutcome::NotApplicable
+    );
 }

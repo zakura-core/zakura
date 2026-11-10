@@ -977,6 +977,7 @@ fn sink_and_core(
     let commitments = Arc::new(Commitments {
         open: AtomicU32::new(1),
         limit: AtomicU32::new(1),
+        tap: std::sync::OnceLock::new(),
     });
     let (frames, queued) = mpsc::unbounded_channel();
     let core = SinkCore::new(
@@ -1008,6 +1009,7 @@ fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
         let counts = Arc::new(Commitments {
             open: AtomicU32::new(1),
             limit: AtomicU32::new(1),
+            tap: std::sync::OnceLock::new(),
         });
         let completed = Completions::default();
         let mut old = Commitment(Some(counts.clone()), tracked.then(|| completed.track(1)));
@@ -1594,4 +1596,66 @@ fn every_serving_peer_can_hold_its_output_budget_at_once() {
     assert_eq!(capacity.node_output_held(), limits.node_output_bytes);
     drop(grants);
     assert_eq!(capacity.node_output_held(), 0);
+}
+
+/// Records each commitment transition a stream tap reports.
+#[derive(Debug, Default)]
+struct Transitions(std::sync::Mutex<Vec<crate::zakura::Transition>>);
+
+impl crate::zakura::TransportObserver for Transitions {
+    fn observe(&self, event: crate::zakura::TransportEvent) {
+        if let crate::zakura::TransportEvent::Regulated { transition, .. } = event {
+            self.0
+                .lock()
+                .expect("no test panics while holding it")
+                .push(transition);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_observed_session_reports_each_count_and_release_with_its_frame() {
+    use crate::zakura::{ConnTap, StreamTap, Transition};
+
+    let observer = Arc::new(Transitions::default());
+    let conn = Arc::new(ConnTap::new(
+        observer.clone(),
+        "127.0.0.1:9".parse().expect("a valid socket address"),
+    ));
+    conn.registered(7);
+    let tap = Arc::new(StreamTap::new(conn, 0));
+    let capacity = capacity(LIMITS);
+    let session = session(&capacity, 1, 4);
+    tap.tag_frames();
+    session.serve.observe_with(tap.clone(), GET.message_type);
+
+    let first = Arc::new(Semaphore::new(0));
+    let second = Arc::new(Semaphore::new(0));
+    for gate in [&first, &second] {
+        tap.header_read(GET.message_type, 0, 4);
+        tap.queue_tag();
+        tap.take_tag();
+        session.serve.admit(gated(gate)).unwrap();
+    }
+    settle().await;
+    first.add_permits(1);
+    settle().await;
+
+    let message_type = GET.message_type;
+    assert_eq!(
+        *observer.0.lock().expect("no test panics while holding it"),
+        [
+            Transition::CommitmentCounted {
+                seq: Some(0),
+                message_type,
+            },
+            Transition::CommitmentCounted {
+                seq: Some(1),
+                message_type,
+            },
+            Transition::CommitmentReleased { message_type },
+        ],
+    );
+    assert_eq!(session.serve.open(), 1);
+    second.add_permits(1);
 }

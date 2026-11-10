@@ -80,8 +80,16 @@ macro_rules! machine_entry {
             config: |value| $crate::harness::machine::config(&$machine, value),
             draw: $crate::harness::machine::draw,
             properties: || $crate::harness::machine::registered(&$machine),
-            witness: |value, input, property, expect, sink| {
-                $crate::harness::machine::witness(&$machine, value, input, property, expect, sink)
+            witness: |value, input, property, expect, also_violates, sink| {
+                $crate::harness::machine::witness(
+                    &$machine,
+                    value,
+                    input,
+                    property,
+                    expect,
+                    also_violates,
+                    sink,
+                )
             },
             run_bytes: |bytes, sink, extra| {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
@@ -123,6 +131,15 @@ impl HasView for Handle {
             .as_ref()
             .map_or(Capture::Missing, |(step, _)| Capture::AfterStep(*step))
     }
+}
+
+/// Every source `machine`'s property needs, for hdr-14's missing-source
+/// keys.
+pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
+    properties(machine)
+        .iter()
+        .flat_map(|property| property.needs.iter().copied())
+        .collect()
 }
 
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
@@ -418,6 +435,7 @@ pub fn witness(
     input: PlanInput,
     property: &str,
     expect: Expect,
+    also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
     if property != machine.name {
@@ -429,7 +447,7 @@ pub fn witness(
     };
     let report = run(machine, value, input, &mut evidence)
         .map_err(|error| WitnessError::HarnessEnd(error.to_string()))?;
-    crate::witness::judge(&report, property, Status::Active, expect)?;
+    crate::witness::judge(&report, property, Status::Active, expect, also_violates)?;
     if expect != Expect::Applicable && !(machine.reached)(&evidence.steps, expect) {
         return Err(WitnessError::LostTriggerHistory);
     }

@@ -1158,6 +1158,15 @@ async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Resul
     }
 }
 
+#[cfg(zakura_sim)]
+impl BlockSyncService {
+    /// A probe of the session slots this service reserves, for the
+    /// simulator's teardown check.
+    pub fn session_slots(&self) -> crate::zakura::SessionSlotsProbe {
+        self.inner.sessions.probe()
+    }
+}
+
 #[cfg(test)]
 mod requester_session_tests {
     use super::*;

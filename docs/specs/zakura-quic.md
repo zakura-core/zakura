@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-08. Version 0.17.
+Status: draft for review, 2026-11-09. Version 0.19.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -34,7 +34,11 @@ adds the §16 row for byte-identical replay; §17l explains it. Version 0.15
 adds API-10, credit holds, and lets CTRL-6 sit below CTRL-5; §17m lists each
 change. Version 0.16 adds `SendStream::stopped` to API-5 and DRV-9; §17n
 explains it. Version 0.17 moves Ed25519 signing and the ID-6 equation from
-`ed25519-zebra` to `ring`; §17o explains it.
+`ed25519-zebra` to `ring`; §17o explains it. Version 0.18 keeps a quarter of
+Zakura's connection and control-handshake caps for outbound work (ADM-3);
+§17p explains it. Version 0.19 lets the acceptor group pending handshakes by
+source and has Zakura count each global IPv6 /64 as one IP; it changes ADM-1,
+ADM-3, ADM-7 and API-3, and adds §16 rows; §17q lists each change.
 
 ## 0. Conventions
 
@@ -380,7 +384,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `remote`, the canonical source address (SOCK-11);
   - `validated`, which is `Incoming::remote_address_validated()`;
   - `pending_total` and `pending_from_ip`, the handshakes in progress on the
-    endpoint and from `remote`'s IP (ADM-7).
+    endpoint and from `remote`'s IP group, `Acceptor::pending_group(remote's
+    IP)` (ADM-7).
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a
   `quinn_proto::Endpoint` call:
   - `Accept` → `accept`;
@@ -398,7 +403,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
      handshakes reach `retry_threshold`;
   6. `Accept` otherwise.
-  Rules apply in that order. Zakura's acceptor applies rules 1, 2 and 4: it
+  Rules apply in that order. Zakura counts every per-IP rule by the source's
+  admission host: an IPv4 address, after IPv4 transition encodings fold to it,
+  or a global unicast IPv6 (2000::/3) address's /64. One host can hold every
+  address in its /64, so an exact-address count would never bind it. Other
+  IPv6 addresses, such as unique local and link-local, count exactly. Its
+  `pending_group` returns the admission host, so the endpoint counts pending
+  handshakes the same way. Zakura's acceptor applies rules 1, 2 and 4: it
   counts `pending_from_ip` with the IP's control handshakes and established
   connections, and counts
   `pending_total` with the control handshakes holding `max_pending_handshakes`
@@ -406,7 +417,17 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   `Accept`, then its connection cap (ADM-12). Rules 3 and 4 both refuse, so
   their order doesn't change the result.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
-  ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
+  ignores attempts once shutdown starts.
+
+  Inbound peers get Zakura's `max_connections` and `max_pending_handshakes`
+  caps less an outbound reserve of a quarter, rounded down but at least one
+  slot once a cap is 2 or more: 69 connections and 24 handshakes at the
+  defaults. The acceptor refuses once inbound connections
+  fill their share. Rule 4 also counts `pending_total` with the inbound control
+  handshakes against the inbound handshake share. The reserve stays free for
+  this node's dials, so peers that dial
+  in can't take the capacity its own peers need. Dials may still use any free
+  slot. Zakura has no IP ban list yet, so
   rule 1 never fires.
 
   Rule 2 reserves the last available per-IP slot for a validated source.
@@ -434,7 +455,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-6.** When `handshake_timeout_secs` is set, every accepted handshake MUST
   finish within it. On expiry, the endpoint MUST drop the connecting attempt,
   which closes the connection, and count `zakura.quic.handshake.timed_out`.
-- **ADM-7.** A pending handshake counts against its IP and against the endpoint
+- **ADM-7.** A pending handshake counts against its IP group,
+  `Acceptor::pending_group` of its source IP, and against the endpoint
   from `Accept` until the handshake completes or fails. A failed or timed-out
   handshake keeps counting until its connection task has closed the
   connection, for at most 3 s. On success, the endpoint calls
@@ -606,7 +628,8 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16, per
+IPv4 address or global IPv6 /64, ADM-3),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
 `peer_memory_budget_bytes` (15 GiB) joins them under CTRL-26.
@@ -808,7 +831,10 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `fn handle(&self, conn: Conn) -> BoxFuture<'static, ()>`; `Conn::alpn()`
     carries the negotiated ALPN. Work done in `handle` before it returns the
     future runs while the handshake still counts as pending (ADM-7);
-  - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3.
+  - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3;
+  - `fn pending_group(&self, ip: IpAddr) -> IpAddr`, default `ip`, the group
+    that ADM-7 counts the IP's pending handshakes under. It must not block
+    (ADM-4).
 - **API-4.** `Conn`:
   - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `alpn()` and `stable_id()`;
   - `open_bi()`, `accept_bi()`, `close(code, reason)`, `closed()` and
@@ -1022,6 +1048,9 @@ this release tolerates, and keep each hard change explicit.
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | A shrink below granted credit becomes debt that reads repay before a new grant (pins `quinn-proto`); a greedy sender's delivered minus released bytes never exceed the window under random holds, reads and releases; releasing a hold unblocks a sender stuck on `DATA_BLOCKED` | API-10 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
+| Inbound connections and handshakes stop at their share while dials still get the reserved quarter | ADM-3 |
+| The endpoint counts pending handshakes under the acceptor's `pending_group` | ADM-1, ADM-7, API-3 |
+| Zakura's admission host folds transition encodings and cuts global IPv6 to /64; every address in a /64 shares the per-IP cap, handshake share and dial reservation, and a redial from another address in it is a same-IP duplicate | ADM-3 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
@@ -1397,3 +1426,46 @@ Changed:
   step 1 point checks, it accepts exactly the signatures the cofactored
   equation accepted, so the accepted set is unchanged. A differential test
   checks this against `ed25519-zebra`.
+
+## 17p. Changes in version 0.18
+
+Before this version inbound and outbound connections drew on one connection
+cap and one control-handshake cap. Peers that dialed in could take every
+slot, and then this node couldn't dial anyone, even the peers it chose for
+eclipse resistance.
+
+Changed:
+
+- **ADM-3.** Inbound connections and inbound handshakes each get Zakura's
+  cap less a quarter, rounded down but at least one slot once the cap is 2
+  or more. That reserve stays for dials. Bitcoin Core, geth, reth and Zebra
+  all bound inbound below the total in the same way.
+- **§16.** Adds the inbound share test.
+
+## 17q. Changes in version 0.19
+
+Zakura counted every per-IP limit by exact address. A host with a /64,
+which most IPv6 hosting gives each server, has 2^64 addresses, so it could
+use a fresh one per identity and fill the node. Zebra counts a
+global IPv6 /64 as one host, and the draft Zcash P2P QUIC ZIP calls a /64 a
+reasonable default for IPv6 limits.
+
+Two tradeoffs are deliberate. A host with several /64s still gets the per-IP
+cap in each one. No coarser refuse tier backs it, because a fixed /48, /32
+or IPv4 /24 cap either locks out honest nodes at big providers or is too
+loose to stop a cheap allocation. The outbound reserve (ADM-3) keeps dials
+free regardless, and eviction by netgroup is the planned control for a full
+inbound pool. Second, providers that share one /64 across customers put
+those customers in one bucket, so a co-tenant can hold that /64's slots on
+a node. An operator can raise `max_connections_per_ip`. IPv4 also works
+for them, except that a dial listing IPv6 first can win the DIAL-3 race and
+then be refused at registration (tracked in #2255).
+
+Changed:
+
+- **API-3.** Adds `Acceptor::pending_group`.
+- **ADM-1, ADM-7.** `pending_from_ip` and the pending count use that group.
+- **ADM-3.** Zakura counts each IP by its admission host, a global unicast
+  IPv6 address's /64 or the exact address otherwise, and its
+  `pending_group` returns it.
+- **§16.** Adds the `pending_group` and admission host tests.

@@ -157,6 +157,10 @@ pub(crate) struct ConnShared {
     released_credit: AtomicU64,
     /// Wakes the task when `released_credit` leaves zero.
     credit_released: Notify,
+    /// The ID both ends derive from the TLS handshake, set when the
+    /// handshake completes ([`crate::Conn::shared_id`]).
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub(crate) shared_id: std::sync::OnceLock<[u8; crate::tls::SHARED_ID_LEN]>,
 }
 
 impl ConnShared {
@@ -174,6 +178,8 @@ impl ConnShared {
             socket_queued_bytes,
             released_credit: AtomicU64::new(0),
             credit_released: Notify::new(),
+            #[cfg(any(test, zakura_sim, feature = "test-support"))]
+            shared_id: std::sync::OnceLock::new(),
         })
     }
 

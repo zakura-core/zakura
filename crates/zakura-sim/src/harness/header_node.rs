@@ -588,6 +588,7 @@ impl HeaderNode {
             Some((tip.height, tip.hash)),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let (vct_repairs, repairs) = watch::channel(VctRootRepairStatus::default());
         startup.committed_snapshots = Some(port.selected_chain());

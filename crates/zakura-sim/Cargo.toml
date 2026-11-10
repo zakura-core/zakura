@@ -10,6 +10,8 @@ keywords.workspace = true
 categories = ["development-tools::testing"]
 # Only tests and the `zakura-sim` binary use it, and no published crate does.
 publish = false
+# `cargo run -p zakura-sim` runs the simulator, beside `header-acceptance`.
+default-run = "zakura-sim"
 
 # The crate is empty outside the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 [target.'cfg(zakura_sim)'.dependencies]
@@ -48,6 +50,12 @@ rayon = { workspace = true }
 # to check that equal records still write equal bytes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
+# The header-acceptance checks read test items from source tokens, with
+# line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# The header-acceptance scan also parses the crate's own source to find
+# every `NotApplicable` construction.
+syn = { version = "2", features = ["full", "visit"] }
 # A runtime for the serving tool in the model agreement tests.
 tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = { workspace = true }

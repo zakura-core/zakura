@@ -228,6 +228,7 @@ fn a_witness_needs_its_trigger_history() {
             PlanInput::Bytes(Vec::new()),
             property,
             expect,
+            &[],
             &mut MemorySink::default(),
         )
     };

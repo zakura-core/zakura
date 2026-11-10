@@ -72,7 +72,7 @@ confirm)
   [ "$status" = confirmed ] || exit 1
   exit 0;;
 replay)
-  case "$1" in *bad*) echo "1 records differed" >&2; exit 1;; esac
+  case "$1" in */traces/bad) echo "1 records differed" >&2; exit 1;; esac
   exit 0;;
 esac
 exit 2
@@ -164,6 +164,7 @@ impl Fake {
             harness: "fixtures/all".to_owned(),
             input,
             property: "race/lost-update".to_owned(),
+            also_violates: Vec::new(),
             out: dir.path().join("out"),
             budget: Budget {
                 runs: 1,

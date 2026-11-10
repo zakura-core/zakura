@@ -14,6 +14,13 @@
 //! the operations that didn't pair into the [`BlockSyncView`] the harness's
 //! checks read.
 //!
+//! Once the harness hands it the node's session slots probe through a
+//! [`TapSessions`], the reader also reads the service's free session slots
+//! at each observation, inside a
+//! [`boundary_read`](zakura_rt::sim::boundary_read), and folds them into
+//! the owner model. The reads stay out of the observation log, so pinned
+//! Plans and traces keep their format.
+//!
 //! A node's teardown ends its block sync on purpose. Once told of it through
 //! a [`TapTeardown`], the tap reports its observer's drop as unhealthy only
 //! until the reader has logged the sequencer's close.
@@ -25,7 +32,7 @@
 //! with the same tap.
 
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     collections::{BTreeMap, HashMap},
     mem,
     rc::Rc,
@@ -40,7 +47,7 @@ use zakura_network::zakura::{
         BlockEvent, BlockSyncObserver, BudgetChangeKind, HeldBody, Holder, HolderChange, LeaseStep,
         RequestStep, RequestWritePhase, RetainedBody, WorkItemPlace,
     },
-    ServicePeerDirection, ZakuraPeerId,
+    ServicePeerDirection, SessionSlotsProbe, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
 use zakura_scheduler::{hooks, SimInstant, TaskId};
@@ -85,6 +92,8 @@ pub struct BlockTap {
     /// Writes the generated-property observations, if the run labels its
     /// links.
     adapter: Option<Adapter>,
+    /// The node's session slots probe, once the harness hands it over.
+    sessions: Rc<OnceCell<SessionSlotsProbe>>,
 }
 
 /// What the observer and the reader share.
@@ -143,6 +152,33 @@ impl TapTeardown {
     /// Marks the teardown begun. Call it before the node drops anything.
     pub(crate) fn begin(&self) {
         self.0.teardown.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Hands a tap its node's session slots probe.
+pub struct TapSessions {
+    probe: Rc<OnceCell<SessionSlotsProbe>>,
+    view: Rc<RefCell<BlockSyncView>>,
+}
+
+impl TapSessions {
+    /// Folds `probe`'s reading now into the owner model as the baseline,
+    /// then has the tap read it at each observation. Call it before the
+    /// harness makes any link to the node.
+    ///
+    /// # Panics
+    ///
+    /// If the tap already has a probe.
+    pub(crate) fn watch(&self, probe: SessionSlotsProbe) {
+        let free = zakura_rt::sim::boundary_read(|| probe.read());
+        self.view
+            .borrow_mut()
+            .owners
+            .apply(OwnerInput::SessionSlots { free });
+        assert!(
+            self.probe.set(probe).is_ok(),
+            "a tap watches one node's session slots"
+        );
     }
 }
 
@@ -326,8 +362,17 @@ impl BlockTap {
             allocations: Allocations::default(),
             view,
             adapter: None,
+            sessions: Rc::default(),
         };
         (observer, tap)
+    }
+
+    /// The handle the harness gives the node's session slots probe to.
+    pub(crate) fn sessions(&self) -> TapSessions {
+        TapSessions {
+            probe: self.sessions.clone(),
+            view: self.view.clone(),
+        }
     }
 
     /// Writes `wire`'s labels, and the node's identities and effects, as the
@@ -797,6 +842,10 @@ impl ActionSource for BlockTap {
             if let Observation::BlockSync { event, .. } = obs {
                 view.owners.observe(event);
             }
+        }
+        if let Some(probe) = self.sessions.get() {
+            let free = zakura_rt::sim::boundary_read(|| probe.read());
+            view.owners.apply(OwnerInput::SessionSlots { free });
         }
         view.step = Some(log.step());
         match paired {

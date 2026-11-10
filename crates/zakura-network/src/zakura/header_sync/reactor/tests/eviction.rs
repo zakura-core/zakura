@@ -65,12 +65,7 @@ impl EvictionFixture {
 
     /// Publish one request owned by `session_id` and let its deadline expire unanswered.
     fn time_out_one_request(&mut self, session_id: u64) {
-        seed_applying_request(
-            &mut self.reactor,
-            &self.snapshot,
-            self.peer.clone(),
-            session_id,
-        );
+        self.start_receiving(session_id);
         let deadline = Instant::now();
         self.reactor
             .state
@@ -181,6 +176,39 @@ fn unresponsive_header_peer_is_dropped_after_the_configured_strikes() {
         )),
         "the drop is reported as its own action: {actions:?}"
     );
+}
+
+/// A peer whose answer our own apply is still handling isn't charged when
+/// the request's deadline passes. It answered, and the apply may already
+/// have finished without the reactor having handled it yet.
+#[test]
+fn a_timeout_during_our_own_apply_charges_no_strike() {
+    let mut fixture = eviction_fixture(1, 7);
+    seed_applying_request(
+        &mut fixture.reactor,
+        &fixture.snapshot,
+        fixture.peer.clone(),
+        7,
+    );
+    let deadline = Instant::now();
+    fixture
+        .reactor
+        .state
+        .request_deadlines
+        .insert(fixture.peer.clone(), deadline);
+
+    fixture.reactor.retire_timed_out_requests(deadline);
+
+    assert!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&fixture.peer)
+            .is_none(),
+        "the timed-out request still retires"
+    );
+    assert_eq!(fixture.unproductive_requests(), Some(0));
+    assert!(fixture.is_admitted() && !fixture.cancel.is_cancelled());
 }
 
 #[test]
@@ -299,6 +327,217 @@ async fn strikes_expire_after_a_cooldown_away() {
         ),
     ));
     assert_eq!(fixture.unproductive_requests(), Some(0));
+}
+
+impl EvictionFixture {
+    /// Advertise a target from `session_id` and answer its locator read, so
+    /// the reactor sends that session a header request.
+    fn start_request(&mut self, session_id: u64) {
+        let anchor = self.snapshot.frontiers.finalized;
+        let target = block::Hash([0x52; 32]);
+        self.reactor.handle_status(
+            self.peer.clone(),
+            session_id,
+            Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                selected_tip_height: block::Height(100),
+                selected_tip_hash: target,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: u32::MAX,
+                max_subscriptions: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: 0,
+            },
+        );
+        for action in self.drain_actions() {
+            if let HeaderPortOperation::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+            } = action
+            {
+                self.reactor.handle_event(Event::HeaderLocatorReady {
+                    peer,
+                    session_id,
+                    target_tip_hash,
+                    scope,
+                    locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+                });
+            }
+        }
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(&self.peer)
+            .expect("the advertised target starts a request");
+        assert_eq!(active.owner.session_id(), session_id);
+        assert_eq!(active.phase, HeaderTargetPhase::Receiving);
+    }
+
+    /// Answer the request `start_request` sent `session_id` with one page of
+    /// one header that extends the anchor but doesn't reach the target.
+    fn answer_started_request(&mut self, session_id: u64) {
+        let anchor = self.snapshot.frontiers.finalized;
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(&self.peer)
+            .expect("the started request is active");
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = anchor.hash;
+        header.time += chrono::Duration::seconds(1);
+        let response = Headers {
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
+            common_ancestor_height: anchor.height,
+            common_ancestor_hash: anchor.hash,
+            reaches_initial_target: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header: Arc::new(header),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        };
+        self.reactor
+            .deliver_page(self.peer.clone(), session_id, response);
+    }
+
+    /// Replace the admitted session with `session_id`, and return its token.
+    fn replace_session(&mut self, session_id: u64) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        let (send, outbound) = framed_channel(8);
+        self._outbound = outbound;
+        self.reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_session_id(
+                self.peer.clone(),
+                session_id,
+                send,
+                cancel.clone(),
+            ),
+        ));
+        cancel
+    }
+}
+
+/// A replacement can't restart the clock on a request its peer never
+/// answered. The replacement's first request gets only the time that was
+/// left, so replacing the session one second before each timeout still gets
+/// charged.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_keeps_its_unanswered_requests_deadline() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    let started = Instant::now();
+    fixture.start_request(7);
+
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let replacement = fixture.replace_session(8);
+    fixture.start_request(8);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(started + timeout)),
+        "the replacement's first request keeps the unanswered deadline"
+    );
+
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(
+        replacement.is_cancelled(),
+        "the unanswered request is charged on its original schedule"
+    );
+}
+
+/// A second replacement before the first one gets a request keeps the
+/// carried time, so replacing twice per timeout doesn't reset it.
+#[tokio::test(start_paused = true)]
+async fn a_second_replacement_keeps_the_carried_time() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    let started = Instant::now();
+    fixture.start_request(7);
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let _first = fixture.replace_session(8);
+    let second = fixture.replace_session(9);
+
+    fixture.start_request(9);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(started + timeout))
+    );
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(second.is_cancelled());
+}
+
+/// The carried time counts from when the node sends the replacement's first
+/// request, so the node's own delay before sending isn't charged to the peer.
+#[tokio::test(start_paused = true)]
+async fn a_delayed_first_request_still_gets_the_carried_time() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    fixture.start_request(7);
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let replacement = fixture.replace_session(8);
+    // The node doesn't send the replacement a request until well after the
+    // replaced request's deadline.
+    time::advance(timeout).await;
+
+    let sent = Instant::now();
+    fixture.start_request(8);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(sent + std::time::Duration::from_secs(1)))
+    );
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(
+        !replacement.is_cancelled(),
+        "the peer isn't charged before it could answer"
+    );
+}
+
+/// The carried time binds only the replacement's first deadline. A staged
+/// page re-arms it in full, so a peer that answers pays nothing for the
+/// replacement.
+#[tokio::test(start_paused = true)]
+async fn an_answered_replacement_request_gets_a_full_timeout() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    fixture.start_request(7);
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let replacement = fixture.replace_session(8);
+    fixture.start_request(8);
+
+    let answered = Instant::now();
+    fixture.answer_started_request(8);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(answered + timeout)),
+        "the staged page re-arms a full timeout"
+    );
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(!replacement.is_cancelled());
+}
+
+/// A replacement that retires no unanswered request gives the replacement's
+/// first request a full timeout.
+#[tokio::test(start_paused = true)]
+async fn only_an_unanswered_request_carries_its_deadline() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let _replacement = fixture.replace_session(8);
+    let now = Instant::now();
+    fixture.start_request(8);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(now + timeout)),
+        "an idle session's replacement starts a fresh deadline"
+    );
 }
 
 #[test]
@@ -643,6 +882,81 @@ async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
             "{inbound} inbound, {outbound} outbound, {connections} connections"
         );
     }
+}
+
+/// Header serving and the lifecycle queue are sized for the header-sync peers
+/// the node can admit: the smaller of the peer limits and the admitted
+/// connections.
+#[test]
+fn serving_and_lifecycle_follow_the_admitted_header_peers() {
+    let cases = [
+        // (inbound, outbound, admitted connections, header peers)
+        (256, 256, 16, 16),
+        (256, 256, 200, 200),
+        (256, 256, 512, 512),
+        (6, 6, 92, 12),
+    ];
+    for (inbound, outbound, connections, peers) in cases {
+        let mut startup = startup(CancellationToken::new());
+        startup.config.peer_limits.max_inbound_peers = inbound;
+        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.max_connections = connections;
+        let (handle, _actions, _reactor) =
+            build_header_sync_reactor(startup).expect("the sizing fixture builds");
+        let case = format!("{inbound} inbound, {outbound} outbound, {connections} connections");
+        assert_eq!(
+            handle.serving.limits(),
+            v9::serving_limits(v9::SERVE_PEER_OUTPUT_BYTES, peers, None),
+            "{case}"
+        );
+        assert_eq!(
+            handle.lifecycle.capacity(),
+            super::super::events::LIFECYCLE_SLOTS_PER_PEER * peers,
+            "{case}"
+        );
+    }
+}
+
+/// The test node builder sizes header sync from its own connection limit, as
+/// the production handler does.
+#[tokio::test]
+async fn the_test_node_sizes_header_sync_from_its_connection_limit() {
+    use crate::zakura::{testkit::ZakuraTestNode, ZakuraLocalLimits};
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
+    limits.max_connections = 16;
+    let node = ZakuraTestNode::builder(86500)
+        .limits(limits)
+        .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
+        .header_sync_driver(
+            network,
+            anchor,
+            FullStateFrontiers {
+                finalized_height: anchor.0,
+                verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
+            },
+            Some(anchor),
+        )
+        .spawn()
+        .await
+        .expect("the test node starts");
+    let handle = node.header_sync().expect("the node runs header sync");
+    let config = ZakuraHeaderSyncConfig::default().for_node_connections(16);
+
+    assert_eq!(
+        handle.serving.limits(),
+        v9::serving_limits(
+            v9::SERVE_PEER_OUTPUT_BYTES,
+            16,
+            config.node_serve_output_bytes
+        )
+    );
+    assert_eq!(
+        handle.lifecycle.capacity(),
+        super::super::events::LIFECYCLE_SLOTS_PER_PEER * 16
+    );
 }
 
 /// Past the cap the cooldown that ends first is evicted, never the one just

@@ -27,6 +27,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -54,6 +55,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,

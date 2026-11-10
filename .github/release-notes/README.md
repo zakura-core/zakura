@@ -20,14 +20,20 @@ The notes always have these parts, in this order:
    HTML comments.
 8. A link to the section in `CHANGELOG.md` at the tag.
 
+The summary leaves out work that operators can't use yet, listed by
+[`config.toml`](config.toml): for now, the experimental Zakura P2P v2 stack,
+which is off by default on Mainnet. Those PRs still appear in the full
+changelog. When that work ships, delete its group from `config.toml`.
+
 The model only writes the text of 1, 3, 4, 5, and 6, as JSON checked against
 a schema. [`release_notes.py`](../scripts/release_notes.py) renders the rest
 and adds every PR link, so the layout cannot drift. It rejects a draft that
 cites a PR the section does not link, writes its own links, or skips the
-highlights, and asks the model once to fix it. Entries longer than the
-longest hand-written v1.8 ones, and any `Added`, `Security`, `Removed`, or
-`Deprecated` entry that the summary leaves out, also get that one retry; if
-they remain, the draft is kept and the run summary lists them for review.
+highlights, and asks the model once to fix it. Overlong entries, more than
+six highlights or four upgrade notes, entries about unreleased work, and any
+released `Added`, `Security`, `Removed`, or `Deprecated` entry that the
+summary leaves out also get that one retry; if they remain, the draft is kept
+and the run summary lists them for review.
 
 The support window is computed, not written by the model. The height is
 `zakurad`'s own end-of-support height: `ESTIMATED_RELEASE_HEIGHT` plus

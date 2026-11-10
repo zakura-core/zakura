@@ -16,9 +16,10 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -26,6 +27,7 @@ from typing import Callable
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PROMPT = REPOSITORY_ROOT / ".github" / "release-notes" / "prompt.md"
+CONFIG = REPOSITORY_ROOT / ".github" / "release-notes" / "config.toml"
 DEFAULT_REPOSITORY = "zakura-core/zakura"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
@@ -48,12 +50,13 @@ PLACEHOLDER_BODIES = frozenset({
 # can't afford to miss.
 COVERED_CATEGORIES = ("Added", "Security", "Removed", "Deprecated")
 
-# Character limits just above the longest entries of the hand-written v1.8
-# notes. A longer entry gets one retry to shorten it, then is kept with a
-# warning. The schema's `maxLength` values are only a backstop against runaway
-# output, since strict decoding may cut a string off at that length.
-LENGTH_LIMITS = {"headline": 150, "compatibility_note": 200, "title": 60,
-                 "detail": 400, "highlight": 400, "library_users": 500}
+# Size limits near the hand-written v1.8 notes, which hold a median highlight
+# of about 120 characters. Going over gets one retry to cut down, then is kept
+# with a warning. The schema's `maxLength` values are only a backstop against
+# runaway output, since strict decoding may cut a string off at that length.
+LENGTH_LIMITS = {"headline": 120, "compatibility_note": 160, "title": 50,
+                 "detail": 280, "highlight": 240, "library_users": 300}
+COUNT_LIMITS = {"before_you_upgrade": 4, "highlights": 6}
 
 RELEASE_TAG = re.compile(r"v(?P<version>(?P<core>[0-9]+\.[0-9]+\.[0-9]+)(?:-[0-9A-Za-z.-]+)?)")
 SECTION_HEADING = re.compile(
@@ -63,6 +66,7 @@ SECTION_HEADING = re.compile(
 LEVEL_TWO_HEADING = re.compile(r"^## ", re.MULTILINE)
 CATEGORY_HEADING = re.compile(r"^### (?P<name>.+?)[ \t]*$", re.MULTILINE)
 PR_REFERENCE = re.compile(r"(?<![\w&])#[0-9]+\b")
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*])")
 NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
                 6: "six", 7: "seven", 8: "eight", 9: "nine"}
 RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
@@ -85,6 +89,7 @@ class Release:
     body: str
     prs: frozenset[int]
     covered: dict[str, tuple[int, ...]]
+    unreleased: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
     @property
     def is_prerelease(self) -> bool:
@@ -92,8 +97,56 @@ class Release:
         return self.version != self.core_version
 
 
-def parse_release(tag: str, changelog: str, repository: str = DEFAULT_REPOSITORY) -> Release:
-    """Return the changelog section for `tag`, the PRs it links, and its must-cover PRs."""
+@dataclass(frozen=True)
+class Unreleased:
+    """A group of changelog work that operators can't use yet; see `config.toml`."""
+
+    name: str
+    patterns: tuple[re.Pattern, ...]
+
+    def matches(self, entry: str) -> bool:
+        """Whether the first sentence of a changelog entry is about this work."""
+        first = SENTENCE_END.split(" ".join(entry.split()), maxsplit=1)[0]
+        return any(pattern.search(first) for pattern in self.patterns)
+
+
+def load_unreleased(text: str) -> tuple[Unreleased, ...]:
+    """Parse the `[[unreleased]]` groups of `config.toml`."""
+    try:
+        groups = tomllib.loads(text).get("unreleased", [])
+        return tuple(
+            Unreleased(group["name"], tuple(re.compile(p, re.IGNORECASE) for p in group["patterns"]))
+            for group in groups
+        )
+    except (tomllib.TOMLDecodeError, re.error, KeyError, TypeError) as error:
+        raise NotesError(f"invalid {CONFIG.name}: {error}") from error
+
+
+def changelog_entries(body: str) -> list[tuple[str | None, str]]:
+    """Return each `- ` list entry of a section, with its continuation lines and category."""
+    entries: list[tuple[str | None, list[str]]] = []
+    category, current = None, None
+    for line in body.splitlines():
+        heading = CATEGORY_HEADING.fullmatch(line)
+        if heading:
+            category, current = heading["name"], None
+        elif line.startswith("- "):
+            current = [line[2:]]
+            entries.append((category, current))
+        elif line.startswith((" ", "\t")) and line.strip() and current is not None:
+            current.append(line.strip())
+        else:
+            current = None
+    return [(name, " ".join(lines)) for name, lines in entries]
+
+
+def parse_release(tag: str, changelog: str, repository: str = DEFAULT_REPOSITORY,
+                  unreleased: tuple[Unreleased, ...] = ()) -> Release:
+    """Return the changelog section for `tag`, the PRs it links, and its must-cover PRs.
+
+    PRs whose entries all belong to an `unreleased` group are reported per group
+    and never required.
+    """
     match = RELEASE_TAG.fullmatch(tag)
     if match is None:
         raise NotesError(f"{tag!r} is not a release tag such as v1.2.3 or v1.2.3-rc1")
@@ -107,17 +160,25 @@ def parse_release(tag: str, changelog: str, repository: str = DEFAULT_REPOSITORY
         raise NotesError(f"the {CHANGELOG} section for {version} is empty")
 
     link = re.compile(rf"\]\(https://github\.com/{re.escape(repository)}/pull/([0-9]+)\)")
-    categories = list(CATEGORY_HEADING.finditer(body))
-    covered = {}
-    for index, category in enumerate(categories):
-        if category["name"] in COVERED_CATEGORIES:
-            end = categories[index + 1].start() if index + 1 < len(categories) else len(body)
-            numbers = sorted({int(n) for n in link.findall(body, category.end(), end)})
-            covered[category["name"]] = tuple(numbers)
+    prs = frozenset(int(n) for n in link.findall(body))
+    released, grouped, covered = set(), {group.name: set() for group in unreleased}, {}
+    for category, entry in changelog_entries(body):
+        numbers = {int(n) for n in link.findall(entry)}
+        group = next((g for g in unreleased if g.matches(entry)), None)
+        if group is not None:
+            grouped[group.name] |= numbers
+            continue
+        released |= numbers
+        if category in COVERED_CATEGORIES:
+            covered.setdefault(category, set()).update(numbers)
+    # PRs outside list entries, such as a section's lead paragraph, are released work.
+    released |= prs - {n for numbers in grouped.values() for n in numbers}
     return Release(
         tag=tag, version=version, core_version=match["core"], date=heading["date"],
-        heading=heading["heading"], body=body,
-        prs=frozenset(int(n) for n in link.findall(body)), covered=covered,
+        heading=heading["heading"], body=body, prs=prs,
+        covered={name: tuple(sorted(numbers)) for name, numbers in covered.items()},
+        unreleased={name: tuple(sorted(numbers - released))
+                    for name, numbers in grouped.items() if numbers - released},
     )
 
 
@@ -394,8 +455,19 @@ def parse_summary(text: str, release: Release) -> tuple[Summary | None, list[str
     compatibility = checked_text(data["compatibility_note"], "compatibility_note",
                                  "compatibility_note", problems, required=False)
 
-    cited = {n for item in (*before, *highlights, *([library_users] if library_users else []))
-             for n in item.prs}
+    for name, items in (("before_you_upgrade", before), ("highlights", highlights)):
+        if len(items) > COUNT_LIMITS[name]:
+            warnings.append(f"{name} has {len(items)} items; keep the {COUNT_LIMITS[name]} "
+                            "that matter most")
+    labeled = [*((f"before_you_upgrade[{i}]", item) for i, item in enumerate(before)),
+               *((f"highlights[{i}]", item) for i, item in enumerate(highlights)),
+               *((("library_users", library_users),) if library_users else ())]
+    unreleased = {n for numbers in release.unreleased.values() for n in numbers}
+    warnings += [
+        f"{where} is only about unreleased work ({', '.join(str(n) for n in item.prs)}); leave it out"
+        for where, item in labeled if item.prs and set(item.prs) <= unreleased
+    ]
+    cited = {n for _, item in labeled for n in item.prs}
     warnings += [
         f"{category} entry {n} is not cited by any summary entry"
         for category, numbers in release.covered.items() for n in numbers if n not in cited
@@ -617,6 +689,8 @@ def request_message(release: Release) -> str:
     for category, numbers in release.covered.items():
         if numbers:
             lines.append(f"{category} entries to cover: " + ", ".join(str(n) for n in numbers))
+    for name, numbers in release.unreleased.items():
+        lines.append(f"PRs about {name}, to leave out: " + ", ".join(str(n) for n in numbers))
     lines += ["", f"{CHANGELOG} section:", "", "<changelog>", release.body, "</changelog>"]
     return "\n".join(lines)
 
@@ -693,7 +767,7 @@ def generate(args: argparse.Namespace) -> int:
     changelog = read(CHANGELOG)
     if changelog is None:
         raise NotesError(f"cannot read {CHANGELOG} at {args.ref or args.tag}")
-    release = parse_release(args.tag, changelog, args.repository)
+    release = parse_release(args.tag, changelog, args.repository, load_unreleased(CONFIG.read_text()))
     support = support_window(read, args.published_at)
     details = []
     if args.skeleton:

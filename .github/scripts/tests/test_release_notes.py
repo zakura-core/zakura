@@ -39,6 +39,11 @@ CHANGELOG = """# CHANGELOG
 
 - Added `network.example` ([#11](https://github.com/zakura-core/zakura/pull/11)).
 
+### Changed
+
+- Mining prefers the first verified block. Native P2P v2 still pulls blocks
+  ([#16](https://github.com/zakura-core/zakura/pull/16)).
+
 ### Removed
 
 - Removed the `old` subcommand
@@ -49,6 +54,8 @@ CHANGELOG = """# CHANGELOG
 ### Security
 
 - Bounded peer state ([#13](https://github.com/zakura-core/zakura/pull/13)).
+- A v2 node now bounds its handshake slots
+  ([#14](https://github.com/zakura-core/zakura/pull/14)).
 
 ## [1.2.0-rc1] - 2026-11-08
 
@@ -134,9 +141,13 @@ def summary_json(**overrides) -> str:
     return json.dumps(reply)
 
 
+GROUPS = release_notes.load_unreleased(release_notes.CONFIG.read_text())
+P2P_V2 = "the experimental Zakura P2P v2 stack"
+
+
 def release() -> release_notes.Release:
-    """Return the parsed 1.2.0 section."""
-    return release_notes.parse_release("v1.2.0", CHANGELOG)
+    """Return the parsed 1.2.0 section, classified with the real `config.toml`."""
+    return release_notes.parse_release("v1.2.0", CHANGELOG, unreleased=GROUPS)
 
 
 class ChangelogTests(unittest.TestCase):
@@ -146,9 +157,31 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual(parsed.heading, "[1.2.0] - 2026-11-10")
         self.assertTrue(parsed.body.startswith("### Added"))
         self.assertNotIn("Candidate fix", parsed.body)
-        self.assertEqual(parsed.prs, {11, 12, 13})
+        self.assertEqual(parsed.prs, {11, 12, 13, 14, 16})
         self.assertEqual(parsed.covered, {"Added": (11,), "Removed": (12,), "Security": (13,)})
+        self.assertEqual(parsed.unreleased, {P2P_V2: (14,)})
         self.assertFalse(parsed.is_prerelease)
+
+    def test_unreleased_groups_match_first_sentences_only(self):
+        link = "([#{0}](https://github.com/zakura-core/zakura/pull/{0}))."
+        section = "\n".join([
+            "## [1.3.0] - 2026-12-01", "", "### Fixed", "",
+            "- A v2 node counts each /64 as one host " + link.format(1),
+            "- Header sync no longer stalls " + link.format(2),
+            "- Mining prefers the first verified block. Native P2P v2 still pulls blocks " + link.format(3),
+            "- Updated Common to v2.2.0, so builds use `-C target-cpu=native` " + link.format(4),
+            "- Blocks download at once instead of after the syncer's discovery round " + link.format(5),
+            "- Fixed native discovery authoring an older record " + link.format(6),
+            "- Bounded legacy TCP ingress " + link.format(7),
+            "- Native P2P bounds its frames " + link.format(7),
+        ])
+        parsed = release_notes.parse_release("v1.3.0", section, unreleased=GROUPS)
+        self.assertEqual(parsed.unreleased, {P2P_V2: (1, 2, 6)})
+
+    def test_invalid_unreleased_config_is_an_error(self):
+        for config in ("[[unreleased]]\nname = 'x'\npatterns = ['(']", "[[unreleased]]\npatterns = []"):
+            with self.subTest(config), self.assertRaises(NotesError):
+                release_notes.load_unreleased(config)
 
     def test_release_candidates_use_their_own_section(self):
         parsed = release_notes.parse_release("v1.2.0-rc1", CHANGELOG)
@@ -250,6 +283,11 @@ Supported on Mainnet until block 3,643,309, around December 5, 2026. Upgrade war
 
 - Added `network.example` ([#11]({pr}11)).
 
+### Changed
+
+- Mining prefers the first verified block. Native P2P v2 still pulls blocks
+  ([#16]({pr}16)).
+
 ### Removed
 
 - Removed the `old` subcommand
@@ -258,6 +296,8 @@ Supported on Mainnet until block 3,643,309, around December 5, 2026. Upgrade war
 ### Security
 
 - Bounded peer state ([#13]({pr}13)).
+- A v2 node now bounds its handshake slots
+  ([#14]({pr}14)).
 
 </details>
 
@@ -320,7 +360,27 @@ Also in [CHANGELOG.md](https://github.com/zakura-core/zakura/blob/v1.2.0/CHANGEL
         self.assertEqual(errors, [])
         self.assertIsNotNone(summary)
         self.assertEqual(warnings, [f"highlights[0].text has {len(long_text.strip())} characters; "
-                                    "shorten it to at most 400"])
+                                    "shorten it to at most 240"])
+
+    def test_more_items_than_the_caps_are_warnings(self):
+        many = [{"text": f"Change {n}.", "prs": [11]} for n in range(6)]
+        summary, errors, warnings = self.parse(summary_json(
+            highlights=[{"text": "**Security:** bounded.", "prs": [13]}, *many],
+        ))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(summary.highlights), 7)
+        self.assertEqual(warnings, ["highlights has 7 items; keep the 6 that matter most"])
+
+    def test_flags_entries_only_about_unreleased_work(self):
+        summary, errors, warnings = self.parse(summary_json(highlights=[
+            {"text": "**Security:** bounded.", "prs": [13]},
+            {"text": "New setting.", "prs": [11]},
+            {"text": "v2 nodes bound their handshake slots.", "prs": [14]},
+            {"text": "Peer state and handshake slots are bounded.", "prs": [13, 14]},
+        ]))
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(summary)
+        self.assertEqual(warnings, ["highlights[2] is only about unreleased work (14); leave it out"])
 
     def test_reports_uncovered_added_security_and_removed_entries(self):
         summary, errors, gaps = self.parse(summary_json(
@@ -366,6 +426,7 @@ class DraftTests(unittest.TestCase):
         self.assertIn("PR numbers you may cite: 11, 12, 13", message)
         self.assertIn("Added entries to cover: 11", message)
         self.assertIn("Security entries to cover: 13", message)
+        self.assertIn(f"PRs about {P2P_V2}, to leave out: 14", message)
         self.assertIn("<changelog>\n### Added", message)
 
     def test_retries_once_with_the_problems(self):
@@ -389,7 +450,7 @@ class DraftTests(unittest.TestCase):
         overlong = summary_json(library_users={"text": "Changed. " * 60, "prs": [12]})
         (summary, warnings), calls = self.draft([overlong, overlong])
         self.assertEqual(len(calls), 2)
-        self.assertIn("library_users.text has 539 characters; shorten it to at most 500",
+        self.assertIn("library_users.text has 539 characters; shorten it to at most 300",
                       calls[1][3]["content"])
         self.assertEqual(len(warnings), 1)
         self.assertTrue(summary.library_users.text.startswith("Changed."))

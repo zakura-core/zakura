@@ -11,12 +11,12 @@ window, the full changelog, and every PR link.
 
 The full changelog appears right below your summary, so summarize instead of
 restating it. Keep only what a reader needs to decide whether and how to
-upgrade, and leave the details to the changelog. Short entries are the norm:
-the examples below show the expected length.
+upgrade, and leave the details to the changelog. Fewer, shorter entries are
+better: the examples below show the expected length.
 
 ## Fields
 
-- `headline`: one sentence of about 15 words, under 150 characters, that
+- `headline`: one sentence of about 12 words, under 120 characters, that
   names the two or three changes that matter most to operators. Don't start
   with "This release", and don't say that it is a release candidate. End with
   at most one of these sentences: "We recommend upgrading." when the release
@@ -27,32 +27,40 @@ the examples below show the expected length.
   empty string. Say "No config changes are needed." and, when the changelog
   supports it, what else stays the same, for example "JSON-RPC methods and
   stored data formats are unchanged."
-- `before_you_upgrade`: what an operator must act on, or will notice right
-  after upgrading: renamed, removed, or newly validated config fields;
-  changed defaults that change behavior; changed RPC results, errors, or
-  limits; removed commands, binaries, or features; new files, directories,
-  system requirements, or dependencies; changed logs or metric names; data
-  migrations. Leave out changes that need no action and change nothing
-  visible for a node that runs the release binaries with its existing
-  config. `title` is a short label, under 60 characters, without a final
-  period. `detail` says what changed and what to do about it in two or three
-  short sentences, under 400 characters. Use an empty list when nothing
-  qualifies.
+- `before_you_upgrade`: at most four things an operator must act on before
+  or right after upgrading: renamed, removed, or newly validated config
+  fields; changed defaults that change behavior; changed RPC results, errors,
+  or limits; removed commands, binaries, or features; new files, system
+  requirements, or dependencies; renamed metrics; data migrations. Leave out
+  anything that needs no action for a node that runs the release binaries
+  with its existing config. `title` is a short label, under 50 characters,
+  without a final period. `detail` says what changed and what to do about it
+  in one or two short sentences, under 280 characters. Use an empty list when
+  nothing qualifies.
 - `highlights`: the most significant operator-visible improvements, most
-  important first. Three to eight items for a normal release, fewer for a
-  small one. Each `text` is one or two short sentences, usually under 200
-  characters and never over 400: the effect, with its key number if the
-  changelog gives one. Combine closely related changes into one item rather
-  than listing each.
-- `library_users`: two or three sentences, under 500 characters, for crate
-  consumers: which crates changed in breaking ways, and the most important
-  changed public types, variants, or functions. Don't list every changed
-  item. Use an empty `text` and `prs` when the section has no Rust interface
-  changes.
+  important first. Three to six items, fewer for a small release. Each
+  `text` is one sentence when possible and two at most, under 240
+  characters: the effect, with its key number if the changelog gives one.
+  Combine closely related changes into one item, and drop minor ones.
+- `library_users`: one or two sentences, under 300 characters, for crate
+  consumers: which crates changed in breaking ways, and the one or two most
+  important changes. Don't list every changed item. Use an empty `text` and
+  `prs` when the section has no Rust interface changes.
 
 Every entry lists the PR numbers it is based on in `prs`, using only PRs that
 the section links. Never write PR numbers, links, or URLs in the text, since
 the renderer adds the links.
+
+## Unreleased work
+
+The user message lists the PRs about work that operators can't use yet, such
+as the experimental Zakura P2P v2 stack, which is off by default on Mainnet:
+native connections, header sync, block sync, discovery, the QUIC transport,
+`[network.zakura]` settings, and trace tooling. Leave that work out
+completely, including from the headline, and don't count its fixes toward
+"We recommend upgrading." Treat other entries that only affect that stack
+the same way. This takes precedence over the coverage rules below; the full
+changelog still lists it.
 
 ## What to cover
 
@@ -63,10 +71,10 @@ the renderer adds the links.
 - Cover every `Removed` and `Deprecated` entry: in `before_you_upgrade` when
   operators notice it, or in `library_users` when it only affects crate APIs.
 - Mention every `Added` entry, since operators can only use features they
-  know about. Put new settings, RPC methods, commands, and metrics in
-  `highlights`, or in `before_you_upgrade` when operators must act on them,
-  and crate API additions in `library_users`. Group related additions into
-  one item.
+  know about. Put new settings, RPC methods, and commands in `highlights`,
+  or in `before_you_upgrade` when operators must act on them, and crate API
+  additions in `library_users`. Group related or minor additions into one
+  item.
 - Leave out changes with no operator-visible effect, such as tests, CI,
   internal refactors, and remarks about version numbering.
 - Keep Rust API details out of `highlights`; they belong in `library_users`.
@@ -91,7 +99,7 @@ the renderer adds the links.
 
 The summaries of two earlier releases.
 
-v1.8.4, which needed upgrade notes:
+v1.8.4, which needed an upgrade note:
 
 ```json
 {
@@ -102,16 +110,11 @@ v1.8.4, which needed upgrade notes:
       "title": "`getstandardfee` recommends higher fees",
       "detail": "It now recommends at least 1,000 zatoshis per logical action, so wallets that use it will pay more. The mempool's acceptance fee and the RPC's result shape are unchanged.",
       "prs": [2060]
-    },
-    {
-      "title": "New file next to the identity key",
-      "detail": "Native discovery now stores its last record sequence in `<identity_dir>/<network>.<node_id>.zakura-discovery-sequence`. Keep it with the identity key if you back up or move that directory.",
-      "prs": [2013]
     }
   ],
   "highlights": [
     {
-      "text": "Relayed blocks used to reach the last peers 9 to 12 seconds late, in 3 second waves. The default `advert_window_min` and `advert_window_max` are now 1000, so every peer gets the advert at once. Configs that still hold the old 32/64 defaults, such as generated ones, load as the new defaults.",
+      "text": "Relayed blocks used to reach the last peers 9 to 12 seconds late. `advert_window_min` and `advert_window_max` now default to 1000, so every peer gets the advert at once.",
       "prs": [2078]
     },
     {
@@ -121,13 +124,12 @@ v1.8.4, which needed upgrade notes:
     {
       "text": "Less verification and mempool work: v5/v6 transaction digests are computed once per block, mempool cleanup no longer rescans the pool, and `getblocktemplate` selection is cheaper on large mempools.",
       "prs": [2022, 2048, 2054]
-    },
-    {
-      "text": "An optional loopback-only `GET /traces` endpoint streams the JSONL trace tables, so collectors can follow them over HTTP. It is disabled by default and requires `trace_dir`.",
-      "prs": [2072]
     }
   ],
-  "library_users": {"text": "", "prs": []}
+  "library_users": {
+    "text": "",
+    "prs": []
+  }
 }
 ```
 
@@ -144,11 +146,11 @@ v1.8.5, which needed no operator action but changed crate APIs:
       "prs": [2087]
     },
     {
-      "text": "Locally submitted blocks, including side-chain blocks, are announced straight from committed state. A peer's committed copy of a block that is still being verified locally is relayed promptly too.",
+      "text": "Locally submitted blocks, including side-chain blocks, are announced straight from committed state, and a peer's committed copy of a block still being verified locally is relayed promptly.",
       "prs": [2090, 2093]
     },
     {
-      "text": "Block adverts now use one size-dependent delay instead of rolling windows, and peers no longer wait on other peers' uploads. New `advert_delay_min` and `advert_delay_max` settings default to zero, so every peer gets announcements immediately. Explicitly configured values are kept.",
+      "text": "Block adverts use one size-dependent delay instead of rolling windows, and peers no longer wait on other peers' uploads. New `advert_delay_min` and `advert_delay_max` settings default to zero.",
       "prs": [2082]
     },
     {

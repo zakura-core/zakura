@@ -55,3 +55,14 @@ pub const FAULT_CAUSES: &[&str] = &[
 pub fn is_fault_cause(cause: &str) -> bool {
     FAULT_CAUSES.contains(&cause)
 }
+
+/// The close causes of a rate limit: the reader closed the connection
+/// because a frame found its bucket empty. They're neutral, so they assign
+/// no fault. A cadence row records exhaustion without rejecting the frame,
+/// so `cadence-never-closes` counts them as a punishment.
+pub const RATE_LIMIT_CAUSES: &[&str] = &["ordered_rate_limited"];
+
+/// True if a close with first recorded cause `cause` is a rate limit.
+pub fn is_rate_limit_cause(cause: &str) -> bool {
+    RATE_LIMIT_CAUSES.contains(&cause)
+}

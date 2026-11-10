@@ -28,7 +28,7 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
-    model::{consequence, is_fault_cause, Consequence, Label},
+    model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
@@ -732,7 +732,8 @@ fn check_closes<S: HasView>(
 /// `conformant-never-closes` and `cadence-never-closes`. The property
 /// applies at each step where the node judges a frame on the ID's stream
 /// for which `applies` holds. At each fault close or `Misbehavior` on a
-/// connection with such a frame, if every frame the node judged on that
+/// connection with such a frame, and for `cadence-never-closes` at each
+/// rate-limit close too, if every frame the node judged on that
 /// connection before the punishment, on any stream, is `Conformant`, the
 /// punishment is a violation. A fault on a sibling stream justifies it, but
 /// only one judged before it. For `conformant-never-closes`, a punishment
@@ -768,7 +769,11 @@ fn check_never_closes<S: HasView>(
                 }
                 continue;
             }
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause }
+                if is_fault_cause(cause)
+                    || (id.template == Template::CadenceNeverCloses
+                        && is_rate_limit_cause(cause)) =>
+            {
                 (*connection, format!("a close with cause {cause}"))
             }
             Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),

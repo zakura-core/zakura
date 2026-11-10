@@ -41,8 +41,9 @@ use super::{
     },
     header_sync::Dialer,
     sync::{
-        spawn_actors, sync_config, sync_properties, Control, QuicLinks, SyncAction, SyncMirror,
-        SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView, Transport,
+        spawn_actors, sync_config, sync_properties, Control, QuicLinks, SavedSync, SyncAction,
+        SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView,
+        Transport,
     },
     wire_node::{Bound, TransportTap, WireEndpoint},
     NetScenario, Subsystem,
@@ -221,7 +222,7 @@ fn redial(
 
 impl Subsystem for SyncWire {
     const NAME: &'static str = "sync/wire";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncWireScenario;
     type Prepared = SyncPorts;
@@ -369,9 +370,9 @@ impl Subsystem for SyncWire {
     }
 
     /// The saved scenario `prefix` tags ([`SavedWire::from_tag`]), or the
-    /// default one.
+    /// combination of actions an untagged prefix picks ([`combined`]).
     fn draw(prefix: &[u8]) -> SyncWireScenario {
-        SavedWire::from_tag(prefix).map_or_else(SavedWire::default_scenario, SavedWire::scenario)
+        SavedWire::from_tag(prefix).map_or_else(|| combined(prefix), SavedWire::scenario)
     }
 }
 
@@ -454,7 +455,8 @@ impl SavedWire {
         }
     }
 
-    /// The scenario of an untagged input: [`SavedWire::Honest`]'s.
+    /// The scenario of an empty input: [`SavedWire::Honest`]'s, which
+    /// [`combined`] picks with no action.
     pub fn default_scenario() -> SyncWireScenario {
         SavedWire::Honest.scenario()
     }
@@ -509,5 +511,77 @@ impl SavedWire {
             net: NetScenario::default(),
             sync,
         }
+    }
+}
+
+/// Curated untagged prefixes for the `sync_wire` fuzz target's seeds, each
+/// a combination of [`combined`]'s actions, by name. Each has a committed
+/// input under `tests/fixtures/sync-wire-<name>.bin`.
+pub const CURATED: [(&str, [u8; 2]); 3] = [
+    // The fork while storage holds a submission, and the node's
+    // connection to mirror-1 replaced once storage admits two bodies.
+    ("combined-reorg-submit-replace", [0b0_1100, 0b011]),
+    // The fork while storage holds a needed-block query, with mirror-0's
+    // connection replaced once storage admits one body.
+    ("combined-reorg-query-replace", [0b0_1010, 0]),
+    // Mirror-0's connection replaced once storage admits one body, with
+    // every read stalled.
+    ("combined-replace-stall", [0b1_1000, 0]),
+];
+
+/// The scenario an untagged two-byte prefix picks: fuzz-13's combined
+/// actions on [`SavedWire::Honest`]'s mirrors. The first byte's bits pick
+/// the actions, and the second byte their parameters.
+///
+/// - The low three bits pick a chain change: none, the mirrors' fork once
+///   storage admits four bodies, or the fork while storage holds the node's
+///   work at one stage of the block pipeline, as `sync/storage`'s saved
+///   reorg scenarios hold it ([`SavedSync`]): a needed-block query, a
+///   mirror's range read, a submission, or a verdict. Values past those
+///   pick none.
+/// - Bit 3 replaces a connection: it closes the node's connection to the
+///   mirror the second byte's low bit names once storage admits one to
+///   four bodies, as its next two bits say. The dialer redials it.
+/// - Bit 4 stalls every mirror's range reads for [`STALL_MS`].
+///
+/// A service stream can't be replaced on its own connection: no `Control`
+/// action reaches a single stream on QUIC, so connection replacement stands
+/// in for it.
+pub fn combined(prefix: &[u8]) -> SyncWireScenario {
+    let actions = prefix.first().copied().unwrap_or(0);
+    let parameters = prefix.get(1).copied().unwrap_or(0);
+    let mut sync = match actions & 0b111 {
+        1 => SavedSync::Reorg,
+        2 => SavedSync::ReorgQuery,
+        3 => SavedSync::ReorgRequest,
+        4 => SavedSync::ReorgSubmit,
+        5 => SavedSync::ReorgVerdict,
+        _ => SavedSync::Honest,
+    }
+    .scenario();
+    if actions & 0b1000 != 0 {
+        let mirror = parameters & 1;
+        let admitted = 1 + u32::from((parameters >> 1) & 0b11);
+        sync.control.push(SyncStep {
+            action: SyncAction::Close {
+                peer: format!("mirror-{mirror}"),
+            },
+            when: Some(super::sync::admitted(admitted)),
+        });
+    }
+    if actions & 0b1_0000 != 0 {
+        sync.block_policy.holds.push(block_policy::Hold {
+            select: block_policy::Select {
+                kind: Some(block_policy::BlockKind::MirrorRead),
+                ..block_policy::Select::default()
+            },
+            until: Trigger::VirtualTime(STALL_MS),
+            then: vec![block_policy::BlockAllow::Serve],
+            deadline_ms: None,
+        });
+    }
+    SyncWireScenario {
+        net: NetScenario::default(),
+        sync,
     }
 }

@@ -1,0 +1,9 @@
+# The committed fuzz input `sync-wire-combined-reorg-submit-replace.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# two bytes pick a combination of fuzz-13's actions, a seed of the
+# `sync_wire` fuzz target.
+harness = "sync/wire"
+generator = 2
+sha256 = "3ff9292ba5f21031dff50cc27295e71f7a647fe704b2f8afe678b77174b85e47"
+scenario_sha256 = "1d1ff8143ddc61f1026c286017e710673da87a3baf222f4618f1fccb8f7e4708"
+source = "crates/zakura-sim/tests/sync_wire.rs"

@@ -867,7 +867,7 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
              block_decoded_retention, block_reactor_policy, block_work_funding, \
              block_work_ownership, discovery_record_book, discovery_session_installation, \
              discovery_verification_capacity, discovery_wait_complete, header_publisher_policy, \
-             header_reactor_policy, header_sync_storage, race_fixtures, sync_storage",
+             header_reactor_policy, header_sync_storage, race_fixtures, sync_storage, sync_wire",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (

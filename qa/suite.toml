@@ -263,6 +263,15 @@ name = "sync_storage"
 smoke-secs = 60
 timeout-secs = 1800
 
+# `sync/wire`'s two-byte prefix picks a saved scenario, or fuzz-13's
+# combined actions: a chain change at a pipeline stage, a connection
+# replacement and a read stall. The target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "sync_wire"
+smoke-secs = 60
+timeout-secs = 1800
+
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
 # cover each fixture's own harness and the fixed variants. Its report must
 # account for each fixture and variant.
@@ -383,11 +392,6 @@ reason = "no target: the harness has two fixed scenarios, the wake fixtures, and
 harness = "header-sync/repair"
 owner = "E5a"
 reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
-
-[[missing-target]]
-harness = "sync/wire"
-owner = "P8c"
-reason = "no target: fuzz-13 maps the combined wire actions to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"

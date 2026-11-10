@@ -46,6 +46,12 @@ whose target has no harness or no campaign.
   node over one engine. Its two-byte prefix picks a saved scenario, or the
   default one, so the target fuzzes each scenario's schedule. Its committed
   seeds are `crates/zakura-sim/tests/fixtures/sync-storage-*.bin`.
+- `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
+  simulated QUIC behind real handlers, so header sync, block sync and
+  discovery share each connection. Its two-byte prefix picks a saved
+  scenario, or fuzz-13's combined actions: the mirrors' fork at one stage
+  of the block pipeline, a connection replacement, and a read stall. Its
+  committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only

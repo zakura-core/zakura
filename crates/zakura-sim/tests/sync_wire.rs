@@ -27,7 +27,7 @@ use zakura_sim::{
     harness::{
         run_prepared,
         sync::SyncPorts,
-        sync_wire::{SavedWire, SyncWire, STALL_GROWTH, STALL_MS},
+        sync_wire::{SavedWire, SyncWire, CURATED, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
@@ -284,6 +284,19 @@ fn stalls(log: &ObservationLog) -> Vec<std::ops::Range<u64>> {
     stalls
 }
 
+/// fuzz-13's combined actions: each curated combination of a chain change
+/// at a pipeline stage, a connection replacement and a read stall runs its
+/// committed Plan with no active property violated, and both of the node's
+/// tips reach the mirrors' tip.
+#[test]
+fn curated_combined_actions_sync_both_tips() {
+    for (name, prefix) in CURATED {
+        let (report, _, ports) = run_scenario(&SyncWire::draw(&prefix), Plan::from_fuzz(&[]));
+        let tip = ports.mirror_tip();
+        assert_eq!(ports.tips(), (tip, tip), "{name}: {:?}", report.end);
+    }
+}
+
 /// The committed fixture directory.
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -393,8 +406,9 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
     }
 }
 
-/// Rewrites every saved scenario's input, sidecar and end record. Each
-/// input is its tag and the default Plan. Run it with `RUSTFLAGS="--cfg
+/// Rewrites every saved scenario's input, sidecar and end record, and each
+/// curated combination's input and sidecar. Each input is its prefix and
+/// the default Plan. Run it with `RUSTFLAGS="--cfg
 /// zakura_sim" cargo test --manifest-path crates/zakura-sim/Cargo.toml
 /// --test sync_wire -- --ignored regenerate_saved_scenarios`.
 #[test]
@@ -433,5 +447,26 @@ fn regenerate_saved_scenarios() {
             format!("{}\n", end(&lines)),
         )
         .expect("the fixture directory exists");
+    }
+    for (name, prefix) in CURATED {
+        let base = fixtures().join(format!("sync-wire-{name}"));
+        fs::write(base.with_extension("bin"), prefix).expect("the fixture directory exists");
+        let scenario = serde_json::to_value(SyncWire::draw(&prefix)).expect("scenarios serialize");
+        let sidecar = format!(
+            "# The committed fuzz input `sync-wire-{name}.bin`: the harness that\n\
+             # runs it, the generator version it was built for, and its SHA-256. Its\n\
+             # two bytes pick a combination of fuzz-13's actions, a seed of the\n\
+             # `sync_wire` fuzz target.\n\
+             harness = \"{harness}\"\n\
+             generator = {generator}\n\
+             sha256 = \"{digest}\"\n\
+             scenario_sha256 = \"{scenario}\"\n\
+             source = \"crates/zakura-sim/tests/sync_wire.rs\"\n",
+            harness = SyncWire::NAME,
+            generator = SyncWire::GENERATOR,
+            digest = seed::sha256(&prefix),
+            scenario = seed::scenario_sha256(&scenario),
+        );
+        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

@@ -1037,10 +1037,14 @@ where
         }
     }
     // A departure the slot rule hasn't judged at a unit boundary yet
-    // leaves the run inconclusive if it ends here (Rule 2), and a fixture
-    // the check couldn't read leaves it so wherever it ends (Rule 3).
-    if view.retirement().unjudged() || view.retirement().unread() {
+    // leaves the run inconclusive if it ends here (Rule 2), and a trigger
+    // the check couldn't read the fixture for leaves it so wherever it
+    // ends (Rule 3).
+    if view.retirement().unjudged() {
         cx.unsettled(Inconclusive::UnreadBoundary);
+    }
+    if view.retirement().unread() {
+        cx.unsettled(Inconclusive::UnreadTrigger);
     }
     let expected = "no work outlives its departed session";
     let mut breaks = view

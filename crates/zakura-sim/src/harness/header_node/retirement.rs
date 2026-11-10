@@ -60,8 +60,8 @@
 //!   until the fixture is ready, so every arm comes after readiness.
 //!
 //! A probe read the fixture needed but the run never made leaves the check
-//! unread ([`RetirementEvidence::unread`]), so the run can't pass without
-//! it. Once the harness began stopping the node, nothing opens and no
+//! unread ([`RetirementEvidence::unread`]), so the run ends
+//! `unread-trigger` and can't pass without it. Once the harness began stopping the node, nothing opens and no
 //! departure makes the check applicable.
 //!
 //! The check applies once a session departs with a slot, as the slots stood

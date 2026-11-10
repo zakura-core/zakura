@@ -277,7 +277,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/header_sync.rs",
         function: "check_peer_retirement",
-        fingerprint: "df5e72f7d28f42c2",
+        fingerprint: "50c476d2ab2cdeec",
         constructions: &[step(
             "no drain has judged a departed session's work by this step, and no hand-off or obliging deadline arm opened before the harness's shutdown",
             TAIL,

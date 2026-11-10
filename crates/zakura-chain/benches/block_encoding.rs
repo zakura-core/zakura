@@ -17,8 +17,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use zakura_chain::{
     block::{merkle, Block},
+    parameters::NetworkUpgrade,
     serialization::{sha256d, ZcashDeserialize, ZcashSerialize},
     transaction::{Transaction, UnminedTx},
+    transparent,
 };
 
 /// Non-coinbase Sapling-era and NU5 mainnet transactions, in vector order.
@@ -178,6 +180,35 @@ fn block_encoding(c: &mut Criterion) {
                             .map(|tx| tx.zcash_serialize_to_vec().expect("vec writes succeed"))
                             .collect::<Vec<_>>(),
                     )
+                })
+            },
+        );
+        let spent_outputs: Vec<_> = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|tx| {
+                let nu = tx.network_upgrade().unwrap_or(NetworkUpgrade::Canopy);
+                let outputs = Arc::new(vec![
+                    transparent::Output {
+                        value: 0.try_into().expect("zero is a valid amount"),
+                        lock_script: transparent::Script::new(&[]),
+                    };
+                    tx.inputs().len()
+                ]);
+                tx.sighasher(nu, outputs.clone())
+                    .expect("vector transactions convert to librustzcash");
+                (tx.clone(), nu, outputs)
+            })
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("sighasher_each", &label),
+            &spent_outputs,
+            |b, spent_outputs| {
+                b.iter(|| {
+                    for (tx, nu, outputs) in spent_outputs {
+                        black_box(tx.sighasher(*nu, outputs.clone()).expect("converts"));
+                    }
                 })
             },
         );

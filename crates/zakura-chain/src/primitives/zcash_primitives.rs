@@ -1,7 +1,10 @@
 //! Contains code that interfaces with the zcash_primitives crate from
 //! librustzcash.
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, OnceLock},
+};
 
 use zcash_primitives::transaction::{self as zp_tx, TxDigests};
 use zcash_protocol::value::{BalanceError, ZatBalance, Zatoshis};
@@ -211,9 +214,13 @@ impl From<Script> for zcash_transparent::address::Script {
 #[derive(Debug)]
 pub(crate) struct PrecomputedTxData {
     tx_data: zp_tx::TransactionData<PrecomputedAuth>,
-    /// The ZIP-244 digests that v5 and later signature hashes commit to. Earlier versions use
-    /// the ZIP-243 signature hash, which does not read them, so they are not computed.
-    txid_parts: Option<TxDigests<blake2b_simd::Hash>>,
+    /// The ZIP-244 digests that v5 and later signature hashes commit to, computed on first use.
+    ///
+    /// `SigHasher` answers v5 and later signature hashes from its native ZIP-244 cache, so
+    /// it never reads these. Computing them eagerly hashed every transaction's effecting
+    /// data once more for nothing. Earlier versions use the ZIP-243 signature hash, which
+    /// does not read them either.
+    txid_parts: OnceLock<TxDigests<blake2b_simd::Hash>>,
     all_previous_outputs: Arc<Vec<transparent::Output>>,
 }
 
@@ -258,13 +265,6 @@ impl PrecomputedTxData {
     ) -> Result<PrecomputedTxData, Error> {
         let tx = tx.to_librustzcash_data(nu)?;
 
-        let txid_parts = match tx.version() {
-            zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => None,
-            zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
-                Some(tx.digest(zp_tx::txid::TxIdDigester))
-            }
-        };
-
         let f_transparent = MapTransparent {
             auth: TransparentAuth {
                 all_prev_outputs: all_previous_outputs.clone(),
@@ -281,7 +281,7 @@ impl PrecomputedTxData {
 
         Ok(PrecomputedTxData {
             tx_data,
-            txid_parts,
+            txid_parts: OnceLock::new(),
             all_previous_outputs,
         })
     }
@@ -509,15 +509,18 @@ fn sighash_inner(
         None => zp_tx::sighash::SignableInput::Shielded,
     };
 
-    let sighash: [u8; 32] = match &precomputed_tx_data.txid_parts {
-        Some(txid_parts) => *zp_tx::sighash::signature_hash(
-            &precomputed_tx_data.tx_data,
-            &signable_input,
-            txid_parts,
-        )
-        .as_ref(),
+    let tx_data = &precomputed_tx_data.tx_data;
+    let sighash: [u8; 32] = match tx_data.version() {
+        zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
+            let txid_parts = precomputed_tx_data
+                .txid_parts
+                .get_or_init(|| tx_data.digest(zp_tx::txid::TxIdDigester));
+            *zp_tx::sighash::signature_hash(tx_data, &signable_input, txid_parts).as_ref()
+        }
         // `signature_hash` sends these versions to the same function, without the digests.
-        None => v4_signature_hash(&precomputed_tx_data.tx_data, &signable_input),
+        zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => {
+            v4_signature_hash(tx_data, &signable_input)
+        }
     };
     Ok(SigHash(sighash))
 }

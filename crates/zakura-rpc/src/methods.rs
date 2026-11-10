@@ -3888,6 +3888,7 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
+                        wait_reason = WaitReason::Tip;
                         // The next pass of the loop sees that this request's long poll ID names
                         // an older tip and answers it there, with this coinbase if it fits.
                         tip_wake_coinbase = precomputed_coinbase?

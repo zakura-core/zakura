@@ -46,6 +46,7 @@ use zakura_chain::{
     transaction::UnminedTxId,
 };
 use zakura_consensus::{error::TransactionError, transaction};
+use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
@@ -56,6 +57,7 @@ use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
 
 use crate::components::sync::SyncStatus;
+use trace::{MempoolTrace, TipProcessing};
 
 pub mod config;
 mod crawler;
@@ -66,6 +68,7 @@ mod peer_cooldown;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
+mod trace;
 
 /// Supplies named, timed storage operations to a benchmark harness.
 #[cfg(feature = "mempool-bench")]
@@ -636,6 +639,9 @@ pub struct Mempool {
     /// Signalled after each transaction download and verify task finishes.
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
+
+    /// Records how the mempool applies each best tip change.
+    trace: MempoolTrace,
 }
 
 impl Mempool {
@@ -679,6 +685,7 @@ impl Mempool {
                 .map(|ip| ip.to_canonical())
                 .collect(),
             verification_finished: Arc::new(Notify::new()),
+            trace: MempoolTrace::default(),
         };
 
         // Make sure `is_enabled` is accurate.
@@ -686,6 +693,12 @@ impl Mempool {
         service.update_state(None, service.is_caught_up_to_start());
 
         (service, transaction_subscriber)
+    }
+
+    /// Writes a `mempool.jsonl` row to `trace` each time the mempool applies a best tip change.
+    pub(crate) fn with_trace(mut self, trace: JsonlEventEmitter) -> Self {
+        self.trace = MempoolTrace(trace);
+        self
     }
 
     /// Returns the signal that fires after each transaction verification finishes.
@@ -883,6 +896,7 @@ impl Service<Request> for Mempool {
                 tip_height = ?tip_action.as_ref().unwrap().best_tip_height(),
                 "resetting mempool: switched best chain, skipped blocks, or activated network upgrade"
             );
+            let reset_started = Instant::now();
 
             let previous_state = self.active_state.take();
             let tx_retries = previous_state.transaction_retry_requests();
@@ -898,18 +912,22 @@ impl Service<Request> for Mempool {
             // Re-initialise an empty state. `update_state()` has already applied
             // the distance-based disable gate, so an active mempool can safely
             // reset at the current tip.
-            self.enable_at_tip(
-                tip_action
-                    .as_ref()
-                    .expect("this branch only matches when tip_action is a Reset"),
-                "chain tip reset",
-            );
+            let tip_action = tip_action
+                .as_ref()
+                .expect("this branch only matches when tip_action is a Reset");
+            self.enable_at_tip(tip_action, "chain tip reset");
 
             // Re-verify the transactions that were pending or valid at the previous tip.
             // This saves us the time and data needed to re-download them.
-            if let ActiveState::Enabled { tx_downloads, .. } = &mut self.active_state {
+            if let ActiveState::Enabled {
+                storage,
+                tx_downloads,
+                ..
+            } = &mut self.active_state
+            {
+                let requeued = tx_retries.len();
                 info!(
-                    transactions = tx_retries.len(),
+                    transactions = requeued,
                     "re-verifying mempool transactions after a chain fork"
                 );
 
@@ -918,6 +936,14 @@ impl Service<Request> for Mempool {
                     // transaction requests fails.
                     let _result = tx_downloads.retry_after_tip_reset(tx, source);
                 }
+
+                self.trace.tip_processed(
+                    TipProcessing::Reset,
+                    tip_action.best_tip_hash_and_height(),
+                    storage.transaction_count(),
+                    requeued,
+                    reset_started.elapsed(),
+                );
             }
 
             return Poll::Ready(Ok(()));
@@ -1088,6 +1114,8 @@ impl Service<Request> for Mempool {
             // Handle best chain tip changes
             if let Some(TipAction::Grow { block }) = tip_action {
                 tracing::trace!(block_height = ?block.height, "handling blocks added to tip");
+                let grow_started = Instant::now();
+                let tip = (block.hash, block.height);
                 *last_seen_tip_hash = block.hash;
 
                 // Cancel downloads/verifications/storage of transactions
@@ -1120,6 +1148,14 @@ impl Service<Request> for Mempool {
 
                     invalidated_ids.extend(expired_transactions);
                 }
+
+                self.trace.tip_processed(
+                    TipProcessing::Grow,
+                    tip,
+                    storage.transaction_count(),
+                    0,
+                    grow_started.elapsed(),
+                );
             }
 
             // Send transactions that were not rejected nor expired to peers and RPC listeners.

@@ -591,8 +591,8 @@ impl AddressBook {
         peers
     }
 
-    /// Get the active addresses in `self`, in preferred caching order,
-    /// excluding our local listener address.
+    /// Get active outbound listener addresses in measured RTT order, followed by
+    /// shuffled addresses without a measurement, excluding our local listener.
     pub fn cacheable(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
@@ -615,8 +615,13 @@ impl AddressBook {
             .cloned()
             .collect();
 
-        // Stable sorting keeps the address-book preference for equal or unknown RTTs.
+        // Keep measured RTT preference and stable measured ties. Unmeasured peers
+        // have no trusted ranking: gossip timestamps and address values must not
+        // decide which ones survive cache truncation.
         eligible.sort_by_key(|peer| (peer.rtt().is_none(), peer.rtt()));
+        let first_unmeasured = eligible.partition_point(|peer| peer.rtt().is_some());
+        use rand_10::seq::SliceRandom;
+        eligible[first_unmeasured..].shuffle(&mut rand_10::rng());
         eligible
     }
 

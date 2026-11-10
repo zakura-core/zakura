@@ -18,7 +18,7 @@ use crate::{
     AddressBook,
 };
 
-/// Cache ranking uses measured RTT, retaining book order for ties and unknowns.
+/// Cache ranking uses measured RTT, retaining book order for measured ties.
 #[test]
 fn peer_cache_ranks_by_rtt_with_stable_ties() {
     let _init_guard = zakura_test::init();
@@ -52,7 +52,7 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
             .collect::<Vec<_>>(),
         vec![Some(10), Some(10), Some(50), None, None]
     );
-    for rtt in [None, Some(std::time::Duration::from_millis(10))] {
+    for rtt in [Some(std::time::Duration::from_millis(10))] {
         assert_eq!(
             ranked
                 .iter()
@@ -66,6 +66,52 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
                 .collect::<Vec<_>>(),
         );
     }
+}
+
+/// Gossip-only peers have no measured preference and do not keep a fixed cache prefix.
+#[test]
+fn peer_cache_shuffles_unmeasured_gossip() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let measured = "127.0.0.9:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(
+        measured,
+        Some(std::time::Duration::from_millis(10)),
+    ));
+    let mut expected = std::collections::HashSet::new();
+    for ip in 1..=8 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        expected.insert(addr);
+        book.update(
+            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
+                .new_gossiped_change()
+                .unwrap(),
+        );
+    }
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let cached = book.cacheable(Utc::now());
+        assert_eq!(cached[0].addr, measured, "measured peers retain priority");
+        let unknown: Vec<_> = cached[1..].iter().map(|peer| peer.addr).collect();
+        assert_eq!(
+            unknown
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        orders.insert(unknown);
+    }
+    // Sixteen identical independent shuffles of eight peers have probability (8!)^-15.
+    assert!(
+        orders.len() > 1,
+        "unmeasured gossip must not retain deterministic priority"
+    );
 }
 
 /// Make sure an empty address book is actually empty.

@@ -41,12 +41,15 @@
 //! its row the serving had counted then, less those it had released, are
 //! the node's count. Past twice the row's `max_in_flight` the request is
 //! judged `OverMargin`, and within it the request is relabelled and judged
-//! `Conformant`. A fault close before the serving counts a request the node
-//! read settles it at the close, before the close: the requests of its row
-//! the node had read up to it, less the commitments released, are the count
-//! the serving would have reached. Any other close leaves it unjudged. A
-//! request the node never reads keeps the peer's label when its connection
-//! is torn down.
+//! `Conformant`. The serving counts a request before it checks the margin,
+//! so a close before the count was never the request's margin close. At a
+//! fault close before the serving counts a request the node read, the
+//! requests of its row the node had read up to it, less the commitments
+//! released, bound the count the serving would have reached. Within the
+//! margin, that bound proves the request `Conformant`, and it is judged
+//! before the close. Past it, and at any other close, the request stays
+//! unjudged. A request the node never reads keeps the peer's label when its
+//! connection is torn down.
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
@@ -639,9 +642,17 @@ impl WireEvidence {
                         return Ok(Some(closed));
                     }
                     // The node closed before its serving counted these
-                    // requests, which it would have counted in the order it
-                    // read them.
+                    // requests. The serving counts a request before it
+                    // checks the margin, so an uncounted request can't be
+                    // what justified the close. Had the serving counted the
+                    // requests in the order the node read them, a request's
+                    // count would have been at most its position less the
+                    // commitments released. Within the margin that bound
+                    // proves the request `Conformant`. Past it, nothing
+                    // proves the request was over the margin, so it stays
+                    // unjudged.
                     let mut judged = Vec::new();
+                    let mut unjudged = Vec::new();
                     for (key, unsettled) in read {
                         let (message_type, position) =
                             unsettled.read.expect("only read requests were listed");
@@ -649,10 +660,20 @@ impl WireEvidence {
                             .margins
                             .get(&(key.0, key.1, message_type))
                             .map_or(0, |margin| margin.released);
-                        let open = position.saturating_sub(released);
-                        judged.extend(self.settle(key, unsettled.frame, message_type, open)?);
+                        let bound = position.saturating_sub(released);
+                        if bound <= margin(message_type)? {
+                            judged.extend(self.settle(
+                                key,
+                                unsettled.frame,
+                                message_type,
+                                bound,
+                            )?);
+                        } else {
+                            unjudged.push(unsettled.frame);
+                        }
                     }
                     judged.push(closed);
+                    judged.extend(unjudged);
                     let mut judged = judged.into_iter();
                     let first = judged.next();
                     self.late.extend(judged);
@@ -945,7 +966,8 @@ impl WireEvidence {
 
     /// The `PeerFrame` of request `key` of type `message_type`, `frame`, and
     /// its `FrameJudged`, with `open` the node's commitments of its row,
-    /// its own included. Past twice the row's `max_in_flight` it keeps its
+    /// its own included, or a bound on them. Past twice the row's
+    /// `max_in_flight` it keeps its
     /// `OverMargin` label, and within it the request is `Conformant`.
     fn settle(
         &mut self,
@@ -954,16 +976,7 @@ impl WireEvidence {
         message_type: u16,
         open: u32,
     ) -> Result<Vec<Observation>, String> {
-        let max_in_flight = match discovery_row(message_type).map(|row| row.role) {
-            Some(MessageRole::Request { max_in_flight, .. }) => max_in_flight,
-            _ => {
-                return Err(format!(
-                    "UntabledCommitment: a commitment names {message_type}, no discovery \
-                     request row"
-                ))
-            }
-        };
-        if open <= max_in_flight.saturating_mul(2) {
+        if open <= margin(message_type)? {
             if let Observation::PeerFrame { label, .. } = &mut frame {
                 *label = Label::Conformant;
             }
@@ -1024,6 +1037,17 @@ fn take_connection<T>(
     keys.into_iter()
         .map(|key| (key, frames.remove(&key).expect("just listed")))
         .collect()
+}
+
+/// The margin of discovery request row `message_type`: twice its
+/// `max_in_flight`, the most commitments the node may hold open.
+fn margin(message_type: u16) -> Result<u32, String> {
+    match discovery_row(message_type).map(|row| row.role) {
+        Some(MessageRole::Request { max_in_flight, .. }) => Ok(max_in_flight.saturating_mul(2)),
+        _ => Err(format!(
+            "UntabledCommitment: a commitment names {message_type}, no discovery request row"
+        )),
+    }
 }
 
 /// Discovery's row for `message_type`, if it has one.
@@ -1742,17 +1766,18 @@ mod tests {
     }
 
     /// A `GetPeers` the peer's models labelled `OverMargin` settles at the
-    /// serving's count of it, or at a fault close before that count. The
-    /// node's count is the commitments of the row it counted, less those it
-    /// released, so a request within twice `max_in_flight` is
-    /// `Conformant`. A request the node read but never counted, under a close
-    /// that isn't a fault, stays unjudged.
+    /// serving's count of it. The node's count is the commitments of the row
+    /// it counted, less those it released, so a request within twice
+    /// `max_in_flight` is `Conformant`. At a fault close before the count,
+    /// the request is `Conformant` if its read position less the releases is
+    /// within the margin, and unjudged otherwise. Under a close that isn't a
+    /// fault it stays unjudged.
     #[test]
     fn an_over_margin_request_settles_at_the_nodes_count() {
         use Then::{Close, Count, Release};
         const FAULT: &str = "service_protocol_reject";
         const CLEAN: &str = "discovery_exchange_complete";
-        let cases: [(&[Then], &[&str]); 6] = [
+        let cases: [(&[Then], &[&str]); 7] = [
             // Released one: the third request is the node's second open.
             (
                 &[Count(0), Release, Count(1), Count(2), Close(CLEAN)],
@@ -1767,11 +1792,13 @@ mod tests {
                 &[Count(0), Count(1), Count(2), Close(CLEAN)],
                 &["over-margin", "judged", "closed"],
             ),
-            // A fault close before the count settles it as the third count.
+            // A fault close before the count proves it `Conformant` when its
+            // bound is within the margin, and leaves it unjudged otherwise.
             (
                 &[Count(0), Count(1), Close(FAULT)],
-                &["over-margin", "judged", "closed"],
+                &["closed", "over-margin"],
             ),
+            (&[Count(0), Close(FAULT)], &["closed", "over-margin"]),
             (
                 &[Count(0), Release, Count(1), Close(FAULT)],
                 &["conformant", "judged", "closed"],
@@ -1804,6 +1831,34 @@ mod tests {
             Close("service_protocol_reject"),
         ]);
         let outcomes = outcomes(log);
+        assert!(
+            matches!(
+                outcomes["discovery/s4v2/conformant-never-closes"],
+                crate::PropertyOutcome::Violated { .. }
+            ),
+            "{outcomes:?}"
+        );
+        assert!(
+            !matches!(
+                outcomes["discovery/s4v2/get-peers/over-margin-closes"],
+                crate::PropertyOutcome::Violated { .. }
+            ),
+            "{outcomes:?}"
+        );
+    }
+
+    /// The #2240 case: with `max_in_flight` 1, the node reads three
+    /// `GetPeers` while its serving has counted only the first, and a bug
+    /// closes the connection with a fault cause. The serving counts a
+    /// request before it checks the margin, so no uncounted request justified
+    /// the close, and the close punished conformant frames.
+    #[test]
+    fn a_close_before_the_nodes_count_violates_conformant_never_closes() {
+        use Then::{Close, Count};
+        let outcomes = outcomes(over_margin_log(&[
+            Count(0),
+            Close("service_protocol_reject"),
+        ]));
         assert!(
             matches!(
                 outcomes["discovery/s4v2/conformant-never-closes"],

@@ -265,6 +265,7 @@ impl QuicEndpoint {
             connections: ConnectionSlots::new(
                 bind.max_connections,
                 bind.dial_reserve,
+                bind.max_inbound_connections,
                 bind.max_closing_connections,
             ),
             hooks: Arc::new(Hooks::default()),
@@ -413,19 +414,17 @@ impl QuicEndpoint {
         self.inner.shared.connections.can_dial()
     }
 
-    /// Whether discovery can reserve an address attempt while leaving one
-    /// live slot below the inbound refusal threshold (ADM-12).
+    /// Whether discovery can reserve an address attempt under its ceiling,
+    /// which leaves the dial reserve and, while inbound is under its own cap,
+    /// one more slot for inbound (ADM-12).
     pub fn has_discovery_capacity(&self) -> bool {
         self.discovery_capacity() > 0
     }
 
-    /// How many address attempts discovery can reserve now while leaving one
-    /// live slot below the inbound refusal threshold (ADM-12).
+    /// How many address attempts discovery can reserve now under its ceiling
+    /// (see [`Self::has_discovery_capacity`]).
     pub fn discovery_capacity(&self) -> usize {
-        let connections = &self.inner.shared.connections;
-        connections
-            .discovery_limit()
-            .saturating_sub(connections.live())
+        self.inner.shared.connections.discovery_room()
     }
 
     /// Network changes the endpoint has passed to its connections (SOCK-12).
@@ -488,12 +487,12 @@ impl QuicEndpoint {
     /// of a protocol lets a node reach peers on older versions in one
     /// handshake. An empty list fails with [`ConnectError::AlpnMismatch`].
     pub async fn connect(&self, addr: NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError> {
-        self.connect_with_limit(addr, alpns, self.inner.shared.connections.max())
+        self.connect_with_limit(addr, alpns, DialCeiling::Whole)
             .await
     }
 
-    /// Dials a discovery candidate without taking the dial reserve or the
-    /// last slot available to inbound connections (ADM-12).
+    /// Dials a discovery candidate without taking the dial reserve or, while
+    /// inbound is under its own cap, the last slot inbound could use (ADM-12).
     ///
     /// Like [`Self::connect`], but reserves all address attempts below this
     /// lower ceiling before sending any packet. A ceiling of zero disables
@@ -503,16 +502,16 @@ impl QuicEndpoint {
         addr: NodeAddr,
         alpns: &[&[u8]],
     ) -> Result<Conn, ConnectError> {
-        self.connect_with_limit(addr, alpns, self.inner.shared.connections.discovery_limit())
+        self.connect_with_limit(addr, alpns, DialCeiling::Discovery)
             .await
     }
 
-    /// Reserves a dial's address attempts together under `limit` before any packet.
+    /// Reserves a dial's address attempts together under `ceiling` before any packet.
     async fn connect_with_limit(
         &self,
         addr: NodeAddr,
         alpns: &[&[u8]],
-        limit: usize,
+        ceiling: DialCeiling,
     ) -> Result<Conn, ConnectError> {
         let shared = &self.inner.shared;
         if alpns.is_empty() {
@@ -546,13 +545,13 @@ impl QuicEndpoint {
         // ADM-12: either every address fits before the first packet, or none
         // is tried. Bound the target set by this dial's ceiling so an idle
         // endpoint can fit it whenever that ceiling is nonzero.
-        targets.truncate(limit);
+        targets.truncate(shared.connections.idle_limit(ceiling));
         if targets.is_empty() {
             return Err(ConnectError::ConnectionLimit);
         }
         let slots = shared
             .connections
-            .claim_dial_slots(targets.len(), limit)
+            .claim_dial_slots(targets.len(), ceiling)
             .ok_or(ConnectError::ConnectionLimit)?;
 
         let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
@@ -975,31 +974,90 @@ impl Drop for PendingGuard {
 pub(crate) struct ConnectionSlots {
     counts: Arc<SlotCounts>,
     max: usize,
+    /// Live connections, both directions, below the dial reserve.
+    below_reserve: usize,
     max_inbound: usize,
     max_closing: usize,
 }
 
 #[derive(Default)]
 struct SlotCounts {
-    live: AtomicUsize,
+    /// The live and inbound counts as one [`Held`] word.
+    held: AtomicU64,
     closing: AtomicUsize,
 }
 
+/// Live slots and the inbound ones among them. They share one atomic word,
+/// so each claim checks both counts and discovery's ceiling against the same
+/// snapshot it updates.
+#[derive(Clone, Copy)]
+struct Held {
+    live: usize,
+    inbound: usize,
+}
+
+impl Held {
+    /// A word's low half counts live slots and its high half inbound ones.
+    const INBOUND_SHIFT: u32 = 32;
+    const LIVE_MASK: u64 = (1 << Self::INBOUND_SHIFT) - 1;
+    /// The most either count can reach, so neither half overflows into the
+    /// other.
+    const MAX: usize = u32::MAX as usize;
+
+    /// Splits a packed word.
+    fn unpack(word: u64) -> Self {
+        // Each half holds at most `Held::MAX`, which fits usize on supported targets.
+        Self {
+            live: (word & Self::LIVE_MASK) as usize,
+            inbound: (word >> Self::INBOUND_SHIFT) as usize,
+        }
+    }
+
+    /// Packs both counts, each at most [`Held::MAX`].
+    fn pack(self) -> u64 {
+        // Both counts are at most `Held::MAX` (u32::MAX), so the casts are lossless.
+        (self.inbound as u64) << Self::INBOUND_SHIFT | self.live as u64
+    }
+}
+
+/// Which ceiling a dial's address attempts must fit under (ADM-12).
+#[derive(Clone, Copy)]
+pub(crate) enum DialCeiling {
+    /// The whole table, for bootstrap and maintained dials.
+    Whole,
+    /// Discovery's lower ceiling.
+    Discovery,
+}
+
 impl ConnectionSlots {
-    /// Allows `max` live connections, of which inbound attempts may take all
-    /// but `dial_reserve`, and `max_closing` closed ones.
-    pub(crate) fn new(max: usize, dial_reserve: usize, max_closing: usize) -> Self {
+    /// Allows `max` live connections and `max_closing` closed ones. Inbound
+    /// attempts may hold up to `max_inbound` live slots (unlimited for
+    /// `None`), and only while all but `dial_reserve` of `max` would be live.
+    /// Live caps above `u32::MAX` act as `u32::MAX`.
+    pub(crate) fn new(
+        max: usize,
+        dial_reserve: usize,
+        max_inbound: Option<usize>,
+        max_closing: usize,
+    ) -> Self {
+        let max = max.min(Held::MAX);
         Self {
             counts: Arc::default(),
             max,
-            max_inbound: max.saturating_sub(dial_reserve),
+            below_reserve: max.saturating_sub(dial_reserve),
+            max_inbound: max_inbound.map_or(Held::MAX, |cap| cap.min(Held::MAX)),
             max_closing,
         }
     }
 
+    /// The live and inbound counts right now.
+    fn held(&self) -> Held {
+        Held::unpack(self.counts.held.load(Ordering::Acquire))
+    }
+
     /// Live connections held right now, dial attempts in flight included.
     pub(crate) fn live(&self) -> usize {
-        self.counts.live.load(Ordering::Acquire)
+        self.held().live
     }
 
     /// Closed connections held right now.
@@ -1007,15 +1065,36 @@ impl ConnectionSlots {
         self.counts.closing.load(Ordering::Acquire)
     }
 
-    /// The most live connections the table ever holds, so the most addresses
-    /// one dial can claim slots for.
-    pub(crate) fn max(&self) -> usize {
-        self.max
+    /// The most live slots a dial under `ceiling` may bring the table to with
+    /// `held` taken. Discovery leaves the dial reserve free, and one more slot
+    /// while inbound attempts are under their own cap and could still use it.
+    fn limit(&self, ceiling: DialCeiling, held: Held) -> usize {
+        match ceiling {
+            DialCeiling::Whole => self.max,
+            DialCeiling::Discovery => self
+                .below_reserve
+                .saturating_sub(usize::from(held.inbound < self.max_inbound)),
+        }
     }
 
-    /// The discovery ceiling leaves the dial reserve and one inbound slot free.
-    fn discovery_limit(&self) -> usize {
-        self.max_inbound.saturating_sub(1)
+    /// The ceiling for `ceiling` on an idle table: the most address attempts
+    /// one dial under it can ever claim. It reads no count, so a dial adds no
+    /// atomic step before its claim.
+    pub(crate) fn idle_limit(&self, ceiling: DialCeiling) -> usize {
+        self.limit(
+            ceiling,
+            Held {
+                live: 0,
+                inbound: 0,
+            },
+        )
+    }
+
+    /// Address attempts discovery could reserve right now.
+    pub(crate) fn discovery_room(&self) -> usize {
+        let held = self.held();
+        self.limit(DialCeiling::Discovery, held)
+            .saturating_sub(held.live)
     }
 
     /// Whether a dial attempt would get a slot right now.
@@ -1023,49 +1102,79 @@ impl ConnectionSlots {
         self.live() < self.max
     }
 
-    /// Claims a live slot for an inbound attempt, or `None` when only the dial
-    /// reserve is left. Closed connections don't count (ADM-13).
+    /// Claims a live slot for an inbound attempt, or `None` when inbound
+    /// attempts hold their cap or only the dial reserve is left. Closed
+    /// connections don't count (ADM-13).
     pub(crate) fn claim_inbound(&self) -> Option<Arc<ConnectionSlot>> {
-        self.claim(self.max_inbound)
+        self.update(|held| {
+            (held.inbound < self.max_inbound && held.live < self.below_reserve).then_some(Held {
+                live: held.live + 1,
+                inbound: held.inbound + 1,
+            })
+        })
+        .then(|| self.new_slot(true))
     }
 
     /// Claims a live slot for one dial attempt, or `None` at the cap.
     #[cfg(test)]
     pub(crate) fn claim_dial(&self) -> Option<Arc<ConnectionSlot>> {
-        self.claim(self.max)
+        self.claim_dial_slots(1, DialCeiling::Whole)?.pop()
     }
 
-    /// Reserves every address attempt atomically, or leaves the count unchanged.
-    fn claim_dial_slots(&self, attempts: usize, limit: usize) -> Option<Vec<Arc<ConnectionSlot>>> {
-        if !try_add(&self.counts.live, attempts, limit) {
-            return None;
-        }
-        Some((0..attempts).map(|_| self.new_slot()).collect())
+    /// Reserves every address attempt under `ceiling` atomically, or leaves
+    /// the counts unchanged.
+    fn claim_dial_slots(
+        &self,
+        attempts: usize,
+        ceiling: DialCeiling,
+    ) -> Option<Vec<Arc<ConnectionSlot>>> {
+        let claimed = self.update(|held| {
+            let live = held
+                .live
+                .checked_add(attempts)
+                .filter(|live| *live <= self.limit(ceiling, held))?;
+            Some(Held { live, ..held })
+        });
+        claimed.then(|| (0..attempts).map(|_| self.new_slot(false)).collect())
     }
 
-    /// Claims a live slot while fewer than `limit` are held.
-    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
-        if !try_add(&self.counts.live, 1, limit) {
-            return None;
+    /// Replaces the counts with `next(held)` in one atomic step, and returns
+    /// whether `next` allowed it. A plain CAS loop: `fetch_update` is
+    /// deprecated on newer toolchains and `try_update` doesn't exist on older
+    /// ones.
+    fn update(&self, next: impl Fn(Held) -> Option<Held>) -> bool {
+        let mut word = self.counts.held.load(Ordering::Acquire);
+        loop {
+            let Some(updated) = next(Held::unpack(word)) else {
+                return false;
+            };
+            match self.counts.held.compare_exchange_weak(
+                word,
+                updated.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => word = current,
+            }
         }
-        Some(self.new_slot())
     }
 
     /// Tracks one already reserved live slot until its connection drains.
-    fn new_slot(&self) -> Arc<ConnectionSlot> {
+    /// `inbound` slots also hold one of the inbound count.
+    fn new_slot(&self, inbound: bool) -> Arc<ConnectionSlot> {
         metrics::gauge!("zakura.quic.connections.held").increment(1.0);
         Arc::new(ConnectionSlot {
             counts: self.counts.clone(),
             max_closing: self.max_closing,
+            inbound,
             closing: AtomicBool::new(false),
         })
     }
 }
 
-/// Adds `additional` to `count` only if the result fits `limit`. Concurrent
-/// dials and endpoint tasks reserve their slots in one atomic step. A plain
-/// CAS loop: `fetch_update` is deprecated on newer toolchains and `try_update`
-/// doesn't exist on older ones.
+/// Adds `additional` to `count` only if the result fits `limit`, in one
+/// atomic step. A plain CAS loop, as in [`ConnectionSlots::update`].
 fn try_add(count: &AtomicUsize, additional: usize, limit: usize) -> bool {
     let mut held = count.load(Ordering::Acquire);
     loop {
@@ -1086,6 +1195,7 @@ fn try_add(count: &AtomicUsize, additional: usize, limit: usize) -> bool {
 pub(crate) struct ConnectionSlot {
     counts: Arc<SlotCounts>,
     max_closing: usize,
+    inbound: bool,
     closing: AtomicBool,
 }
 
@@ -1107,7 +1217,7 @@ impl ConnectionSlot {
         }
         self.closing.store(true, Ordering::Release);
         shrink();
-        self.counts.live.fetch_sub(1, Ordering::AcqRel);
+        self.release_live();
         metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         metrics::gauge!("zakura.quic.connections.closing").increment(1.0);
         true
@@ -1117,6 +1227,18 @@ impl ConnectionSlot {
     pub(crate) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
+
+    /// Frees the live slot, and the inbound count for an inbound one, in one
+    /// step. Both counts include this slot, so neither half borrows.
+    fn release_live(&self) {
+        let released = Held {
+            live: 1,
+            inbound: usize::from(self.inbound),
+        };
+        self.counts
+            .held
+            .fetch_sub(released.pack(), Ordering::AcqRel);
+    }
 }
 
 impl Drop for ConnectionSlot {
@@ -1125,7 +1247,7 @@ impl Drop for ConnectionSlot {
             self.counts.closing.fetch_sub(1, Ordering::AcqRel);
             metrics::gauge!("zakura.quic.connections.closing").decrement(1.0);
         } else {
-            self.counts.live.fetch_sub(1, Ordering::AcqRel);
+            self.release_live();
             metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         }
     }
@@ -1140,14 +1262,14 @@ mod tests {
     /// retain their separate capacity, and dropping every claim refunds it.
     #[test]
     fn concurrent_discovery_reservations_preserve_inbound_capacity() {
-        let slots = ConnectionSlots::new(8, 2, 0);
+        let slots = ConnectionSlots::new(8, 2, None, 0);
         let barrier = std::sync::Barrier::new(9);
         let observed = std::thread::scope(|scope| {
             for _ in 0..8 {
                 let (slots, barrier) = (&slots, &barrier);
                 scope.spawn(move || {
                     barrier.wait();
-                    let held = slots.claim_dial_slots(2, slots.discovery_limit());
+                    let held = slots.claim_dial_slots(2, DialCeiling::Discovery);
                     barrier.wait();
                     barrier.wait();
                     drop(held);
@@ -1156,13 +1278,15 @@ mod tests {
             barrier.wait();
             barrier.wait();
             let live = slots.live();
-            let overflow_refused = slots.claim_dial_slots(usize::MAX, usize::MAX).is_none();
+            let overflow_refused = slots
+                .claim_dial_slots(usize::MAX, DialCeiling::Whole)
+                .is_none();
             let inbound = [
                 slots.claim_inbound(),
                 slots.claim_inbound(),
                 slots.claim_inbound(),
             ];
-            let maintained = slots.claim_dial_slots(2, slots.max());
+            let maintained = slots.claim_dial_slots(2, DialCeiling::Whole);
             let observed = (
                 live,
                 overflow_refused,
@@ -1186,6 +1310,84 @@ mod tests {
         assert_eq!(maintained_slots, 2);
         assert_eq!(full_count, 8);
         assert_eq!(slots.live(), 0);
+    }
+
+    /// Inbound attempts stop at their own cap, and each holds it until its
+    /// connection moves to closing or, when the closing allowance is full,
+    /// until its slot drops. Once inbound holds its cap, discovery may take
+    /// the slot it otherwise leaves for inbound, and a maintained dial still
+    /// fits the reserve.
+    #[test]
+    fn the_inbound_cap_holds_each_slot_until_it_closes() {
+        let slots = ConnectionSlots::new(12, 3, Some(5), 1);
+        let mut inbound: Vec<_> = (0..5).map(|_| slots.claim_inbound().unwrap()).collect();
+        // Four slots stay below the reserve, but inbound holds its cap.
+        assert!(slots.claim_inbound().is_none());
+        assert_eq!(slots.limit(DialCeiling::Discovery, slots.held()), 9);
+        let discovery = slots.claim_dial_slots(4, DialCeiling::Discovery).unwrap();
+        let maintained = slots.claim_dial_slots(3, DialCeiling::Whole).unwrap();
+        assert_eq!(slots.live(), 12);
+        drop((discovery, maintained));
+
+        // Moving to closing frees the inbound count with the live slot.
+        assert!(inbound[0].begin_closing(|| {}));
+        assert_eq!(slots.limit(DialCeiling::Discovery, slots.held()), 8);
+        inbound.push(slots.claim_inbound().unwrap());
+        // The closing allowance is full, so this one stays live and counted.
+        assert!(!inbound[1].begin_closing(|| {}));
+        assert!(slots.claim_inbound().is_none());
+        drop(inbound.remove(1));
+        assert!(slots.claim_inbound().is_some());
+
+        drop(inbound);
+        assert_eq!((slots.live(), slots.closing()), (0, 0));
+        assert_eq!(slots.held().inbound, 0);
+    }
+
+    /// Discovery's ceiling and an inbound claim, or an inbound close, decide
+    /// against one snapshot of both counts. With inbound one under its cap
+    /// and one slot left below the reserve, a racing inbound claim always
+    /// gets that slot, and discovery never does. With inbound at its cap and
+    /// discovery at the reserve, a racing close never lets discovery take the
+    /// slot the close frees for inbound.
+    #[test]
+    fn discovery_never_takes_the_inbound_slot_in_a_race() {
+        for _ in 0..500 {
+            // Four inbound and four discovery slots, one below the reserve.
+            let slots = ConnectionSlots::new(12, 3, Some(5), 24);
+            let inbound: Vec<_> = (0..4).map(|_| slots.claim_inbound().unwrap()).collect();
+            let discovery = slots.claim_dial_slots(4, DialCeiling::Discovery).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            let (claimed, discovered) = std::thread::scope(|scope| {
+                let claimed = scope.spawn(|| {
+                    barrier.wait();
+                    slots.claim_inbound()
+                });
+                barrier.wait();
+                let discovered = slots.claim_dial_slots(1, DialCeiling::Discovery);
+                (claimed.join().unwrap(), discovered)
+            });
+            assert!(claimed.is_some());
+            assert!(discovered.is_none());
+            drop((claimed, inbound, discovery));
+
+            // Inbound at its cap, and discovery up to the reserve.
+            let mut inbound: Vec<_> = (0..5).map(|_| slots.claim_inbound().unwrap()).collect();
+            let discovery = slots.claim_dial_slots(4, DialCeiling::Discovery).unwrap();
+            let closed = inbound.pop().unwrap();
+            let discovered = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    drop(closed);
+                });
+                barrier.wait();
+                slots.claim_dial_slots(1, DialCeiling::Discovery)
+            });
+            assert!(discovered.is_none());
+            assert!(slots.claim_inbound().is_some());
+            drop((inbound, discovery));
+            assert_eq!(slots.live(), 0);
+        }
     }
 
     /// A dial refused at this node's own cap never reached the peer, so it

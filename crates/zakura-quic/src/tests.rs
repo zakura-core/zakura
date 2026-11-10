@@ -83,6 +83,7 @@ fn loopback() -> QuicBindConfig {
         max_bidi_streams: 64,
         max_connections: 1024,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 1024,
     }
 }
@@ -93,6 +94,7 @@ fn wildcard() -> QuicBindConfig {
         max_bidi_streams: 64,
         max_connections: 1024,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 1024,
     }
 }
@@ -2216,13 +2218,42 @@ async fn churned_connections_stay_within_both_allowances() {
     const CAP: usize = 6;
     const RESERVE: usize = 2;
     const CLOSING: usize = 3;
+    let (peak_live, peak_closing) = churn(QuicBindConfig {
+        max_connections: CAP,
+        dial_reserve: RESERVE,
+        max_closing_connections: CLOSING,
+        ..loopback()
+    })
+    .await;
+    // Inbound attempts stop short of the dial reserve.
+    assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
+    assert!(peak_closing <= CLOSING);
+}
+
+/// ADM-12: an acceptor that closes each connection right after its TLS
+/// handshake, as Zakura does for a bad control hello, frees its own
+/// accounting while the connection is still live. The inbound cap keeps
+/// counting those connections until they close, so the churn stays within it
+/// even with room left below the dial reserve.
+#[tokio::test]
+async fn churned_connections_stay_within_the_inbound_cap() {
+    const INBOUND: usize = 3;
+    let (peak_live, _) = churn(QuicBindConfig {
+        max_connections: 12,
+        dial_reserve: 1,
+        max_inbound_connections: Some(INBOUND),
+        max_closing_connections: 24,
+        ..loopback()
+    })
+    .await;
+    assert!((1..=INBOUND).contains(&peak_live), "{peak_live}");
+}
+
+/// Runs twelve peers that each connect eight times to a [`ChurnAcceptor`]
+/// bound with `bind`, waits until every slot frees, and returns the most live
+/// and closing connections the server held.
+async fn churn(bind: QuicBindConfig) -> (usize, usize) {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let bind = QuicBindConfig {
-            max_connections: CAP,
-            dial_reserve: RESERVE,
-            max_closing_connections: CLOSING,
-            ..loopback()
-        };
         let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
         server.serve(ChurnAcceptor).unwrap();
         let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
@@ -2265,10 +2296,6 @@ async fn churned_connections_stay_within_both_allowances() {
         stop.store(true, Ordering::Relaxed);
         sampler.await.unwrap();
 
-        // Inbound attempts stop short of the dial reserve.
-        let peak_live = peaks.0.load(Ordering::Relaxed);
-        assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
-        assert!(peaks.1.load(Ordering::Relaxed) <= CLOSING);
         tokio::time::timeout(Duration::from_secs(5), async {
             while server.connection_count() + server.closing_connection_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2276,9 +2303,13 @@ async fn churned_connections_stay_within_both_allowances() {
         })
         .await
         .expect("every slot frees once its connection drains");
+        (
+            peaks.0.load(Ordering::Relaxed),
+            peaks.1.load(Ordering::Relaxed),
+        )
     })
     .await
-    .unwrap();
+    .unwrap()
 }
 
 /// ADM-12: inbound connections can't take the dial reserve, and a dial at the

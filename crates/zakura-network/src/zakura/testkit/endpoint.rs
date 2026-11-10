@@ -26,6 +26,8 @@ pub struct LocalEndpointFactory {
 impl LocalEndpointFactory {
     /// Create a factory with the default transport settings.
     pub fn new() -> Self {
+        let default_bind =
+            ZakuraLocalLimits::from_config(&crate::Config::default()).quic_bind_config(Vec::new());
         Self {
             quic: QuicConfig::default(),
             bind: QuicBindConfig {
@@ -33,7 +35,8 @@ impl LocalEndpointFactory {
                 max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
                 max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS
                     + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-                dial_reserve: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES.div_ceil(2),
+                dial_reserve: default_bind.dial_reserve,
+                max_inbound_connections: default_bind.max_inbound_connections,
                 max_closing_connections: 2
                     * (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES),
             },

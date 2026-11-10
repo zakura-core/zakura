@@ -1305,7 +1305,7 @@ mod tests {
             recv_ends: HashMap::new(),
             recv_payload: HashSet::new(),
             send_payload: HashSet::new(),
-            slot: crate::endpoint::ConnectionSlots::new(1, 0, 1)
+            slot: crate::endpoint::ConnectionSlots::new(1, 0, None, 1)
                 .claim_dial()
                 .unwrap(),
             send_buf: Vec::new(),

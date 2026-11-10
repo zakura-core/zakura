@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-09. Version 0.19.
+Status: draft for review, 2026-11-10. Version 0.20.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -38,7 +38,10 @@ explains it. Version 0.17 moves Ed25519 signing and the ID-6 equation from
 Zakura's connection and control-handshake caps for outbound work (ADM-3);
 §17p explains it. Version 0.19 lets the acceptor group pending handshakes by
 source and has Zakura count each global IPv6 /64 as one IP; it changes ADM-1,
-ADM-3, ADM-7 and API-3, and adds §16 rows; §17q lists each change.
+ADM-3, ADM-7 and API-3, and adds §16 rows; §17q lists each change. Version
+0.20 gives inbound connections their own transport cap and sizes Zakura's
+dial reserve for one full address record, so discovery keeps the outbound
+share when inbound is full (ADM-12); §17r explains it.
 
 ## 0. Conventions
 
@@ -484,10 +487,21 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   established connections count. Each address attempt of a dial (DIAL-3)
   counts on its own. Closed connections move to ADM-13's allowance.
   - An attempt the acceptor and rules 3 and 5 accept MUST be refused while
-    `max_connections - dial_reserve` live connections are held. Refusing
-    creates no connection state (SEC-3). Inbound attempts therefore never take
-    the last `dial_reserve` slots, and peers that churn inbound connections
-    can't stop this node's dials.
+    `max_connections - dial_reserve` live connections are held, or while
+    `QuicBindConfig::max_inbound_connections` inbound ones are, when that is
+    set. Refusing creates no connection state (SEC-3). Inbound attempts
+    therefore never take the last `dial_reserve` slots, and peers that churn
+    inbound connections can't stop this node's dials.
+  - An inbound connection MUST count against `max_inbound_connections` from
+    accept until it moves to ADM-13's closing allowance, or until its slot
+    drops when that allowance is full. That includes a connection the
+    acceptor already closed and dropped from its own accounting, such as one
+    Zakura closes right after TLS for a bad control hello, so a peer that
+    repeats such closes can't hold more live slots than the cap. Releasing
+    the count at closing takes no dial room, because closing connections sit
+    in their own allowance. The live and inbound counts MUST change in one
+    atomic step, so each claim, and discovery's ceiling below, sees one
+    snapshot of both.
   - A dial MUST claim a live slot for every address it will try (DIAL-3)
     before its first attempt. The complete reservation MUST be atomic across
     concurrent dials and inbound accepts. It tries at most the first
@@ -500,9 +514,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     that the node owns every address it lists, or call a dial that contacted
     the peer a local limit and retry it without backoff.
   - Discovery dials MUST leave one live slot below the inbound refusal
-    threshold. Their ceiling is
-    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 107 at
-    the defaults. `connect_discovery` caps its address list to this ceiling
+    threshold while inbound connections are under `max_inbound_connections`.
+    Their ceiling is then
+    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 115 at
+    the defaults. Once inbound holds its cap, inbound can't use that slot, so
+    the ceiling is `max_connections.saturating_sub(dial_reserve)` (116).
+    `connect_discovery` caps its address list to this ceiling
     and atomically claims every attempt under it. A zero ceiling disables
     discovery dials and returns `ConnectionLimit`. Bootstrap and maintained
     dials use `connect` and may use the full transport cap. This prevents
@@ -522,9 +539,23 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     made the dialer spin.
 
   Zakura sets `max_connections` to its admitted cap plus
-  `max_pending_handshakes`, and `dial_reserve` to half of
-  `max_pending_handshakes` rounded up, so at least one slot: 124 and 16 at
-  the defaults (CTRL-26).
+  `max_pending_handshakes`: 124 at the defaults (CTRL-26). It sets
+  `max_inbound_connections` to its inbound connection and handshake shares
+  (ADM-3) together: 93. It sets `dial_reserve` to the 31 slots inbound can't
+  hold, capped at one discovery record's 8 addresses and at least one slot:
+  8 at the defaults. With inbound full, discovery's ceiling (116) leaves it
+  the whole outbound share (23), and the reserve still fits one maintained
+  dial of a full record. That holds whenever the handshake reserve is at
+  least 8, so from 32 pending handshakes up. Below that the reserve keeps its
+  full record first, and discovery gets what's left above inbound, which is
+  zero when inbound can't hold only 8 slots or fewer. Discovery records and
+  legacy upgrade hand-offs carry at most 8 addresses, and each default
+  bootstrap peer lists one, so one such maintained dial fits the reserve
+  whenever nothing else holds it. A maintained dial that doesn't fit right
+  now, for example an operator's bootstrap identity listed with more than 8
+  usable addresses, fails with `ConnectionLimit` and retries without
+  counting an attempt, so it starts once the table has room for all of
+  them.
 - **ADM-13.** When a connection closes, its connection task MUST release the
   stream payload `quinn-proto` still holds, then move its slot from ADM-12's
   live count to `QuicBindConfig::max_closing_connections`.
@@ -1056,6 +1087,9 @@ this release tolerates, and keep each hard change explicit.
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
+| Inbound connections stop at their own cap and count until they close, even when the acceptor closes them right after TLS; with inbound at its cap, discovery reaches the reserve and a maintained dial still fits it | ADM-12 |
+| Racing inbound claims and closes never let discovery take the slot it leaves for inbound | ADM-12 |
+| Zakura's dial reserve fits one full address record and leaves discovery the whole outbound share with inbound at both of its shares | ADM-3, ADM-12 |
 | Cancelling discovery before or after its second address attempt starts returns all slots, sends no packet to an unstarted address, and lets a subsequent whole dial reserve capacity | ADM-12, ADM-13 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
 | Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
@@ -1469,3 +1503,33 @@ Changed:
   IPv6 address's /64 or the exact address otherwise, and its
   `pending_group` returns it.
 - **§16.** Adds the `pending_group` and admission host tests.
+
+## 17r. Changes in version 0.20
+
+Version 0.18 bounded inbound peers in Zakura's handler but left the
+transport's split alone. The transport refused inbound attempts at 108 live
+connections and stopped discovery at 107, and both counts include every
+direction. Inbound peers holding 68 connections and 24 stalled TLS
+handshakes took 92 of those slots, which left discovery 15 instead of the
+23-slot outbound share. With small caps, discovery could reach zero.
+
+The handler's bound wasn't enough on its own either. Zakura drops a
+connection's permits as soon as it closes it, for example after a bad
+control hello, while the transport keeps the slot live until the close
+finishes. A peer that finishes TLS and sends a bad hello, over and over, held
+more live slots than the handler's shares.
+
+Changed:
+
+- **ADM-12.** `QuicBindConfig` gains `max_inbound_connections`. Inbound
+  connections count against it from accept until they close, and an
+  inbound attempt is refused at that cap as well as at the dial reserve.
+  Discovery's ceiling leaves its spare inbound slot only while inbound is
+  under its cap. Zakura sets the cap to its inbound connection and
+  handshake shares (93 at the defaults), and its `dial_reserve` to the
+  slots inbound can't hold, capped at one discovery record's 8 addresses
+  (8, down from 16). Discovery then keeps the whole outbound share (23)
+  with inbound full, and one maintained dial of a full record still fits
+  the reserve. The live and inbound counts share one atomic word, so
+  discovery's ceiling can't race an inbound claim or close.
+- **§16.** Adds the inbound cap, race and dial reserve tests.

@@ -99,6 +99,11 @@ use crate::{
     },
 };
 
+// A legacy upgrade hand-off dials at most `MAX_IROH_DIRECT_ADDRESSES`, so the
+// QUIC dial reserve that fits one discovery record fits one hand-off too (see
+// `ZakuraLocalLimits::quic_bind_config`).
+const _: () = assert!(super::MAX_IROH_DIRECT_ADDRESSES <= discovery::MAX_DIRECT_ADDRS_PER_RECORD);
+
 /// Default total Zakura connections when P2P v2 is enabled: 92, the count
 /// the previous 8 GiB budget admitted at the default windows. The default peer
 /// memory budget funds this many at every reactor's share (see `peer_memory`).
@@ -828,18 +833,33 @@ impl ZakuraLocalLimits {
     /// Returns the QUIC bind settings for `addrs` under these limits.
     ///
     /// The transport holds the admitted connections plus
-    /// `max_pending_handshakes` more live ones, half of those (rounded up, so
-    /// at least one) kept for dials, and two closing connections per live slot
-    /// (see `peer_memory`).
+    /// `max_pending_handshakes` more live ones, and two closing connections
+    /// per live slot (see `peer_memory`). Inbound attempts may hold
+    /// [`Self::max_inbound_connections`] plus [`Self::max_inbound_handshakes`]
+    /// of the live slots (93 at the defaults), counted until each connection
+    /// closes, so a peer that this node closes right after its TLS handshake
+    /// still counts until the close finishes.
+    ///
+    /// The dial reserve fits one maintained dial of a full address record
+    /// ([`discovery::MAX_DIRECT_ADDRS_PER_RECORD`]), within the slots inbound can't
+    /// hold: 8 at the defaults. Discovery stops at the reserve, so with
+    /// inbound full it keeps the slots between the two. That's the whole
+    /// outbound share (23 at the defaults) whenever the handshake reserve is
+    /// at least the address cap, which holds from 32 pending handshakes up.
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
         let max_connections = self
             .max_connections
             .saturating_add(self.max_pending_handshakes);
+        let max_inbound_connections = self
+            .max_inbound_connections()
+            .saturating_add(self.max_inbound_handshakes());
+        let outbound_slots = max_connections.saturating_sub(max_inbound_connections);
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
             max_connections,
-            dial_reserve: self.max_pending_handshakes.div_ceil(2),
+            dial_reserve: outbound_slots.clamp(1, discovery::MAX_DIRECT_ADDRS_PER_RECORD),
+            max_inbound_connections: Some(max_inbound_connections),
             max_closing_connections: max_connections
                 .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }

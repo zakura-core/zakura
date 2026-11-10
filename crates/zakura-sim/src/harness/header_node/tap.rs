@@ -112,6 +112,7 @@ use super::{
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
+    retirement::{Retirement, RetirementEvidence},
     round_life::{RoundLife, RoundLifeEvidence},
     session::SessionEvidence,
     stale::{StaleCheck, StaleEvidence},
@@ -219,6 +220,9 @@ struct TapState {
     /// Checks rounds' owner binding and pages' paths. None until
     /// [`ReactorTap::watch_authority`].
     authority: Mutex<Option<Authority>>,
+    /// Checks that no work outlives its departed session. None until
+    /// [`ReactorTap::watch_retirement`].
+    retirement: Mutex<Option<Retirement>>,
 }
 
 /// The resource probe a tap was handed.
@@ -302,6 +306,10 @@ struct Buffer {
     /// Each reservation and admission, by its peer, in order. They stay out
     /// of the log, so they take no number.
     effects: Vec<(LinkEffect, ZakuraPeerId)>,
+    /// Each page a publisher handed to its writer in the run, by its peer,
+    /// as storage names it, its session and its read's lease, in order.
+    /// They stay out of the log too.
+    queued: Vec<(String, u64, u64)>,
 }
 
 impl TapState {
@@ -422,6 +430,20 @@ impl TapState {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::StaleChainEffect,
+                detail,
+            });
+        }
+        let departed = self
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|retirement| retirement.drain(step))
+            .unwrap_or_default();
+        for detail in departed {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::PeerRetirementProgress,
                 detail,
             });
         }
@@ -808,6 +830,14 @@ impl TapState {
             {
                 outstanding.observe(&event);
             }
+            if let Some(retirement) = state
+                .retirement
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                retirement.observe(&event, on_reactor, stale_handler);
+            }
             if let Some(chain) = state
                 .chain_effect
                 .lock()
@@ -860,6 +890,7 @@ impl TapState {
                 | ReactorEvent::ServingAcquired { .. }
                 | ReactorEvent::PublisherStarted { .. }
                 | ReactorEvent::PublisherEnded { .. }
+                | ReactorEvent::PageQueued { .. }
                 | ReactorEvent::TargetCompleted { .. }
                 | ReactorEvent::CursorsAccepted { .. }
                 | ReactorEvent::CursorClaimed { .. }
@@ -870,6 +901,21 @@ impl TapState {
                     .buffer()
                     .effects
                     .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
+            if let (
+                true,
+                ReactorEvent::PageQueued {
+                    peer,
+                    session_id,
+                    lease,
+                    ..
+                },
+            ) = (in_run, &event)
+            {
+                state
+                    .buffer()
+                    .queued
+                    .push((self::peer(peer), *session_id, *lease));
             }
             // The events it takes and its turns, kept in order with what it
             // adopts. The run's own shutdown takes events and sets causes
@@ -1140,6 +1186,7 @@ impl ReactorTap {
                 chain_effect: Mutex::default(),
                 outstanding: Mutex::default(),
                 authority: Mutex::default(),
+                retirement: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -1237,6 +1284,17 @@ impl ReactorTap {
                 outstanding.storage(fact);
             }
         }
+        if let Some(retirement) = self
+            .state
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (seq, fact) in &facts {
+                retirement.storage(*seq, fact);
+            }
+        }
         if let Some(rounds) = self
             .state
             .round_life
@@ -1289,6 +1347,31 @@ impl ReactorTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) =
             WakeCheck::new(wake, self.state.sessions.clone());
+    }
+
+    /// Checks from now on that no slot or new work outlives its departed
+    /// session, and, where `evidence` is armed, that another peer takes a
+    /// departed slot's target up, as [`super::retirement`] describes,
+    /// keeping its facts in `evidence` under the node's stamps. Call it
+    /// before the run starts. A harness that arms it must hand the tap the
+    /// node's storage facts.
+    pub fn watch_retirement(&self, evidence: RetirementEvidence) {
+        evidence.stamp_with(self.stamps());
+        let port = self.state.port.clone();
+        *self
+            .state
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Retirement::new(
+            evidence,
+            self.state.sessions.clone(),
+            self.state.ends.clone(),
+            Box::new(move || {
+                // A dropped port publishes nothing more, so every fact drained
+                // after it went was published before.
+                port.upgrade().map_or(u64::MAX, |port| port.last_seq())
+            }),
+        ));
     }
 
     /// Checks from now on that this reactor's work follows the resets it
@@ -1493,6 +1576,15 @@ impl ReactorTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .permits(read.locator_permits);
+        if let Some(retirement) = self
+            .state
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            retirement.permits(read.locator_permits);
+        }
         evidence.record(CapacityReading {
             step,
             reserved: read.reserved,
@@ -1528,6 +1620,13 @@ impl ReactorTap {
     /// by peer, in order.
     pub(crate) fn take_effects(&mut self) -> Vec<(LinkEffect, ZakuraPeerId)> {
         mem::take(&mut self.state.buffer().effects)
+    }
+
+    /// Takes the pages publishers handed to their writers since the last
+    /// call, by peer, session and read lease, in order
+    /// ([`ReactorEvent::PageQueued`]).
+    pub(crate) fn take_queued(&mut self) -> Vec<(String, u64, u64)> {
+        mem::take(&mut self.state.buffer().queued)
     }
 }
 

@@ -1,0 +1,18 @@
+# The publisher commits the page, then drops its transport slot and frame
+# instead of queuing them, so the writer never gets the page the held read
+# served. The input's first page read is held until a `Release` step, so
+# its served page opens the obligation, and no page reaches the writer
+# before the run goes quiet, where the obligation expires (Rule 13). This
+# is hdr-10a's witness that `PageQueued` follows the hand-off itself.
+# Besides publisher.rs, which the patch changes, the publisher's state and
+# the serving regulation decide when the page read is dispatched. A change
+# there can move the input off its held read.
+checks = [
+    "crates/zakura-network/src/zakura/header_sync",
+    "crates/zakura-network/src/zakura/regulation",
+]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-hold-serving-read.json"
+plan = "crates/zakura-sim/tests/fixtures/header-hold-serving-read.plan"

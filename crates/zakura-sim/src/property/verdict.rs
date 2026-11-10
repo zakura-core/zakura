@@ -196,6 +196,10 @@ pub enum Inconclusive {
     TeardownOpen,
     /// The run ended at a boundary whose state the check couldn't read.
     UnreadBoundary,
+    /// A trigger came before any read of the state the check needed to
+    /// judge it, which no later read can supply, so the run stays
+    /// unsettled wherever it ends.
+    UnreadTrigger,
 }
 
 impl fmt::Display for Inconclusive {
@@ -208,6 +212,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::HarnessFailed => "harness-failed",
             Inconclusive::TeardownOpen => "teardown-open",
             Inconclusive::UnreadBoundary => "unread-boundary",
+            Inconclusive::UnreadTrigger => "unread-trigger",
         })
     }
 }

@@ -13,15 +13,18 @@ use crate::{
         capacity::{BoundaryRead, CapacityEvidence},
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        ends::{EndEvidence, EndFact, EnvironmentAction},
+        hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
+        retirement::{HandoffFact, RetirementEvidence},
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
     },
     property::{
-        CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind, LivenessBound,
-        ObligationKey, Property, PropertyId, Source, Status, Subject, TriggerHistory, Unit,
-        Verdict,
+        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind,
+        LivenessBound, ObligationKey, Property, PropertyId, Source, Status, Subject,
+        TriggerHistory, Unit, Verdict,
     },
     ObservationLog,
 };
@@ -766,6 +769,493 @@ fn opened_at(wake: &WakeEvidence, subject: &str, stamp: u64) -> Option<SimInstan
 /// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
 fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
     view.wake().any_opened()
+}
+
+/// A held storage operation whose reply reached the reactor's waiting call
+/// is handled before the reactor goes quiet, and a held serving read's page
+/// is handed to the session's writer before the run goes quiet.
+pub const HOLD_RELEASE_WAKES: &str = "header-sync/hold-release-wakes";
+
+/// What the hold-release check reads: one node's hold-wake facts and its
+/// end facts.
+pub trait HoldWakeView {
+    /// The node's hold-wake facts.
+    fn hold_wake(&self) -> &HoldWakeEvidence;
+
+    /// The harness's environment actions and the reactor's own exit.
+    fn ends(&self) -> &EndEvidence;
+}
+
+/// [`HOLD_RELEASE_WAKES`], as a harness whose view is a [`HoldWakeView`]
+/// registers it. It applies only where a hold picked a reactor call's
+/// operation and its reply was delivered, or picked a serving read that
+/// completed with a page ([`crate::harness::header_node::hold_wake`]).
+pub fn hold_release_wakes<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: HoldWakeView,
+{
+    Property {
+        id: PropertyId::new(HOLD_RELEASE_WAKES),
+        claim: "once a held storage operation's reply reaches the reactor's waiting call, \
+                whatever its result, the reactor handles that call before quiescence, and once \
+                a held serving read's page reaches its page job, the session's publisher hands \
+                a page to its writer before quiescence, unless the harness closed or relinked \
+                that mirror or began stopping the node",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_hold_release_wake::<S>,
+        witness: Some(TriggerHistory::View(hold_wake_opened::<S::View>)),
+    }
+}
+
+/// Checks [`HOLD_RELEASE_WAKES`] at the boundary after a step.
+///
+/// Each held reply the step delivered ([`HoldWakeFact::Opened`]) obliges
+/// the reactor to handle its call before quiescence. The call's handling
+/// answers it ([`HoldWakeFact::Handled`]), and so does the harness's
+/// `Shutdown` step, the only environment action that stops the reactor
+/// ([`EnvironmentAction::Shutdown`]). Each held serving read the step
+/// served ([`HoldWakeFact::Served`]) obliges the session's publisher to
+/// queue a page before quiescence ([`HoldWakeFact::Queued`]). The harness
+/// closing or relinking that mirror answers it too, and so does the
+/// `Shutdown` step, but the node's own end of the session doesn't, and
+/// neither does an outcome the publisher picks for itself (Rule 13). A
+/// fact made once the shutdown had begun opens nothing. A reactor or
+/// publisher that ends by itself answers nothing, so the obligation expires
+/// at the next quiescence. It applies once either kind opened before any
+/// shutdown began.
+fn check_hold_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: HoldWakeView,
+{
+    let view = cx.view();
+    let shutdown = shutdown_stamp(view.ends());
+    for stamp in cx.new_stamps().to_vec() {
+        if let Some(HoldWakeFact::Opened { op, .. } | HoldWakeFact::Served { op, .. }) =
+            view.hold_wake().fact(stamp)
+        {
+            if shutdown.is_some_and(|shutdown| shutdown < stamp) {
+                continue;
+            }
+            let mut obligation = cx.fact_obligation(
+                Some(stamp),
+                Subject::Operation(op),
+                hold_wake_answer::<S::View>,
+            );
+            // One shutdown ends every reply still waiting. A `Handled` or
+            // `Queued` names one operation, so it still answers only its own.
+            obligation.cardinality = Cardinality::Every;
+            cx.oblige(obligation);
+        }
+    }
+    if hold_wake_obliged(&view) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// The stamp of the harness's `Shutdown` step, if it began stopping the
+/// node.
+fn shutdown_stamp(ends: &EndEvidence) -> Option<u64> {
+    ends.facts().into_iter().find_map(|(at, fact)| {
+        matches!(
+            fact,
+            EndFact::Environment {
+                action: EnvironmentAction::Shutdown,
+                ..
+            }
+        )
+        .then_some(at)
+    })
+}
+
+/// Whether a held reply reached the reactor, or a held serving read was
+/// served, before any shutdown began, so [`check_hold_release_wake`]
+/// obliged its answer.
+fn hold_wake_obliged<V: HoldWakeView>(view: &V) -> bool {
+    let shutdown = shutdown_stamp(view.ends());
+    view.hold_wake().facts().into_iter().any(|(at, fact)| {
+        matches!(
+            fact,
+            HoldWakeFact::Opened { .. } | HoldWakeFact::Served { .. }
+        ) && shutdown.is_none_or(|shutdown| at < shutdown)
+    })
+}
+
+/// What the fact with `stamp` means for the held reply `key` names, as
+/// [`check_hold_release_wake`] describes.
+fn hold_wake_answer<V: HoldWakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Operation(held) = key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    match view.hold_wake().fact(stamp) {
+        Some(HoldWakeFact::Handled { op, .. } | HoldWakeFact::Queued { op, .. }) if op == held => {
+            return FactAnswer::Discharges
+        }
+        Some(_) => return FactAnswer::Unrelated,
+        None => {}
+    }
+    match view.ends().fact(stamp) {
+        Some(EndFact::Environment {
+            action: EnvironmentAction::Shutdown,
+            ..
+        }) => FactAnswer::Discharges,
+        // Only a served read is the mirror's, so only its obligation ends
+        // with the mirror's session.
+        Some(EndFact::Environment {
+            peer,
+            action: EnvironmentAction::Close | EnvironmentAction::Relink,
+            ..
+        }) if view.hold_wake().served_peer(held).as_ref() == Some(&peer) => FactAnswer::Discharges,
+        _ => FactAnswer::Unrelated,
+    }
+}
+
+/// [`HOLD_RELEASE_WAKES`]'s trigger history: a held reply reached the
+/// reactor before any shutdown began.
+fn hold_wake_opened<V: HoldWakeView>(view: &V, _: &ObservationLog) -> bool {
+    hold_wake_obliged(view)
+}
+
+/// No work outlives the session it belongs to: once a session ends or is
+/// replaced, no slot names it past that unit of work, unless it's a body
+/// repair kept for its call in flight, and no round starts and no apply is
+/// dispatched for it, unless it's that repair's one apply. In the departure
+/// and timeout fixtures, once a slot goes, the one other peer that holds its
+/// target gets a locator read for it to storage before quiescence, and a
+/// round past its request deadline is handed off within the request
+/// timeout and one cached-pass refill.
+pub const PEER_RETIREMENT_PROGRESS: &str = "header-sync/peer-retirement-progress";
+
+/// The reactor's request timeout, restated: a round past this long since
+/// its deadline last armed is retired. `header_peer_retirement`'s tests pin
+/// it to the startup the harness's nodes run.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the retirement check reads: one reactor's claim breaks and when the
+/// check first applied.
+pub trait RetirementView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// The harness's environment actions and the reactor's own exit.
+    fn ends(&self) -> &EndEvidence;
+
+    /// When the reactor's departed-work check first applied.
+    fn retirement(&self) -> &RetirementEvidence;
+}
+
+/// [`PEER_RETIREMENT_PROGRESS`], as a harness whose view is a
+/// [`RetirementView`] registers it.
+pub fn peer_retirement_progress<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: RetirementView,
+{
+    Property {
+        id: PropertyId::new(PEER_RETIREMENT_PROGRESS),
+        claim: "once a session ends or is replaced, no work slot names it past the unit of \
+                work it departed in, except a body repair kept until its in-flight calls are \
+                handled, and no round starts and no apply is dispatched for it outside a stale \
+                call's own handler, except that repair's one apply; and in the departure \
+                and timeout fixtures, once a slot goes, another session's locator read for \
+                its target reaches storage before quiescence, or within one cached-pass refill \
+                when the pass is deferred, unless the node adopted the target or the \
+                environment ended the other peer's session; and a round's target is taken up \
+                by another session, or adopted, within the request timeout of its deadline's \
+                last arm plus one refill",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_peer_retirement::<S>,
+        witness: Some(TriggerHistory::View(retirement_applied::<S::View>)),
+    }
+}
+
+/// Checks [`PEER_RETIREMENT_PROGRESS`] at the boundary after a step.
+///
+/// The tap's retirement check ([`crate::harness::header_node::retirement`])
+/// judges the reactor's facts as they arrive. A departed-work break the
+/// step's drain found violates at once. Each hand-off the step's facts
+/// opened ([`HandoffFact::Opened`]) obliges another session's locator read
+/// for its target to reach storage before quiescence, and each obliging
+/// request-deadline arm ([`HandoffFact::Armed`]) obliges, within
+/// [`REQUEST_TIMEOUT`] plus one cached-pass refill, the round's next arm or
+/// the hand-off of its target, as [`retirement_answer`] says. Once the
+/// harness began stopping the node, nothing new opens, and its `Shutdown`
+/// answers every open obligation (Rule 13). It applies once a session
+/// departed with a slot, or an obligation opened, before that `Shutdown`.
+fn check_peer_retirement<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: RetirementView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let shutdown = shutdown_stamp(view.ends());
+    for stamp in cx.new_stamps().to_vec() {
+        // Once the harness began stopping the node, nothing more is owed.
+        if shutdown.is_some_and(|shutdown| shutdown < stamp) {
+            continue;
+        }
+        match view.retirement().fact(stamp) {
+            // One read, adoption or shutdown can answer a hand-off and a
+            // deadline arm together, so each answers every match. A read
+            // names a target and an arm a round, so neither crosses to
+            // another obligation's.
+            Some(HandoffFact::Opened { target, .. }) => {
+                let subject = Subject::Session(crate::storage::hex(&target.0));
+                let mut obligation =
+                    cx.fact_obligation(Some(stamp), subject, handoff_answer::<S::View>);
+                obligation.cardinality = Cardinality::Every;
+                cx.oblige(obligation);
+            }
+            Some(HandoffFact::Armed {
+                round,
+                arm,
+                obliges: true,
+                ..
+            }) => {
+                let subject = Subject::Owner(format!("round {round} arm {arm}"));
+                let mut obligation =
+                    cx.fact_obligation(Some(stamp), subject, timeout_answer::<S::View>);
+                obligation.bound = LivenessBound::VirtualTime(REQUEST_TIMEOUT + CACHED_PASS_REFILL);
+                obligation.cardinality = Cardinality::Every;
+                cx.oblige(obligation);
+            }
+            _ => {}
+        }
+    }
+    // A departure the slot rule hasn't judged at a unit boundary yet
+    // leaves the run inconclusive if it ends here (Rule 2), and a trigger
+    // the check couldn't read the fixture for leaves it so wherever it
+    // ends (Rule 3).
+    if view.retirement().unjudged() {
+        cx.unsettled(Inconclusive::UnreadBoundary);
+    }
+    if view.retirement().unread() {
+        cx.unsettled(Inconclusive::UnreadTrigger);
+    }
+    let expected = "no work outlives its departed session";
+    let mut breaks = view
+        .claims()
+        .at(
+            step,
+            &[
+                Claim::PeerRetirementProgress,
+                Claim::UnreleasedDepartedRound,
+            ],
+        )
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.retirement().applicable_by(step) || view.retirement().opened_before(shutdown) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// What the fact with `stamp` means for the obligation `opener` opened, a
+/// hand-off ([`HandoffFact::Opened`]) or an obliging deadline arm
+/// ([`HandoffFact::Armed`]), for a `stamp` after the opener's.
+///
+/// The harness's `Shutdown`, or any `Environment` fact naming the fixture's
+/// taker, discharges either (Rule 13): the taker's readiness relink comes
+/// before every obligation. So does a locator read for the target from a
+/// session other than the owner's, or the node adopting the target. The
+/// round's next arm discharges an arm. A deferred cached pass moves a
+/// hand-off's deadline to the pass's refill, but never past
+/// [`CACHED_PASS_REFILL`] after it opened.
+pub fn retirement_answer(
+    opener: &HandoffFact,
+    stamp: u64,
+    retirement: &RetirementEvidence,
+    ends: &EndEvidence,
+) -> FactAnswer {
+    if let Some(EndFact::Environment { peer, action, .. }) = ends.fact(stamp) {
+        let taker = retirement.roles().is_some_and(|roles| roles.taker == peer);
+        return if action == EnvironmentAction::Shutdown || taker {
+            FactAnswer::Discharges
+        } else {
+            FactAnswer::Unrelated
+        };
+    }
+    let Some(fact) = retirement.fact(stamp) else {
+        return FactAnswer::Unrelated;
+    };
+    let (target, session) = match opener {
+        HandoffFact::Opened {
+            target, departed, ..
+        } => (target, departed),
+        HandoffFact::Armed {
+            target, session, ..
+        } => (target, session),
+        _ => return FactAnswer::Unrelated,
+    };
+    match (opener, fact) {
+        (
+            _,
+            HandoffFact::Read {
+                target: read,
+                session: from,
+            },
+        ) if read == *target && from != *session => FactAnswer::Discharges,
+        (_, HandoffFact::Reached { target: reached }) if reached == *target => {
+            FactAnswer::Discharges
+        }
+        (
+            HandoffFact::Armed { round, arm, .. },
+            HandoffFact::Armed {
+                round: rearmed,
+                arm: next,
+                ..
+            },
+        ) if rearmed == *round && next > *arm => FactAnswer::Discharges,
+        (HandoffFact::Opened { at, .. }, HandoffFact::Deferred { until }) => FactAnswer::DefersTo(
+            at.checked_add(CACHED_PASS_REFILL)
+                .map_or(until, |cap| until.min(cap)),
+        ),
+        _ => FactAnswer::Unrelated,
+    }
+}
+
+/// A [`PEER_RETIREMENT_PROGRESS`] obligation no later fact has answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenRetirement {
+    /// The stamp of the fact that opened it.
+    pub stamp: u64,
+    /// The latest it can conclude: a hand-off one cached-pass refill after
+    /// it opened, which a deferred pass can reach and quiescence comes
+    /// before, and a deadline arm at its deadline.
+    pub deadline: SimInstant,
+    /// Whether it's a deadline arm, whose deadline the clock must reach.
+    pub timed: bool,
+}
+
+/// The obligations [`check_peer_retirement`] opened from `retirement`'s
+/// facts that no later fact in `retirement` or `ends` has discharged, by
+/// [`retirement_answer`]. The liveness harness ends a run and moves its clock
+/// by these, so it and the property can't disagree.
+pub fn open_retirement(retirement: &RetirementEvidence, ends: &EndEvidence) -> Vec<OpenRetirement> {
+    let shutdown = shutdown_stamp(ends);
+    let facts = retirement.facts();
+    let mut stamps: Vec<u64> = facts
+        .iter()
+        .map(|(stamp, _)| *stamp)
+        .chain(ends.facts().into_iter().map(|(stamp, _)| stamp))
+        .collect();
+    stamps.sort_unstable();
+    facts
+        .iter()
+        .filter(|(stamp, _)| shutdown.is_none_or(|shutdown| *stamp < shutdown))
+        .filter_map(|(stamp, fact)| {
+            let (at, timed) = match fact {
+                HandoffFact::Opened { at, .. } => (at.checked_add(CACHED_PASS_REFILL)?, false),
+                HandoffFact::Armed {
+                    obliges: true, at, ..
+                } => (at.checked_add(REQUEST_TIMEOUT + CACHED_PASS_REFILL)?, true),
+                _ => return None,
+            };
+            let answered = stamps.iter().filter(|later| *later > stamp).any(|later| {
+                matches!(
+                    retirement_answer(fact, *later, retirement, ends),
+                    FactAnswer::Discharges
+                )
+            });
+            (!answered).then_some(OpenRetirement {
+                stamp: *stamp,
+                deadline: at,
+                timed,
+            })
+        })
+        .collect()
+}
+
+/// What the fact with `stamp` means for the deadline arm `key` names, as
+/// [`retirement_answer`] says. Its bound is [`REQUEST_TIMEOUT`] after the
+/// arm, plus one cached-pass refill.
+fn timeout_answer<V: RetirementView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Owner(subject) = &key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    let Some(opener) = view
+        .retirement()
+        .facts()
+        .into_iter()
+        .find_map(|(_, fact)| match fact {
+            HandoffFact::Armed {
+                round,
+                arm,
+                obliges: true,
+                ..
+            } if format!("round {round} arm {arm}") == *subject => Some(fact),
+            _ => None,
+        })
+    else {
+        return FactAnswer::Unrelated;
+    };
+    retirement_answer(&opener, stamp, view.retirement(), view.ends())
+}
+
+/// [`PEER_RETIREMENT_PROGRESS`]'s violations at a settled end: the slot
+/// rule's breaks for a departure that never reached its unit boundary,
+/// since a settled run is judged there (Rule 2).
+pub fn retirement_end_violations(retirement: &RetirementEvidence) -> Vec<EndViolation> {
+    retirement
+        .settled_breaks()
+        .into_iter()
+        .map(|actual| EndViolation {
+            property: PropertyId::new(PEER_RETIREMENT_PROGRESS),
+            expected: "no work outlives its departed session".to_owned(),
+            actual,
+        })
+        .collect()
+}
+
+/// What the fact with `stamp` means for the hand-off `key` names, the latest
+/// before `stamp` for its target, as [`retirement_answer`] says.
+fn handoff_answer<V: RetirementView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Session(subject) = &key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    let Some(opener) = view
+        .retirement()
+        .facts()
+        .into_iter()
+        .rev()
+        .filter(|(at, _)| *at < stamp)
+        .find_map(|(_, fact)| match fact {
+            HandoffFact::Opened { target, .. } if crate::storage::hex(&target.0) == *subject => {
+                Some(fact)
+            }
+            _ => None,
+        })
+    else {
+        return FactAnswer::Unrelated;
+    };
+    retirement_answer(&opener, stamp, view.retirement(), view.ends())
+}
+
+/// [`PEER_RETIREMENT_PROGRESS`]'s trigger history: a session departed with
+/// a slot, or an obligation opened before the harness began stopping the
+/// node.
+fn retirement_applied<V: RetirementView>(view: &V, _: &ObservationLog) -> bool {
+    view.retirement().applicable() || view.retirement().opened_before(shutdown_stamp(view.ends()))
 }
 
 /// Under a wire flood, the run loop reads each externally published

@@ -426,6 +426,48 @@ struct OwnedTerminal {
 struct EncodedPage {
     page: Page,
     frame: Frame,
+    #[cfg(any(test, zakura_sim))]
+    queued: QueuedPage,
+}
+
+/// What [`ReactorEvent::PageQueued`] reports of an encoded page, and where.
+/// The frame took its entries, so the page keeps their header hashes here.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct QueuedPage {
+    subscription_id: u64,
+    common_ancestor: Frontier,
+    headers: Vec<block::Hash>,
+    initial_target: block::Hash,
+    reaches_target: bool,
+    /// The handle of the retained-path lease the page's read used, which
+    /// [`run_job`] attaches once the read returns the page.
+    lease: Option<u64>,
+    /// The publisher's tap, which [`start_page`] attaches once its job
+    /// returns the page, if the publisher has one.
+    tap: Option<super::CreditTap>,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl QueuedPage {
+    /// Reports the page to its tap, if it has one.
+    fn report(self) {
+        if let Some(tap) = self.tap {
+            tap.observer
+                .observe(super::super::observe::ReactorEvent::PageQueued {
+                    peer: tap.peer,
+                    session_id: tap.session_id,
+                    lease: self
+                        .lease
+                        .expect("run_job names every page's read lease before returning it"),
+                    subscription_id: self.subscription_id,
+                    common_ancestor: self.common_ancestor,
+                    headers: self.headers,
+                    initial_target: self.initial_target,
+                    reaches_target: self.reaches_target,
+                });
+        }
+    }
 }
 
 /// What a page job found instead of a page.
@@ -783,11 +825,12 @@ fn settle(
                 slot.send(encoded.frame);
             }
             // The same commit, reported under the same lock, since it grows
-            // the subscription's sent-cursor ring. Release keeps the
-            // statement above unchanged.
+            // the subscription's sent-cursor ring, and the same send, which
+            // reports the queued page. Release keeps the statement above
+            // unchanged.
             #[cfg(any(test, zakura_sim))]
             if lock(shared).commit_reported(key, &encoded.page) {
-                slot.send(encoded.frame);
+                queue_page(slot, encoded);
             }
             ControlFlow::Continue(())
         }
@@ -818,6 +861,17 @@ fn settle(
             ControlFlow::Continue(())
         }
         Progress::Closed => ControlFlow::Break(lock(shared).state.closed()),
+    }
+}
+
+/// Queues committed `encoded`'s frame on its transport `slot`, the page's
+/// hand-off to the writer, then reports the page
+/// ([`ReactorEvent::PageQueued`]) if the queue took it, so a page whose
+/// frame isn't queued, such as one sent to a closed queue, reports nothing.
+#[cfg(any(test, zakura_sim))]
+fn queue_page(slot: PushSend<'_>, encoded: EncodedPage) {
+    if slot.send(encoded.frame) {
+        encoded.queued.report();
     }
 }
 
@@ -853,6 +907,12 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let seen = job.selected.clone();
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
     let check = job.count == 0;
+    #[cfg(any(test, zakura_sim))]
+    let tap = task.life.as_ref().map(|life| super::CreditTap {
+        observer: life.observer.clone(),
+        peer: life.peer.clone(),
+        session_id: life.session_id,
+    });
     Box::pin(async move {
         let permit = if check {
             Admission::Check {
@@ -890,6 +950,14 @@ fn start_page<'a, const HEADER_BYTES: usize>(
                 unreachable!("a check runs `check_following`, which reads no page")
             }
             (Err(refusal), _) => return Progress::Refused(refusal),
+        };
+        #[cfg(any(test, zakura_sim))]
+        let encoded = EncodedPage {
+            queued: QueuedPage {
+                tap,
+                ..encoded.queued
+            },
+            ..encoded
         };
         let Ok(slot) = permit.reserve_send(send).await else {
             return Progress::Closed;
@@ -999,7 +1067,17 @@ async fn run_job<const HEADER_BYTES: usize>(
             want_tree_aux: job.schema == AuxSchema::V1,
         };
         match port.read_header_path(path.clone(), read).await {
+            #[cfg(not(any(test, zakura_sim)))]
             Ok(ReadPathReply::Page(page)) => return page_output::<HEADER_BYTES>(job, *page),
+            // The same page, naming the lease its read used.
+            #[cfg(any(test, zakura_sim))]
+            Ok(ReadPathReply::Page(page)) => {
+                let lease = path.handle_id();
+                return page_output::<HEADER_BYTES>(job, *page).map(|mut encoded| {
+                    encoded.queued.lease = Some(lease);
+                    encoded
+                });
+            }
             // The lease expired or state evicted it. Acquire it again from
             // the last header sent.
             Ok(ReadPathReply::Unavailable) => release(port, job.id, path).await,
@@ -1144,6 +1222,16 @@ fn page_output<const HEADER_BYTES: usize>(
     };
     let last = Frontier::new(block::Height(height), last.header.hash());
     let reaches_target = reaches_target(job.following, last.hash, job.initial_target);
+    #[cfg(any(test, zakura_sim))]
+    let queued = QueuedPage {
+        subscription_id: job.id,
+        common_ancestor: page.common_ancestor,
+        headers: entries.iter().map(|entry| entry.header.hash()).collect(),
+        initial_target: job.initial_target,
+        reaches_target,
+        lease: None,
+        tap: None,
+    };
     let frame = encode_frame(&Message::<HEADER_BYTES>::Headers(Headers {
         subscription_id: job.id,
         initial_target_tip_hash: job.initial_target,
@@ -1165,6 +1253,8 @@ fn page_output<const HEADER_BYTES: usize>(
                     payload_len: frame.payload.len(),
                 },
                 frame,
+                #[cfg(any(test, zakura_sim))]
+                queued,
             })
         }
         _ => Err(Output::Stall(Stall::Local, "encode").into()),

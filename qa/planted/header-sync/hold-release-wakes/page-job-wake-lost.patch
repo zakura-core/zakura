@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -855,7 +855,16 @@
+                 }
+             }
+         });
+-        let (result, permit) = match running.await {
++        // Mutation: polls the job's handle with a waker that does nothing,
++        // so the job's end never wakes the publisher, which sees the page
++        // only once something else wakes it.
++        let mut running = std::pin::pin!(running);
++        let joined = std::future::poll_fn(|_| {
++            let mut quiet = std::task::Context::from_waker(std::task::Waker::noop());
++            running.as_mut().poll(&mut quiet)
++        })
++        .await;
++        let (result, permit) = match joined {
+             Ok(Some(done)) => done,
+             // The publisher task re-raises the job's panic.
+             Ok(None) => {

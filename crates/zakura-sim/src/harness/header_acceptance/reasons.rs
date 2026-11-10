@@ -267,6 +267,24 @@ pub static NA_REASONS: &[NaProducer] = &[
     },
     NaProducer {
         file: "src/domain/header_sync.rs",
+        function: "check_hold_release_wake",
+        fingerprint: "385d74bc1223da8e",
+        constructions: &[step(
+            "no held reply reached a reactor call, and no held serving read served its page, before the harness's shutdown by this step",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_peer_retirement",
+        fingerprint: "50c476d2ab2cdeec",
+        constructions: &[step(
+            "no drain has judged a departed session's work by this step, and no hand-off or obliging deadline arm opened before the harness's shutdown",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
         function: "check_outstanding_work_bounded",
         fingerprint: "4722d816dec8d8c8",
         constructions: &[step(

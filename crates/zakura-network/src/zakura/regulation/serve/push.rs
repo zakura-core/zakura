@@ -174,10 +174,12 @@ impl PushPermit {
 }
 
 impl PushSend<'_> {
-    /// Queue the page immediately after its subscription credit is committed.
-    pub(crate) fn send(self, frame: Frame) {
+    /// Queue the page immediately after its subscription credit is committed,
+    /// returning whether the transport queue took it
+    /// ([`crate::zakura::transport::Queued`]).
+    pub(crate) fn send(self, frame: Frame) -> crate::zakura::transport::Queued {
         self.slot
-            .send(frame, FrameGuard::new(Arc::new(self.grants)));
+            .send(frame, FrameGuard::new(Arc::new(self.grants)))
     }
 }
 

@@ -24,11 +24,13 @@ pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;
+pub mod hold_wake;
 pub mod outstanding;
 mod pair;
 pub mod policy;
 pub mod recovery;
 pub mod reservation;
+pub mod retirement;
 pub mod round_life;
 pub mod session;
 pub mod stale;
@@ -75,6 +77,7 @@ use zakura_storage::header::{
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
     ends::EnvironmentAction,
+    hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RELINK, UNREACHED},
     session::SessionEvidence,
@@ -300,6 +303,9 @@ pub struct Effects {
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
+    /// Finds which held operations' replies reached the reactor, once
+    /// [`PolicySource::with_hold_wakes`] turns it on.
+    hold_wake: Option<HoldWakeCheck>,
     port: Arc<ControlledPort>,
     base: Base,
     bound: Option<Duration>,
@@ -326,6 +332,7 @@ impl PolicySource {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             tap: None,
+            hold_wake: None,
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
@@ -357,6 +364,26 @@ impl PolicySource {
     pub fn with_tap(self, tap: ReactorTap) -> Self {
         PolicySource {
             tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This source, keeping `header-sync/hold-release-wakes`'s facts in
+    /// `evidence` ([`hold_wake`]), stamped with its tap's stamps. Call it
+    /// after [`PolicySource::with_tap`].
+    ///
+    /// # Panics
+    ///
+    /// If the source has no tap, which logs the reactor facts the check
+    /// reads.
+    pub fn with_hold_wakes(self, evidence: HoldWakeEvidence) -> Self {
+        let tap = self
+            .tap
+            .as_ref()
+            .expect("the hold-wake check reads the reactor facts the tap logs");
+        evidence.stamp_with(tap.stamps());
+        PolicySource {
+            hold_wake: Some(HoldWakeCheck::new(evidence)),
             ..self
         }
     }
@@ -434,6 +461,7 @@ impl ActionSource for PolicySource {
         let before = log.entries().len();
         let stored = self.storage.observe(log);
         let mut tapped_effects = Vec::new();
+        let mut queued = Vec::new();
         // Drained even when storage failed, so a port panic the tap holds
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
@@ -454,6 +482,7 @@ impl ActionSource for PolicySource {
                 );
                 tap.engine_runs(&runs);
                 tapped_effects = tap.take_effects();
+                queued = tap.take_queued();
                 tap.observe(log)
             }
             None => Ok(()),
@@ -474,6 +503,13 @@ impl ActionSource for PolicySource {
             .borrow()
             .first()
             .map(|(_, name)| name.clone());
+        let names = self.effects.names.borrow();
+        let name = |storage: &str| {
+            names
+                .iter()
+                .find(|(id, _)| tap::peer(id) == storage)
+                .map(|(_, name)| name.clone())
+        };
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
@@ -482,12 +518,24 @@ impl ActionSource for PolicySource {
                     if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
                         predicates.record_link(LinkEffect::StorageStopped, node);
                     }
+                    if let Some(check) = &mut self.hold_wake {
+                        check.storage(fact, &predicates, name);
+                    }
                 }
-                Observation::Reactor { event, .. } => predicates.record_reactor(event),
+                Observation::Reactor { event, .. } => {
+                    predicates.record_reactor(event);
+                    if let Some(check) = &mut self.hold_wake {
+                        check.reactor(event);
+                    }
+                }
                 _ => {}
             }
         }
-        let names = self.effects.names.borrow();
+        if let Some(check) = &mut self.hold_wake {
+            for (peer, session_id, lease) in &queued {
+                check.queued(peer, *session_id, *lease);
+            }
+        }
         for (effect, peer) in tapped_effects {
             if let Some((_, name)) = names.iter().find(|(id, _)| *id == peer) {
                 predicates.record_link(effect, name);
@@ -715,6 +763,62 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
+    /// The mirror whose pages the harness holds back, if any.
+    delayed_page: Option<DelayedPage>,
+}
+
+/// A mirror whose first `Headers` frame on each of its links the harness
+/// holds for `by` of virtual time before the node under test gets it, with
+/// every later frame behind it, as a slow path to the node would. It's how
+/// a fixture makes a page arrive just before the node's request deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelayedPage {
+    /// The mirror's name.
+    pub mirror: String,
+    /// How long its first page waits.
+    pub by: Duration,
+}
+
+/// Forwards each frame from `from_mirror` to `to_node`, in order, holding
+/// the first `Headers` frame for `by` of virtual time before it goes and
+/// reading nothing meanwhile, until the link closes or either stream ends.
+async fn delay_first_page(
+    mut from_mirror: FramedRecv,
+    to_node: FramedSend,
+    by: Duration,
+    cancel: CancellationToken,
+) {
+    let mut held = false;
+    loop {
+        let frame = zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = from_mirror.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        if !held
+            && matches!(
+                decode_frame::<RegtestMessage>(&frame),
+                Ok(v9::Message::Headers(_))
+            )
+        {
+            held = true;
+            zakura_rt::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                () = zakura_rt::time::sleep(by) => {}
+            }
+        }
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            sent = to_node.send(frame) => if sent.is_err() {
+                return;
+            },
+        }
+    }
 }
 
 /// The far end of a flooding link: the dialer's streams and its connection
@@ -816,6 +920,16 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
+            delayed_page: None,
+        }
+    }
+
+    /// This topology, holding back `delayed`'s mirror's first page on each
+    /// of its links ([`DelayedPage`]).
+    pub fn with_delayed_page(self, delayed: Option<DelayedPage>) -> Self {
+        Topology {
+            delayed_page: delayed,
+            ..self
         }
     }
 
@@ -1040,6 +1154,23 @@ impl Topology {
                 });
                 continue;
             }
+            let delay = self
+                .delayed_page
+                .as_ref()
+                .filter(|delayed| local != 0 && delayed.mirror == self.nodes[local].name)
+                .map(|delayed| delayed.by);
+            let streams = match delay {
+                Some(by) => {
+                    let (from_node, to_node) = streams;
+                    let (to_relay, from_mirror) = framed_channel(LINK_DEPTH);
+                    zakura_rt::task::spawn_named(
+                        "delay-page",
+                        delay_first_page(from_mirror, to_node, by, token.clone()),
+                    );
+                    (from_node, to_relay)
+                }
+                None => streams,
+            };
             let peer = Peer::new_versioned(
                 id,
                 self.nodes[remote].id.clone(),
@@ -1094,6 +1225,27 @@ impl Topology {
     /// was picked, or its reactor is cancelled.
     fn stopping(&self) -> bool {
         self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
+    }
+
+    /// Begins the run's end, as the step loop picks it: the node under
+    /// test's stop, recorded as a `Shutdown` step's pick records it, unless
+    /// a `Shutdown` step already began it. [`Topology::finish`] carries it
+    /// out.
+    pub(crate) fn begin_finish(&self) {
+        if !self.shutdown_picked() {
+            self.expect_shutdown();
+        }
+    }
+
+    /// Ends every node's work, so a run can end idle: closes every link and
+    /// cancels the node under test's reactor, as a `Shutdown` step does,
+    /// then each mirror's. Run it from a harness task, after
+    /// [`Topology::begin_finish`].
+    pub(crate) fn finish(&self) {
+        self.shutdown();
+        for node in &self.nodes[1..] {
+            node.shutdown.cancel();
+        }
     }
 
     /// Whether the harness picked a `Shutdown` step, which begins the node

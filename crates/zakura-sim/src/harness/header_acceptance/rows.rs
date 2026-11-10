@@ -26,6 +26,8 @@ const WIRE: &str = "header-sync/wire";
 const FLOOD: &str = "header-sync/flood";
 /// `header-sync/repair`.
 const REPAIR: &str = "header-sync/repair";
+/// `header-sync/liveness`.
+const LIVENESS: &str = "header-sync/liveness";
 /// The header reactor machine.
 const REACTOR: &str = "header/reactor-policy";
 /// The header publisher machine.
@@ -40,6 +42,7 @@ pub const HEADER_HARNESSES: &[&str] = &[
     WIRE,
     FLOOD,
     REPAIR,
+    LIVENESS,
     REACTOR,
     PUBLISHER,
 ];
@@ -64,6 +67,10 @@ const CHAIN: &str = "header-sync/stale-chain-effect-inert";
 const COMMIT: &str = "header-sync/commit-only-authorized";
 /// `header-sync/outstanding-work-bounded`.
 const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
+/// `header-sync/hold-release-wakes`.
+const HOLD: &str = "header-sync/hold-release-wakes";
+/// `header-sync/peer-retirement-progress`.
+const RETIREMENT: &str = "header-sync/peer-retirement-progress";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
 /// `header-sync/watch-observed-under-flood`.
@@ -81,7 +88,7 @@ const HONEST: &str = "session/honest-never-punished";
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
-const STORAGE_REGISTERS: [&str; 11] = [
+const STORAGE_REGISTERS: [&str; 12] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -92,6 +99,7 @@ const STORAGE_REGISTERS: [&str; 11] = [
     RESET,
     CHAIN,
     COMMIT,
+    RETIREMENT,
     OUTSTANDING,
 ];
 
@@ -114,6 +122,8 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(FLOOD, &STORAGE_REGISTERS);
     add(FLOOD, &[WATCH_WIRE, WATCH_LIFECYCLE]);
     add(REPAIR, &STORAGE_REGISTERS);
+    add(LIVENESS, &STORAGE_REGISTERS);
+    add(LIVENESS, &[HOLD]);
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
@@ -361,6 +371,50 @@ const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_witnesses_hold_outstanding_work_bounded",
     ),
     case: "header-authority-forks-sharing-a-header",
+};
+
+/// Each committed hold-release fixture, by its fixture stem, which its
+/// witness test runs under the fixed Plan.
+const HOLD_CASES: [&str; 4] = [
+    "header-hold-held-locator",
+    "header-hold-held-prepare",
+    "header-hold-held-apply",
+    "header-hold-serving-read",
+];
+
+/// The committed hold-release fixtures, each holding and applying
+/// `hold-release-wakes` under the fixed Plan.
+const HOLD_WITNESSES: HistoryRef = HistoryRef {
+    harness: LIVENESS,
+    witness: sim_test(
+        "tests/header_hold_release.rs",
+        "the_committed_fixtures_match_their_names",
+    ),
+    case: "header-hold-held-locator",
+};
+
+/// Each committed retirement fixture, by its fixture stem, which its
+/// witness test runs under the fixed Plan.
+const RETIRE_CASES: [&str; 8] = [
+    "header-retire-timeout",
+    "header-retire-late-page",
+    "header-retire-awaiting-close",
+    "header-retire-preparing-close",
+    "header-retire-receiving-close",
+    "header-retire-receiving-relink",
+    "header-retire-preparing-relink",
+    "header-retire-applying-relink",
+];
+
+/// The committed retirement fixtures, each holding and applying
+/// `peer-retirement-progress` under the fixed Plan.
+const RETIRE_WITNESSES: HistoryRef = HistoryRef {
+    harness: LIVENESS,
+    witness: sim_test(
+        "tests/header_peer_retirement.rs",
+        "the_committed_fixtures_match_their_names",
+    ),
+    case: "header-retire-timeout",
 };
 
 /// The flood witness test, which runs both committed flood inputs.
@@ -690,6 +744,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             OUTSTANDING,
         ));
     }
+    // Each committed hdr-10 liveness fixture under the fixed Plan.
+    for (cases, history, id) in [
+        (&HOLD_CASES[..], HOLD_WITNESSES, HOLD),
+        (&RETIRE_CASES[..], RETIRE_WITNESSES, RETIREMENT),
+    ] {
+        for &case in cases {
+            histories.push((HistoryRef { case, ..history }, id));
+        }
+    }
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
@@ -816,6 +879,8 @@ pub fn witness_tests() -> Vec<TestRef> {
         CHAIN_WITNESSES.witness,
         AUTHORITY_WITNESSES.witness,
         OUTSTANDING_WITNESSES.witness,
+        HOLD_WITNESSES.witness,
+        RETIRE_WITNESSES.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
         MID_PREPARE.witness,
@@ -1068,7 +1133,8 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
 
 /// The 13 hand-written header IDs' rows.
 fn hand_written_rows() -> Vec<Row> {
-    let storage_harnesses: &'static [&'static str] = &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR];
+    let storage_harnesses: &'static [&'static str] =
+        &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS];
     let mut rows = Vec::new();
 
     let mut operation_ids = holds(OPERATION_IDS, G1, NODE_SYNC);
@@ -1798,8 +1864,59 @@ fn hand_written_rows() -> Vec<Row> {
     }
     rows.push(sim_row(
         OUTSTANDING,
-        &[STORAGE, RELEASE_WAKE, FLOOD, REPAIR],
+        &[STORAGE, RELEASE_WAKE, FLOOD, REPAIR, LIVENESS],
         outstanding,
+    ));
+
+    let mut hold = holds(HOLD, G5, HOLD_WITNESSES);
+    for (index, name) in [
+        "committed-page-dropped",
+        "completion-arm-removed",
+        "exits-on-reply",
+        "lost-notification",
+        "page-job-wake-lost",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        hold.extend(caught(
+            LIVENESS,
+            case(HOLD, name),
+            &[HOLD],
+            Found::AtStep,
+            G5,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(HOLD, &[LIVENESS], hold));
+
+    let mut retirement = holds(RETIREMENT, G5, RETIRE_WITNESSES);
+    // `session-view` and `unreleased-retirement` are hdr-5's native
+    // mutations, moved here as cases of their own names.
+    for (index, name) in [
+        "kept-repair-widened",
+        "lost-timeout",
+        "retained-owner",
+        "session-view",
+        "spent-on-refusal",
+        "unreleased-retirement",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        retirement.extend(caught(
+            LIVENESS,
+            case(RETIREMENT, name),
+            &[RETIREMENT],
+            Found::AtStep,
+            G5,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(
+        RETIREMENT,
+        &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS],
+        retirement,
     ));
 
     let wakes = WAKES;
@@ -1928,7 +2045,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(machine_row(PUBLISHER, publisher));
 
     let node_harnesses: &'static [&'static str] =
-        &[SMOKE, STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR];
+        &[SMOKE, STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS];
     let mut panic = holds(SIM_WIDE[0], NONE, SMOKE_RUN);
     panic.push(owed(Key::catch(SIM_WIDE[0]), NONE));
     rows.push(sim_row(SIM_WIDE[0], node_harnesses, panic));
@@ -2416,11 +2533,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     to_move("reordered-payload", COMMIT, "hdr-9c.2a"),
     to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
-    to_move(
-        "session-view",
-        "header-sync/peer-retirement-progress",
-        "hdr-10b",
-    ),
+    NativeMutation {
+        patch: "session-view",
+        class: NativeClass::Moved {
+            property: "header-sync/peer-retirement-progress",
+            case: "session-view",
+        },
+    },
     to_move(
         "short-cooldown",
         "header-sync/header-fault-penalized",
@@ -2442,11 +2561,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         "hdr-12b",
     ),
     to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
-    to_move(
-        "unreleased-retirement",
-        "header-sync/peer-retirement-progress",
-        "hdr-10b",
-    ),
+    NativeMutation {
+        patch: "unreleased-retirement",
+        class: NativeClass::Moved {
+            property: "header-sync/peer-retirement-progress",
+            case: "unreleased-retirement",
+        },
+    },
     to_move(
         "unsent-tip",
         "header-sync/state-publication-consistent",

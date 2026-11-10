@@ -665,6 +665,15 @@ impl<F: Family> Predicates<F> {
         ))
     }
 
+    /// Whether a hold picked operation `key`'s current stage at its
+    /// submission, so it completes only once that hold opens.
+    pub(crate) fn held(&self, key: F::Key) -> bool {
+        self.ops
+            .get(&key)
+            .and_then(|stages| stages.last())
+            .is_some_and(|op| op.hold.is_some())
+    }
+
     /// Whether a reply hold picked operation `key`'s current stage, so an
     /// engine completion commits it and holds its reply.
     pub(crate) fn reply_held(&self, key: F::Key) -> bool {

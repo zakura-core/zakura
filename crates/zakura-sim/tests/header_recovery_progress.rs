@@ -16,15 +16,20 @@ mod support;
 use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
 
 use support::{byte_inputs, inputs};
+use zakura_chain::block;
+use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
     harness::{
-        header_node::recovery::{RecoveryEvidence, RecoveryObjective},
+        header_node::{
+            recovery::{RecoveryEvidence, RecoveryObjective},
+            Chain, Fork,
+        },
         header_sync::{
             liveness::{LivenessScenario, RecoveryFixture, RECOVERY_SOURCE},
-            Liveness,
+            Liveness, Weights,
         },
         run_prepared, Subsystem,
     },
@@ -337,5 +342,115 @@ fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
                 && stdout.contains("every pick, draw and observation matched"),
             "{name}: {replayed:?}"
         );
+    }
+}
+
+/// The fixture headers of `chain` above `height`, in height order.
+fn above(chain: Chain, height: u32) -> Vec<Frontier> {
+    let fixture = Weights::default().fixture();
+    let mut headers = Vec::new();
+    for (parent, segment) in chain.segments(&fixture) {
+        for (offset, header) in (1..).zip(segment) {
+            let at = parent.height.0 + offset;
+            headers.push(Frontier::new(block::Height(at), header.hash()));
+        }
+    }
+    headers.retain(|header| header.height.0 > height);
+    headers
+}
+
+/// `main` headers on the main branch, then `len` on branch 1.
+fn fork(main: u32, len: u32) -> Chain {
+    Chain {
+        main,
+        fork: Some(Fork { branch: 1, len }),
+    }
+}
+
+/// Every other recovery control holds under 4 plans, each met at the
+/// `recovered` pick, with the objective its doc names. Mirrors sync from
+/// the node too, so a member's recorded chain can be one it took from the
+/// node, and the expected headers come from the fixture's chains:
+///
+/// - `Fork`: A4 and A5. `mirror-1`'s B4, heavier than the baseline,
+///   doesn't meet it.
+/// - `SharedPrefix`: A4 to A6, so `mirror-1`'s A4 meets it, and its B5
+///   doesn't.
+/// - `Invalidation`: from a baseline at A2, A3 and A4, so the header the
+///   `Recover` reconsidered counts.
+/// - `EqualWork`: both tied tips, A4 and B4.
+/// - `Reconsideration`: from a baseline at A2, the node's own branch B3 to
+///   B5, which it holds at the pick. The source's lighter A3 and A4 don't
+///   meet it.
+///
+/// `SyncedFirst`'s baseline already holds A4, so nothing is owed and the
+/// property doesn't apply.
+#[test]
+fn every_recovery_control_holds() {
+    for fixture in RecoveryFixture::ALL {
+        for input in inputs(4, 256) {
+            let run = run(fixture, input);
+            let (record, objective) = run.recovery.objective().expect("the pick wrote its record");
+            let baseline = run
+                .recovery
+                .baseline()
+                .expect("the recover kept a baseline");
+            let base = baseline
+                .chain
+                .last()
+                .expect("a chain has its anchor")
+                .height
+                .0;
+            if fixture == RecoveryFixture::SyncedFirst {
+                assert_eq!(base, 4, "{fixture:?}");
+                assert_eq!(objective, None, "{fixture:?}");
+                assert_eq!(
+                    outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+                    &PropertyOutcome::NotApplicable,
+                    "{fixture:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+                &PropertyOutcome::Held { applicable: 1 },
+                "{fixture:?}"
+            );
+            let objective = objective.expect("a successor is owed");
+            assert!(
+                objective.met_by(&record.node_tip.0),
+                "{fixture:?}: met at the pick"
+            );
+            let (mut expected, unmet) = match fixture {
+                RecoveryFixture::Successor => (above(Chain::main(4), 3), Vec::new()),
+                RecoveryFixture::Fork => (above(Chain::main(5), 3), above(fork(3, 1), 3)),
+                RecoveryFixture::SharedPrefix => {
+                    assert!(objective.met_by(&above(fork(4, 1), 3)[0]), "{fixture:?}");
+                    (above(Chain::main(6), 3), above(fork(4, 1), 4))
+                }
+                RecoveryFixture::Invalidation => {
+                    assert_eq!(base, 2, "{fixture:?}");
+                    (above(Chain::main(4), 2), Vec::new())
+                }
+                RecoveryFixture::EqualWork => {
+                    let mut tied = above(Chain::main(4), 3);
+                    tied.extend(above(fork(3, 1), 3));
+                    (tied, Vec::new())
+                }
+                RecoveryFixture::Reconsideration => {
+                    assert_eq!(base, 2, "{fixture:?}");
+                    assert_eq!(record.node_tip.0.height.0, 5, "{fixture:?}");
+                    (above(fork(2, 3), 2), above(Chain::main(4), 2))
+                }
+                RecoveryFixture::SyncedFirst => unreachable!("judged above"),
+            };
+            let mut headers = objective.headers.clone();
+            headers.sort_by_key(|header| (header.height, header.hash.0));
+            expected.sort_by_key(|header| (header.height, header.hash.0));
+            assert_eq!(headers, expected, "{fixture:?}");
+            for header in unmet {
+                assert!(!objective.met_by(&header), "{fixture:?}: {header:?}");
+            }
+        }
     }
 }

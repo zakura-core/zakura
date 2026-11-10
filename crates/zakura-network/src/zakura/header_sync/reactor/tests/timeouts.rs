@@ -1584,6 +1584,134 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
     assert!(deadline >= before + fixture.reactor.startup.request_timeout);
 }
 
+/// A carried replacement budget caps a VCT repair request's timeout, like an
+/// ordinary request's, and is used up.
+#[test]
+fn a_repair_request_uses_a_carried_budget() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let carried = std::time::Duration::from_secs(1);
+    fixture
+        .reactor
+        .state
+        .carry_replaced_request_budget(peer, carried);
+    fixture.schedule();
+    let before = Instant::now();
+    fixture.advertise(&peers, 7);
+    let after = Instant::now();
+
+    assert!(matches!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .map(|active| &active.purpose),
+        Some(HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
+    ));
+    let deadline = fixture.reactor.state.request_deadlines[peer];
+    assert!(deadline >= before + carried && deadline <= after + carried);
+    assert!(fixture.reactor.state.request_deadline_is_carried(peer));
+    assert_eq!(
+        fixture.reactor.state.peers[peer].replaced_request_budget,
+        None
+    );
+}
+
+/// A sole repair supplier that never answers can't replace its session just
+/// before each timeout forever. Each cycle, a fresh session gets the repair
+/// with a full timeout, and the session replacing it just before that timeout
+/// gets the carried second. That timeout costs a strike and requeues the
+/// repair without excluding the supplier, so the strike limit drops the peer.
+#[tokio::test(start_paused = true)]
+async fn a_sole_repair_supplier_cannot_replace_its_way_past_the_timeout() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let timeout = fixture.reactor.startup.request_timeout;
+    let limit = fixture
+        .reactor
+        .startup
+        .config
+        .max_unproductive_header_requests;
+    let left = std::time::Duration::from_secs(1);
+    let (peers, mut outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    let mut session_id = 7;
+    for strike in 1..=limit {
+        for full in [true, false] {
+            if !full {
+                time::advance(timeout - left).await;
+            }
+            session_id += 1;
+            let (replacement, outbound) = fixture.connect(&[0x71], session_id);
+            outbounds.extend(outbound);
+            fixture.advertise(&replacement, session_id);
+            assert_eq!(
+                fixture
+                    .reactor
+                    .peer_work_queue
+                    .active(peer)
+                    .map(|active| active.owner.session_id()),
+                Some(session_id),
+                "session {session_id} holds the repair before strike {strike}"
+            );
+        }
+        time::advance(left).await;
+        fixture.reactor.retire_timed_out_requests(Instant::now());
+
+        if strike < limit {
+            assert_eq!(
+                fixture.reactor.state.peers[peer].unproductive_requests,
+                strike
+            );
+            let task = fixture
+                .reactor
+                .state
+                .vct_repair
+                .current()
+                .expect("the timeout keeps the repair scheduled");
+            assert!(
+                task.tried_sources.is_empty(),
+                "a carried timeout doesn't exclude the supplier"
+            );
+        } else {
+            assert!(
+                !fixture.reactor.sessions.contains_key(peer),
+                "the strike limit drops the supplier"
+            );
+            assert!(fixture
+                .reactor
+                .state
+                .unproductive_peer_cooldowns
+                .contains_key(peer));
+        }
+    }
+}
+
+/// A repair that times out under a full timeout still excludes its supplier
+/// for the episode, as before carried budgets.
+#[tokio::test(start_paused = true)]
+async fn a_full_repair_timeout_still_excludes_the_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(!fixture.reactor.state.request_deadline_is_carried(peer));
+
+    time::advance(fixture.reactor.startup.request_timeout).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+
+    assert_eq!(fixture.reactor.state.peers[peer].unproductive_requests, 1);
+    let task = fixture
+        .reactor
+        .state
+        .vct_repair
+        .current()
+        .expect("the timeout keeps the repair scheduled");
+    assert!(task.tried_sources.contains(&source_id_from_peer(peer)));
+}
+
 #[tokio::test(start_paused = true)]
 async fn unselected_supplier_waits_for_status_without_a_retry_deadline() {
     let mut fixture = ReadyVctRepairFixture::new();

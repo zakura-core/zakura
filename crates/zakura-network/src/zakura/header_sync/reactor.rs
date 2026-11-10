@@ -955,10 +955,24 @@ impl HeaderSyncReactor {
             )
         });
         let replaces_existing_peer = self.sessions.contains_key(&peer);
+        let mut unanswered_budget = None;
         if replaces_existing_peer && !owns_local_repair_operation {
+            // A receiving request's deadline is reset by each page, so it
+            // still measures how long the peer has left the request unanswered.
+            let now = Instant::now();
+            unanswered_budget = self
+                .peer_work_queue
+                .active(&peer)
+                .is_some_and(|active| active.phase == HeaderTargetPhase::Receiving)
+                .then(|| self.state.request_deadlines.get(&peer).copied())
+                .flatten()
+                .map(|deadline| deadline.saturating_duration_since(now));
             self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
         }
         let replaced_schedule = self.state.admit_session(&peer, Instant::now());
+        if let Some(budget) = unanswered_budget {
+            self.state.carry_replaced_request_budget(&peer, budget);
+        }
         let previous = self.sessions.insert(
             peer.clone(),
             SessionHandles {
@@ -2425,7 +2439,7 @@ impl HeaderSyncReactor {
                                 .expect("the request was just started")
                         )
                     );
-                    self.state.arm_request_deadline(
+                    self.state.arm_started_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,
@@ -2747,10 +2761,12 @@ impl HeaderSyncReactor {
                             .peer_work_queue
                             .active(&peer)
                             .map(|active| active.owner.session_id());
-                        self.retry_vct_repair(
-                            owner,
-                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut),
-                        );
+                        let retry = if self.state.request_deadline_is_carried(&peer) {
+                            VctRepairRetry::carried_timeout(source)
+                        } else {
+                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut)
+                        };
+                        self.retry_vct_repair(owner, retry);
                         // A repair reserves aggregate header budget that ordinary staging cannot
                         // use, so a supplier that withholds its response until the deadline must
                         // be charged like any other unresponsive peer.

@@ -231,6 +231,10 @@ shared = [
     "crates/zakura-network/src/zakura/handler.rs",
 ]
 # Each table's witness, which the runner runs once per shared-path patch.
+# The block-sync harness's relay checks each header but never runs
+# `admit_inbound_message` (handler.rs), so a break to that admission step
+# (its size check, cadence charge and row `expect`) reaches stream 6 only
+# in production. Its runs count only through discovery/s4v2.
 tables = [
     { table = "block-sync/s6v3", witness = { test = "each_probe_fault_reaches_its_exact_id", test_target = "block_table" } },
     { table = "discovery/s4v2", witness = { test = "hello_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" } },

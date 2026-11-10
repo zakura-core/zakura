@@ -784,6 +784,10 @@ fn check_closes<S: HasView>(
 /// only one judged before it. For `conformant-never-closes`, a punishment
 /// before the node judged any frame on the connection is a violation too.
 /// Every unjustified punishment at the step is a violation of its own.
+///
+/// A rate-limit close names no stream, so this assumes the connection
+/// carries no stream without a table, whose own message bucket can justify
+/// that close ([`crate::model::RATE_LIMIT_CAUSES`]).
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,

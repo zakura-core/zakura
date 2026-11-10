@@ -385,12 +385,16 @@ fn parse_call_as_sent(body: &[u8]) -> Option<(JsonRpcVersion, Body<'_>)> {
     Some((version, body))
 }
 
-/// Returns whether re-encoding `params` gives back the same bytes, so the server reads them the
-/// same either way.
+/// Maximum JSON bytes the shortcut may copy and re-encode, excluding a leading unescaped string.
+/// Larger values use conversion directly instead of risking a second large decode/encode pass.
+const MAX_PARAMS_RE_ENCODE_BYTES: usize = 1024;
+
+/// Returns whether parameters can be checked within the shortcut's work bound and re-encode to
+/// the same bytes, so the server reads them the same either way.
 ///
 /// A leading unescaped string argument, like a block's hex in `submitblock`, re-encodes
 /// unchanged, and a vectorized search checks it far faster than parsing. Any arguments after it,
-/// like a work ID, are re-encoded and compared.
+/// like a work ID, are re-encoded and compared only when they fit the work bound.
 fn params_re_encode_unchanged(params: &RawValue) -> bool {
     let json = params.get();
     let rest = match json.strip_prefix("[\"") {
@@ -403,12 +407,15 @@ fn params_re_encode_unchanged(params: &RawValue) -> bool {
             match &string_and_rest[end + 1..] {
                 "]" => return true,
                 rest => match rest.strip_prefix(',') {
-                    Some(arguments) => Cow::Owned(format!("[{arguments}")),
-                    None => return false,
+                    Some(arguments) if arguments.len() < MAX_PARAMS_RE_ENCODE_BYTES => {
+                        Cow::Owned(format!("[{arguments}"))
+                    }
+                    _ => return false,
                 },
             }
         }
-        None => Cow::Borrowed(json),
+        None if json.len() <= MAX_PARAMS_RE_ENCODE_BYTES => Cow::Borrowed(json),
+        None => return false,
     };
 
     serde_json::from_str::<serde_json::Value>(&rest)

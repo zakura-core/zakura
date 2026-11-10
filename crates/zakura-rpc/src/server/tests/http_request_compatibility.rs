@@ -395,6 +395,42 @@ fn json_rpc_2_responses_are_unchanged() {
     );
 }
 
+/// Large canonical parameters bypass the shortcut; small parameters still avoid conversion.
+#[test]
+fn parameter_re_encoding_is_bounded() {
+    for version in [r#""jsonrpc":"2.0","#, r#""jsonrpc":"1.0","#, ""] {
+        // The trailing array reconstructed after skipping the first string is 1024 or 1025 bytes.
+        for (length, parsed) in [(1020, true), (1021, false)] {
+            let tail = "a".repeat(length);
+            let params = format!(r#"["00ff","{tail}"]"#);
+            let request =
+                format!(r#"{{{version}"method":"submitblock","params":{params},"id":1}}"#);
+            assert_eq!(
+                matches!(
+                    request_to_json_rpc_2(request.as_bytes()),
+                    JsonRpc2Request::Parsed { .. }
+                ),
+                parsed,
+                "trailing argument length {length}",
+            );
+        }
+        // Numeric arrays have no leading string to skip (1023 and 1025 bytes).
+        for (count, parsed) in [(511, true), (512, false), (1_999_999, false)] {
+            let params = format!("[{}0]", "0,".repeat(count - 1));
+            let request =
+                format!(r#"{{{version}"method":"submitblock","params":{params},"id":1}}"#);
+            assert_eq!(
+                matches!(
+                    request_to_json_rpc_2(request.as_bytes()),
+                    JsonRpc2Request::Parsed { .. }
+                ),
+                parsed,
+                "numeric argument count {count}",
+            );
+        }
+    }
+}
+
 /// A near-limit numeric array with a noncanonical final number keeps the conversion behavior.
 #[test]
 fn large_numeric_array_is_normalized() {

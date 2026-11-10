@@ -1,0 +1,9 @@
+# The committed fuzz input `sync-storage-honest.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `honest` scenario, and
+# `sync-storage-honest.end.json` is its pinned end record.
+harness = "sync/storage"
+generator = 1
+sha256 = "1cc6494268e42514adeb66eaf5e5e30ba8c5100d9968dc7965295db90c1b6e41"
+scenario_sha256 = "28b5e44be27548dda604bb665cfe135f3f086aba8d9ad1bd532407deeba6488f"
+source = "crates/zakura-sim/tests/sync_harness.rs"

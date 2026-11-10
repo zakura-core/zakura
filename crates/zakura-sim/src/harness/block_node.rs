@@ -1661,3 +1661,56 @@ const PROBE_SEED: u8 = 0xEE;
 pub fn verified_tip(engine: &EnginePort) -> Frontier {
     engine.view().frontiers.verified_best
 }
+
+impl BlockNode {
+    /// Hands `peer` to the node's service, as a link does. Returns `false`
+    /// once a teardown dropped the service.
+    pub(crate) fn add_peer(&self, peer: Peer) -> bool {
+        match self.live.borrow().as_ref() {
+            Some(live) => {
+                live.service.add_peer(peer);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tears the node's block sync down as [`Topology::teardown`] does, but
+    /// leaves its links to the caller: cancels its reactor and drops every
+    /// handle the harness holds outside its tasks. Returns `false` if it's
+    /// already torn down.
+    pub(crate) fn tear_down(&self) -> bool {
+        let Some(live) = self.live.borrow_mut().take() else {
+            return false;
+        };
+        self.shutdown.cancel();
+        let replies = self
+            .controlled
+            .as_ref()
+            .and_then(|(_, replies)| replies.clear());
+        drop((live, replies));
+        true
+    }
+}
+
+impl Link {
+    /// A link a harness other than [`Topology`] made, with each side's
+    /// connection token, dialer first, so the [`PolicySource`] counts it.
+    pub(crate) fn made(
+        peer: String,
+        dialer: usize,
+        listener: usize,
+        conn_id: u64,
+        cause: CloseCauseReader,
+        tokens: [CancellationToken; 2],
+    ) -> Self {
+        Link {
+            peer,
+            dialer: Some(dialer),
+            listener,
+            conn_id,
+            cause,
+            tokens,
+        }
+    }
+}

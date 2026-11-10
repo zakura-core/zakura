@@ -971,6 +971,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("no-room-check"),
     },
     Coverage {
+        property: crate::domain::block_sync_semantic::QUERY_WORK_AUTHORIZED,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reply_under_a_retired_authority_installs_nothing",
+        ),
+        bypass: Bypass::Planted("accept-retired-authority"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::FRONTIER_WORK_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "an_epoch_change_retires_the_old_epochs_work",
+        ),
+        bypass: Bypass::Planted("omit-work-reset"),
+    },
+    Coverage {
         property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
         passing: passes(
             "tests/block_semantic_properties.rs",

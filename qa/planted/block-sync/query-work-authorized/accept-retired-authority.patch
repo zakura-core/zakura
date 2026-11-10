@@ -1,0 +1,25 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+index f36982fa0e..e284db5d37 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+@@ -214,9 +214,7 @@ impl ReactorState {
+         let Some(query) = self.queries.complete(query_id, scope) else {
+             return NeededReply::Stale;
+         };
+-        if self.body_work_scope() != Some(scope) {
+-            return NeededReply::StaleAuthority;
+-        }
++        // Accept a reply under any authority the reply names.
+         let progress = &self.progress;
+         if body_anchor.height != progress.verified_block_tip
+             || body_anchor.hash != progress.verified_block_hash
+@@ -1083,8 +1081,8 @@ impl ReactorState {
+         .then_some(view.state_version);
+ 
+         let current_scope = BodyWorkAuthority::for_view(&view);
++        // Keep the pending query across an authority change.
+         let authority = (previous_scope != Some(current_scope)).then(|| {
+-            self.queries.clear();
+             if body_work_epoch_changed {
+                 AuthorityUpdate::EpochChanged {
+                     authority: current_scope,

@@ -10,6 +10,26 @@ import subprocess
 import tomllib
 
 WITNESSES = "qa/mutation-readiness/witnesses.json"
+WORK_LIST = "qa/native-mutations/work-list.toml"
+
+# Crates that hold the simulator, its storage and scheduler, and the tools
+# that run it. A loop patch changes production code only, so none of these.
+SIMULATOR_CRATES = {"zakura-sim", "zakura-scheduler", "zakura-storage", "xtask"}
+
+# The mutation plan's fault classes.
+FAULT_CLASSES = {
+    "stale-result", "resource-lifetime", "ownership", "wakeup",
+    "boundary-accounting", "request-authorization", "queue-refusal",
+    "fault-isolation",
+}
+
+# The README line that names an ID a loop patch must fail, possibly
+# wrapped: `Required failure: the run ends at `<id>`` or, for a patch that
+# runs against several tables or instances, `Required failure for `<table>`:
+# the run ends at `<id>``.
+REQUIRED_FAILURE = re.compile(
+    r"Required failure(?: for `[^`]+`)?: the run ends at `([^`]+)`"
+)
 
 
 def sha256(path):
@@ -139,6 +159,116 @@ def native_binding(root, case):
     }
 
 
+def production_errors(paths):
+    """Name each path a loop patch may not change: anything but a Rust
+    source file of a production crate, outside its tests."""
+    errors = []
+    for path in paths:
+        parts = Path(path).parts
+        name = parts[-1]
+        if (
+            len(parts) < 3 or parts[0] != "crates" or parts[1] in SIMULATOR_CRATES
+            or not name.endswith(".rs") or name == "tests.rs" or name.endswith("_tests.rs")
+            or any(part in ("tests", "benches", "fuzz", "testkit") for part in parts[2:-1])
+        ):
+            errors.append(f"changes a non-production file: {path}")
+    return errors
+
+
+def work_list_ids(work_list):
+    """Map each work-list entry ID to the property IDs it covers and the
+    table prefixes it covers."""
+    entries = {}
+    for entry in work_list["entry"]:
+        ids = {instance["property"] for instance in entry.get("instance", [])}
+        tables = set()
+        if "table" in entry:
+            tables.add(entry["table"])
+        tables.update(table["table"] for table in entry.get("tables", []))
+        entries[entry["id"]] = (ids, tables)
+    return entries
+
+
+def witness_binding(root, witness):
+    """Check one loop witness: a planted case's witness, a committed input,
+    or one `zakura-sim` integration test. Returns its errors."""
+    forms = [key for key in ("planted", "input", "test") if key in witness]
+    if len(forms) != 1:
+        return [f"a witness names exactly one of planted, input or test, not {forms}"]
+    if "planted" in witness:
+        path = root / witness["planted"]
+        if not path.is_file():
+            return [f"missing planted case: {witness['planted']}"]
+        case = tomllib.loads(path.read_text())
+        if ("input" in case) == ("typed" in case):
+            return [f"{witness['planted']} names neither or both of input and typed"]
+        return []
+    if "input" in witness:
+        path = root / witness["input"]
+        if not path.is_file() or not path.with_suffix(".toml").is_file():
+            return [f"missing input or sidecar: {witness['input']}"]
+        return []
+    if "test_target" not in witness:
+        return ["a test witness names its test_target"]
+    source = f"crates/zakura-sim/tests/{witness['test_target']}.rs"
+    if not (root / source).is_file():
+        return [f"missing test file: {source}"]
+    _, errors = selector_errors(root, source, witness["test"], witness["test_target"])
+    return errors
+
+
+def loop_binding(root, patch, cases, work_list):
+    """Check a loop patch: it changes production files only, its README
+    names each ID it must fail, and each `cases.json` entry names one of
+    those IDs, a work-list entry covering it, and one witness."""
+    errors = []
+    numstat = subprocess.run(
+        ["git", "apply", "--numstat", str(patch)], cwd=root,
+        capture_output=True, text=True, check=False,
+    )
+    changed = [line.split("\t", 2)[2] for line in numstat.stdout.splitlines() if line.count("\t") >= 2]
+    if not changed:
+        errors.append("the patch changes no file")
+    errors.extend(production_errors(changed))
+    readme = patch.parent / "README.md"
+    required = []
+    if readme.is_file():
+        required = REQUIRED_FAILURE.findall(" ".join(readme.read_text().split()))
+    else:
+        errors.append("missing README.md")
+    if not required:
+        errors.append("the README names no required failure")
+    if len(set(required)) != len(required):
+        errors.append("the README names an ID twice")
+    entries = work_list_ids(work_list)
+    named = []
+    for case in cases:
+        property_id = case["property"]
+        named.append(property_id)
+        entry = entries.get(case.get("entry"))
+        if entry is None:
+            errors.append(f"{property_id}: unknown work-list entry {case.get('entry')!r}")
+        else:
+            ids, tables = entry
+            covered = property_id in ids or any(
+                property_id.startswith(table + "/") and case.get("table", table) == table
+                for table in tables
+            )
+            if not covered:
+                errors.append(f"{property_id}: entry {case['entry']} doesn't cover it")
+        if "fault_class" in case and case["fault_class"] not in FAULT_CLASSES:
+            errors.append(f"{property_id}: unknown fault class {case['fault_class']}")
+        errors.extend(f"{property_id}: {error}" for error in witness_binding(root, case.get("witness", {})))
+    if sorted(named) != sorted(required):
+        errors.append(f"cases.json names {sorted(named)}, the README {sorted(required)}")
+    return {
+        "properties": named,
+        "changed": changed,
+        "witnesses": [case.get("witness") for case in cases],
+        "errors": errors,
+    }
+
+
 def witness_errors(root):
     """Check every native selector in the witness inventory, if one exists."""
     path = root / WITNESSES
@@ -155,13 +285,36 @@ def witness_errors(root):
     return errors
 
 
-def inventory(root):
-    """Return one row per retained patch and every static validation failure."""
-    native = json.loads((root / "qa/native-mutations/cases.json").read_text())
+def inventory(root, loop_only=False, cases_dir=None):
+    """Return one row per retained patch and every static validation failure.
+    With `loop_only`, only the mutation loop's patches: those whose
+    `cases.json` entries name a property. With `cases_dir`, the loop patches
+    of that directory's own `cases.json`, such as a generator's output before
+    triage, whose patch paths are relative to it."""
+    native_dir = Path(cases_dir) if cases_dir is not None else root / "qa/native-mutations"
+    native = json.loads((native_dir / "cases.json").read_text())
+    work_list = (
+        tomllib.loads((root / WORK_LIST).read_text())
+        if (root / WORK_LIST).is_file() else {"entry": []}
+    )
     mappings = {}
+    loops = {}
     errors = []
+    def patch_path(name):
+        full = native_dir / name
+        try:
+            return full.relative_to(root).as_posix()
+        except ValueError:
+            return full.as_posix()
+
     for case in native:
-        path = "qa/native-mutations/" + case["patch"]
+        path = patch_path(case["patch"])
+        if "property" in case:
+            # A loop patch has one entry for each ID it must fail.
+            if any(other["property"] == case["property"] for other in loops.get(path, [])):
+                errors.append(f"duplicate loop mapping: {path} {case['property']}")
+            loops.setdefault(path, []).append(case)
+            continue
         if path in mappings:
             errors.append(f"duplicate native mapping: {path}")
         mappings[path] = case
@@ -169,9 +322,14 @@ def inventory(root):
         *(root / "qa/planted").rglob("*.patch"),
         *(root / "qa/native-mutations").rglob("*.patch"),
     ])
+    if cases_dir is not None:
+        patches = sorted(Path(cases_dir).resolve().rglob("*.patch"))
+    if loop_only or cases_dir is not None:
+        patches = [patch for patch in patches if patch_path(patch) in loops]
+        mappings = {}
     rows = []
     for patch in patches:
-        path = patch.relative_to(root).as_posix()
+        path = patch_path(patch)
         row = {"patch": path, "patch_sha256": sha256(patch)}
         checked = subprocess.run(
             ["git", "apply", "--check", str(patch)], cwd=root,
@@ -182,13 +340,16 @@ def inventory(root):
         try:
             if path.startswith("qa/planted/"):
                 row.update(planted_binding(root, patch))
+            elif path in loops:
+                row.update(loop_binding(root, patch, loops.pop(path), work_list))
             else:
                 row.update(native_binding(root, mappings.pop(path)))
         except (OSError, KeyError, ValueError, StopIteration) as error:
             row["errors"] = [f"binding metadata: {error!r}"]
         rows.append(row)
-    errors.extend(f"mapping has no patch: {path}" for path in sorted(mappings))
-    errors.extend(witness_errors(root))
+    errors.extend(f"mapping has no patch: {path}" for path in sorted([*mappings, *loops]))
+    if not loop_only and cases_dir is None:
+        errors.extend(witness_errors(root))
     return {
         "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "worktree_status": subprocess.check_output(
@@ -203,9 +364,17 @@ def inventory(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="check only the mutation loop's patches (qa/native-mutations/PROMPT.md)",
+    )
+    parser.add_argument(
+        "--cases", type=Path,
+        help="check the loop patches of this directory's cases.json instead",
+    )
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
-    report = inventory(root)
+    report = inventory(root, loop_only=args.loop, cases_dir=args.cases and args.cases.resolve())
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     failures = len(report["errors"]) + sum(
         bool(row["errors"]) or row["apply"] != "passed" for row in report["cases"]

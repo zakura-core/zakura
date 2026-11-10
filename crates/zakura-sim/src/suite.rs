@@ -53,6 +53,7 @@ use crate::{
         coverage::{Bypass, Ci, Witness, COVERAGE},
         HarnessEntry, HARNESSES,
     },
+    planted::{self, PLANTED_DIR},
     property::Status,
     record::{CONTRACT_VERSION, FORMAT_VERSION},
     seed::{self, sha256},
@@ -82,9 +83,6 @@ pub const FUZZ_DIR: &str = "qa/fuzz";
 /// The fuzz package under [`FUZZ_DIR`] whose targets run harnesses in the
 /// simulator.
 pub const SIM_FUZZ_PACKAGE: &str = "sim";
-
-/// Where the planted cases live, relative to the repository's root.
-pub const PLANTED_DIR: &str = "qa/planted";
 
 /// Where the committed seeds live, relative to the repository's root.
 pub const FIXTURES_DIR: &str = "crates/zakura-sim/tests/fixtures";
@@ -1347,11 +1345,7 @@ impl Builder<'_> {
         let mut by_property: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for file in files(self.root, PLANTED_DIR, "patch") {
             let path = Path::new(&file);
-            let property = path
-                .parent()
-                .and_then(|parent| parent.strip_prefix(PLANTED_DIR).ok())
-                .map(|parent| parent.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let property = planted::property_id(Path::new(PLANTED_DIR), path).unwrap_or_default();
             let name = path
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())

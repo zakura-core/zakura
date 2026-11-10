@@ -74,9 +74,9 @@
 //! holds no case fails the run, so a run that passes ran at least one case.
 //! A case's shard follows from its position, so adding or removing a case
 //! moves every later case to another shard: across that change, a case can
-//! run on two nights in a row, or wait up to `2 * count - 1` nights. The
-//! nightly job runs one shard a night, and a remote host runs the whole
-//! catalogue (qa/fuzz/sim's README, Long runs).
+//! run in two consecutive shard runs, or wait up to `2 * count - 1` shard
+//! runs. The nightly job runs two shards a night, and a remote host runs
+//! the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -117,10 +117,13 @@ mod pilot;
 #[path = "../../zakura-sim/build/provenance.rs"]
 mod provenance;
 
-pub(super) use pilot::run as pilot;
+/// Where the cases live and the property each bypasses, shared with the
+/// simulator's checks of the catalogue.
+#[path = "../../zakura-sim/src/planted.rs"]
+mod planted_layout;
 
-/// Where the planted cases live, relative to the repository root.
-const PLANTED_DIR: &str = "qa/planted";
+pub(super) use pilot::run as pilot;
+use planted_layout::PLANTED_DIR;
 
 /// What every case runs on, relative to the repository root: xtask, which
 /// holds this runner and the flags and arguments it runs with, the
@@ -578,18 +581,11 @@ pub(super) fn run(
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
 fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
     let root = repo_root.join(PLANTED_DIR);
-    let mut patches = Vec::new();
-    find_patches(&root, &mut patches)?;
-    patches.sort();
-    patches
+    planted_layout::files(&root, "patch")?
         .into_iter()
         .map(|patch| {
-            let property = patch
-                .parent()
-                .and_then(|dir| dir.strip_prefix(&root).ok())
-                .and_then(Path::to_str)
-                .ok_or_else(|| format!("{} isn't under a property", patch.display()))?
-                .to_owned();
+            let property = planted_layout::property_id(&root, &patch)
+                .ok_or_else(|| format!("{} isn't under a property", patch.display()))?;
             let case_file = patch.with_extension("toml");
             let CaseFile {
                 input,
@@ -751,19 +747,6 @@ fn is_affected(watched: &[PathBuf], changed: &[PathBuf]) -> bool {
     changed
         .iter()
         .any(|path| watched.iter().any(|w| path.starts_with(w)))
-}
-
-/// Appends every `.patch` file under `dir` to `patches`.
-fn find_patches(dir: &Path, patches: &mut Vec<PathBuf>) -> Result<(), BoxError> {
-    for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            find_patches(&path, patches)?;
-        } else if path.extension().is_some_and(|e| e == "patch") {
-            patches.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Where confirmations through a fuzz target build, in the planted work

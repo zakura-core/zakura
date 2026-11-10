@@ -1,0 +1,12 @@
+# Detaches a peer-registry entry's claims whichever routine generation owns
+# the entry, so a routine pairs the entry by peer ID alone. The input closes
+# the node's connection to the mirror it dials and holds that connection's
+# block-sync routine until block sync admits the redialed connection's
+# session. The held routine's drop then detaches its replacement's claims.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-replace.bin"
+# Besides state.rs, which the patch changes, the registry's wrappers and the
+# routine's drop decide which generation's writes reach an entry.
+checks = [
+    "crates/zakura-network/src/zakura/block_sync/peer_registry.rs",
+    "crates/zakura-network/src/zakura/block_sync/peer_routine.rs",
+]

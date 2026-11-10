@@ -18,6 +18,7 @@
 //! task to run never sees that state here.
 
 use std::{
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,14 +30,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
     testkit::discovery::build_discovery_handle, DiscoveryService, HeaderSyncService, Service,
-    TransportEvent, TransportObserver, ZakuraHandshakeConfig, ZakuraServiceId,
+    TransportEvent, TransportObserver, ZakuraHandshakeConfig, ZakuraPeerId, ZakuraServiceId,
 };
 use zakura_quic::{sim::SeededInputs, NodeAddr};
 use zakura_rt::sync::watch;
+use zakura_scheduler::{At, TaskId};
 
 use super::{
     block_node::{
         policy::{self as block_policy, Trigger},
+        tap::TapRoutines,
+        view::BlockSyncView,
         LateHandle,
     },
     header_sync::Dialer,
@@ -52,7 +56,7 @@ use crate::{
     domain::session,
     peer::{key_index, peer_addr, peer_id, NODE_ADDR},
     property::{Capture, HasView, Property, Source, Sources},
-    RunConfig, Sim,
+    RunConfig, Sim, TaskHold,
 };
 
 /// How long a dialer waits after its connection ends before it dials
@@ -73,6 +77,72 @@ pub struct SyncWireScenario {
     /// The chain, the mirrors, both storages' policies and the control
     /// steps.
     pub sync: SyncScenario,
+    /// Holds the block-sync routine that a `Control` close supersedes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_hold: Option<SupersededHold>,
+}
+
+/// Holds the node's block-sync routine on the first connection a `Control`
+/// close ends, from the close until block sync admits the peer's next
+/// session, as a busy thread would leave the superseded routine's drop
+/// behind its replacement's admission. The routine's drop then makes its
+/// generation-gated registry writes against the replacement's entry.
+///
+/// The hold ends, for good, at that admission, or `steps` steps after the
+/// close. The routine also runs whenever nothing else can, since a
+/// [`TaskHold`] never ends a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersededHold {
+    /// The most steps the hold lasts after the close.
+    pub steps: u64,
+}
+
+/// [`SupersededHold`]'s hold: the tasks of the closed peer's routines that
+/// block sync admitted before the close.
+struct HeldSuperseded {
+    routines: TapRoutines,
+    /// The peers `Control` closed, in close order.
+    closed: Rc<RefCell<Vec<ZakuraPeerId>>>,
+    view: Rc<RefCell<BlockSyncView>>,
+    steps: u64,
+    /// The closed peer, its newest generation at the close, and the step
+    /// after which the hold began, once a close happened.
+    armed: RefCell<Option<(ZakuraPeerId, u64, u64)>>,
+    /// Set once the hold ends.
+    over: Cell<bool>,
+}
+
+impl TaskHold for HeldSuperseded {
+    fn holds(&self, task: TaskId, _at: &At) -> bool {
+        if self.over.get() {
+            return false;
+        }
+        let step = self.view.borrow().step.unwrap_or(0);
+        let mut armed = self.armed.borrow_mut();
+        if armed.is_none() {
+            let Some(peer) = self.closed.borrow().first().cloned() else {
+                return false;
+            };
+            let Some(generation) = self.routines.admitted(&peer) else {
+                self.over.set(true);
+                return false;
+            };
+            *armed = Some((peer, generation, step));
+        }
+        let (peer, superseded, since) = armed.as_ref().expect("the hold armed above");
+        let replaced = self
+            .routines
+            .admitted(peer)
+            .is_some_and(|newest| newest > *superseded);
+        if replaced || step >= since.saturating_add(self.steps) {
+            self.over.set(true);
+            return false;
+        }
+        self.routines
+            .routine(task)
+            .is_some_and(|(routine, generation)| routine == *peer && generation <= *superseded)
+    }
 }
 
 /// The node under test, with header sync, block sync and discovery behind
@@ -222,7 +292,7 @@ fn redial(
 
 impl Subsystem for SyncWire {
     const NAME: &'static str = "sync/wire";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncWireScenario;
     type Prepared = SyncPorts;
@@ -261,7 +331,18 @@ impl Subsystem for SyncWire {
             peers: (0..scenario.sync.mirrors.len())
                 .map(|index| (format!("mirror-{index}"), peer_id(seed, index)))
                 .collect(),
+            closed: Rc::default(),
         };
+        if let Some(hold) = scenario.superseded_hold {
+            sim.hold_tasks(Box::new(HeldSuperseded {
+                routines: actors.routines.clone(),
+                closed: quic.closed.clone(),
+                view: view.clone(),
+                steps: hold.steps,
+                armed: RefCell::default(),
+                over: Cell::new(false),
+            }));
+        }
         let mut endpoints = Vec::new();
         for (index, node) in actors.nodes.iter().enumerate() {
             // The node is endpoint 0; mirror `i` is peer `i`.
@@ -386,7 +467,10 @@ pub enum SavedWire {
     /// dials closed once the node has asked storage to admit four bodies.
     /// The node redials it, so header sync, block sync and discovery each
     /// open a session on the replacement while the other mirror's
-    /// connection stays up.
+    /// connection stays up. A [`SupersededHold`] keeps the closed
+    /// connection's block-sync routine from running until block sync admits
+    /// the replacement's session, so the routine's drop writes to the peer
+    /// registry after that admission.
     Replace,
     /// [`SavedWire::Honest`], with every mirror's block-sync range read
     /// held for [`STALL_MS`]. Block sync's sessions stall with requests
@@ -506,12 +590,20 @@ impl SavedWire {
                 }
             }
         };
+        let superseded_hold = (self == SavedWire::Replace).then_some(SupersededHold {
+            steps: REPLACE_HOLD_STEPS,
+        });
         SyncWireScenario {
             net: NetScenario::default(),
             sync,
+            superseded_hold,
         }
     }
 }
+
+/// How many steps [`SavedWire::Replace`] holds the superseded routine at
+/// most: past the redial, [`REDIAL_SETTLE`] after the close.
+const REPLACE_HOLD_STEPS: u64 = 40_000;
 
 /// Curated combinations for the `sync_wire` fuzz target's seeds, each a
 /// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a
@@ -593,5 +685,6 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
     SyncWireScenario {
         net: NetScenario::default(),
         sync,
+        superseded_hold: None,
     }
 }

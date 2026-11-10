@@ -124,11 +124,53 @@ fn honest_sync_shares_one_connection_per_peer() {
     }
 }
 
+/// The block-sync generations of each routine that ended after block sync
+/// admitted a newer generation for its peer, by peer.
+fn superseded_after_replacement(log: &ObservationLog) -> BTreeMap<String, Vec<u64>> {
+    let mut newest: BTreeMap<String, u64> = BTreeMap::new();
+    let mut superseded: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::SessionAdmitted {
+                        peer, generation, ..
+                    },
+                ..
+            } => {
+                newest.insert(peer.clone(), *generation);
+            }
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::Routine {
+                        peer,
+                        generation,
+                        ended: true,
+                        ..
+                    },
+                ..
+            } if newest.get(peer).is_some_and(|newest| newest > generation) => {
+                superseded
+                    .entry(peer.clone())
+                    .or_default()
+                    .push(*generation);
+            }
+            _ => {}
+        }
+    }
+    superseded
+}
+
 /// xsync-3: the node's connection to the mirror it dials closes once it
 /// has asked storage to admit four bodies, and the node redials. The
 /// replacement carries all three services' sessions again, each under a
 /// session ID no earlier session carried, while the other mirror keeps its
 /// one connection. Both of the node's tips still reach the mirrors' tip.
+///
+/// The scenario holds the closed connection's block-sync routine until
+/// block sync admits the replacement's session, so exactly one routine, the
+/// superseded one, ends after its replacement's admission, and its drop's
+/// registry writes land on nothing the replacement owns.
 #[test]
 fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
     let committed = Plan::from_fuzz(&[]);
@@ -141,6 +183,12 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
         let replaced = &sessions["mirror-1"];
         assert!(replaced.len() >= 2, "{sessions:?}");
         assert_eq!(replaced[1].1, every_service(), "{sessions:?}");
+        let superseded = superseded_after_replacement(&report.log);
+        assert_eq!(
+            superseded.values().map(Vec::len).sum::<usize>(),
+            1,
+            "{superseded:?}"
+        );
         assert!(
             matches!(
                 outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION),

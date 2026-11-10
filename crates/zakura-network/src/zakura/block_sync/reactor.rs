@@ -223,7 +223,10 @@ pub fn spawn_block_sync_reactor(
     let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
-    let registry = Arc::new(PeerRegistry::new());
+    let registry = PeerRegistry::new();
+    #[cfg(any(test, zakura_sim))]
+    let registry = registry.with_observer(startup.observer.clone());
+    let registry = Arc::new(registry);
     registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];

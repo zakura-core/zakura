@@ -1355,6 +1355,18 @@ pub enum BlockSyncFact {
         /// `inbound` or `outbound`.
         direction: String,
     },
+    /// A generation-gated peer-registry write landed on an entry another
+    /// routine generation owns.
+    StaleRegistryWrite {
+        /// The entry's peer.
+        peer: String,
+        /// The writer, as the peer registry's method names it.
+        writer: String,
+        /// The generation the write came from.
+        generation: u64,
+        /// The generation that owns the entry.
+        entry_generation: u64,
+    },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
         /// The sending peer.

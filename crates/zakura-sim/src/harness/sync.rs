@@ -63,7 +63,7 @@ use super::{
         policy::{self as block_policy, Predicates, Trigger},
         preload,
         relay::{Way, Wire},
-        tap::{BlockTap, TapTeardown},
+        tap::{BlockTap, TapRoutines, TapTeardown},
         view::BlockSyncView,
         BlockNode, LateHandle, MirrorReadSource, MirrorReads, MirrorStorage, NodeStorage,
     },
@@ -363,6 +363,8 @@ pub(crate) struct QuicLinks {
     pub(crate) stopped: Arc<std::sync::atomic::AtomicBool>,
     /// Each mirror's peer ID on QUIC, its endpoint key's, by name.
     pub(crate) peers: BTreeMap<String, ZakuraPeerId>,
+    /// The peers whose connections `Control` closed, in close order.
+    pub(crate) closed: Rc<RefCell<Vec<ZakuraPeerId>>>,
 }
 
 impl SyncTopology {
@@ -423,6 +425,7 @@ impl SyncTopology {
             self.fail("the node's endpoint doesn't serve yet".to_owned());
             return;
         };
+        quic.closed.borrow_mut().push(id.clone());
         if !supervisor.disconnect_peer(id).await {
             self.fail(format!("the node has no connection to `{peer}`"));
         }
@@ -1096,6 +1099,8 @@ pub(crate) struct Actors {
     wire: Wire,
     header_tap: TapShutdown,
     block_tap: TapTeardown,
+    /// Which block-sync routine runs on which task, as the node's tap sees.
+    pub(crate) routines: TapRoutines,
 }
 
 /// Spawns the node's two services on its storages, each under its policy
@@ -1160,6 +1165,7 @@ pub(crate) fn spawn_actors(
     let wire = Wire::new(block_sync_serving_limit(&config));
     block_tap.label_with(wire.clone());
     let block_teardown = block_tap.teardown();
+    let routines = block_tap.routines();
     sim.add_source(Box::new(EngineWatch {
         engine: ports.engine.clone(),
         effects: ports.effects.clone(),
@@ -1247,6 +1253,7 @@ pub(crate) fn spawn_actors(
             wire,
             header_tap: header_shutdown,
             block_tap: block_teardown,
+            routines,
         },
         predicates,
     )

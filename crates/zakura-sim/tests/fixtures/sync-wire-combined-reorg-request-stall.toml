@@ -3,7 +3,7 @@
 # two bytes pick a combination of fuzz-13's actions, a seed of the
 # `sync_wire` fuzz target.
 harness = "sync/wire"
-generator = 2
+generator = 3
 sha256 = "72aa76414475bfcd64cf4c338ec07d4fccebb57fa4356f655152d8a59d4987fa"
 scenario_sha256 = "fc5f954d3ef11fe44873309ab8520dffa05de016ed1d2bbb95e7ed8aea393e43"
 source = "crates/zakura-sim/tests/sync_wire.rs"

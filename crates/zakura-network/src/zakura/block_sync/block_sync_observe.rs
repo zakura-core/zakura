@@ -1,7 +1,8 @@
 //! Synchronous block-sync effects and owner snapshots for simulator tests.
 //!
 //! Block sync's tasks report what they do to an installed
-//! [`BlockSyncObserver`]: session admission, judged frames, request write
+//! [`BlockSyncObserver`]: session admission, peer-registry writes that land
+//! on another generation's entry, judged frames, request write
 //! steps, byte-budget changes, the body handoff to the sequencer, sequencer
 //! holder changes and epoch changes, serving leases and frames, and each
 //! owning task's snapshot after an input. This module exists only in test and `zakura_sim` builds.
@@ -71,6 +72,20 @@ pub enum BlockEvent {
         generation: u64,
         /// The connection's direction.
         direction: ServicePeerDirection,
+    },
+    /// A generation-gated peer-registry write landed on an entry that another
+    /// routine generation owns. Each gated writer reports this from inside its
+    /// write, under the registry lock, so the report follows the write and
+    /// not its gate. A write the gate refuses reports nothing.
+    StaleRegistryWrite {
+        /// The entry's peer.
+        peer: ZakuraPeerId,
+        /// The writer.
+        writer: RegistryWriter,
+        /// The generation the write came from.
+        generation: u64,
+        /// The generation that owns the entry.
+        entry_generation: u64,
     },
     /// A routine took a frame from its stream and is about to judge it. Every
     /// check the routine, its regulated session and the sequencer run on the
@@ -224,6 +239,40 @@ pub enum BlockEvent {
     /// body released after this has no next holder: the task's drop
     /// releases the bodies left in its input, and a routine's send fails.
     SequencerClosed,
+}
+
+/// A generation-gated peer-registry writer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RegistryWriter {
+    /// Records a routine's outbound queue probe.
+    AttachOutbound,
+    /// Marks a session closed.
+    CloseSession,
+    /// Applies a peer's status.
+    UpsertStatus,
+    /// Publishes a request's claims.
+    InsertOutstanding,
+    /// Withdraws a request's claims.
+    RemoveOutstanding,
+    /// Detaches every claim.
+    TakeOutstanding,
+    /// Publishes slot diagnostics.
+    PublishSlots,
+}
+
+impl RegistryWriter {
+    /// The writer's name, as the peer registry's method names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RegistryWriter::AttachOutbound => "attach_outbound",
+            RegistryWriter::CloseSession => "close_session",
+            RegistryWriter::UpsertStatus => "upsert_status",
+            RegistryWriter::InsertOutstanding => "insert_outstanding",
+            RegistryWriter::RemoveOutstanding => "remove_outstanding_for_owner",
+            RegistryWriter::TakeOutstanding => "take_outstanding",
+            RegistryWriter::PublishSlots => "publish_slots",
+        }
+    }
 }
 
 /// One step of a request's frame write.

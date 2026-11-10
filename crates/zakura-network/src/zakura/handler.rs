@@ -6384,6 +6384,14 @@ async fn read_frame(
 /// Read one frame as [`read_frame`] does, with `gate` admitting its bytes after
 /// the header's checks and before the payload's allocation. The grant holds
 /// the payload's QUIC credit until it drops.
+/// The start of the log line for a frame that disconnects the peer before its
+/// payload is read.
+///
+/// These disconnects used to leave only a counter, so a peer whose responses
+/// were all refused looked idle: the block-sync requester parked without a
+/// reason after a peer's blocks outgrew a stale message-table limit.
+const FRAME_DISCONNECT_LOG: &str = "disconnecting Zakura peer after an invalid frame header";
+
 async fn read_admitted_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -6477,6 +6485,12 @@ where
         .map_err(|rejection| {
             metrics::counter!("zakura.p2p.frame.rejected", "reason" => rejection.label())
                 .increment(1);
+            info!(
+                message_type,
+                payload_len,
+                reason = rejection.label(),
+                "{FRAME_DISCONNECT_LOG}: the stream rejects its header"
+            );
             ZakuraHandlerError::RejectedFrame {
                 message_type,
                 rejection,
@@ -6485,6 +6499,12 @@ where
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
+        info!(
+            message_type,
+            payload_len,
+            max_frame_bytes,
+            "{FRAME_DISCONNECT_LOG}: the frame is larger than its stream or message allows"
+        );
         return Err(ZakuraHandlerError::OversizeFrame {
             payload_len,
             frame_len,
@@ -12006,6 +12026,40 @@ mod tests {
 
         const ALPN: &[u8] = b"/zakura/testkit/message-tables/0";
         let _guard = zakura_test::init();
+        // Every header rejection disconnects the peer, so each one must be logged.
+        let disconnect_logs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _capture = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            struct CountDisconnects(Arc<std::sync::atomic::AtomicUsize>);
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountDisconnects {
+                fn on_event(
+                    &self,
+                    event: &tracing::Event<'_>,
+                    _: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    struct Message(bool);
+                    impl tracing::field::Visit for Message {
+                        fn record_debug(
+                            &mut self,
+                            field: &tracing::field::Field,
+                            value: &dyn std::fmt::Debug,
+                        ) {
+                            if field.name() == "message" {
+                                self.0 = format!("{value:?}").starts_with(FRAME_DISCONNECT_LOG);
+                            }
+                        }
+                    }
+                    let mut message = Message(false);
+                    event.record(&mut message);
+                    if message.0 && *event.metadata().level() == tracing::Level::INFO {
+                        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+            tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(CountDisconnects(disconnect_logs.clone())),
+            )
+        };
         let server = LocalEndpointFactory::new().endpoint(79).await?;
         let (conn_tx, _conn_rx) = mpsc::channel(8);
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
@@ -12056,6 +12110,7 @@ mod tests {
                 Box::new(rejected(FrameRejection::PayloadTooShort { min: 9 })),
             ),
         ];
+        let cases_len = cases.len();
         for (message_type, flags, payload_len, frame_cap, expected) in cases {
             let connection = timeout(
                 Duration::from_secs(5),
@@ -12088,6 +12143,11 @@ mod tests {
                 "type {message_type} flags {flags} length {payload_len}: {result:?}"
             );
         }
+        assert_eq!(
+            disconnect_logs.load(std::sync::atomic::Ordering::SeqCst),
+            cases_len,
+            "every rejected frame header is logged"
+        );
 
         // Frames within their rows read normally, at both bounds.
         let connection =

@@ -648,8 +648,6 @@ pub struct Storage {
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     topology: Rc<Topology>,
-    /// The node's session view.
-    sessions: SessionEvidence,
     /// The run's recovery, once a `Recover` step is picked.
     recovery: RecoveryEvidence,
 }
@@ -1134,6 +1132,7 @@ impl Subsystem for Storage {
                     .collect(),
                 sessions: ports.sessions.clone(),
                 cooldowns,
+                ends: ports.ends.clone(),
                 cooldown,
                 names,
             },
@@ -1159,7 +1158,6 @@ impl Subsystem for Storage {
             stamps,
             faults,
             topology,
-            sessions: ports.sessions,
             recovery,
         }
     }
@@ -1212,7 +1210,7 @@ impl Subsystem for Storage {
                 params: serde_json::json!({ "contract": crate::record::CONTRACT_VERSION }),
             },
         ])
-        .holds_when(|storage, assume| storage.recovery.holds(&storage.sessions, assume))
+        .holds_when(|storage, assume| storage.recovery.holds(&storage.ends, assume))
     }
 
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its

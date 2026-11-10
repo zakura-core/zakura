@@ -204,6 +204,24 @@ impl Run {
             Some(&record.source_tip.0),
             "the chain ends at the source's tip"
         );
+        // The record is the pick's, and keeps every member's selected chain
+        // and the node's, each read from its own engine, ending at its tip.
+        assert_eq!((record.step, record.at), (done.step, done.now));
+        let members: Vec<_> = record.members.iter().map(|m| m.member.clone()).collect();
+        assert_eq!(members, record.membership);
+        let source = record
+            .members
+            .iter()
+            .find(|m| m.member == record.source)
+            .expect("the source is a member");
+        assert_eq!(source.selected.chain.last(), Some(&record.source_tip.0));
+        assert_eq!(source.selected.work, record.source_tip.1);
+        assert_eq!(record.node_chain.chain.last(), Some(&record.node_tip.0));
+        assert_eq!(record.node_chain.work, record.node_tip.1);
+        assert!(record
+            .source_chain
+            .iter()
+            .all(|h| source.selected.chain.contains(h)));
         // The barrier opens only once no task is ready, so a node with a
         // live source has finished syncing from it: it's at the source's
         // tip at the record already, and still there at the end. Nothing
@@ -311,6 +329,15 @@ fn each_witness_recovers_from_its_class() {
                 assert_eq!(resets.len(), 2, "{resets:?}");
                 assert!(resets[0].0 < started && resets[0].1 == "invalidate");
                 assert_eq!(resets[1], (started, "reconsider"));
+                // The baseline is the node's chain before the reconsider,
+                // without the invalidated tip the reconsider restores.
+                let baseline = run
+                    .recovery
+                    .baseline()
+                    .expect("the recover kept a baseline");
+                let tip = *baseline.chain.last().expect("the chain has its anchor");
+                assert!(tip.height < recovered.node_tip.0.height, "{baseline:?}");
+                assert!(baseline.work < recovered.node_tip.1);
             }
             _ => unreachable!("every class is checked"),
         }
@@ -489,9 +516,11 @@ fn admitted(peer: &str, session_id: u64, replaced: Option<u64>) -> SessionFact {
     }
 }
 
-/// The membership rules over hand-built facts: a session the service ends
-/// while its connection stays open ends `StableMembership` and the source's
-/// session at that step, as a closed link or a replacement does.
+/// The membership helpers over hand-built facts: a session the service ends
+/// while its connection stays open changes the membership and ends the
+/// source's session at that step, as a closed link or a replacement does.
+/// They say what the node's sessions did. The assumptions read only the
+/// environment's ends (`RecoveryEvidence::holds`).
 #[test]
 fn membership_and_the_source_follow_the_session_facts() {
     let source = Member {

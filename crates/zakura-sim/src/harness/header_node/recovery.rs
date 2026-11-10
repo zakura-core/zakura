@@ -21,7 +21,16 @@
 //! disconnect an earlier step queued, since an unhandled one leaves its
 //! receiving task ready. The `recovered` pick is the conditions point, and
 //! writes a [`RecoveryRecord`] of the membership, the source and both
-//! nodes' selected chains.
+//! nodes' selected chains, and each member's.
+//!
+//! The `Recover` pick also keeps the node's [`Baseline`], its selected
+//! chain before the pick reconsiders anything, which
+//! `header-sync/bounded-adversary-progress` measures progress from.
+//!
+//! Only the environment breaks the assumptions recovery declares
+//! ([`RecoveryEvidence::holds`]): the harness closing or relinking a peer,
+//! or stopping the node. A session the node or a mirror ends by itself
+//! breaks none, so a node that drops its honest source still owes progress.
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
@@ -31,6 +40,7 @@ use zakura_scheduler::SimInstant;
 use zakura_storage::header::{adapter::EnginePort, controlled::ControlledPort};
 
 use super::{
+    ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
     session::{SessionEvidence, SessionFact},
     tap,
@@ -54,8 +64,8 @@ pub(super) const RELINK: u64 = u64::MAX - 1;
 pub(super) const UNREACHED: u64 = u64::MAX - 2;
 
 /// What recovery reads: the node's and the mirrors' engines, the node's
-/// session view and cooldown facts, its configured readmission cooldown, and
-/// each node's peer identity.
+/// session view, cooldown facts and end facts, its configured readmission
+/// cooldown, and each node's peer identity.
 pub struct RecoveryInputs {
     /// The node under test's port.
     pub node: Arc<ControlledPort>,
@@ -65,6 +75,8 @@ pub struct RecoveryInputs {
     pub sessions: SessionEvidence,
     /// The node's cooldown facts.
     pub cooldowns: CooldownEvidence,
+    /// The node's end facts, whose stamps are the node's.
+    pub ends: EndEvidence,
     /// The node's configured readmission cooldown.
     pub cooldown: Duration,
     /// Each node's peer identity and name.
@@ -81,11 +93,59 @@ pub struct Member {
     pub session_id: u64,
 }
 
+/// A selected chain, read from an engine: every header from the finalized
+/// anchor to the selected tip, both included, and the tip's work after the
+/// anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedChain {
+    /// The chain, anchor first.
+    pub chain: Vec<Frontier>,
+    /// The tip's work after the anchor.
+    pub work: SuffixWork,
+}
+
+impl SelectedChain {
+    /// `port`'s selected chain now.
+    pub fn of(port: &EnginePort) -> Self {
+        SelectedChain {
+            chain: port.selected_path(),
+            work: port.snapshot().header_best_score.suffix_work,
+        }
+    }
+}
+
+/// The node's selected chain at the `Recover` pick, before it reconsiders
+/// any invalidation. Storage can commit between the `Recover` and
+/// `recovered` picks, so a baseline taken later could already hold what
+/// recovery is meant to bring.
+pub type Baseline = SelectedChain;
+
+/// One recorded member's selected chain, read from its own engine at the
+/// `recovered` pick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberChain {
+    /// The member.
+    pub member: Member,
+    /// Its selected chain.
+    pub selected: SelectedChain,
+}
+
 /// What the `recovered` pick recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryRecord {
+    /// The step that picked `recovered`.
+    pub step: u64,
+    /// When.
+    pub at: SimInstant,
+    /// The last stamp the node's facts took by the pick
+    /// ([`super::stamp`]), so later facts are the ones after it.
+    pub stamp: u64,
     /// Every live admitted session of the node, by peer.
     pub membership: Vec<Member>,
+    /// Each member's selected chain, in membership order.
+    pub members: Vec<MemberChain>,
+    /// The node's selected chain.
+    pub node_chain: SelectedChain,
     /// The source's live session.
     pub source: Member,
     /// The node's selected tip and its work after the finalized anchor.
@@ -128,6 +188,8 @@ pub struct Recovery {
     pub source: String,
     /// When the `Recover` step was picked.
     pub started: SimInstant,
+    /// The node's selected chain at that pick.
+    pub baseline: Baseline,
     /// Where it is.
     pub state: RecoveryState,
 }
@@ -152,21 +214,42 @@ impl RecoveryEvidence {
     }
 
     /// Whether `assume` holds after a step of a recovering run whose node's
-    /// session view is `sessions`. None holds before the `recovered` pick.
-    /// After it, `StableMembership` holds until a session is admitted or
-    /// ended or a link closes ([`membership_changed`]), `HonestPeer` until
-    /// the source's recorded session ends ([`session_lasts`]), and the rest
-    /// always, since recovery enforces them.
-    pub fn holds(&self, sessions: &SessionEvidence, assume: Assume) -> bool {
+    /// end facts are `ends`. None holds before the `recovered` pick. After
+    /// it, only the environment breaks one (Rule 13 of the hdr-9 to hdr-13
+    /// plan): `StableMembership` holds until the harness closes or relinks
+    /// any peer, `HonestPeer` until it closes or relinks the source, and
+    /// both until it stops the node. The rest always hold, since recovery
+    /// enforces them. A session the node, or a mirror running the same
+    /// code, ends by itself breaks nothing, so an obligation the node owes
+    /// its honest source runs on to its deadline.
+    pub fn holds(&self, ends: &EndEvidence, assume: Assume) -> bool {
         let Some(record) = self.record() else {
             return false;
         };
-        let facts = sessions.facts();
-        match assume {
-            Assume::StableMembership => !membership_changed(&facts, record.facts),
-            Assume::HonestPeer => session_lasts(&facts, record.facts, &record.source),
-            _ => true,
-        }
+        let source_only = match assume {
+            Assume::StableMembership => false,
+            Assume::HonestPeer => true,
+            _ => return true,
+        };
+        !ends.facts().into_iter().any(|(stamp, fact)| {
+            stamp > record.stamp
+                && match fact {
+                    EndFact::Environment {
+                        action: EnvironmentAction::Shutdown,
+                        ..
+                    } => true,
+                    EndFact::Environment { peer, .. } => !source_only || peer == record.source.peer,
+                    EndFact::ReactorExited { .. } => false,
+                }
+        })
+    }
+
+    /// The node's baseline, once a `Recover` step was picked.
+    pub fn baseline(&self) -> Option<Baseline> {
+        self.0
+            .borrow()
+            .as_ref()
+            .map(|recovery| recovery.baseline.clone())
     }
 
     /// Whether recovery ended unreached: every relink settled without a
@@ -197,11 +280,13 @@ impl RecoveryEvidence {
         }
     }
 
-    /// Starts recovery from `source` at `started`.
-    pub(super) fn start(&self, source: String, started: SimInstant) {
+    /// Starts recovery from `source` at `started`, from the node's
+    /// `baseline`.
+    pub(super) fn start(&self, source: String, started: SimInstant, baseline: Baseline) {
         *self.0.borrow_mut() = Some(Recovery {
             source,
             started,
+            baseline,
             state: RecoveryState::Establishing { relinks: 0 },
         });
     }
@@ -260,7 +345,7 @@ pub fn live_sessions(facts: &[SessionFact]) -> Vec<Member> {
 }
 
 /// Whether `facts` after the first `from` change the node's membership: a
-/// session admitted or ended, or a link closed.
+/// session admitted or ended, or a link closed, by anyone.
 pub fn membership_changed(facts: &[SessionFact], from: usize) -> bool {
     facts.get(from..).unwrap_or_default().iter().any(|fact| {
         matches!(
@@ -315,20 +400,25 @@ impl RecoveryInputs {
         cooldown_end(&self.cooldowns.facts(), &tap::peer(id), self.cooldown)
     }
 
-    /// The source's engine.
-    fn source_engine(&self, source: &str) -> Option<&EnginePort> {
+    /// Mirror `name`'s engine.
+    fn mirror_engine(&self, mirror: &str) -> Option<&EnginePort> {
         self.mirrors
             .iter()
-            .find(|(name, _)| name == source)
+            .find(|(name, _)| name == mirror)
             .map(|(_, port)| &**port)
     }
 
-    /// The record of the conditions at the `recovered` pick, with `source`'s
-    /// live session `session`.
-    fn record(&self, source: &str, session: Member) -> Result<RecoveryRecord, String> {
+    /// The record of the conditions at the `recovered` pick, at `step` and
+    /// `at`, with `source`'s live session `session`.
+    fn record(
+        &self,
+        (step, at): (u64, SimInstant),
+        source: &str,
+        session: Member,
+    ) -> Result<RecoveryRecord, String> {
         let facts = self.sessions.facts();
         let engine = self
-            .source_engine(source)
+            .mirror_engine(source)
             .ok_or_else(|| format!("recovery's source {source} is no mirror"))?;
         let node = self.node.engine();
         let (node_chain, node_snapshot) = (node.selected_path(), node.snapshot());
@@ -338,8 +428,29 @@ impl RecoveryInputs {
             .zip(&source_chain)
             .take_while(|(a, b)| a == b)
             .count();
+        let membership = live_sessions(&facts);
+        let members = membership
+            .iter()
+            .map(|member| {
+                let port = self
+                    .mirror_engine(&member.peer)
+                    .ok_or_else(|| format!("recovery's member {} is no mirror", member.peer))?;
+                Ok(MemberChain {
+                    member: member.clone(),
+                    selected: SelectedChain::of(port),
+                })
+            })
+            .collect::<Result<_, String>>()?;
         Ok(RecoveryRecord {
-            membership: live_sessions(&facts),
+            step,
+            at,
+            stamp: self.ends.stamps().issued(),
+            members,
+            node_chain: SelectedChain {
+                chain: node_chain.clone(),
+                work: node_snapshot.header_best_score.suffix_work,
+            },
+            membership,
             source: session,
             node_tip: (
                 node_snapshot.frontiers.header_best,
@@ -408,8 +519,8 @@ impl Driver {
         }
     }
 
-    /// Writes the record at the `recovered` pick.
-    pub(super) fn recovered(&self) -> Result<(), String> {
+    /// Writes the record at the `recovered` pick, at `step`.
+    pub(super) fn recovered(&self, step: u64) -> Result<(), String> {
         let source = self
             .evidence
             .get()
@@ -419,7 +530,9 @@ impl Driver {
             .inputs
             .source_session(&source)
             .expect("`recovered` is offered only while the source has a live session");
-        let record = self.inputs.record(&source, session)?;
+        let at = zakura_scheduler::hooks::now()
+            .ok_or_else(|| "a recovery is recorded inside a run".to_owned())?;
+        let record = self.inputs.record((step, at), &source, session)?;
         if let Some(recovery) = self.evidence.0.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));
         }
@@ -539,18 +652,27 @@ mod tests {
         });
     }
 
-    /// Which of [`DECLARED`] `recovery` says hold over `sessions`.
-    fn holding(recovery: &RecoveryEvidence, sessions: &SessionEvidence) -> Vec<Assume> {
+    /// Which of [`DECLARED`] `recovery` says hold over `ends`.
+    fn holding(recovery: &RecoveryEvidence, ends: &EndEvidence) -> Vec<Assume> {
         DECLARED
             .into_iter()
-            .filter(|assume| recovery.holds(sessions, *assume))
+            .filter(|assume| recovery.holds(ends, *assume))
             .collect()
     }
 
-    /// `mirror-0`'s recovery, `recovered` at `sessions`' current facts.
-    fn recovered(sessions: &SessionEvidence) -> RecoveryEvidence {
+    /// An empty selected chain.
+    fn empty() -> SelectedChain {
+        SelectedChain {
+            chain: Vec::new(),
+            work: SuffixWork::zero(),
+        }
+    }
+
+    /// `mirror-0`'s recovery, `recovered` at `sessions`' current facts, with
+    /// every stamp `ends` handed out so far before the pick.
+    fn recovered(sessions: &SessionEvidence, ends: &EndEvidence) -> RecoveryEvidence {
         let recovery = RecoveryEvidence::default();
-        recovery.start("mirror-0".into(), at(0));
+        recovery.start("mirror-0".into(), at(0), empty());
         let source = Member {
             peer: "mirror-0".into(),
             session_id: 1,
@@ -560,7 +682,12 @@ mod tests {
             SuffixWork::zero(),
         );
         let record = RecoveryRecord {
+            step: 1,
+            at: at(0),
+            stamp: ends.stamps().issued(),
             membership: live_sessions(&sessions.facts()),
+            members: Vec::new(),
+            node_chain: empty(),
             source,
             node_tip: tip,
             source_tip: tip,
@@ -582,47 +709,76 @@ mod tests {
         sessions
     }
 
+    /// The harness's `action` on `peer`.
+    fn environment(peer: &str, action: EnvironmentAction) -> EndFact {
+        EndFact::Environment {
+            peer: peer.to_owned(),
+            connection: None,
+            action,
+        }
+    }
+
     #[test]
-    fn hdr13_assumptions_hold_from_recovered_until_their_trigger() {
+    fn hdr13_assumptions_hold_from_recovered_until_the_environment_breaks_them() {
         // Before the `recovered` pick none holds: with no recovery, while it
         // establishes, and once it ended unreached.
         let sessions = two_links();
+        let ends = EndEvidence::default();
         let recovery = RecoveryEvidence::default();
-        assert_eq!(holding(&recovery, &sessions), []);
-        recovery.start("mirror-0".into(), at(0));
-        assert_eq!(holding(&recovery, &sessions), []);
+        assert_eq!(holding(&recovery, &ends), []);
+        recovery.start("mirror-0".into(), at(0), empty());
+        assert_eq!(holding(&recovery, &ends), []);
         recovery.give_up();
-        assert_eq!(holding(&recovery, &sessions), []);
+        assert_eq!(holding(&recovery, &ends), []);
 
-        // From the pick, all five hold.
-        assert_eq!(holding(&recovered(&sessions), &sessions), DECLARED);
+        // From the pick, all five hold. An environment action before the
+        // pick, such as recovery's own relink, breaks nothing.
+        ends.record(environment("mirror-0", EnvironmentAction::Relink));
+        assert_eq!(holding(&recovered(&sessions, &ends), &ends), DECLARED);
 
-        // A session admitted or another peer's link closing after the pick
-        // ends `StableMembership` only.
+        // The harness closing or relinking another peer after the pick ends
+        // `StableMembership` only.
         let rest = [
             Assume::BoundedStorage,
             Assume::BoundedDelivery,
             Assume::FairScheduling,
         ];
         let honest: Vec<Assume> = [Assume::HonestPeer].into_iter().chain(rest).collect();
-        let admitted = two_links();
-        let recovery = recovered(&admitted);
-        link(&admitted, 4, "mirror-2", 3);
-        assert_eq!(holding(&recovery, &admitted), honest);
-        let closed = two_links();
-        let recovery = recovered(&closed);
-        closed.link_closed(2);
-        assert_eq!(holding(&recovery, &closed), honest);
+        for action in [EnvironmentAction::Close, EnvironmentAction::Relink] {
+            let ends = EndEvidence::default();
+            let recovery = recovered(&sessions, &ends);
+            ends.record(environment("mirror-1", action));
+            assert_eq!(holding(&recovery, &ends), honest, "{action:?}");
+        }
 
-        // The service ending the source's session while its link stays open
-        // ends `HonestPeer` too, and the other three keep holding.
-        let recovery = recovered(&sessions);
+        // Closing or relinking the source ends `HonestPeer` too, and so does
+        // stopping the node. The other three keep holding.
+        for (peer, action) in [
+            ("mirror-0", EnvironmentAction::Close),
+            ("mirror-0", EnvironmentAction::Relink),
+            ("node", EnvironmentAction::Shutdown),
+        ] {
+            let ends = EndEvidence::default();
+            let recovery = recovered(&sessions, &ends);
+            ends.record(environment(peer, action));
+            assert_eq!(holding(&recovery, &ends), rest, "{peer} {action:?}");
+        }
+
+        // Ends the environment didn't make break nothing: the service ending
+        // the source's session, a link the source closed itself, another
+        // peer admitted, and the reactor exiting by itself. Each would hide
+        // a node that drops its honest source.
+        let ends = EndEvidence::default();
+        let recovery = recovered(&sessions, &ends);
         sessions.reactor(&ReactorEvent::SessionEnded {
             peer: id(2),
             session_id: 1,
             reason: "unproductive",
         });
-        assert_eq!(holding(&recovery, &sessions), rest);
+        sessions.link_closed(2);
+        link(&sessions, 4, "mirror-2", 3);
+        ends.record(EndFact::ReactorExited { step: 9 });
+        assert_eq!(holding(&recovery, &ends), DECLARED);
     }
 
     #[test]
@@ -704,7 +860,7 @@ mod tests {
             "no time boundary once every relink is spent"
         );
         let evidence = RecoveryEvidence::default();
-        evidence.start("mirror-0".into(), at(0));
+        evidence.start("mirror-0".into(), at(0), empty());
         for _ in 0..RECOVERY_RELINKS {
             assert_eq!(evidence.relinked(), "mirror-0");
         }

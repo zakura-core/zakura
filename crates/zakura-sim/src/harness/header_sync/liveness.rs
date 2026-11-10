@@ -214,11 +214,30 @@ pub enum RecoveryFixture {
     /// the objective is the node's own branch, which it reselects without
     /// adopting the source's fork.
     Reconsideration,
+    /// hdr-13's close class: the node at A3 and its source at A6, which the
+    /// harness closes before the `Recover`, so recovery relinks it. The
+    /// objective is A4 to A6.
+    Closes,
+    /// hdr-13's fault class: the node at A3 and its source at A6, with
+    /// every prepare failing `local-resource` until the `Recover`, which
+    /// comes once the first has. The objective is A4 to A6.
+    Faults,
+    /// hdr-13's close class as the departure's completion, hdr-10's
+    /// departure fixture with a recover: mirrors A ([`OWNER`]) and B
+    /// ([`TAKER`]) on one chain, A closed while its round holds the target,
+    /// then a recover of B. The node is at A3. B starts at A3 and grows to
+    /// A6 once A's locator read is submitted, then is relinked, so its new
+    /// session's first `Status` carries the target at once. A's first
+    /// locator read is held until that admission, so A owns the target
+    /// before B offers it, and A's round reserves its first request only
+    /// after it. A is closed once it has. Only B, the one member left, can
+    /// then supply the target.
+    Departure,
 }
 
 impl RecoveryFixture {
-    /// Every recovery fixture, in order.
-    pub const ALL: [RecoveryFixture; 7] = [
+    /// hdr-11's recovery control fixtures, in order.
+    pub const CONTROLS: [RecoveryFixture; 7] = [
         RecoveryFixture::Successor,
         RecoveryFixture::SyncedFirst,
         RecoveryFixture::Fork,
@@ -228,8 +247,24 @@ impl RecoveryFixture {
         RecoveryFixture::Reconsideration,
     ];
 
+    /// hdr-13's hostile-prefix class fixtures, in order. They come after
+    /// hdr-12b's publication fixtures in [`LivenessScenario::all`].
+    pub const CLASSES: [RecoveryFixture; 3] = [
+        RecoveryFixture::Closes,
+        RecoveryFixture::Faults,
+        RecoveryFixture::Departure,
+    ];
+
+    /// Every recovery fixture: [`Self::CONTROLS`], then [`Self::CLASSES`].
+    pub fn all() -> impl Iterator<Item = RecoveryFixture> {
+        Self::CONTROLS.into_iter().chain(Self::CLASSES)
+    }
+
     /// The storage scenario this fixture runs.
     pub fn storage(self) -> StorageScenario {
+        if self == RecoveryFixture::Departure {
+            return departure_recovery();
+        }
         let mirror = |chain| MirrorSpec {
             chain,
             dialer: Dialer::Mirror,
@@ -273,9 +308,36 @@ impl RecoveryFixture {
                 vec![mirror(Chain::main(4))],
                 vec![invalidate(2)],
             ),
+            RecoveryFixture::Closes => (
+                Chain::main(3),
+                vec![mirror(Chain::main(6))],
+                vec![ControlStep {
+                    peer: RECOVERY_SOURCE.to_owned(),
+                    action: ControlAction::Close,
+                    when: None,
+                }],
+            ),
+            RecoveryFixture::Faults => (Chain::main(3), vec![mirror(Chain::main(6))], Vec::new()),
+            RecoveryFixture::Departure => unreachable!("handled above"),
         };
-        let when = (self == RecoveryFixture::SyncedFirst)
-            .then(|| Trigger::Completed(Select::nth(OpKind::Apply, 1)));
+        let when = match self {
+            RecoveryFixture::SyncedFirst => Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+            RecoveryFixture::Faults => Some(Trigger::Completed(Select::nth(OpKind::Prepare, 1))),
+            _ => None,
+        };
+        let holds = if self == RecoveryFixture::Faults {
+            vec![Hold {
+                select: Select {
+                    kind: Some(OpKind::Prepare),
+                    ..Select::default()
+                },
+                until: Trigger::VirtualTime(0),
+                then: vec![Allow::LocalResource],
+                deadline_ms: None,
+            }]
+        } else {
+            Vec::new()
+        };
         controls.push(ControlStep {
             peer: RECOVERY_SOURCE.to_owned(),
             action: ControlAction::Recover,
@@ -284,10 +346,58 @@ impl RecoveryFixture {
         StorageScenario {
             node,
             mirrors,
-            policy: Policy::converging(),
+            policy: Policy {
+                holds,
+                ..Policy::converging()
+            },
             controls,
             weights: Default::default(),
         }
+    }
+}
+
+/// [`RecoveryFixture::Departure`]'s storage scenario.
+fn departure_recovery() -> StorageScenario {
+    let step = |peer: &str, action, when| ControlStep {
+        peer: peer.to_owned(),
+        action,
+        when,
+    };
+    let mirror = |chain| MirrorSpec {
+        chain,
+        dialer: Dialer::Mirror,
+    };
+    StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![mirror(Chain::main(6)), mirror(Chain::main(3))],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 1),
+                until: Trigger::Count(2, Box::new(Trigger::SessionAdmitted(TAKER.to_owned()))),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![
+            step(
+                TAKER,
+                ControlAction::Grow { len: 3 },
+                Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
+            ),
+            step(
+                TAKER,
+                ControlAction::Relink,
+                Some(Trigger::Grown(TAKER.to_owned())),
+            ),
+            step(
+                OWNER,
+                ControlAction::Close,
+                Some(Trigger::ReservationOpened(OWNER.to_owned())),
+            ),
+            step(TAKER, ControlAction::Recover, None),
+        ],
+        weights: Default::default(),
     }
 }
 
@@ -434,13 +544,14 @@ pub const STATUS_CHANGES: u64 = 5;
 
 impl LivenessScenario {
     /// The departure and timeout fixtures' mirrors, for the hand-off rule,
-    /// or `None` for a hold fixture.
+    /// the recovery departure fixture's included, or `None` for any other.
     pub fn roles(self) -> Option<Roles> {
         matches!(
             self,
             LivenessScenario::Departure { .. }
                 | LivenessScenario::Timeout { .. }
                 | LivenessScenario::LatePage
+                | LivenessScenario::Recovery(RecoveryFixture::Departure)
         )
         .then(|| Roles {
             owner: OWNER.to_owned(),
@@ -468,8 +579,9 @@ impl LivenessScenario {
         all.extend([false, true].map(|late_apply| LivenessScenario::Timeout { late_apply }));
         all.push(LivenessScenario::LatePage);
         all.extend(LivenessScenario::serving());
-        all.extend(RecoveryFixture::ALL.map(LivenessScenario::Recovery));
+        all.extend(RecoveryFixture::CONTROLS.map(LivenessScenario::Recovery));
         all.extend(LivenessScenario::publication());
+        all.extend(RecoveryFixture::CLASSES.map(LivenessScenario::Recovery));
         all
     }
 
@@ -1309,10 +1421,11 @@ impl HasView for Liveness {
 
 impl Subsystem for Liveness {
     const NAME: &'static str = "header-sync/liveness";
-    // 2: hdr-11's recovery fixtures, and 3: hdr-12b's publication
-    // fixtures after them, each of which grew [`LivenessScenario::all`] and
-    // so moved what each scenario byte picks.
-    const GENERATOR: u32 = 3;
+    // 2: hdr-11's recovery fixtures, 3: hdr-12b's publication fixtures
+    // after them, and 4: hdr-13's close, fault and departure fixtures after
+    // those, each of which grew [`LivenessScenario::all`] and so moved what
+    // each scenario byte picks.
+    const GENERATOR: u32 = 4;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = LivenessScenario;
     type Prepared = Ports;

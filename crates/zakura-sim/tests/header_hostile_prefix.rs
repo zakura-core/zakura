@@ -15,14 +15,23 @@ use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
-    domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
+    domain::{
+        header_sync::PEER_RETIREMENT_PROGRESS,
+        header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
+    },
     harness::{
         header_node::{
+            ends::{EndFact, EnvironmentAction},
             policy::{Allow, OpKind, Select, Trigger},
             recovery::{recovery_window, Disruption, RecoveryEvidence, RECOVERY_BOUND},
+            retirement::HandoffFact,
             Chain, ControlAction,
         },
-        header_sync::{grammar, Storage, StorageScenario},
+        header_sync::{
+            grammar,
+            liveness::{LivenessScenario, RecoveryFixture},
+            Liveness, Storage, StorageScenario,
+        },
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
@@ -721,6 +730,75 @@ fn a_source_cooling_down_on_the_node_isnt_unreached() {
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
             &PropertyOutcome::NotApplicable
+        );
+    }
+}
+
+/// The departure recovery fixture arms `peer-retirement-progress`'s
+/// hand-off, with mirror A as the owner and B as the taker, so the close
+/// class's completion runs beside it. Under 8 plans the hand-off opens for
+/// A's target when A's session departs holding it, a locator read for that
+/// same target then reaches storage for another peer's session, B's, and
+/// that comes before the harness begins stopping the node. Both
+/// properties hold, and the run ends idle.
+#[test]
+fn the_departure_recovery_hands_the_target_to_the_survivor() {
+    let fixture = LivenessScenario::Recovery(RecoveryFixture::Departure);
+    assert!(fixture.roles().is_some());
+    for input in inputs(8, 256) {
+        let ports = Liveness::prepare(&fixture);
+        let (retirement, ends) = (ports.retirement.clone(), ports.ends.clone());
+        let report =
+            run_prepared::<Liveness>(&fixture, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        let end = &report.end;
+        assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+        assert!(matches!(end.outcome, Outcome::Idle { .. }), "{end:?}");
+        assert_eq!(
+            outcome(&report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Held { applicable: 1 }
+        );
+        assert!(
+            matches!(
+                outcome(&report, PEER_RETIREMENT_PROGRESS),
+                PropertyOutcome::Held { .. }
+            ),
+            "{:?}",
+            outcome(&report, PEER_RETIREMENT_PROGRESS)
+        );
+        let facts = retirement.facts();
+        let (opened, target, departed) = facts
+            .iter()
+            .find_map(|(stamp, fact)| match fact {
+                HandoffFact::Opened {
+                    target, departed, ..
+                } => Some((*stamp, *target, departed.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the hand-off opens: {facts:?}"));
+        let read = facts
+            .iter()
+            .find_map(|(stamp, fact)| match fact {
+                HandoffFact::Read {
+                    target: read,
+                    session,
+                } if *stamp > opened && *read == target && session.0 != departed.0 => Some(*stamp),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("B reads A's target: {facts:?}"));
+        let stopped = ends
+            .facts()
+            .into_iter()
+            .find_map(|(stamp, fact)| match fact {
+                EndFact::Environment {
+                    action: EnvironmentAction::Shutdown,
+                    ..
+                } => Some(stamp),
+                _ => None,
+            });
+        assert!(
+            stopped.is_none_or(|stopped| read < stopped),
+            "the read comes before the stop"
         );
     }
 }

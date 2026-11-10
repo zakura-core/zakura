@@ -2,11 +2,15 @@
 //! the tests that read them build: each is a typed scenario generator 3 can
 //! encode, so the fuzzer can draw it from its seed.
 
+// Not every test that shares this module names them.
+#[allow(unused_imports)]
+pub use zakura_sim::harness::header_sync::liveness::{OWNER, TAKER};
 use zakura_sim::harness::{
     header_node::{
         policy::{Allow, Hold, OpKind, ReplyHold, Select, Trigger},
         Chain, ControlAction, ControlStep, Fork, Policy, Reset,
     },
+    header_sync::liveness::RecoveryFixture,
     header_sync::{Dialer, MirrorSpec, StorageScenario, Weights},
 };
 
@@ -569,56 +573,10 @@ pub fn grown_source() -> StorageScenario {
     ])
 }
 
-/// The departed owner, mirror A, in [`departure_recovery`].
-pub const OWNER: &str = "mirror-0";
-
-/// The surviving taker, mirror B, in [`departure_recovery`].
-pub const TAKER: &str = "mirror-1";
-
-/// hdr-13's close class as the departure's completion: hdr-10's departure
-/// fixture, mirrors A ([`OWNER`]) and B ([`TAKER`]) on one chain, with A
-/// closed while its round holds the target and then a recover of B. The
-/// node is at A3. B starts at A3 and grows to A6 once A's locator read is
-/// submitted, then is relinked, so its new session's first `Status` carries
-/// the target at once. A's first locator read is held until that
-/// admission, so A owns the target before B offers it, and A's round
-/// reserves its first request only after it. A is closed once it has. Only
-/// B, the one member left, can then supply the target.
+/// hdr-13's close class as the departure's completion
+/// ([`RecoveryFixture::Departure`]).
 pub fn departure_recovery() -> StorageScenario {
-    StorageScenario {
-        node: Chain::main(3),
-        mirrors: vec![
-            mirror(Chain::main(6), Dialer::Mirror),
-            mirror(Chain::main(3), Dialer::Mirror),
-        ],
-        policy: Policy {
-            holds: vec![hold(
-                Select::nth(OpKind::Locator, 1),
-                Trigger::Count(2, Box::new(Trigger::SessionAdmitted(TAKER.to_owned()))),
-                Allow::Engine,
-            )],
-            ..Policy::converging()
-        },
-        controls: vec![
-            step(
-                TAKER,
-                ControlAction::Grow { len: 3 },
-                Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
-            ),
-            step(
-                TAKER,
-                ControlAction::Relink,
-                Some(Trigger::Grown(TAKER.to_owned())),
-            ),
-            step(
-                OWNER,
-                ControlAction::Close,
-                Some(Trigger::ReservationOpened(OWNER.to_owned())),
-            ),
-            step(TAKER, ControlAction::Recover, None),
-        ],
-        weights: Weights::default(),
-    }
+    RecoveryFixture::Departure.storage()
 }
 
 /// [`StorageScenario::holds`], the scenario whose node releases a header

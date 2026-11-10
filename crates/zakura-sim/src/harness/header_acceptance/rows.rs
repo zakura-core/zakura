@@ -500,7 +500,17 @@ const RETIRE_WITNESSES: HistoryRef = HistoryRef {
     case: "header-retire-timeout",
 };
 
-/// The committed recovery control, holding and applying
+/// Each committed recovery fixture, by its fixture stem, which its witness
+/// test runs under the fixed Plan: hdr-11's control and hdr-13's close,
+/// fault and departure classes.
+const RECOVERY_CASES: [&str; 4] = [
+    "header-recovery-successor",
+    "header-recovery-closes",
+    "header-recovery-faults",
+    "header-recovery-departure",
+];
+
+/// The committed recovery fixtures, each holding and applying
 /// `bounded-adversary-progress` under the fixed Plan.
 const RECOVERY_WITNESS: HistoryRef = HistoryRef {
     harness: LIVENESS,
@@ -858,7 +868,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             histories.push((HistoryRef { case, ..history }, id));
         }
     }
-    histories.push((RECOVERY_WITNESS, RECOVERY_ID));
+    for case in RECOVERY_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..RECOVERY_WITNESS
+            },
+            RECOVERY_ID,
+        ));
+    }
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),

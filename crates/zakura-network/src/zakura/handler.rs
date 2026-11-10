@@ -80,7 +80,7 @@ use crate::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, frame_cap_carries_payload, spawn_block_sync_reactor,
+        admission_host, canonical_ip, frame_cap_carries_payload, spawn_block_sync_reactor,
         spawn_header_sync_reactor, supported_p2p_v2_alpns, zakura_protocol_for_alpn,
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
@@ -355,10 +355,15 @@ pub struct ZakuraConfig {
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
+    /// A global unicast IPv6 source counts by its /64, since one host can hold
+    /// every address in it. Other sources count by their exact address, after
+    /// IPv4 transition encodings fold to the IPv4 address.
+    ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
     /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
-    /// stricter per-IP default. Global caps and outbound peer diversity remain
-    /// the primary eclipse-resistance controls.
+    /// stricter per-IP default. The outbound share of
+    /// [`max_connections`](Self::max_connections) remains the primary
+    /// eclipse-resistance control.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
     ///
@@ -1428,6 +1433,7 @@ pub struct ZakuraSupervisorHandle {
 
 /// Connections charged to each source IP: registered connections, and inbound
 /// connections still in their control handshake (zakura-quic ADM-3 rule 2).
+/// Each count is keyed by [`admission_host`], so an IPv6 /64 is one IP here.
 ///
 /// A std mutex guards the counts, so the QUIC acceptor, which must not block,
 /// reads them without the supervisor's async lock (zakura-quic ADM-4).
@@ -1605,7 +1611,9 @@ struct ZakuraPeerConnectionEntry {
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
     registered_at: Instant,
-    remote_ip: Option<IpAddr>,
+    /// The [`admission_host`] this connection is charged to, if its IP is
+    /// known.
+    host: Option<IpAddr>,
 }
 
 impl ZakuraSupervisorState {
@@ -1627,7 +1635,7 @@ impl ZakuraSupervisorState {
             self.ip_slots.registered_total(),
             self.active_by_peer
                 .values()
-                .filter(|entry| entry.remote_ip.is_some())
+                .filter(|entry| entry.host.is_some())
                 .count(),
             "Zakura per-IP registered totals must match active peer registrations with known IPs",
         );
@@ -1819,7 +1827,7 @@ impl ZakuraSupervisorHandle {
         max_handshakes_per_ip: usize,
         validated: bool,
     ) -> IpAdmission {
-        let ip = canonical_ip(remote_ip);
+        let ip = admission_host(remote_ip);
         let registered = self.ip_slots.registered(ip);
         let in_flight = self.ip_slots.handshaking(ip).saturating_add(pending);
         if in_flight >= max_handshakes_per_ip {
@@ -1852,7 +1860,7 @@ impl ZakuraSupervisorHandle {
     /// Counts an inbound control handshake against `remote_ip` until the guard
     /// drops at registration (zakura-quic ADM-3 rule 2).
     fn enter_control_handshake(&self, remote_ip: IpAddr) -> ControlHandshakeGuard {
-        self.ip_slots.enter_handshake(canonical_ip(remote_ip))
+        self.ip_slots.enter_handshake(admission_host(remote_ip))
     }
 
     /// Returns the currently registered authenticated Zakura peer ids.
@@ -1988,7 +1996,10 @@ impl ZakuraSupervisorHandle {
         disconnect_token: CancellationToken,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
+        // Discovery matches the registered IP against advertised addresses,
+        // so it keeps the address itself. Only accounting uses the host.
         let remote_ip = remote_ip.map(canonical_ip);
+        let host = remote_ip.map(admission_host);
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
@@ -2001,10 +2012,10 @@ impl ZakuraSupervisorHandle {
         let same_ip_duplicate_redial = state
             .active_by_peer
             .get(&peer_id)
-            .is_some_and(|entry| entry.remote_ip == remote_ip);
-        if let Some(remote_ip) = remote_ip {
+            .is_some_and(|entry| entry.host == host);
+        if let Some(host) = host {
             if !same_ip_duplicate_redial
-                && state.ip_slots.registered(remote_ip) >= state.max_connections_per_ip
+                && state.ip_slots.registered(host) >= state.max_connections_per_ip
             {
                 metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
                 return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
@@ -2031,14 +2042,14 @@ impl ZakuraSupervisorHandle {
                     outbound_handle,
                     disconnect_token,
                     registered_at: Instant::now(),
-                    remote_ip,
+                    host,
                 };
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
-                    state.decrement_ip(old_entry.remote_ip);
+                    state.decrement_ip(old_entry.host);
                     old_entry.disconnect_token.cancel();
                     metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
-                state.increment_ip(remote_ip);
+                state.increment_ip(host);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
@@ -2112,7 +2123,7 @@ impl ZakuraSupervisorHandle {
             .active_by_peer
             .remove(peer_id)
             .expect("peer entry exists because it was just checked");
-        state.decrement_ip(entry.remote_ip);
+        state.decrement_ip(entry.host);
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
@@ -2143,7 +2154,7 @@ impl ZakuraSupervisorHandle {
         in_flight_count: usize,
     ) -> bool {
         self.ip_slots
-            .registered(canonical_ip(remote_ip))
+            .registered(admission_host(remote_ip))
             .saturating_add(in_flight_count)
             < self.max_connections_per_ip
     }
@@ -4584,6 +4595,12 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn alpns(&self) -> Vec<Vec<u8>> {
         supported_p2p_v2_alpns()
+    }
+
+    /// Counts pending handshakes by [`admission_host`], the key every per-IP
+    /// count here uses, so one IPv6 /64 gets one share of the budget.
+    fn pending_group(&self, ip: IpAddr) -> IpAddr {
+        admission_host(ip)
     }
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
@@ -8728,7 +8745,7 @@ mod tests {
                 .get(&peer)
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
-            assert_eq!(entry.remote_ip, Some(remote_ip));
+            assert_eq!(entry.host, Some(remote_ip));
             assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }
@@ -13834,6 +13851,157 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn register_test_peer_from(
+        supervisor: &ZakuraSupervisorHandle,
+        peer: &ZakuraPeerId,
+        ip: &str,
+        token: CancellationToken,
+    ) -> ZakuraRegistration {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        supervisor
+            .register(
+                test_conn_id(),
+                peer.clone(),
+                Some(ip.parse().expect("test ip parses")),
+                [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
+                token,
+                ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await
+    }
+
+    /// #645: every address in a global IPv6 /64 shares one per-IP cap, so a
+    /// host that holds a /64 can't fill the node by using a fresh address per
+    /// identity. Another /64 and unique-local addresses keep their own caps.
+    #[tokio::test]
+    async fn ipv6_slash_64_shares_one_per_ip_cap() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let register = |byte: u8, ip: &'static str| {
+            let supervisor = supervisor.clone();
+            async move {
+                register_test_peer_from(&supervisor, &test_peer(byte), ip, CancellationToken::new())
+                    .await
+            }
+        };
+        assert!(matches!(
+            register(1, "2001:db8:a:b::1").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        assert!(matches!(
+            register(2, "2001:db8:a:b::2").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        assert!(matches!(
+            register(3, "2001:db8:a:b:ffff:ffff:ffff:3").await,
+            ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
+        ));
+        let full_slash_64 = "2001:db8:a:b::99".parse().expect("test ip parses");
+        assert!(!supervisor.can_accept_remote_ip_with_in_flight(full_slash_64, 0));
+
+        let other_slash_64 = "2001:db8:a:c::1".parse().expect("test ip parses");
+        assert!(supervisor.can_accept_remote_ip_with_in_flight(other_slash_64, 1));
+        assert!(!supervisor.can_accept_remote_ip_with_in_flight(other_slash_64, 2));
+        assert!(matches!(
+            register(4, "2001:db8:a:c::1").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        for (byte, unique_local) in [(5, "fd00::1"), (6, "fd00::2"), (7, "fd00::3")] {
+            assert!(
+                matches!(
+                    register(byte, unique_local).await,
+                    ZakuraRegistration::Registered { .. }
+                ),
+                "{unique_local} has its own cap",
+            );
+        }
+    }
+
+    /// Registration charges the /64, but reports the peer's own address,
+    /// which discovery matches exactly against the addresses the peer
+    /// advertises.
+    #[tokio::test]
+    async fn registration_reports_the_address_not_its_slash_64() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let registration = register_test_peer_from(
+            &supervisor,
+            &test_peer(1),
+            "2001:db8:a:b::7",
+            CancellationToken::new(),
+        )
+        .await;
+        let ZakuraRegistration::Registered { remote_ip, .. } = registration else {
+            panic!("a fresh peer registers: {registration:?}");
+        };
+        assert_eq!(
+            remote_ip,
+            Some("2001:db8:a:b::7".parse().expect("test ip parses"))
+        );
+        assert_eq!(
+            supervisor
+                .ip_slots
+                .registered("2001:db8:a:b::".parse().expect("test ip parses")),
+            1
+        );
+    }
+
+    /// A restarted peer that comes back on another address of its /64, as
+    /// RFC 8981 temporary addresses do, still takes the same-IP redial path:
+    /// it passes a full cap and evicts its stale incumbent on the short gate.
+    #[tokio::test(start_paused = true)]
+    async fn redial_from_the_same_slash_64_is_a_same_ip_duplicate() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer = test_peer(60);
+        let incumbent = CancellationToken::new();
+        assert!(matches!(
+            register_test_peer_from(&supervisor, &peer, "2001:db8:a:b::1", incumbent.clone()).await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        tokio::time::advance(ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE + Duration::from_secs(1)).await;
+        assert!(matches!(
+            register_test_peer_from(
+                &supervisor,
+                &peer,
+                "2001:db8:a:b::2",
+                CancellationToken::new()
+            )
+            .await,
+            ZakuraRegistration::Duplicate { .. }
+        ));
+        assert!(incumbent.is_cancelled());
+    }
+
+    /// The acceptor charges control handshakes and the transport's pending
+    /// handshakes to the /64 too, so one /64 gets one share of the handshake
+    /// budget however many addresses it uses.
+    #[test]
+    fn handshakes_from_one_slash_64_count_together() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        let ip = |ip: &str| -> IpAddr { ip.parse().expect("test ip parses") };
+        assert_eq!(
+            handler.pending_group(ip("2001:db8:a:b::7")),
+            ip("2001:db8:a:b::")
+        );
+        let _controls = [
+            supervisor.enter_control_handshake(ip("2001:db8:a:b::1")),
+            supervisor.enter_control_handshake(ip("2001:db8:a:b::2")),
+        ];
+        let attempt = |remote: &str| IncomingInfo {
+            remote: SocketAddr::new(ip(remote), 8234),
+            validated: true,
+            pending_total: 0,
+            pending_from_ip: 0,
+        };
+        assert_eq!(handler.admit(&attempt("2001:db8:a:b::3")), Admit::Refuse);
+        assert_eq!(handler.admit(&attempt("2001:db8:a:c::3")), Admit::Accept);
     }
 
     /// ADM-3's inbound share (#1367): once inbound connections or inbound

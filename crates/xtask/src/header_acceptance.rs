@@ -1369,6 +1369,7 @@ impl Tree {
     }
 
     /// The processes in `table` in the tree, as `(pid, group)`.
+    #[cfg(unix)]
     fn alive(&self, table: &[(i32, i32, i32)]) -> Vec<(i32, i32)> {
         table
             .iter()

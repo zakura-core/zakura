@@ -535,7 +535,8 @@ impl BlockTemplateResponse {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // The checked invariants are the same as the non-cancellable constructor.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal_cancellable(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,

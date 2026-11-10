@@ -1955,7 +1955,8 @@ where
             .gbt
             .shared_template
             .ready(chain_info.tip_hash, validity)?;
-        if template.max_time != chain_info.max_time
+        if template.bits != chain_info.expected_difficulty
+            || template.max_time != chain_info.max_time
             || template.cur_time < chain_info.min_time
             || chain_info.cur_time > template.max_time
             || Some(&template.long_poll_id) == client_id

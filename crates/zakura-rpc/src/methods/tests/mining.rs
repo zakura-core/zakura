@@ -2007,6 +2007,12 @@ fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
             .send(mempool::MempoolChange::added(Default::default()))
             .unwrap();
         assert!(rpc.ready_populated_template(&current, None).is_some());
+        let mut different_difficulty = current.clone();
+        different_difficulty.expected_difficulty =
+            CompactDifficulty::from(ExpandedDifficulty::from(U256::from(2)));
+        assert!(rpc
+            .ready_populated_template(&different_difficulty, None)
+            .is_none());
         // Cache admission must see removal immediately, before the worker polls the event.
         changes
             .send(mempool::MempoolChange::invalidated(Default::default()))
@@ -2027,5 +2033,28 @@ fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
         replacement.publish(response);
         assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_some());
         drop(info_tx);
+    });
+}
+
+#[test]
+fn speculative_builds_do_not_queue_ahead_of_foreground_work() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(1, 1, 0));
+        let (rpc, _tip, _) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+        let mut occupied = Box::pin(rpc.gbt.run_template_build(|| ()));
+        assert!(futures::poll!(&mut occupied).is_pending());
+        let mut foreground = Box::pin(rpc.gbt.run_template_build(|| 7));
+        assert!(futures::poll!(&mut foreground).is_pending());
+        let result = rpc
+            .gbt
+            .run_template_build_with_priority(true, || {
+                panic!("speculation must not acquire occupied capacity")
+            })
+            .await;
+        assert!(result.is_err());
+        gate.release().await;
+        bounded(occupied).await.unwrap();
+        assert_eq!(bounded(foreground).await.unwrap(), 7);
     });
 }

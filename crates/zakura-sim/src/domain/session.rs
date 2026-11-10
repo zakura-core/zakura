@@ -3,11 +3,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
+    time::Duration,
 };
+
+use zakura_network::zakura::ZakuraBlockSyncConfig;
 
 use crate::{
     model::is_fault_cause,
-    observe::Entry,
+    observe::{BlockSyncFact, Entry, TransportFact},
     peer::peer_of,
     property::{
         Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory,
@@ -134,10 +137,48 @@ fn remote_of(entries: &[Entry], connection: u64) -> Option<&str> {
 /// connection's session carried.
 pub const REPLACEMENT_PRESERVES_AUTHORIZATION: &str = "session/replacement-preserves-authorization";
 
+/// A block-sync request that waits on its peer closes no shared connection:
+/// the node decides no close with a recorded cause on the request's
+/// connection while the request waits within its request timeout. A
+/// routine that abandons a request doesn't end the wait: its peer may still
+/// answer.
+pub const STALLED_SERVICE_ISOLATED: &str = "session/stalled-service-isolated";
+
+/// How long a block-sync request must wait, in virtual time, before
+/// [`STALLED_SERVICE_ISOLATED`]'s trigger history counts it as a stall:
+/// several round trips of the simulated network, and less than any saved
+/// stall.
+const STALL_WITNESS: Duration = Duration::from_millis(500);
+
 /// The session properties a wire harness with several services on one
-/// connection reaches: [`REPLACEMENT_PRESERVES_AUTHORIZATION`].
+/// connection reaches: [`REPLACEMENT_PRESERVES_AUTHORIZATION`] and
+/// [`STALLED_SERVICE_ISOLATED`].
 pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
-    vec![Property {
+    vec![
+        replacement_preserves_authorization(),
+        Property {
+            id: PropertyId::new(STALLED_SERVICE_ISOLATED),
+            claim: "while a block-sync request waits on its peer, from its publication until its \
+                    first body arrives, block sync resets it, or its request timeout passes, the \
+                    node decides no close with a recorded cause on the request's connection, so \
+                    header sync and discovery keep the sessions they share it with",
+            kind: Kind::Safety,
+            // A wire harness's mirrors all serve honestly, so no recorded
+            // cause justifies a close while one of their requests waits.
+            assumes: &[],
+            // The block tap's request rows and the transport tap's close
+            // rows.
+            needs: &[Source::View, Source::Datagrams],
+            status: Status::Active,
+            check: check_stalled_service_isolated::<S>,
+            witness: Some(TriggerHistory::Log(a_request_stalled)),
+        },
+    ]
+}
+
+/// [`REPLACEMENT_PRESERVES_AUTHORIZATION`].
+fn replacement_preserves_authorization<S: HasView>() -> Property<S> {
+    Property {
         id: PropertyId::new(REPLACEMENT_PRESERVES_AUTHORIZATION),
         claim: "every service session the node admits on a connection that replaces an \
                 earlier connection to the same peer carries a session ID that no session on \
@@ -151,7 +192,7 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         status: Status::Active,
         check: check_replacement_preserves_authorization::<S>,
         witness: Some(TriggerHistory::Log(replacement_admitted)),
-    }]
+    }
 }
 
 /// One session row: its connection, its peer and its session ID.
@@ -256,4 +297,193 @@ fn replacement_admitted(log: &ObservationLog) -> bool {
         .iter()
         .filter_map(|entry| session_row(&entry.obs))
         .any(|row| sessions.fold(row).is_some())
+}
+
+/// One block-sync request's wait: the connection its routine runs on and
+/// when it was published, in nanoseconds of virtual time.
+struct Wait {
+    connection: Option<u64>,
+    since_ns: u64,
+}
+
+/// The block-sync requests that wait on their peers, folded from the log.
+#[derive(Default)]
+struct Waits {
+    /// Each routine generation's connection, from its admission.
+    connections: BTreeMap<u64, u64>,
+    /// Each waiting request, by its owner's generation and request ID.
+    waiting: BTreeMap<(u64, u64), Wait>,
+    /// The virtual time of the last `TimeAdvanced` row.
+    now_ns: u64,
+    /// The longest wait that ended or that its routine abandoned, in
+    /// nanoseconds.
+    longest_ns: u64,
+}
+
+impl Waits {
+    /// Folds `obs`. Returns true if it ended a wait.
+    fn fold(&mut self, obs: &Observation) -> bool {
+        let fact = match obs {
+            Observation::TimeAdvanced { to_ns, .. } => {
+                self.now_ns = *to_ns;
+                return false;
+            }
+            Observation::BlockSync { event, .. } => event,
+            _ => return false,
+        };
+        let ended = match fact {
+            BlockSyncFact::SessionAdmitted {
+                connection,
+                generation,
+                ..
+            } => {
+                self.connections.insert(*generation, *connection);
+                return false;
+            }
+            BlockSyncFact::Request { owner, step, .. } if step == "published" => {
+                let wait = Wait {
+                    connection: self.connections.get(&owner.session_id).copied(),
+                    since_ns: self.now_ns,
+                };
+                self.waiting
+                    .insert((owner.session_id, owner.request_id), wait);
+                return false;
+            }
+            BlockSyncFact::Request { owner, step, .. }
+                if matches!(step.as_str(), "reset" | "expired" | "delivery-failed") =>
+            {
+                owner
+            }
+            BlockSyncFact::Request { owner, step, .. } if step.starts_with("dropped") => {
+                // The routine abandoned the request unanswered. It still
+                // waits, but its wait so far counts as a stall.
+                if let Some(wait) = self.waiting.get(&(owner.session_id, owner.request_id)) {
+                    self.longest_ns = self
+                        .longest_ns
+                        .max(self.now_ns.saturating_sub(wait.since_ns));
+                }
+                return false;
+            }
+            BlockSyncFact::HandoffStarted { owner, .. } => owner,
+            _ => return false,
+        };
+        let Some(wait) = self.waiting.remove(&(ended.session_id, ended.request_id)) else {
+            return false;
+        };
+        self.longest_ns = self
+            .longest_ns
+            .max(self.now_ns.saturating_sub(wait.since_ns));
+        true
+    }
+
+    /// The requests on `connection` that wait within the request timeout of
+    /// block sync's default config, which wire harnesses run, as
+    /// `generation/request` labels.
+    fn on(&self, connection: u64) -> Vec<String> {
+        let timeout = u64::try_from(ZakuraBlockSyncConfig::default().request_timeout.as_nanos())
+            .unwrap_or(u64::MAX);
+        self.waiting
+            .iter()
+            .filter(|(_, wait)| {
+                wait.connection == Some(connection)
+                    && self.now_ns.saturating_sub(wait.since_ns) < timeout
+            })
+            .map(|((generation, request), _)| format!("{generation}/{request}"))
+            .collect()
+    }
+}
+
+/// Checks [`STALLED_SERVICE_ISOLATED`] at each step that ends a request's
+/// wait or decides a close with a recorded cause. A wait that ends holds.
+/// A close with a recorded cause on a connection with a waiting request
+/// violates it. A waiting request whose routine no admission row names is
+/// missing evidence. It folds the log's earlier rows each time, since a run
+/// publishes only a few dozen requests.
+fn check_stalled_service_isolated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let step = cx.step;
+    let judged = |obs: &Observation| {
+        matches!(
+            obs,
+            Observation::BlockSync {
+                event: BlockSyncFact::HandoffStarted { .. } | BlockSyncFact::Request { .. },
+                ..
+            } | Observation::Transport {
+                event: TransportFact::CloseDecided { cause: Some(_) },
+                ..
+            }
+        )
+    };
+    if !cx.observations().any(judged) {
+        return Verdict::NotApplicable;
+    }
+    let mut waits = Waits::default();
+    let mut verdict = Verdict::NotApplicable;
+    let mut findings = Vec::new();
+    let mut unmapped = None;
+    for entry in cx.log.entries() {
+        let ended = waits.fold(&entry.obs);
+        if entry.step != step {
+            continue;
+        }
+        if ended {
+            verdict = Verdict::Holds;
+        }
+        let Observation::Transport {
+            connection: Some(connection),
+            event: TransportFact::CloseDecided { cause: Some(cause) },
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        if let Some(((generation, request), _)) = waits
+            .waiting
+            .iter()
+            .find(|(_, wait)| wait.connection.is_none())
+        {
+            unmapped = Some(format!(
+                "request {request} of routine generation {generation} waits, but no \
+                 block-sync admission row names its connection"
+            ));
+        }
+        let waiting = waits.on(*connection);
+        if !waiting.is_empty() {
+            findings.push((
+                "the node decides no close with a recorded cause on a connection while a \
+                 block-sync request on it waits"
+                    .to_owned(),
+                format!(
+                    "the node closed connection {connection} with cause {cause} while \
+                     requests {} waited on it",
+                    waiting.join(", ")
+                ),
+            ));
+        }
+    }
+    if let Some(detail) = unmapped {
+        cx.missing_evidence(detail);
+        return Verdict::NotApplicable;
+    }
+    let mut findings = findings.into_iter();
+    match findings.next() {
+        Some((expected, actual)) => {
+            for (expected, actual) in findings {
+                cx.record_violation(expected, actual);
+            }
+            cx.violated(expected, actual)
+        }
+        None => verdict,
+    }
+}
+
+/// [`STALLED_SERVICE_ISOLATED`]'s trigger history: a block-sync request
+/// waited at least [`STALL_WITNESS`] before its first body arrived, block
+/// sync reset it, or its routine abandoned it.
+fn a_request_stalled(log: &ObservationLog) -> bool {
+    let mut waits = Waits::default();
+    for entry in log.entries() {
+        waits.fold(&entry.obs);
+    }
+    let threshold = u64::try_from(STALL_WITNESS.as_nanos()).expect("half a second fits u64");
+    waits.longest_ns >= threshold
 }

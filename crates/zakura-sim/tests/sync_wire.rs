@@ -14,6 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::Duration,
 };
 
 use support::inputs;
@@ -22,14 +23,14 @@ use zakura_network::zakura::{
     ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_sim::{
-    domain::session::REPLACEMENT_PRESERVES_AUTHORIZATION,
+    domain::session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
     harness::{
         run_prepared,
-        sync::{self, SyncPorts},
-        sync_wire::{SavedWire, SyncWire},
+        sync::SyncPorts,
+        sync_wire::{SavedWire, SyncWire, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
-    observe::{StorageFact, StorageRequest},
+    observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
     seed, MemorySink, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -152,11 +153,16 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
 }
 
 /// #2094's first case on the shared connection: every mirror's block-sync
-/// range read stalls for [`STALL_MS`](zakura_sim::harness::sync_wire::STALL_MS),
-/// so block sync's sessions hold requests outstanding, while header sync's
-/// and discovery's sessions share their connections. Header sync still
-/// applies the mirrors' tip before storage takes the node's first body, no
-/// connection closes, and both tips reach the mirrors' tip once the reads
+/// range read stalls for [`STALL_MS`], so block sync's sessions hold
+/// requests outstanding, while header sync's and discovery's sessions share
+/// their connections. Once the first read is held, the mirrors' chains grow
+/// by [`STALL_GROWTH`] blocks.
+///
+/// Header sync applies the grown tip, and the node reads a discovery frame,
+/// inside a stall: while a block-sync request that waits at least
+/// [`STALL_MS`] for its first body waits. No
+/// connection closes, the run holds [`STALLED_SERVICE_ISOLATED`] with its
+/// trigger history, and both tips reach the grown tip once the reads
 /// complete.
 #[test]
 fn a_stalled_block_session_starves_no_other_service() {
@@ -164,37 +170,118 @@ fn a_stalled_block_session_starves_no_other_service() {
     for input in std::iter::once(committed).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::StalledBlocks, input);
         let tip = ports.mirror_tip();
+        let fixture_tip = ports.chain.last().expect("the fixture has blocks").height.0;
+        let grown = fixture_tip + STALL_GROWTH;
+        assert_eq!(tip.height.0, grown, "{:?}", report.end);
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
-        let tip_hash = sync::hashes(&ports.chain)[&tip.height.0].clone();
-        let mut tip_applied = None;
-        let mut first_body = None;
-        for entry in report.log.entries() {
-            let Observation::Storage { fact, .. } = &entry.obs else {
-                continue;
-            };
-            match fact {
-                StorageFact::Submitted {
-                    request: StorageRequest::ApplyHeaderTarget { target, .. },
+        let stalls = stalls(&report.log);
+        let stalled = |step: u64| stalls.iter().any(|stall| stall.contains(&step));
+        let tip_hash: String = tip
+            .hash
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let tip_applied = report
+            .log
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.obs {
+                Observation::Storage {
+                    fact:
+                        StorageFact::Submitted {
+                            request: StorageRequest::ApplyHeaderTarget { target, .. },
+                            ..
+                        },
                     ..
-                } if *target == tip_hash => {
-                    tip_applied.get_or_insert(entry.step);
+                } if *target == tip_hash => Some(entry.step),
+                _ => None,
+            });
+        let discovery: BTreeSet<(u64, u64)> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Session {
+                    connection,
+                    quic_stream,
+                    kind,
+                    ..
+                } if *kind == ZAKURA_STREAM_DISCOVERY => Some((*connection, *quic_stream)),
+                _ => None,
+            })
+            .collect();
+        let discovery_read = report
+            .log
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.obs {
+                Observation::Transport {
+                    connection: Some(connection),
+                    event: TransportFact::FrameRead { quic_stream, .. },
+                    ..
+                } if stalled(entry.step) && discovery.contains(&(*connection, *quic_stream)) => {
+                    Some(entry.step)
                 }
-                StorageFact::BlockSubmitted { .. } => {
-                    first_body.get_or_insert(entry.step);
-                }
-                _ => {}
-            }
-        }
-        let (Some(tip_applied), Some(first_body)) = (tip_applied, first_body) else {
-            panic!("{tip_applied:?}, {first_body:?}: {:?}", report.end);
-        };
-        assert!(tip_applied < first_body, "{tip_applied} {first_body}");
+                _ => None,
+            });
+        assert!(
+            tip_applied.is_some_and(stalled),
+            "the grown tip applied at {tip_applied:?}, outside the stalls {stalls:?}"
+        );
+        assert!(
+            discovery_read.is_some(),
+            "no discovery frame read inside the stalls {stalls:?}"
+        );
         let sessions = sessions(&report.log);
         for (peer, connections) in &sessions {
             assert_eq!(connections.len(), 1, "{peer}: {connections:?}");
             assert_eq!(connections[0].1, every_service(), "{peer}");
         }
+        assert!(
+            matches!(
+                outcome(&report, STALLED_SERVICE_ISOLATED),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{:?}",
+            outcome(&report, STALLED_SERVICE_ISOLATED)
+        );
     }
+}
+
+/// The stalls: each block-sync request's wait, from its publication to the
+/// step before its first body arrived, that lasted at least [`STALL_MS`] of
+/// virtual time. Fails the test if there is none.
+fn stalls(log: &ObservationLog) -> Vec<std::ops::Range<u64>> {
+    let mut now_ns = 0;
+    let mut waiting = BTreeMap::new();
+    let mut stalls = Vec::new();
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => now_ns = *to_ns,
+            Observation::BlockSync {
+                event: BlockSyncFact::Request { owner, step, .. },
+                ..
+            } if step == "published" => {
+                waiting.insert((owner.session_id, owner.request_id), (entry.step, now_ns));
+            }
+            Observation::BlockSync {
+                event: BlockSyncFact::HandoffStarted { owner, .. },
+                ..
+            } => {
+                if let Some((start, since_ns)) =
+                    waiting.remove(&(owner.session_id, owner.request_id))
+                {
+                    if Duration::from_nanos(now_ns - since_ns) >= Duration::from_millis(STALL_MS) {
+                        stalls.push(start..entry.step);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(!stalls.is_empty(), "no request waited {STALL_MS} ms");
+    stalls
 }
 
 /// The committed fixture directory.

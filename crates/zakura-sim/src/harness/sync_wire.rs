@@ -11,6 +11,11 @@
 //! Each connection's dialer redials it once it ends, [`REDIAL_SETTLE`]
 //! later, until the node shuts down. So a `Close` step, which disconnects
 //! the node's connection to a mirror, replaces that connection.
+//!
+//! A run ends on its step budget ([`wire_config`]), not idle: QUIC's and
+//! the services' timers keep firing after the node syncs. So each saved
+//! scenario's end record ends on `budget`, and a check that waits for no
+//! task to run never sees that state here.
 
 use std::{
     rc::Rc,
@@ -122,10 +127,11 @@ impl TransportObserver for Unobserved {
 /// and timers.
 const WIRE_STEPS_PER_BLOCK: u64 = 6_000;
 
-/// [`sync_config`], with room for QUIC's own steps.
+/// [`sync_config`], with room for QUIC's own steps for each fixture block
+/// and each block a `Control` step grows or forks.
 pub fn wire_config(scenario: &SyncWireScenario) -> RunConfig {
     let config = sync_config(&scenario.sync);
-    let blocks = u64::from(scenario.sync.blocks);
+    let blocks = u64::from(scenario.sync.blocks) + scenario.sync.changed();
     RunConfig {
         budget: scenario
             .sync
@@ -382,7 +388,9 @@ pub enum SavedWire {
     /// [`SavedWire::Honest`], with every mirror's block-sync range read
     /// held for [`STALL_MS`]. Block sync's sessions stall with requests
     /// outstanding, while header sync and discovery share their
-    /// connections.
+    /// connections. Once the first read is held, every mirror's chain grows
+    /// by [`STALL_GROWTH`] blocks, so header sync has new tips to apply
+    /// while block sync waits.
     StalledBlocks,
 }
 
@@ -390,6 +398,10 @@ pub enum SavedWire {
 /// milliseconds of virtual time: under block sync's 8-second request
 /// timeout, so the stalled requests complete rather than time out.
 pub const STALL_MS: u64 = 5_000;
+
+/// How many blocks [`SavedWire::StalledBlocks`] grows the mirrors' chains
+/// by while the first read is held.
+pub const STALL_GROWTH: u32 = 4;
 
 /// The first byte of a saved scenario's tag.
 const TAG: u8 = 0xFC;
@@ -434,8 +446,9 @@ impl SavedWire {
     /// `[[witness]]` entries.
     pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            SavedWire::Honest | SavedWire::StalledBlocks => &[],
+            SavedWire::Honest => &[],
             SavedWire::Replace => &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")],
+            SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, "holds")],
         }
     }
 
@@ -469,18 +482,23 @@ impl SavedWire {
                 ..sync
             },
             SavedWire::StalledBlocks => {
+                let read = block_policy::Select {
+                    kind: Some(block_policy::BlockKind::MirrorRead),
+                    ..block_policy::Select::default()
+                };
                 let mut block_policy = sync.block_policy.clone();
                 block_policy.holds.push(block_policy::Hold {
-                    select: block_policy::Select {
-                        kind: Some(block_policy::BlockKind::MirrorRead),
-                        ..block_policy::Select::default()
-                    },
+                    select: read.clone(),
                     until: Trigger::VirtualTime(STALL_MS),
                     then: vec![block_policy::BlockAllow::Serve],
                     deadline_ms: None,
                 });
                 SyncScenario {
                     block_policy,
+                    control: vec![SyncStep {
+                        action: SyncAction::Grow { len: STALL_GROWTH },
+                        when: Some(Trigger::Submitted(read)),
+                    }],
                     ..sync
                 }
             }

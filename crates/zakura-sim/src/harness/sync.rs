@@ -233,7 +233,7 @@ impl SyncScenario {
 
     /// The blocks every control step adds, which the step budget makes room
     /// for.
-    fn changed(&self) -> u64 {
+    pub(super) fn changed(&self) -> u64 {
         self.control
             .iter()
             .map(|step| match step.action {
@@ -399,15 +399,15 @@ impl SyncTopology {
     /// Closes the node's newest connection to the mirror named `peer`. A
     /// QUIC connection's dialer redials it.
     async fn close(&self, peer: &str) {
-        if let Transport::Memory = self.transport {
-            match self.link_to(peer) {
-                Some(link) => link.close(),
-                None => self.fail(format!("the scenario never links `{peer}`")),
+        let quic = match &self.transport {
+            Transport::Memory => {
+                match self.link_to(peer) {
+                    Some(link) => link.close(),
+                    None => self.fail(format!("the scenario never links `{peer}`")),
+                }
+                return;
             }
-            return;
-        }
-        let Transport::Quic(quic) = &self.transport else {
-            unreachable!("a memory link returned above");
+            Transport::Quic(quic) => quic,
         };
         let Some(id) = quic.peers.get(peer) else {
             self.fail(format!("the scenario has no mirror `{peer}`"));
@@ -421,6 +421,7 @@ impl SyncTopology {
             self.fail(format!("the node has no connection to `{peer}`"));
         }
     }
+
     /// The next connection and session ID.
     fn next_id(&self) -> u64 {
         let id = self.last_id.get() + 1;

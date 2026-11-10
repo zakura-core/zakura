@@ -507,8 +507,9 @@ impl Config {
     /// and load cached peers from disk, if available.
     /// Alternates cached peers in saved RTT order with shuffled seed peers,
     /// starting with a cached peer unless the startup budget is one, in which case
-    /// a seed gets the sole slot when available. Shared addresses keep
-    /// their cache position; an exhausted list yields the rest of the other list.
+    /// a seed gets the sole slot when available, even if it is also cached.
+    /// With larger budgets, shared addresses keep their cache position.
+    /// An exhausted list yields the rest of the other list.
     ///
     /// # Panics
     ///

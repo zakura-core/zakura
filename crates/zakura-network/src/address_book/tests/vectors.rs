@@ -52,20 +52,19 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
             .collect::<Vec<_>>(),
         vec![Some(10), Some(10), Some(50), None, None]
     );
-    for rtt in [Some(std::time::Duration::from_millis(10))] {
-        assert_eq!(
-            ranked
-                .iter()
-                .filter(|peer| peer.rtt() == rtt)
-                .map(|peer| peer.addr)
-                .collect::<Vec<_>>(),
-            before
-                .iter()
-                .filter(|peer| peer.rtt() == rtt)
-                .map(|peer| peer.addr)
-                .collect::<Vec<_>>(),
-        );
-    }
+    let rtt = Some(std::time::Duration::from_millis(10));
+    assert_eq!(
+        ranked
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// Gossip-only peers have no measured preference and do not keep a fixed cache prefix.

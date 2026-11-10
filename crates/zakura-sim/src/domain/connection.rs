@@ -32,8 +32,10 @@ pub const CREDIT_ISOLATED: &str = "session/credit-isolated";
 /// window of the other services' bytes.
 pub const SEND_ISOLATED: &str = "session/send-isolated";
 
-/// Each service's held frames and queued output on a connection stay within
-/// that service's shares.
+/// Each service's frame gates on a connection grant no more than that
+/// service's shares. The check reads the gates' own grants, so a frame a
+/// service keeps after its grant ends, or a grant released twice, is out of
+/// its reach.
 pub const CONNECTION_SHARES_BOUND: &str = "session/connection-shares-bound";
 
 /// The production limits the properties judge against: the node's, and the
@@ -115,20 +117,22 @@ where
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
             needs: &[Source::View, Source::Datagrams],
-            // A draft until a planted bypass fails it. QUIC buffers at most
-            // a send window per stream, and each service's worker hands it
-            // one frame at a time, so raising block sync's send priority
-            // keeps the bound: the saturated scenario's header frames wait
-            // behind one body at most.
+            // A draft until a planted bypass fails it. Each service's worker
+            // hands QUIC one frame at a time, and the saturated scenario's
+            // mirrors never queue a second body on a block-sync stream ahead
+            // of another service's frame. Raising block sync's send priority
+            // and its stream's write-ahead from 64 KiB to 4 MiB together
+            // keeps the bound: the longest wait is one body, 500,001 bytes
+            // against a bound of 565,578.
             status: Status::Draft,
             check: check_send_isolated::<S>,
             witness: Some(TriggerHistory::View(written_under_saturation::<S>)),
         },
         Property {
             id: PropertyId::new(CONNECTION_SHARES_BOUND),
-            claim: "on every connection, each service's held received frames stay within its \
-                    receive share and its queued output within its output share, as the node's \
-                    reactor shares declare them",
+            claim: "on every connection, each service's raw inbound frame gate grants no more \
+                    than its receive share and its output frame gate no more than its output \
+                    share, as the node's reactor shares declare them",
             kind: Kind::Safety,
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
@@ -387,14 +391,14 @@ impl ConnectionFold {
                 self.holding.insert(connection, load.kind);
             }
             for (what, held, bound) in [
-                ("received frames", load.raw_held, share.receive),
-                ("queued output", load.output_held, share.output),
+                ("raw inbound gate", load.raw_held, share.receive),
+                ("output gate", load.output_held, share.output),
             ] {
                 if held > bound {
                     self.findings.shares.violations.push((
-                        format!("each service's {what} on a connection stay within its share"),
+                        format!("each service's {what} on a connection grants within its share"),
                         format!(
-                            "kind {}'s {what} held {held} bytes on connection {connection}, \
+                            "kind {}'s {what} granted {held} bytes on connection {connection}, \
                              above its share of {bound}",
                             load.kind
                         ),

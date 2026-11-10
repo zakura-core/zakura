@@ -2797,11 +2797,12 @@ fn sapling_lazy_cv_epk_edge_cases() {
         "commitment() must round-trip a valid value commitment",
     );
 
-    // `rk` was not made lazy: a small-order rk is still rejected at deserialization
-    // via `ValidatingKey::try_from`.
+    // The validating constructor still rejects a small-order rk; deserialization
+    // defers that check like cv and epk (see
+    // `sapling_point_encodings_check_rejects_bad_v4_spend_cv`).
     assert!(
         ValidatingKey::try_from(small_order).is_err(),
-        "Sapling rk must still reject a small-order point at deserialization",
+        "ValidatingKey::try_from must reject a small-order rk",
     );
 }
 
@@ -3140,6 +3141,8 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
     use group::Group;
 
+    use crate::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
     use crate::{
         amount::Amount,
         at_least_one,
@@ -3161,14 +3164,14 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 
     let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
     let off_curve = [0xffu8; 32];
-    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
 
-    let make_v4 = |cv: [u8; 32]| -> Transaction {
+    let make_v4_with_rk = |cv: [u8; 32], rk: [u8; 32]| -> Transaction {
         let spend = Spend::<sapling::PerSpendAnchor> {
             cv: ValueCommitment(cv),
             per_spend_anchor: sapling::tree::Root::default(),
             nullifier: sapling::Nullifier::from([0u8; 32]),
-            rk: rk.clone(),
+            rk: ValidatingKey::from_bytes_unvalidated(rk),
             zkproof: Groth16Proof([0u8; 192]),
             spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
         };
@@ -3190,6 +3193,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
             })),
         }
     };
+    let make_v4 = |cv: [u8; 32]| make_v4_with_rk(cv, valid);
 
     assert!(
         make_v4(valid).sapling_point_encodings_are_valid(),
@@ -3199,10 +3203,30 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
         !make_v4(off_curve).sapling_point_encodings_are_valid(),
         "a V4 spend with an off-curve cv must fail the deferred point check",
     );
+
+    // An invalid rk deserializes, keeps its exact bytes, and fails the deferred
+    // point check instead.
+    for (rk, kind) in [(small_order, "small-order"), (off_curve, "off-curve")] {
+        let bytes = make_v4_with_rk(valid, rk)
+            .zcash_serialize_to_vec()
+            .expect("serializes");
+        let parsed: Transaction = bytes
+            .zcash_deserialize_into()
+            .unwrap_or_else(|_| panic!("deserialization defers the {kind} rk check"));
+        assert_eq!(
+            parsed.zcash_serialize_to_vec().expect("re-serializes"),
+            bytes,
+            "a {kind} rk must round-trip byte-for-byte",
+        );
+        assert!(
+            !parsed.sapling_point_encodings_are_valid(),
+            "a V4 spend with a {kind} rk must fail the deferred point check",
+        );
+    }
 }
 
-/// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
-/// same encodings as the librustzcash functions they mirror.
+/// The relocated Sapling `cv` / `rk` / `epk` not-small-order checks accept
+/// exactly the same encodings as the librustzcash functions they mirror.
 ///
 /// If `ValueCommitment::is_valid_not_small_order` or
 /// `EphemeralPublicKey::is_valid_not_small_order` ever diverged from librustzcash,
@@ -3220,9 +3244,22 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 fn sapling_point_checks_match_librustzcash_predicates() {
     use group::{Group, GroupEncoding};
 
-    use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
+    use crate::sapling::{
+        keys::{EphemeralPublicKey, ValidatingKey},
+        ValueCommitment,
+    };
 
     let _init_guard = zakura_test::init();
+
+    // The exact predicate librustzcash applies to an `rk`: its parser decodes it
+    // as a RedJubjub verification key, and sapling-crypto's `check_spend`
+    // rejects a small-order point.
+    let librustzcash_rk_valid = |bytes: [u8; 32]| -> bool {
+        redjubjub::VerificationKey::<redjubjub::SpendAuth>::try_from(bytes).is_ok()
+            && jubjub::ExtendedPoint::from_bytes(&bytes)
+                .into_option()
+                .is_some_and(|point| !bool::from(point.is_small_order()))
+    };
 
     // The exact predicate the librustzcash Sapling verifier applies to a `cv`.
     let librustzcash_cv_valid = |bytes: [u8; 32]| -> bool {
@@ -3288,6 +3325,12 @@ fn sapling_point_checks_match_librustzcash_predicates() {
             librustzcash_epk_valid(bytes),
             "EphemeralPublicKey::is_valid_not_small_order must match librustzcash \
              check_output for {bytes:02x?}",
+        );
+        assert_eq!(
+            ValidatingKey::from_bytes_unvalidated(bytes).is_valid_not_small_order(),
+            librustzcash_rk_valid(bytes),
+            "ValidatingKey::is_valid_not_small_order must match librustzcash \
+             parsing and check_spend for {bytes:02x?}",
         );
     }
 }

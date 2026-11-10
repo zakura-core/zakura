@@ -33,8 +33,9 @@ pub use shielded_data::{
 pub use spend::{Spend, SpendPrefixInTransactionV5};
 
 /// Returns true if every encoding is a canonical, non-small-order Jubjub point:
-/// the check [`ValueCommitment::is_valid_not_small_order`] and
-/// [`keys::EphemeralPublicKey::is_valid_not_small_order`] run on one encoding.
+/// the check [`ValueCommitment::is_valid_not_small_order`],
+/// [`keys::EphemeralPublicKey::is_valid_not_small_order`] and
+/// [`keys::ValidatingKey::is_valid_not_small_order`] run on one encoding.
 ///
 /// The points are decompressed together, so their field inversions are batched
 /// into one. Each square root is still computed separately.

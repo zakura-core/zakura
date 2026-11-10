@@ -126,14 +126,46 @@ impl ZcashDeserialize for EphemeralPublicKey {
 /// represent [SpendAuthSig^{Sapling}.Public][2], which allows any points, including
 /// of small order).
 ///
+/// Deserialization stores the encoding without decompressing it, like Sapling
+/// `cv` and `epk`. The semantic verifier checks it with
+/// [`Self::is_valid_not_small_order`] through
+/// `Transaction::sapling_point_encodings_are_valid`. The [`TryFrom`]
+/// constructors still validate.
+///
 /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretereddsa
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct ValidatingKey(redjubjub::VerificationKey<SpendAuth>);
+pub struct ValidatingKey(redjubjub::VerificationKeyBytes<SpendAuth>);
 
-impl From<ValidatingKey> for redjubjub::VerificationKey<SpendAuth> {
-    fn from(rk: ValidatingKey) -> Self {
-        rk.0
+impl ValidatingKey {
+    /// Wraps `bytes` without checking that they encode a valid `rk`.
+    ///
+    /// Callers that accept untrusted bytes must check
+    /// [`Self::is_valid_not_small_order`] before relying on the key.
+    pub fn from_bytes_unvalidated(bytes: [u8; 32]) -> Self {
+        Self(bytes.into())
+    }
+
+    /// Returns true if the stored encoding is a canonical, non-small-order
+    /// Jubjub point, i.e. a valid `rk` per the consensus rules.
+    ///
+    /// # Consensus
+    ///
+    /// > Check that a Spend description's cv and rk are not of small order,
+    /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]rk MUST NOT be 𝒪_J.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#spenddesc>
+    pub fn is_valid_not_small_order(&self) -> bool {
+        redjubjub::VerificationKey::<SpendAuth>::try_from(self.0)
+            .is_ok_and(|key| !bool::from(jubjub::AffinePoint::from(key).is_small_order()))
+    }
+}
+
+impl TryFrom<ValidatingKey> for redjubjub::VerificationKey<SpendAuth> {
+    type Error = redjubjub::Error;
+
+    fn try_from(rk: ValidatingKey) -> Result<Self, Self::Error> {
+        rk.0.try_into()
     }
 }
 
@@ -151,12 +183,11 @@ impl TryFrom<redjubjub::VerificationKey<SpendAuth>> for ValidatingKey {
     ///
     /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
     fn try_from(key: redjubjub::VerificationKey<SpendAuth>) -> Result<Self, Self::Error> {
-        // `key` already holds its decoded point. Reusing it avoids decompressing
-        // the encoding a second time, which dominated Sapling block decoding.
+        // `key` already holds its decoded point, so this does not decompress it again.
         if bool::from(jubjub::AffinePoint::from(key).is_small_order()) {
             Err("jubjub::AffinePoint value for Sapling ValidatingKey is of small order")
         } else {
-            Ok(Self(key))
+            Ok(Self(key.into()))
         }
     }
 }
@@ -179,6 +210,6 @@ impl From<ValidatingKey> for [u8; 32] {
 
 impl From<ValidatingKey> for redjubjub::VerificationKeyBytes<SpendAuth> {
     fn from(key: ValidatingKey) -> Self {
-        key.0.into()
+        key.0
     }
 }

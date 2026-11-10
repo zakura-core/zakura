@@ -3,7 +3,11 @@
 use group::GroupEncoding;
 use sha2::{Digest, Sha256};
 
-use crate::sapling::{all_valid_not_small_order, keys::EphemeralPublicKey, ValueCommitment};
+use crate::sapling::{
+    all_valid_not_small_order,
+    keys::{EphemeralPublicKey, ValidatingKey},
+    ValueCommitment,
+};
 
 /// Valid points, small-order points, off-curve values and non-canonical encodings.
 fn encodings() -> Vec<[u8; 32]> {
@@ -37,6 +41,11 @@ fn each_valid(encodings: &[[u8; 32]]) -> bool {
             cv,
             EphemeralPublicKey(bytes).is_valid_not_small_order(),
             "cv and epk use the same predicate"
+        );
+        assert_eq!(
+            cv,
+            ValidatingKey::from_bytes_unvalidated(bytes).is_valid_not_small_order(),
+            "cv and rk use the same predicate"
         );
         cv
     })

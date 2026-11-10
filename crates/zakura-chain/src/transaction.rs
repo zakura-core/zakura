@@ -1272,9 +1272,9 @@ impl Transaction {
         }
     }
 
-    /// Returns true if every Sapling value commitment and ephemeral public key in
-    /// this transaction is a canonical, non-small-order Jubjub point (or the
-    /// transaction has no Sapling data).
+    /// Returns true if every Sapling value commitment, spend validating key
+    /// (`rk`) and ephemeral public key in this transaction is a canonical,
+    /// non-small-order Jubjub point (or the transaction has no Sapling data).
     ///
     /// These points are stored as raw bytes with their not-small-order check
     /// deferred from deserialization, to keep point decompression off the

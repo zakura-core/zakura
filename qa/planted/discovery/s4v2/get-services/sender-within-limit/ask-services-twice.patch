@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/requester.rs b/crates/zakura-network/src/zakura/discovery/requester.rs
+index 73beaa38bc..5a95744987 100644
+--- a/crates/zakura-network/src/zakura/discovery/requester.rs
++++ b/crates/zakura-network/src/zakura/discovery/requester.rs
+@@ -427,7 +427,15 @@ impl Queries {
+     /// Reserves the answer to `query`, then sends it.
+     pub(super) async fn send_get_services(&self, query: GetServices) -> Result<(), QueryUnsent> {
+         let message = DiscoveryMessage::GetServices(query.clone());
+-        self.send_query(Asked::Services(query), &message).await
++        self.send_query(Asked::Services(query), &message).await?;
++        // Planted bypass: the node sends its `GetServices` again before the answer.
++        self.send_again(&message).await
++    }
++
++    /// Planted bypass: writes `message` once more, with no reservation.
++    async fn send_again(&self, message: &DiscoveryMessage) -> Result<(), QueryUnsent> {
++        let frame = encode_frame(message).expect("the node's query encodes");
++        self.send.send(frame).await.map_err(|_| QueryUnsent::Closed)
+     }
+ 
+     /// Reserves the answer to `message`, which asks `asked`, then sends it.

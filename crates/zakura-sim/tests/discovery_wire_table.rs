@@ -7,7 +7,7 @@ use zakura_network::zakura::{wire_codec::WireMessage, DiscoveryMessage};
 use zakura_sim::{
     domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
-        discovery_service::{has_planted_case, DiscoveryWire, FAMILY, STREAMS},
+        discovery_service::{has_planted_case, DiscoveryWire, FAMILY, SCRIPTED, STREAMS},
         Subsystem,
     },
     peer::discovery::discovery_stream,
@@ -34,10 +34,12 @@ fn the_registered_stream_is_the_services() {
 
 /// The harness registers discovery's 31 generated receiver IDs, then its
 /// 7 sender IDs, then `discovery/late-response-admitted`, and no other
-/// property. The 16 stateless `<label>-closes` IDs have planted cases, are
-/// `Active` and check their cases' trigger histories, and the rest of the
-/// generated IDs are `Draft`s. The late-response ID is hand-written, not
-/// generated, so [`has_planted_case`] doesn't cover it: it is `Active`
+/// property. The 16 stateless `<label>-closes` IDs and the 21 IDs whose
+/// guard is discovery's own have planted cases, are `Active` and check
+/// their cases' trigger histories. The [`SCRIPTED`] ID no scenario reaches
+/// is `Active` with a scripted bypass, and the rest
+/// of the generated IDs are `Draft`s. The late-response ID is hand-written,
+/// not generated, so [`has_planted_case`] doesn't cover it: it is `Active`
 /// with its own planted case and trigger history. A receiver ID reads only
 /// the peers' frames and the node's closes, and a sender ID only the
 /// frames. The late-response ID also reads the step loop's task
@@ -72,14 +74,22 @@ fn the_harness_registers_the_generated_discovery_ids() {
         .collect();
     assert_eq!(ids, expected);
     let planted = ids.iter().filter(|id| has_planted_case(id)).count();
-    // One per stream, `undeclared-type-closes`, then three per row.
-    assert_eq!(planted, 16, "{ids:?}");
+    // The stateless reader IDs: one per stream, `undeclared-type-closes`,
+    // then three per row. Discovery's own guards: over-margin on 2 request
+    // rows, unsolicited on 2 response rows, over-owed on peers, bad content
+    // on 5 rows, cadence on 3 rows, conformant-never-closes, and the 7
+    // sender IDs.
+    assert_eq!(planted, 16 + 21, "{ids:?}");
     // Another family's ID with the same template and row has no case here.
     assert!(!has_planted_case("header-sync/s5v9/undeclared-type-closes"));
     assert!(!has_planted_case("discovery/s5v9/undeclared-type-closes"));
+    assert!(!has_planted_case(
+        "header-sync/s5v9/conformant-never-closes"
+    ));
     assert!(!has_planted_case(LATE_RESPONSE_ADMITTED));
     for property in &registered {
-        let status = if has_planted_case(property.id.as_str()) || property.id.to_string() == late {
+        let planted = has_planted_case(property.id.as_str()) || property.id.to_string() == late;
+        let status = if planted || SCRIPTED.contains(&property.id.as_str()) {
             Status::Active
         } else {
             Status::Draft
@@ -87,7 +97,7 @@ fn the_harness_registers_the_generated_discovery_ids() {
         assert_eq!(property.status, status, "{}", property.id);
         assert_eq!(
             property.witness.is_some(),
-            status == Status::Active,
+            planted,
             "{}: only a planted ID checks its case's trigger history",
             property.id
         );

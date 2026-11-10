@@ -7,6 +7,8 @@
 //! applies and holds in the `late-response` saved Plan (disc-3.4).
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::BTreeSet,
     future::Future,
@@ -14,6 +16,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
@@ -21,14 +24,15 @@ use zakura_sim::{
     domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
         discovery_service::{
-            act_scenario, DiscoveryWire, NodeHandle, SavedPlan, WireScenario, FAMILY,
+            act_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan, WireScenario,
+            FAMILY, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
     peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule},
-    table::GeneratedId,
+    table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
 };
@@ -241,9 +245,9 @@ fn generated() -> Vec<String> {
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`, as
 /// `applicable` witness tests judge them, and so does the stream's
-/// `conformant-never-closes`. Most registered properties are `Draft`s,
-/// whose violation doesn't stop the run, so this also requires that no
-/// property is violated. The [`UNREACHED`] ID stays `NotApplicable`.
+/// `conformant-never-closes`. A `Draft` property's violation doesn't stop
+/// the run, so this also requires that no property is violated. The
+/// [`UNREACHED`] ID stays `NotApplicable`.
 fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) {
     assert_eq!(report.end.harness, None, "{witness:?}: {:?}", report.end);
     assert_eq!(report.end.violation, None, "{witness:?}: {:?}", report.end);
@@ -302,7 +306,8 @@ fn apply_on_row(row: DiscoveryRow) {
 /// #2114's audit: the node checks a `Peers` against its own request's cap,
 /// `peers_cap(limit)`, which is under the row's maximum when its limit is
 /// under 32. In the over-owed witness, a node asking for [`LIMIT`] record
-/// gets a `Peers` one byte over that cap and under the row's maximum. The
+/// gets a `Peers` one byte over that cap and under the row's maximum, two
+/// validly signed records that decode. The
 /// peer's models label it `over-owed`, not `Conformant` and not
 /// `long-payload`. The node reads it, its claim of the answer refuses it,
 /// and the node closes the connection with a fault cause.
@@ -485,6 +490,48 @@ fn conformant_controls_hold_conformant_never_closes() {
             })
             .collect();
         assert_eq!(labels, BTreeSet::from(["conformant"]), "{control:?}");
+    }
+}
+
+/// The scripted history that violates `id` on connection 1, one batch per
+/// step: a fault the node never punishes.
+fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
+    let peer = |label: Label| Observation::PeerFrame {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+        row: id.row.map(str::to_owned),
+        rule_stream: STREAM,
+        label,
+        exhausted: false,
+        exchange: None,
+        payload: 9,
+    };
+    let judged = Observation::FrameJudged {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+    };
+    match id.template {
+        Template::Closes(label) => vec![vec![peer(label)], vec![judged]],
+        template => panic!("no scripted bypass covers {template:?}"),
+    }
+}
+
+/// Each [`SCRIPTED`] ID fails on a scripted history that bypasses its
+/// rule.
+#[test]
+fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
+    for name in SCRIPTED {
+        let parsed = GeneratedId::parse(name).expect("a generated ID parses back");
+        let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+        assert!(
+            matches!(outcome(&report, name), PropertyOutcome::Violated { .. }),
+            "{name}: {:?}",
+            report.properties
+        );
     }
 }
 

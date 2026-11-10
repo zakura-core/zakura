@@ -1977,7 +1977,8 @@ fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
         let (info_tx, info) = watch::channel(current.clone());
         let (rpc, _tip_sender, _, _) = shared_template_rpc(info, mempool_txs(1));
         let (sender, _) = tokio::sync::broadcast::channel(16);
-        let rpc = rpc.with_mempool_change(mempool::MempoolTxSubscriber::new(sender));
+        let changes = mempool::MempoolTxSubscriber::new(sender);
+        let rpc = rpc.with_mempool_change(changes.clone());
         let worker_rpc = rpc.clone();
         let worker = tokio::spawn(async move { worker_rpc.run_proactive_templates().await });
         // No getblocktemplate call triggers this construction.
@@ -2001,8 +2002,30 @@ fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
         assert!(!response.transactions.is_empty());
         assert_eq!(response.previous_block_hash, current.tip_hash);
         assert_eq!(response.submit_old, Some(false));
+        // Additions do not make existing selected transactions ineligible.
+        changes
+            .send(mempool::MempoolChange::added(Default::default()))
+            .unwrap();
+        assert!(rpc.ready_populated_template(&current, None).is_some());
+        // Cache admission must see removal immediately, before the worker polls the event.
+        changes
+            .send(mempool::MempoolChange::invalidated(Default::default()))
+            .unwrap();
+        assert!(rpc.ready_populated_template(&current, None).is_none());
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_none());
+
+        // A late completion after returning to the same parent cannot publish over its replacement.
+        let old = rpc.gbt.shared_template.claim(current.tip_hash).unwrap();
+        let cancelled = old.cancellation();
+        rpc.gbt.shared_template.invalidate();
+        let replacement = rpc.gbt.shared_template.claim(current.tip_hash).unwrap();
+        old.publish(response.clone());
+        assert!(cancelled.is_cancelled());
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_none());
+        replacement.publish(response);
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_some());
         drop(info_tx);
     });
 }

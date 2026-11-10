@@ -1684,6 +1684,7 @@ where
 
     /// Selects mempool transactions for the next block on `chain_info`'s tip and builds its
     /// template, with no `submit_old`.
+    #[allow(clippy::too_many_arguments)]
     async fn build_full_template(
         &self,
         miner_params: &types::get_block_template::MinerParams,

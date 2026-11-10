@@ -937,26 +937,29 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         Ok(256)
     );
 
-    // The transport holds the admitted connections and the headroom, half of
-    // it kept for dials (zakura-quic ADM-12), and two closing connections per
-    // live slot (ADM-13).
+    // The transport holds the admitted connections and the headroom, keeps
+    // one discovery record's 8 addresses for dials, lets inbound hold its
+    // connection and handshake shares (zakura-quic ADM-12), and keeps two
+    // closing connections per live slot (ADM-13).
     let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (288, 16, 576)
+        (288, 8, Some(216), 576)
     );
     let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (124, 16, 248)
+        (124, 8, Some(93), 248)
     );
 
     // With a 1 GiB receive window, the handshake headroom alone exceeds the

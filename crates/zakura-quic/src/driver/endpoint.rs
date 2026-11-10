@@ -667,7 +667,7 @@ mod tests {
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
-            connections: ConnectionSlots::new(16, 0, 16),
+            connections: ConnectionSlots::new(16, 0, None, 16),
             hooks: Arc::default(),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),

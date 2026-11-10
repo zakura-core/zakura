@@ -666,6 +666,17 @@ pub const NARROWING: &[Narrowing] = &[
     },
 ];
 
+/// The fingerprint of [`NARROWING`]'s source together with every `const`,
+/// `static` and `fn` in this file it reaches by name, transitively (today
+/// `PEERLESS` and `every_execution`), as `tests/header_acceptance.rs`'s
+/// `the_narrowing_rules_match_their_pin` computes it. Each entry's
+/// `releases` is a closure, which the inventory pin
+/// ([`INVENTORY_FINGERPRINT`](super::inventory::INVENTORY_FINGERPRINT))
+/// can't compare, so a widened release, such as a harness added to
+/// `PEERLESS`, moves this one, and needs a reread of what each entry
+/// releases. Callees outside this file are their owners' contracts.
+pub const NARROWING_FINGERPRINT: &str = "409050b93c616bb3";
+
 /// The [`Key::ContractTest`] results: one `Passes` per proving test of each
 /// `Satisfied` contract.
 pub fn contract_test_results(table: &[Contract]) -> Vec<ExpectedResult> {

@@ -1639,18 +1639,40 @@ pub fn record(
 }
 
 /// Assembles `plan`'s artifacts, evaluates them against the committed
-/// manifest, and returns the result file and the record.
+/// manifest, and returns the result file and the record, failed if the
+/// committed inventories don't match their pin ([`evaluate_against`]).
 pub fn evaluate_artifacts(
     repo: &Path,
     plan: &RunPlan,
     artifacts: &Path,
     run: &RunBinding,
 ) -> (ResultFile, Record) {
+    evaluate_against(
+        repo,
+        plan,
+        artifacts,
+        run,
+        super::inventory::INVENTORY_FINGERPRINT,
+    )
+}
+
+/// [`evaluate_artifacts`] with the inventories checked against `pin`
+/// ([`super::inventory`]): on a mismatch the evaluation is invalidated, so
+/// the record lists the mismatch as a stray and fails every gate. The
+/// record's only path runs through here, so deleting a list entry or a
+/// static test can't remove the check.
+fn evaluate_against(
+    repo: &Path,
+    plan: &RunPlan,
+    artifacts: &Path,
+    run: &RunBinding,
+    pin: &str,
+) -> (ResultFile, Record) {
     let (subject, subject_source) = (run.subject.as_str(), run.subject_source.as_str());
     let manifest = Manifest::committed();
     let required = committed_required(repo, &manifest);
     let results = assemble(repo, plan, artifacts, run);
-    let evaluation = evaluate(
+    let mut evaluation = evaluate(
         &manifest,
         &required,
         &results,
@@ -1659,6 +1681,12 @@ pub fn evaluate_artifacts(
             source: subject_source,
         },
     );
+    evaluation.invalidate(super::inventory::errors_against(
+        &manifest,
+        &required,
+        &super::inventory::Lists::committed(),
+        pin,
+    ));
     let refusal = binding_refusal(repo, plan, artifacts, run);
     let record = record(&manifest, plan, artifacts, run, refusal, &evaluation);
     (results, record)
@@ -2320,6 +2348,35 @@ mod tests {
                 owned("session/honest-never-punished", "punished"),
             ]
         );
+    }
+
+    /// The record fails when the inventories don't match the pin: it lists
+    /// the mismatch as a stray, fails every gate, and isn't accepted. With
+    /// the committed pin, the inventories add nothing to it.
+    #[test]
+    fn the_record_fails_on_an_inventory_mismatch() {
+        let manifest = Manifest::committed();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&manifest, &repo).expect("the committed manifest plans");
+        let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+        let run = RunBinding {
+            run_id: "run-1".into(),
+            subject: "s".into(),
+            subject_source: "source".into(),
+            containment: Containment::Subreaper,
+        };
+        let changed = |record: &Record| {
+            record
+                .stray
+                .iter()
+                .any(|stray| stray.contains("inventories changed"))
+        };
+        let (_, committed) = evaluate_artifacts(&repo, &plan, artifacts.path(), &run);
+        assert!(!changed(&committed));
+        let (_, moved) = evaluate_against(&repo, &plan, artifacts.path(), &run, "another pin");
+        assert!(changed(&moved));
+        assert!(!moved.accepted);
+        assert!(moved.gates.values().all(|verdict| !verdict));
     }
 
     /// A shared header ID's planted case counts for header acceptance only

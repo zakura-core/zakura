@@ -15,6 +15,8 @@
 //! * [`required`]: the obligation keys the manifest must cover, derived
 //!   from inventories the manifest doesn't control.
 //! * [`evaluate`]: the gate evaluator.
+//! * [`inventory`]: the pin on the lists that define obligations, which
+//!   the gate's own path checks.
 //!
 //! Everything here is static data and pure functions. The acceptance tool
 //! (hdr-14.7) produces the result file, and `tests/header_acceptance.rs`
@@ -31,6 +33,7 @@
 
 pub mod contracts;
 pub mod evaluate;
+pub mod inventory;
 pub mod reasons;
 pub mod required;
 pub mod rows;

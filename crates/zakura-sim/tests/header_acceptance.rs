@@ -3957,6 +3957,154 @@ fn scan_errors(sources: &[(String, String)]) -> Vec<String> {
     errors
 }
 
+/// The fingerprint of `NARROWING`'s source in `contracts` (that file's
+/// text) and every top-level `const`, `static` and `fn` there that it
+/// reaches by name, transitively, in source order, by the C20
+/// [`fingerprint`]. A type isn't a value item, so a new contract variant or
+/// `Narrowing` field doesn't move it.
+fn narrowing_print(contracts: &str) -> String {
+    use syn::spanned::Spanned;
+    let parsed = syn::parse_file(contracts).expect("contracts.rs parses");
+    let lines: Vec<&str> = contracts.lines().collect();
+    let source = |span: proc_macro2::Span| -> String {
+        let (start, end) = (span.start(), span.end());
+        let mut text = Vec::new();
+        for line in start.line..=end.line {
+            let chars: Vec<char> = lines.get(line - 1).unwrap_or(&"").chars().collect();
+            let from = if line == start.line { start.column } else { 0 };
+            let to = if line == end.line {
+                end.column
+            } else {
+                chars.len()
+            };
+            text.push(
+                chars[from.min(chars.len())..to.min(chars.len())]
+                    .iter()
+                    .collect::<String>(),
+            );
+        }
+        text.join("\n")
+    };
+    let mut items: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for item in &parsed.items {
+        let name = match item {
+            syn::Item::Const(item) => item.ident.to_string(),
+            syn::Item::Static(item) => item.ident.to_string(),
+            syn::Item::Fn(item) => item.sig.ident.to_string(),
+            _ => continue,
+        };
+        items.insert(name, (item.span().start().line, source(item.span())));
+    }
+    /// Every identifier in `stream`, groups included.
+    fn names(stream: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+        for token in stream {
+            match token {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    out.insert(ident.to_string());
+                }
+                proc_macro2::TokenTree::Group(group) => names(group.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut reached = BTreeSet::from(["NARROWING".to_owned()]);
+    let mut queue = vec!["NARROWING".to_owned()];
+    while let Some(name) = queue.pop() {
+        let (_, text) = &items[&name];
+        let mut named = BTreeSet::new();
+        names(text.parse().expect("an item's text parses"), &mut named);
+        for name in named {
+            if items.contains_key(&name) && reached.insert(name.clone()) {
+                queue.push(name);
+            }
+        }
+    }
+    let mut texts: Vec<&(usize, String)> = reached.iter().map(|name| &items[name]).collect();
+    texts.sort();
+    fingerprint(
+        &texts
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// `NARROWING`'s releases match their pin: its source and what it reaches
+/// in `contracts.rs` are as last reread. A harness added to `PEERLESS`, a
+/// changed `every_execution`, or a helper it starts calling, changed
+/// later, moves the fingerprint. A comment, or an unrelated item or type,
+/// doesn't.
+#[test]
+fn the_narrowing_rules_match_their_pin() {
+    let contracts = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness/header_acceptance/contracts.rs"),
+    )
+    .unwrap();
+    let print = narrowing_print(&contracts);
+    assert_eq!(
+        print,
+        contracts::NARROWING_FINGERPRINT,
+        "NARROWING or what it reaches changed: reread what each entry releases, then update \
+         NARROWING_FINGERPRINT to {print}"
+    );
+    let edit = |from: &str, to: &str| {
+        assert!(contracts.contains(from), "{from}");
+        narrowing_print(&contracts.replacen(from, to, 1))
+    };
+    assert_ne!(
+        edit(
+            "    \"header-sync/repair\",\n];",
+            "    \"header-sync/repair\",\n    \"header-sync/wire\",\n];"
+        ),
+        print,
+        "a harness added to PEERLESS"
+    );
+    assert_ne!(
+        edit("!ctx.executions.is_empty()\n", "ctx.executions.len() > 1\n"),
+        print,
+        "every_execution changed"
+    );
+    let helped = |body: &str| {
+        narrowing_print(
+            &contracts
+                .replacen(
+                    "!ctx.executions.is_empty()\n",
+                    "!ctx.executions.is_empty() && helper()\n",
+                    1,
+                )
+                .replacen(
+                    "/// Whether `ctx` has executions",
+                    &format!(
+                        "fn helper() -> bool {{ {body} }}\n\n/// Whether `ctx` has executions"
+                    ),
+                    1,
+                ),
+        )
+    };
+    assert_ne!(
+        helped("true"),
+        helped("false"),
+        "a helper every_execution calls, changed"
+    );
+    assert_eq!(
+        edit(
+            "/// The node harnesses with no peers.",
+            "// A comment.\n/// The node harnesses with no peers."
+        ),
+        print,
+        "a comment"
+    );
+    assert_eq!(
+        edit(
+            "    ContractId::C22,\n];",
+            "    ContractId::C22,\n    ContractId::C21,\n];"
+        ),
+        print,
+        "an unrelated item"
+    );
+}
+
 #[test]
 fn the_not_applicable_inventory_equals_a_source_scan() {
     let sources = crate_sources();

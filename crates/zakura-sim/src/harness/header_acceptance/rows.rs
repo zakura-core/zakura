@@ -1735,6 +1735,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
     "the_not_applicable_inventory_equals_a_source_scan",
+    "the_narrowing_rules_match_their_pin",
     "the_source_scan_refuses_an_unlisted_producer",
 ];
 

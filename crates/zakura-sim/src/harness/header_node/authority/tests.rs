@@ -774,8 +774,28 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
         judged(applied(chain[2]), Some(StorageResult::Applied)),
         Vec::<String>::new()
     );
-    // Until storage's result reaches the check, nothing breaks.
-    assert_eq!(judged(applied(chain[2]), None), Vec::<String>::new());
+    // Storage's result may reach the check a drain late, but an apply
+    // that reported none breaks at the drain after.
+    let mut credit = credit::Credit::default();
+    for event in &honest(&applied(chain[2])) {
+        if let ReactorEvent::CreditIssued {
+            kind: CreditKind::Open,
+            update,
+            ..
+        } = event
+        {
+            if let Some(first) = update.locator_hashes.first() {
+                credit.note_read(*first, update.acknowledged.height);
+            }
+        }
+        credit.observe(event, true, false);
+    }
+    assert_eq!(credit.take_breaks(), Vec::<String>::new());
+    let unreported = credit.take_breaks();
+    assert!(
+        matches!(&unreported[..], [only] if only.contains("reported no storage result")),
+        "{unreported:?}"
+    );
     let failed = judged(
         applied(chain[2]),
         Some(StorageResult::ApplyFailed {

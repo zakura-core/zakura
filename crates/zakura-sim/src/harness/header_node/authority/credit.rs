@@ -40,9 +40,11 @@
 //!   last page that subscription staged before the apply's dispatch, as
 //!   production accepts only the round's last staged cursor and only once
 //!   its apply succeeded. That apply's storage operation, found by its
-//!   `Submitted { call }`, must have completed `Applied`. Storage's facts
-//!   reach this check at its drains, so an acceptance whose apply result
-//!   isn't known yet is judged once it is.
+//!   `Submitted { call }`, must have completed `Applied`. Storage completes
+//!   an apply before its reply reaches the reactor, and each drain feeds
+//!   storage's facts before the reactor's, so the result is known by the
+//!   drain that sees the acceptance. One drain later, an acceptance whose
+//!   apply reported no storage result breaks too.
 //! - **Operations.** An `Open`'s and a `Grant`'s credit comes in an update
 //!   of that operation, and a built `Close` is a `Close` that adds no
 //!   credit.
@@ -147,8 +149,8 @@ pub(super) struct Credit {
     /// call number.
     applied: HashMap<u64, bool>,
     /// Acceptances under an apply call whose storage result isn't known
-    /// yet, with the call.
-    awaiting: Vec<(Subscription, u64, Frontier)>,
+    /// yet, with the call and whether a drain has already found it unknown.
+    awaiting: Vec<(Subscription, u64, Frontier, bool)>,
     breaks: Vec<String>,
 }
 
@@ -385,22 +387,25 @@ impl Credit {
     }
 
     /// Breaks for each awaited acceptance whose apply call's storage
-    /// operation completed other than `Applied`, and forgets every one
-    /// whose result is known.
+    /// operation completed other than `Applied`, or that a second drain still
+    /// finds with no result, and forgets every one it judges.
     fn judge_awaited(&mut self) {
         let mut waiting = Vec::new();
-        for (key, call, through) in std::mem::take(&mut self.awaiting) {
+        for (key, call, through, waited) in std::mem::take(&mut self.awaiting) {
+            let (_, session, subscription) = &key;
             match self.applied.get(&call) {
-                None => waiting.push((key, call, through)),
+                None if !waited => waiting.push((key, call, through, true)),
+                None => self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session} subscription {subscription} \
+                     accepted through {through:?} in apply call {call}'s completion, whose \
+                     apply reported no storage result"
+                )),
                 Some(true) => {}
-                Some(false) => {
-                    let (_, session, subscription) = key;
-                    self.breaks.push(format!(
-                        "CommitOnlyAuthorized: session {session} subscription {subscription} \
-                         accepted through {through:?} in apply call {call}'s completion, \
-                         whose apply didn't succeed"
-                    ));
-                }
+                Some(false) => self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session} subscription {subscription} \
+                     accepted through {through:?} in apply call {call}'s completion, whose \
+                     apply didn't succeed"
+                )),
             }
         }
         self.awaiting = waiting;
@@ -688,7 +693,7 @@ impl Credit {
                  page staged before that apply, {before:?} (now {last_staged:?})"
             ));
         }
-        self.awaiting.push((key.clone(), call, through));
+        self.awaiting.push((key.clone(), call, through, false));
     }
 }
 

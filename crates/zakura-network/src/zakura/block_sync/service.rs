@@ -545,13 +545,6 @@ impl BlockSyncService {
             .len()
     }
 
-    /// A probe of the session slots this service reserves, for the
-    /// simulator's teardown check.
-    #[cfg(zakura_sim)]
-    pub fn session_slots(&self) -> crate::zakura::SessionSlotsProbe {
-        self.inner.sessions.probe()
-    }
-
     /// Recheck local policy, skipping only capacity already owned by the session.
     fn demand_for_session(
         &self,
@@ -1162,6 +1155,15 @@ async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Resul
                 }
             }
         }
+    }
+}
+
+#[cfg(zakura_sim)]
+impl BlockSyncService {
+    /// A probe of the session slots this service reserves, for the
+    /// simulator's teardown check.
+    pub fn session_slots(&self) -> crate::zakura::SessionSlotsProbe {
+        self.inner.sessions.probe()
     }
 }
 

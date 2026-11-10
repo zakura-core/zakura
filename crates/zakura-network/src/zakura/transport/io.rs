@@ -272,15 +272,6 @@ impl FramedSend {
         self
     }
 
-    /// This sender, keeping `resources` charged while it or a clone lives,
-    /// as the transport's application senders keep their session's
-    /// reservation. For the simulator's harness, which admits sessions
-    /// without the transport.
-    #[cfg(zakura_sim)]
-    pub fn holding_session(self, resources: Arc<dyn super::service::SessionResources>) -> Self {
-        self.with_session_resources(Some(resources))
-    }
-
     /// Fund frames without another owner from `gate`.
     pub(crate) fn with_output_gate(mut self, gate: FrameGate) -> Self {
         self.output = Some(gate);
@@ -635,6 +626,17 @@ pub(crate) fn worker_framed_channel(depth: usize) -> (FramedSend, FramedWorkerRe
 pub fn framed_channel(depth: usize) -> (FramedSend, FramedRecv) {
     let (queue, receiver) = FrameQueue::new(depth);
     (FramedSend::queued(queue), FramedRecv::queued(receiver))
+}
+
+#[cfg(zakura_sim)]
+impl FramedSend {
+    /// This sender, keeping `resources` charged while it or a clone lives,
+    /// as the transport's application senders keep their session's
+    /// reservation. For the simulator's harness, which admits sessions
+    /// without the transport.
+    pub fn holding_session(self, resources: Arc<dyn super::service::SessionResources>) -> Self {
+        self.with_session_resources(Some(resources))
+    }
 }
 
 #[cfg(test)]

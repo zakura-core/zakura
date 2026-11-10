@@ -1449,6 +1449,17 @@ use a fresh one per identity and fill the node. Zebra counts a
 global IPv6 /64 as one host, and the draft Zcash P2P QUIC ZIP calls a /64 a
 reasonable default for IPv6 limits.
 
+Two tradeoffs are deliberate. A host with several /64s still gets the per-IP
+cap in each one. No coarser refuse tier backs it, because a fixed /48, /32
+or IPv4 /24 cap either locks out honest nodes at big providers or is too
+loose to stop a cheap allocation. The outbound reserve (ADM-3) keeps dials
+free regardless, and eviction by netgroup is the planned control for a full
+inbound pool. Second, providers that share one /64 across customers put
+those customers in one bucket, so a co-tenant can hold that /64's slots on
+a node. An operator can raise `max_connections_per_ip`. IPv4 also works
+for them, except that a dial listing IPv6 first can win the DIAL-3 race and
+then be refused at registration (tracked in #2255).
+
 Changed:
 
 - **API-3.** Adds `Acceptor::pending_group`.

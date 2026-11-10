@@ -80,7 +80,7 @@ use super::{
         tap::{ReactorTap, TapShutdown},
         DispatchFlag, HeaderNode, LINK_DEPTH,
     },
-    header_sync::{check_service_operation_ids, Dialer},
+    header_sync::Dialer,
     policy::LinkEffect,
     Subsystem,
 };
@@ -91,21 +91,16 @@ use crate::{
             TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
         },
         block_sync_semantic::{
-            semantic_properties, SemanticModel, SemanticView, FRONTIER_WORK_CONSISTENT,
-            QUERY_WORK_AUTHORIZED,
+            semantic_properties, SemanticModel, SemanticView, CAPACITY_RELEASE_WAKES,
+            FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED,
         },
         connection::{WireState, WireView},
         cross::{self, CrossModel, CrossView, Dag, ViewSample},
         header_sync::TeardownView,
     },
-    property::{Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status},
-    storage::HEADER_SERVICE,
+    property::{Capture, HasView, Property, PropertyId, Sources},
     ActionSource, Boundary, Identity, ObservationLog, RunConfig, Sim,
 };
-
-/// The node's header operations get rising IDs, each completes at most once,
-/// and only after its submission. The header storage harness's ID.
-pub const HEADER_OPERATION_IDS: &str = super::header_sync::OPERATION_IDS;
 
 /// A mirror: header sync and block sync on one engine that holds the whole
 /// fixture chain. It's named `mirror-<i>` by its index in
@@ -1086,11 +1081,23 @@ impl Subsystem for SyncStorage {
         }
     }
 
-    /// Both storages' operation ID properties, block sync's stream-6
-    /// generated, resource and semantic properties, then the cross
-    /// properties.
+    /// [`sync_properties`] but those no `sync/storage` scenario can apply:
+    /// block sync's stream-6 table wiring, whose close rules need a peer
+    /// that sends malformed frames, and `capacity-release-wakes`, which needs
+    /// block capacity to fill. Every mirror here serves honestly, and
+    /// `block-sync/storage` and `sync/wire` run those IDs.
     fn properties() -> Vec<Property<Self>> {
+        let wiring: Vec<PropertyId> = table_wiring_properties::<Self>()
+            .into_iter()
+            .map(|property| property.id)
+            .collect();
         sync_properties()
+            .into_iter()
+            .filter(|property| {
+                !wiring.contains(&property.id)
+                    && property.id != PropertyId::new(CAPACITY_RELEASE_WAKES)
+            })
+            .collect()
     }
 
     /// Block sync's: the node's storage facts, its block-sync relays'
@@ -1285,27 +1292,14 @@ pub(crate) fn spawn_actors(
     )
 }
 
-/// Checks [`HEADER_OPERATION_IDS`] on the node's header storage.
-fn check_header_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> crate::property::Verdict {
-    check_service_operation_ids(HEADER_SERVICE, cx)
-}
-
-/// Both storages' operation ID properties, block sync's stream-6
+/// Block storage's operation ID properties, block sync's stream-6
 /// generated, resource and semantic properties, then the cross properties,
-/// for a harness whose view is a [`SyncView`].
+/// for a harness whose view is a [`SyncView`]. It registers no header ID:
+/// header IDs run on the header harnesses, which header acceptance lists
+/// (`HEADER_HARNESSES`), and header storage's operation IDs are checked
+/// there.
 pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
-    let mut properties = vec![Property {
-        id: PropertyId::new(HEADER_OPERATION_IDS),
-        claim: "the node's storage operations get rising IDs, and each completes at most \
-                once, after its submission",
-        kind: Kind::Safety,
-        assumes: &[],
-        needs: &[Source::Storage],
-        status: Status::Active,
-        check: check_header_operation_ids::<S>,
-        witness: None,
-    }];
-    properties.extend(block_storage_properties());
+    let mut properties = block_storage_properties();
     properties.extend(table_wiring_properties());
     properties.extend(resource_properties());
     properties.extend(semantic_properties());

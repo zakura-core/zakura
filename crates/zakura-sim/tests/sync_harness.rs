@@ -110,7 +110,6 @@ fn honest_sync_reaches_the_tip_through_both_services() {
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
         let held = held(&report);
         for property in [
-            "header-sync/storage-operation-ids",
             "block-sync/storage-operation-ids",
             "block-sync/submit-only-requested",
         ] {

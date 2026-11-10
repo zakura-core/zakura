@@ -683,23 +683,16 @@ fn known_violation_does_not_stop_the_run() {
 }
 
 /// A violation the view reports only at the run's end counts against its
-/// property, at the run's last step. A property already violated keeps its
-/// first violation, and an ID nothing registered is ignored.
+/// property, at the run's last step, and an ID nothing registered is
+/// ignored. A property already violated at a step keeps that violation
+/// first, and the end finding beside it (C12).
 #[test]
-fn an_end_violation_counts_unless_the_property_already_broke() {
+fn an_end_violation_counts_beside_earlier_violations() {
     let bumps = |twice: bool| {
         let world = honest();
         world.end.borrow_mut().extend([
-            EndViolation {
-                property: LEVEL,
-                expected: "settled".to_owned(),
-                actual: "still open".to_owned(),
-            },
-            EndViolation {
-                property: PropertyId::new("test/unregistered"),
-                expected: String::new(),
-                actual: String::new(),
-            },
+            end_finding(LEVEL, "settled", "still open"),
+            end_finding(PropertyId::new("test/unregistered"), "", ""),
         ]);
         let task_world = world.clone();
         let known = level(Status::Known { issue: 1523 });
@@ -727,10 +720,91 @@ fn an_end_violation_counts_unless_the_property_already_broke() {
         .all(|p| p.property != "test/unregistered"));
 
     let broke = bumps(true);
+    let bump_step = exit_step(&broke.log, "bump.1");
     assert_eq!(
         outcome(&broke, &LEVEL),
         PropertyOutcome::Violated {
-            witness: vec![exit_step(&broke.log, "bump.1")]
+            witness: vec![bump_step]
+        }
+    );
+    let kept: Vec<(u64, &str)> = property_report(&broke, &LEVEL)
+        .violations
+        .iter()
+        .map(|v| (v.step, v.actual.as_str()))
+        .collect();
+    assert_eq!(
+        kept,
+        [(bump_step, "level 2"), (broke.end.steps, "still open")]
+    );
+}
+
+/// An end finding `expected` and `actual` of `property`.
+fn end_finding(property: PropertyId, expected: &str, actual: &str) -> EndViolation {
+    EndViolation {
+        property,
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
+}
+
+/// C12: the registry keeps every end finding beside the violations the
+/// steps found: a step finding and an end finding of one ID, two end
+/// findings of one ID, even in the same words, since distinct breaks can
+/// share them, and an `Active` and a `Known` property's end findings at one
+/// boundary. A harness whose end replay finds a step's break again leaves it
+/// out itself, where it knows the break's identity.
+#[test]
+fn every_end_finding_is_kept() {
+    const ACTIVE: PropertyId = PropertyId::new("test/active-end");
+    let world = honest();
+    world.end.borrow_mut().extend([
+        end_finding(LEVEL, "settled", "first still open"),
+        end_finding(LEVEL, "settled", "second still open"),
+        end_finding(LEVEL, "settled", "second still open"),
+        end_finding(ACTIVE, "settled", "active still open"),
+    ]);
+    let task_world = world.clone();
+    let active = Property {
+        id: ACTIVE,
+        check: |_| Verdict::Holds,
+        ..level(Status::Active)
+    };
+    let known = level(Status::Known { issue: 1523 });
+    let report = report(
+        world,
+        vec![known, active],
+        Assumptions::none(),
+        move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
+            });
+        },
+    );
+    let bump_step = exit_step(&report.log, "bump.1");
+    let kept = |id: &PropertyId| -> Vec<(u64, String)> {
+        property_report(&report, id)
+            .violations
+            .iter()
+            .map(|v| (v.step, v.actual.clone()))
+            .collect()
+    };
+    let last = report.end.steps;
+    assert_eq!(
+        kept(&LEVEL),
+        [
+            (bump_step, "level 2".to_owned()),
+            (last, "first still open".to_owned()),
+            (last, "second still open".to_owned()),
+            (last, "second still open".to_owned()),
+        ]
+    );
+    assert_eq!(kept(&ACTIVE), [(last, "active still open".to_owned())]);
+    assert_eq!(
+        outcome(&report, &ACTIVE),
+        PropertyOutcome::Violated {
+            witness: vec![last]
         }
     );
 }

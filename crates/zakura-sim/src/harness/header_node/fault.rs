@@ -780,6 +780,20 @@ impl FaultEvidence {
         }
     }
 
+    /// Each break, then the evidence error, the property's check has
+    /// already reported at a step, in the words it reported them. Each names
+    /// its operation, so a break [`FaultEvidence::penalized`] finds again in
+    /// the same words is the same one.
+    pub fn reported(&self) -> Vec<String> {
+        self.judge.borrow().as_ref().map_or_else(Vec::new, |judge| {
+            judge.broken[..judge.reported]
+                .iter()
+                .chain(judge.error.iter().filter(|_| judge.error_reported))
+                .cloned()
+                .collect()
+        })
+    }
+
     /// The same rule as [`FaultEvidence::check`] over a finished run's
     /// `entries`, with every distinct finding. A break of the rule is
     /// violated at any end. What's still open is a break once a settled run

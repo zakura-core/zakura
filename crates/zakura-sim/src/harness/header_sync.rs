@@ -2121,12 +2121,26 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
 
 /// [`HEADER_FAULT_PENALIZED`]'s breaks at the run's end, one each, from
 /// [`FaultEvidence::penalized`] over `log`, such as two failed replies the
-/// reactor never took by the time a settled run ended.
+/// reactor never took by the time a settled run ended. The end replay reads
+/// the whole run again, so it finds every break the step check already
+/// reported too. Each of those is left out once, by its words, which name
+/// its operation ([`FaultEvidence::reported`]), so each break is reported
+/// once (C12).
 fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<EndViolation> {
+    let mut reported = faults.reported();
     faults
         .penalized(log.entries())
         .violated
         .into_iter()
+        .filter(
+            |actual| match reported.iter().position(|at_step| at_step == actual) {
+                Some(at) => {
+                    reported.swap_remove(at);
+                    false
+                }
+                None => true,
+            },
+        )
         .map(|actual| EndViolation {
             property: PropertyId::new(HEADER_FAULT_PENALIZED),
             expected: FAULT_PENALIZED_EXPECTED.to_owned(),
@@ -2412,8 +2426,9 @@ mod tests {
 
     /// Two penalties broken in one step are two violations at that step,
     /// and an untaken reply beside them leaves the property unsettled. A
-    /// later check reports neither again, and the settled end reports both
-    /// breaks and the untaken reply.
+    /// later check reports neither again. The settled end's replay finds
+    /// both breaks again, in the same words, and the untaken reply, and
+    /// reports only the untaken reply, since the step reported the breaks.
     #[test]
     fn the_fault_check_reports_every_break_at_a_step() {
         use crate::check::{Phase, StepCtx};
@@ -2449,9 +2464,9 @@ mod tests {
             actual.extend(parts.recorded.into_iter().map(|violation| violation.actual));
             (actual, parts.unsettled)
         };
-        let (actual, unsettled) = check(0);
+        let (stepped, unsettled) = check(0);
         starts_with_each(
-            &actual,
+            &stepped,
             &[
                 "UnpenalizedFault: prepare operation 1 ",
                 "UnpenalizedFault: prepare operation 2 ",
@@ -2462,18 +2477,22 @@ mod tests {
         assert!(actual.is_empty(), "{actual:?}");
         assert_eq!(unsettled, Some(Inconclusive::ObligationOpen));
 
-        let ended: Vec<String> = fault_end_violations(&harness.0, &log)
-            .into_iter()
-            .map(|found| found.actual)
-            .collect();
+        let replayed = harness.0.penalized(log.entries()).violated;
         starts_with_each(
-            &ended,
+            &replayed,
             &[
                 "UnpenalizedFault: prepare operation 1 ",
                 "UnpenalizedFault: prepare operation 2 ",
                 "UntakenFault: operation 3 ",
             ],
         );
+        assert_eq!(replayed[..2], stepped[..]);
+        assert_eq!(harness.0.reported(), stepped);
+        let ended: Vec<String> = fault_end_violations(&harness.0, &log)
+            .into_iter()
+            .map(|found| found.actual)
+            .collect();
+        starts_with_each(&ended, &["UntakenFault: operation 3 "]);
     }
 
     /// A harness with no view, for checks that read only the log.

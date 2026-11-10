@@ -43,8 +43,9 @@ pub trait HasView {
     /// The violations only the run's end shows, judged over its whole `log`
     /// after [`ended`](HasView::ended), such as an obligation still open
     /// when a settled run stopped. The registry records each against its
-    /// property, unless that property was already violated. None by
-    /// default.
+    /// property, beside the violations its steps found, so one that repeats
+    /// a break a step check already reported must be left out here, where
+    /// the break's identity is known. None by default.
     fn end_violations(&self, _log: &ObservationLog) -> Vec<EndViolation> {
         Vec::new()
     }

@@ -484,7 +484,11 @@ impl<S: HasView> RegistryChecker<S> {
     }
 
     /// Records `found` as the registered property's with its ID, at the
-    /// run's last step, `last`, unless that property was already violated.
+    /// run's last step, `last`, beside any violation it already has. A step
+    /// finding and an end finding of one ID are both kept, and so are two
+    /// end findings of one ID (C12). A harness whose end replay finds a
+    /// step's break again leaves it out itself
+    /// ([`HasView::end_violations`]).
     fn end_violation(&mut self, found: EndViolation, last: u64) {
         let state = self
             .properties
@@ -492,7 +496,7 @@ impl<S: HasView> RegistryChecker<S> {
             .zip(&mut self.state)
             .find(|(property, _)| property.id == found.property)
             .map(|(_, state)| state);
-        if let Some(state) = state.filter(|state| state.violations.is_empty()) {
+        if let Some(state) = state {
             state.violations.push(Violation {
                 property: found.property.to_string(),
                 step: last,

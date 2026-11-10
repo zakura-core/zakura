@@ -80,10 +80,14 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     let cache_dir = tempfile::tempdir().unwrap();
     let config = Config {
         cache_dir: CacheDir::custom_path(cache_dir.path()),
-        initial_mainnet_peers: ["127.0.0.1:8233".to_owned(), "127.0.0.2:8233".to_owned()]
-            .into_iter()
-            .collect(),
-        peerset_initial_target_size: 2,
+        initial_mainnet_peers: [
+            "127.0.0.1:8233".to_owned(),
+            "127.0.0.2:8233".to_owned(),
+            "127.0.0.3:9000".to_owned(),
+        ]
+        .into_iter()
+        .collect(),
+        peerset_initial_target_size: 4,
         ..test_defaults()
     };
     let cached: IndexSet<PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.8:9000"]
@@ -94,18 +98,38 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
 
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
     let selected = super::super::limit_initial_peers(&config, book_tx).await;
-    let expected: Vec<_> = cached.iter().copied().take(2).collect();
-    assert_eq!(selected.into_iter().collect::<Vec<_>>(), expected);
+    let assert_alternating = |peers: &[PeerSocketAddr]| {
+        assert_eq!(peers.len(), 4);
+        assert_eq!(peers[0], cached[0]);
+        assert_eq!(peers[2], cached[1]);
+        // Seeds with equal address preference remain shuffled, but get alternate turns.
+        assert_eq!(
+            IndexSet::from([peers[1], peers[3]]),
+            IndexSet::from([
+                "127.0.0.2:8233".parse().unwrap(),
+                "127.0.0.3:9000".parse().unwrap()
+            ]),
+        );
+    };
+    let selected: Vec<_> = selected.into_iter().collect();
+    assert_alternating(&selected);
     let mut discovered = Vec::new();
     while let Some(change) = book_rx.recv().await {
         discovered.push(change.addr());
     }
     assert_eq!(
         discovered.len(),
-        4,
+        5,
         "unselected peers remain available to discovery"
     );
-    assert_eq!(&discovered[..3], cached.iter().copied().collect::<Vec<_>>());
+    assert_eq!(
+        discovered,
+        selected
+            .iter()
+            .copied()
+            .chain([cached[2]])
+            .collect::<Vec<_>>()
+    );
 
     let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
     let connector = service_fn(move |request: OutboundConnectorRequest| {
@@ -124,14 +148,17 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     .await
     .unwrap()
     .unwrap();
-    let first = attempt_rx.recv().await.unwrap();
-    let second = attempt_rx.recv().await.unwrap();
-    assert_eq!([first.0, second.0], [expected[0], expected[1]]);
-    assert_eq!(
-        second.1 - first.1,
-        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
-    );
-    assert!(attempt_rx.recv().await.is_none());
+    let mut attempts = Vec::new();
+    while let Some(attempt) = attempt_rx.recv().await {
+        attempts.push(attempt);
+    }
+    assert_alternating(&attempts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
+    for pair in attempts.windows(2) {
+        assert_eq!(
+            pair[1].1 - pair[0].1,
+            constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+        );
+    }
 }
 
 /// A crawler peer limit large enough to exercise multi-peer behavior without

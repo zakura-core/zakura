@@ -69,7 +69,7 @@ fn peer_cache_rtt_survives_only_same_connection_updates() {
     ] {
         let updated = change
             .apply_to_meta_addr(
-                Some(original.clone()),
+                Some(original),
                 now + later,
                 wall_now + chrono::Duration::from_std(later).unwrap(),
             )

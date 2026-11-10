@@ -504,8 +504,9 @@ impl Config {
 
     /// Resolve initial seed peer IP addresses, based on the configured network,
     /// and load cached peers from disk, if available.
-    /// Cached peers retain their saved order, followed by shuffled seed peers grouped
-    /// by address preference. Duplicate addresses retain their first position.
+    /// Alternates cached peers in saved RTT order with shuffled seed peers grouped
+    /// by address preference, starting with a cached peer. Shared addresses keep
+    /// their cache position; an exhausted list yields the rest of the other list.
     ///
     /// # Panics
     ///
@@ -518,11 +519,11 @@ impl Config {
         )
         .await;
 
-        // Only fallback peers are shuffled and grouped by address preference.
-        let mut fallback: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
+        // Only seed peers are shuffled and grouped by address preference.
+        let mut preferred_seeds: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
         for addr in dns_peers {
             match PeerPreference::new(addr, self.network.clone()) {
-                Ok(preference) => fallback.entry(preference).or_default().push(addr),
+                Ok(preference) => preferred_seeds.entry(preference).or_default().push(addr),
                 Err(error) => info!(
                     peer = %addr.addr_label(self.expose_peer_addresses),
                     ?error,
@@ -531,7 +532,7 @@ impl Config {
             }
         }
         let mut dns_peers = Vec::new();
-        for peers in fallback.values_mut() {
+        for peers in preferred_seeds.values_mut() {
             peers.shuffle(&mut rand_10::rng());
             dns_peers.extend(peers.iter().copied());
         }
@@ -544,9 +545,36 @@ impl Config {
                 .collect()
         } else {
             // Ignore disk errors because the cache is optional and the method already logs them.
-            let disk_peers = self.load_peer_cache().await.unwrap_or_default();
+            let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
+            disk_peers.retain(
+                |addr| match PeerPreference::new(*addr, self.network.clone()) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        info!(
+                            peer = %addr.addr_label(self.expose_peer_addresses),
+                            ?error,
+                            "invalid initial peer from disk cache",
+                        );
+                        false
+                    }
+                },
+            );
 
-            disk_peers.into_iter().chain(dns_peers).collect()
+            // Remove overlap before alternating, so a duplicate cannot consume a seed turn.
+            dns_peers.retain(|addr| !disk_peers.contains(addr));
+            let mut cached = disk_peers.into_iter();
+            let mut seeds = dns_peers.into_iter();
+            let mut initial_peers = IndexSet::new();
+            loop {
+                match (cached.next(), seeds.next()) {
+                    (None, None) => break,
+                    (cached, seed) => {
+                        initial_peers.extend(cached);
+                        initial_peers.extend(seed);
+                    }
+                }
+            }
+            initial_peers
         }
     }
 

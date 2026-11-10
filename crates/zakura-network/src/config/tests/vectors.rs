@@ -31,7 +31,7 @@ use crate::{
 
 /// Cache line order survives parsing, deduplication, and fallback peer discovery.
 #[tokio::test]
-async fn peer_cache_preserves_order_and_precedes_seeds() {
+async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     let _init_guard = zakura_test::init();
     let cache_dir = tempfile::tempdir().unwrap();
     let mut config = Config {
@@ -69,7 +69,7 @@ async fn peer_cache_preserves_order_and_precedes_seeds() {
         ordered.iter().copied().collect::<Vec<_>>()
     );
     let expected: Vec<crate::PeerSocketAddr> =
-        ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.2:8233"]
+        ["127.0.0.9:9000", "127.0.0.2:8233", "127.0.0.1:8233"]
             .into_iter()
             .map(|addr| addr.parse().unwrap())
             .collect();
@@ -82,6 +82,46 @@ async fn peer_cache_preserves_order_and_precedes_seeds() {
     config.cache_dir = CacheDir::disabled();
     assert_eq!(config.initial_peers().await.len(), 2);
     assert!(config.load_peer_cache().await.unwrap().is_empty());
+}
+
+/// Invalid addresses do not consume turns, and either source can exhaust first.
+#[tokio::test]
+async fn peer_cache_alternation_handles_exhaustion_and_invalid_addresses() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: Vec<crate::PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.8:9000"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    for seed_count in 0..=4 {
+        let seeds: indexmap::IndexSet<String> = (1..=seed_count)
+            .map(|ip| format!("127.0.0.{ip}:8233"))
+            .collect();
+        let config = Config {
+            initial_mainnet_peers: seeds.clone(),
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            ..Config::default()
+        };
+        config
+            .update_peer_cache(
+                ["0.0.0.0:8233".parse().unwrap()]
+                    .into_iter()
+                    .chain(cached.iter().copied())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let actual: Vec<_> = config.initial_peers().await.into_iter().collect();
+        assert_eq!(actual.len(), cached.len() + seeds.len());
+        assert_eq!(actual[0], cached[0]);
+        assert_eq!(actual[if seed_count == 0 { 1 } else { 2 }], cached[1]);
+        let actual_seeds: std::collections::HashSet<_> = actual
+            .into_iter()
+            .filter(|addr| !cached.contains(addr))
+            .collect();
+        let expected_seeds = seeds.iter().map(|addr| addr.parse().unwrap()).collect();
+        assert_eq!(actual_seeds, expected_seeds);
+    }
 }
 
 /// Truncation retains the first addresses, rather than an arbitrary set subset.

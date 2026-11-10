@@ -50,7 +50,7 @@ use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
         self, address_is_valid_for_inbound_listeners, HandshakeRequest, MinimumPeerVersion,
-        OutboundConnectorRequest, PeerPreference,
+        OutboundConnectorRequest,
     },
     peer_cache_updater::peer_cache_updater,
     peer_registry::PeerRegistry,
@@ -738,17 +738,9 @@ async fn limit_initial_peers(
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
 
-    // Validate all addresses, retaining cached RTT order before fallback peers.
-    // Feed every valid candidate to discovery, even beyond the startup dial limit.
+    // Config has validated and interleaved cached peers with preferred seeds.
+    // Feed every candidate to discovery, even beyond the startup dial limit.
     for peer in all_peers {
-        if let Err(error) = PeerPreference::new(peer, config.network.clone()) {
-            info!(
-                peer = %peer.addr_label(config.expose_peer_addresses),
-                ?error,
-                "invalid initial peer from DNS seeder, configured IP address, or disk cache",
-            );
-            continue;
-        }
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;

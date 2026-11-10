@@ -27,7 +27,8 @@ pub enum Expect {
     Holds,
     /// The property's run shows the violation, with its trigger history. A
     /// `Known` property that holds instead fails the test with
-    /// [`WitnessError::Fixed`].
+    /// [`WitnessError::Fixed`]. No other property may be violated, except
+    /// one the caller lists as an expected co-violation.
     Violated,
     /// The property applies and holds. Other `Known` or `Draft` properties
     /// may report violations, as long as none stopped the run. A property
@@ -162,6 +163,7 @@ pub fn witness<S: Subsystem>(
         scenario.input,
         property,
         expect,
+        &[],
         &mut MemorySink::default(),
     )
 }
@@ -169,19 +171,25 @@ pub fn witness<S: Subsystem>(
 /// [`witness`], writing the run's records to `sink`, so a recorded trace
 /// is the run the test judged. Nothing is written if the property isn't
 /// registered or has no trigger-history check.
+///
+/// An [`Expect::Violated`] test also passes when properties in
+/// `also_violates` are violated beside `property`: a bug that breaks
+/// `property` can break them too.
 pub fn witness_into<S: Subsystem>(
     scenario: &S::Scenario,
     input: PlanInput,
     property: &str,
     expect: Expect,
+    also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    witness_prepared::<S>(
+    witness_judged::<S>(
         scenario,
         S::prepare(scenario),
         input,
         property,
         expect,
+        also_violates,
         sink,
     )
 }
@@ -196,14 +204,36 @@ pub fn witness_prepared<S: Subsystem>(
     expect: Expect,
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
+    witness_judged::<S>(scenario, prepared, input, property, expect, &[], sink)
+}
+
+/// [`witness_prepared`], with [`witness_into`]'s `also_violates`.
+fn witness_judged<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    property: &str,
+    expect: Expect,
+    also_violates: &[String],
+    sink: &mut dyn RecordSink,
+) -> Result<(), WitnessError> {
     let registered = Registered::<S>::of(property, expect)?;
     let mut sink = EndSeen { sink, ended: false };
     // Judged once the run's end is final and before shutdown, which can
     // still change the view.
     let id = property.to_owned();
+    let also_violates = also_violates.to_vec();
     let judge =
         move |harness: &S, end: &RunEnd, reports: &[PropertyReport], log: &ObservationLog| {
-            registered.judge(end, reports, log, Some(harness), &id, expect)
+            registered.judge(
+                end,
+                reports,
+                log,
+                Some(harness),
+                &id,
+                expect,
+                &also_violates,
+            )
         };
     let (_, judged) = match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, judge) {
         Ok(run) => run,
@@ -234,6 +264,7 @@ pub fn judge_report<S: Subsystem>(
         None,
         property,
         expect,
+        &[],
     )
 }
 
@@ -261,11 +292,13 @@ impl<S: Subsystem> Registered<S> {
         })
     }
 
-    /// Checks the run's `end` and `reports` against `expect`, then the
-    /// trigger history, if the property has one, over the final `log` and,
-    /// for a view trigger, the `harness`'s view. The view is read only once
-    /// the report fits, so only on a run a check could read it in, and only
-    /// if it shows the run's last step.
+    /// Checks the run's `end` and `reports` against `expect`, allowing
+    /// `also_violates` beside a violation, then the trigger history, if the
+    /// property has one, over the final `log` and, for a view trigger, the
+    /// `harness`'s view. The view is read only once the report fits, so
+    /// only on a run a check could read it in, and only if it shows the
+    /// run's last step.
+    #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
         end: &RunEnd,
@@ -274,8 +307,9 @@ impl<S: Subsystem> Registered<S> {
         harness: Option<&S>,
         property: &str,
         expect: Expect,
+        also_violates: &[String],
     ) -> Result<(), WitnessError> {
-        judge_end(end, reports, property, self.status, expect)?;
+        judge_end(end, reports, property, self.status, expect, also_violates)?;
         let reached = match self.trigger_history {
             None => true,
             Some(TriggerHistory::Log(history)) => history(log),
@@ -319,17 +353,28 @@ pub(crate) fn judge(
     property: &str,
     status: Status,
     expect: Expect,
+    also_violates: &[String],
 ) -> Result<(), WitnessError> {
-    judge_end(&report.end, &report.properties, property, status, expect)
+    judge_end(
+        &report.end,
+        &report.properties,
+        property,
+        status,
+        expect,
+        also_violates,
+    )
 }
 
-/// [`judge`] on a run's `end` and property `reports`.
+/// [`judge`] on a run's `end` and property `reports`. Under
+/// [`Expect::Violated`], a violation of a property in `also_violates`
+/// isn't unrelated.
 fn judge_end(
     end: &RunEnd,
     reports: &[PropertyReport],
     property: &str,
     status: Status,
     expect: Expect,
+    also_violates: &[String],
 ) -> Result<(), WitnessError> {
     if end.outcome == Outcome::Harness {
         let failure = end
@@ -345,16 +390,20 @@ fn judge_end(
         .outcome;
     // Another property's violation is unrelated to this one: one that
     // stopped the run fails every expectation, and one that didn't fails
-    // all but `Applicable`.
+    // all but `Applicable`. A `Violated` test expects `also_violates`.
+    let expected = |other: &str| {
+        other == property
+            || (expect == Expect::Violated && also_violates.iter().any(|a| a == other))
+    };
     let unrelated = reports
         .iter()
-        .filter(|r| r.property != property)
+        .filter(|r| !expected(&r.property))
         .find(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }));
     let stopped_by = end
         .violation
         .as_ref()
         .map(|v| v.property.as_str())
-        .filter(|p| *p != property);
+        .filter(|p| !expected(p));
     match expect {
         Expect::Holds | Expect::Applicable => {
             if let Some(stopped_by) = stopped_by {
@@ -434,7 +483,7 @@ mod tests {
         let report = stopped_by("test/own");
         for expect in [Expect::Holds, Expect::Applicable] {
             assert_eq!(
-                judge(&report, "test/own", Status::Active, expect),
+                judge(&report, "test/own", Status::Active, expect, &[]),
                 Err(WitnessError::Outcome(PropertyOutcome::Violated {
                     witness: vec![3]
                 })),
@@ -442,8 +491,42 @@ mod tests {
             );
         }
         assert_eq!(
-            judge(&report, "test/own", Status::Active, Expect::Violated),
+            judge(&report, "test/own", Status::Active, Expect::Violated, &[]),
             Ok(())
         );
+    }
+
+    /// A `Violated` test passes with a listed co-violation beside the
+    /// property's own, fails on an unlisted one, and still needs the
+    /// property's own violation. Other expectations ignore the list.
+    #[test]
+    fn listed_co_violations_pass_violated_only() {
+        let mut report = stopped_by("test/own");
+        report.properties.push(PropertyReport::new(
+            "test/co",
+            PropertyOutcome::Violated { witness: vec![3] },
+        ));
+        let also = ["test/co".to_owned()];
+        let judged = |report: &RunReport, also: &[String], expect| {
+            judge(report, "test/own", Status::Active, expect, also)
+        };
+        assert_eq!(judged(&report, &also, Expect::Violated), Ok(()));
+        let unrelated = Err(WitnessError::Unrelated {
+            property: "test/co".to_owned(),
+        });
+        assert_eq!(judged(&report, &[], Expect::Violated), unrelated);
+        // The listed property stopped the run, and the own one held.
+        let mut held = stopped_by("test/co");
+        held.properties.push(PropertyReport::new(
+            "test/own",
+            PropertyOutcome::Held { applicable: 1 },
+        ));
+        assert_eq!(
+            judged(&held, &also, Expect::Violated),
+            Err(WitnessError::Outcome(PropertyOutcome::Held {
+                applicable: 1
+            }))
+        );
+        assert_eq!(judged(&held, &also, Expect::Holds), unrelated);
     }
 }

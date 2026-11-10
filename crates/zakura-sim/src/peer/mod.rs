@@ -75,7 +75,7 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote, SharedIds};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
@@ -407,25 +407,28 @@ pub struct PeerControl {
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`, and the peers' tasks
-    /// record into `records`.
-    pub(crate) fn new(failure: PeerFailure, records: PeerRecords) -> Self {
+    /// No peers yet. Failures land in `failure`, the peers' tasks record
+    /// into `records`, and the transport tap hands over each connection's
+    /// shared ID in `shared_ids`.
+    pub(crate) fn new(failure: PeerFailure, records: PeerRecords, shared_ids: SharedIds) -> Self {
         PeerControl {
             slots: Vec::new(),
             failure,
             records,
-            evidence: WireEvidence::default(),
+            evidence: WireEvidence::new(shared_ids),
         }
     }
 
     /// Also logs the peers' frames on `stream`, discovery's, which the
     /// evidence judges none of.
-    pub(crate) fn with_discovery(mut self, stream: &Stream) -> Self {
-        self.evidence = WireEvidence::with_discovery(StreamId {
-            kind: stream.kind,
-            version: stream.version,
-        });
-        self
+    pub(crate) fn with_discovery(self, stream: &Stream) -> Self {
+        PeerControl {
+            evidence: self.evidence.with_discovery(StreamId {
+                kind: stream.kind,
+                version: stream.version,
+            }),
+            ..self
+        }
     }
 
     /// Adds peer `name`'s script, limited to [`ADVERSARY_RATE`] actions
@@ -1037,9 +1040,8 @@ impl Drop for Live {
 
 impl Acceptor for Forward {
     /// Accepts an attempt while no other is in its handshake or live, and
-    /// refuses it otherwise. So each connection the node opens reaches the
-    /// peer, and gets its handshake outcome, one after another
-    /// ([`WireEvidence`]'s incarnations).
+    /// refuses it otherwise. So the connections the node opens reach the
+    /// peer's task one after another, since it serves one at a time.
     fn admit(&self, incoming: &IncomingInfo) -> Admit {
         if incoming.pending_total > 0 || self.live.load(Ordering::SeqCst) > 0 {
             return Admit::Refuse;
@@ -1300,7 +1302,10 @@ impl PeerTask {
             else {
                 return;
             };
-            let remote = Remote::first(peer_addr(self.index, dial));
+            let remote = Remote {
+                addr: peer_addr(self.index, dial),
+                shared_id: conn.shared_id(),
+            };
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
                 return;
             }
@@ -1326,8 +1331,7 @@ impl PeerTask {
         }
     }
 
-    /// Listens for the node's dials, and answers each one's handshake. Each
-    /// connection is the next incarnation at the peer's address.
+    /// Listens for the node's dials, and answers each one's handshake.
     async fn listen(&mut self, local: &Local, scripts: &mut Scripts) {
         let quic = self.bind(0);
         let (to_task, mut incoming) = mpsc::channel(4);
@@ -1342,8 +1346,11 @@ impl PeerTask {
         } else {
             Echo::Faithful
         };
-        let mut remote = Remote::first(peer_addr(self.index, 0));
         while let Some(conn) = incoming.recv().await {
+            let remote = Remote {
+                addr: peer_addr(self.index, 0),
+                shared_id: conn.shared_id(),
+            };
             let answered =
                 handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
                     .await;
@@ -1357,7 +1364,6 @@ impl PeerTask {
             if let Ended::Failed = ended {
                 return;
             }
-            remote.incarnation += 1;
         }
     }
 
@@ -1717,7 +1723,7 @@ mod tests {
 
     /// A listening peer's acceptor admits an attempt only while no other is
     /// in its QUIC handshake or live, so the node's connections reach the
-    /// peer one after another, as `WireEvidence`'s incarnations need.
+    /// peer's task one after another.
     #[test]
     fn a_listening_peer_admits_one_connection_at_a_time() {
         let (to_task, _incoming) = mpsc::channel(1);

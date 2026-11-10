@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index c11f4dbdc5..89797cb1ce 100644
+index dd496a9605..f6cf271309 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -506,6 +506,16 @@ impl HeaderSyncReactor {
+@@ -514,6 +514,16 @@ impl HeaderSyncReactor {
              if self.startup.shutdown.is_cancelled() {
                  break HeaderRequestTerminal::Shutdown;
              }
@@ -16,6 +16,6 @@ index c11f4dbdc5..89797cb1ce 100644
 +            }) {
 +                std::future::pending::<()>().await;
 +            }
-             // Retire already-ready state operations before any event can enforce
-             // their hard deadlines. Bound this pass to the current operation set.
-             // A spent coop budget mustn't hide one. See `a_spent_budget_hides_no_ready_completion`.
+             // Inspect watches on every turn, even when peer queues never become empty.
+             self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
+             // One item from each queue per turn prevents either queue monopolizing the loop.

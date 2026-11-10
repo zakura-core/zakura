@@ -97,6 +97,9 @@ pub(super) struct Request {
     pub(super) input: PathBuf,
     /// The property the original violates.
     pub(super) property: String,
+    /// Other properties the original may violate beside `property`, which
+    /// `zakura-sim confirm --also-violates` expects.
+    pub(super) also_violates: Vec<String>,
     /// The output directory. It must be missing or empty.
     pub(super) out: PathBuf,
     /// The limits.
@@ -235,6 +238,7 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
         harness,
         input: path::absolute(input)?,
         property,
+        also_violates: Vec::new(),
         out,
         budget: Budget { runs, wall, child },
         sanitizer,
@@ -1479,6 +1483,11 @@ impl Checker<'_> {
             .arg(&confirm_dir);
         if let Some(against) = against {
             confirm.arg("--against").arg(against);
+        }
+        if !self.request.also_violates.is_empty() {
+            confirm
+                .arg("--also-violates")
+                .arg(self.request.also_violates.join(","));
         }
         let confirmation_file = confirm_dir.join(CONFIRMATION_FILE);
         let ended = run_child(&mut confirm, &confirm_log, Some(child), self.interrupt)?;

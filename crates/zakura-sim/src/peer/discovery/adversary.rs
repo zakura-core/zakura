@@ -22,7 +22,8 @@ use zakura_network::zakura::{
 use zakura_quic::NodeSecretKey;
 
 use super::{
-    body, peers_cap, services, unix_now, Answer, DiscoveryFrame, DiscoveryPeer, Request, SESSION,
+    body, peers_cap, relay_author, services, unix_now, Answer, DiscoveryFrame, DiscoveryPeer,
+    Request, FIXTURE_ADDR, SESSION,
 };
 use crate::{model::Label, peer::Outgoing};
 
@@ -148,7 +149,9 @@ pub enum DiscoveryAct {
         /// The response row.
         row: DiscoveryRow,
     },
-    /// The held answer of `row`, one byte over its request's own cap.
+    /// The held answer of `row`, one byte over its request's own cap: the
+    /// held `Peers` with one more validly signed record, whose extension
+    /// bytes take the payload to the cap plus one, so it decodes.
     OverOwed {
         /// The response row.
         row: DiscoveryRow,
@@ -245,6 +248,10 @@ impl DiscoveryAct {
         }
     }
 }
+
+/// The index of the over-owed record's author: past every script's
+/// relays, so it's never one of them.
+const OVER_OWED_AUTHOR: u8 = 0x30;
 
 /// `record` with another body's signature: its own body with the next
 /// sequence, signed by `secret`, the record's author.
@@ -374,7 +381,7 @@ impl DiscoveryPeer {
                         "the node's GetPeers limit {limit} owes the row's largest Peers"
                     ));
                 }
-                frame.resize(cap + 1);
+                frame = self.over_owed(frame, cap + 1)?;
                 vec![self.send(frame, exchange)]
             }
             DiscoveryAct::BadContent { rule } => {
@@ -532,6 +539,35 @@ impl DiscoveryPeer {
             (rule, message) => unreachable!("{rule:?}'s row gives {message:?}"),
         }
         Ok((frame, exchange))
+    }
+
+    /// The held `Peers` `frame` with one more record, by an author no
+    /// script relays, whose extension bytes take the payload to `len`.
+    fn over_owed(&self, frame: DiscoveryFrame, len: usize) -> Result<DiscoveryFrame, String> {
+        let DiscoveryMessage::Peers { records } = frame.message else {
+            return Err("over-owed needs a held Peers".to_owned());
+        };
+        let author = relay_author(OVER_OWED_AUTHOR);
+        let with = |extensions: Vec<u8>| -> Result<DiscoveryFrame, String> {
+            let mut extra = body(&author, &self.handshake, unix_now(), vec![FIXTURE_ADDR]);
+            extra.extensions = extensions;
+            let extra = ZakuraNodeRecord::sign(extra, &author)
+                .map_err(|error| format!("the over-owed record doesn't sign: {error:?}"))?;
+            let mut records = records.clone();
+            records.push(extra);
+            Ok(DiscoveryFrame::of(DiscoveryMessage::Peers { records }))
+        };
+        let short = len
+            .checked_sub(with(Vec::new())?.payload.len())
+            .ok_or("the held Peers with one more record is past the cap already")?;
+        let frame = with(vec![0; short])?;
+        if frame.payload.len() != len {
+            return Err(format!(
+                "the over-owed Peers is {} bytes, not {len}",
+                frame.payload.len()
+            ));
+        }
+        Ok(frame)
     }
 
     /// `record` re-signed by `author` with an expiry past the node's clock

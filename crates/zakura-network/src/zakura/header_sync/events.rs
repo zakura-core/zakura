@@ -50,8 +50,8 @@ pub struct HeaderSyncStartup {
     /// Application frame cap for header-sync messages.
     pub max_frame_bytes: u32,
     /// The most connections the node admits at once, which caps how many
-    /// header-sync peers it can hold. Defaults to
-    /// [`DEFAULT_ZAKURA_MAX_CONNECTIONS`](crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS).
+    /// header-sync peers it can hold. It sizes header serving, the lifecycle
+    /// queue and the per-identity state that outlives a session.
     pub max_connections: usize,
     /// Per-request timeout.
     pub request_timeout: Duration,
@@ -69,7 +69,9 @@ pub struct HeaderSyncStartup {
 }
 
 impl HeaderSyncStartup {
-    /// Build startup configuration from durable state facts.
+    /// Build startup configuration from durable state facts, for a node that
+    /// admits `max_connections` at once. Pass the same count `config` was
+    /// derived for with [`ZakuraHeaderSyncConfig::for_node_connections`].
     pub fn new(
         network: Network,
         anchor: (block::Height, block::Hash),
@@ -77,6 +79,7 @@ impl HeaderSyncStartup {
         best_header_tip: Option<(block::Height, block::Hash)>,
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
+        max_connections: usize,
     ) -> Self {
         let status_refresh_interval = config.effective_status_refresh_interval();
         Self {
@@ -96,7 +99,7 @@ impl HeaderSyncStartup {
             port_dispatch: PortDispatch::External,
             config,
             max_frame_bytes,
-            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            max_connections,
             request_timeout: Duration::from_secs(30),
             status_refresh_interval,
             trace: ZakuraTrace::noop(),
@@ -157,6 +160,17 @@ pub(crate) enum PortDispatch {
     External,
 }
 
+/// Lifecycle queue slots per admissible header-sync peer.
+///
+/// A session holds two until the reactor reads its admission, one for that
+/// admission and one reserved for its teardown, then one until the reactor
+/// reads its teardown. Generations of one peer overlap: a replacement is
+/// admitted while the session it replaces is live, and a reconnect can arrive
+/// while the ended session's teardown is still queued. So each peer gets room
+/// for its session and one more overlapping generation. Past that the reactor
+/// is behind, and a new session is refused until it catches up.
+pub(super) const LIFECYCLE_SLOTS_PER_PEER: usize = 4;
+
 /// A bounded lifecycle queue whose admitted sessions retain their cleanup capacity.
 #[derive(Clone, Debug)]
 pub(super) struct LifecycleSender {
@@ -172,9 +186,11 @@ pub(super) struct LifecycleEvent {
 }
 
 impl LifecycleSender {
-    /// Allocate two slots per configured peer, shared by pending admission and teardown.
+    /// Allocate [`LIFECYCLE_SLOTS_PER_PEER`] slots for each of `peers`, the
+    /// header-sync peers the node can admit at once.
     pub(super) fn channel(peers: usize) -> (Self, mpsc::Receiver<LifecycleEvent>) {
-        let (sender, receiver) = mpsc::channel(peers.max(1).saturating_mul(2));
+        let (sender, receiver) =
+            mpsc::channel(peers.max(1).saturating_mul(LIFECYCLE_SLOTS_PER_PEER));
         (
             Self {
                 sender,
@@ -184,7 +200,16 @@ impl LifecycleSender {
         )
     }
 
+    /// The most events the queue holds at once.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
+
     /// Reserve cleanup before queueing a connection; duplicate/stale teardown is harmless.
+    ///
+    /// A connection that finds the queue full is refused, its session is
+    /// cancelled, and `sync.header.peer.lifecycle_refused.total` counts it.
     pub(super) fn send(
         &self,
         event: Event,
@@ -197,13 +222,22 @@ impl LifecycleSender {
         match &event {
             Event::PeerConnected(session) => {
                 let key = (session.peer_id().clone(), session.session_id());
-                let Ok(connect) = self.sender.clone().try_reserve_owned() else {
-                    session.cancel_token().cancel();
-                    return Err(mpsc::error::SendError(event));
-                };
-                let Ok(disconnect) = self.sender.clone().try_reserve_owned() else {
-                    session.cancel_token().cancel();
-                    return Err(mpsc::error::SendError(event));
+                let reserved =
+                    self.sender.clone().try_reserve_owned().and_then(|connect| {
+                        Ok((connect, self.sender.clone().try_reserve_owned()?))
+                    });
+                let (connect, disconnect) = match reserved {
+                    Ok(permits) => permits,
+                    Err(refused) => {
+                        // A full queue means the reactor is behind, the overload
+                        // `LIFECYCLE_SLOTS_PER_PEER` bounds. A closed one is shutdown.
+                        if matches!(refused, mpsc::error::TrySendError::Full(_)) {
+                            metrics::counter!("sync.header.peer.lifecycle_refused.total")
+                                .increment(1);
+                        }
+                        session.cancel_token().cancel();
+                        return Err(mpsc::error::SendError(event));
+                    }
                 };
                 disconnects.insert(key, disconnect);
                 connect.send(LifecycleEvent { event, applied });

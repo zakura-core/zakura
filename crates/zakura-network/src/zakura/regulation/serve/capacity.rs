@@ -263,6 +263,12 @@ impl ServeCapacity {
         budgets
     }
 
+    /// The limits this capacity was built with.
+    #[cfg(test)]
+    pub(crate) fn limits(&self) -> ServeLimits {
+        self.limits
+    }
+
     /// Node execution slots in use.
     #[cfg(test)]
     pub(crate) fn node_execution_held(&self) -> usize {

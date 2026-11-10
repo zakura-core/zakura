@@ -3010,6 +3010,7 @@ impl ZakuraProtocolHandler {
             super::TransportEvent::Registered {
                 conn_id,
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
             }
         );
     }
@@ -3022,6 +3023,7 @@ impl ZakuraProtocolHandler {
             self.transport_observer,
             super::TransportEvent::HandshakeRefused {
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
                 reason: reason.to_string(),
             }
         );
@@ -4953,8 +4955,8 @@ async fn spawn_zakura_endpoint_inner(
             .clone()
             .for_node_connections(limits.max_connections),
         limits.max_frame_bytes,
+        limits.max_connections,
     );
-    startup.max_connections = limits.max_connections;
     let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
     startup.fatal_events = Some(header_sync_fatal_tx);
     startup.use_direct_port();
@@ -9141,6 +9143,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         startup.shutdown = shutdown;
         startup

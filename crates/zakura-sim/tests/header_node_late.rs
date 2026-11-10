@@ -253,6 +253,7 @@ fn request_timeout() -> Duration {
         Some((anchor.height, anchor.hash)),
         zakura_network::zakura::ZakuraHeaderSyncConfig::default(),
         zakura_network::zakura::LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     )
     .request_timeout
 }

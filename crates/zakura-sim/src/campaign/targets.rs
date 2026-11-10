@@ -50,9 +50,10 @@ use crate::{
         ProcessExit, ProcessFailure, Worker, ABANDON_LIMIT_VAR, EXPECT_VAR,
     },
     harness::{HarnessEntry, HARNESSES, NO_TASK_PANIC},
+    planted::{self, PLANTED_DIR},
     seed::{self, sha256, Seed},
     sim::NO_LIVELOCK,
-    suite::{SuiteFile, PLANTED_DIR, SIM_FUZZ_PACKAGE, SUITE_FILE},
+    suite::{SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
 };
 
@@ -435,41 +436,38 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
     }
     let mut cases = Vec::new();
     let root = repo.join(PLANTED_DIR);
-    for family in sorted(&root)? {
-        for property in sorted(&family)? {
-            for case in sorted(&property)? {
-                if case.extension().is_none_or(|extension| extension != "toml") {
-                    continue;
-                }
-                let text = fs::read_to_string(&case)
-                    .map_err(|error| format!("reading {}: {error}", case.display()))?;
-                let file: CaseFile = toml::from_str(&text)
-                    .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-                let input = match (file.input, file.typed) {
-                    (Some(input), None) => repo.join(input),
-                    (None, Some(_)) => continue,
-                    (input, _) => {
-                        return Err(format!(
-                            "{}: a case names either `input` or `[typed]`, and this names {}",
-                            case.display(),
-                            if input.is_some() { "both" } else { "neither" }
-                        ))
-                    }
-                };
-                if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
-                    continue;
-                }
-                let id = property
-                    .strip_prefix(&root)
-                    .map_err(|_| format!("{} is outside {PLANTED_DIR}", property.display()))?;
-                cases.push(BypassCase {
-                    property: id.to_string_lossy().into_owned(),
-                    patch: Path::new(PLANTED_DIR)
-                        .join(id)
-                        .join(case.with_extension("patch").file_name().unwrap_or_default()),
-                });
+    let case_files = match planted::files(&root, "toml") {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("listing {error}")),
+    };
+    for case in case_files {
+        let text = fs::read_to_string(&case)
+            .map_err(|error| format!("reading {}: {error}", case.display()))?;
+        let file: CaseFile = toml::from_str(&text)
+            .map_err(|error| format!("parsing {}: {error}", case.display()))?;
+        let input = match (file.input, file.typed) {
+            (Some(input), None) => repo.join(input),
+            (None, Some(_)) => continue,
+            (input, _) => {
+                return Err(format!(
+                    "{}: a case names either `input` or `[typed]`, and this names {}",
+                    case.display(),
+                    if input.is_some() { "both" } else { "neither" }
+                ))
             }
+        };
+        if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
+            continue;
         }
+        let property = planted::property_id(&root, &case)
+            .ok_or_else(|| format!("{} isn't under a property", case.display()))?;
+        cases.push(BypassCase {
+            patch: Path::new(PLANTED_DIR)
+                .join(&property)
+                .join(case.with_extension("patch").file_name().unwrap_or_default()),
+            property,
+        });
     }
     Ok(cases)
 }

@@ -551,13 +551,14 @@ only from a target with a collector.
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
 each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
-runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
-`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+splits `qa/planted/` into fourteen shards. Each night its two parts run the
+two shards the UTC weekday picks, with `cargo xtask planted --shard
+<index>/14`, so each case runs once a week. A
 case's shard follows from its position in path order. Adding or removing a
 case moves every later case to another shard, so across that change a case
 can run on two nights in a row or wait up to 13 nights. A shard that holds no
 case fails the run. Each shard has its own failure issue,
-`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
+`[nightly] zakura_sim planted shard <index>/14 failed`, and only a passing run
 of that shard closes it, so a pass of another shard can't close it. A remote
 host runs the rest, including `cargo xtask planted --targets`, and its results
 never block a pull request. No CI job runs `planted --targets`.

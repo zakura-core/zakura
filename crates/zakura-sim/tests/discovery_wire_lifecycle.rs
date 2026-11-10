@@ -1,7 +1,8 @@
 //! disc-2.3: `discovery/wire`'s saved Plans. Each committed Plan replays to
 //! its pinned end record, and shows the history its scenario exists for: a
 //! completed exchange, a timed-out one, verification on `discovery_verify`
-//! tasks, and a dial of a static candidate. A run repeats under its Plan
+//! tasks, a dial of a static candidate, and a late answer (disc-3.4). A
+//! run repeats under its Plan
 //! alone, with another run between, and replays Exact in a fresh process
 //! through `zakura-sim replay`. A history a test needs that never happened fails
 //! it: a missing observation is a harness failure, never evidence.
@@ -23,19 +24,31 @@ use zakura_network::zakura::{
 };
 use zakura_quic::NodeId;
 use zakura_sim::{
+    check::after_step,
+    domain::discovery::{is_source, late_answer, LateAnswer, LATE_RESPONSE_ADMITTED},
     harness::{
         discovery_service::{DiscoveryWire, NodeHandle, SavedPlan, WireScenario, RELAYED},
         run_prepared, HarnessError, Subsystem,
     },
     observe::TransportFact,
     peer::{discovery::relayed_node, peer_addr},
-    seed, MemorySink, NoChecks, Observation, Plan, RunReport,
+    record::{DrawRecord, Record},
+    seed, Checker, MemorySink, NoChecks, Observation, Plan, RunReport,
 };
 
 /// Runs `scenario` under the Plan `plan`, and returns the report, even of a
 /// run that ended in a harness failure, with its records and the node's
 /// handle.
 fn run(scenario: &WireScenario, plan: &[u8]) -> (RunReport, Vec<String>, NodeHandle) {
+    run_with(scenario, plan, &mut NoChecks)
+}
+
+/// [`run`], with `extra` checking each step beside the harness's checks.
+fn run_with(
+    scenario: &WireScenario,
+    plan: &[u8],
+    extra: &mut dyn Checker,
+) -> (RunReport, Vec<String>, NodeHandle) {
     let node = DiscoveryWire::prepare(scenario);
     let mut sink = MemorySink::default();
     let ran = run_prepared::<DiscoveryWire>(
@@ -43,7 +56,7 @@ fn run(scenario: &WireScenario, plan: &[u8]) -> (RunReport, Vec<String>, NodeHan
         node.clone(),
         Plan::from_fuzz(plan),
         &mut sink,
-        Some(&mut NoChecks),
+        Some(extra),
     );
     let report = match ran {
         Ok(report) => report,
@@ -233,6 +246,162 @@ fn registered_from_peer_0(report: &RunReport) -> Vec<u64> {
         .collect()
 }
 
+/// The task an identity runs, if it runs one: `<task>` of
+/// `task:<task>:<point>`.
+fn task_of(identity: &str) -> Option<&str> {
+    let rest = identity.strip_prefix("task:")?;
+    Some(&rest[..rest.rfind(':')?])
+}
+
+/// The log index where the node's discovery source ended its initial wait
+/// on the wait's timer: the source's first entry after it reached its
+/// `sleep` point at or after the session's admission plus
+/// [`DISCOVERY_INITIAL_EXCHANGE_TIMEOUT`]. The wait is biased toward a
+/// complete exchange, which the source checks before the timer in the
+/// same poll, so a run from that point takes the timeout.
+fn initial_wait_timed_out(report: &RunReport) -> Option<usize> {
+    let entries = report.log.entries();
+    let times = times(report);
+    let admitted = entries.iter().position(|entry| {
+        matches!(entry.obs, Observation::Session { kind, .. } if kind == ZAKURA_STREAM_DISCOVERY)
+    })?;
+    let slept = (admitted..entries.len()).find(|&at| {
+        matches!(&entries[at].obs, Observation::TaskReached { task, at: point, .. }
+            if is_source(task) && point.starts_with("sleep"))
+            && times[at] - times[admitted] >= DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+    })?;
+    (slept + 1..entries.len()).find(|&at| {
+        entries[at].step > entries[slept].step && entries[at].obs.ran_task().is_some_and(is_source)
+    })
+}
+
+/// The first late answer in `report`'s log ([`late_answer`]), and its log
+/// index.
+fn first_late_answer(report: &RunReport) -> Option<(usize, LateAnswer)> {
+    let entries = report.log.entries();
+    (0..entries.len()).find_map(|at| {
+        late_answer(entries, at)
+            .expect("every discovery header read has its peer frame")
+            .map(|late| (at, late))
+    })
+}
+
+/// Each step's option count, the index it picked, and, where it picked the
+/// node's discovery source while [`late_response_plan`] holds the source
+/// back, the first other option.
+type Choices = Vec<(usize, usize, Option<usize>)>;
+
+/// Runs [`SavedPlan::LateResponse`]'s scenario under the Plan `plan`, and
+/// records each step's choices. The source is held back from the step
+/// after it took its initial wait's timeout until the node's reader has the
+/// late `Peers` header or the node closes the connection.
+fn steer_late_response(plan: &[u8]) -> (RunReport, Vec<String>, Choices) {
+    let mut choices = Choices::new();
+    let mut admitted = None;
+    let mut timed_out = false;
+    let mut settled = false;
+    let source = |identity: &str| task_of(identity).is_some_and(is_source);
+    let mut steering = after_step(|cx| {
+        let enabled: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
+        let pick = cx.pick.to_string();
+        // The loop picks from the enabled set, so the pick is always in it.
+        let index = enabled.iter().position(|e| *e == pick).unwrap_or_default();
+        let hold = (timed_out && !settled && source(&pick))
+            .then(|| enabled.iter().position(|e| !source(e)))
+            .flatten();
+        choices.push((enabled.len(), index, hold));
+        let discovery_session = |obs: &Observation| matches!(obs, Observation::Session { kind, .. } if *kind == ZAKURA_STREAM_DISCOVERY);
+        if admitted.is_none() && cx.observations().any(discovery_session) {
+            admitted = Some(cx.now);
+        }
+        timed_out |= source(&pick)
+            && pick
+                .rsplit(':')
+                .next()
+                .is_some_and(|point| point.starts_with("sleep"))
+            && admitted.is_some_and(|at| {
+                cx.now.saturating_duration_since(at) >= DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+            });
+        let entries = cx.log.entries();
+        let start = entries.partition_point(|entry| entry.step < cx.step);
+        settled |= (start..entries.len()).any(|at| {
+            matches!(entries[at].obs, Observation::ConnectionClosed { .. })
+                || matches!(late_answer(entries, at), Ok(Some(_)))
+        });
+        None
+    });
+    let (report, lines, _) = run_with(&SavedPlan::LateResponse.scenario(), plan, &mut steering);
+    drop(steering);
+    (report, lines, choices)
+}
+
+/// How many bytes choose among `range` values, as the `Plan` decodes them.
+fn width(range: u128) -> usize {
+    match range {
+        0..=0x100 => 1,
+        0x101..=0x1_0000 => 2,
+        0x1_0001..=0x1_0000_0000 => 4,
+        _ => 8,
+    }
+}
+
+/// Appends `value` as `width(range)` little-endian bytes.
+fn push(bytes: &mut Vec<u8>, value: u64, range: u128) {
+    bytes.extend_from_slice(&value.to_le_bytes()[..width(range)]);
+}
+
+/// Appends a draw's answer, unless its bound makes it forced.
+fn push_draw(bytes: &mut Vec<u8>, draw: &DrawRecord) {
+    match draw.bound.0 {
+        1 => {}
+        0 => push(bytes, draw.value.0, 1 << 64),
+        bound => push(bytes, draw.value.0, u128::from(bound)),
+    }
+}
+
+/// Builds [`SavedPlan::LateResponse`]'s Plan, as `tests/discovery.rs`
+/// builds its input: from the step after the node's discovery source took
+/// its initial wait's timeout, it picks another action over the source
+/// until the node's reader has the late `Peers` header. Each round reruns
+/// the Plan, finds the first step where the round-robin default ran the
+/// source then, and rewrites the Plan from there.
+fn late_response_plan() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..1_000 {
+        let (_, lines, choices) = steer_late_response(&bytes);
+        let Some(deviation) = choices.iter().position(|(.., hold)| hold.is_some()) else {
+            return bytes;
+        };
+        let records: Vec<Record> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("a run writes valid records"))
+            .collect();
+        let mut next = Vec::new();
+        for record in &records {
+            if let Record::Init(init) = record {
+                init.draws.iter().for_each(|d| push_draw(&mut next, d));
+            }
+        }
+        let steps = records.iter().filter_map(|record| match record {
+            Record::Step(step) => Some(step),
+            _ => None,
+        });
+        for (at, (step, (options, picked, hold))) in steps.zip(&choices).enumerate() {
+            if *options > 1 {
+                let index = hold.unwrap_or(*picked);
+                // A step's index and option count fit in u64 and u128.
+                push(&mut next, index as u64, *options as u128);
+            }
+            if at == deviation {
+                break;
+            }
+            step.draws.iter().for_each(|d| push_draw(&mut next, d));
+        }
+        bytes = next;
+    }
+    panic!("no Plan found in 1,000 rounds");
+}
+
 /// Each saved Plan, committed under `tests/fixtures/discovery-wire-*.bin`
 /// with its sidecar, replays to its pinned end record,
 /// `discovery-wire-*.end.json`. Its prefix picks the saved scenario. No run
@@ -257,6 +426,10 @@ fn registered_from_peer_0(report: &RunReport) -> Vec<u64> {
 /// - `static-dial`: the node dials the listening peer it holds as a static
 ///   candidate, registers the connection, and the exchange on it
 ///   completes.
+/// - `late-response`: the node's discovery source takes its initial wait's
+///   timeout, and then the node's reader has the held `Peers` header, a
+///   late answer. The answer completes the exchange, and the node closes
+///   with `discovery_exchange_complete`.
 ///
 /// This fails if a saved Plan's end record changes. After a deliberate
 /// change, regenerate them with `regenerate_saved_plans`.
@@ -342,6 +515,29 @@ fn saved_plans_replay_their_end_records() {
                     closes.first(),
                     Some(&(*first, "discovery_exchange_complete".to_owned())),
                     "{name}"
+                );
+            }
+            SavedPlan::LateResponse => {
+                let [(connection, cause)] = &closes[..] else {
+                    panic!("{name}: {closes:?}");
+                };
+                assert_eq!(cause, "discovery_exchange_complete", "{name}");
+                assert_eq!(
+                    peer_frames(&report, *connection),
+                    [EXCHANGE[0], EXCHANGE[2], EXCHANGE[1]],
+                    "{name}: the held Peers goes last"
+                );
+                let timed_out =
+                    initial_wait_timed_out(&report).expect("the initial wait timed out");
+                let (read, late) = first_late_answer(&report).expect("the node read a late answer");
+                assert_eq!(
+                    (late.connection, late.row.as_str()),
+                    (*connection, "peers"),
+                    "{name}"
+                );
+                assert!(
+                    timed_out < read,
+                    "{name}: the reader had the Peers header before the wait timed out"
                 );
             }
         }
@@ -432,19 +628,23 @@ fn saved_plans_replay_exact_in_a_fresh_process() {
 
 /// Rewrites every saved Plan: its input, its sidecar and its end record.
 /// Each input is its tag and the default Plan, the one disc-2.2's tests
-/// run. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo test
+/// run, except `late-response`'s, whose Plan [`late_response_plan`] builds.
+/// Run it with `RUSTFLAGS="--cfg zakura_sim" cargo test
 /// --manifest-path crates/zakura-sim/Cargo.toml --test
 /// discovery_wire_lifecycle -- --ignored regenerate_saved_plans`.
 #[test]
 #[ignore = "rewrites the committed saved Plans"]
 fn regenerate_saved_plans() {
     for plan in SavedPlan::ALL {
-        let input = plan.tag().to_vec();
+        let mut input = plan.tag().to_vec();
+        if plan == SavedPlan::LateResponse {
+            input.extend(late_response_plan());
+        }
         let (_, lines, _) = replay(&input);
         let base = base(plan);
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        let sidecar = format!(
+        let mut sidecar = format!(
             "# The committed fuzz input `discovery-wire-{name}.bin`: the harness that\n\
              # runs it, the generator version it was built for, and its SHA-256. Its\n\
              # first two bytes pick the saved `{name}` scenario, and\n\
@@ -460,6 +660,13 @@ fn regenerate_saved_plans() {
             digest = seed::sha256(&input),
             scenario = seed::scenario_sha256(&scenario),
         );
+        // The planted case's input carries the witness `cargo xtask planted`
+        // checks unpatched.
+        if plan == SavedPlan::LateResponse {
+            sidecar.push_str(&format!(
+                "\n[[witness]]\nproperty = \"{LATE_RESPONSE_ADMITTED}\"\nexpect = \"holds\"\n"
+            ));
+        }
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
         fs::write(
             base.with_extension("end.json"),

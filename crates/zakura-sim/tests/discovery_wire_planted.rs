@@ -65,8 +65,8 @@ fn case(act: DiscoveryAct) -> String {
     format!("qa/planted/{}/drop-{}", id(act), act.label().name())
 }
 
-/// Every ID with a planted case has one case here, and each case runs its
-/// act's scenario, [`act_scenario`], under the default Plan, the empty Plan
+/// Each stateless ID has a planted case, in registration order, and each
+/// case runs its act's scenario, [`act_scenario`], under the default Plan, the empty Plan
 /// bytes. Its case file names the harness, the scenario and the Plan bytes.
 ///
 /// This fails if an act's scenario changes or stops parsing; rerun
@@ -79,7 +79,8 @@ fn each_planted_reader_case_runs_its_act() {
         .filter(|id| has_planted_case(id))
         .collect();
     let ids: Vec<String> = acts().into_iter().map(id).collect();
-    assert_eq!(ids, planted);
+    let planted: Vec<&String> = planted.iter().filter(|id| ids.contains(id)).collect();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), planted);
     let root = root();
     for act in acts() {
         let case = case(act);

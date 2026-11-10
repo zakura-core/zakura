@@ -132,6 +132,7 @@ fn repairing_reactor(
         Some((tip.height, tip.hash)),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     );
     let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
         state: VctRootRepairState::Unavailable {

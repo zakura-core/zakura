@@ -246,9 +246,11 @@ fn json(value: &impl Serialize) -> String {
 /// classifier reads the run, as in the fuzz target. Then:
 ///
 /// 1. the classifier must select `property`, as `ZAKURA_SIM_EXPECT` does,
-///    and no other property may be violated;
+///    and no other property may be violated, except those in
+///    `also_violates`, which a bug that breaks `property` breaks too;
 /// 2. a rerun on a new thread must pass the `violated` witness test of
-///    `property`, which checks its trigger history;
+///    `property`, with the same `also_violates`, which checks its trigger
+///    history;
 /// 3. [`record_failure`] records the trace under `out/traces/`, checks that
 ///    it violates `property` at the same step, and replays it Exact.
 ///
@@ -263,6 +265,7 @@ pub fn confirm(
     entry: &'static HarnessEntry,
     input: &[u8],
     property: &str,
+    also_violates: &[String],
     out: &Path,
 ) -> Result<Confirmation, RecordError> {
     // An ID that isn't valid can't name a registered property.
@@ -294,17 +297,26 @@ pub fn confirm(
         trace_id: None,
     };
     let out = out.to_path_buf();
+    let also_violates = also_violates.to_vec();
     Worker::new().explore(entry, input, move |input, run, classified| {
-        judge(entry, input, &id, run, classified, &out, confirmation)
+        judge(
+            entry,
+            input,
+            (&id, &also_violates),
+            run,
+            classified,
+            &out,
+            confirmation,
+        )
     })
 }
 
 /// [`confirm`]'s checks on the classified `run` of `input`, filling in
-/// `confirmation`.
+/// `confirmation`. `property` comes with its expected co-violations.
 fn judge(
     entry: &'static HarnessEntry,
     input: &[u8],
-    property: &PropertyId,
+    (property, also_violates): (&PropertyId, &[String]),
     run: &ExploreRun,
     classified: &Classified,
     out: &Path,
@@ -341,6 +353,11 @@ fn judge(
         .filter(|other| *other != want)
         .collect();
     let violates = others.len() < confirmation.violated.len();
+    // The listed co-violations are expected beside `property`'s.
+    let others: Vec<&str> = others
+        .into_iter()
+        .filter(|other| !also_violates.iter().any(|also| also == other))
+        .collect();
     let finding = match (&classified.outcome, selected) {
         (ExploreOutcome::HarnessFailure { reason }, _) => Some((
             ConfirmStatus::IncompleteEvidence,
@@ -371,7 +388,14 @@ fn judge(
         return Ok(confirmation);
     }
 
-    if let Err(error) = witness(entry, input, want, &confirmation.scenario, run) {
+    if let Err(error) = witness(
+        entry,
+        input,
+        want,
+        also_violates,
+        &confirmation.scenario,
+        run,
+    ) {
         let status = match error {
             WitnessError::Unregistered | WitnessError::NoTriggerHistory | WitnessError::NoView => {
                 ConfirmStatus::WitnessUnsupported
@@ -422,18 +446,20 @@ fn judge(
     }
 }
 
-/// Runs the `violated` witness test of `property` on `input` on a new
-/// thread. The thread parks for good if the first `run` leaked tasks, as
-/// the rerun then likely does too.
+/// Runs the `violated` witness test of `property`, allowing
+/// `also_violates`, on `input` on a new thread. The thread parks for good
+/// if the first `run` leaked tasks, as the rerun then likely does too.
 fn witness(
     entry: &'static HarnessEntry,
     input: &[u8],
     property: &str,
+    also_violates: &[String],
     scenario: &Value,
     run: &ExploreRun,
 ) -> Result<(), WitnessError> {
     let plan = input[entry.scenario_bytes.min(input.len())..].to_vec();
     let (property, scenario) = (property.to_owned(), scenario.clone());
+    let also_violates = also_violates.to_vec();
     let clean = run.leaked() == 0;
     on_new_thread(move || {
         let result = (entry.witness)(
@@ -441,6 +467,7 @@ fn witness(
             Plan::from_fuzz(&plan),
             &property,
             Expect::Violated,
+            &also_violates,
             &mut NullSink,
         );
         (result, clean)

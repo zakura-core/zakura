@@ -124,6 +124,7 @@ fn the_committed_flood_inputs_hold_their_watch_rules() {
             plan(input),
             seed.2,
             Expect::Holds,
+            &[],
             &mut MemorySink::default(),
         );
         assert_eq!(result, Ok(()), "{}", seed.0);

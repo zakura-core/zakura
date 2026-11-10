@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index 1c04c67b6e..a56ecc3d9d 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -738,7 +738,13 @@ async fn read_frame(
+         .claim(frame.message_type, frame.payload.len())
+         .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?
+         .map(|claimed| TracedAnswer::claimed(claimed, sink));
++    let message_type = frame.message_type;
+     if let Flow::Reject(reject) = pipe.run_one(frame) {
++        // Planted bypass: discovery drops a `GetServices` its codec refuses
++        // instead of closing.
++        if message_type == super::wire::GET_SERVICES.message_type {
++            return Ok(());
++        }
+         return Err((ViolationStage::Decode, reject));
+     }
+     let Some(message) = pipe.local_mut().take_decoded() else {

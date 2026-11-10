@@ -27,6 +27,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -54,6 +55,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -251,6 +253,10 @@ jobs:
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
+
+      - name: Release notes drafter tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_notes*.py'
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

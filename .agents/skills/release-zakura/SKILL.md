@@ -295,8 +295,11 @@ still has the previous package version.
   for the same tag, never by yanking.
 - Confirm the run's `Verify the published versions` and `Install zakurad from
   crates.io` jobs passed; they replace publishing and installing by hand.
-- Replace the boilerplate GitHub release body with concrete notes from the final
-  changelog or approved release-note draft.
+- Review the notes that the `Release notes` workflow (`release-notes.yml`)
+  drafts in place of the placeholder body after publication, and edit them on
+  the release page as needed. It never replaces edited notes; if its run failed,
+  re-run it or dispatch it with `-f release_tag=<tag>`. See
+  `.github/release-notes/README.md`.
 - Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`
   after signing; it refuses unsigned releases and release candidates.
 - Keep release candidates marked as pre-releases.

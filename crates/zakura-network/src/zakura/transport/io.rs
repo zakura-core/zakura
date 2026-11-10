@@ -414,6 +414,25 @@ impl FramedSend {
     }
 }
 
+/// What a guarded send returns: in test and simulator builds, whether the
+/// queue took the frame, and in release builds nothing, so a release send
+/// does no more than it did before the simulator read the answer.
+#[cfg(any(test, zakura_sim))]
+pub(crate) type Queued = bool;
+/// What a guarded send returns. See the test and simulator definition.
+#[cfg(not(any(test, zakura_sim)))]
+pub(crate) type Queued = ();
+
+/// The queue's answer to a send, as [`Queued`] keeps it.
+#[cfg(any(test, zakura_sim))]
+fn queued<E>(sent: Result<(), E>) -> Queued {
+    sent.is_ok()
+}
+
+/// The queue's answer to a send, as [`Queued`] keeps it: nothing.
+#[cfg(not(any(test, zakura_sim)))]
+fn queued<E>(_sent: Result<(), E>) -> Queued {}
+
 /// One reserved queue slot. Dropping it returns capacity without sending a frame.
 #[derive(Debug)]
 pub(crate) struct GuardedFrameSlot<'a> {
@@ -422,13 +441,15 @@ pub(crate) struct GuardedFrameSlot<'a> {
 }
 
 impl GuardedFrameSlot<'_> {
-    /// Transfer a validated frame and its ownership to the reserved queue slot.
+    /// Transfer a validated frame and its ownership to the reserved queue slot,
+    /// returning whether the queue took it ([`Queued`]).
     ///
     /// A closed queue drops the frame and returns its guard's ownership.
-    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
-        let _closed = self
-            .sender
-            .send(QueuedFrame::guarded(frame, guard, Some(self.slot)));
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) -> Queued {
+        queued(
+            self.sender
+                .send(QueuedFrame::guarded(frame, guard, Some(self.slot))),
+        )
     }
 
     /// Publish a request whose ownership must be claimed before its first byte.
@@ -455,9 +476,11 @@ pub(crate) struct ResponseFrameSlot<'a> {
 }
 
 impl ResponseFrameSlot<'_> {
-    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+    /// Sends `frame` as [`GuardedFrameSlot::send`] does, with the response
+    /// permit held by its guard.
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) -> Queued {
         self.slot
-            .send(frame, FrameGuard::new(Arc::new((guard, self.response))));
+            .send(frame, FrameGuard::new(Arc::new((guard, self.response))))
     }
 }
 

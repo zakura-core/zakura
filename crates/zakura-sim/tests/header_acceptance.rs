@@ -1313,6 +1313,7 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "header-hold-held-locator",
                 "header-hold-held-prepare",
                 "header-hold-held-apply",
+                "header-hold-serving-read",
             ]),
         ),
         (

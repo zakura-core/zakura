@@ -375,10 +375,11 @@ const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
 
 /// Each committed hold-release fixture, by its fixture stem, which its
 /// witness test runs under the fixed Plan.
-const HOLD_CASES: [&str; 3] = [
+const HOLD_CASES: [&str; 4] = [
     "header-hold-held-locator",
     "header-hold-held-prepare",
     "header-hold-held-apply",
+    "header-hold-serving-read",
 ];
 
 /// The committed hold-release fixtures, each holding and applying
@@ -1869,9 +1870,11 @@ fn hand_written_rows() -> Vec<Row> {
 
     let mut hold = holds(HOLD, G5, HOLD_WITNESSES);
     for (index, name) in [
+        "committed-page-dropped",
         "completion-arm-removed",
         "exits-on-reply",
         "lost-notification",
+        "page-job-wake-lost",
     ]
     .into_iter()
     .enumerate()

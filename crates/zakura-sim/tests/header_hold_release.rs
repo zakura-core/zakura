@@ -164,7 +164,8 @@ fn every_fixture_holds_and_takes_its_path() {
         for input in inputs(plans, 256) {
             let (report, reading) = run_reading(fixture, input);
             assert_holds_and_applies(fixture, &report);
-            let wakes: Vec<HoldWakeFact> = reading.wakes.iter().map(|(_, fact)| *fact).collect();
+            let wakes: Vec<HoldWakeFact> =
+                reading.wakes.iter().map(|(_, fact)| fact.clone()).collect();
             let [HoldWakeFact::Opened { call, op, .. }, rest @ ..] = &wakes[..] else {
                 panic!("{fixture:?}: one held reply opens first: {wakes:?}");
             };
@@ -258,11 +259,12 @@ fn the_hold_fixture_repeats_a_a_and_a_b_a() {
 /// The fixtures `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-hold-<name>.json` with its Plan bytes beside
 /// it in `header-hold-<name>.plan`.
-fn committed_fixtures() -> [(&'static str, LivenessScenario); 3] {
+fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
     [
         ("held-locator", LivenessScenario::Held(HeldKind::Locator)),
         ("held-prepare", LivenessScenario::Held(HeldKind::Prepare)),
         ("held-apply", LivenessScenario::Held(HeldKind::Apply)),
+        ("serving-read", LivenessScenario::ServingHeld),
     ]
 }
 
@@ -664,7 +666,7 @@ impl Subsystem for Spinning {
                 let facts = hold_wake.facts();
                 let opened = facts.iter().find_map(|(_, fact)| match fact {
                     HoldWakeFact::Opened { call, .. } => Some(*call),
-                    HoldWakeFact::Handled { .. } => None,
+                    _ => None,
                 });
                 if let Some(call) = opened {
                     let handled = facts.iter().any(|(_, fact)| {
@@ -769,5 +771,98 @@ fn the_scenario_byte_picks_each_fixture() {
         assert_eq!(Liveness::draw(&[byte]), *fixture);
         let wrapped = u8::try_from(index + all.len()).expect("few fixtures");
         assert_eq!(Liveness::draw(&[wrapped]), *fixture);
+    }
+}
+
+/// The serving-read fixture holds the property and applies, with the
+/// controls holding or not applying beside it, and takes its path: the
+/// publisher's held page read for the mirror's session is served, a page
+/// read that completes with a page, and that session's publisher then
+/// queues a page, which answers it. The finish stops the node after the
+/// page.
+#[test]
+fn the_serving_fixture_holds_and_takes_its_path() {
+    let fixture = LivenessScenario::ServingHeld;
+    for input in inputs(16, 256) {
+        let (report, reading) = run_reading(fixture, input);
+        assert_holds_and_applies(fixture, &report);
+        let wakes: Vec<HoldWakeFact> = reading.wakes.iter().map(|(_, fact)| fact.clone()).collect();
+        let [HoldWakeFact::Served {
+            op,
+            peer,
+            session_id,
+            ..
+        }, HoldWakeFact::Queued {
+            op: queued,
+            session_id: session,
+        }] = &wakes[..]
+        else {
+            panic!("one served read, then its page: {wakes:?}");
+        };
+        assert_eq!((queued, session), (op, session_id), "{wakes:?}");
+        assert_eq!(peer, "mirror-0");
+        let shutdown = reading.shutdown.expect("every run stops the node");
+        assert!(
+            shutdown > reading.wakes[1].0,
+            "the finish came before the page"
+        );
+        let served = facts(&report).iter().any(|fact| {
+            matches!(fact, Fact::Storage(StorageFact::Completed {
+                id,
+                delivered: true,
+                result: StorageResult::Page { .. },
+                ..
+            }) if id == op)
+        });
+        assert!(served, "the held read completes with a page");
+    }
+}
+
+/// The serving fixture's passing controls open nothing, so the property
+/// doesn't apply: a held page read that fails, which the publisher may
+/// stall on, and a mirror level with the node, for which the publisher
+/// reads no page.
+#[test]
+fn the_serving_controls_open_nothing() {
+    for fixture in [
+        LivenessScenario::ServingFailed,
+        LivenessScenario::ServingCaughtUp,
+    ] {
+        for input in inputs(6, 256) {
+            let (report, reading) = run_reading(fixture, input);
+            assert!(reading.wakes.is_empty(), "{fixture:?}: {:?}", reading.wakes);
+            assert!(
+                matches!(
+                    outcome(&report, HOLD_RELEASE_WAKES),
+                    PropertyOutcome::NotApplicable
+                ),
+                "{fixture:?}: {:?}",
+                outcome(&report, HOLD_RELEASE_WAKES)
+            );
+            for control in CONTROLS {
+                assert!(
+                    matches!(
+                        outcome(&report, control),
+                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                    ),
+                    "{fixture:?}: {control}: {:?}",
+                    outcome(&report, control)
+                );
+            }
+            let failed_read = facts(&report).iter().any(|fact| {
+                matches!(
+                    fact,
+                    Fact::Storage(StorageFact::Completed {
+                        result: StorageResult::Fault { .. },
+                        ..
+                    })
+                )
+            });
+            assert_eq!(
+                failed_read,
+                fixture == LivenessScenario::ServingFailed,
+                "{fixture:?}: only the failing control's held read fails"
+            );
+        }
     }
 }

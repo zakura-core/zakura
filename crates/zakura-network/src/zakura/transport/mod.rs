@@ -40,7 +40,7 @@ pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
     worker_framed_channel, AdmittedFrame, FrameGuard, FrameWriteClaim, FramedWorkerRecv,
-    GuardedFrameSlot, GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause,
+    GuardedFrameSlot, GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, Queued,
     QueuedFrame, ResponseFrameSlot,
 };
 #[cfg(test)]

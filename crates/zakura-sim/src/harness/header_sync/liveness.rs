@@ -80,6 +80,14 @@ const LATE_PAGE_PREPARE_MS: u64 = 70_000;
 /// release.
 pub const LATE_PAGE_HORIZON: std::time::Duration = std::time::Duration::from_secs(80);
 
+/// How long a serving fixture's held read may stay pending, in virtual
+/// milliseconds. The clock can't pass it, so the release and the read both
+/// come well before the read's lease idles out and the mirror's request
+/// deadline, both 30 seconds. Otherwise a Plan could let the lease expire,
+/// and the read would complete unavailable, or let the mirror close the
+/// subscription, both outside the fixture.
+pub const SERVING_READ_DEADLINE_MS: u64 = 1_000;
+
 /// A storage operation kind a hold fixture holds: the reactor's three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -217,6 +225,23 @@ pub enum LivenessScenario {
     /// the rearmed deadline, so production retires A's round 30 seconds
     /// after the page, and the cached pass hands the target to B.
     LatePage,
+    /// The serving-read fixture: the node at A3 serving `mirror-0` at A1,
+    /// its only peer, which subscribes to it. The publisher's first page
+    /// read is held until a `Release` step, which the Plan may take any time
+    /// once that read is submitted, long before the mirror's 30-second
+    /// request deadline. The node is two headers ahead, fewer than one page
+    /// and than the mirror's first credit, and no peer is ahead of the node,
+    /// so once the held page reaches its job nothing else is left to wake
+    /// the publisher.
+    ServingHeld,
+    /// [`LivenessScenario::ServingHeld`] with the held read failing as
+    /// storage unavailable, a passing control: a failed read opens nothing,
+    /// since the publisher may stall on it.
+    ServingFailed,
+    /// [`LivenessScenario::ServingHeld`] with the mirror at A3, level with
+    /// the node, a passing control: the publisher reads no page, so nothing
+    /// opens.
+    ServingCaughtUp,
 }
 
 impl LivenessScenario {
@@ -254,20 +279,38 @@ impl LivenessScenario {
         all.extend(LivenessScenario::departures());
         all.extend([false, true].map(|late_apply| LivenessScenario::Timeout { late_apply }));
         all.push(LivenessScenario::LatePage);
+        all.extend(LivenessScenario::serving());
         all
     }
 
-    /// The hold fixtures, every one whose obligation a held reply opens.
+    /// The hold fixtures, every one whose obligation a held reactor reply
+    /// opens.
     pub fn holds() -> Vec<LivenessScenario> {
         LivenessScenario::all()
             .into_iter()
-            .filter(|fixture| {
-                !matches!(
-                    fixture,
-                    LivenessScenario::Departure { .. } | LivenessScenario::Timeout { .. }
-                )
-            })
+            .filter(|fixture| fixture.kind() == FixtureKind::Hold)
             .collect()
+    }
+
+    /// The serving-read fixture and its two passing controls.
+    pub fn serving() -> [LivenessScenario; 3] {
+        [
+            LivenessScenario::ServingHeld,
+            LivenessScenario::ServingFailed,
+            LivenessScenario::ServingCaughtUp,
+        ]
+    }
+
+    /// Which kind of fixture it is, for [`Finish`].
+    fn kind(self) -> FixtureKind {
+        match self {
+            LivenessScenario::Departure { .. } => FixtureKind::Departure,
+            LivenessScenario::Timeout { .. } | LivenessScenario::LatePage => FixtureKind::Timeout,
+            LivenessScenario::ServingHeld
+            | LivenessScenario::ServingFailed
+            | LivenessScenario::ServingCaughtUp => FixtureKind::Serving,
+            _ => FixtureKind::Hold,
+        }
     }
 
     /// When the fixture's script is done: [`LATE_PAGE_HORIZON`] for the
@@ -338,7 +381,39 @@ impl LivenessScenario {
             LivenessScenario::Departure { stage, by } => departure(stage, by),
             LivenessScenario::Timeout { late_apply } => timeout(late_apply),
             LivenessScenario::LatePage => late_page(),
+            LivenessScenario::ServingHeld => serving(Allow::Engine, 1),
+            LivenessScenario::ServingFailed => serving(Allow::Unavailable, 1),
+            LivenessScenario::ServingCaughtUp => serving(Allow::Engine, 3),
         }
+    }
+}
+
+/// The serving-read fixtures' storage scenario: the node at A3 serving one
+/// mirror at A`mirror`, with the publisher's first page read held until a
+/// `Release` step and then completing as `then` allows, within
+/// [`SERVING_READ_DEADLINE_MS`] of its submission.
+fn serving(then: Allow, mirror: u32) -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![MirrorSpec {
+            chain: Chain::main(mirror),
+            dialer: Dialer::Mirror,
+        }],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Read, 1),
+                until: Trigger::Released,
+                then: vec![then],
+                deadline_ms: Some(SERVING_READ_DEADLINE_MS),
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Release { hold: 0 },
+            when: Some(Trigger::Submitted(Select::nth(OpKind::Read, 1))),
+        }],
+        weights: Default::default(),
     }
 }
 
@@ -494,11 +569,14 @@ fn held(kind: OpKind) -> StorageScenario {
 
 /// Ends a liveness run once its obligations have concluded, so it ends
 /// idle rather than at its budget. That's once each held reply that reached
-/// the reactor has been handled or the clock has moved past it, the
-/// fixture's key event has happened, and every
+/// the reactor has been handled, and each served read's publisher has
+/// queued a page, or the clock has moved past it, the fixture's key event
+/// has happened, and every
 /// `header-sync/peer-retirement-progress` obligation still open
 /// ([`open_retirement`]) is past its deadline. A hold fixture's key event is
-/// its first held reply, a departure fixture's the harness's close or
+/// its first held reply, a serving fixture's its served read, or the clock
+/// past [`FIXTURE_HORIZON`] for a control that serves none, a departure
+/// fixture's the harness's close or
 /// relink of [`OWNER`] with the clock past it, and a timeout fixture's the
 /// clock past its horizon ([`LivenessScenario::horizon`]). A departure
 /// fixture whose departure never
@@ -540,19 +618,26 @@ impl Finish {
         let opened: Vec<(u64, SimInstant)> = facts
             .iter()
             .filter_map(|(_, fact)| match fact {
-                HoldWakeFact::Opened { call, at, .. } => Some((*call, *at)),
-                HoldWakeFact::Handled { .. } => None,
+                HoldWakeFact::Opened { op, at, .. } | HoldWakeFact::Served { op, at, .. } => {
+                    Some((*op, *at))
+                }
+                HoldWakeFact::Handled { .. } | HoldWakeFact::Queued { .. } => None,
             })
             .collect();
-        let handled = |call: u64| {
+        let answered = |op: u64| {
             facts.iter().any(|(_, fact)| {
-                matches!(fact, HoldWakeFact::Handled { call: handled, .. } if *handled == call)
+                matches!(
+                    fact,
+                    HoldWakeFact::Handled { op: answered, .. }
+                        | HoldWakeFact::Queued { op: answered, .. } if *answered == op
+                )
             })
         };
-        let replies_concluded = opened.iter().all(|(call, at)| now > *at || handled(*call));
+        let replies_concluded = opened.iter().all(|(op, at)| now > *at || answered(*op));
         let horizon = now > SimInstant::from_start(self.horizon);
         let key_event = match self.kind {
             FixtureKind::Hold => !opened.is_empty(),
+            FixtureKind::Serving => !opened.is_empty() || horizon,
             FixtureKind::Departure => self.departed_at.is_some_and(|at| now > at) || horizon,
             FixtureKind::Timeout => horizon,
         };
@@ -608,6 +693,8 @@ impl ActionSource for Finish {
 enum FixtureKind {
     /// A hold fixture.
     Hold,
+    /// A serving-read fixture or control.
+    Serving,
     /// A departure fixture.
     Departure,
     /// A timeout fixture.
@@ -749,13 +836,7 @@ impl Subsystem for Liveness {
             ends,
             retirement,
             topology,
-            kind: match scenario {
-                LivenessScenario::Departure { .. } => FixtureKind::Departure,
-                LivenessScenario::Timeout { .. } | LivenessScenario::LatePage => {
-                    FixtureKind::Timeout
-                }
-                _ => FixtureKind::Hold,
-            },
+            kind: scenario.kind(),
             horizon: scenario.horizon(),
             departed_at: None,
             waits_for_shutdown: storage

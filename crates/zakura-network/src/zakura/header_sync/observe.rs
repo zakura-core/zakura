@@ -570,6 +570,31 @@ pub enum ReactorEvent {
         /// The serving budgets in use.
         in_use: ServeInUse,
     },
+    /// A session's publisher handed a page to its writer: state committed
+    /// the page, and its frame is already queued on the session's send
+    /// slot, so a committed page whose frame never reached the writer
+    /// reports nothing. Reported by the publisher task, through the reactor
+    /// observer's capacity handle.
+    PageQueued {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+        /// The handle of the retained-path lease the page's read used,
+        /// which storage reports as that read's lease ID. Each lease serves
+        /// one read, so it names the read the page came from.
+        lease: u64,
+        /// The page's subscription.
+        subscription_id: u64,
+        /// The common ancestor the page declares.
+        common_ancestor: Frontier,
+        /// Each entry's header hash, in order.
+        headers: Vec<block::Hash>,
+        /// The subscription's initial target.
+        initial_target: block::Hash,
+        /// Whether the page reaches that target.
+        reaches_target: bool,
+    },
     /// A session's publisher task started. Reported by the task itself, as
     /// it begins, through the reactor observer's capacity handle.
     PublisherStarted {

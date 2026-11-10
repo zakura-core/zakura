@@ -268,9 +268,9 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/header_sync.rs",
         function: "check_hold_release_wake",
-        fingerprint: "cc25fac639cc35f2",
+        fingerprint: "385d74bc1223da8e",
         constructions: &[step(
-            "no held reply reached a reactor call before the harness's shutdown by this step",
+            "no held reply reached a reactor call, and no held serving read served its page, before the harness's shutdown by this step",
             TAIL,
         )],
     },

@@ -306,6 +306,10 @@ struct Buffer {
     /// Each reservation and admission, by its peer, in order. They stay out
     /// of the log, so they take no number.
     effects: Vec<(LinkEffect, ZakuraPeerId)>,
+    /// Each page a publisher handed to its writer in the run, by its peer,
+    /// as storage names it, its session and its read's lease, in order.
+    /// They stay out of the log too.
+    queued: Vec<(String, u64, u64)>,
 }
 
 impl TapState {
@@ -886,6 +890,7 @@ impl TapState {
                 | ReactorEvent::ServingAcquired { .. }
                 | ReactorEvent::PublisherStarted { .. }
                 | ReactorEvent::PublisherEnded { .. }
+                | ReactorEvent::PageQueued { .. }
                 | ReactorEvent::TargetCompleted { .. }
                 | ReactorEvent::CursorsAccepted { .. }
                 | ReactorEvent::CursorClaimed { .. }
@@ -896,6 +901,21 @@ impl TapState {
                     .buffer()
                     .effects
                     .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
+            if let (
+                true,
+                ReactorEvent::PageQueued {
+                    peer,
+                    session_id,
+                    lease,
+                    ..
+                },
+            ) = (in_run, &event)
+            {
+                state
+                    .buffer()
+                    .queued
+                    .push((self::peer(peer), *session_id, *lease));
             }
             // The events it takes and its turns, kept in order with what it
             // adopts. The run's own shutdown takes events and sets causes
@@ -1600,6 +1620,13 @@ impl ReactorTap {
     /// by peer, in order.
     pub(crate) fn take_effects(&mut self) -> Vec<(LinkEffect, ZakuraPeerId)> {
         mem::take(&mut self.state.buffer().effects)
+    }
+
+    /// Takes the pages publishers handed to their writers since the last
+    /// call, by peer, session and read lease, in order
+    /// ([`ReactorEvent::PageQueued`]).
+    pub(crate) fn take_queued(&mut self) -> Vec<(String, u64, u64)> {
+        mem::take(&mut self.state.buffer().queued)
     }
 }
 

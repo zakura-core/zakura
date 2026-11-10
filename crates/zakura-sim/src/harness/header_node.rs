@@ -461,6 +461,7 @@ impl ActionSource for PolicySource {
         let before = log.entries().len();
         let stored = self.storage.observe(log);
         let mut tapped_effects = Vec::new();
+        let mut queued = Vec::new();
         // Drained even when storage failed, so a port panic the tap holds
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
@@ -481,6 +482,7 @@ impl ActionSource for PolicySource {
                 );
                 tap.engine_runs(&runs);
                 tapped_effects = tap.take_effects();
+                queued = tap.take_queued();
                 tap.observe(log)
             }
             None => Ok(()),
@@ -501,6 +503,13 @@ impl ActionSource for PolicySource {
             .borrow()
             .first()
             .map(|(_, name)| name.clone());
+        let names = self.effects.names.borrow();
+        let name = |storage: &str| {
+            names
+                .iter()
+                .find(|(id, _)| tap::peer(id) == storage)
+                .map(|(_, name)| name.clone())
+        };
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
@@ -510,7 +519,7 @@ impl ActionSource for PolicySource {
                         predicates.record_link(LinkEffect::StorageStopped, node);
                     }
                     if let Some(check) = &mut self.hold_wake {
-                        check.storage(fact, &predicates);
+                        check.storage(fact, &predicates, name);
                     }
                 }
                 Observation::Reactor { event, .. } => {
@@ -522,7 +531,11 @@ impl ActionSource for PolicySource {
                 _ => {}
             }
         }
-        let names = self.effects.names.borrow();
+        if let Some(check) = &mut self.hold_wake {
+            for (peer, session_id, lease) in &queued {
+                check.queued(peer, *session_id, *lease);
+            }
+        }
         for (effect, peer) in tapped_effects {
             if let Some((_, name)) = names.iter().find(|(id, _)| *id == peer) {
                 predicates.record_link(effect, name);

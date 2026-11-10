@@ -772,7 +772,8 @@ fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
 }
 
 /// A held storage operation whose reply reached the reactor's waiting call
-/// is handled before the reactor goes quiet.
+/// is handled before the reactor goes quiet, and a held serving read's page
+/// is handed to the session's writer before the run goes quiet.
 pub const HOLD_RELEASE_WAKES: &str = "header-sync/hold-release-wakes";
 
 /// What the hold-release check reads: one node's hold-wake facts and its
@@ -787,8 +788,8 @@ pub trait HoldWakeView {
 
 /// [`HOLD_RELEASE_WAKES`], as a harness whose view is a [`HoldWakeView`]
 /// registers it. It applies only where a hold picked a reactor call's
-/// operation and its reply was delivered
-/// ([`crate::harness::header_node::hold_wake`]).
+/// operation and its reply was delivered, or picked a serving read that
+/// completed with a page ([`crate::harness::header_node::hold_wake`]).
 pub fn hold_release_wakes<S>() -> Property<S>
 where
     S: HasView,
@@ -797,8 +798,10 @@ where
     Property {
         id: PropertyId::new(HOLD_RELEASE_WAKES),
         claim: "once a held storage operation's reply reaches the reactor's waiting call, \
-                whatever its result, the reactor handles that call before quiescence, unless \
-                the harness began stopping the node",
+                whatever its result, the reactor handles that call before quiescence, and once \
+                a held serving read's page reaches its page job, the session's publisher hands \
+                a page to its writer before quiescence, unless the harness closed or relinked \
+                that mirror or began stopping the node",
         kind: Kind::Liveness {
             bound: LivenessBound::BeforeQuiescence,
         },
@@ -816,10 +819,16 @@ where
 /// the reactor to handle its call before quiescence. The call's handling
 /// answers it ([`HoldWakeFact::Handled`]), and so does the harness's
 /// `Shutdown` step, the only environment action that stops the reactor
-/// ([`EnvironmentAction::Shutdown`]). A reply delivered once the shutdown
-/// had begun opens nothing. A reactor that exits by itself answers nothing,
-/// so the obligation expires at the next quiescence. It applies once a held
-/// reply was delivered before any shutdown began.
+/// ([`EnvironmentAction::Shutdown`]). Each held serving read the step
+/// served ([`HoldWakeFact::Served`]) obliges the session's publisher to
+/// queue a page before quiescence ([`HoldWakeFact::Queued`]). The harness
+/// closing or relinking that mirror answers it too, and so does the
+/// `Shutdown` step, but the node's own end of the session doesn't, and
+/// neither does an outcome the publisher picks for itself (Rule 13). A
+/// fact made once the shutdown had begun opens nothing. A reactor or
+/// publisher that ends by itself answers nothing, so the obligation expires
+/// at the next quiescence. It applies once either kind opened before any
+/// shutdown began.
 fn check_hold_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -828,7 +837,9 @@ where
     let view = cx.view();
     let shutdown = shutdown_stamp(view.ends());
     for stamp in cx.new_stamps().to_vec() {
-        if let Some(HoldWakeFact::Opened { op, .. }) = view.hold_wake().fact(stamp) {
+        if let Some(HoldWakeFact::Opened { op, .. } | HoldWakeFact::Served { op, .. }) =
+            view.hold_wake().fact(stamp)
+        {
             if shutdown.is_some_and(|shutdown| shutdown < stamp) {
                 continue;
             }
@@ -837,8 +848,8 @@ where
                 Subject::Operation(op),
                 hold_wake_answer::<S::View>,
             );
-            // One shutdown ends every reply still waiting. A `Handled` names
-            // one operation, so it still answers only its own.
+            // One shutdown ends every reply still waiting. A `Handled` or
+            // `Queued` names one operation, so it still answers only its own.
             obligation.cardinality = Cardinality::Every;
             cx.oblige(obligation);
         }
@@ -865,12 +876,16 @@ fn shutdown_stamp(ends: &EndEvidence) -> Option<u64> {
     })
 }
 
-/// Whether a held reply reached the reactor before any shutdown began, so
-/// [`check_hold_release_wake`] obliged its handling.
+/// Whether a held reply reached the reactor, or a held serving read was
+/// served, before any shutdown began, so [`check_hold_release_wake`]
+/// obliged its answer.
 fn hold_wake_obliged<V: HoldWakeView>(view: &V) -> bool {
     let shutdown = shutdown_stamp(view.ends());
     view.hold_wake().facts().into_iter().any(|(at, fact)| {
-        matches!(fact, HoldWakeFact::Opened { .. }) && shutdown.is_none_or(|shutdown| at < shutdown)
+        matches!(
+            fact,
+            HoldWakeFact::Opened { .. } | HoldWakeFact::Served { .. }
+        ) && shutdown.is_none_or(|shutdown| at < shutdown)
     })
 }
 
@@ -881,7 +896,9 @@ fn hold_wake_answer<V: HoldWakeView>(key: &ObligationKey, view: &V, stamp: u64) 
         return FactAnswer::Unrelated;
     };
     match view.hold_wake().fact(stamp) {
-        Some(HoldWakeFact::Handled { op, .. }) if op == held => return FactAnswer::Discharges,
+        Some(HoldWakeFact::Handled { op, .. } | HoldWakeFact::Queued { op, .. }) if op == held => {
+            return FactAnswer::Discharges
+        }
         Some(_) => return FactAnswer::Unrelated,
         None => {}
     }
@@ -890,6 +907,13 @@ fn hold_wake_answer<V: HoldWakeView>(key: &ObligationKey, view: &V, stamp: u64) 
             action: EnvironmentAction::Shutdown,
             ..
         }) => FactAnswer::Discharges,
+        // Only a served read is the mirror's, so only its obligation ends
+        // with the mirror's session.
+        Some(EndFact::Environment {
+            peer,
+            action: EnvironmentAction::Close | EnvironmentAction::Relink,
+            ..
+        }) if view.hold_wake().served_peer(held).as_ref() == Some(&peer) => FactAnswer::Discharges,
         _ => FactAnswer::Unrelated,
     }
 }

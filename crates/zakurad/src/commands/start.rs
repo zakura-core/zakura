@@ -874,7 +874,8 @@ impl StartCmd {
                 sync_status.clone(),
                 latest_chain_tip.clone(),
                 block_announcements,
-                block_adverts,
+                block_adverts.legacy,
+                block_adverts.native,
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
             )

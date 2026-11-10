@@ -30,3 +30,6 @@ pub use methods::types::{
         PendingBlockRegistry, PendingBlockSignal,
     },
 };
+
+#[cfg(feature = "proptest-impl")]
+pub use methods::types::submit_block::PendingBlockFailure;

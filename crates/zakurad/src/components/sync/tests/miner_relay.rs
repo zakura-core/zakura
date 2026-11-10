@@ -154,7 +154,7 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                 SyncStatus::sync_close_to_tip(&mut recent_syncs);
                 let gossip = gossip_best_tip_block_hashes(
                     sync_status, latest_tip.clone(), block_announcements,
-                    peers, read_state.clone(), Some(mining_events.receiver()),
+                    Some(peers), None, read_state.clone(), Some(mining_events.receiver()),
                 );
                 tokio::pin!(gossip);
                 let (_, initial) = next_advertisement(gossip.as_mut(), &mut advertisements).await;
@@ -191,10 +191,10 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                 let mut release_early = None;
                 let waiting_early = if ordering == RelayOrdering::EarlyWaitingForReadiness {
                     let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_with_timeout(
+                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_until(
                         NeverReady(polled.clone()), Request::AdvertiseMinedBlock(
                             zakura_network::AdvertisedBlock::new(candidate.hash(), candidate.zcash_serialized_size()),
-                        ), admission.clone(),
+                        ), admission.clone(), Instant::now() + Duration::from_secs(90),
                     ));
                     tokio::time::timeout(Duration::from_secs(10), async {
                         while !polled.load(std::sync::atomic::Ordering::SeqCst) {
@@ -216,10 +216,10 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                             Ok::<_, crate::BoxError>(Response::Nil)
                         }
                     });
-                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_with_timeout(
+                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_until(
                         peers, Request::AdvertiseMinedBlock(zakura_network::AdvertisedBlock::new(
                             candidate.hash(), candidate.zcash_serialized_size(),
-                        )), admission.clone(),
+                        )), admission.clone(), Instant::now() + Duration::from_secs(90),
                     ));
                     tokio::time::timeout(Duration::from_secs(10), started_rx).await.unwrap().unwrap();
                     Some(task)
@@ -239,9 +239,9 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                     if let Some(release) = release_early {
                         assert!(!waiting.is_finished(), "commit preserves an already dispatched early broadcast");
                         release.send(()).unwrap();
-                        assert!(tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap());
+                        assert_eq!(tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap(), crate::components::sync::gossip::Outcome::Delivered);
                     } else {
-                        assert!(!tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap(),
+                        assert_eq!(tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap(), crate::components::sync::gossip::Outcome::Failed,
                             "commit cancels early readiness without dispatch");
                     }
                 }

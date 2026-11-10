@@ -212,11 +212,10 @@ pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), Transactio
 /// <https://zips.z.cash/protocol/protocol.pdf#outputdesc>
 /// <https://zips.z.cash/protocol/protocol.pdf#spenddesc>
 ///
-/// Deserialization stores Sapling cv and epk as raw bytes and defers their
+/// Deserialization stores Sapling cv, rk and epk as raw bytes and defers their
 /// not-small-order check to keep point decompression off the checkpoint-sync hot
 /// path. The semantic and mempool paths enforce it before any state lookup or
-/// librustzcash conversion so invalid points fail fast. Spend rk is still
-/// validated at deserialization.
+/// librustzcash conversion so invalid points fail fast.
 pub fn sapling_point_encodings_are_valid(tx: &Transaction) -> Result<(), TransactionError> {
     if !tx.sapling_point_encodings_are_valid() {
         return Err(TransactionError::SmallOrder);

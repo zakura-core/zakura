@@ -222,11 +222,9 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
             // Type is `SpendAuthSig^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretereddsa
-            // See [`ValidatingKey::try_from`].
-            rk: reader
-                .read_32_bytes()?
-                .try_into()
-                .map_err(SerializationError::Parse)?,
+            // Stores the bytes without validating the point; see
+            // [`ValidatingKey::is_valid_not_small_order`].
+            rk: ValidatingKey::from_bytes_unvalidated(reader.read_32_bytes()?),
             // Type is `ZKSpend.Proof`, described in
             // https://zips.z.cash/protocol/protocol.pdf#grothencoding
             // It is not enforced here; this just reads 192 bytes.
@@ -278,11 +276,9 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
             // Type is `SpendAuthSig^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretereddsa
-            // See [`ValidatingKey::try_from`].
-            rk: reader
-                .read_32_bytes()?
-                .try_into()
-                .map_err(SerializationError::Parse)?,
+            // Stores the bytes without validating the point; see
+            // [`ValidatingKey::is_valid_not_small_order`].
+            rk: ValidatingKey::from_bytes_unvalidated(reader.read_32_bytes()?),
         })
     }
 }

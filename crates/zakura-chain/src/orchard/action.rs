@@ -56,7 +56,68 @@ impl ZcashSerialize for Action {
     }
 }
 
+/// An [`Action`] as read, with its `cv` and `epk` points still compressed.
+///
+/// Every other field is validated when it is read. Decompressing a bundle's
+/// points together with [`ActionEncoding::decompress`] is faster than decoding
+/// each point as it is read.
+#[derive(Clone, Debug)]
+pub(crate) struct ActionEncoding {
+    cv: [u8; 32],
+    nullifier: note::Nullifier,
+    rk: reddsa::VerificationKeyBytes<SpendAuth>,
+    cm_x: pallas::Base,
+    ephemeral_key: [u8; 32],
+    enc_ciphertext: note::EncryptedNote,
+    out_ciphertext: note::WrappedNoteKey,
+}
+
+impl ActionEncoding {
+    /// Decompresses the `cv` and `epk` points of every action, returning the
+    /// actions in order, or an error if any point is not a valid encoding.
+    ///
+    /// Each point is validated exactly as [`ValueCommitment::try_from`] and
+    /// [`keys::EphemeralPublicKey::try_from`] validate it.
+    pub(crate) fn decompress(encodings: Vec<Self>) -> Result<Vec<Action>, SerializationError> {
+        let points = pallas::Affine::batch_from_bytes(
+            encodings
+                .iter()
+                .flat_map(|encoding| [encoding.cv, encoding.ephemeral_key]),
+        );
+
+        encodings
+            .into_iter()
+            .zip(points.chunks_exact(2))
+            .map(|(encoding, points)| {
+                Ok(Action {
+                    cv: ValueCommitment::from_decoded(points[0].into())
+                        .map_err(SerializationError::Parse)?,
+                    nullifier: encoding.nullifier,
+                    rk: encoding.rk,
+                    cm_x: encoding.cm_x,
+                    ephemeral_key: keys::EphemeralPublicKey::from_decoded(points[1].into())
+                        .map_err(SerializationError::Parse)?,
+                    enc_ciphertext: encoding.enc_ciphertext,
+                    out_ciphertext: encoding.out_ciphertext,
+                })
+            })
+            .collect()
+    }
+}
+
 impl ZcashDeserialize for Action {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let encoding = reader.read_value::<ActionEncoding>()?;
+        let mut actions = ActionEncoding::decompress(vec![encoding])?;
+        Ok(actions
+            .pop()
+            .expect("decompressing one encoding returns one action"))
+    }
+}
+
+impl ZcashDeserialize for ActionEncoding {
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
@@ -71,11 +132,11 @@ impl ZcashDeserialize for Action {
         // https://zips.z.cash/protocol/protocol.pdf#actionencodingandconsensus
         //
         // See comments below for each specific type.
-        Ok(Action {
+        Ok(ActionEncoding {
             // Type is ValueCommit^{Orchard}.Output, i.e. ℙ.
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`ValueCommitment::zcash_deserialize`].
-            cv: reader.read_value::<ValueCommitment>()?,
+            // Decompressed and validated by [`ActionEncoding::decompress`].
+            cv: reader.read_32_bytes()?,
             // Type is `{0 .. 𝑞_ℙ − 1}`. See [`Nullifier::try_from`].
             nullifier: Nullifier::try_from(reader.read_32_bytes()?)?,
             // Type is SpendAuthSig^{Orchard}.Public, i.e. ℙ.
@@ -98,8 +159,8 @@ impl ZcashDeserialize for Action {
             cm_x: reader.read_value::<pallas::Base>()?,
             // Denoted by `epk` in the spec. Type is KA^{Orchard}.Public, i.e. ℙ^*.
             // https://zips.z.cash/protocol/protocol.pdf#concreteorchardkeyagreement
-            // See [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: reader.read_value::<keys::EphemeralPublicKey>()?,
+            // Decompressed and validated by [`ActionEncoding::decompress`].
+            ephemeral_key: reader.read_32_bytes()?,
             // Type is `Sym.C`, i.e. `𝔹^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus

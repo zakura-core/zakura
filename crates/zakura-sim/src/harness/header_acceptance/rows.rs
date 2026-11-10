@@ -1297,6 +1297,12 @@ fn hand_written_rows() -> Vec<Row> {
     // Three cases run a saved wire Plan, on the wire harness.
     for (index, (name, harness, set, found)) in [
         (
+            "accepted-before-apply",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "accepted-not-stored",
             STORAGE,
             &[COMMIT] as &'static [&'static str],

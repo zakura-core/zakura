@@ -140,7 +140,12 @@ where
         // The generated service dispatches on the method path itself, and answers unknown
         // methods with `Unimplemented`, so a single service needs no tonic router.
         server
-            .serve_with_incoming(IndexerServer::new(indexer_service), incoming)
+            .serve_with_incoming(
+                IndexerServer::new(indexer_service)
+                    .max_encoding_message_size(super::MAX_INDEXER_MESSAGE_BYTES)
+                    .max_decoding_message_size(super::MAX_INDEXER_MESSAGE_BYTES),
+                incoming,
+            )
             .await?;
 
         Ok(())

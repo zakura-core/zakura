@@ -15,6 +15,13 @@ pub mod server;
 /// The byte length of a block hash in indexer RPC requests.
 const BLOCK_HASH_BYTE_LEN: usize = 32;
 
+/// The largest indexer message either side sends or reads: a maximum-size block
+/// plus its hash, height and field framing. tonic's default 4 MiB decoding limit
+/// is smaller than an 8 MB block.
+// MAX_BLOCK_BYTES is a few megabytes, so it fits in a usize.
+pub const MAX_INDEXER_MESSAGE_BYTES: usize =
+    zakura_chain::block::MAX_BLOCK_BYTES as usize + 64 * 1024;
+
 /// The byte length of a big-endian block height in indexer RPC requests.
 const BLOCK_HEIGHT_BYTE_LEN: usize = std::mem::size_of::<u32>();
 

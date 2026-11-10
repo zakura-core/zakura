@@ -445,6 +445,21 @@ impl TransactionTemplate<NegativeOrZero> {
         let mut data = vec![];
         tx.write(&mut data)?;
 
+        if miner_params.coinbase_padding_bytes() > 0 {
+            return pad_coinbase(&data, miner_params.coinbase_padding_bytes()).map(|padded| Self {
+                data: padded
+                    .zcash_serialize_to_vec()
+                    .expect("vec writes succeed")
+                    .into(),
+                hash: padded.hash(),
+                auth_digest: padded.auth_digest().unwrap_or(AUTH_DIGEST_PLACEHOLDER),
+                depends: Vec::new(),
+                fee: (-miner_fees).constrain().expect("fees are in range"),
+                sigops: tx.sigops(),
+                required: true,
+            });
+        }
+
         Ok(Self {
             data: data.into(),
             hash: tx.txid().as_ref().into(),
@@ -455,6 +470,41 @@ impl TransactionTemplate<NegativeOrZero> {
             required: true,
         })
     }
+}
+
+/// Returns the coinbase transaction `data` with about `padding_bytes` of zero-value
+/// `OP_RETURN` outputs appended.
+///
+/// The outputs are unspendable, so their scripts are never run, and their bytes
+/// contain no signature operations. They only make the block larger.
+fn pad_coinbase(data: &[u8], padding_bytes: usize) -> Result<Transaction, TransactionError> {
+    // Each output holds a 10,000-byte push: OP_RETURN, OP_PUSHDATA2 and a 2-byte length.
+    const PUSH_BYTES: usize = 10_000;
+    let mut script = vec![0x6a, 0x4d];
+    // PUSH_BYTES fits in two bytes.
+    script.extend_from_slice(&(PUSH_BYTES as u16).to_le_bytes());
+    script.resize(script.len() + PUSH_BYTES, 0);
+    let output = zakura_chain::transparent::Output {
+        value: Amount::zero(),
+        lock_script: Script::new(&script),
+    };
+
+    let mut transaction: Transaction =
+        zakura_chain::serialization::ZcashDeserializeInto::zcash_deserialize_into(data)
+            .map_err(|error| TransactionError::CoinbaseConstruction(error.to_string()))?;
+    let outputs = match &mut transaction {
+        Transaction::V1 { outputs, .. }
+        | Transaction::V2 { outputs, .. }
+        | Transaction::V3 { outputs, .. }
+        | Transaction::V4 { outputs, .. }
+        | Transaction::V5 { outputs, .. }
+        | Transaction::V6 { outputs, .. } => outputs,
+    };
+    outputs.extend(std::iter::repeat_n(
+        output,
+        padding_bytes.div_ceil(script.len()),
+    ));
+    Ok(transaction)
 }
 
 /// A Transaction object as returned by `getrawtransaction` and `getblock` RPC

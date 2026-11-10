@@ -67,6 +67,15 @@ pub struct Config {
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
+
+    /// Pads every coinbase transaction this node builds with about this many bytes of
+    /// zero-value `OP_RETURN` outputs, to produce full-size blocks for measuring larger
+    /// block limits on private test networks without a transaction load generator.
+    ///
+    /// Only in builds with the `experimental-8mb-blocks` feature, which refuse to run on
+    /// Mainnet and the public Testnet. 0, the default, adds no padding.
+    #[cfg(feature = "experimental-8mb-blocks")]
+    pub experimental_coinbase_padding_bytes: usize,
 }
 
 mod miner_address {
@@ -105,6 +114,8 @@ impl Default for Config {
             miner_memo: None,
             internal_miner: false,
             optimistic_block_inventory: true,
+            #[cfg(feature = "experimental-8mb-blocks")]
+            experimental_coinbase_padding_bytes: 0,
         }
     }
 }

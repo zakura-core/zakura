@@ -58,6 +58,14 @@ features = [
 ]
 
 [features]
+# Raises block and message limits for 8 MB blocks. Refuses to run on Mainnet or the
+# public Testnet.
+experimental-8mb-blocks = [
+    "zakura-chain/experimental-8mb-blocks",
+    "zakura-network/experimental-8mb-blocks",
+    "zakura-rpc/experimental-8mb-blocks",
+]
+
 # In release builds, don't compile debug logging code, to improve performance.
 default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc", "x86_64-asm"]
 

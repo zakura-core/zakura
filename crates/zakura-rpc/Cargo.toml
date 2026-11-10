@@ -23,6 +23,9 @@ categories = [
 exclude = ["*.proto"]
 
 [features]
+# Raises block limits to 8 MB and adds test-network coinbase padding for measuring them.
+experimental-8mb-blocks = ["zakura-chain/experimental-8mb-blocks"]
+
 # Production features that activate extra dependencies, or extra features in
 # dependencies
 

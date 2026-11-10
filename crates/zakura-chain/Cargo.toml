@@ -15,6 +15,9 @@ keywords.workspace = true
 categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding"]
 
 [features]
+# Raises the block-size limit to 8 MB for private test networks. See `MAX_BLOCK_BYTES`.
+experimental-8mb-blocks = []
+
 default = []
 
 # Production features that activate extra functionality

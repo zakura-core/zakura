@@ -32,11 +32,16 @@ pub const MAX_BS_BLOCKS_PER_REQUEST: u32 = 128;
 /// stream-6 can read and classify slightly oversized or future-expanded frames
 /// in the block-sync codec instead of dropping them at the raw transport gate.
 /// Decoded `Block` messages are still bounded by [`block::MAX_BLOCK_BYTES`].
-pub const MAX_BS_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
+pub const MAX_BS_MESSAGE_BYTES: usize = if cfg!(feature = "experimental-8mb-blocks") {
+    9 * 1024 * 1024
+} else {
+    3 * 1024 * 1024
+};
 
 pub(super) const BLOCK_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 
-const _: () = assert!(MAX_BS_MESSAGE_BYTES < 4 * 1024 * 1024);
+const _: () =
+    assert!(MAX_BS_MESSAGE_BYTES < super::super::handshake::LOCAL_MAX_MESSAGE_BYTES as usize);
 const _: () = assert!(MAX_BS_MESSAGE_BYTES > block::MAX_BLOCK_BYTES as usize);
 
 /// Native stream-6 block-sync message.

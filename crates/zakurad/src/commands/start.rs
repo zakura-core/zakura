@@ -337,6 +337,21 @@ impl StartCmd {
     ) -> Result<(), Report> {
         check_tcp_slow_start_after_idle();
 
+        // An 8 MB build accepts blocks the public networks' 2 MB consensus limit
+        // rejects, so it would fork from them.
+        if cfg!(feature = "experimental-8mb-blocks")
+            && (matches!(
+                config.network.network,
+                zakura_chain::parameters::Network::Mainnet
+            ) || config.network.network.is_default_testnet())
+        {
+            return Err(eyre!(
+                "this zakurad build has the experimental-8mb-blocks feature, which only runs \
+                 on Regtest or a configured private testnet, not {}",
+                config.network.network
+            ));
+        }
+
         let is_regtest = config.network.network.is_regtest();
 
         let config = if is_regtest {

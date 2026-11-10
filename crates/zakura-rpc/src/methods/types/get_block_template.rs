@@ -697,6 +697,9 @@ pub struct MinerParams {
     ///
     /// Applies only if [`Self::addr`] contains a shielded component.
     memo: Option<MemoBytes>,
+
+    /// Bytes of zero-value `OP_RETURN` outputs to add to the coinbase, for test networks.
+    coinbase_padding_bytes: usize,
 }
 
 /// Builds the coinbase input data for a block Zakura constructs.
@@ -738,7 +741,17 @@ impl MinerParams {
             .map(|memo| MemoBytes::from_bytes(memo.as_bytes()))
             .transpose()?;
 
-        Ok(Self { addr, data, memo })
+        #[cfg(feature = "experimental-8mb-blocks")]
+        let coinbase_padding_bytes = conf.experimental_coinbase_padding_bytes;
+        #[cfg(not(feature = "experimental-8mb-blocks"))]
+        let coinbase_padding_bytes = 0;
+
+        Ok(Self {
+            addr,
+            data,
+            memo,
+            coinbase_padding_bytes,
+        })
     }
 
     /// Returns the miner address.
@@ -749,6 +762,11 @@ impl MinerParams {
     /// Returns the miner data.
     pub fn data(&self) -> &Option<PushValue> {
         &self.data
+    }
+
+    /// Returns how many bytes of padding outputs to add to the coinbase.
+    pub fn coinbase_padding_bytes(&self) -> usize {
+        self.coinbase_padding_bytes
     }
 
     /// Returns the miner memo.
@@ -777,6 +795,7 @@ impl From<MinerAddress> for MinerParams {
             addr,
             data: None,
             memo: None,
+            coinbase_padding_bytes: 0,
         }
     }
 }

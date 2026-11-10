@@ -37,7 +37,19 @@ pub type HttpResponse<B = HttpBody> = hyper::Response<B>;
 ///
 /// [`HttpRequestMiddleware`](super::http_request_compatibility::HttpRequestMiddleware) applies a
 /// smaller limit first.
-pub(super) const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
+///
+/// It holds a `submitblock` call with a maximum-size block as hex, plus room for the
+/// rest of the call: at least 10 MiB, as before 8 MB blocks were possible.
+pub(super) const MAX_REQUEST_BODY_SIZE: u32 = {
+    let submitblock: u64 = zakura_chain::block::MAX_BLOCK_BYTES * 2 + 1024 * 1024;
+    let floor: u32 = 10 * 1024 * 1024;
+    // Twice the block size plus 1 MiB fits in a u32 for any block size below 2 GB.
+    if submitblock > floor as u64 {
+        submitblock as u32
+    } else {
+        floor
+    }
+};
 
 /// The maximum number of requests a server handles at the same time.
 const MAX_CONCURRENT_REQUESTS: usize = 100;

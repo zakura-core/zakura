@@ -118,7 +118,14 @@ pub const MAX_IROH_RELAY_HINT_BYTES: usize = 512;
 pub const LOCAL_MAX_CONTROL_FRAME_BYTES: u32 = 1024 * 1024;
 
 /// Maximum locally accepted application message size advertised in control hello.
-pub const LOCAL_MAX_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
+///
+/// The `experimental-8mb-blocks` feature raises it so a block-sync message can hold
+/// an 8 MB block. Both peers must be built with the feature.
+pub const LOCAL_MAX_MESSAGE_BYTES: u32 = if cfg!(feature = "experimental-8mb-blocks") {
+    10 * 1024 * 1024
+} else {
+    4 * 1024 * 1024
+};
 
 /// Maximum locally accepted open streams advertised in control hello.
 pub const LOCAL_MAX_OPEN_STREAMS: u16 = 1024;

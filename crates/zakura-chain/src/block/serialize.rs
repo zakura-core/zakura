@@ -24,7 +24,15 @@ use crate::{
 /// in the Zcash specification. (But since blocks also contain a
 /// block header and transaction count, the maximum size of a
 /// transaction in the chain is approximately 1.5 kB smaller.)
-pub const MAX_BLOCK_BYTES: u64 = 2_000_000;
+///
+/// The `experimental-8mb-blocks` feature raises this to 8 MB, for measuring larger
+/// blocks on private test networks. Nodes built with it refuse to run on Mainnet
+/// and the public Testnet, whose consensus limit is 2 MB.
+pub const MAX_BLOCK_BYTES: u64 = if cfg!(feature = "experimental-8mb-blocks") {
+    8_000_000
+} else {
+    2_000_000
+};
 
 /// Checks if a block header version is valid.
 ///

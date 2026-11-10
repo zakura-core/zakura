@@ -366,7 +366,8 @@ impl TrustedChainSync {
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .connect()
             .await?;
-        let indexer_rpc_client = IndexerClient::new(channel);
+        let indexer_rpc_client = IndexerClient::new(channel)
+            .max_decoding_message_size(crate::indexer::MAX_INDEXER_MESSAGE_BYTES);
         let finalized_chain_tip_sender = chain_tip_sender.finalized_sender();
 
         // `sync()` flips this after receiving its first parseable non-finalized

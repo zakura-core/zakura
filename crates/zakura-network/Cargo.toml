@@ -37,6 +37,9 @@ exclude = [
 ]
 
 [features]
+# Raises block and message limits for 8 MB blocks on private test networks.
+experimental-8mb-blocks = ["zakura-chain/experimental-8mb-blocks"]
+
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

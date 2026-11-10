@@ -1,0 +1,24 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/regulated/session.rs b/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
+index 6e7d8cc7c8..529cdfb29e 100644
+--- a/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
++++ b/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
+@@ -242,17 +242,8 @@ impl ServingSession {
+                 .map(|(first, (last, _))| (*first, *last))
+                 .collect(),
+         );
+-        if self
+-            .ranges
+-            .range(..=last)
+-            .next_back()
+-            .is_some_and(|(_, (end, _))| *end >= start)
+-        {
+-            return Err(SinkReject::protocol(std::io::Error::new(
+-                std::io::ErrorKind::InvalidData,
+-                "GetBlocks overlaps a live range",
+-            )));
+-        }
++        // Mutation: the session admits a range that overlaps one it still
++        // serves.
+         let completed = self.completed.track(u64::from(start.0));
+         let id = completed.id();
+         self.serve

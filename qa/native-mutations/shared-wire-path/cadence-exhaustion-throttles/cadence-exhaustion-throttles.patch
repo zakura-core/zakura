@@ -1,0 +1,23 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index 0133e0afa3..88bd01c1a2 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -2738,8 +2738,8 @@ fn admit_inbound_message(
+             .lock()
+             .expect("Zakura cadence bucket mutex is never poisoned")
+             .charge(cadence.layout, rule);
+-        // A sibling stream can keep the connection alive during an unbounded
+-        // transport stall. Exhaustion cannot prove a sender violation.
++        // A peer that empties its row's bucket sends faster than the row
++        // allows, so it is throttled like an untabled stream.
+         if charge == CadenceCharge::Exhausted {
+             context.conn.trace_rate_limit(
+                 "cadence.exhausted",
+@@ -2749,6 +2749,7 @@ fn admit_inbound_message(
+                 None,
+                 None,
+             );
++            return InboundMessageAdmission::Throttled;
+         }
+         return InboundMessageAdmission::Admit;
+     }

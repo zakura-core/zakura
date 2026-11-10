@@ -1220,7 +1220,16 @@ impl WorkQueueState {
         self.in_flight.contains_key(&height)
     }
 
+    /// Whether another attempt's body ended the reservation of the
+    /// in-flight item at `height`, whose owner's request still claims it.
     #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn answered_elsewhere(&self, height: block::Height) -> bool {
+        self.in_flight
+            .get(&height)
+            .is_some_and(|item| item.answered_elsewhere)
+    }
+
+    #[cfg(test)]
     pub(in crate::zakura::block_sync) fn reserved_in_flight_charge(
         &self,
         height: block::Height,

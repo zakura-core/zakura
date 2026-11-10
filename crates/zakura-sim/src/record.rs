@@ -311,12 +311,74 @@ pub trait RecordSink {
     /// Takes the next record.
     fn record(&mut self, record: Record);
 
+    /// Takes the run's full report, after its `end` record: every property's
+    /// violations, which `end` leaves out, and the harness's evidence
+    /// snapshot. A harness run sends it once. A sink that wraps another
+    /// forwards it. The default drops it.
+    fn report(&mut self, _report: &FullReport) {}
+
     /// Whether the run emits step records to this sink. When it's false,
     /// the run skips each step's record and its `obs` digest, and emits
     /// only `init` and `end`. The run reads it once, before its first step.
     fn wants_steps(&self) -> bool {
         true
     }
+}
+
+/// The file beside a trace that holds its run's [`FullReport`], which
+/// `record` writes and `replay` compares its own with.
+pub const FULL_REPORT_FILE: &str = "full-report.json";
+
+/// A run's full report (C8): every property's outcome with every violation,
+/// in report order, and the harness's evidence snapshot at the run's end.
+/// The `end` record keeps only outcomes, since violations grow with the
+/// run, so this is what a later judge reads instead of rerunning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FullReport {
+    /// Each property's outcome and violations, in report order.
+    pub properties: Vec<PropertyFindings>,
+    /// What [`crate::property::HasView::snapshot`] showed after the run's
+    /// end and before shutdown, or `None` for a harness that keeps none.
+    pub snapshot: Option<serde_json::Value>,
+}
+
+impl FullReport {
+    /// The full report of `properties` and `snapshot`.
+    pub fn new(properties: &[PropertyReport], snapshot: Option<serde_json::Value>) -> Self {
+        FullReport {
+            properties: properties
+                .iter()
+                .map(|report| PropertyFindings {
+                    property: report.property.clone(),
+                    outcome: report.outcome.clone(),
+                    violations: report.violations.clone(),
+                    end_found: report.end_found,
+                })
+                .collect(),
+            snapshot,
+        }
+    }
+
+    /// The JSON [`FULL_REPORT_FILE`] holds, on one line.
+    pub fn to_line(&self) -> String {
+        serde_json::to_string(self).expect("a full report holds only strings and integers")
+    }
+}
+
+/// One property's entry in a [`FullReport`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertyFindings {
+    /// The property's ID.
+    pub property: String,
+    /// Its outcome.
+    pub outcome: crate::PropertyOutcome,
+    /// Every violation, in the order the run found them.
+    pub violations: Vec<Violation>,
+    /// How many of `violations`, the last ones, the run's end found
+    /// ([`PropertyReport::end_found`]).
+    pub end_found: usize,
 }
 
 /// A sink that keeps nothing and wants no step records, for the fuzz loop,

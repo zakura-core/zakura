@@ -15,14 +15,15 @@ use std::{
 use serde::Serialize;
 
 use super::{
+    read::read_bounded,
     verify::{end_difference, VerifySink},
-    BuildInfo, Invalid, MetaRecord, Trace,
+    BuildInfo, Invalid, MetaRecord, Trace, MAX_REPORT_BYTES,
 };
 use crate::{
     check::PropertyReport,
     harness::{self, HarnessEntry, HarnessError},
     plan::TraceScript,
-    record::EndRecord,
+    record::{EndRecord, FullReport, FULL_REPORT_FILE},
     Divergence, HarnessFailure, Observation, ObservationLog, PlanError, PlanInput, Record,
 };
 
@@ -64,9 +65,13 @@ pub struct ReplayReport {
     pub obs_mismatches: u64,
     /// The first record that differed: its step, 0 for `init`, and field.
     pub first_obs_mismatch: Option<(u64, &'static str)>,
-    /// The first `end` field that differed, such as `end.properties`. Set
+    /// The first `end` field that differed, such as `end.properties`, or
+    /// the recording's [`FULL_REPORT_FILE`] field, such as `report.snapshot`. Set
     /// only on a build mismatch.
     pub end_mismatch: Option<&'static str>,
+    /// The replay's own full report, as `record` writes it beside a trace.
+    /// `None` if the run sent none.
+    pub report: Option<FullReport>,
     /// The options it ran with.
     pub options: ReplayOptions,
 }
@@ -367,7 +372,8 @@ fn replay_on<'h>(
             options,
         );
     };
-    let end_mismatch = end_difference(recorded, &produced);
+    let end_mismatch = end_difference(recorded, &produced)
+        .or_else(|| report_difference(trace, sink.report.as_ref()));
     if strict && end_mismatch.is_some() {
         if let Some(failure) = failure.filter(|f| recorded.harness != Some(f.to_string())) {
             return Err(ReplayError::Harness(failure));
@@ -417,8 +423,32 @@ fn finish(
         obs_mismatches: sink.mismatches,
         first_obs_mismatch: sink.first,
         end_mismatch: None,
+        report: sink.report.clone(),
         options,
     })
+}
+
+/// The first field of `trace`'s [`FULL_REPORT_FILE`] that the replay's own
+/// full report, `replayed`, doesn't match, or `None` for a trace with no
+/// such file. A file that [`read_bounded`] refuses or that doesn't read as a
+/// report, or a replay that sent none, differs in `report`.
+fn report_difference(trace: &Trace, replayed: Option<&FullReport>) -> Option<&'static str> {
+    let bytes = match read_bounded(&trace.dir.join(FULL_REPORT_FILE), MAX_REPORT_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return None,
+        Err(_) => return Some("report"),
+    };
+    let (Ok(recorded), Some(replayed)) = (serde_json::from_slice::<FullReport>(&bytes), replayed)
+    else {
+        return Some("report");
+    };
+    if recorded.properties != replayed.properties {
+        Some("report.properties")
+    } else if recorded.snapshot != replayed.snapshot {
+        Some("report.snapshot")
+    } else {
+        None
+    }
 }
 
 /// A harness error before the run as [`ReplayError::UnsupportedScenario`].

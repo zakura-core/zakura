@@ -11,7 +11,9 @@
 //! compared against and the first difference between them.
 
 use std::{
-    env, fs, io,
+    env,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process,
@@ -25,16 +27,18 @@ use std::{
 use serde_json::{json, Value};
 
 use super::{
+    read::read_bounded,
     replay::{replay_keeping, ReplayRun},
     replay_with,
     verify::{end_difference, trace_difference},
     FileSink, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, BLOBS_DIR, INPUT_FILE,
-    TRACE_FILE,
+    MAX_REPORT_BYTES, TRACE_FILE,
 };
 use crate::{
     check::{PropertyOutcome, PropertyReport},
     harness::{write_trace, HarnessEntry, HarnessError, RecordError},
     property::PropertyId,
+    record::FULL_REPORT_FILE,
     Plan, RecordSink, RunReport,
 };
 
@@ -103,8 +107,9 @@ pub fn artifacts_root() -> PathBuf {
 /// A trace that passes both moves to
 /// `out_root/traces/<property-id>/<first 12 hex of the trace ID>/`, with
 /// each segment of the property ID a directory. If that directory already
-/// holds the same trace, the new copy is deleted and the saved one is
-/// returned.
+/// holds the same trace with the same full report, the new copy is deleted
+/// and the saved one is returned. A saved copy without a full report gets
+/// the new one, and one whose report differs fails the save.
 ///
 /// Either failure returns [`RecordError::Nondeterministic`], and keeps its
 /// evidence in
@@ -551,15 +556,41 @@ fn save(trace: &Trace, partial: &Path, parent: &Path) -> Result<Trace, RecordErr
     let dir = parent.join(&trace.id[..ID_PREFIX]);
     if let Err(error) = fs::rename(partial, &dir) {
         // A rename fails onto a directory that holds files. That's the same
-        // trace only if its ID matches.
-        let _ = remove(partial);
+        // trace only if its ID matches and it keeps the same full report,
+        // which the ID doesn't cover.
         let same = fs::symlink_metadata(dir.join(TRACE_FILE)).is_ok()
             && TraceReader::open(&dir).is_ok_and(|saved| saved.id == trace.id);
-        if !same {
-            return Err(RecordError::Io(error));
+        let report = same.then(|| keep_report(partial, &dir));
+        let _ = remove(partial);
+        match report {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(RecordError::Io(error)),
+            None => return Err(RecordError::Io(error)),
         }
     }
     TraceReader::open(&dir).map_err(RecordError::Read)
+}
+
+/// Checks that `saved`, a saved copy of the trace just recorded at
+/// `partial`, holds the same [`FULL_REPORT_FILE`]. A copy that has none
+/// gets `partial`'s, written to a new file. Fails if the two differ.
+fn keep_report(partial: &Path, saved: &Path) -> io::Result<()> {
+    let read = |dir: &Path| {
+        read_bounded(&dir.join(FULL_REPORT_FILE), MAX_REPORT_BYTES)
+            .map_err(|error| io::Error::other(error.to_string()))
+    };
+    match (read(partial)?, read(saved)?) {
+        (recorded, kept) if recorded == kept => Ok(()),
+        (Some(recorded), None) => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(saved.join(FULL_REPORT_FILE))?
+            .write_all(&recorded),
+        _ => Err(io::Error::other(format!(
+            "{} holds this trace with a different {FULL_REPORT_FILE}",
+            saved.display()
+        ))),
+    }
 }
 
 /// Deletes `dir` and everything in it, if it exists.

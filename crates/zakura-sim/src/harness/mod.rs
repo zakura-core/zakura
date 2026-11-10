@@ -51,7 +51,7 @@ use crate::{
         Assume, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Property, PropertyId, Registry,
         RegistryChecker, Source, Sources, Status, Tee, Verdict,
     },
-    record::{CONTRACT_VERSION, FORMAT_VERSION},
+    record::{FullReport, CONTRACT_VERSION, FORMAT_VERSION},
     sim::NO_LIVELOCK,
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
@@ -239,17 +239,21 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     sim.on_end({
         let this = Rc::clone(&this);
         let read_out = Rc::clone(&read_out);
-        move |end, properties, log| *read_out.borrow_mut() = Some(read(&this, end, properties, log))
+        move |end, properties, log| {
+            let snapshot = this.snapshot();
+            *read_out.borrow_mut() = Some((read(&this, end, properties, log), snapshot));
+        }
     });
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
-    let read = read_out
+    let (read, snapshot) = read_out
         .borrow_mut()
         .take()
         .expect("`Sim::run` runs its end hooks once");
+    sink.report(&FullReport::new(&report.properties, snapshot));
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);

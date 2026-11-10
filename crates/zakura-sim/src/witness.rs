@@ -14,7 +14,7 @@ use std::{fmt, str::FromStr};
 use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
     property::{HasView, PropertyId, Status, TriggerHistory},
-    record::Record,
+    record::{FullReport, Record},
     trace::end_records::{self, TriggerState, WitnessRecord},
     MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
     RunEnd, RunReport,
@@ -611,6 +611,11 @@ impl RecordSink for EndSeen<'_> {
     /// Forwards to the sink.
     fn wants_steps(&self) -> bool {
         self.sink.wants_steps()
+    }
+
+    /// Forwards to the sink.
+    fn report(&mut self, report: &FullReport) {
+        self.sink.report(report);
     }
 }
 

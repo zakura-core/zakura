@@ -50,6 +50,17 @@ pub trait HasView {
         Vec::new()
     }
 
+    /// The harness's evidence stores as they stand after the run's end and
+    /// before shutdown, for the run's full report
+    /// ([`crate::record::FullReport`]), or `None` for a harness that keeps
+    /// none, as by default. Two runs that end with equal stores must give
+    /// equal snapshots. It runs under the simulated runtime, so it reads
+    /// shared state only through non-preempting peeks, such as
+    /// `Weak::peek_strong_count`, or a saved input's replay drifts.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// The stamps of the view-side facts that [`view`](HasView::view) shows
     /// after stamp `after`, or of all of them with `None`, in increasing
     /// order. `None` if the harness keeps no stamped facts, as by default.

@@ -27,7 +27,7 @@ use crate::{
     },
     record::{
         machine::{MachineScenario, MachineStep},
-        InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
+        FullReport, InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
     },
     sim::Pick,
     trace::{
@@ -402,6 +402,7 @@ fn run_checked(
     let record = report.end_record();
     crate::trace::end_records::write_end(&record);
     sink.record(Record::End(record));
+    sink.report(&FullReport::new(&report.properties, None));
     match report.end.harness.clone() {
         Some(failure) => Err(HarnessError::Run {
             failure,
@@ -473,5 +474,10 @@ impl RecordSink for WitnessSink<'_> {
             }
         }
         self.sink.record(record);
+    }
+
+    /// Forwards to the sink.
+    fn report(&mut self, report: &FullReport) {
+        self.sink.report(report);
     }
 }

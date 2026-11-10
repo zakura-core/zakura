@@ -8,6 +8,7 @@
 //!     [--witness <property> --expect <holds|violated|applicable|violated-set>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
+//!     [--report <file>]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
 //! zakura-sim versions --sim <name>
 //! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
@@ -105,7 +106,8 @@ mod cli {
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
-             zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
+             zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
+             [--report <file>]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
              zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
@@ -136,6 +138,9 @@ mod cli {
              `--draft` lists, comma-separated, properties the run checks as Draft\n\
              whatever their status, as a planted case's Draft run does. The trace's\n\
              meta records them, and `replay` applies them too.\n\
+             `record` writes the run's full report, every violation and the harness's\n\
+             evidence snapshot, to full-report.json beside the trace. `replay` compares its\n\
+             own with it, and `--report` writes the replay's to a file.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -391,7 +396,18 @@ mod cli {
         let mut dir = None;
         let mut options = ReplayOptions::default();
         let mut explain = false;
-        for arg in args {
+        let mut report_out = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if arg == "--report" {
+                let file = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--report needs a value".to_owned()))?;
+                if report_out.replace(PathBuf::from(file)).is_some() {
+                    return Err(Error::Usage("--report given twice".to_owned()));
+                }
+                continue;
+            }
             let flag = match arg.as_str() {
                 "--allow-build-mismatch" => &mut options.allow_build_mismatch,
                 "--prefix" => &mut options.prefix,
@@ -431,6 +447,18 @@ mod cli {
         } else {
             trace::replay(&trace, options).map_err(|error| Error::Failed(error.to_string()))?
         };
+        if let (Some(file), Some(full)) = (&report_out, &report.report) {
+            // Never over an existing file or through a symlink, such as one
+            // of the trace's own files.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(file)
+                .and_then(|mut out| {
+                    std::io::Write::write_all(&mut out, format!("{}\n", full.to_line()).as_bytes())
+                })
+                .map_err(|error| Error::Failed(format!("writing {}: {error}", file.display())))?;
+        }
         let ran = report.end.as_ref().map_or_else(
             || format!("{} steps", trace.steps.len()),
             |end| format!("{} after {} steps", outcome(end), end.steps),

@@ -296,8 +296,25 @@ pub fn shrink(
 
 /// [`shrink`] on `harness`, whatever `meta.sim` names. The passes stop
 /// before the next candidate once `interrupt` is set, and the shrink then
-/// re-records the best candidate so far.
+/// re-records the best candidate so far. Every run applies the trace's
+/// `meta.draft`.
 pub fn shrink_with(
+    trace: &Trace,
+    harness: &'static HarnessEntry,
+    budget: ShrinkBudget,
+    out: &Path,
+    interrupt: &AtomicBool,
+) -> Result<ShrinkReport, ShrinkError> {
+    // The trace's `Draft` override is run configuration: every candidate
+    // and the reduced recording run under it, as the trace's own replay
+    // does.
+    harness::with_draft(&trace.meta.draft, || {
+        shrink_under_draft(trace, harness, budget, out, interrupt)
+    })
+}
+
+/// [`shrink_with`], under the trace's `Draft` override.
+fn shrink_under_draft(
     trace: &Trace,
     harness: &'static HarnessEntry,
     budget: ShrinkBudget,

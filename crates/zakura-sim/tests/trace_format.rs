@@ -81,6 +81,7 @@ fn meta() -> MetaRecord {
         rng: RNG.into(),
         fixtures: Vec::new(),
         properties: Vec::new(),
+        draft: Vec::new(),
         input: None,
         derived_from: None,
     }
@@ -1692,6 +1693,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
             (text(), status).prop_map(|(id, status)| PropertyRef { id, status }),
             0..3,
         ),
+        vec(text(), 0..3),
         option::of((text(), edge_u64()).prop_map(|(sha256, len)| InputRef { sha256, len })),
         option::of(
             (text(), tool, any::<u32>()).prop_map(|(trace, tool, tool_version)| Derivation {
@@ -1714,7 +1716,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 build,
                 (sim, scenario, rng),
                 (scheduler, budget),
-                (assumptions, fixtures, properties, input, derived_from),
+                (assumptions, fixtures, properties, draft, input, derived_from),
             )| MetaRecord {
                 format,
                 contract,
@@ -1728,6 +1730,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 rng,
                 fixtures,
                 properties,
+                draft,
                 input,
                 derived_from,
             },
@@ -1797,6 +1800,7 @@ fn round_trip_edges() {
         rng: String::new(),
         fixtures: Vec::new(),
         properties: Vec::new(),
+        draft: Vec::new(),
         input: None,
         derived_from: None,
     };

@@ -50,6 +50,12 @@ pub struct MetaRecord {
     pub fixtures: Vec<BlobRef>,
     /// Every property the run checks.
     pub properties: Vec<PropertyRef>,
+    /// The properties the run checks as `Draft` whatever their registered
+    /// status, sorted: the run configuration a planted case's `Draft` run
+    /// records ([`crate::harness::with_draft`]), so a replay applies it too.
+    /// Each one's status in `properties` reads `draft`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draft: Vec<String>,
     /// `input.bin`, when input bytes produced the run.
     pub input: Option<InputRef>,
     /// The trace this one was derived from, if any.

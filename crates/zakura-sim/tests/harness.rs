@@ -17,7 +17,7 @@ use zakura_sim::{
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Status},
     sim::NO_LIVELOCK,
-    MemorySink, Outcome, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
+    Checker, MemorySink, NoChecks, Outcome, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
 };
 
 /// Every scenario prefix of `entry` worth trying: each first byte, with each
@@ -201,6 +201,45 @@ fn livelock_fires_before_budget() {
         outcome(&report, NO_LIVELOCK),
         PropertyOutcome::Violated { .. }
     ));
+}
+
+/// C9: under a `Draft` override, the step loop records `sim/no-livelock`'s
+/// spin and the run goes on to its budget, where the `Active` run stops at
+/// the first spin.
+#[test]
+fn a_draft_livelock_records_and_runs_on() {
+    let config = harness::run_config::<Probe>(&Behavior::Spin);
+    let report = harness::with_draft(&[NO_LIVELOCK.to_owned()], || probe(Behavior::Spin));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert!(report.end.steps >= config.budget, "{:?}", report.end);
+    assert!(matches!(
+        outcome(&report, NO_LIVELOCK),
+        PropertyOutcome::Violated { .. }
+    ));
+    let spins = report
+        .properties
+        .iter()
+        .find(|r| r.property == NO_LIVELOCK)
+        .map_or(0, |r| r.violations.len());
+    assert!(
+        spins > 1,
+        "a spin is recorded each time it reaches the limit"
+    );
+
+    // An extra checker, which the harness wraps beside its own, doesn't
+    // bring the stop back, and nor does boxing it.
+    let mut extra: Box<dyn Checker> = Box::new(NoChecks);
+    let wrapped = harness::with_draft(&[NO_LIVELOCK.to_owned()], || {
+        run_harness::<Probe>(
+            &Behavior::Spin,
+            Plan::from_fuzz(&[]),
+            &mut MemorySink::default(),
+            Some(&mut extra),
+        )
+        .unwrap()
+    });
+    assert_eq!(wrapped.end.violation, None, "{:?}", wrapped.end);
+    assert!(wrapped.end.steps >= config.budget, "{:?}", wrapped.end);
 }
 
 /// [`Probe`], but its `BoundedAdversary` assumption never holds.

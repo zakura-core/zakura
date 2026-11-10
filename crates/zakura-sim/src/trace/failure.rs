@@ -497,7 +497,8 @@ fn replay_keeping_on_new_thread(
     })
 }
 
-/// Runs `job` on a new thread and returns its value. `job` also returns
+/// Runs `job` on a new thread, under the caller's `Draft` override
+/// ([`crate::harness::with_draft`]), and returns its value. `job` also returns
 /// whether its run ended with no leaked task. If not, or if `job` panicked,
 /// the thread parks for good, so nothing the leaked tasks hold is dropped or
 /// reused. A panic resumes on the caller's thread.
@@ -505,10 +506,14 @@ pub(super) fn on_new_thread<T: Send + 'static>(
     job: impl FnOnce() -> (T, bool) + Send + 'static,
 ) -> T {
     let (done, result) = mpsc::sync_channel(1);
+    // The caller's `Draft` override is run configuration, so the run on the
+    // new thread keeps it.
+    let draft = crate::harness::draft();
     thread::Builder::new()
         .name("zakura-sim-run".to_owned())
         .spawn(move || {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(job));
+            let outcome =
+                panic::catch_unwind(AssertUnwindSafe(|| crate::harness::with_draft(&draft, job)));
             let clean = matches!(outcome, Ok((_, true)));
             // The caller waits on this, so the send can't fail.
             let _ = done.send(outcome.map(|(value, _)| value));

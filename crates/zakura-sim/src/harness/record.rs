@@ -70,6 +70,13 @@ pub enum RecordError {
     /// The witness test couldn't run: the harness doesn't register the
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
+    /// The run's `Draft` override ([`super::with_draft`]) names a property
+    /// the harness doesn't register, or overrides a machine harness, whose
+    /// one property can't run as `Draft`. Nothing was written.
+    UnregisteredDraft {
+        /// The property.
+        property: String,
+    },
     /// The run [`crate::trace::record_failure`] was handed doesn't violate
     /// the property it was asked to record.
     NotViolated {
@@ -100,6 +107,12 @@ impl fmt::Display for RecordError {
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
             RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
+            RecordError::UnregisteredDraft { property } => {
+                write!(
+                    f,
+                    "the Draft override names {property}, which the harness can't check as Draft"
+                )
+            }
             RecordError::NotViolated { property } => {
                 write!(f, "the run doesn't violate {property}")
             }
@@ -216,6 +229,12 @@ pub(crate) fn write_trace<T>(
     out: &Path,
     run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
 ) -> Result<(Trace, T), RecordError> {
+    if let Some(property) = super::draft()
+        .into_iter()
+        .find(|id| harness.machine || harness.status(id).is_none())
+    {
+        return Err(RecordError::UnregisteredDraft { property });
+    }
     let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
     meta.derived_from = derived_from;
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;

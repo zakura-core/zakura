@@ -3,10 +3,10 @@
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable|violated-set>
-//!     [--also-violates <ids>]]
+//!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable|violated-set>
-//!     [--also-violates <ids>]]
+//!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
 //! zakura-sim versions --sim <name>
@@ -101,10 +101,10 @@ mod cli {
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
-             [--also-violates <ids>]]\n  \
+             [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
-             [--also-violates <ids>]]\n  \
+             [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
@@ -131,6 +131,9 @@ mod cli {
              test or `confirm` expects violated beside the property, as a planted bug's\n\
              co-violations. Under `violated-set` each of them must be violated, as a\n\
              nested case's exact set.\n\
+             `--draft` lists, comma-separated, properties the run checks as Draft\n\
+             whatever their status, as a planted case's Draft run does. The trace's\n\
+             meta records them, and `replay` applies them too.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -226,6 +229,7 @@ mod cli {
         witness: Option<String>,
         expect: Option<String>,
         also_violates: Option<String>,
+        draft: Option<String>,
     }
 
     /// `record`: runs one input on a harness and writes the trace.
@@ -288,21 +292,27 @@ mod cli {
                 ))
             }
         };
+        let draft: Vec<String> = flags
+            .draft
+            .map(|ids| ids.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
         let Some((property, expect)) = witness else {
-            let trace = harness::record(entry, what, &out)
+            let trace = harness::with_draft(&draft, || harness::record(entry, what, &out))
                 .map_err(|error| Error::Failed(error.to_string()))?;
             print_trace(&trace, &out);
             return Ok(());
         };
-        let (trace, result) =
+        let (trace, result) = harness::with_draft(&draft, || {
             harness::record_witness(entry, what, &out, &property, expect, &also_violates)
-                .map_err(|error| Error::Failed(error.to_string()))?;
+        })
+        .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
         let error = result.as_ref().err().map(ToString::to_string);
         let file = json!({
             "property": property,
             "expect": expect.name(),
             "also_violates": also_violates,
+            "draft": draft,
             "passed": result.is_ok(),
             "error": error,
         });
@@ -1115,6 +1125,7 @@ mod cli {
                 "--witness" => flags.witness.replace(value).is_some(),
                 "--expect" => flags.expect.replace(value).is_some(),
                 "--also-violates" => flags.also_violates.replace(value).is_some(),
+                "--draft" => flags.draft.replace(value).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
             if slot_taken {

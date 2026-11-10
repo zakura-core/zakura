@@ -599,6 +599,16 @@ impl Sim {
                 ),
                 actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
             });
+            // A `Draft` or `Known` `sim/no-livelock` records the spin, and
+            // the run goes on, its count starting over.
+            let livelock = match livelock {
+                Some(livelock) if !checker.stops(NO_LIVELOCK) => {
+                    checker.step_loop_violation(&livelock);
+                    at_instant = 0;
+                    None
+                }
+                livelock => livelock,
+            };
             let violation = match (violation, livelock) {
                 (Some(violation), Some(livelock)) => {
                     checker.step_loop_violation(&livelock);

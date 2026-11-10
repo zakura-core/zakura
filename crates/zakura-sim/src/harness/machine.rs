@@ -225,6 +225,7 @@ pub fn meta(machine: &Machine, value: &Value) -> Result<MetaRecord, HarnessError
         rng: RNG.into(),
         fixtures: Vec::new(),
         properties: registered(machine),
+        draft: Vec::new(),
         input: None,
         derived_from: None,
     })

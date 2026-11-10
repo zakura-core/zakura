@@ -223,4 +223,10 @@ impl Checker for Pair<'_> {
         self.0.step_loop_violation(violation);
         self.1.step_loop_violation(violation);
     }
+
+    /// True only if both stop at it. Asks both.
+    fn stops(&mut self, property: &str) -> bool {
+        let first = self.0.stops(property);
+        self.1.stops(property) && first
+    }
 }

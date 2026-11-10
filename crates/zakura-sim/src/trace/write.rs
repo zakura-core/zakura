@@ -286,6 +286,7 @@ mod tests {
             budget: BudgetRecord::from(&config),
             rng: RNG.into(),
             fixtures: Vec::new(),
+            draft: Vec::new(),
             properties: Vec::new(),
             input: None,
             derived_from: None,

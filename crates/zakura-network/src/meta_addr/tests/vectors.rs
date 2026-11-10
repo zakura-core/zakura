@@ -40,8 +40,15 @@ fn peer_cache_port_does_not_override_book_order() {
     let custom = peer("127.0.0.1:9000".parse().unwrap());
     for port in [8233, 18233] {
         let default = peer(SocketAddr::from(([127, 0, 0, 2], port)).into());
+        assert_eq!(
+            custom.peer_preference().unwrap(),
+            default.peer_preference().unwrap()
+        );
         assert!(custom < default);
     }
+    assert!(peer("0.0.0.0:8233".parse().unwrap())
+        .peer_preference()
+        .is_err());
 }
 
 /// RTT survives same-connection updates but never carries into another connection.

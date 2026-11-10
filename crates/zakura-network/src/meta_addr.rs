@@ -11,7 +11,7 @@ use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
     constants,
-    peer::address_is_valid_for_outbound_connections,
+    peer::{address_is_valid_for_outbound_connections, PeerPreference},
     protocol::{external::canonical_peer_addr, types::PeerServices},
 };
 
@@ -480,6 +480,13 @@ impl MetaAddr {
     /// Return the address for this `MetaAddr`.
     pub fn addr(&self) -> PeerSocketAddr {
         self.addr
+    }
+
+    /// Validate this address, returning equal preference for all valid listening ports.
+    ///
+    /// This published accessor remains available, but no longer ranks default ports.
+    pub fn peer_preference(&self) -> Result<PeerPreference, &'static str> {
+        PeerPreference::new(self.addr, None)
     }
 
     /// Returns the time of the last successful interaction with this peer.
@@ -1220,8 +1227,7 @@ impl Ord for MetaAddr {
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
         // Keep valid addresses before invalid ones, without ranking their ports.
-        let more_likely_valid = address_is_valid_for_outbound_connections(self.addr, None)
-            .cmp(&address_is_valid_for_outbound_connections(other.addr, None));
+        let more_likely_valid = self.peer_preference().cmp(&other.peer_preference());
 
         // # Security and Correctness
         //

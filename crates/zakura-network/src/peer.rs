@@ -37,4 +37,5 @@ pub use minimum_peer_version::MinimumPeerVersion;
 #[allow(unused_imports)]
 pub use priority::{
     address_is_valid_for_inbound_listeners, address_is_valid_for_outbound_connections,
+    PeerPreference,
 };

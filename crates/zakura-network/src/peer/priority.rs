@@ -6,6 +6,27 @@ use zakura_chain::parameters::Network;
 
 use crate::PeerSocketAddr;
 
+/// A validated peer address, retained as the return type of the published preference API.
+///
+/// All valid addresses compare equally: listening ports do not determine preference.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PeerPreference {
+    private: (),
+}
+
+impl PeerPreference {
+    /// Validate `peer_addr` and return the same preference for every valid address.
+    ///
+    /// Returns an error when the address is invalid for outbound connections.
+    pub fn new(
+        peer_addr: impl Into<PeerSocketAddr>,
+        network: impl Into<Option<Network>>,
+    ) -> Result<PeerPreference, &'static str> {
+        address_is_valid_for_outbound_connections(peer_addr.into(), network)?;
+        Ok(PeerPreference { private: () })
+    }
+}
+
 /// Is the [`PeerSocketAddr`] we have for this peer valid for outbound
 /// connections?
 ///

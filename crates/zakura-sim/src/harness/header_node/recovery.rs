@@ -31,6 +31,9 @@
 //! ([`RecoveryEvidence::holds`]): the harness closing or relinking a peer,
 //! or stopping the node. A session the node or a mirror ends by itself
 //! breaks none, so a node that drops its honest source still owes progress.
+//!
+//! A scenario with a `Recover` step runs at most [`PREFIX_BOUND`] hostile
+//! events before its pick ([`Prefix`]).
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
@@ -63,6 +66,80 @@ pub(super) const RELINK: u64 = u64::MAX - 1;
 
 /// The `recovery-unreached` action's local index in the control source.
 pub(super) const UNREACHED: u64 = u64::MAX - 2;
+
+/// The most hostile events a scenario with a `Recover` step executes before
+/// its pick (hdr-13).
+pub const PREFIX_BOUND: u32 = 32;
+
+/// One hostile event of a prefix ([`Prefix`]), as the harness counted it,
+/// with the step it executed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostileEvent {
+    /// The step.
+    pub step: u64,
+    /// What executed.
+    pub hostile: Hostile,
+}
+
+/// What a hostile event was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hostile {
+    /// The control source picked the script's step at this index.
+    Step(usize),
+    /// A hold or reply hold caught this storage operation at its submission.
+    Caught(u64),
+    /// This storage operation completed with an outcome the success-only
+    /// base wouldn't offer.
+    Fault(u64),
+}
+
+/// A run's hostile prefix: the hostile events that executed before its
+/// `Recover` pick, in a scenario that has one ([`Hostile`]). Script slots
+/// don't bound these, since a hold with no `nth` catches every operation it
+/// selects and the `any` base offers a fault for each, so the harness keeps
+/// each where it executes. Once [`PREFIX_BOUND`] have executed, it offers no
+/// more until the `Recover` pick: the control source offers only the
+/// `Recover` step, holds catch nothing new, and completions offer only what
+/// the success-only base would. Below the bound the record changes nothing
+/// a run offers. A scenario without a `Recover` step is unbounded and keeps
+/// nothing. Cloning shares it.
+#[derive(Clone, Default)]
+pub struct Prefix(Rc<RefCell<Option<Vec<HostileEvent>>>>);
+
+impl Prefix {
+    /// A bounded prefix, for a scenario with a `Recover` step, with nothing
+    /// executed yet.
+    pub fn bounded() -> Self {
+        Prefix(Rc::new(RefCell::new(Some(Vec::new()))))
+    }
+
+    /// How many hostile events executed, or `None` for an unbounded prefix.
+    pub fn spent(&self) -> Option<u32> {
+        self.0
+            .borrow()
+            .as_ref()
+            .map(|events| u32::try_from(events.len()).expect("the bound keeps the record short"))
+    }
+
+    /// The hostile events that executed, in order, or `None` for an
+    /// unbounded prefix.
+    pub fn events(&self) -> Option<Vec<HostileEvent>> {
+        self.0.borrow().clone()
+    }
+
+    /// Whether [`PREFIX_BOUND`] hostile events executed, so no more may.
+    pub fn full(&self) -> bool {
+        self.spent().is_some_and(|spent| spent >= PREFIX_BOUND)
+    }
+
+    /// Records `hostile`, executed at `step`. Does nothing for an unbounded
+    /// prefix.
+    pub(super) fn spend(&self, step: u64, hostile: Hostile) {
+        if let Some(events) = self.0.borrow_mut().as_mut() {
+            events.push(HostileEvent { step, hostile });
+        }
+    }
+}
 
 /// What recovery reads: the node's and the mirrors' engines, the node's
 /// session view, cooldown facts and end facts, its configured readmission
@@ -177,10 +254,11 @@ pub enum RecoveryState {
     Unreached,
 }
 
-/// A run's recovery, shared by the control source and the harness's view.
-/// Empty until a `Recover` step is picked. Cloning shares it.
+/// A run's recovery, shared by the control source, the storage source and
+/// the harness's view: the recovery, empty until a `Recover` step is
+/// picked, and the hostile prefix before it. Cloning shares both.
 #[derive(Clone, Default)]
-pub struct RecoveryEvidence(Rc<RefCell<Option<Recovery>>>);
+pub struct RecoveryEvidence(Rc<RefCell<Option<Recovery>>>, Prefix);
 
 /// One recovery: its source, when it started, and where it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +274,23 @@ pub struct Recovery {
 }
 
 impl RecoveryEvidence {
+    /// The evidence for a scenario with a `Recover` step, whose prefix is
+    /// bounded.
+    pub fn bounded() -> Self {
+        RecoveryEvidence(Rc::default(), Prefix::bounded())
+    }
+
+    /// The run's hostile prefix.
+    pub fn prefix(&self) -> &Prefix {
+        &self.1
+    }
+
+    /// Whether the prefix is still open: the `Recover` step isn't picked
+    /// yet, so a hostile event that executes now counts.
+    pub(super) fn in_prefix(&self) -> bool {
+        self.started().is_none()
+    }
+
     /// The recovery, if a `Recover` step was picked.
     pub fn get(&self) -> Option<Recovery> {
         self.0.borrow().clone()

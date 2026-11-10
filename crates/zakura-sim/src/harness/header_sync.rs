@@ -1181,7 +1181,11 @@ impl Subsystem for Storage {
             chain_effect: ChainEffectEvidence::default(),
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
-            recovery: RecoveryEvidence::default(),
+            recovery: if recovery_source(scenario).is_some() {
+                RecoveryEvidence::bounded()
+            } else {
+                RecoveryEvidence::default()
+            },
             delayed_page: None,
             fork_choice: ForkChoiceEvidence::default(),
             // A flood or churn scenario's adoption is the watch-flood

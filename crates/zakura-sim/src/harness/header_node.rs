@@ -82,7 +82,8 @@ use self::{
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     recovery::{
-        Driver, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED, RELINK, UNREACHED,
+        Driver, Hostile, Prefix, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED,
+        RELINK, UNREACHED,
     },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -357,7 +358,10 @@ impl PolicySource {
     /// on each operation is offered only `engine`, or `rejected` where
     /// that's the only legal outcome, each held reply is delivered, and each
     /// must be done within [`recovery::RECOVERY_BOUND`] of the later of its
-    /// submission, or its commit, and the `Recover` pick.
+    /// submission, or its commit, and the `Recover` pick. Before that it
+    /// counts each hold's catch and each fault it executes in `recovery`'s
+    /// prefix ([`recovery::Prefix`]), and once the prefix is full it catches
+    /// and offers as recovery will.
     pub fn with_recovery(self, recovery: RecoveryEvidence) -> Self {
         PolicySource { recovery, ..self }
     }
@@ -409,16 +413,18 @@ impl ActionSource for PolicySource {
         let committed = self.port.committed();
         let predicates = self.predicates.borrow();
         let recovering = self.recovery.started().is_some();
+        let full = self.recovery.prefix().full();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
             match crate::storage::decode(*local) {
                 StorageAction::Complete(id, outcome) => {
                     pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                        let success = Base::SuccessOnly.offers(&op.enabled, outcome);
                         if recovering {
-                            Base::SuccessOnly.offers(&op.enabled, outcome)
+                            success
                         } else {
-                            predicates.offers(self.base, op, outcome)
+                            predicates.offers(self.base, op, outcome) && (success || !full)
                         }
                     })
                 }
@@ -448,6 +454,18 @@ impl ActionSource for PolicySource {
     }
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        if let StorageAction::Complete(id, outcome) = crate::storage::decode(local) {
+            let fault = self
+                .port
+                .pending()
+                .iter()
+                .any(|op| op.id == id && !Base::SuccessOnly.offers(&op.enabled, outcome));
+            if fault && self.recovery.in_prefix() {
+                self.recovery
+                    .prefix()
+                    .spend(log.step(), Hostile::Fault(id.0));
+            }
+        }
         match crate::storage::decode(local) {
             StorageAction::Complete(id, Outcome::Engine)
                 if self.recovery.started().is_none()
@@ -520,7 +538,16 @@ impl ActionSource for PolicySource {
         for entry in &log.entries()[before..] {
             match &entry.obs {
                 Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
+                    let prefix = self.recovery.in_prefix().then(|| self.recovery.prefix());
+                    if prefix.is_some_and(Prefix::full) {
+                        predicates.stop_catching();
+                    }
                     predicates.record(fact);
+                    if let (StorageFact::Submitted { id, .. }, Some(prefix)) = (fact, prefix) {
+                        if predicates.holds_op(*id) {
+                            prefix.spend(entry.step, Hostile::Caught(*id));
+                        }
+                    }
                     if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
                         predicates.record_link(LinkEffect::StorageStopped, node);
                     }
@@ -1495,6 +1522,10 @@ pub struct ControlStep {
 /// task has carried out every earlier step, so the script keeps its order.
 /// A churn step hands its mirror to its own churn task, which relinks it
 /// from then on.
+///
+/// Each step it picks before a `Recover` counts in the recovery's hostile
+/// prefix ([`recovery::Prefix`]). Once that's full it offers only the
+/// `Recover` step, and the steps between are dropped.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -1613,6 +1644,25 @@ impl Control {
         self.recovery
             .as_ref()
             .is_some_and(|driver| driver.evidence.started().is_some())
+    }
+
+    /// The index of the script step to offer next: the next one, or once
+    /// the hostile prefix is full ([`Prefix`]), the `Recover` step at or
+    /// after it, skipping the steps between. `None` once the script is done,
+    /// or with the prefix full and no `Recover` step left.
+    fn next_step(&self) -> Option<usize> {
+        let full = self
+            .recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.prefix().full());
+        if !full {
+            return (self.next < self.script.len()).then_some(self.next);
+        }
+        self.script
+            .iter()
+            .skip(self.next)
+            .position(|step| step.action == ControlAction::Recover)
+            .map(|offset| self.next + offset)
     }
 
     /// This source, resetting, committing to and stopping `port`, the node
@@ -1770,9 +1820,10 @@ impl ActionSource for Control {
         if self.recovering() {
             return;
         }
-        let Some(step) = self.script.get(self.next) else {
+        let Some(index) = self.next_step() else {
             return;
         };
+        let step = &self.script[index];
         let open = self.ready(step)
             && step
                 .when
@@ -1780,10 +1831,7 @@ impl ActionSource for Control {
                 .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
         if open {
             // A script is far shorter than u64.
-            out.push((
-                Identity::peer(&step.peer, step.action.name()),
-                self.next as u64,
-            ));
+            out.push((Identity::peer(&step.peer, step.action.name()), index as u64));
         }
     }
 
@@ -1793,9 +1841,8 @@ impl ActionSource for Control {
             return;
         }
         if let Some(when) = self
-            .script
-            .get(self.next)
-            .and_then(|step| step.when.as_ref())
+            .next_step()
+            .and_then(|index| self.script[index].when.as_ref())
         {
             self.predicates.borrow().control_boundaries(when, now, out);
         }
@@ -1849,8 +1896,18 @@ impl ActionSource for Control {
                 _ => {}
             }
         }
-        let step = self.script[self.next].clone();
-        self.next += 1;
+        // `enabled` offered this step's index, which came from a usize.
+        let index = local as usize;
+        let step = self.script[index].clone();
+        self.next = index + 1;
+        if let Some(driver) = &self.recovery {
+            if step.action != ControlAction::Recover && driver.evidence.in_prefix() {
+                driver
+                    .evidence
+                    .prefix()
+                    .spend(log.step(), Hostile::Step(index));
+            }
+        }
         let node = &self.topology.nodes[0].name;
         let invalid = match step.action {
             ControlAction::Recover if step.peer == *node => {

@@ -249,6 +249,14 @@ smoke-secs = 60
 args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
+# `sync/storage`'s two-byte prefix picks a saved scenario or the default
+# one, so the target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "sync_storage"
+smoke-secs = 60
+timeout-secs = 1800
+
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
 # cover each fixture's own harness and the fixed variants. Its report must
 # account for each fixture and variant.
@@ -369,11 +377,6 @@ reason = "no target: the harness has two fixed scenarios, the wake fixtures, and
 harness = "header-sync/repair"
 owner = "E5a"
 reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
-
-[[missing-target]]
-harness = "sync/storage"
-owner = "P8d"
-reason = "no target yet; xsync-4 adds it with its curated seeds"
 
 [[missing-target]]
 harness = "block-sync/storage"

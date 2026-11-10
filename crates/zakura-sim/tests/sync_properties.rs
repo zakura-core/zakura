@@ -9,6 +9,7 @@ mod support;
 use support::inputs;
 use zakura_sim::{
     domain::{
+        block_sync::TEARDOWN_RETURNS_BASELINE,
         block_sync_semantic::{SemanticModel, FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED},
         cross::{
             EpochHistory, BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK,
@@ -17,7 +18,7 @@ use zakura_sim::{
     },
     harness::{
         run_prepared,
-        sync::{SavedSync, SyncStorage},
+        sync::{SavedSync, SyncPorts, SyncStorage},
         HarnessError, Subsystem,
     },
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
@@ -26,10 +27,16 @@ use zakura_sim::{
 /// Runs saved scenario `saved` under `input`. Fails the test on a harness
 /// failure.
 fn run(saved: SavedSync, input: PlanInput) -> RunReport {
+    run_with_ports(saved, input).0
+}
+
+/// [`run`], which also returns the ports, which outlive the run.
+fn run_with_ports(saved: SavedSync, input: PlanInput) -> (RunReport, SyncPorts) {
     let scenario = saved.scenario();
     let ports = SyncStorage::prepare(&scenario);
-    match run_prepared::<SyncStorage>(&scenario, ports, input, &mut MemorySink::default(), None) {
-        Ok(report) => report,
+    let sink = &mut MemorySink::default();
+    match run_prepared::<SyncStorage>(&scenario, ports.clone(), input, sink, None) {
+        Ok(report) => (report, ports),
         Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
         Err(error) => panic!("{error}"),
     }
@@ -127,5 +134,25 @@ fn work_after_a_reorg_follows_the_new_branch() {
         );
         applicable_and_held(&report, BLOCK_REQUESTS_FOLLOW_HEADERS);
         applicable_and_held(&report, HEADER_REORG_RETIRES_BLOCK_WORK);
+    }
+}
+
+/// xsync-4's teardown matrix: the node shuts down while block storage holds
+/// its first needed-block query, and while it holds its second body's apply.
+/// Each held operation completes after the shutdown. Once both settle,
+/// `block-sync/teardown-returns-baseline` holds: no block-sync charge
+/// remains, session slots included. Neither storage holds an operation of
+/// the node's at the end, and no active property is violated.
+#[test]
+fn teardown_across_held_work_returns_baseline() {
+    let committed = Plan::from_fuzz(&[]);
+    for saved in [SavedSync::TeardownQuery, SavedSync::TeardownSubmission] {
+        for input in std::iter::once(committed.clone()).chain(inputs(4, 256)) {
+            let (report, ports) = run_with_ports(saved, input);
+            assert_eq!(report.end.violation, None, "{}", saved.name());
+            applicable_and_held(&report, TEARDOWN_RETURNS_BASELINE);
+            assert_eq!(ports.port.pending(), Vec::new(), "{}", saved.name());
+            assert_eq!(ports.service.pending(), Vec::new(), "{}", saved.name());
+        }
     }
 }

@@ -136,7 +136,8 @@ fn a_header_reorg_reaches_block_sync_through_the_engine() {
 }
 
 /// Each saved scenario's committed input replays to its pinned end record,
-/// with both of the node's tips at the mirrors' tip.
+/// with both of the node's tips at the mirrors' tip unless the node shuts
+/// down.
 #[test]
 fn saved_scenarios_replay_their_end_records() {
     for saved in SavedSync::ALL {
@@ -149,8 +150,13 @@ fn saved_scenarios_replay_their_end_records() {
         );
         let (_, lines, ports) = replay(&input);
         assert_eq!(end(&lines), pinned, "{name}");
+        // A node that shuts down early stops short of the tip.
+        let torn_down = matches!(
+            saved,
+            SavedSync::TeardownQuery | SavedSync::TeardownSubmission
+        );
         let tip = ports.mirror_tip();
-        assert_eq!(ports.tips(), (tip, tip), "{name}");
+        assert!(torn_down || ports.tips() == (tip, tip), "{name}");
     }
 }
 

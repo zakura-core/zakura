@@ -81,7 +81,10 @@ use super::{
 };
 use crate::{
     domain::{
-        block_sync::{resource_properties, Limits, OwnerModel, OwnerView},
+        block_sync::{
+            resource_properties, Limits, OwnerModel, OwnerView,
+            TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
+        },
         block_sync_semantic::{
             semantic_properties, SemanticModel, SemanticView, FRONTIER_WORK_CONSISTENT,
             QUERY_WORK_AUTHORIZED,
@@ -1099,7 +1102,17 @@ pub enum SavedSync {
     /// body-work epoch, and the query's reply reaches the reactor under the
     /// retired authority.
     RetiredQuery,
+    /// The node shuts down while storage holds its first needed-block
+    /// query, which completes [`TEARDOWN_HOLD_MS`] after its submission.
+    TeardownQuery,
+    /// The node shuts down while storage holds its second body's apply,
+    /// which completes [`TEARDOWN_HOLD_MS`] after its submission.
+    TeardownSubmission,
 }
+
+/// How long the teardown scenarios hold their operation past the node's
+/// shutdown, at least, in milliseconds of virtual time.
+const TEARDOWN_HOLD_MS: u64 = 2_000;
 
 /// How long [`SavedSync::RetiredQuery`] holds its query, at least, in
 /// milliseconds of virtual time.
@@ -1110,7 +1123,13 @@ const TAG: u8 = 0xFD;
 
 impl SavedSync {
     /// Every saved scenario.
-    pub const ALL: [SavedSync; 3] = [SavedSync::Honest, SavedSync::Reorg, SavedSync::RetiredQuery];
+    pub const ALL: [SavedSync; 5] = [
+        SavedSync::Honest,
+        SavedSync::Reorg,
+        SavedSync::RetiredQuery,
+        SavedSync::TeardownQuery,
+        SavedSync::TeardownSubmission,
+    ];
 
     /// The fixture's name, `sync-storage-<name>.bin`.
     pub fn name(self) -> &'static str {
@@ -1118,6 +1137,8 @@ impl SavedSync {
             SavedSync::Honest => "honest",
             SavedSync::Reorg => "reorg",
             SavedSync::RetiredQuery => "retired-query",
+            SavedSync::TeardownQuery => "teardown-query",
+            SavedSync::TeardownSubmission => "teardown-submission",
         }
     }
 
@@ -1143,6 +1164,9 @@ impl SavedSync {
                 (cross::TIPS_CONSISTENT, "holds"),
             ],
             SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, "holds")],
+            SavedSync::TeardownQuery | SavedSync::TeardownSubmission => {
+                &[(BLOCK_TEARDOWN_RETURNS_BASELINE, "holds")]
+            }
         }
     }
 
@@ -1200,7 +1224,38 @@ impl SavedSync {
                     ..two_mirrors
                 }
             }
+            SavedSync::TeardownQuery => teardown_holding(
+                two_mirrors,
+                block_policy::Select::nth(block_policy::BlockKind::Query, 1),
+            ),
+            SavedSync::TeardownSubmission => teardown_holding(
+                two_mirrors,
+                block_policy::Select::nth(block_policy::BlockKind::Apply, 2),
+            ),
         }
+    }
+}
+
+/// `scenario`, with block storage holding the operation `held` selects for
+/// [`TEARDOWN_HOLD_MS`], and the node shutting down once storage takes it.
+fn teardown_holding(scenario: SyncScenario, held: block_policy::Select) -> SyncScenario {
+    let mut block_policy = block_node::Policy::converging();
+    block_policy.holds.push(block_policy::Hold {
+        select: held.clone(),
+        until: Trigger::VirtualTime(TEARDOWN_HOLD_MS),
+        then: vec![
+            block_policy::BlockAllow::Answer,
+            block_policy::BlockAllow::Committed,
+        ],
+        deadline_ms: None,
+    });
+    SyncScenario {
+        block_policy,
+        control: vec![SyncStep {
+            action: SyncAction::Teardown,
+            when: Some(Trigger::Submitted(held)),
+        }],
+        ..scenario
     }
 }
 

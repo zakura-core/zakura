@@ -42,6 +42,10 @@ whose target has no harness or no campaign.
   hours. Its committed seeds,
   `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
   the grammar and carry Plan bytes past the prefix.
+- `sync_storage` runs `sync/storage`, header sync and block sync on one
+  node over one engine. Its two-byte prefix picks a saved scenario, or the
+  default one, so the target fuzzes each scenario's schedule. Its committed
+  seeds are `crates/zakura-sim/tests/fixtures/sync-storage-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only

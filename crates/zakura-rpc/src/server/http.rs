@@ -160,20 +160,21 @@ pub(super) async fn answer_body<S: RpcServiceT>(
     max_batch_entries: usize,
     max_response_body_size: usize,
 ) -> HttpResponse {
-    let (version, body) = match request_to_json_rpc_2(body) {
-        JsonRpc2Request::Plain(call) => {
-            let response = handle_parsed_body(call, rpc_service, max_response_body_size).await;
-            return json_response(StatusCode::OK, response);
+    let (version, response) = match request_to_json_rpc_2(body) {
+        JsonRpc2Request::Parsed { version, body } => {
+            let response = handle_parsed_body(body, rpc_service, max_response_body_size).await;
+            (version, response)
         }
-        JsonRpc2Request::Converted { version, body } => (version, body),
+        JsonRpc2Request::Converted { version, body } => {
+            let Some((body, is_single)) = strip_leading_whitespace(&body) else {
+                let response = MethodResponse::error(Id::Null, ErrorCode::ParseError.into());
+                return json_response(StatusCode::BAD_REQUEST, response);
+            };
+            let body = Body::parse(body, is_single, max_batch_entries);
+            let response = handle_parsed_body(body, rpc_service, max_response_body_size).await;
+            (version, response)
+        }
     };
-
-    let Some((body, is_single)) = strip_leading_whitespace(&body) else {
-        let response = MethodResponse::error(Id::Null, ErrorCode::ParseError.into());
-        return json_response(StatusCode::BAD_REQUEST, response);
-    };
-    let body = Body::parse(body, is_single, max_batch_entries);
-    let response = handle_parsed_body(body, rpc_service, max_response_body_size).await;
 
     response_with_body(
         StatusCode::OK,

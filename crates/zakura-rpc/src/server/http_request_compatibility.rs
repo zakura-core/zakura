@@ -256,8 +256,13 @@ pub(super) enum JsonRpcVersion {
 
 /// A request body mapped to JSON-RPC 2.0.
 pub(super) enum JsonRpc2Request<'a> {
-    /// A plain JSON-RPC 2.0 call, already parsed from the body as sent.
-    Plain(Body<'a>),
+    /// A call that re-encoding would not change, parsed once from the body as sent.
+    Parsed {
+        /// The client's version, for [`response_from_json_rpc_2`].
+        version: JsonRpcVersion,
+        /// The call the server would parse from the re-encoded body.
+        body: Body<'a>,
+    },
     /// Any other body, re-encoded as JSON-RPC 2.0 if it is a call from a known version.
     Converted {
         /// The client's version, for [`response_from_json_rpc_2`].
@@ -269,34 +274,36 @@ pub(super) enum JsonRpc2Request<'a> {
 
 /// Maps a request body from whatever JSON-RPC version the client is using to JSON-RPC 2.0.
 ///
-/// A plain JSON-RPC 2.0 call is parsed once, here, into the [`Body`] the server would parse
-/// from it, so a block's hex in `submitblock` is read once instead of twice. Any other body is
-/// re-encoded as JSON-RPC 2.0 for the server to parse, after removing a JSON-RPC 1.0 `jsonrpc`
-/// field. That field was only added in JSON-RPC 2.0:
+/// A call whose method, parameters and ID re-encoding would not change is parsed once, here,
+/// into the [`Body`] the server would parse from its re-encoded form. So a block's hex in
+/// `submitblock` is read once, whether or not the call has a work ID or comes from a JSON-RPC
+/// 1.0 or bitcoind-style client. Any other body is converted by [`convert_to_json_rpc_2`].
+pub(super) fn request_to_json_rpc_2(body: &[u8]) -> JsonRpc2Request<'_> {
+    match parse_call_as_sent(body) {
+        Some((version, body)) => JsonRpc2Request::Parsed { version, body },
+        None => {
+            let (version, body) = convert_to_json_rpc_2(body);
+            JsonRpc2Request::Converted { version, body }
+        }
+    }
+}
+
+/// Re-encodes a call from a known JSON-RPC version as JSON-RPC 2.0, after removing a JSON-RPC
+/// 1.0 `jsonrpc` field. That field was only added in JSON-RPC 2.0:
 /// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
 ///
-/// A body that isn't a call from a known version is passed on unchanged.
-pub(super) fn request_to_json_rpc_2(body: &[u8]) -> JsonRpc2Request<'_> {
-    if let Some(call) = parse_plain_json_rpc_2_call(body) {
-        return JsonRpc2Request::Plain(call);
-    }
-
+/// A body that isn't a call from a known version is returned unchanged.
+pub(super) fn convert_to_json_rpc_2(body: &[u8]) -> (JsonRpcVersion, Cow<'_, [u8]>) {
     let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(body) else {
-        return JsonRpc2Request::Converted {
-            version: JsonRpcVersion::Unknown,
-            body: Cow::Borrowed(body),
-        };
+        return (JsonRpcVersion::Unknown, Cow::Borrowed(body));
     };
     let version = request.version();
-    let body = if version == JsonRpcVersion::Unknown {
-        Cow::Borrowed(body)
-    } else {
-        Cow::Owned(
-            serde_json::to_vec(&request.into_2())
-                .expect("values parsed from JSON serialize back to JSON"),
-        )
-    };
-    JsonRpc2Request::Converted { version, body }
+    if version == JsonRpcVersion::Unknown {
+        return (version, Cow::Borrowed(body));
+    }
+    let body = serde_json::to_vec(&request.into_2())
+        .expect("values parsed from JSON serialize back to JSON");
+    (version, Cow::Owned(body))
 }
 
 /// Maps a JSON-RPC 2.0 response to the client's JSON-RPC `version`.
@@ -314,87 +321,108 @@ pub(super) fn response_from_json_rpc_2(version: JsonRpcVersion, json: Box<RawVal
     }
 }
 
-/// Parses `body` if it is a JSON-RPC 2.0 call that [`JsonRpcRequest::into_2`] would only
-/// re-encode, returning the [`Body`] that the server would parse from it.
+/// Parses `body` if [`convert_to_json_rpc_2`] would only re-encode it without changing what
+/// the server reads, returning the client's version and the [`Body`] the server would parse.
 ///
-/// The server reads a few things differently from their re-encoded form: whitespace inside
-/// positional parameters, duplicate or reordered named parameters, leading whitespace, a `null`
-/// ID (which re-encoding drops) and unknown fields (which re-encoding drops). So this accepts
-/// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
-/// no parameters, an empty array, or one unescaped string argument. This avoids copying and
-/// re-encoding a block's hex in `submitblock` without inspecting each array element.
-fn parse_plain_json_rpc_2_call(body: &[u8]) -> Option<Body<'_>> {
+/// Re-encoding changes some things the server reads: escaped strings and non-canonical numbers
+/// in parameters, whitespace inside parameters, duplicate named parameters, a `null` ID (which
+/// it drops), unknown fields (which it drops), and leading whitespace. So this accepts only a
+/// body that starts with `{`, has no other fields, has a string or number ID or none, and has
+/// parameters that re-encode to the same bytes, or none. The method and ID are read the same
+/// from either form, and both read `null` parameters as none.
+fn parse_call_as_sent(body: &[u8]) -> Option<(JsonRpcVersion, Body<'_>)> {
     if body.first() != Some(&b'{') {
         return None;
     }
 
-    let call = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body).ok()?;
+    let call = serde_json::from_slice::<'_, CallFields<'_>>(body).ok()?;
 
-    if call.jsonrpc != "2.0" || !call.params.is_none_or(params_can_pass_through_unchanged) {
+    if !call.params.is_none_or(params_re_encode_unchanged) {
         return None;
     }
-    let params = call.params.map(Cow::Borrowed);
-
-    let Some(id) = call.id else {
-        // Like the server, a call without an ID is a notification.
-        return Some(Body::Notification(Notification {
-            jsonrpc: TwoPointZero,
-            method: call.method,
-            params,
-        }));
-    };
-
     // RawValue is valid JSON; the first byte distinguishes strings and numbers.
-    if !matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9')) {
+    if !call
+        .id
+        .is_none_or(|id| matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9')))
+    {
         return None;
     }
 
-    // Like the server, a call whose ID is a number that isn't a `u64` is a notification.
-    Some(match serde_json::from_str::<Id<'_>>(id.get()) {
-        Ok(id) => Body::Call(Request {
+    let version = JsonRpcVersion::of_call(
+        call.jsonrpc.as_deref(),
+        call.params.is_some(),
+        call.id.map(|_| IdKind::NullStringOrNumber),
+    );
+    if version == JsonRpcVersion::Unknown {
+        return None;
+    }
+
+    let params = call.params.map(Cow::Borrowed);
+    // Like the server, a call without an ID, or whose ID is a number that isn't a `u64`, is a
+    // notification.
+    let body = match call.id.map(|id| serde_json::from_str::<Id<'_>>(id.get())) {
+        Some(Ok(id)) => Body::Call(Request {
             jsonrpc: TwoPointZero,
             id,
             method: call.method,
             params,
         }),
-        Err(_) => Body::Notification(Notification {
+        Some(Err(_))
+            if call.id.is_some_and(|id| {
+                serde_json::from_str::<serde_json::Number>(id.get()).is_err()
+            }) =>
+        {
+            // Conversion rejects unrepresentable numbers. Preserve that error path without
+            // parsing ordinary call IDs twice.
+            return None;
+        }
+        None | Some(Err(_)) => Body::Notification(Notification {
             jsonrpc: TwoPointZero,
             method: call.method,
             params,
         }),
-    })
+    };
+    Some((version, body))
 }
 
-/// Returns whether parameters are `[]` or one compact, unescaped string argument.
+/// Returns whether re-encoding `params` gives back the same bytes, so the server reads them the
+/// same either way.
 ///
-/// `RawValue` already contains valid JSON. Checking its delimiters and string contents avoids
-/// allocating per argument or parsing and serializing values before falling back to conversion.
-fn params_can_pass_through_unchanged(params: &RawValue) -> bool {
+/// A leading unescaped string argument, like a block's hex in `submitblock`, re-encodes
+/// unchanged, and a vectorized search checks it far faster than parsing. Any arguments after it,
+/// like a work ID, are re-encoded and compared.
+fn params_re_encode_unchanged(params: &RawValue) -> bool {
     let json = params.get();
-
-    if json == "[]" {
-        return true;
-    }
-
-    let Some(value) = json
-        .strip_prefix("[\"")
-        .and_then(|value| value.strip_suffix("\"]"))
-    else {
-        return false;
+    let rest = match json.strip_prefix("[\"") {
+        Some(string_and_rest) => {
+            // RawValue is valid JSON, so the string ends at the first `"` unless it has an escape.
+            let end = memchr::memchr2(b'"', b'\\', string_and_rest.as_bytes());
+            let Some(end) = end.filter(|&end| string_and_rest.as_bytes()[end] == b'"') else {
+                return false;
+            };
+            match &string_and_rest[end + 1..] {
+                "]" => return true,
+                rest => match rest.strip_prefix(',') {
+                    Some(arguments) => Cow::Owned(format!("[{arguments}")),
+                    None => return false,
+                },
+            }
+        }
+        None => Cow::Borrowed(json),
     };
 
-    // A block's hex is megabytes long, and a vectorized search scans it far faster than a byte
-    // loop.
-    memchr::memchr2(b'"', b'\\', value.as_bytes()).is_none()
+    serde_json::from_str::<serde_json::Value>(&rest)
+        .and_then(|value| serde_json::to_string(&value))
+        .is_ok_and(|re_encoded| re_encoded == *rest)
 }
 
-/// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.
+/// The standard fields of a call from any JSON-RPC version, borrowed from the request body.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PlainJsonRpc2Call<'a> {
-    #[serde(borrow)]
-    jsonrpc: Cow<'a, str>,
-    /// Required, so that a call without a method isn't treated as a plain call.
+struct CallFields<'a> {
+    #[serde(borrow, default)]
+    jsonrpc: Option<Cow<'a, str>>,
+    /// Required, so that a body without a method isn't parsed as a call.
     #[serde(borrow)]
     method: Cow<'a, str>,
     #[serde(borrow, default)]
@@ -411,6 +439,25 @@ fn present<'de, D: serde::Deserializer<'de>>(
     <&RawValue>::deserialize(deserializer).map(Some)
 }
 
+/// The kind of a call's ID, which its JSON-RPC version depends on.
+enum IdKind {
+    NullStringOrNumber,
+    Other,
+}
+
+impl JsonRpcVersion {
+    /// Returns the version of a call with a `jsonrpc` field, parameters if `has_params`, and an
+    /// `id` of a kind, if it has one.
+    fn of_call(jsonrpc: Option<&str>, has_params: bool, id: Option<IdKind>) -> Self {
+        match (jsonrpc, has_params, id) {
+            (Some("2.0"), _, None | Some(IdKind::NullStringOrNumber)) => Self::TwoPointZero,
+            (Some("1.0"), true, Some(_)) => Self::Lightwalletd,
+            (None, true, Some(_)) => Self::Bitcoind,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A version-agnostic JSON-RPC request.
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRpcRequest {
@@ -425,21 +472,13 @@ struct JsonRpcRequest {
 
 impl JsonRpcRequest {
     fn version(&self) -> JsonRpcVersion {
-        match (self.jsonrpc.as_deref(), &self.params, &self.id) {
-            (
-                Some("2.0"),
-                _,
-                None
-                | Some(
-                    serde_json::Value::Null
-                    | serde_json::Value::String(_)
-                    | serde_json::Value::Number(_),
-                ),
-            ) => JsonRpcVersion::TwoPointZero,
-            (Some("1.0"), Some(_), Some(_)) => JsonRpcVersion::Lightwalletd,
-            (None, Some(_), Some(_)) => JsonRpcVersion::Bitcoind,
-            _ => JsonRpcVersion::Unknown,
-        }
+        let id = self.id.as_ref().map(|id| match id {
+            serde_json::Value::Null
+            | serde_json::Value::String(_)
+            | serde_json::Value::Number(_) => IdKind::NullStringOrNumber,
+            _ => IdKind::Other,
+        });
+        JsonRpcVersion::of_call(self.jsonrpc.as_deref(), self.params.is_some(), id)
     }
 
     fn into_2(mut self) -> Self {
@@ -447,6 +486,7 @@ impl JsonRpcRequest {
         self
     }
 }
+
 /// A version-agnostic JSON-RPC response.
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRpcResponse {

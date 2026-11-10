@@ -15,8 +15,8 @@ use tower::{BoxError, Layer, Service};
 use crate::server::{
     http::{HttpBody, HttpRequest, HttpResponse},
     http_request_compatibility::{
-        request_to_json_rpc_2, response_from_json_rpc_2, HttpRequestMiddleware,
-        HttpRequestMiddlewareLayer, JsonRpc2Request, JsonRpcVersion,
+        convert_to_json_rpc_2, request_to_json_rpc_2, response_from_json_rpc_2,
+        HttpRequestMiddleware, HttpRequestMiddlewareLayer, JsonRpc2Request, JsonRpcVersion,
     },
     jsonrpc::Body,
 };
@@ -200,20 +200,29 @@ fn describe(body: &Body<'_>) -> String {
     }
 }
 
-/// Returns the converted body and version, failing if `request` is parsed as a plain call.
+/// Returns the converted body and version, failing if `request` is parsed as sent.
 fn converted(request: &str) -> (JsonRpcVersion, Vec<u8>) {
     match request_to_json_rpc_2(request.as_bytes()) {
-        JsonRpc2Request::Plain(_) => panic!("{request} should be converted"),
+        JsonRpc2Request::Parsed { .. } => panic!("{request} should be converted"),
         JsonRpc2Request::Converted { version, body } => (version, body.into_owned()),
     }
 }
 
-/// Every call parsed in one pass is the call the server would parse from the body as sent.
+/// Every call parsed as sent is the call, and version, that conversion gives the server.
 ///
-/// This covers the field orders, IDs, versions, methods, and parameters that decide whether a
-/// call is plain, and those that make the server read it as a notification.
+/// This covers the field orders, versions, IDs, methods, and parameters that decide whether a
+/// call can be parsed as sent, and those that make the server read it as a notification.
 #[test]
-fn plain_calls_parse_like_the_server() {
+fn calls_parsed_as_sent_match_their_conversion() {
+    let versions = [
+        Some(r#""2.0""#),
+        Some(r#""2\u002e0""#),
+        Some(r#""1.0""#),
+        Some(r#""1.1""#),
+        None,
+        Some("null"),
+        Some("2"),
+    ];
     let ids = [
         None,
         Some("0"),
@@ -223,6 +232,8 @@ fn plain_calls_parse_like_the_server() {
         Some("-1"),
         Some("1.5"),
         Some("1e2"),
+        Some("1e400"),
+        Some("-1e400"),
         Some(r#""x""#),
         Some(r#""\u0041""#),
         Some(r#""""#),
@@ -230,28 +241,37 @@ fn plain_calls_parse_like_the_server() {
         Some("true"),
         Some("[]"),
     ];
-    let versions = [r#""2.0""#, r#""2\u002e0""#, r#""1.0""#, "2"];
     let methods = [r#""getinfo""#, r#""get\u0069nfo""#, "1"];
     let params = [
         None,
+        Some("null"),
         Some("[]"),
+        Some("[ ]"),
+        Some(r#""x""#),
+        Some("{}"),
+        Some(r#"{"a":1}"#),
+        Some("[1]"),
+        Some("[0,0]"),
+        Some("[1e2]"),
         Some(r#"["00ff"]"#),
         Some(r#"["a\"b"]"#),
-        Some("[ ]"),
-        Some("[1]"),
-        Some("{}"),
+        Some(r#"["a","b"]"#),
+        Some(r#"["00ff",{"workid":"ab"}]"#),
+        Some(r#"["00ff", {"workid":"ab"}]"#),
+        Some(r#"["00ff",{"workid": "ab"}]"#),
+        Some(r#"["00ff",{"workid":"a","workid":"b"}]"#),
+        Some(r#"["00ff",{"workid":"\u0041"}]"#),
+        Some(r#"["00ff",{"workid":"ab"} ]"#),
     ];
 
-    let (mut calls, mut notifications) = (0, 0);
-    for id in ids {
-        for version in versions {
+    let mut parsed = std::collections::BTreeMap::<String, usize>::new();
+    for version in versions {
+        for id in ids {
             for method in methods {
                 for param in params {
                     for extra in [false, true] {
-                        let mut fields = vec![
-                            format!(r#""jsonrpc":{version}"#),
-                            format!(r#""method":{method}"#),
-                        ];
+                        let mut fields = vec![format!(r#""method":{method}"#)];
+                        fields.extend(version.map(|version| format!(r#""jsonrpc":{version}"#)));
                         fields.extend(id.map(|id| format!(r#""id":{id}"#)));
                         fields.extend(param.map(|params| format!(r#""params":{params}"#)));
                         if extra {
@@ -267,21 +287,25 @@ fn plain_calls_parse_like_the_server() {
                                 }
                                 let request = format!("{{{}}}", fields.join(","));
 
-                                let JsonRpc2Request::Plain(plain) =
+                                let JsonRpc2Request::Parsed { version, body } =
                                     request_to_json_rpc_2(request.as_bytes())
                                 else {
                                     continue;
                                 };
-                                match plain {
-                                    Body::Call(_) => calls += 1,
-                                    Body::Notification(_) => notifications += 1,
-                                    _ => panic!("{request} is parsed as neither call"),
-                                }
+                                let (converted_version, converted) =
+                                    convert_to_json_rpc_2(request.as_bytes());
+                                assert_eq!(version, converted_version, "{request}");
                                 assert_eq!(
-                                    describe(&plain),
-                                    describe(&Body::parse(request.as_bytes(), true, 1)),
+                                    describe(&body),
+                                    describe(&Body::parse(&converted, true, 1)),
                                     "{request}",
                                 );
+                                let kind = match body {
+                                    Body::Call(_) => "call",
+                                    Body::Notification(_) => "notification",
+                                    _ => panic!("{request} is parsed as neither call"),
+                                };
+                                *parsed.entry(format!("{version:?} {kind}")).or_default() += 1;
                             }
                         }
                     }
@@ -289,27 +313,74 @@ fn plain_calls_parse_like_the_server() {
             }
         }
     }
-    assert!(
-        calls > 0 && notifications > 0,
-        "{calls} calls, {notifications} notifications"
-    );
+    for expected in [
+        "TwoPointZero call",
+        "TwoPointZero notification",
+        "Lightwalletd call",
+        "Lightwalletd notification",
+        "Bitcoind call",
+        "Bitcoind notification",
+    ] {
+        assert!(parsed.contains_key(expected), "no {expected}: {parsed:?}");
+    }
 }
 
-/// A block's hex in `submitblock` is parsed in place, without copying or re-encoding the body.
+/// Legacy requests with unrepresentable numeric IDs retain their parse-error responses.
+#[test]
+fn legacy_overflow_ids_keep_parse_errors() {
+    for version in ["", r#""jsonrpc":"1.0","#] {
+        for id in ["1e400", "-1e400"] {
+            for params in ["[]", r#"["00ff",{"workid":"ab"}]"#] {
+                let request =
+                    format!(r#"{{{version}"method":"submitblock","id":{id},"params":{params}}}"#);
+                let (version, body) = converted(&request);
+                assert_eq!(version, JsonRpcVersion::Unknown, "{request}");
+                let Body::Error(response) = Body::parse(&body, true, 1) else {
+                    panic!("{request} must return an error, not become a notification");
+                };
+                assert_eq!(
+                    response_from_json_rpc_2(version, response.into_json()),
+                    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#,
+                    "{request}",
+                );
+            }
+        }
+    }
+}
+
+/// A block's hex in `submitblock` is parsed in place, without copying or re-encoding the body,
+/// with or without a work ID, and from JSON-RPC 2.0, 1.0, and bitcoind-style clients.
 #[test]
 fn submitblock_hex_is_parsed_in_place() {
     let block = "00".repeat(2_000_000);
-    let request =
-        format!(r#"{{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["{block}"]}}"#);
+    for (fields, expected_version) in [
+        (r#""jsonrpc": "2.0""#, JsonRpcVersion::TwoPointZero),
+        (r#""jsonrpc":"1.0""#, JsonRpcVersion::Lightwalletd),
+        (r#""x":0"#, JsonRpcVersion::Bitcoind),
+    ] {
+        for work_id in ["", r#",{"workid":"3f9a"}"#] {
+            // A bitcoind-style call has no `jsonrpc` field, or any other.
+            let fields = fields.replace(r#""x":0"#, "");
+            let separator = if fields.is_empty() { "" } else { ", " };
+            let request = format!(
+                r#"{{"id": 3, "method": "submitblock"{separator}{fields}, "params": ["{block}"{work_id}]}}"#
+            );
 
-    let JsonRpc2Request::Plain(Body::Call(call)) = request_to_json_rpc_2(request.as_bytes()) else {
-        panic!("a plain submitblock call is parsed in one pass");
-    };
-    let params = call.params.expect("the call has parameters");
-    let params = params.get().as_bytes().as_ptr_range();
-    let body = request.as_bytes().as_ptr_range();
-    assert!(body.start <= params.start && params.end <= body.end);
-    assert_eq!(call.method, "submitblock");
+            let JsonRpc2Request::Parsed {
+                version,
+                body: Body::Call(call),
+            } = request_to_json_rpc_2(request.as_bytes())
+            else {
+                panic!("a submitblock call with {fields:?} and {work_id:?} is parsed as sent");
+            };
+            assert_eq!(version, expected_version);
+            let params = call.params.expect("the call has parameters");
+            let params = params.get().as_bytes().as_ptr_range();
+            let body = request.as_bytes().as_ptr_range();
+            assert!(body.start <= params.start && params.end <= body.end);
+            assert_eq!(call.method, "submitblock");
+        }
+    }
 }
 
 /// A plain call's response goes back exactly as the server sent it.
@@ -346,12 +417,12 @@ fn large_numeric_array_is_normalized() {
 fn json_rpc_2_calls_the_server_reads_differently_are_still_re_encoded() {
     for (request, forwarded) in [
         (
-            r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": [0,0]}"#,
+            r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": [0, 0]}"#,
             r#"{"jsonrpc":"2.0","method":"getinfo","params":[0,0],"id":1}"#,
         ),
         (
-            r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": ["a","b"]}"#,
-            r#"{"jsonrpc":"2.0","method":"getinfo","params":["a","b"],"id":1}"#,
+            r#"{"id": 1, "method": "submitblock", "jsonrpc": "2.0", "params": ["00", {"workid": "a"}]}"#,
+            r#"{"jsonrpc":"2.0","method":"submitblock","params":["00",{"workid":"a"}],"id":1}"#,
         ),
         (
             r#"{"jsonrpc":"2.0","method":"getinfo","params":[ ],"id":1}"#,
@@ -397,6 +468,8 @@ fn unknown_bodies_are_unchanged() {
         "not json",
         "[]",
         r#"[{"jsonrpc":"2.0","method":"getinfo","id":1}]"#,
+        r#"{"jsonrpc":"1.1","method":"getinfo","params":[],"id":1}"#,
+        r#"{"method":"getinfo","params":[]}"#,
     ] {
         assert_eq!(
             converted(request),
@@ -417,10 +490,17 @@ fn response_in_version(version: JsonRpcVersion, response: &str) -> serde_json::V
 /// the same method, parameters and ID, and the response goes back without a `jsonrpc` field.
 #[test]
 fn bitcoind_request_is_rewritten_to_json_rpc_2() {
-    let (version, received) =
-        converted(r#"{"method":"submitblock","params":["00ff"],"id":"miner"}"#);
+    let request = r#"{"method":"submitblock","params":["00ff"],"id":"miner"}"#;
+    let (version, received) = convert_to_json_rpc_2(request.as_bytes());
 
     assert_eq!(version, JsonRpcVersion::Bitcoind);
+    assert!(matches!(
+        request_to_json_rpc_2(request.as_bytes()),
+        JsonRpc2Request::Parsed {
+            version: JsonRpcVersion::Bitcoind,
+            ..
+        }
+    ));
     let received: serde_json::Value =
         serde_json::from_slice(&received).expect("the rewritten request is JSON");
     assert_eq!(
@@ -437,10 +517,17 @@ fn bitcoind_request_is_rewritten_to_json_rpc_2() {
 /// response goes back labelled 1.0.
 #[test]
 fn lightwalletd_request_is_rewritten_to_json_rpc_2() {
-    let (version, received) =
-        converted(r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":7}"#);
+    let request = r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":7}"#;
+    let (version, received) = convert_to_json_rpc_2(request.as_bytes());
 
     assert_eq!(version, JsonRpcVersion::Lightwalletd);
+    assert!(matches!(
+        request_to_json_rpc_2(request.as_bytes()),
+        JsonRpc2Request::Parsed {
+            version: JsonRpcVersion::Lightwalletd,
+            ..
+        }
+    ));
     let received: serde_json::Value =
         serde_json::from_slice(&received).expect("the rewritten request is JSON");
     assert_eq!(

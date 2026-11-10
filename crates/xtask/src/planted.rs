@@ -2137,8 +2137,8 @@ mod tests {
         }
     }
 
-    /// Each committed case watches its patch's production files and its
-    /// listed checks, which all exist.
+    /// Each committed case patches only production code, and watches its
+    /// patch's files and its listed checks, which all exist.
     #[test]
     fn committed_cases_watch_existing_files() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
@@ -2153,14 +2153,23 @@ mod tests {
                 );
             }
             assert!(!case.checks.is_empty(), "{}", case.patch.display());
+            let patched = patched_files(&repo_root, &case.patch).expect("the patch parses");
             assert!(
-                watched
-                    .iter()
-                    .any(|path| path.starts_with("crates/zakura-network")
-                        || path.starts_with("crates/zakura-node-services")),
-                "{} watches the production file it patches",
+                !patched.is_empty(),
+                "{} changes no file",
                 case.patch.display()
             );
+            for path in &patched {
+                assert!(
+                    path.starts_with("crates")
+                        && !path.starts_with("crates/zakura-sim")
+                        && !path.starts_with("crates/xtask")
+                        && !path.components().any(|part| part.as_os_str() == "tests"),
+                    "{} patches {}, which isn't production code",
+                    case.patch.display(),
+                    path.display()
+                );
+            }
         }
     }
 

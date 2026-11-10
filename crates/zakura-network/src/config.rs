@@ -505,7 +505,8 @@ impl Config {
     /// Resolve initial seed peer IP addresses, based on the configured network,
     /// and load cached peers from disk, if available.
     /// Alternates cached peers in saved RTT order with shuffled seed peers,
-    /// starting with a cached peer. Shared addresses keep
+    /// starting with a cached peer unless the startup budget is one, in which case
+    /// a seed gets the sole slot when available. Shared addresses keep
     /// their cache position; an exhausted list yields the rest of the other list.
     ///
     /// # Panics
@@ -566,8 +567,14 @@ impl Config {
                 match (cached.next(), seeds.next()) {
                     (None, None) => break,
                     (cached, seed) => {
-                        initial_peers.extend(cached);
-                        initial_peers.extend(seed);
+                        // A cached peer must not permanently own the only outbound slot.
+                        if self.peerset_initial_target_size == 1 {
+                            initial_peers.extend(seed);
+                            initial_peers.extend(cached);
+                        } else {
+                            initial_peers.extend(cached);
+                            initial_peers.extend(seed);
+                        }
                     }
                 }
             }

@@ -194,6 +194,33 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     }
 }
 
+/// A cached peer cannot deterministically retain the only startup dial slot.
+#[tokio::test]
+async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: PeerSocketAddr = "127.0.0.9:9000".parse().unwrap();
+    let seed: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 1,
+        initial_mainnet_peers: [seed.to_string()].into_iter().collect(),
+        ..test_defaults()
+    };
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    assert_eq!(selected, IndexSet::from([seed]));
+    let mut discovered = IndexSet::new();
+    while let Some(change) = book_rx.recv().await {
+        discovered.insert(change.addr());
+    }
+    assert_eq!(discovered, IndexSet::from([seed, cached]));
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

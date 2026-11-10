@@ -84,6 +84,47 @@ async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     assert!(config.load_peer_cache().await.unwrap().is_empty());
 }
 
+/// A one-slot startup uses a fresh seed when available and cached peers as fallback.
+#[tokio::test]
+async fn single_startup_slot_prefers_seed_over_cached_peer() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: crate::PeerSocketAddr = "127.0.0.9:9000".parse().unwrap();
+    let seed: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let mut config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 1,
+        initial_mainnet_peers: [seed.to_string()].into_iter().collect(),
+        ..Config::default()
+    };
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec![seed, cached]
+    );
+
+    // A seed already in the cache is deduplicated and the cache remains usable.
+    config.initial_mainnet_peers = [cached.to_string()].into_iter().collect();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec![cached]
+    );
+    config.initial_mainnet_peers.clear();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec![cached]
+    );
+    config.initial_mainnet_peers = [seed.to_string()].into_iter().collect();
+    config.cache_dir = CacheDir::disabled();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec![seed]
+    );
+}
+
 /// Cached peers retain their turns, and seed membership does not depend on the port.
 #[tokio::test]
 async fn peer_cache_alternates_with_seeds_on_any_network_port() {

@@ -40,6 +40,7 @@ use zakura_scheduler::SimInstant;
 use zakura_storage::header::{adapter::EnginePort, controlled::ControlledPort};
 
 use super::{
+    adoption::{AdoptionEvidence, AdoptionFact},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
     session::{SessionEvidence, SessionFact},
@@ -244,6 +245,54 @@ impl RecoveryEvidence {
         })
     }
 
+    /// The record and its objective, once the `recovered` pick wrote the
+    /// record. The objective is `None` if no successor exists.
+    pub fn objective(&self) -> Option<(RecoveryRecord, Option<RecoveryObjective>)> {
+        let recovery = self.get()?;
+        let RecoveryState::Recovered(record) = recovery.state else {
+            return None;
+        };
+        let objective = RecoveryObjective::of(&recovery.baseline, &record);
+        Some((*record, objective))
+    }
+
+    /// Where the objective stands, given the node's `adoption` and `ends`
+    /// facts. The node's adoption at the `recovered` pick and every later
+    /// one count. `header-sync/bounded-adversary-progress` and the liveness
+    /// harness's finish and deadline sources all read this, so they can't
+    /// disagree.
+    pub fn progress(&self, adoption: &AdoptionEvidence, ends: &EndEvidence) -> RecoveryProgress {
+        if self.unreached() {
+            return RecoveryProgress::Concluded;
+        }
+        let Some((record, objective)) = self.objective() else {
+            return RecoveryProgress::Pending;
+        };
+        let Some(objective) = objective else {
+            return RecoveryProgress::Concluded;
+        };
+        let lost = [Assume::StableMembership, Assume::HonestPeer]
+            .into_iter()
+            .any(|assume| !self.holds(ends, assume));
+        let tips: Vec<(u64, Frontier)> = adoption
+            .facts()
+            .into_iter()
+            .filter_map(|stamped| match stamped.fact {
+                AdoptionFact::Adopted(adoption) => Some((stamped.stamp, adoption.header_best)),
+                _ => None,
+            })
+            .collect();
+        let at_pick = tips.iter().rev().find(|(stamp, _)| *stamp <= record.stamp);
+        let met = at_pick
+            .into_iter()
+            .chain(tips.iter().filter(|(stamp, _)| *stamp > record.stamp))
+            .any(|(_, tip)| objective.met_by(tip));
+        if lost || met {
+            return RecoveryProgress::Concluded;
+        }
+        RecoveryProgress::Owed { since: record.at }
+    }
+
     /// The node's baseline, once a `Recover` step was picked.
     pub fn baseline(&self) -> Option<Baseline> {
         self.0
@@ -290,6 +339,71 @@ impl RecoveryEvidence {
             state: RecoveryState::Establishing { relinks: 0 },
         });
     }
+}
+
+/// What a recovery owes the node, by item 7 of the hdr-9 to hdr-13 plan:
+/// `W`, the most work of any member's selected tip or the node's own at the
+/// `recovered` pick, and the headers that meet it. Those are every header of
+/// every such chain whose tip has work `W` that the node's baseline chain
+/// doesn't hold. Every header of those chains is eligible, since the
+/// `Recover` pick reconsidered every invalidation and nothing invalidates
+/// after it. Any supplier counts, and with a tie any of the tied chains
+/// does. A heavier chain no member holds can't come, since members only
+/// take headers some member holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryObjective {
+    /// `W`.
+    pub work: SuffixWork,
+    /// The headers that meet it, in chain order, each once.
+    pub headers: Vec<Frontier>,
+}
+
+impl RecoveryObjective {
+    /// The objective of a recovery from `baseline` that recorded `record`,
+    /// or `None` if no candidate has more work than the baseline, so no
+    /// successor exists.
+    pub fn of(baseline: &Baseline, record: &RecoveryRecord) -> Option<Self> {
+        let candidates: Vec<&SelectedChain> = record
+            .members
+            .iter()
+            .map(|member| &member.selected)
+            .chain(std::iter::once(&record.node_chain))
+            .collect();
+        let work = candidates.iter().map(|chain| chain.work).max()?;
+        if work <= baseline.work {
+            return None;
+        }
+        let mut headers = Vec::new();
+        for chain in candidates.into_iter().filter(|chain| chain.work == work) {
+            for header in &chain.chain {
+                if !baseline.chain.contains(header) && !headers.contains(header) {
+                    headers.push(*header);
+                }
+            }
+        }
+        Some(RecoveryObjective { work, headers })
+    }
+
+    /// Whether the node adopting `tip` meets it.
+    pub fn met_by(&self, tip: &Frontier) -> bool {
+        self.headers.contains(tip)
+    }
+}
+
+/// Where a recovery's objective stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryProgress {
+    /// No `Recover` was picked, or recovery is still establishing.
+    Pending,
+    /// Nothing is owed any more: recovery ended unreached or found no
+    /// successor, the node adopted a header that meets the objective, or
+    /// the environment broke an assumption after the `recovered` pick.
+    Concluded,
+    /// The node owes a successor, since the `recovered` pick at `since`.
+    Owed {
+        /// The `recovered` pick's time.
+        since: SimInstant,
+    },
 }
 
 /// The node's live admitted sessions in `facts`: each admitted session whose
@@ -873,5 +987,212 @@ mod tests {
         evidence.give_up();
         assert!(evidence.unreached());
         assert_eq!(evidence.record(), None);
+    }
+
+    /// Header `height` on fixture branch `branch`, a made-up hash.
+    fn header(branch: u8, height: u32) -> Frontier {
+        let byte = u8::try_from(height).expect("test heights are small");
+        Frontier::new(
+            block::Height(height),
+            block::Hash([branch.wrapping_mul(64) ^ byte; 32]),
+        )
+    }
+
+    /// A chain of `main` branch-0 headers, then `fork` more on `branch`,
+    /// each header one unit of work, from the anchor at height 0.
+    fn chain(main: u32, branch: u8, fork: u32) -> SelectedChain {
+        let mut chain: Vec<Frontier> = (0..=main).map(|height| header(0, height)).collect();
+        chain.extend((main + 1..=main + fork).map(|height| header(branch, height)));
+        let tip = main + fork;
+        SelectedChain {
+            chain,
+            work: SuffixWork::new(zakura_chain::work::difficulty::U256::from(tip)),
+        }
+    }
+
+    /// A record whose members hold `members` and whose node holds `node`.
+    fn record_of(members: Vec<SelectedChain>, node: SelectedChain) -> RecoveryRecord {
+        let tip = |chain: &SelectedChain| (*chain.chain.last().unwrap(), chain.work);
+        RecoveryRecord {
+            step: 7,
+            at: at(2_000),
+            stamp: 0,
+            membership: Vec::new(),
+            members: members
+                .into_iter()
+                .enumerate()
+                .map(|(index, selected)| MemberChain {
+                    member: Member {
+                        peer: format!("mirror-{index}"),
+                        session_id: u64::try_from(index).unwrap(),
+                    },
+                    selected,
+                })
+                .collect(),
+            source: Member {
+                peer: "mirror-0".into(),
+                session_id: 0,
+            },
+            node_tip: tip(&node),
+            source_tip: tip(&node),
+            source_chain: Vec::new(),
+            node_chain: node,
+            facts: 0,
+        }
+    }
+
+    /// The objective is every header of the heaviest chains the baseline
+    /// lacks, whoever holds them: a heavier member's, a tied member's, or
+    /// the node's own reconsidered branch. A lighter fork isn't in it, a
+    /// shared prefix is, and no heavier candidate means none.
+    #[test]
+    fn the_objective_is_the_heaviest_chains_past_the_baseline() {
+        let baseline = chain(3, 0, 0);
+        let headers = |objective: Option<RecoveryObjective>| objective.map(|o| o.headers);
+
+        // One member one header ahead: its successor.
+        let one = record_of(vec![chain(4, 0, 0)], chain(3, 0, 0));
+        assert_eq!(
+            headers(RecoveryObjective::of(&baseline, &one)),
+            Some(vec![header(0, 4)])
+        );
+
+        // A lighter fork from the baseline's tip isn't in it.
+        let fork = record_of(vec![chain(5, 0, 0), chain(3, 1, 1)], chain(3, 0, 0));
+        let objective = RecoveryObjective::of(&baseline, &fork).unwrap();
+        assert_eq!(objective.headers, [header(0, 4), header(0, 5)]);
+        assert!(!objective.met_by(&header(1, 4)));
+        assert_eq!(objective.work, chain(5, 0, 0).work);
+
+        // A fork that shares the heaviest chain's first header: that header
+        // meets it, whoever serves it.
+        let shared = record_of(vec![chain(6, 0, 0), chain(4, 1, 1)], chain(3, 0, 0));
+        assert!(RecoveryObjective::of(&baseline, &shared)
+            .unwrap()
+            .met_by(&header(0, 4)));
+
+        // Two tied chains: either one's headers meet it.
+        let tied = record_of(vec![chain(4, 0, 0), chain(3, 1, 1)], chain(3, 0, 0));
+        assert_eq!(
+            headers(RecoveryObjective::of(&baseline, &tied)),
+            Some(vec![header(0, 4), header(1, 4)])
+        );
+
+        // The node's own branch, reconsidered after a baseline that lost it,
+        // outweighs a lighter separate member fork.
+        let lost = chain(2, 0, 0);
+        let reconsidered = record_of(vec![chain(4, 0, 0)], chain(2, 1, 3));
+        assert_eq!(
+            headers(RecoveryObjective::of(&lost, &reconsidered)),
+            Some(vec![header(1, 3), header(1, 4), header(1, 5)])
+        );
+
+        // Nothing heavier than the baseline: no successor.
+        let even = record_of(vec![chain(3, 0, 0), chain(2, 1, 1)], chain(3, 0, 0));
+        assert_eq!(RecoveryObjective::of(&baseline, &even), None);
+    }
+
+    /// The node's adoption at `height` on branch 0, reported to `adoption`.
+    fn adopt(adoption: &AdoptionEvidence, height: u32) {
+        use zakura_header_chain::{HeaderGeneration, StateVersion, VerifiedGeneration};
+
+        let anchor = header(0, 0);
+        adoption.record(
+            Duration::ZERO,
+            AdoptionFact::Adopted(super::super::adoption::Adoption {
+                state_version: StateVersion::new(u64::from(height)),
+                header_generation: HeaderGeneration::new(1),
+                finalized: anchor,
+                header_best: header(0, height),
+                suffix_work: zakura_chain::work::difficulty::U256::from(height),
+                oldest_retained: anchor.height,
+                verified_generation: VerifiedGeneration::new(1),
+                verified_best: anchor,
+            }),
+        );
+    }
+
+    /// A recovery of `mirror-0` from a baseline at 3, recorded once
+    /// `adoption`'s and `ends`' facts so far are in, with one member at 4.
+    fn owing(ends: &EndEvidence) -> RecoveryEvidence {
+        let recovery = RecoveryEvidence::default();
+        recovery.start("mirror-0".into(), at(0), chain(3, 0, 0));
+        let record = RecoveryRecord {
+            stamp: ends.stamps().issued(),
+            ..record_of(vec![chain(4, 0, 0)], chain(3, 0, 0))
+        };
+        if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
+            recovery.state = RecoveryState::Recovered(Box::new(record));
+        }
+        recovery
+    }
+
+    /// Progress is pending until the record, owed from the pick until the
+    /// node adopts a header that meets the objective, either before the
+    /// pick or after it, and concluded once the environment breaks an
+    /// assumption or recovery ends unreached. An adoption off the objective
+    /// answers nothing.
+    #[test]
+    fn progress_is_owed_from_the_record_until_met_or_ended() {
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let pending = RecoveryEvidence::default();
+        assert_eq!(
+            pending.progress(&adoption, &ends),
+            RecoveryProgress::Pending
+        );
+        pending.start("mirror-0".into(), at(0), chain(3, 0, 0));
+        assert_eq!(
+            pending.progress(&adoption, &ends),
+            RecoveryProgress::Pending
+        );
+        pending.give_up();
+        assert_eq!(
+            pending.progress(&adoption, &ends),
+            RecoveryProgress::Concluded
+        );
+
+        // Owed from the pick's time, with the node at the baseline.
+        adopt(&adoption, 3);
+        let recovery = owing(&ends);
+        let owed = RecoveryProgress::Owed { since: at(2_000) };
+        assert_eq!(recovery.progress(&adoption, &ends), owed);
+        // A later adoption of the baseline's own tip answers nothing, and
+        // one of the successor meets it.
+        adopt(&adoption, 3);
+        assert_eq!(recovery.progress(&adoption, &ends), owed);
+        adopt(&adoption, 4);
+        assert_eq!(
+            recovery.progress(&adoption, &ends),
+            RecoveryProgress::Concluded
+        );
+
+        // The node already at the successor at the pick meets it there. An
+        // older adoption at the pick doesn't.
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        adopt(&adoption, 4);
+        assert_eq!(
+            owing(&ends).progress(&adoption, &ends),
+            RecoveryProgress::Concluded
+        );
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        adopt(&adoption, 4);
+        adopt(&adoption, 3);
+        assert_eq!(owing(&ends).progress(&adoption, &ends), owed);
+
+        // The environment closing a member after the pick ends what's owed,
+        // and the node ending the source's session doesn't.
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let recovery = owing(&ends);
+        ends.record(EndFact::ReactorExited { step: 9 });
+        assert_eq!(recovery.progress(&adoption, &ends), owed);
+        ends.record(environment("mirror-1", EnvironmentAction::Close));
+        assert_eq!(
+            recovery.progress(&adoption, &ends),
+            RecoveryProgress::Concluded
+        );
     }
 }

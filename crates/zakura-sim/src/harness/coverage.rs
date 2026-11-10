@@ -935,6 +935,14 @@ pub static COVERAGE: &[Coverage] = &[
         )),
     },
     Coverage {
+        property: crate::domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
+        passing: passes(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("skipped-apply"),
+    },
+    Coverage {
         property: crate::domain::header_sync_progress::HONEST_PROGRESS,
         passing: passes(
             "tests/header_wire_progress.rs",

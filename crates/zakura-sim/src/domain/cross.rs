@@ -808,7 +808,7 @@ where
         needs: &[Source::View, Source::Schedule],
         status: Status::Active,
         check: check_teardown::<S>,
-        witness: Some(TriggerHistory::View(node_settled::<S::View>)),
+        witness: Some(TriggerHistory::View(header_settlement_reached::<S::View>)),
     }]
 }
 
@@ -836,8 +836,9 @@ where
     }
 }
 
-/// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the harness stopped the
-/// node and header sync's tap saw it settle.
-fn node_settled<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
-    view.rounds().settled()
+/// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history, as header sync's:
+/// header sync's queue released a round, or the harness stopped the node
+/// and header sync's tap saw it settle.
+fn header_settlement_reached<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
+    view.rounds().any_released() || view.rounds().settled()
 }

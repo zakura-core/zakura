@@ -139,9 +139,10 @@ pub const REPLACEMENT_PRESERVES_AUTHORIZATION: &str = "session/replacement-prese
 
 /// A block-sync request that waits on its peer closes no shared connection:
 /// the node decides no close with a recorded cause on the request's
-/// connection while the request waits within its request timeout. A
-/// routine that abandons a request doesn't end the wait: its peer may still
-/// answer.
+/// connection while the request waits within its request timeout. Only
+/// the request's first body, a reset, a skipped or failed write, or the
+/// timeout ends the wait: a request whose routine drops it unanswered still
+/// waits, since its peer may still answer.
 pub const STALLED_SERVICE_ISOLATED: &str = "session/stalled-service-isolated";
 
 /// How long a block-sync request must wait, in virtual time, before
@@ -315,8 +316,7 @@ struct Waits {
     waiting: BTreeMap<(u64, u64), Wait>,
     /// The virtual time of the last `TimeAdvanced` row.
     now_ns: u64,
-    /// The longest wait that ended or that its routine abandoned, in
-    /// nanoseconds.
+    /// The longest wait that ended, in nanoseconds.
     longest_ns: u64,
 }
 
@@ -353,16 +353,6 @@ impl Waits {
                 if matches!(step.as_str(), "reset" | "expired" | "delivery-failed") =>
             {
                 owner
-            }
-            BlockSyncFact::Request { owner, step, .. } if step.starts_with("dropped") => {
-                // The routine abandoned the request unanswered. It still
-                // waits, but its wait so far counts as a stall.
-                if let Some(wait) = self.waiting.get(&(owner.session_id, owner.request_id)) {
-                    self.longest_ns = self
-                        .longest_ns
-                        .max(self.now_ns.saturating_sub(wait.since_ns));
-                }
-                return false;
             }
             BlockSyncFact::HandoffStarted { owner, .. } => owner,
             _ => return false,
@@ -478,12 +468,18 @@ fn check_stalled_service_isolated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdi
 
 /// [`STALLED_SERVICE_ISOLATED`]'s trigger history: a block-sync request
 /// waited at least [`STALL_WITNESS`] before its first body arrived, block
-/// sync reset it, or its routine abandoned it.
+/// sync reset it, or the log ended.
 fn a_request_stalled(log: &ObservationLog) -> bool {
     let mut waits = Waits::default();
     for entry in log.entries() {
         waits.fold(&entry.obs);
     }
+    let open = waits
+        .waiting
+        .values()
+        .map(|wait| waits.now_ns.saturating_sub(wait.since_ns))
+        .max()
+        .unwrap_or(0);
     let threshold = u64::try_from(STALL_WITNESS.as_nanos()).expect("half a second fits u64");
-    waits.longest_ns >= threshold
+    waits.longest_ns.max(open) >= threshold
 }

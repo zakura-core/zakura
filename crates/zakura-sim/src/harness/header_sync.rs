@@ -1373,6 +1373,7 @@ impl Subsystem for HeaderWire {
             Some(ports.sessions.clone()),
         );
         let dials = tap.dials();
+        let shared_ids = tap.shared_ids();
         sim.add_source(Box::new(tap));
         let node = WireNode::spawn(
             sim,
@@ -1384,7 +1385,7 @@ impl Subsystem for HeaderWire {
             dials,
         );
         let failure = PeerFailure::default();
-        let mut control = PeerControl::new(failure.clone(), ports.records.clone());
+        let mut control = PeerControl::new(failure.clone(), ports.records.clone(), shared_ids);
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =
                 control.add(&name, spec.script.clone(), spec.adversary.is_some());

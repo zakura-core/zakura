@@ -208,7 +208,7 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
         ..test_defaults()
     };
     config
-        .update_peer_cache([cached].into_iter().collect())
+        .update_peer_cache([cached, seed].into_iter().collect())
         .await
         .unwrap();
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);

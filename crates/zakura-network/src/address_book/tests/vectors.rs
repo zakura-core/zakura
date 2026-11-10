@@ -145,7 +145,7 @@ fn peer_cache_excludes_known_non_node_services() {
         .get(non_node)
         .unwrap()
         .last_known_info_is_valid_for_outbound(&Mainnet));
-    assert_eq!(book.get(unknown).unwrap().untrusted_services(), None);
+    assert_eq!(book.get(unknown).unwrap().services, None);
     assert_eq!(
         book.cacheable(Utc::now())
             .iter()

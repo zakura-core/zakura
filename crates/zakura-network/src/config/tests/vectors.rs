@@ -106,6 +106,20 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
         vec![seed, cached]
     );
 
+    // Seeds retain their source priority even behind a faster peer in the cache.
+    config
+        .update_peer_cache([cached, seed].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec![seed, cached]
+    );
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+
     // A seed already in the cache is deduplicated and the cache remains usable.
     config.initial_mainnet_peers = [cached.to_string()].into_iter().collect();
     assert_eq!(

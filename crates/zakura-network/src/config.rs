@@ -559,8 +559,11 @@ impl Config {
                 }
             });
 
-            // Remove overlap before alternating, so a duplicate cannot consume a seed turn.
-            dns_peers.retain(|addr| !disk_peers.contains(addr));
+            // With one slot, seed membership must survive even if a seed is cached.
+            // Otherwise remove overlap so a duplicate cannot consume a seed turn.
+            if self.peerset_initial_target_size != 1 {
+                dns_peers.retain(|addr| !disk_peers.contains(addr));
+            }
             let mut cached = disk_peers.into_iter();
             let mut seeds = dns_peers.into_iter();
             let mut initial_peers = IndexSet::new();

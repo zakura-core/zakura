@@ -1,4 +1,4 @@
-//! `header-sync/state-publication-consistent`'s safety rules, judged at the
+//! `header-sync/state-publication-consistent`'s rules, judged at the
 //! owner boundaries Rule 10 names: the engine's own records, the port's
 //! publications on its selected-chain watch, the reactor's adoption, and
 //! what the reactor's publishers queue or send.
@@ -32,6 +32,17 @@
 //! broken rule is a claim break, which the tap hands
 //! [`Claim::StatePublicationConsistent`](super::claim::Claim) at its drain.
 //!
+//! **Liveness facts.** A harness that arms the evidence
+//! ([`PublicationEvidence::armed`]) also gets stamped facts, which the
+//! property's obligations read: each commit ([`PublicationFact::Committed`])
+//! and adoption, and, in a declared status fixture, each session's owed
+//! `Status` and the queued one that pays it. A session is owed one at its
+//! admission, and at the first adoption that changes what its `Status`
+//! advertises while nothing it was queued advertises that adoption. Later
+//! changes keep the debt open rather than opening another. A queued
+//! `Status` that advertises the newest adoption pays it, and a stale one is
+//! `StaleStatus` already.
+//!
 //! **Taint.** A run that changed the engine other than its rules allow,
 //! such as a failed apply that installed its state anyway, is
 //! `commit-only-authorized`'s commit-contents check's to report. What it
@@ -43,13 +54,73 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use zakura_header_chain::{EngineSnapshot, Frontier};
-use zakura_network::zakura::observe::ReactorEvent;
+use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::EngineRun;
 
-use super::adoption::Adoption;
+use super::{
+    adoption::{Adoption, STATUS_CHANGE_BOUND},
+    stamp::Stamps,
+};
+
+/// How long a session in a status fixture may be owed its `Status`: the
+/// publisher's change bound ([`STATUS_CHANGE_BOUND`], its
+/// `MAX_CHANGE_DELAY`) plus its one-second publication floor
+/// (`MIN_PUBLICATION_INTERVAL`), behind which it coalesces changes.
+pub const STATUS_DEADLINE: Duration = STATUS_CHANGE_BOUND.saturating_add(Duration::from_secs(1));
+
+/// A stamped fact an armed [`PublicationEvidence`] keeps for the
+/// property's obligations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicationFact {
+    /// An engine run committed state `state_version` at `at`.
+    Committed {
+        /// The committed state version.
+        state_version: u64,
+        /// When its record was read.
+        at: SimInstant,
+    },
+    /// The reactor adopted state `state_version`.
+    Adopted {
+        /// The adopted state version.
+        state_version: u64,
+    },
+    /// `peer`'s session `session_id` is owed a `Status` advertising the
+    /// newest adoption, from `at`. Only a status fixture's evidence keeps
+    /// it.
+    StatusOwed {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+        /// When the debt opened.
+        at: SimInstant,
+    },
+    /// A `Status` advertising the newest adoption was queued for session
+    /// `session_id`, which paid what it was owed.
+    StatusPaid {
+        /// The session.
+        session_id: u64,
+    },
+    /// The commit-contents check found a run corrupt, after which this
+    /// check judges nothing and every debt is that check's
+    /// ([`Publication::run`]).
+    Tainted,
+}
+
+/// What an armed [`PublicationEvidence`] stamps facts for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Arming {
+    /// Whether the evidence keeps facts at all.
+    pub armed: bool,
+    /// Whether the harness declared a status fixture, whose sessions are
+    /// owed their `Status` in time.
+    pub status: bool,
+}
 
 /// What [`PublicationEvidence`] keeps.
 #[derive(Debug, Default)]
@@ -66,6 +137,18 @@ struct Store {
     owed: Option<Frontier>,
     /// Whether the run settled, once it has ended.
     settled: Option<bool>,
+    /// What the store keeps stamped facts for.
+    arming: Arming,
+    /// Where its stamps come from: the node's, once its tap hands them
+    /// over.
+    stamps: Stamps,
+    /// Each stamped fact, in stamp order.
+    facts: Vec<(u64, PublicationFact)>,
+    /// Set when the run's log froze. Facts after it are dropped.
+    frozen: bool,
+    /// Each node's peer ID and harness name, which the harness's
+    /// environment facts name it by.
+    names: Vec<(ZakuraPeerId, String)>,
 }
 
 /// When the publication check first applied, and the tip it still owes,
@@ -74,6 +157,109 @@ struct Store {
 pub struct PublicationEvidence(Arc<Mutex<Store>>);
 
 impl PublicationEvidence {
+    /// Evidence that also keeps the stamped facts `arming` asks for. The
+    /// default keeps none.
+    pub fn armed(arming: Arming) -> PublicationEvidence {
+        PublicationEvidence(Arc::new(Mutex::new(Store {
+            arming,
+            ..Store::default()
+        })))
+    }
+
+    /// What the evidence keeps stamped facts for.
+    pub fn arming(&self) -> Arming {
+        self.with(|store| store.arming)
+    }
+
+    /// Stamps facts from `stamps`, the node's, from now on.
+    pub(super) fn stamp_with(&self, stamps: Stamps) {
+        self.with(|store| store.stamps = stamps);
+    }
+
+    /// Stops keeping facts. The harness calls it when the run's log
+    /// freezes, as [`super::adoption::AdoptionEvidence`] does.
+    pub fn freeze(&self) {
+        self.with(|store| store.frozen = true);
+    }
+
+    /// Keeps `fact` with the next stamp, if the evidence is armed, `status`
+    /// facts only in a status fixture, and the log hasn't frozen.
+    fn keep(&self, fact: PublicationFact) {
+        self.with(|store| {
+            let status = matches!(
+                fact,
+                PublicationFact::StatusOwed { .. } | PublicationFact::StatusPaid { .. }
+            );
+            if store.arming.armed && (store.arming.status || !status) && !store.frozen {
+                let stamp = store.stamps.next();
+                store.facts.push((stamp, fact));
+            }
+        });
+    }
+
+    /// Every stamped fact, in stamp order.
+    pub fn facts(&self) -> Vec<(u64, PublicationFact)> {
+        self.with(|store| store.facts.clone())
+    }
+
+    /// The fact with stamp `stamp`, if this store holds it.
+    pub fn fact(&self, stamp: u64) -> Option<PublicationFact> {
+        self.with(|store| {
+            store
+                .facts
+                .binary_search_by_key(&stamp, |(at, _)| *at)
+                .ok()
+                .map(|index| store.facts[index].1.clone())
+        })
+    }
+
+    /// The newest state version adopted by a fact stamped before `stamp`.
+    pub fn adopted_before(&self, stamp: u64) -> Option<u64> {
+        self.with(|store| {
+            store
+                .facts
+                .iter()
+                .take_while(|(at, _)| *at < stamp)
+                .filter_map(|(_, fact)| match fact {
+                    PublicationFact::Adopted { state_version } => Some(*state_version),
+                    _ => None,
+                })
+                .max()
+        })
+    }
+
+    /// Notes each node's peer ID and harness name, so a debt's peer can be
+    /// matched with the harness's environment facts, which name peers.
+    pub fn name_peers(&self, names: Vec<(ZakuraPeerId, String)>) {
+        self.with(|store| store.names = names);
+    }
+
+    /// The harness name of the node with peer ID `peer`, if the harness
+    /// named it ([`Self::name_peers`]).
+    pub fn peer_name(&self, peer: &ZakuraPeerId) -> Option<String> {
+        self.with(|store| {
+            store
+                .names
+                .iter()
+                .find(|(id, _)| id == peer)
+                .map(|(_, name)| name.clone())
+        })
+    }
+
+    /// The peer whose session `session_id` was owed a `Status`, if it was.
+    pub fn owed_peer(&self, session_id: u64) -> Option<ZakuraPeerId> {
+        self.with(|store| {
+            store.facts.iter().find_map(|(_, fact)| match fact {
+                PublicationFact::StatusOwed {
+                    peer,
+                    session_id: owed,
+                    ..
+                } if *owed == session_id => Some(peer.clone()),
+                _ => None,
+            })
+        })
+    }
+
     /// Runs `change` on the store. Nothing else is called while the lock
     /// is held.
     fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
@@ -131,6 +317,8 @@ pub(super) struct Publication {
     committed: Vec<EngineSnapshot>,
     /// The latest adoption.
     adopted: Option<Adoption>,
+    /// Each admitted session the node still holds, in a status fixture.
+    sessions: HashMap<u64, Session>,
     /// Whether the commit-contents check found a run corrupt, after which
     /// nothing is judged.
     tainted: bool,
@@ -148,6 +336,7 @@ impl Publication {
             newest,
             committed: Vec::new(),
             adopted: None,
+            sessions: HashMap::new(),
             tainted: false,
             breaks: Vec::new(),
             evidence,
@@ -163,6 +352,7 @@ impl Publication {
             self.tainted = true;
             self.committed.clear();
             self.evidence.with(|store| store.taint_pending = true);
+            self.evidence.keep(PublicationFact::Tainted);
         }
         if self.tainted {
             return;
@@ -172,6 +362,10 @@ impl Publication {
         if run.after.metadata.state_version != run.before.metadata.state_version {
             self.newest = version;
             self.committed.push(run.snapshot.clone());
+            self.evidence.keep(PublicationFact::Committed {
+                state_version: version,
+                at: now(),
+            });
         }
     }
 
@@ -222,9 +416,18 @@ impl Publication {
                 };
                 self.adopted_one(adoption);
             }
+            ReactorEvent::SessionAdmitted {
+                peer, session_id, ..
+            } => self.admitted(peer, *session_id),
+            ReactorEvent::SessionEnded { session_id, .. } => {
+                // The node ending a session pays nothing it owed, and it's
+                // owed nothing new.
+                self.sessions.remove(session_id);
+            }
             ReactorEvent::StatusQueued {
                 session_id, status, ..
             } => {
+                self.queued(*session_id, status);
                 if let Some(adopted) = self
                     .adopted
                     .as_ref()
@@ -331,7 +534,63 @@ impl Publication {
             self.evidence
                 .with(|store| store.owed = Some(adoption.header_best));
         }
+        self.evidence.keep(PublicationFact::Adopted {
+            state_version: version,
+        });
+        for (session_id, session) in &mut self.sessions {
+            let advertised = session
+                .queued
+                .as_ref()
+                .is_some_and(|status| adoption.advertised_by(status));
+            if !session.owed && !advertised {
+                session.owed = true;
+                self.evidence.keep(PublicationFact::StatusOwed {
+                    peer: session.peer.clone(),
+                    session_id: *session_id,
+                    at: now(),
+                });
+            }
+        }
         self.adopted = Some(adoption);
+    }
+
+    /// Notes `peer`'s admitted session `session_id`, which is owed its
+    /// first `Status`.
+    fn admitted(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        if !self.evidence.arming().status {
+            return;
+        }
+        self.sessions.insert(
+            session_id,
+            Session {
+                peer: peer.clone(),
+                owed: true,
+                queued: None,
+            },
+        );
+        self.evidence.keep(PublicationFact::StatusOwed {
+            peer: peer.clone(),
+            session_id,
+            at: now(),
+        });
+    }
+
+    /// Notes the `status` queued for `session_id`, which pays its debt if it
+    /// advertises the newest adoption.
+    fn queued(&mut self, session_id: u64, status: &Status) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.queued = Some(status.clone());
+        let newest = self
+            .adopted
+            .as_ref()
+            .is_none_or(|adopted| adopted.advertised_by(status));
+        if session.owed && newest {
+            session.owed = false;
+            self.evidence
+                .keep(PublicationFact::StatusPaid { session_id });
+        }
     }
 
     /// The breaks found since the last call. Marks the check applicable at
@@ -358,6 +617,21 @@ impl Publication {
     fn applies(&self) {
         self.evidence.with(|store| store.pending = true);
     }
+}
+
+/// One admitted session's `Status` debt.
+struct Session {
+    /// Its peer.
+    peer: ZakuraPeerId,
+    /// Whether it's owed a `Status` advertising the newest adoption.
+    owed: bool,
+    /// The last `Status` queued for it.
+    queued: Option<Status>,
+}
+
+/// The run's current time, or its start outside a step.
+fn now() -> SimInstant {
+    zakura_scheduler::hooks::now().unwrap_or_default()
 }
 
 #[cfg(test)]

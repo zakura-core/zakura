@@ -772,6 +772,14 @@ fn the_scenario_byte_picks_each_fixture() {
         let wrapped = u8::try_from(index + all.len()).expect("few fixtures");
         assert_eq!(Liveness::draw(&[wrapped]), *fixture);
     }
+    // A change to the fixture list moves this mapping, so it bumps the
+    // generator, which corpus carry checks.
+    assert_eq!(
+        (Liveness::GENERATOR, all.len()),
+        (3, 39),
+        "a new fixture list needs a new generator"
+    );
+    assert_eq!(Liveness::draw(&[30]), LivenessScenario::QuietReset);
 }
 
 /// The serving-read fixture holds the property and applies, with the

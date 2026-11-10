@@ -965,7 +965,7 @@ impl Topology {
 
     /// Records why a `Control` step couldn't take effect, which ends the
     /// run as a harness failure.
-    fn fail(&self, why: String) {
+    pub(crate) fn fail(&self, why: String) {
         self.effects.failure.borrow_mut().get_or_insert(why);
     }
 
@@ -1648,7 +1648,13 @@ impl Control {
             }
             ControlAction::Release { hold } => self.topology.release(hold),
             ControlAction::StopStorage => port()?.shut_down(),
-            ControlAction::Commit { len } => self.commit(&*port()?, len)?,
+            ControlAction::Commit { len } => {
+                let adoption = self
+                    .adoption
+                    .as_ref()
+                    .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?;
+                harness_commit(&*port()?, &self.fixture, adoption, len)?;
+            }
             ControlAction::Recover => self.recover(&*port()?, &step.peer)?,
             ControlAction::RepairStatus {
                 unavailable,
@@ -1695,40 +1701,40 @@ impl Control {
     }
 }
 
-impl Control {
-    /// Commits `len` fixture headers past `port`'s selected tip straight
-    /// into its engine, through the port's harness-commit hook, which
-    /// records the commit's engine run, then records the engine's new state
-    /// as `Published`.
-    /// The step loop calls it outside any task, so the engine's watch sends
-    /// wake no task before the record.
-    fn commit(&self, port: &ControlledPort, len: u32) -> Result<(), String> {
-        let engine = port.engine();
-        let snapshot = engine.snapshot();
-        let tip = snapshot.frontiers.header_best;
-        let headers = self.fixture.extend(tip, len, 0);
-        let hashes = headers.iter().map(|header| header.hash()).collect();
-        let request = self.fixture.target_request(&snapshot, tip, &headers, 1);
-        // The port records the commit's engine run, so every check that
-        // judges engine runs judges it as it does an apply's.
-        port.harness_commit(hashes, |engine| {
-            let applied = ready(engine.prepare_header_target(request))
-                .and_then(|prepared| ready(engine.apply_header_target(prepared)))
-                .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
-            if !matches!(applied, ApplyHeaderTargetOutcome::Applied) {
-                return Err(format!(
-                    "committing {len} headers on {tip:?} gave {applied:?}"
-                ));
-            }
-            Ok(())
-        })?;
-        let published = engine.snapshot();
-        self.adoption
-            .as_ref()
-            .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?
-            .publish(published.state_version, published.header_generation);
+/// Commits `len` of `fixture`'s headers past `port`'s selected tip straight
+/// into its engine, through the port's harness-commit hook, which records
+/// the commit's engine run, then records the engine's new state in
+/// `adoption` as `Published`, as a `Commit` step does. Call it from the step
+/// loop, outside any task, so the engine's watch sends wake no task before
+/// the record.
+pub(crate) fn harness_commit(
+    port: &ControlledPort,
+    fixture: &HeaderFixture,
+    adoption: &AdoptionEvidence,
+    len: u32,
+) -> Result<(), String> {
+    let engine = port.engine();
+    let snapshot = engine.snapshot();
+    let tip = snapshot.frontiers.header_best;
+    let headers = fixture.extend(tip, len, 0);
+    let hashes = headers.iter().map(|header| header.hash()).collect();
+    let request = fixture.target_request(&snapshot, tip, &headers, 1);
+    // The port records the commit's engine run, so every check that
+    // judges engine runs judges it as it does an apply's.
+    port.harness_commit(hashes, |engine| {
+        let applied = ready(engine.prepare_header_target(request))
+            .and_then(|prepared| ready(engine.apply_header_target(prepared)))
+            .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
+        if !matches!(applied, ApplyHeaderTargetOutcome::Applied) {
+            return Err(format!(
+                "committing {len} headers on {tip:?} gave {applied:?}"
+            ));
+        }
         Ok(())
-    }
+    })?;
+    let published = engine.snapshot();
+    adoption.publish(published.state_version, published.header_generation);
+    Ok(())
 }
 
 impl ActionSource for Control {

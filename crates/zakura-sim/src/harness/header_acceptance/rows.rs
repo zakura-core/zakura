@@ -1935,6 +1935,111 @@ fn hand_written_rows() -> Vec<Row> {
         retirement,
     ));
 
+<<<<<<< HEAD
+=======
+    let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
+    for (index, (name, harness, set, found)) in [
+        (
+            "offer-by-height",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "score-corrupted",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "score-corrupted-by-commit",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "selector-prefers-length",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        selected.extend(caught(
+            harness,
+            case(SELECTED, name),
+            set,
+            found,
+            G2,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(SELECTED, storage_harnesses, selected));
+
+    let mut publication = holds(PUBLICATION, G134, PUBLICATION_WITNESSES);
+    // `stale-status-cache` is the adopted-state native
+    // mutation, moved here as a case of their own name.
+    for (index, (name, harness, set, found)) in [
+        (
+            "mixed-adoption",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "old-fields-after-reset",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "permanent-refusal",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "postponed-while-changing",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "publication-skipped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-status-cache",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "watch-ignored",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        publication.extend(caught(
+            harness,
+            case(PUBLICATION, name),
+            set,
+            found,
+            G134,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(PUBLICATION, storage_harnesses, publication));
+
+>>>>>>> 512faa2e1a (test(zakura-sim): oblige adoption and a timely status in state-publication-consistent)
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);
     for (index, name) in [
@@ -2593,11 +2698,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         "header-sync/reset-invalidates-work",
         "hdr-9a.2",
     ),
-    to_move(
-        "stale-status-cache",
-        "header-sync/state-publication-consistent",
-        "hdr-12b",
-    ),
+    NativeMutation {
+        patch: "stale-status-cache",
+        class: NativeClass::Moved {
+            property: "header-sync/state-publication-consistent",
+            case: "stale-status-cache",
+        },
+    },
     to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
     NativeMutation {
         patch: "unreleased-retirement",

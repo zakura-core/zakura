@@ -301,7 +301,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/header_sync.rs",
         function: "check_state_publication",
-        fingerprint: "f336b39a795850ad",
+        fingerprint: "d61ab900be190998",
         constructions: &[
             step(
                 "no commit, adoption, status debt or served page had applied by this step, or a corrupt engine state tainted the publication evidence",

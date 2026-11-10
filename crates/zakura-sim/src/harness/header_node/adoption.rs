@@ -8,14 +8,13 @@
 //! drain, which bounds how far a run got, and, once the run ends, whether it
 //! settled.
 //!
-//! [`AdoptionEvidence::generation`] and [`AdoptionEvidence::status`]
-//! check hdr-4's adopted-state rules over the facts. Its tip rule is
+//! [`AdoptionEvidence::generation`] checks hdr-4's generation rule over the
+//! facts. Its status and tip rules are
 //! `header-sync/state-publication-consistent`'s
-//! ([`super::publication`]). A rule whose deadline the run didn't reach is
-//! [`Acceptance::Inconclusive`].
+//! ([`super::publication`]), whose status deadline replaced
+//! `StatusOverdue`.
 
 use std::{
-    collections::BTreeMap,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -30,15 +29,10 @@ use zakura_network::zakura::{
 use super::stamp::Stamps;
 use crate::{IdleStatus, Outcome, RunEnd};
 
-/// How long after an adoption that changes a session's status the reactor
-/// may wait before it queues that status or records a deferral:
+/// How long after an adoption that changes a session's status the
+/// reactor's status publisher may wait before it queues that status:
 /// `MAX_CHANGE_DELAY` in header sync's status publisher.
 pub const STATUS_CHANGE_BOUND: Duration = Duration::from_secs(2);
-
-/// How long after a deferral the reactor may wait before it tries again:
-/// the publisher's 100 ms retry, raised to at most one second after its last
-/// send by its publication floor.
-pub const STATUS_RETRY_BOUND: Duration = Duration::from_secs(1);
 
 /// A committed snapshot the reactor adopted, in the fields it schedules and
 /// publishes from.
@@ -535,96 +529,6 @@ impl AdoptionEvidence {
         }
         Acceptance::Holds
     }
-
-    /// The status rule. Every queued `Status` advertises the latest adoption.
-    /// Each session in `sessions` is owed, while it lasts:
-    ///
-    /// - its first status fact within [`STATUS_CHANGE_BOUND`] of starting,
-    ///   since the reactor publishes to a session as soon as it admits it,
-    /// - after an adoption that changes the advertised status, a
-    ///   `StatusQueued` with it or a `StatusDeferred` within
-    ///   [`STATUS_CHANGE_BOUND`],
-    /// - after a deferral, another status fact within [`STATUS_RETRY_BOUND`].
-    ///
-    /// A later adoption that changes the status replaces what's owed, since
-    /// the publisher only ever sends its latest desired status, and resets the
-    /// deadline even when the session already holds that status, since the
-    /// publisher then sends it again. One that doesn't change the status keeps
-    /// the deadline. An adoption before a session starts owes it nothing
-    /// beyond its first status, and a deadline at or after its end is owed
-    /// nothing. The bounds assume the harness doesn't hold the reactor's task
-    /// (`Sim::hold_tasks`), as the header harnesses don't. A run that ends before a deadline is
-    /// inconclusive. Status facts for a session not in `sessions` are checked
-    /// only for what they advertise.
-    pub fn status(&self, sessions: &[SessionLife]) -> Acceptance {
-        let store = self.store();
-        let mut latest: Option<&Adoption> = None;
-        let mut owed: BTreeMap<u64, Owed> = sessions
-            .iter()
-            .map(|life| {
-                let owed = Owed {
-                    due: Some(life.from + STATUS_CHANGE_BOUND),
-                    from: life.from,
-                    until: life.until,
-                };
-                (life.session_id, owed)
-            })
-            .collect();
-        for stamped in &store.facts {
-            if let Some((session, due)) = overdue(&owed, stamped.at) {
-                return unsent(session, due);
-            }
-            match &stamped.fact {
-                AdoptionFact::Adopted(adoption) => {
-                    let changed = latest.is_none_or(|latest| !latest.advertises_as(adoption));
-                    latest = Some(adoption);
-                    if !changed {
-                        continue;
-                    }
-                    for session in owed.values_mut().filter(|owed| owed.from <= stamped.at) {
-                        session.due = Some(stamped.at + STATUS_CHANGE_BOUND);
-                    }
-                }
-                AdoptionFact::StatusQueued {
-                    session_id, status, ..
-                } => {
-                    if let Some(adoption) = latest.filter(|latest| !latest.advertised_by(status)) {
-                        return Acceptance::Violated(format!(
-                            "StaleStatus: session {session_id} was queued a status for tip \
-                             {:?}, anchor {:?}, while the reactor's adopted tip is {:?}, \
-                             anchor {:?}",
-                            Frontier::new(status.selected_tip_height, status.selected_tip_hash),
-                            Frontier::new(status.work_anchor_height, status.work_anchor_hash),
-                            adoption.header_best,
-                            adoption.finalized,
-                        ));
-                    }
-                    if let Some(session) = owed.get_mut(session_id) {
-                        session.due = None;
-                    }
-                }
-                AdoptionFact::StatusDeferred { session_id, .. } => {
-                    if let Some(session) = owed.get_mut(session_id) {
-                        session.due = Some(stamped.at + STATUS_RETRY_BOUND);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some((session, due)) = overdue(&owed, store.horizon) {
-            return unsent(session, due);
-        }
-        match owed
-            .iter()
-            .find_map(|(session, owed)| owed.pending().map(|due| (*session, due)))
-        {
-            Some((session, due)) => Acceptance::Inconclusive(format!(
-                "the run ended at {:?}, before session {session}'s status was due at {due:?}",
-                store.horizon
-            )),
-            None => Acceptance::Holds,
-        }
-    }
 }
 
 /// A session's lifetime, from the harness's side of its link.
@@ -636,41 +540,6 @@ pub struct SessionLife {
     pub from: Duration,
     /// When it closed or was replaced, if it did.
     pub until: Option<Duration>,
-}
-
-/// What the status rule says one session is owed.
-struct Owed {
-    /// When its next status fact is due, if one is owed.
-    due: Option<Duration>,
-    /// When it started.
-    from: Duration,
-    /// When it ended, if it did.
-    until: Option<Duration>,
-}
-
-impl Owed {
-    /// The deadline still owed: one before the session's end, if any.
-    fn pending(&self) -> Option<Duration> {
-        self.due
-            .filter(|due| self.until.is_none_or(|until| *due < until))
-    }
-}
-
-/// The first session whose owed deadline is before `now`, and that deadline.
-fn overdue(owed: &BTreeMap<u64, Owed>, now: Duration) -> Option<(u64, Duration)> {
-    owed.iter().find_map(|(session, owed)| {
-        owed.pending()
-            .filter(|due| now > *due)
-            .map(|due| (*session, due))
-    })
-}
-
-/// The status rule's break for `session`, owed a status fact by `due`.
-fn unsent(session: u64, due: Duration) -> Acceptance {
-    Acceptance::Violated(format!(
-        "StatusOverdue: session {session} was owed its latest status by {due:?}, and the \
-         reactor neither queued it nor recorded a deferral"
-    ))
 }
 
 #[cfg(test)]
@@ -702,27 +571,6 @@ mod tests {
         Frontier::new(block::Height(height), block::Hash([byte; 32]))
     }
 
-    /// The status `adoption` advertises.
-    fn status(adoption: &Adoption) -> Status {
-        Status {
-            work_anchor_height: adoption.finalized.height,
-            work_anchor_hash: adoption.finalized.hash,
-            selected_tip_height: adoption.header_best.height,
-            selected_tip_hash: adoption.header_best.hash,
-            suffix_cumulative_work: adoption.suffix_work,
-            oldest_retained_height: adoption.oldest_retained,
-            max_headers_per_response: 1,
-            max_subscriptions: 1,
-            max_message_bytes: 1,
-            tree_aux_schema_mask: 1,
-        }
-    }
-
-    /// The test peer.
-    fn peer() -> ZakuraPeerId {
-        ZakuraPeerId::new(vec![7; 32]).expect("32 bytes is a peer ID")
-    }
-
     /// Evidence holding `facts`, each at its time in milliseconds, reaching
     /// `horizon_ms`.
     fn evidence(facts: Vec<(u64, AdoptionFact)>, horizon_ms: u64) -> AdoptionEvidence {
@@ -737,23 +585,6 @@ mod tests {
     /// `adoption` as a fact.
     fn adopted(adoption: &Adoption) -> AdoptionFact {
         AdoptionFact::Adopted(adoption.clone())
-    }
-
-    /// `status` queued on session 1.
-    fn queued(status: Status) -> AdoptionFact {
-        AdoptionFact::StatusQueued {
-            peer: peer(),
-            session_id: 1,
-            status,
-        }
-    }
-
-    /// A deferral on session 1.
-    fn deferred() -> AdoptionFact {
-        AdoptionFact::StatusDeferred {
-            peer: peer(),
-            session_id: 1,
-        }
     }
 
     /// A wire take at `point` leaving `queued`.
@@ -943,133 +774,5 @@ mod tests {
             );
             assert!(violates(&broken.generation(), "StaleGeneration"));
         }
-    }
-
-    /// A session is owed its first status and each new one within their
-    /// bounds while it lasts, a deferral owes a retry, and a later changed
-    /// adoption replaces what's owed while an unchanged one keeps the
-    /// deadline. A stale queued status breaks for any session, and a run
-    /// ending before a deadline is inconclusive.
-    #[test]
-    fn a_session_is_owed_its_latest_status_while_it_lasts() {
-        let (first, second, third) = (adoption(1, 1), adoption(2, 2), adoption(3, 3));
-        let life = |until| {
-            [SessionLife {
-                session_id: 1,
-                from: Duration::ZERO,
-                until,
-            }]
-        };
-        let live = life(None);
-        let held = evidence(
-            vec![
-                (0, adopted(&first)),
-                (0, queued(status(&first))),
-                (10, adopted(&second)),
-                (1_000, deferred()),
-                // A later changed adoption replaces what's owed.
-                (1_500, adopted(&third)),
-                (2_000, queued(status(&third))),
-            ],
-            60_000,
-        );
-        assert_eq!(held.status(&live), Acceptance::Holds);
-
-        let stale = evidence(
-            vec![
-                (0, adopted(&first)),
-                (5, adopted(&second)),
-                (5, queued(status(&first))),
-            ],
-            0,
-        );
-        assert!(violates(&stale.status(&live), "StaleStatus"));
-        assert!(violates(&stale.status(&[]), "StaleStatus"));
-
-        // A session that never gets a status breaks once its first is due.
-        let silent = vec![(0, adopted(&first))];
-        assert!(violates(
-            &evidence(silent.clone(), 2_001).status(&live),
-            "StatusOverdue"
-        ));
-        assert!(matches!(
-            evidence(silent, 2_000).status(&live),
-            Acceptance::Inconclusive(_)
-        ));
-
-        let unsent = vec![
-            (0, adopted(&first)),
-            (0, queued(status(&first))),
-            (10, adopted(&second)),
-        ];
-        let overdue = evidence(unsent.clone(), 2_011);
-        assert!(violates(&overdue.status(&live), "StatusOverdue"));
-        assert_eq!(overdue.status(&[]), Acceptance::Holds);
-        // Ending before the deadline owes nothing, and ending after it still
-        // breaks the rule.
-        assert_eq!(
-            overdue.status(&life(Some(Duration::from_millis(2_010)))),
-            Acceptance::Holds
-        );
-        assert!(violates(
-            &overdue.status(&life(Some(Duration::from_millis(2_011)))),
-            "StatusOverdue"
-        ));
-        let cut = evidence(unsent.clone(), 2_010);
-        assert!(matches!(cut.status(&live), Acceptance::Inconclusive(_)));
-
-        // An adoption that changes only the state version keeps the deadline.
-        let same = Adoption {
-            state_version: StateVersion::new(9),
-            ..second.clone()
-        };
-        let mut postponed = unsent;
-        postponed.push((1_900, adopted(&same)));
-        postponed.push((3_000, queued(status(&second))));
-        assert!(violates(
-            &evidence(postponed, 3_000).status(&live),
-            "StatusOverdue"
-        ));
-
-        // A session that starts after an adoption owes its first status from
-        // its own start.
-        let late = [SessionLife {
-            session_id: 1,
-            from: Duration::from_secs(10),
-            until: None,
-        }];
-        let joined = evidence(
-            vec![(0, adopted(&first)), (10_000, queued(status(&first)))],
-            60_000,
-        );
-        assert_eq!(joined.status(&late), Acceptance::Holds);
-
-        // Returning to the queued status still owes a status in time, which the
-        // publisher sends again.
-        let back = vec![
-            (0, adopted(&first)),
-            (0, queued(status(&first))),
-            (1_000, adopted(&second)),
-            (2_900, adopted(&first)),
-        ];
-        assert!(matches!(
-            evidence(back.clone(), 3_100).status(&live),
-            Acceptance::Inconclusive(_)
-        ));
-        let mut resent = back;
-        resent.push((3_000, queued(status(&first))));
-        assert_eq!(evidence(resent, 60_000).status(&live), Acceptance::Holds);
-
-        let retry = vec![
-            (0, adopted(&first)),
-            (0, queued(status(&first))),
-            (10, adopted(&second)),
-            (100, deferred()),
-        ];
-        let unretried = evidence(retry.clone(), 1_101);
-        assert!(violates(&unretried.status(&live), "StatusOverdue"));
-        let mut retried = retry;
-        retried.push((1_100, queued(status(&second))));
-        assert_eq!(evidence(retried, 60_000).status(&live), Acceptance::Holds);
     }
 }

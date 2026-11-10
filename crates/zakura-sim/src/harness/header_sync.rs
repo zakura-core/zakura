@@ -52,7 +52,7 @@ use super::{
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
-        publication::PublicationEvidence,
+        publication::{Arming, PublicationEvidence},
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
@@ -771,9 +771,8 @@ pub struct StorageView {
     pub honest_peers: Rc<BTreeSet<usize>>,
     /// The node's adopted state and what it published from it.
     pub adoption: AdoptionEvidence,
-    /// Each of the node's sessions and how long it lasted, which the status
-    /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
-    /// knows them, from its links.
+    /// Each of the node's sessions and how long it lasted. Only
+    /// `header-sync/storage` knows them, from its links.
     pub sessions: Vec<SessionLife>,
     /// Whom the node's storage failures blamed, for the penalty rule
     /// ([`FaultEvidence::penalized`]).
@@ -829,6 +828,11 @@ impl PublicationView for StorageView {
     /// [`StorageView::publication`].
     fn publication(&self) -> &PublicationEvidence {
         &self.publication
+    }
+
+    /// [`StorageView::ends`].
+    fn ends(&self) -> &EndEvidence {
+        &self.ends
     }
 }
 
@@ -1162,7 +1166,15 @@ impl Subsystem for Storage {
             recovery: RecoveryEvidence::default(),
             delayed_page: None,
             fork_choice: ForkChoiceEvidence::default(),
-            publication: PublicationEvidence::default(),
+            // A flood or churn scenario's adoption is the watch-flood
+            // properties' to judge, so it keeps no adoption facts there.
+            publication: PublicationEvidence::armed(Arming {
+                armed: !scenario
+                    .controls
+                    .iter()
+                    .any(|step| matches!(step.action, ControlAction::Flood | ControlAction::Churn)),
+                status: false,
+            }),
         }
     }
 
@@ -1222,6 +1234,10 @@ impl Subsystem for Storage {
             fork_fixture(scenario),
         );
         tap.watch_publication(ports.publication.clone());
+        sim.on_frozen({
+            let publication = ports.publication.clone();
+            move || publication.freeze()
+        });
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1266,6 +1282,7 @@ impl Subsystem for Storage {
             .iter()
             .map(|node| (node.id.clone(), node.name.clone()))
             .collect();
+        ports.publication.name_peers(names.clone());
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
@@ -1549,8 +1566,7 @@ impl HasView for HeaderWire {
 
     /// The node's port, the dispatch guard's flag, the honest peers and the
     /// node's adoption facts. Its sessions run over the network, so the view
-    /// gives no lifetimes, and the status rule judges only what each queued
-    /// status advertises.
+    /// gives no lifetimes.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),

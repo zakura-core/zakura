@@ -210,6 +210,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_publication_liveness.rs"
+test = "regenerate_liveness_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed liveness witnesses from their fixtures"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_publication.rs"
 test = "regenerate_publication_witnesses"
 run = false

@@ -17,7 +17,7 @@ use crate::{
         fork_choice::ForkChoiceEvidence,
         hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
-        publication::PublicationEvidence,
+        publication::{PublicationEvidence, PublicationFact, STATUS_DEADLINE},
         retirement::{HandoffFact, RetirementEvidence},
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
@@ -754,8 +754,9 @@ fn authority_applied<V: AuthorityView>(view: &V, _: &ObservationLog) -> bool {
 }
 
 /// The node's port publishes every committed engine state as it was, the
-/// reactor adopts only engine records, faithfully, and every `Status` and tip
-/// it publishes names its latest adoption.
+/// reactor adopts only engine records, faithfully, and adopts each commit
+/// before quiescence, and every `Status` and tip it publishes names its
+/// latest adoption, a changed `Status` in time.
 pub const STATE_PUBLICATION_CONSISTENT: &str = "header-sync/state-publication-consistent";
 
 /// What the publication check reads: one reactor's claim breaks and when
@@ -764,9 +765,12 @@ pub trait PublicationView {
     /// The claim rules the reactor's tap found broken.
     fn claims(&self) -> &ClaimEvidence;
 
-    /// When the node's publication check first applied, and the tip it
-    /// still owes.
+    /// When the node's publication check first applied, the tip it still
+    /// owes, and, armed, its stamped facts.
     fn publication(&self) -> &PublicationEvidence;
+
+    /// The harness's environment actions and the reactor's own exit.
+    fn ends(&self) -> &EndEvidence;
 }
 
 /// [`STATE_PUBLICATION_CONSISTENT`], as a harness whose view is a
@@ -780,9 +784,13 @@ where
         id: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
         claim: "the node's port publishes every committed engine state on its selected-chain \
                 watch as committed, in the step that commits it; the reactor adopts only \
-                states some engine record holds, equal to that record; and every Status it \
-                queues and tip it publishes names its latest adoption",
-        kind: Kind::Safety,
+                states some engine record holds, equal to that record, and adopts each \
+                commit before quiescence unless the harness began stopping it; and every \
+                Status it queues and tip it publishes names its latest adoption, and in a \
+                status fixture a changed Status is queued within the deadline",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
         assumes: &[],
         needs: &[Source::View],
         status: Status::Active,
@@ -802,6 +810,26 @@ where
 /// one owed at any other end is inconclusive. It applies once a drain
 /// judged an adoption or a commit's publication, until a drain found a run
 /// corrupt, which is `commit-only-authorized`'s.
+///
+/// Where the harness armed the evidence, two rules oblige the node too
+/// ([`crate::harness::header_node::publication`] lists the facts):
+///
+/// - **Adoption happens.** Each commit obliges an adoption of its state
+///   version or a later one before quiescence, so watch coalescing is
+///   fine. A commit once the harness's `Shutdown` step began, or one an
+///   earlier adoption already covers, opens nothing, and the step answers
+///   every open one (Rule 13). A reactor that exits by itself answers
+///   nothing.
+/// - **A changed status is queued in time.** In a status fixture, each
+///   session's debt obliges a queued `Status` advertising the newest
+///   adoption within [`STATUS_DEADLINE`] of the debt. The harness closing
+///   or relinking the session's link, or its `Shutdown` step, answers it,
+///   and a debt opened after such a step opens nothing
+///   ([`session_left`]), since the node can still adopt or admit before
+///   it reads the close or its reactor stops. The node ending the session answers nothing.
+///
+/// A taint answers every obligation, since a corrupt run's consequences
+/// are its owner's.
 fn check_state_publication<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -822,6 +850,39 @@ where
         return cx.violated(expected, first.detail);
     }
     let publication = view.publication();
+    let shutdown = shutdown_stamp(view.ends());
+    for stamp in cx.new_stamps().to_vec() {
+        let (subject, bound) = match publication.fact(stamp) {
+            Some(PublicationFact::Committed { state_version, .. }) => {
+                let covered = publication
+                    .adopted_before(stamp)
+                    .is_some_and(|adopted| adopted >= state_version);
+                if covered || shutdown.is_some_and(|shutdown| shutdown < stamp) {
+                    continue;
+                }
+                (adoption_subject(state_version), None)
+            }
+            Some(PublicationFact::StatusOwed { session_id, .. }) => {
+                if session_left(&view, session_id, stamp) {
+                    continue;
+                }
+                (
+                    Subject::Session(session_id.to_string()),
+                    Some(LivenessBound::VirtualTime(STATUS_DEADLINE)),
+                )
+            }
+            _ => continue,
+        };
+        let mut obligation =
+            cx.fact_obligation(Some(stamp), subject, publication_answer::<S::View>);
+        if let Some(bound) = bound {
+            obligation.bound = bound;
+        }
+        // One adoption covers every commit up to its version, and a
+        // shutdown or a taint answers every obligation.
+        obligation.cardinality = Cardinality::Every;
+        cx.oblige(obligation);
+    }
     if publication.tainted_by(step) || !publication.applicable_by(step) {
         return Verdict::NotApplicable;
     }
@@ -831,6 +892,106 @@ where
         cx.unsettled(Inconclusive::ObligationOpen);
     }
     Verdict::Holds
+}
+
+/// The prefix of an adoption obligation's subject, before the committed
+/// state version it waits on.
+const ADOPTION_OWNER: &str = "adoption-of-state-version-";
+
+/// The subject of the obligation to adopt `state_version` or a later one.
+fn adoption_subject(state_version: u64) -> Subject {
+    Subject::Owner(format!("{ADOPTION_OWNER}{state_version}"))
+}
+
+/// Whether the harness's environment `fact` ended session `session_id`:
+/// a `Close` of its connection (a session's ID is its link's connection),
+/// a `Relink` of its peer to a newer connection, or a `Shutdown`, which
+/// closes every link.
+fn ends_session(publication: &PublicationEvidence, fact: &EndFact, session_id: u64) -> bool {
+    match fact {
+        EndFact::Environment {
+            action: EnvironmentAction::Shutdown,
+            ..
+        } => true,
+        EndFact::Environment {
+            action: EnvironmentAction::Close,
+            connection,
+            ..
+        } => *connection == Some(session_id),
+        EndFact::Environment {
+            peer,
+            action: EnvironmentAction::Relink,
+            connection,
+        } => {
+            connection.is_some_and(|newer| newer > session_id)
+                && publication
+                    .owed_peer(session_id)
+                    .and_then(|owed| publication.peer_name(&owed))
+                    .is_some_and(|name| name == *peer)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the harness ended session `session_id` ([`ends_session`]) before
+/// the fact with `stamp`, so a debt opened then is on a session the harness
+/// already ended, which the node may still adopt into or admit before it
+/// reads the close. A relinked peer's new session is a newer connection, so
+/// it still owes.
+fn session_left<V: PublicationView>(view: &V, session_id: u64, stamp: u64) -> bool {
+    let publication = view.publication();
+    view.ends()
+        .facts()
+        .into_iter()
+        .any(|(at, fact)| at < stamp && ends_session(publication, &fact, session_id))
+}
+
+/// What the fact with `stamp` means for the obligation `key` names, as
+/// [`check_state_publication`] describes.
+fn publication_answer<V: PublicationView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let publication = view.publication();
+    let owed = match &key.subject {
+        Subject::Owner(owner) => owner
+            .strip_prefix(ADOPTION_OWNER)
+            .and_then(|version| version.parse::<u64>().ok())
+            .map(Ok),
+        Subject::Session(session) => session.parse::<u64>().ok().map(Err),
+        _ => None,
+    };
+    let Some(owed) = owed else {
+        return FactAnswer::Unrelated;
+    };
+    match (publication.fact(stamp), owed) {
+        (Some(PublicationFact::Tainted), _) => return FactAnswer::Discharges,
+        (Some(PublicationFact::Adopted { state_version }), Ok(committed))
+            if state_version >= committed =>
+        {
+            return FactAnswer::Discharges
+        }
+        (Some(PublicationFact::StatusPaid { session_id }), Err(session))
+            if session_id == session =>
+        {
+            return FactAnswer::Discharges
+        }
+        (Some(_), _) => return FactAnswer::Unrelated,
+        (None, _) => {}
+    }
+    let ended = view.ends().fact(stamp).is_some_and(|fact| match owed {
+        // A shutdown ends every adoption obligation, and nothing else does.
+        Ok(_) => matches!(
+            fact,
+            EndFact::Environment {
+                action: EnvironmentAction::Shutdown,
+                ..
+            }
+        ),
+        Err(session) => ends_session(publication, &fact, session),
+    });
+    if ended {
+        FactAnswer::Discharges
+    } else {
+        FactAnswer::Unrelated
+    }
 }
 
 /// [`STATE_PUBLICATION_CONSISTENT`]'s trigger history: the check judged an

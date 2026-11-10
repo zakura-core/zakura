@@ -214,3 +214,193 @@ fn a_corrupt_run_taints_the_check() {
     evidence.end(true);
     assert_eq!(evidence.unpublished_at_settled_end(), None);
 }
+
+/// The test mirror's peer ID.
+fn mirror() -> zakura_network::zakura::ZakuraPeerId {
+    zakura_network::zakura::ZakuraPeerId::new(vec![9; 32]).expect("32 bytes is a valid peer ID")
+}
+
+/// The mirror's admission as session 1.
+fn admitted_one() -> ReactorEvent {
+    ReactorEvent::SessionAdmitted {
+        peer: mirror(),
+        session_id: 1,
+        direction: zakura_network::zakura::ServicePeerDirection::Inbound,
+        replaced: None,
+        origin: None,
+    }
+}
+
+/// The `Status` advertising `snapshot`, queued for session 1.
+fn status_queued(snapshot: &EngineSnapshot) -> ReactorEvent {
+    ReactorEvent::StatusQueued {
+        peer: mirror(),
+        session_id: 1,
+        status: zakura_network::zakura::Status {
+            work_anchor_height: snapshot.frontiers.finalized.height,
+            work_anchor_hash: snapshot.frontiers.finalized.hash,
+            selected_tip_height: snapshot.frontiers.header_best.height,
+            selected_tip_hash: snapshot.frontiers.header_best.hash,
+            suffix_cumulative_work: snapshot.header_best_score.suffix_work.as_u256(),
+            oldest_retained_height: snapshot.oldest_retained_height,
+            max_headers_per_response: 1,
+            max_subscriptions: 1,
+            max_message_bytes: 1,
+            tree_aux_schema_mask: 1,
+        },
+    }
+}
+
+/// A check whose evidence `arming` arms, seeded with a fresh engine.
+fn armed(arming: Arming) -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
+    let fixture = HeaderFixture::regtest();
+    let port = EnginePort::new(&fixture);
+    let evidence = PublicationEvidence::armed(arming);
+    let check = Publication::new(evidence.clone(), port.snapshot());
+    (fixture, port, check, evidence)
+}
+
+/// The kinds of `evidence`'s facts, in stamp order.
+fn kinds(evidence: &PublicationEvidence) -> Vec<&'static str> {
+    evidence
+        .facts()
+        .into_iter()
+        .map(|(_, fact)| match fact {
+            PublicationFact::Committed { .. } => "committed",
+            PublicationFact::Adopted { .. } => "adopted",
+            PublicationFact::StatusOwed { .. } => "owed",
+            PublicationFact::StatusPaid { .. } => "paid",
+            PublicationFact::Tainted => "tainted",
+        })
+        .collect()
+}
+
+/// In a status fixture, a session is owed its first `Status` at admission
+/// and paid by one that advertises the adoption. A commit's adoption that
+/// changes what it advertises owes another, a second change while it's owed
+/// opens none, and a `Status` advertising the newest pays it.
+#[test]
+fn status_debts_open_at_admission_and_at_a_change() {
+    let (fixture, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let seed = port.snapshot();
+    check.observe(&adopted(&seed), true);
+    check.observe(&tip_published(&seed, true), true);
+    check.observe(&admitted_one(), true);
+    check.observe(&status_queued(&seed), true);
+    for len in [2, 1] {
+        let run = commit(&fixture, &port, len);
+        check.run(&run, false);
+        check.publications(&port.take_publications());
+        check.observe(&adopted(&run.snapshot), true);
+        check.observe(&tip_published(&run.snapshot, true), true);
+    }
+    check.observe(&status_queued(&port.snapshot()), true);
+    assert_eq!(check.drain(1), Vec::<String>::new());
+    assert_eq!(
+        kinds(&evidence),
+        [
+            "adopted",
+            "owed",
+            "paid",
+            "committed",
+            "adopted",
+            "owed",
+            "committed",
+            "adopted",
+            "paid"
+        ]
+    );
+    assert_eq!(evidence.owed_peer(1), Some(mirror()));
+    assert_eq!(
+        evidence.adopted_before(u64::MAX),
+        Some(port.snapshot().state_version.get())
+    );
+}
+
+/// A refused queue attempt (`StatusDeferred`) neither pays a session's
+/// debt nor opens another, so the deadline stays the one admission opened,
+/// and the `Status` its retry queues pays it.
+#[test]
+fn a_deferral_keeps_the_debt_its_retry_pays() {
+    let (_, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let seed = port.snapshot();
+    check.observe(&adopted(&seed), true);
+    check.observe(&tip_published(&seed, true), true);
+    check.observe(&admitted_one(), true);
+    let owed = evidence.facts();
+    check.observe(
+        &ReactorEvent::StatusDeferred {
+            peer: mirror(),
+            session_id: 1,
+        },
+        true,
+    );
+    assert_eq!(evidence.facts(), owed);
+    check.observe(&status_queued(&seed), true);
+    assert_eq!(check.drain(1), Vec::<String>::new());
+    assert_eq!(kinds(&evidence), ["adopted", "owed", "paid"]);
+}
+
+/// Outside a status fixture the evidence keeps commits and adoptions only,
+/// and unarmed it keeps nothing.
+#[test]
+fn only_a_status_fixture_keeps_status_debts() {
+    for (arming, expected) in [
+        (
+            Arming {
+                armed: true,
+                status: false,
+            },
+            vec!["adopted"],
+        ),
+        (Arming::default(), Vec::new()),
+    ] {
+        let (_, port, mut check, evidence) = armed(arming);
+        let seed = port.snapshot();
+        check.observe(&adopted(&seed), true);
+        check.observe(&admitted_one(), true);
+        check.observe(&status_queued(&seed), true);
+        assert_eq!(kinds(&evidence), expected, "{arming:?}");
+    }
+}
+
+/// A queued `Status` that doesn't advertise the latest adoption breaks with
+/// `StaleStatus`, and pays no debt.
+#[test]
+fn a_stale_status_breaks_and_pays_nothing() {
+    let (fixture, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let seed = port.snapshot();
+    check.observe(&admitted_one(), true);
+    let run = commit(&fixture, &port, 2);
+    check.run(&run, false);
+    check.publications(&port.take_publications());
+    check.observe(&adopted(&run.snapshot), true);
+    check.observe(&status_queued(&seed), true);
+    let breaks = check.drain(1);
+    assert!(breaks[0].starts_with("StaleStatus"), "{breaks:?}");
+    assert_eq!(kinds(&evidence), ["owed", "committed", "adopted"]);
+}
+
+/// A corrupt run keeps a `Tainted` fact, which answers every open
+/// obligation, and nothing after it.
+#[test]
+fn a_taint_is_kept_and_ends_the_facts() {
+    let (fixture, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let run = commit(&fixture, &port, 2);
+    check.run(&run, true);
+    check.observe(&adopted(&run.snapshot), true);
+    check.observe(&admitted_one(), true);
+    assert_eq!(kinds(&evidence), ["tainted"]);
+}

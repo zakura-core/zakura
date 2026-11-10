@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
+index fe2b40dd43..4d0b70dee2 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
+@@ -44,10 +44,9 @@ impl StatusPublisher {
+             return;
+         }
+         self.desired = desired;
+-        let floor = self
+-            .last_sent_at
+-            .map_or(committed_at, |sent_at| sent_at + MIN_PUBLICATION_INTERVAL);
+-        self.pending_at = Some(floor.max(committed_at).min(committed_at + MAX_CHANGE_DELAY));
++        // Mutation: wait until two seconds after the latest change, so
++        // changes that keep coming postpone the publication.
++        self.pending_at = Some(committed_at + MAX_CHANGE_DELAY);
+     }
+ 
+     pub(in crate::zakura::header_sync) fn next_deadline(&self) -> Instant {

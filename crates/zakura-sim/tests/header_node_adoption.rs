@@ -145,10 +145,11 @@ impl Run {
         &self.view.adoption
     }
 
-    /// hdr-4's tip rule, which `header-sync/state-publication-consistent`
-    /// owns now, as its outcome in the run's report: held, broken, or, with
-    /// nothing judged, inconclusive.
-    fn tip(&self) -> Acceptance {
+    /// hdr-4's status and tip rules, which
+    /// `header-sync/state-publication-consistent` owns now, as its outcome
+    /// in the run's report: held, broken, or, with nothing judged,
+    /// inconclusive.
+    fn publication(&self) -> Acceptance {
         let outcome = &self
             .report
             .properties
@@ -163,11 +164,6 @@ impl Run {
             }
             other => Acceptance::Inconclusive(format!("{other:?}")),
         }
-    }
-
-    /// The status rule over the node's sessions.
-    fn status(&self) -> Acceptance {
-        self.adoption().status(&self.view.sessions)
     }
 }
 
@@ -420,18 +416,13 @@ fn new_work_carries_the_adopted_generation() {
     sweep("generation", |run| run.adoption().generation());
 }
 
-/// The status rule holds on the witness: both live sessions get each adopted
-/// status in time.
+/// The status and tip rules hold on the witness: every queued status
+/// advertises the latest adoption, the initial tip and each adopted tip are
+/// published, and every publication reaches the node's handle. Their
+/// deadline is checked on `header-sync/liveness`'s status fixtures.
 #[test]
-fn every_live_session_gets_the_adopted_status() {
-    sweep("status", Run::status);
-}
-
-/// The tip rule holds on the witness: the initial tip and each adopted tip
-/// are published, and every publication reaches the node's handle.
-#[test]
-fn every_adopted_tip_is_published() {
-    sweep("tip", |run| run.tip());
+fn every_adopted_status_and_tip_is_published() {
+    sweep("publication", Run::publication);
 }
 
 /// One tip change, with nothing after it: the node at A3 syncs A5 from
@@ -464,7 +455,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
             "{:?}",
             run.report.end
         );
-        assert_eq!(run.tip(), Acceptance::Holds);
+        assert_eq!(run.publication(), Acceptance::Holds);
     }
 }
 
@@ -477,7 +468,7 @@ fn a_run_that_ends_early_breaks_no_rule() {
     for budget in [1, 20, 60, 120, 240, 480] {
         for input in inputs(4, 256) {
             let run = run_for(&scenario, Some(budget), input);
-            for outcome in [run.adoption().generation(), run.tip(), run.status()] {
+            for outcome in [run.adoption().generation(), run.publication()] {
                 assert!(
                     !matches!(outcome, Acceptance::Violated(_)),
                     "budget {budget}: {outcome:?}"
@@ -507,7 +498,7 @@ fn a_cut_off_run_keeps_the_evidence_it_ended_with() {
                 &run.adoption().facts()[run.seen..]
             );
             assert!(
-                !matches!(run.tip(), Acceptance::Violated(_)),
+                !matches!(run.publication(), Acceptance::Violated(_)),
                 "budget {budget}"
             );
         }

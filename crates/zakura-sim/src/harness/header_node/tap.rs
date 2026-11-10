@@ -1618,6 +1618,7 @@ impl ReactorTap {
             .expect("the tap's port outlives its harness's setup");
         let engine = port.engine();
         engine.take_publications();
+        evidence.stamp_with(self.state.stamps.clone());
         *self
             .state
             .publication

@@ -1,0 +1,11 @@
+# Every status queue attempt fails, so the publisher records
+# `StatusDeferred` and retries forever. On the status-startup witness the
+# mirror's session is never queued its first `Status`, and the deadline
+# from its admission passes. The reactor's status sending decides when a
+# `Status` goes, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-status-startup.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-status-startup.plan"

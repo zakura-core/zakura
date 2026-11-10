@@ -157,6 +157,15 @@ const CAMPAIGN_INPUT_BYTES: usize = 64;
 /// The longest one child of a confirmation through a fuzz target may run.
 const TARGET_CHILD: Duration = Duration::from_secs(300);
 
+/// The longest one `zakura-sim` run of a case may take: a baseline, patched
+/// or campaign recording, or a fresh replay. A run past it is killed and
+/// never counts as a catch (C4).
+const RUN_DEADLINE: Duration = Duration::from_secs(900);
+
+/// The interrupt flag of a case's runs, which nothing sets: only the pilot
+/// interrupts its runs.
+static NEVER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 /// The directory under the planted work directory where a confirmation
 /// through a fuzz target builds `zakura-sim` and the target. It sits
 /// outside the scratch worktree, which each run removes, so later cases,
@@ -215,6 +224,11 @@ struct Case {
     /// Other properties the patch's bug breaks, which any run may violate
     /// beside the case's property, and a campaign run instead of it.
     also_violates: Vec<String>,
+    /// A nested case's exact set: the broader properties its patch can't
+    /// break the case's property without, each of which the committed
+    /// input must violate too, and nothing else (C4). Empty for a case that
+    /// breaks its property alone.
+    set: Vec<String>,
     /// The simulator fuzz target that runs the input's harness, with
     /// `--targets`.
     target: Option<String>,
@@ -315,6 +329,14 @@ struct CaseFile {
     /// of it. The committed input must still violate the case's property.
     #[serde(default)]
     also_violates: Vec<String>,
+    /// A nested case's exact set, by ID: the broader properties the patched
+    /// bug can't break the case's property without, such as
+    /// `conformant-never-closes` beside a `cadence-never-closes` catch. Every
+    /// run of the committed input and the campaign must violate the case's
+    /// property and each of them, and nothing else, to count as a catch. A
+    /// case names `set` or `also_violates`, not both.
+    #[serde(default)]
+    set: Vec<String>,
 }
 
 /// A committed fuzz input's sidecar, as `zakura-sim`'s tests check it.
@@ -611,6 +633,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 typed,
                 checks,
                 also_violates,
+                set,
             } = toml::from_str(
                 &fs::read_to_string(&case_file)
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
@@ -650,12 +673,20 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .into());
                 }
             }
+            if !set.is_empty() && !also_violates.is_empty() {
+                return Err(format!(
+                    "{}: a case names either `set` or `also_violates`, not both",
+                    case_file.display()
+                )
+                .into());
+            }
             Ok(Case {
                 property,
                 patch,
                 witness,
                 checks,
                 also_violates,
+                set,
                 target: None,
             })
         })
@@ -844,7 +875,7 @@ fn check_case(
         &case.property,
         Expect::Holds,
         &scratch.join("baseline"),
-        None,
+        Some((RUN_DEADLINE, &NEVER_INTERRUPTED)),
     )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
@@ -863,7 +894,7 @@ fn check_case(
     if let Err(why) = built_from(&patched, worktree)? {
         return Ok(Verdict::StaleBinary(why));
     }
-    let verdict = judge_patched(&patched, &harness, &input, case, scratch)?;
+    let verdict = judge_patched(&patched, &harness, &input, case, scratch, RUN_DEADLINE)?;
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
@@ -907,13 +938,15 @@ fn apply_case_patch(worktree: &Path, case: &Case) -> Result<Option<Verdict>, Box
 
 /// Records `input` on `harness` with the patched `zakura_sim` binary into
 /// `scratch`'s `patched`, and judges it: the patched run's verdict, then,
-/// for a catch, the campaign's, then, for a typed case, its fresh replay's.
+/// for a catch, the campaign's, then the patched trace's fresh replay's.
+/// Each run gets `deadline`.
 fn judge_patched(
     zakura_sim: &Path,
     harness: &str,
     input: &Located,
     case: &Case,
     scratch: &Path,
+    deadline: Duration,
 ) -> Result<Verdict, BoxError> {
     let trace = scratch.join("patched");
     let patched = record(
@@ -921,15 +954,53 @@ fn judge_patched(
         harness,
         input,
         &case.property,
-        Expect::Violated(&case.also_violates),
+        case.expect(),
         &trace,
-        None,
+        Some((deadline, &NEVER_INTERRUPTED)),
     )?;
-    let verdict = match classify(&case.property, &case.also_violates, &patched) {
-        Verdict::Caught(None) => campaign(zakura_sim, harness, case, &scratch.join("campaign"))?,
+    let verdict = match case.classify(&patched) {
+        Verdict::Caught(None) => campaign(
+            zakura_sim,
+            harness,
+            case,
+            &scratch.join("campaign"),
+            deadline,
+        )?,
         verdict => return Ok(verdict),
     };
-    typed_replay(verdict, &case.witness, || replay_misses(zakura_sim, &trace))
+    fresh_replay(verdict, || replay_misses(zakura_sim, &trace, deadline))
+}
+
+impl Case {
+    /// What every patched run of the case expects: its property violated,
+    /// beside `also_violates`, or with exactly its `set`.
+    fn expect(&self) -> Expect<'_> {
+        if self.set.is_empty() {
+            Expect::Violated(&self.also_violates)
+        } else {
+            Expect::ViolatedSet(&self.set)
+        }
+    }
+
+    /// The properties a confirmation through a fuzz target may find
+    /// violated beside the case's: its `also_violates`, or its nested `set`.
+    /// The committed input's recording has already shown each member of the
+    /// set violated, exactly ([`Case::expect`]), so the confirmation checks
+    /// that the target selects the case's property and allows the members
+    /// beside it, as it allows co-violations.
+    fn beside(&self) -> Vec<String> {
+        self.also_violates
+            .iter()
+            .chain(&self.set)
+            .cloned()
+            .collect()
+    }
+
+    /// What `patched`, one of the case's patched runs, shows about it
+    /// ([`classify_set`]).
+    fn classify(&self, patched: &Run) -> Verdict {
+        classify_set(&self.property, &self.also_violates, &self.set, patched)
+    }
 }
 
 /// The fuzz target that runs `harness`, from the fuzz package's targets
@@ -974,7 +1045,7 @@ fn through_target(
         harness: harness.to_owned(),
         input: path::absolute(worktree.join(input))?,
         property: case.property.clone(),
-        also_violates: case.also_violates.clone(),
+        also_violates: case.beside(),
         out: out.clone(),
         budget: sim_minimize::Budget {
             runs: 1,
@@ -1052,7 +1123,13 @@ pub(super) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
 /// `binary`, which [`check_case`] built. Each input and its trace go under
 /// `dir`.
-fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
+fn campaign(
+    binary: &Path,
+    harness: &str,
+    case: &Case,
+    dir: &Path,
+    deadline: Duration,
+) -> Result<Verdict, BoxError> {
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
@@ -1067,11 +1144,11 @@ fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
             harness,
             &Located::Input(input.clone()),
             &case.property,
-            Expect::Violated(&case.also_violates),
+            case.expect(),
             &dir.join(format!("run-{index}")),
-            None,
+            Some((deadline, &NEVER_INTERRUPTED)),
         )?;
-        match classify(&case.property, &case.also_violates, &run) {
+        match case.classify(&run) {
             Verdict::Caught(_) => caught += 1,
             Verdict::NotCaught(outcome) => *missed.entry(outcome).or_default() += 1,
             verdict => {
@@ -1190,6 +1267,9 @@ enum Expect<'a> {
     /// The property is violated, and no other property is, except the
     /// listed ones, the case's `also_violates`.
     Violated(&'a [String]),
+    /// The property and every listed one, the case's `set`, are violated,
+    /// and no other property is.
+    ViolatedSet(&'a [String]),
 }
 
 impl Expect<'_> {
@@ -1205,6 +1285,12 @@ impl Expect<'_> {
                 }
                 args
             }
+            Expect::ViolatedSet(set) => vec![
+                "--expect".to_owned(),
+                "violated-set".to_owned(),
+                "--also-violates".to_owned(),
+                set.join(","),
+            ],
         }
     }
 }
@@ -1299,19 +1385,14 @@ fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
     })
 }
 
-/// `verdict`, unless `witness` is a typed case caught by its patched run and
-/// `replay`, the fresh replay of that run, says why it missed: then
-/// [`Verdict::ReplayMisses`]. A fuzz input, or a case not caught, never
-/// replays here.
-fn typed_replay(
+/// `verdict`, unless it's a catch and `replay`, the fresh replay of the
+/// patched run's trace, says why it missed: then [`Verdict::ReplayMisses`].
+/// Every catch replays, a fuzz input's and a typed case's alike (C4).
+fn fresh_replay(
     verdict: Verdict,
-    witness: &Witness,
     replay: impl FnOnce() -> Result<Option<String>, BoxError>,
 ) -> Result<Verdict, BoxError> {
-    if !matches!(
-        (&verdict, witness),
-        (Verdict::Caught(_), Witness::Typed { .. })
-    ) {
+    if !matches!(verdict, Verdict::Caught(_)) {
         return Ok(verdict);
     }
     Ok(match replay()? {
@@ -1321,16 +1402,25 @@ fn typed_replay(
 }
 
 /// Replays the trace in `trace` with `zakura_sim` in a fresh process, and
-/// says why it didn't match Exact, or `None` if it did.
-fn replay_misses(zakura_sim: &Path, trace: &Path) -> Result<Option<String>, BoxError> {
-    let output = Command::new(zakura_sim).arg("replay").arg(trace).output()?;
-    Ok((!output.status.success()).then(|| {
-        format!(
-            "`zakura-sim replay` exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }))
+/// says why it didn't match Exact, or `None` if it did. The replay's output
+/// goes to `<trace>.replay.log`, and a replay past `deadline` is killed and
+/// misses.
+fn replay_misses(
+    zakura_sim: &Path,
+    trace: &Path,
+    deadline: Duration,
+) -> Result<Option<String>, BoxError> {
+    let log = trace.with_extension("replay.log");
+    let mut replay = Command::new(zakura_sim);
+    replay.arg("replay").arg(trace);
+    let end = sim_minimize::run_child(&mut replay, &log, Some(deadline), &NEVER_INTERRUPTED)?;
+    Ok(match end {
+        sim_minimize::ChildEnd::Exited(0) => None,
+        end => Some(format!(
+            "`zakura-sim replay` {end}: {}",
+            fs::read_to_string(&log).unwrap_or_default().trim()
+        )),
+    })
 }
 
 /// Reads `line`, a trace's `end` record, for `property`.
@@ -1403,6 +1493,19 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
 /// other violated property makes the verdict [`Verdict::Unrelated`]. The
 /// committed input and every campaign input are judged by this one rule.
 fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict {
+    classify_set(property, also_violates, &[], patched)
+}
+
+/// [`classify`] for a case with a nested `set`, which every member of must
+/// violate beside `property` for a catch. A member is expected, as an
+/// `also_violates` property is, and a run that violates `property` without
+/// every member isn't a catch.
+fn classify_set(
+    property: &str,
+    also_violates: &[String],
+    set: &[String],
+    patched: &Run,
+) -> Verdict {
     let (violation, others_violated, outcome, witness) = match patched {
         Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
         Run::Ended {
@@ -1418,7 +1521,8 @@ fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict 
         } => (violation, others_violated, outcome, witness),
     };
     let violated = || violation.iter().chain(others_violated);
-    if let Some(unrelated) = violated().find(|id| *id != property && !also_violates.contains(id)) {
+    let expected = |id: &String| id == property || also_violates.contains(id) || set.contains(id);
+    if let Some(unrelated) = violated().find(|id| !expected(id)) {
         return Verdict::Unrelated(unrelated.clone());
     }
     if violation.as_deref() != Some(property) && outcome.as_deref() != Some("violated") {
@@ -1429,6 +1533,12 @@ fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict 
                 .clone()
                 .map_or(Verdict::Unreported, Verdict::NotCaught),
         };
+    }
+    if let Some(missing) = set
+        .iter()
+        .find(|member| !violated().any(|id| id == *member))
+    {
+        return Verdict::NotCaught(format!("violated, but not {missing} of its set"));
     }
     match witness {
         Some(why) => Verdict::WitnessFails(why.clone()),
@@ -2044,6 +2154,7 @@ mod tests {
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
+            set: Vec::new(),
             target: None,
         };
         let fuzz = Case {
@@ -2319,48 +2430,31 @@ mod tests {
         );
     }
 
-    /// A typed case that its patched run caught passes only if its fresh
-    /// replay matches. A miss is its own verdict, and a fuzz input or an
-    /// uncaught case never replays here.
+    /// A catch, a fuzz input's or a typed case's, passes only if its
+    /// fresh replay matches (C4). A miss is its own verdict, and an
+    /// uncaught case never replays.
     #[test]
-    fn a_typed_catch_needs_its_fresh_replay() {
-        let typed = Witness::Typed {
-            harness: "header-sync/storage".to_owned(),
-            scenario: "s.json".into(),
-            plan: "p.bin".into(),
-        };
+    fn every_catch_needs_its_fresh_replay() {
         let caught = || Verdict::Caught(None);
+        assert_eq!(fresh_replay(caught(), || Ok(None)).unwrap(), caught());
         assert_eq!(
-            typed_replay(caught(), &typed, || Ok(None)).unwrap(),
-            caught()
-        );
-        assert_eq!(
-            typed_replay(caught(), &typed, || Ok(Some(
-                "differs at step 3".to_owned()
-            )))
-            .unwrap(),
+            fresh_replay(caught(), || Ok(Some("differs at step 3".to_owned()))).unwrap(),
             Verdict::ReplayMisses("differs at step 3".to_owned())
         );
-        let unreachable =
-            || -> Result<Option<String>, BoxError> { panic!("only a typed catch replays") };
-        let input = Witness::Input("a.bin".into());
+        let unreachable = || -> Result<Option<String>, BoxError> { panic!("only a catch replays") };
         assert_eq!(
-            typed_replay(caught(), &input, unreachable).unwrap(),
-            caught()
-        );
-        assert_eq!(
-            typed_replay(Verdict::Unreported, &typed, unreachable).unwrap(),
+            fresh_replay(Verdict::Unreported, unreachable).unwrap(),
             Verdict::Unreported
         );
     }
 
-    /// The runner's patched judgment replays a caught typed case's own
-    /// patched trace: with a `zakura-sim` whose runs violate the case's
-    /// property, a replay that matches keeps the catch, and one that doesn't
-    /// makes it [`Verdict::ReplayMisses`]. A fuzz-input case never replays.
+    /// The runner's patched judgment replays a caught case's own patched
+    /// trace, a typed case's and a fuzz input's alike: with a `zakura-sim`
+    /// whose runs violate the case's property, a replay that matches keeps
+    /// the catch, and one that doesn't makes it [`Verdict::ReplayMisses`].
     #[cfg(unix)]
     #[test]
-    fn the_runner_replays_a_caught_typed_case() {
+    fn the_runner_replays_every_caught_case() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a temporary directory");
         let end = end(Some(ID), &[(ID, VIOLATED)]);
@@ -2401,6 +2495,7 @@ mod tests {
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
+            set: Vec::new(),
             target: None,
         };
         let judge = |binary: &Path, case: &Case| {
@@ -2410,6 +2505,7 @@ mod tests {
                 &case.witness.located(dir.path()),
                 case,
                 &scratch,
+                RUN_DEADLINE,
             )
             .expect("the fake binary runs")
         };
@@ -2426,8 +2522,12 @@ mod tests {
             ..typed.clone()
         };
         assert!(
-            matches!(judge(&misses, &input), Verdict::Caught(Some(_))),
-            "a fuzz-input case doesn't replay here"
+            matches!(judge(&misses, &input), Verdict::ReplayMisses(_)),
+            "a fuzz-input case replays too"
+        );
+        assert!(
+            matches!(judge(&matches, &input), Verdict::Caught(Some(_))),
+            "a fuzz-input case's matching replay keeps the catch"
         );
     }
 
@@ -2447,11 +2547,121 @@ mod tests {
         };
         let matched = fake("matched", "test \"$1\" = replay || exit 2");
         let missed = fake("missed", "echo 'pick 3 differs' >&2; exit 1");
-        assert_eq!(replay_misses(&matched, dir.path()).unwrap(), None);
-        let why = replay_misses(&missed, dir.path())
+        assert_eq!(
+            replay_misses(&matched, dir.path(), RUN_DEADLINE).unwrap(),
+            None
+        );
+        let why = replay_misses(&missed, dir.path(), RUN_DEADLINE)
             .unwrap()
             .expect("a failed replay says why");
         assert!(why.contains("pick 3 differs"), "{why}");
+        // A replay that hangs is killed at its deadline, and misses.
+        // `wait_until_executable` runs it with no arguments.
+        let hangs = fake("hangs", "[ $# -gt 0 ] || exit 0\nsleep 60");
+        let why = replay_misses(&hangs, dir.path(), Duration::from_millis(200))
+            .unwrap()
+            .expect("a hung replay misses");
+        assert!(why.contains("ran past its deadline"), "{why}");
+    }
+
+    /// C4: every run of a case has a deadline. A patched recording that
+    /// hangs is killed at it, ends `Killed`, and never counts as a catch.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_patched_run_is_killed_and_never_caught() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let hangs = dir.path().join("hangs");
+        // `wait_until_executable` runs it with no arguments.
+        fs::write(&hangs, "#!/bin/sh\n[ $# -gt 0 ] || exit 0\nsleep 60\n").unwrap();
+        fs::set_permissions(&hangs, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&hangs);
+        let case = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Input("a.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: Vec::new(),
+            target: None,
+        };
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        let started = std::time::Instant::now();
+        let run = record(
+            Command::new(&hangs),
+            "header-sync/storage",
+            &case.witness.located(dir.path()),
+            ID,
+            case.expect(),
+            &scratch.join("patched"),
+            Some((Duration::from_millis(200), &NEVER_INTERRUPTED)),
+        )
+        .expect("the fake binary starts");
+        assert!(matches!(run, Run::Killed(_)), "{run:?}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(
+            matches!(case.classify(&run), Verdict::Failed(_)),
+            "a killed run isn't a catch"
+        );
+        let verdict = judge_patched(
+            &hangs,
+            "header-sync/storage",
+            &case.witness.located(dir.path()),
+            &case,
+            &scratch,
+            Duration::from_millis(200),
+        )
+        .expect("the fake binary starts");
+        assert!(matches!(verdict, Verdict::Failed(_)), "{verdict:?}");
+    }
+
+    /// C4: a nested case's exact set. Its committed input is a catch only
+    /// with its property and every member of its set violated. A missing
+    /// member isn't a catch, and a property outside the set is unrelated.
+    /// Its runs ask the witness judge for the same set.
+    #[test]
+    fn a_nested_case_needs_exactly_its_set() {
+        const BROADER: &str = "header-sync/s5v9/conformant-never-closes";
+        let set = [BROADER.to_owned()];
+        let judged = |others: &[&str]| {
+            let mut reports = vec![(ID, VIOLATED)];
+            reports.extend(others.iter().map(|id| (*id, VIOLATED)));
+            classify_set(ID, &[], &set, &run(Some(ID), &reports))
+        };
+        assert_eq!(judged(&[BROADER]), Verdict::Caught(None));
+        assert!(
+            matches!(judged(&[]), Verdict::NotCaught(why) if why.contains(BROADER)),
+            "a missing member isn't a catch"
+        );
+        assert_eq!(
+            judged(&[BROADER, "test/other"]),
+            Verdict::Unrelated("test/other".to_owned())
+        );
+        assert_eq!(
+            Expect::ViolatedSet(&set).args(),
+            ["--expect", "violated-set", "--also-violates", BROADER]
+        );
+        // A confirmation through the case's fuzz target keeps the set.
+        let nested = Case {
+            property: ID.to_owned(),
+            patch: PathBuf::from("case.patch"),
+            witness: Witness::Input("a.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: set.to_vec(),
+            target: Some("header_sync".to_owned()),
+        };
+        assert_eq!(nested.beside(), set);
+        let both = r#"
+            input = "a.bin"
+            set = ["x/broader"]
+            also_violates = ["x/other"]
+        "#;
+        let error = parse_case(both)
+            .expect_err("a case names a set or co-violations")
+            .to_string();
+        assert!(error.contains("not both"), "{error}");
     }
 
     /// A typed case watches its scenario and Plan bytes, and runs with

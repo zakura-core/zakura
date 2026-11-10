@@ -14,8 +14,8 @@ use serde_json::json;
 use super::{
     build_failure,
     classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
-    parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
-    LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    parse_flags, planted_cases, selects, summarize, test_executables, BaselineReport,
+    BuildIdentity, CaseReport, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
 
 const NAMED: &str = "block-sync/retained-byte-bound";
@@ -843,6 +843,30 @@ fn a_child_reports_its_exit_or_its_deadline() {
     )
     .unwrap();
     assert_eq!(ended, Ended::TimedOut);
+}
+
+/// `--planted` refuses a nested case rather than drop its `set`: the loop
+/// would count a catch of the case's property alone, with a member held, as
+/// killed by the named rule.
+#[test]
+fn planted_cases_refuse_a_nested_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let case = repo.path().join("qa/planted/race/lost-update");
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join("nested.patch"), "").unwrap();
+    fs::write(
+        case.join("nested.toml"),
+        "input = \"in.bin\"\nset = [\"race/other\"]\n",
+    )
+    .unwrap();
+    let error =
+        planted_cases(repo.path(), &["race".to_owned()]).expect_err("a nested case is refused");
+    assert!(error.to_string().contains("`set`"), "{error}");
+
+    fs::write(case.join("nested.toml"), "input = \"in.bin\"\n").unwrap();
+    let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].property, "race/lost-update");
 }
 
 /// `--planted` selects whole path components or one case, so a prefix that

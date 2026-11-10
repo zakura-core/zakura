@@ -372,24 +372,23 @@ fn block_sync_teardown_returns_baseline() {
     check_witness(witness, TEARDOWN_RETURNS_BASELINE, Expect::Holds);
 }
 
-/// The committed scenario of the serving teardown's planted cases, under
-/// `qa/planted/block-sync/teardown-returns-baseline/`.
+/// The committed scenario of the session-slot teardown's planted case,
+/// `qa/planted/block-sync/teardown-returns-baseline/kept-session-sender`.
 const SERVED_SCENARIO: &str = include_str!(
     "../../../qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.scenario.json"
 );
 
 /// The peers-leave run with a probe the node serves and links that reserve
-/// its session slots. The node holds both serving leases and a session slot
-/// for each link during the run, and teardown settles with every one
-/// returned, so the serving-lease and session-slot charges apply and hold.
-/// With `kept-serving-lease.patch` a served request's lease never returns,
-/// and with `kept-session-slot.patch` a session's slot never does, and the
-/// same run violates the property.
+/// its session slots. The node holds a session slot for each link during
+/// the run, and teardown settles with every one returned, so the
+/// session-slot charge applies and holds. With `kept-session-sender.patch`
+/// the server keeps a clone of one session's sender, so that session's slot
+/// never returns, and the same run violates the property.
 #[test]
-fn teardown_returns_serving_leases_and_session_slots() {
+fn teardown_returns_session_slots() {
     let scenario = BlockScenario::peers_leave_served();
     let committed: BlockScenario = serde_json::from_str(SERVED_SCENARIO).unwrap();
-    assert_eq!(committed, scenario, "the planted cases run this scenario");
+    assert_eq!(committed, scenario, "the planted case runs this scenario");
     let witness = WitnessScenario::<Storage> {
         scenario,
         input: Plan::from_fuzz(&[]),
@@ -404,11 +403,8 @@ fn teardown_returns_serving_leases_and_session_slots() {
         let view = ports.view.borrow();
         let owners = &view.owners;
         let peaks = owners.peaks();
-        assert_eq!(peaks.serving_leases, 2, "{peaks:?}");
         assert_eq!(peaks.session_slots, 3, "{peaks:?}");
-        assert_eq!(owners.serving_leases(), 0);
         assert_eq!(owners.session_slots(), 0);
-        assert_eq!(owners.serving_gap(), None);
     }
     check_witness(witness, TEARDOWN_RETURNS_BASELINE, Expect::Holds);
 }
@@ -965,32 +961,10 @@ fn the_lookahead_quantities_count_only_above_the_window() {
     assert_eq!(owners.verified_tip(), 11);
 }
 
-/// A serving lease counts from its acquisition until its release, by its
-/// session and range, and a release of a lease never taken is a gap. Session
-/// slots count against the first reading, of every kind together.
+/// Session slots count against the first reading, of every kind together.
 #[test]
-fn serving_leases_and_session_slots_follow_their_inputs() {
+fn session_slots_follow_their_readings() {
     let mut owners = OwnerModel::new(small_limits(), 0);
-    let lease = |start, acquired| OwnerInput::ServingLease {
-        connection: 4,
-        generation: 1,
-        start,
-        count: 1,
-        acquired,
-    };
-    owners.apply(lease(1, true));
-    owners.apply(lease(1, true));
-    owners.apply(lease(2, true));
-    assert_eq!(owners.serving_leases(), 3);
-    owners.apply(lease(1, false));
-    owners.apply(lease(2, false));
-    assert_eq!(owners.serving_leases(), 1);
-    assert_eq!(owners.serving_gap(), None);
-    owners.apply(lease(3, false));
-    assert!(owners.serving_gap().is_some());
-    assert_eq!(owners.serving_leases(), 1);
-    assert_eq!(owners.peaks().serving_leases, 3);
-
     let free = |inbound, outbound, setup, inbound_setup| OwnerInput::SessionSlots {
         free: FreeSlots {
             inbound,

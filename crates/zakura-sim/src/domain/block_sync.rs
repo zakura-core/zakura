@@ -29,8 +29,7 @@
 //!   `L + H + (W + 1)·k·B`;
 //! - [`TEARDOWN_RETURNS_BASELINE`]: once every peer has left, every
 //!   routine has ended and the sequencer's input queue is empty, at rest,
-//!   every charge is back to zero, serving leases and session slots
-//!   included.
+//!   every charge is back to zero, session slots included.
 //!
 //! `B` is [`ESTIMATE_CEILING`], and `k` is
 //! `advertised_max_blocks_per_response()`, the most bodies one request asks
@@ -389,20 +388,6 @@ pub enum OwnerInput {
         /// The links not yet closed.
         open: u64,
     },
-    /// A serving response took its execution lease, both its node and its
-    /// peer slot, or released it once both slots returned.
-    ServingLease {
-        /// The serving session's connection.
-        connection: u64,
-        /// The serving session's routine generation.
-        generation: u64,
-        /// The range's first height.
-        start: u32,
-        /// The range's requested count.
-        count: u32,
-        /// True when it took the lease, false when it released it.
-        acquired: bool,
-    },
     /// The node's block-sync service had `free` session slots. The first
     /// reading, taken before the harness makes any link, is the baseline.
     SessionSlots {
@@ -519,20 +504,6 @@ impl OwnerInput {
                     OwnerInput::Released { holder }
                 }
             }
-            BlockSyncFact::ServingLease {
-                connection,
-                generation,
-                start,
-                count,
-                step,
-                ..
-            } => OwnerInput::ServingLease {
-                connection: *connection,
-                generation: *generation,
-                start: *start,
-                count: *count,
-                acquired: step == "acquired",
-            },
             BlockSyncFact::WorkQueue { items } => OwnerInput::WorkQueue {
                 reserved: items.iter().map(|item| item.reserved_bytes).sum(),
             },
@@ -640,9 +611,6 @@ pub struct OwnerModel {
     /// The links the harness made and how many are still open, once it
     /// reported them.
     links: Option<(u64, u64)>,
-    /// Each held serving lease, by session connection, generation, first
-    /// height and count, with how many it holds.
-    serving: BTreeMap<(u64, u64, u32, u32), u64>,
     /// The session slots free before any link, and at the latest reading.
     session_slots: Option<(FreeSlots, FreeSlots)>,
     /// The largest value of each quantity, for the run's report.
@@ -651,8 +619,6 @@ pub struct OwnerModel {
     budget_gap: Option<String>,
     /// The first holder or handoff input the model couldn't apply.
     holder_gap: Option<String>,
-    /// The first serving lease input the model couldn't apply.
-    serving_gap: Option<String>,
     /// Whether a completed sequencer boundary supplied a runtime inventory.
     payloads_observed: bool,
     /// First mismatch between actual payload storage and policy membership.
@@ -671,8 +637,6 @@ pub struct Peaks {
     /// The most wire bytes in the sequencer's input queue, the `Q·b`
     /// allowance's quantity.
     pub queued: u64,
-    /// The most serving leases held at once.
-    pub serving_leases: u64,
     /// The most session slots held at once.
     pub session_slots: u64,
 }
@@ -822,13 +786,6 @@ impl OwnerModel {
                 self.verified_tip = self.verified_tip.max(height);
             }
             OwnerInput::Links { made, open } => self.links = Some((made, open)),
-            OwnerInput::ServingLease {
-                connection,
-                generation,
-                start,
-                count,
-                acquired,
-            } => self.lease((connection, generation, start, count), acquired),
             OwnerInput::SessionSlots { free } => {
                 let baseline = self.session_slots.map_or(free, |(baseline, _)| baseline);
                 self.session_slots = Some((baseline, free));
@@ -915,28 +872,6 @@ impl OwnerModel {
                     self.retained = self.retained.saturating_sub(entry.bytes);
                     self.allocations.remove(&allocation);
                 }
-            }
-        }
-    }
-
-    /// Folds the serving lease `lease` taken, if `acquired`, or released.
-    fn lease(&mut self, lease: (u64, u64, u32, u32), acquired: bool) {
-        if acquired {
-            *self.serving.entry(lease).or_default() += 1;
-            self.peaks.serving_leases = self.peaks.serving_leases.max(self.serving_leases());
-            return;
-        }
-        match self.serving.get_mut(&lease) {
-            Some(held) if *held > 1 => *held -= 1,
-            Some(_) => {
-                self.serving.remove(&lease);
-            }
-            None => {
-                let (connection, generation, start, count) = lease;
-                self.serving_gap.get_or_insert(format!(
-                    "serving on connection {connection}, generation {generation}, released \
-                     a lease on {count} heights from {start} that it never took"
-                ));
             }
         }
     }
@@ -1082,11 +1017,6 @@ impl OwnerModel {
             .count()
     }
 
-    /// The serving leases taken and not yet released.
-    pub fn serving_leases(&self) -> u64 {
-        self.serving.values().sum()
-    }
-
     /// The session slots the node's service holds beyond its baseline, of
     /// every kind together, or 0 before any reading.
     pub fn session_slots(&self) -> u64 {
@@ -1117,12 +1047,6 @@ impl OwnerModel {
     /// Holders and handoffs aren't known after it.
     pub fn holder_gap(&self) -> Option<&str> {
         self.holder_gap.as_deref()
-    }
-
-    /// The first serving lease input the model couldn't apply, if any. The
-    /// serving leases held aren't known after it.
-    pub fn serving_gap(&self) -> Option<&str> {
-        self.serving_gap.as_deref()
     }
 
     /// The first input the model couldn't apply, budget inputs first.
@@ -1496,13 +1420,14 @@ where
 /// waiting for storage, with bodies still queued: those bodies are the
 /// sequencer's work, which no peer's leaving ends. Then the budget, the
 /// work queue's tally and the routines' unreceived estimates must all be
-/// zero, no handoff may be open, every serving lease must have released
-/// both its slots, and the service's session slots must all be free again.
+/// zero, no handoff may be open, and the service's session slots must all
+/// be free again. Serving leases aren't a charge here:
+/// `receiver-serving-bounded` already requires every serving owner to
+/// retire at each rest after its request ends, from the same lease report,
+/// so a held lease always violates it first.
 /// Before settlement the property is unsettled, so a run that ends there,
 /// including one with a leaked routine or queued body, is
-/// `Inconclusive { TeardownOpen }`, not a violation. A serving lease gap
-/// leaves the leases held unknown, so it is missing evidence here, and only
-/// here, since no other property reads them.
+/// `Inconclusive { TeardownOpen }`, not a violation.
 fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
@@ -1524,12 +1449,9 @@ where
                     "open handoffs",
                     u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX),
                 ),
-                ("held serving leases", owners.serving_leases()),
                 ("held session slots", owners.session_slots()),
             ],
-            owners
-                .gap()
-                .or_else(|| owners.serving_gap().map(str::to_owned)),
+            owners.gap(),
         )
     });
     if !left {
@@ -1725,17 +1647,6 @@ mod tests {
         }
     }
 
-    /// A serving lease on height 1 of connection 3, taken if `acquired`.
-    fn lease(acquired: bool) -> OwnerInput {
-        OwnerInput::ServingLease {
-            connection: 3,
-            generation: 1,
-            start: 1,
-            count: 1,
-            acquired,
-        }
-    }
-
     /// The `(expected, actual)` text of `verdict`'s violation.
     fn violation(verdict: &Verdict) -> (&str, &str) {
         match verdict {
@@ -1747,32 +1658,18 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_teardown_with_every_lease_and_slot_returned_holds() {
+    fn a_settled_teardown_with_every_slot_returned_holds() {
         let mut owners = settled(2);
-        owners.apply(lease(true));
         owners.apply(slots(1));
-        owners.apply(lease(false));
         owners.apply(slots(2));
         assert_eq!(teardown(owners), (Verdict::Holds, None));
     }
 
-    /// The scripted bypass: one serving lease and one session slot held
-    /// once teardown settles. The lease comes first in the charges' order,
-    /// so the violation names it, and with it returned, the slot.
+    /// The scripted bypass: one session slot held once teardown settles.
     #[test]
-    fn a_held_serving_lease_or_session_slot_violates_once_teardown_settles() {
+    fn a_held_session_slot_violates_once_teardown_settles() {
         let mut owners = settled(2);
-        owners.apply(lease(true));
         owners.apply(slots(1));
-        let (verdict, _) = teardown(owners.clone());
-        assert_eq!(
-            violation(&verdict),
-            (
-                "held serving leases is zero once teardown settles",
-                "it counts 1"
-            )
-        );
-        owners.apply(lease(false));
         let (verdict, _) = teardown(owners);
         assert_eq!(
             violation(&verdict),
@@ -1781,14 +1678,5 @@ mod tests {
                 "it counts 1"
             )
         );
-    }
-
-    #[test]
-    fn a_lease_released_without_its_acquisition_is_missing_evidence() {
-        let mut owners = settled(1);
-        owners.apply(lease(false));
-        let (verdict, missing) = teardown(owners);
-        assert_eq!(verdict, Verdict::NotApplicable);
-        assert!(missing.is_some_and(|gap| gap.contains("never took")));
     }
 }

@@ -55,8 +55,8 @@ use zakura_network::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
         BlockRangeRead, BlockRangeReadResult, BlockRangeSource, BlockSyncAction,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, CloseCauseReader,
-        FramedSend, Peer, Service, ServicePeerDirection, SessionSlotsProbe, StreamReader,
-        ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        FramedSend, Peer, Service, ServicePeerDirection, SessionFull, SessionSlotsProbe,
+        StreamReader, ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
@@ -1095,11 +1095,10 @@ impl Topology {
     /// `remote`, with `streams`, whose receiving end `reader` reads if it
     /// has one, and returns why it closes. If the topology reserves
     /// sessions and `local` is the node under test, its service reserves
-    /// the session first, and the session's one stream is ready at once.
-    ///
-    /// # Panics
-    ///
-    /// If that reservation finds the service's session slots full.
+    /// the session first, and the session's one stream is ready at once. If
+    /// the service's slots for `direction` are full, as a leaked slot can
+    /// leave them, it records a failure and admits the peer without a
+    /// reservation, since the failure ends the run.
     #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
@@ -1118,12 +1117,17 @@ impl Topology {
             .service;
         let (recv, mut send) = streams;
         if self.sessions && local == 0 {
-            let reservation = service
-                .reserve_session(direction)
-                .expect("a scenario's links fit the node's session slots")
-                .expect("a service with routines reserves its sessions");
-            reservation.admitted();
-            send = send.holding_session(reservation);
+            match service.reserve_session(direction) {
+                Ok(reservation) => {
+                    let reservation =
+                        reservation.expect("a service with routines reserves its sessions");
+                    reservation.admitted();
+                    send = send.holding_session(reservation);
+                }
+                Err(SessionFull) => self.fail(&format!(
+                    "the node's {direction:?} session slots are full, so it takes no link"
+                )),
+            }
         }
         let streams = (recv, send);
         let peer = Peer::new_versioned(

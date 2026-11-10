@@ -135,13 +135,17 @@ enum Behavior {
 
 /// One task, checked by properties whose verdicts don't depend on it: one
 /// that holds, a `Known` one that holds, one whose obligation never closes,
-/// and one with no trigger-history check.
+/// one with no trigger-history check, and two that share an ID-aware one.
 struct Probe;
 
 const HOLDS: &str = "test/holds";
 const KNOWN: &str = "test/known";
 const OPEN: &str = "test/open";
 const NO_HISTORY: &str = "test/no-history";
+/// The property whose history [`named_step`] reaches.
+const NAMED: &str = "test/named";
+/// A property that shares [`named_step`] with [`NAMED`].
+const NAMED_SIBLING: &str = "test/named-sibling";
 
 impl HasView for Probe {
     type View = ();
@@ -216,12 +220,26 @@ impl Subsystem for Probe {
                 witness: None,
                 ..holds(NO_HISTORY, Status::Active)
             },
+            Property {
+                witness: Some(TriggerHistory::LogOf(named_step)),
+                ..holds(NAMED, Status::Active)
+            },
+            Property {
+                witness: Some(TriggerHistory::LogOf(named_step)),
+                ..holds(NAMED_SIBLING, Status::Active)
+            },
         ]
     }
 
     fn draw(_: &[u8]) -> Behavior {
         Behavior::Sleep
     }
+}
+
+/// [`any_step`], for [`NAMED`] only: one function shared by two IDs that
+/// tells them apart by the ID the judge hands it.
+fn named_step(id: &PropertyId, log: &ObservationLog) -> bool {
+    id.as_str() == NAMED && any_step(log)
 }
 
 /// A trigger history that every run past setup has.
@@ -244,6 +262,18 @@ fn probe(behavior: Behavior) -> WitnessScenario<Probe> {
 fn holding_probe_passes() {
     check_witness(probe(Behavior::Sleep), HOLDS, Expect::Holds);
     check_witness(probe(Behavior::Sleep), HOLDS, Expect::Applicable);
+}
+
+/// C7: the judge hands a trigger its property's ID, so one function can
+/// serve several IDs. [`named_step`] reaches only [`NAMED`]'s history, and
+/// the same run loses [`NAMED_SIBLING`]'s.
+#[test]
+fn a_trigger_sees_its_property_id() {
+    check_witness(probe(Behavior::Sleep), NAMED, Expect::Holds);
+    assert_eq!(
+        witness(probe(Behavior::Sleep), NAMED_SIBLING, Expect::Holds),
+        Err(WitnessError::LostTriggerHistory)
+    );
 }
 
 /// A run that ends with the property's obligation still open is

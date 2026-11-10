@@ -199,6 +199,13 @@ pub enum Observation {
         /// frame to an empty bucket: its charge returned
         /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
+        /// The exchange or subscription the frame names, in the key space
+        /// of [`Observation::PeerFrame`]'s `exchange`: header sync's
+        /// subscription ID. `None` for a frame whose message names none,
+        /// such as a status or a discovery message, whose exchanges run in
+        /// order on their stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.

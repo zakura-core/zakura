@@ -84,6 +84,7 @@ fn node_frame(stream: Stream, seq: u64, row: &str, label: Label, exhausted: bool
         rule_stream: id(stream),
         label,
         exhausted,
+        exchange: None,
     }
 }
 

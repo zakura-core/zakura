@@ -51,6 +51,10 @@ pub struct Property<S: HasView> {
 pub enum TriggerHistory<S: HasView> {
     /// Reads the observation log.
     Log(fn(&ObservationLog) -> bool),
+    /// Reads the observation log, handed the property's ID, so one function
+    /// can check every ID a template generates, such as
+    /// [`crate::table::generated_trigger`]'s.
+    LogOf(fn(&PropertyId, &ObservationLog) -> bool),
     /// Reads the harness's view at the run's end and the log, for a trigger
     /// made of view-side facts.
     View(fn(&S::View, &ObservationLog) -> bool),

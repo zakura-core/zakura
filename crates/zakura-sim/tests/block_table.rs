@@ -858,6 +858,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
             rule_stream: STREAM,
             label,
             exhausted,
+            exchange: None,
         }]]
     };
     let judged = Observation::FrameJudged {

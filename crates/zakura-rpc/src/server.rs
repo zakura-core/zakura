@@ -65,6 +65,7 @@ pub mod fuzz;
 pub mod http;
 pub mod http_request_compatibility;
 pub mod jsonrpc;
+pub mod rest;
 pub mod rpc_call_compatibility;
 pub mod rpc_logger;
 pub mod rpc_metrics;
@@ -229,6 +230,8 @@ impl RpcServer {
         );
         conf.admin_listen_addr = None;
         conf.enable_cookie_auth = true;
+        // The admin listener serves only JSON-RPC.
+        conf.enable_rest = false;
         conf.tls = None;
 
         Self::start_inner(rpc, conf, RpcSurface::Full, OPENED_ADMIN_RPC_ENDPOINT_MSG).await
@@ -263,6 +266,7 @@ impl RpcServer {
             .expect("caller should make sure listen_addr is set");
 
         let rpc = rpc.with_rpc_surface(surface);
+        let rest_state = conf.enable_rest.then(|| rpc.read_state().clone());
         let enabled_methods = enabled_rpc_methods(registered_methods(&rpc), surface)?;
 
         // The largest RPC request is submitblock, which sends a full block
@@ -299,6 +303,9 @@ impl RpcServer {
                 MAX_RPC_BATCH_REQUESTS,
                 max_response_body_size,
             ));
+        // REST requests are answered before the JSON-RPC middleware, which only
+        // accepts authenticated JSON POST requests.
+        let service = rest::RestRouter::new(service, rest_state);
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;

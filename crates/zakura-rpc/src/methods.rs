@@ -1455,6 +1455,11 @@ where
         &self.network
     }
 
+    /// Returns a handle to the read-only state service.
+    pub(crate) fn read_state(&self) -> &ReadState {
+        &self.read_state
+    }
+
     /// Returns whether background validation rejected this server work ID.
     #[cfg(test)]
     pub fn mining_template_rejected(&self, work_id: &str) -> bool {

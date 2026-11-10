@@ -1,7 +1,7 @@
 //! Fixed test vectors for codec.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use chrono::DateTime;
 use futures::prelude::*;
@@ -860,4 +860,56 @@ fn unknown_command_is_escaped_in_debug_log() {
         !log_output.contains("\nFORGED"),
         "raw newlines from the command must not reach the log output: {log_output:?}",
     );
+}
+
+/// A block that kept its received encoding is sent as exactly the message a
+/// freshly serialized block produces.
+#[test]
+fn block_with_kept_encoding_encodes_like_a_serialized_block() {
+    use tokio_util::codec::Encoder;
+    use zakura_chain::{
+        block::{Block, BlockEncoding},
+        serialization::ZcashDeserializeInto,
+    };
+    use zakura_node_services::block_memory::{
+        Admission, BlockHandle, DecodedBlockPool, MeasuredBlock,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let encode = |message: Message| {
+        let mut bytes = BytesMut::new();
+        Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish()
+            .encode(message, &mut bytes)
+            .expect("blocks encode");
+        bytes
+    };
+
+    for raw in [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ] {
+        let block: Block = raw
+            .zcash_deserialize_into()
+            .expect("vectors are valid blocks");
+        let serialized = encode(Message::Block(Arc::new(block.clone()).into()));
+
+        let (decoded, encoding) =
+            BlockEncoding::decode(Arc::from(raw), 0).expect("vectors are valid blocks");
+        let encoding = encoding.expect("vectors re-encode to their bytes");
+        let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::MAX);
+        let owner = pool
+            .try_admit_measured(
+                MeasuredBlock::with_encoding(decoded, encoding),
+                Admission::WithinLimit,
+            )
+            .expect("an unlimited pool admits the block");
+        let handle = BlockHandle::from(owner);
+        assert!(handle.encoding().is_some());
+
+        assert_eq!(encode(Message::Block(handle)), serialized);
+    }
 }

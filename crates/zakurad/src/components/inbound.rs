@@ -29,7 +29,6 @@ use zakura_state::{self as zs};
 use zakura_chain::{
     block::{self},
     parameters::Network,
-    serialization::ZcashSerialize,
     transaction::UnminedTxId,
 };
 use zakura_consensus::{router::RouterError, VerifyBlockError};
@@ -697,7 +696,7 @@ impl Service<zn::Request> for Inbound {
                         };
                         if let Some(Some(block)) = &block {
                             state_lookup_bytes = state_lookup_bytes
-                                .saturating_add(block.zcash_serialized_size());
+                                .saturating_add(block.serialized_size());
                         }
                         lookup_results.push((index, hash, block));
                     }
@@ -719,9 +718,7 @@ impl Service<zn::Request> for Inbound {
                         };
                         match block {
                             Some(block) => {
-                                // If checking the serialized size of the block performs badly,
-                                // return the size from the state using a wrapper type.
-                                total_size += block.zcash_serialized_size();
+                                total_size += block.serialized_size();
 
                                 blocks.push(Available((block, None)))
                             },

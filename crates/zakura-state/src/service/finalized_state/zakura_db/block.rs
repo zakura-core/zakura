@@ -1137,7 +1137,18 @@ impl ZakuraDb {
                 }
             },
             || {
-                if store_raw_txs {
+                if !store_raw_txs {
+                    None
+                } else if let Some(encoding) = finalized.block.encoding() {
+                    // The block kept the bytes it was received as: copy each
+                    // transaction's slice instead of serializing it again.
+                    Some(
+                        encoding
+                            .transactions_bytes()
+                            .map(|bytes| RawBytes::new_raw_bytes(bytes.to_vec()))
+                            .collect(),
+                    )
+                } else {
                     use rayon::prelude::*;
                     Some(
                         finalized
@@ -1147,8 +1158,6 @@ impl ZakuraDb {
                             .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
                             .collect(),
                     )
-                } else {
-                    None
                 }
             },
         );
@@ -1784,6 +1793,11 @@ impl DiskWriteBatch {
             // Serialized off the committer's critical path (overlapped with the
             // spent-UTXO reads in `write_block`); use those bytes directly.
             precomputed
+        } else if let Some(encoding) = block.encoding() {
+            encoding
+                .transactions_bytes()
+                .map(|bytes| RawBytes::new_raw_bytes(bytes.to_vec()))
+                .collect()
         } else if block.view().transactions().len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
             use rayon::prelude::*;
             block

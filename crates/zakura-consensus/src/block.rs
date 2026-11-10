@@ -587,7 +587,8 @@ where
                 // The Merkle root check needs only transaction IDs. Authorizing data is hashed
                 // after it and after the quick checks, so a body that does not match its
                 // header, or fails a cheap rule, never has its proofs and signatures hashed.
-                let transaction_hashes = block.view().transaction_hashes();
+                // A block from the v2 sync routine already carries its IDs.
+                let transaction_hashes = block.transaction_hashes();
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
                 let check::CoinbaseSummary {
                     coinbase_tx,

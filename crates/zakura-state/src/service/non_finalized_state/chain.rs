@@ -2047,7 +2047,7 @@ impl Chain {
         }
 
         // update the chain value pool balances
-        let size = block.zcash_serialized_size();
+        let size = contextually_valid.block.serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
         Ok(())

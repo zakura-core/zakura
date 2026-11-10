@@ -345,7 +345,10 @@ impl DiskWriteBatch {
         // Only fan out to rayon once the block has enough transactions to
         // amortize the fork-join cost; small blocks sum sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
-        let block_size = {
+        let block_size = if let Some(encoding) = finalized.block.encoding() {
+            // The block kept the bytes it was received as, so their length is its size.
+            encoding.len()
+        } else {
             let block_view = finalized.block.view();
             let transaction_count = block_view.transactions().len();
             let transactions_size: usize =

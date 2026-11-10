@@ -873,8 +873,8 @@ impl CheckpointVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("checkpoint verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> =
-            block.view().transactions().map(|tx| tx.hash()).collect();
+        // A block from the v2 sync routine already carries its IDs.
+        let transaction_hashes = block.transaction_hashes();
         let new_outputs = Arc::new(transparent::new_ordered_outputs(
             &block,
             &transaction_hashes,

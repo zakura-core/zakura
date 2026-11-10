@@ -333,7 +333,11 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(writer)?,
+            // A block kept with its received encoding is written as those bytes.
+            Message::Block(block) => match block.encoding() {
+                Some(encoding) => writer.write_all(encoding.as_bytes())?,
+                None => block.zcash_serialize(writer)?,
+            },
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
                 known_blocks.zcash_serialize(writer)?;

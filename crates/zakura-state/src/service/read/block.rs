@@ -97,7 +97,7 @@ where
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
     {
-        let size = contextual.block.zcash_serialized_size();
+        let size = contextual.block.serialized_size();
         return Ok(Some((contextual.block.clone(), size)));
     }
     db.block_and_size(hash_or_height)
@@ -128,10 +128,14 @@ where
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
     {
-        let bytes = contextual
-            .block
-            .zcash_serialize_to_vec()
-            .expect("serializing a block to a vec cannot fail");
+        // A block kept with its received encoding is copied instead of serialized.
+        let bytes = match contextual.block.encoding() {
+            Some(encoding) => encoding.as_bytes().to_vec(),
+            None => contextual
+                .block
+                .zcash_serialize_to_vec()
+                .expect("serializing a block to a vec cannot fail"),
+        };
         return db.retain_serialized_bytes(bytes).map(Some);
     }
     db.raw_block_result(hash_or_height)

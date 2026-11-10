@@ -1,7 +1,7 @@
 //! Configuration for Zakura's network communication.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
@@ -43,7 +43,7 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR,
         OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
-    peer::PeerPreference,
+    peer::address_is_valid_for_outbound_connections,
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
     BoxError, PeerSocketAddr,
@@ -504,8 +504,8 @@ impl Config {
 
     /// Resolve initial seed peer IP addresses, based on the configured network,
     /// and load cached peers from disk, if available.
-    /// Alternates cached peers in saved RTT order with shuffled seed peers grouped
-    /// by address preference, starting with a cached peer. Shared addresses keep
+    /// Alternates cached peers in saved RTT order with shuffled seed peers,
+    /// starting with a cached peer. Shared addresses keep
     /// their cache position; an exhausted list yields the rest of the other list.
     ///
     /// # Panics
@@ -519,11 +519,11 @@ impl Config {
         )
         .await;
 
-        // Only seed peers are shuffled and grouped by address preference.
-        let mut preferred_seeds: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
+        // Validate seeds before shuffling, without preferring any listening port.
+        let mut valid_seeds = Vec::new();
         for addr in dns_peers {
-            match PeerPreference::new(addr, self.network.clone()) {
-                Ok(preference) => preferred_seeds.entry(preference).or_default().push(addr),
+            match address_is_valid_for_outbound_connections(addr, self.network.clone()) {
+                Ok(()) => valid_seeds.push(addr),
                 Err(error) => info!(
                     peer = %addr.addr_label(self.expose_peer_addresses),
                     ?error,
@@ -531,11 +531,8 @@ impl Config {
                 ),
             }
         }
-        let mut dns_peers = Vec::new();
-        for peers in preferred_seeds.values_mut() {
-            peers.shuffle(&mut rand_10::rng());
-            dns_peers.extend(peers.iter().copied());
-        }
+        let mut dns_peers = valid_seeds;
+        dns_peers.shuffle(&mut rand_10::rng());
 
         if self.network.is_regtest() {
             // Only return local peer addresses and skip loading the peer cache on Regtest.
@@ -546,8 +543,8 @@ impl Config {
         } else {
             // Ignore disk errors because the cache is optional and the method already logs them.
             let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
-            disk_peers.retain(
-                |addr| match PeerPreference::new(*addr, self.network.clone()) {
+            disk_peers.retain(|addr| {
+                match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
                     Ok(_) => true,
                     Err(error) => {
                         info!(
@@ -557,8 +554,8 @@ impl Config {
                         );
                         false
                     }
-                },
-            );
+                }
+            });
 
             // Remove overlap before alternating, so a duplicate cannot consume a seed turn.
             dns_peers.retain(|addr| !disk_peers.contains(addr));

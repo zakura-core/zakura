@@ -84,15 +84,17 @@ async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     assert!(config.load_peer_cache().await.unwrap().is_empty());
 }
 
-/// Cached peers retain their turns while canonical-port seeds precede other seeds.
+/// Cached peers retain their turns, and seed membership does not depend on the port.
 #[tokio::test]
-async fn peer_cache_alternates_with_both_seed_preference_groups() {
+async fn peer_cache_alternates_with_seeds_on_any_network_port() {
     let _init_guard = zakura_test::init();
     let cache_dir = tempfile::tempdir().unwrap();
     for network in [Network::Mainnet, Network::new_default_testnet()] {
-        let preferred = format!("127.0.0.2:{}", network.default_port());
-        let ordinary = "127.0.0.3:9000".to_owned();
-        let seeds = [ordinary.clone(), preferred.clone()].into_iter().collect();
+        let seed_addresses = ["127.0.0.2:8233", "127.0.0.3:18233", "127.0.0.4:9000"];
+        let seeds = seed_addresses
+            .iter()
+            .map(|addr| (*addr).to_owned())
+            .collect();
         let mut config = Config {
             network,
             cache_dir: CacheDir::custom_path(cache_dir.path()),
@@ -108,14 +110,20 @@ async fn peer_cache_alternates_with_both_seed_preference_groups() {
             .update_peer_cache([cached.parse().unwrap()].into_iter().collect())
             .await
             .unwrap();
-        let expected: Vec<crate::PeerSocketAddr> = [cached, &preferred, &ordinary]
+        let actual: Vec<_> = config.initial_peers().await.into_iter().collect();
+        assert_eq!(actual[0], cached.parse().unwrap());
+        let expected: std::collections::HashSet<crate::PeerSocketAddr> = seed_addresses
             .into_iter()
             .map(|addr| addr.parse().unwrap())
             .collect();
         assert_eq!(
-            config.initial_peers().await.into_iter().collect::<Vec<_>>(),
-            expected,
+            actual[1..]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
         );
+        assert_eq!(actual.len(), 4);
     }
 }
 

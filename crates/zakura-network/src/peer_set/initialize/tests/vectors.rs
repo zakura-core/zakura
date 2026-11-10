@@ -135,7 +135,7 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
         assert_eq!(peers.len(), 4);
         assert_eq!(peers[0], cached[0]);
         assert_eq!(peers[2], cached[1]);
-        // Seeds with equal address preference remain shuffled, but get alternate turns.
+        // Seeds remain shuffled, but get alternate turns regardless of listening port.
         assert_eq!(
             IndexSet::from([peers[1], peers[3]]),
             IndexSet::from([

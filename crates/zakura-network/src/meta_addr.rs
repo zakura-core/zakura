@@ -11,7 +11,7 @@ use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
     constants,
-    peer::{address_is_valid_for_outbound_connections, PeerPreference},
+    peer::address_is_valid_for_outbound_connections,
     protocol::{external::canonical_peer_addr, types::PeerServices},
 };
 
@@ -480,11 +480,6 @@ impl MetaAddr {
     /// Return the address for this `MetaAddr`.
     pub fn addr(&self) -> PeerSocketAddr {
         self.addr
-    }
-
-    /// Return the address preference level for this `MetaAddr`.
-    pub fn peer_preference(&self) -> Result<PeerPreference, &'static str> {
-        PeerPreference::new(self.addr, None)
     }
 
     /// Returns the time of the last successful interaction with this peer.
@@ -1224,9 +1219,9 @@ impl Ord for MetaAddr {
         // First, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
-        // Then, try addresses that are more likely to be valid.
-        // Currently, this prefers addresses with canonical Zcash ports.
-        let more_likely_valid = self.peer_preference().cmp(&other.peer_preference());
+        // Keep valid addresses before invalid ones, without ranking their ports.
+        let more_likely_valid = address_is_valid_for_outbound_connections(self.addr, None)
+            .cmp(&address_is_valid_for_outbound_connections(other.addr, None));
 
         // # Security and Correctness
         //

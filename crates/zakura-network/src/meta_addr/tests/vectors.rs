@@ -27,6 +27,23 @@ use super::{super::MetaAddr, check};
 /// [`DateTime32`]s.
 const TEST_TIME_ERROR_MARGIN: Duration32 = Duration32::from_seconds(1);
 
+/// Default ports do not override the address tie-breaker for otherwise identical peers.
+#[test]
+fn peer_cache_port_does_not_override_book_order() {
+    let now = Instant::now();
+    let wall_now = Utc::now();
+    let peer = |addr| {
+        MetaAddr::new_responded(addr, Some(Duration::from_millis(20)))
+            .apply_to_meta_addr(None, now, wall_now)
+            .unwrap()
+    };
+    let custom = peer("127.0.0.1:9000".parse().unwrap());
+    for port in [8233, 18233] {
+        let default = peer(SocketAddr::from(([127, 0, 0, 2], port)).into());
+        assert!(custom < default);
+    }
+}
+
 /// RTT survives same-connection updates but never carries into another connection.
 #[test]
 fn peer_cache_rtt_survives_only_same_connection_updates() {

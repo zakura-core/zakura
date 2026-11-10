@@ -1,80 +1,10 @@
-//! Prioritizing outbound peer connections based on peer attributes.
+//! Validating peer listener and outbound connection addresses.
 
 use std::net::SocketAddr;
 
 use zakura_chain::parameters::Network;
 
 use crate::PeerSocketAddr;
-
-use AttributePreference::*;
-
-/// A level of preference for a peer attribute.
-///
-/// Invalid peer attributes are represented as errors.
-///
-/// Outbound peer connections are initiated in the sorted [order](std::cmp::Ord)
-/// of this type.
-///
-/// The derived order depends on the order of the variants in the enum.
-/// The variants are sorted in the order they are listed.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum AttributePreference {
-    /// This peer is more likely to be a valid Zcash network peer.
-    ///
-    /// # Correctness
-    ///
-    /// This variant must be declared as the first enum variant,
-    /// so that `Preferred` peers sort before `Acceptable` peers.
-    Preferred,
-
-    /// This peer is possibly a valid Zcash network peer.
-    Acceptable,
-}
-
-/// A level of preference for a peer.
-///
-/// Outbound peer connections are initiated in the sorted [order](std::cmp::Ord)
-/// of this type.
-///
-/// The derived order depends on the order of the fields in the struct.
-/// The first field determines the overall order, then later fields sort equal first field values.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PeerPreference {
-    /// Is the peer using the canonical Zcash port for the configured [`Network`]?
-    canonical_port: AttributePreference,
-}
-
-impl AttributePreference {
-    /// Returns `Preferred` if `is_preferred` is true.
-    pub fn preferred_from(is_preferred: bool) -> Self {
-        if is_preferred {
-            Preferred
-        } else {
-            Acceptable
-        }
-    }
-}
-
-impl PeerPreference {
-    /// Return a preference for the peer at `peer_addr` on `network`.
-    ///
-    /// Use the [`PeerPreference`] [`Ord`] implementation to sort preferred peers first.
-    pub fn new(
-        peer_addr: impl Into<PeerSocketAddr>,
-        network: impl Into<Option<Network>>,
-    ) -> Result<PeerPreference, &'static str> {
-        let peer_addr = peer_addr.into();
-
-        address_is_valid_for_outbound_connections(peer_addr, network)?;
-
-        // This check only prefers the configured network, because
-        // address_is_valid_for_outbound_connections() rejects the port used by the other network.
-        let canonical_port =
-            AttributePreference::preferred_from([8233, 18233].contains(&peer_addr.port()));
-
-        Ok(PeerPreference { canonical_port })
-    }
-}
 
 /// Is the [`PeerSocketAddr`] we have for this peer valid for outbound
 /// connections?
@@ -112,21 +42,12 @@ pub fn address_is_valid_for_inbound_listeners(
 ) -> Result<(), &'static str> {
     // TODO: make private IP addresses an error unless a debug config is set (#3117)
 
-    // Ignore ports used by potentially compatible nodes: misconfigured Zcash ports.
-    if let Some(network) = network.into() {
-        if listener_addr.port() == network.default_port() {
-            return Ok(());
-        }
-
-        if listener_addr.port() == 8233 {
-            return Err(
-                "invalid peer port: port is for Mainnet, but this node is configured for Testnet",
-            );
-        } else if listener_addr.port() == 18233 {
-            return Err(
-                "invalid peer port: port is for Testnet, but this node is configured for Mainnet",
-            );
-        }
+    // A port does not identify the network; message framing checks network magic.
+    if network
+        .into()
+        .is_some_and(|network| listener_addr.port() == network.default_port())
+    {
+        return Ok(());
     }
 
     // Ignore ports used by potentially compatible nodes: other coins and unsupported Zcash regtest.
@@ -149,24 +70,24 @@ pub fn address_is_valid_for_inbound_listeners(
 mod tests {
     use super::*;
 
-    /// Default P2P ports are preferred on their network and rejected on the other network.
+    /// Network identity is checked by the protocol, not inferred from the default port.
     #[test]
-    fn default_ports_are_preferred_only_on_the_matching_network() {
-        let mainnet = Network::Mainnet;
-        let testnet = Network::new_default_testnet();
-        for (network, other_network) in [(&mainnet, &testnet), (&testnet, &mainnet)] {
-            let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
-            let preferred = PeerPreference::new(addr(network.default_port()), network.clone())
-                .expect("the network's default P2P port is valid");
-            let ordinary = PeerPreference::new(addr(9000), network.clone())
-                .expect("custom listening ports are valid");
-            assert_eq!(preferred.canonical_port, Preferred);
-            assert_eq!(ordinary.canonical_port, Acceptable);
-            assert!(preferred < ordinary);
-            assert!(
-                PeerPreference::new(addr(other_network.default_port()), network.clone()).is_err()
-            );
-            assert!(PeerPreference::new(addr(0), network.clone()).is_err());
+    fn peer_cache_accepts_default_and_custom_ports_on_either_network() {
+        for network in [Network::Mainnet, Network::new_default_testnet()] {
+            for port in [8233, 18233, 9000] {
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                assert!(
+                    address_is_valid_for_outbound_connections(addr.into(), network.clone()).is_ok()
+                );
+                assert!(address_is_valid_for_inbound_listeners(addr, network.clone()).is_ok());
+            }
+            for addr in ["0.0.0.0:8233", "127.0.0.1:0", "127.0.0.1:8033"] {
+                assert!(address_is_valid_for_outbound_connections(
+                    addr.parse().unwrap(),
+                    network.clone()
+                )
+                .is_err());
+            }
         }
     }
 }

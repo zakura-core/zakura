@@ -728,7 +728,7 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// preserving the alternation between cached peers and preferred seeds.
+/// preserving the alternation between cached peers and shuffled seeds.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
@@ -738,7 +738,7 @@ async fn limit_initial_peers(
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
 
-    // Config has validated and interleaved cached peers with preferred seeds.
+    // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
     for peer in all_peers {
         let _ = address_book_updater

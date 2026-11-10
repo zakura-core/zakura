@@ -35,7 +35,7 @@ use super::{
         ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
-    rows::NativeClass,
+    rows::{NativeClass, HEADER_HARNESSES},
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
     NARROWING, NATIVE_MUTATIONS, REQUIRED_CONTRACTS,
 };
@@ -1108,27 +1108,49 @@ fn provenance_refusal(dir: &Path) -> Option<String> {
     }
 }
 
-/// Every planted case under `repo`'s `qa/planted` whose property is a
-/// header one, as `(property, name)`: a registered header ID, or any
-/// property under the `header-sync` or `header` families. The property is
-/// the patch's directory relative to `qa/planted`, at any depth, as the
-/// planted runner reads it.
+/// Every planted case under `repo`'s `qa/planted` that is header sync's
+/// ([`is_header_case`]), as `(property, name)`. The property is the patch's
+/// directory relative to `qa/planted`, at any depth, as the planted runner
+/// reads it.
 pub fn planted_cases(repo: &Path) -> Vec<(String, String)> {
     let registered = super::registered();
     let ids: BTreeSet<&str> = registered
         .iter()
         .map(|registration| registration.property.as_ref())
         .collect();
-    planted_cases_in(&repo.join("qa/planted"), &|property| {
-        ids.contains(property)
-            || property.starts_with("header-sync/")
-            || property.starts_with("header/")
+    planted_cases_in(&repo.join("qa/planted"), &|property, name| {
+        is_header_case(repo, &ids, property, name)
     })
 }
 
-/// Every planted case under `root` whose property `header` keeps, as
-/// `(property, name)`, sorted. An unreadable directory holds none.
-fn planted_cases_in(root: &Path, header: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
+/// Whether planted case `name` of `property` is header sync's: any case
+/// under the `header-sync` or `header` families, whatever harness it names,
+/// so validation still checks it; or a case of a registered header ID
+/// (`ids`) that runs on a header harness. An ID that other harnesses
+/// register too, such as `session/honest-never-punished`, holds their cases
+/// as well, so a case there is left out only when it names a known
+/// harness that isn't a header one. One whose harness can't be read, or
+/// names no known harness, is kept, so it fails validation rather than
+/// disappearing.
+fn is_header_case(repo: &Path, ids: &BTreeSet<&str>, property: &str, name: &str) -> bool {
+    if property.starts_with("header-sync/") || property.starts_with("header/") {
+        return true;
+    }
+    if !ids.contains(property) {
+        return false;
+    }
+    super::planted_harness(repo, property, name).map_or(true, |harness| {
+        HEADER_HARNESSES.contains(&harness.as_str())
+            || !crate::harness::HARNESSES
+                .iter()
+                .any(|entry| entry.name == harness)
+    })
+}
+
+/// Every planted case under `root` that `header` keeps, given its property
+/// and name, as `(property, name)`, sorted. An unreadable directory holds
+/// none.
+fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(String, String)> {
     /// Collects every `.patch` under `dir`.
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -1151,7 +1173,7 @@ fn planted_cases_in(root: &Path, header: &dyn Fn(&str) -> bool) -> Vec<(String, 
     }
     let mut cases = Vec::new();
     walk(root, root, &mut cases);
-    cases.retain(|(property, _)| header(property));
+    cases.retain(|(property, name)| header(property, name));
     cases.sort();
     cases
 }
@@ -2294,7 +2316,7 @@ mod tests {
             fs::write(root.path().join(dir).join(format!("{name}.patch")), "")
                 .expect("the temp dir is writable");
         }
-        let cases = planted_cases_in(root.path(), &|property| {
+        let cases = planted_cases_in(root.path(), &|property, _| {
             property.starts_with("header-sync/") || property == "session/honest-never-punished"
         });
         let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());
@@ -2306,6 +2328,99 @@ mod tests {
                 owned("session/honest-never-punished", "punished"),
             ]
         );
+    }
+
+    /// A shared header ID's planted case counts for header acceptance only
+    /// when it runs on a header harness, or when its harness can't be read
+    /// or is no known one, by its typed table or its fuzz input's sidecar.
+    /// A header-family case counts whatever its harness says.
+    #[test]
+    fn a_shared_id_s_case_counts_only_on_a_header_harness() {
+        const SHARED: &str = "session/honest-never-punished";
+        let registered = super::super::registered();
+        assert!(
+            registered.iter().any(|r| r.property == SHARED),
+            "{SHARED} is a registered header ID"
+        );
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            fs::create_dir_all(path.parent().expect("the path has a parent"))
+                .expect("the temp dir is writable");
+            fs::write(path, text).expect("the temp dir is writable");
+        };
+        let typed = |harness: &str| {
+            format!("[typed]\nharness = \"{harness}\"\nscenario = \"s\"\nplan = \"p\"\n")
+        };
+        let fuzz = |input: &str| format!("input = \"{input}\"\n");
+        let cases: [(&str, &str, Option<String>, bool); 9] = [
+            (
+                SHARED,
+                "typed-header",
+                Some(typed("header-sync/storage")),
+                true,
+            ),
+            (
+                SHARED,
+                "typed-block",
+                Some(typed("block-sync/storage")),
+                false,
+            ),
+            (
+                SHARED,
+                "typed-typo",
+                Some(typed("header-sync/no-such-harness")),
+                true,
+            ),
+            (
+                SHARED,
+                "fuzz-header",
+                Some(fuzz("fixtures/header.bin")),
+                true,
+            ),
+            (
+                SHARED,
+                "fuzz-discovery",
+                Some(fuzz("fixtures/discovery.bin")),
+                false,
+            ),
+            (SHARED, "fuzz-typo", Some(fuzz("fixtures/typo.bin")), true),
+            (SHARED, "unreadable", None, true),
+            (
+                "header-sync/x/y",
+                "typed-block",
+                Some(typed("block-sync/storage")),
+                true,
+            ),
+            (
+                "block-sync/retained-byte-bound",
+                "typed-block",
+                Some(typed("block-sync/storage")),
+                false,
+            ),
+        ];
+        write(
+            "fixtures/header.toml",
+            "harness = \"header/publisher-policy\"\n",
+        );
+        write("fixtures/discovery.toml", "harness = \"discovery/wire\"\n");
+        write(
+            "fixtures/typo.toml",
+            "harness = \"discovery/no-such-harness\"\n",
+        );
+        for (property, name, toml, _) in &cases {
+            write(&format!("qa/planted/{property}/{name}.patch"), "");
+            if let Some(toml) = toml {
+                write(&format!("qa/planted/{property}/{name}.toml"), toml);
+            }
+        }
+        let mut kept: Vec<(String, String)> = cases
+            .iter()
+            .filter(|(.., kept)| *kept)
+            .map(|(property, name, ..)| ((*property).to_owned(), (*name).to_owned()))
+            .collect();
+        kept.sort();
+        assert_eq!(planted_cases(repo.path()), kept);
     }
 
     /// Every task's keys link its evidence: a node case, whose result the

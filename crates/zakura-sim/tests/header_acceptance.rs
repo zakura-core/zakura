@@ -230,40 +230,38 @@ fn the_matrix_check_refuses_one_id_moved_between_harnesses() {
     assert!(matrix_matches(&drafted, &header_acceptance::harness_matrix()).is_err());
 }
 
-/// Every planted case under `root` whose property is a header one, as
-/// `(property, name)`. The property is the patch's directory relative to
-/// `root`, at any depth, as the planted runner reads it.
-fn planted_cases_in(root: &Path, header: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
-    /// Collects every `.patch` under `dir`.
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(root, &path, out);
-            } else if path.extension().is_some_and(|ext| ext == "patch") {
-                let property = path.parent().unwrap().strip_prefix(root).unwrap();
-                out.push((
-                    property.to_str().unwrap().to_owned(),
-                    path.file_stem().unwrap().to_str().unwrap().to_owned(),
-                ));
-            }
-        }
-    }
-    let mut cases = Vec::new();
-    walk(root, root, &mut cases);
-    cases.retain(|(property, _)| header(property));
-    cases.sort();
-    cases
+/// Every planted case of header sync, as the tool's plan counts them
+/// (shared IDs' cases only on a header harness, `tool.rs`'s
+/// `is_header_case`).
+fn planted_cases() -> Vec<(String, String)> {
+    header_acceptance::tool::planted_cases(&repo())
 }
 
-/// Every planted case of a header ID, or under the header families.
-fn planted_cases() -> Vec<(String, String)> {
-    let ids = registered_ids();
-    planted_cases_in(&repo().join("qa/planted"), &|property| {
-        ids.contains(property)
-            || property.starts_with("header-sync/")
-            || property.starts_with("header/")
-    })
+/// The planted inventory reads a property at any depth under
+/// `qa/planted`, keeps the header families' and the header IDs' cases, and
+/// skips the rest. A shared ID's case with no readable harness is kept.
+#[test]
+fn the_planted_scan_reads_nested_properties() {
+    let repo = tempfile::tempdir().unwrap();
+    for (dir, name) in [
+        ("header-sync/s5v9/status/reserved-flags-closes", "flags"),
+        ("header-sync/s5v9/headers/reserved-flags-closes", "flags"),
+        ("session/honest-never-punished", "punished"),
+        ("block-sync/retained-byte-bound", "wide"),
+    ] {
+        let dir = repo.path().join("qa/planted").join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.patch")), "").unwrap();
+    }
+    let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());
+    assert_eq!(
+        header_acceptance::tool::planted_cases(repo.path()),
+        vec![
+            owned("header-sync/s5v9/headers/reserved-flags-closes", "flags"),
+            owned("header-sync/s5v9/status/reserved-flags-closes", "flags"),
+            owned("session/honest-never-punished", "punished"),
+        ]
+    );
 }
 
 /// A planted case's harness is read as the planted runner reads its case:
@@ -315,40 +313,6 @@ fn a_planted_case_s_harness_is_read_as_the_runner_reads_it() {
     assert!(read("both").is_err());
     assert!(read("neither").is_err());
     assert!(read("missing").is_err());
-}
-
-#[test]
-fn the_planted_scan_reads_nested_properties() {
-    let root = tempfile::tempdir().unwrap();
-    for (dir, name) in [
-        ("header-sync/s5v9/status/reserved-flags-closes", "flags"),
-        ("header-sync/s5v9/headers/reserved-flags-closes", "flags"),
-        ("session/honest-never-punished", "punished"),
-        ("block-sync/retained-byte-bound", "wide"),
-    ] {
-        std::fs::create_dir_all(root.path().join(dir)).unwrap();
-        std::fs::write(root.path().join(dir).join(format!("{name}.patch")), "").unwrap();
-    }
-    let cases = planted_cases_in(root.path(), &|property| {
-        property.starts_with("header-sync/") || property == "session/honest-never-punished"
-    });
-    assert_eq!(
-        cases,
-        vec![
-            (
-                "header-sync/s5v9/headers/reserved-flags-closes".to_owned(),
-                "flags".to_owned()
-            ),
-            (
-                "header-sync/s5v9/status/reserved-flags-closes".to_owned(),
-                "flags".to_owned()
-            ),
-            (
-                "session/honest-never-punished".to_owned(),
-                "punished".to_owned()
-            ),
-        ]
-    );
 }
 
 /// Every native-mutation directory under `qa/native-mutations/header-sync/`.

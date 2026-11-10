@@ -645,10 +645,25 @@ impl Runner {
             .collect::<Result<Vec<_>, _>>()?;
         let source = provenance::Provenance::read(&slots[0].tree, provenance::SOURCE_PATHS).source;
         let all: Vec<usize> = (0..cases.len()).collect();
-        let built = match self.build(&slots[0], &runnables, &all, &self.out.join("baseline"))? {
+        let host_jobs = thread::available_parallelism().map_or(1, usize::from);
+        let baseline_dir = self.out.join("baseline");
+        let built = match self.build(&slots[0], &runnables, &all, &baseline_dir, host_jobs)? {
             Ok(built) => built,
             Err(failure) => return Err(format!("the unpatched build fails: {failure}").into()),
         };
+        // Every slot starts from slot 0's dependencies, so a slot's first
+        // mutant rebuilds only the workspace crates.
+        for slot in &slots[1..] {
+            if slot.target.exists() {
+                fs::remove_dir_all(&slot.target)?;
+            }
+            run_command(
+                Command::new("cp")
+                    .args(["-a", "--reflink=auto"])
+                    .arg(&slots[0].target)
+                    .arg(&slot.target),
+            )?;
+        }
         let baselines = self.baselines(cases, &runnables, &slots[0], &built, &source)?;
         let mut mutants: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, case) in cases.iter().enumerate() {
@@ -864,7 +879,7 @@ impl Runner {
         if live.is_empty() {
             return Ok(reports);
         }
-        let built = match self.build(slot, runnables, &live, &dir)? {
+        let built = match self.build(slot, runnables, &live, &dir, self.build_jobs)? {
             Ok(built) => built,
             Err(BuildFailure::Rejected(why)) => {
                 reports.extend(live.iter().map(|index| {
@@ -915,15 +930,16 @@ impl Runner {
         Ok(reports)
     }
 
-    /// Builds in `slot` the `zakura-sim` binary if a case in `cases` runs a
-    /// recorded witness, and each test binary they name. The binaries, or
-    /// why the build failed.
+    /// Builds in `slot`, with `jobs` compiler jobs, the `zakura-sim` binary
+    /// if a case in `cases` runs a recorded witness, and each test binary
+    /// they name. The binaries, or why the build failed.
     fn build(
         &self,
         slot: &Slot,
         runnables: &[Runnable],
         cases: &[usize],
         dir: &Path,
+        jobs: usize,
     ) -> Result<Result<Built, BuildFailure>, BoxError> {
         fs::create_dir_all(dir)?;
         let needs_sim = cases
@@ -944,7 +960,7 @@ impl Runner {
                 .env("RUSTFLAGS", SIM_RUSTFLAGS)
                 .env("CARGO_TARGET_DIR", &slot.target)
                 .env("CARGO_BUILD_WARNINGS", "warn")
-                .env("CARGO_BUILD_JOBS", self.build_jobs.to_string())
+                .env("CARGO_BUILD_JOBS", jobs.to_string())
                 .args(args)
                 .args([
                     "--locked",

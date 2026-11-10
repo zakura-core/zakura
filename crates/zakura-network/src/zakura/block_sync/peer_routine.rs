@@ -300,11 +300,13 @@ impl PeerRoutine {
     /// observer is installed. `ended` marks the routine's last snapshot.
     ///
     /// Each request lists its received heights and the unreceived heights
-    /// the work queue still assigns to it. Another actor's revocation
+    /// the work queue still charges to it. Another actor's revocation
     /// releases a height's charge at once, but the routine drops the height
     /// only at its next fill (`gc_obsolete_outstanding`), which a full
-    /// outbound queue skips. The snapshot applies the same check now, so it
-    /// lists only heights the budget still counts.
+    /// outbound queue skips. Another peer's body for a height ends the
+    /// request's charge too, and the request keeps the height, because its
+    /// peer still owes the body. The snapshot omits both, so it lists only
+    /// heights the budget still counts.
     #[cfg(any(test, zakura_sim))]
     fn observe_owners(&self, ended: bool) {
         use super::block_sync_observe::{BlockEvent, RegistryClaim, RoutineSnapshot};
@@ -320,11 +322,11 @@ impl PeerRoutine {
             })
             .collect();
         if !unreceived.is_empty() {
-            let disowned = self.io.work.disowned(&unreceived, |owner| *owner);
+            let uncharged = self.io.work.uncharged(&unreceived, |owner| *owner);
             for request in &mut requests {
                 request
                     .heights
-                    .retain(|height| !disowned.contains(&(height.height, request.owner)));
+                    .retain(|height| !uncharged.contains(&(height.height, request.owner)));
             }
         }
         observe!(

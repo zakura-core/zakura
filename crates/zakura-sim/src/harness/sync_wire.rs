@@ -516,7 +516,7 @@ impl SavedWire {
 /// Curated combinations for the `sync_wire` fuzz target's seeds, each a
 /// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a
 /// committed input under `tests/fixtures/sync-wire-<name>.bin`.
-pub const CURATED: [(&str, [u8; 2]); 3] = [
+pub const CURATED: [(&str, [u8; 2]); 4] = [
     // The fork while storage holds a submission, and the node's
     // connection to mirror-1 replaced once storage admits two bodies.
     ("combined-reorg-submit-replace", [COMBINED_TAG, 0b0110_1100]),
@@ -526,6 +526,10 @@ pub const CURATED: [(&str, [u8; 2]); 3] = [
     // Mirror-0's connection replaced once storage admits one body, with
     // every read stalled.
     ("combined-replace-stall", [COMBINED_TAG, 0b0001_1000]),
+    // The fork while storage holds a mirror's range read, with every read
+    // stalled. A late body for a retired request answers the height another
+    // connection's request still claims.
+    ("combined-reorg-request-stall", [COMBINED_TAG, 0b0001_0011]),
 ];
 
 /// The first byte of a prefix that picks fuzz-13's combined actions

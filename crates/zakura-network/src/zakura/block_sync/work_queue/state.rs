@@ -1220,7 +1220,7 @@ impl WorkQueueState {
         self.in_flight.contains_key(&height)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::block_sync) fn reserved_in_flight_charge(
         &self,
         height: block::Height,

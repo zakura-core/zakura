@@ -5,8 +5,12 @@
 //! a production node's does.
 //!
 //! The node's actors, taps and engine watch are `sync/storage`'s
-//! ([`spawn_actors`]). Only the node's transport is tapped
-//! ([`TransportTap`]). A mirror's transport reports to no one.
+//! ([`spawn_actors`]). The node's transport is tapped ([`TransportTap`]).
+//! A mirror's transport reports to no one, unless the scenario sets QUIC
+//! windows ([`WireWindows`], sim-9.3): then every mirror's transport is
+//! tapped too, and every tap samples each connection's resources after
+//! every step for the connection properties
+//! ([`connection`](crate::domain::connection)).
 //!
 //! Each connection's dialer redials it once it ends, [`REDIAL_SETTLE`]
 //! later, until the node shuts down. So a `Close` step, which disconnects
@@ -45,11 +49,15 @@ use super::{
         SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView,
         Transport,
     },
+    wire_node::config as wire_config_for,
     wire_node::{Bound, TransportTap, WireEndpoint},
-    NetScenario, Subsystem,
+    LinkSpec, NetScenario, Subsystem,
 };
 use crate::{
-    domain::session,
+    domain::{
+        connection::{self, WireBounds, WireState},
+        session,
+    },
     peer::{key_index, peer_addr, peer_id, NODE_ADDR},
     property::{Capture, HasView, Property, Source, Sources},
     RunConfig, Sim,
@@ -73,12 +81,33 @@ pub struct SyncWireScenario {
     /// The chain, the mirrors, both storages' policies and the control
     /// steps.
     pub sync: SyncScenario,
+    /// The QUIC windows the node and the mirrors run with in place of
+    /// production's, which also taps every mirror's transport and samples
+    /// every connection's resources (sim-9.3). `None` runs production's
+    /// windows with only the node's transport tapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WireWindows>,
+}
+
+/// The QUIC windows a sim-9.3 scenario sets. The node's reactor shares,
+/// which its connections add to their receive windows, stay production's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireWindows {
+    /// The node's `[network.zakura.quic] receive_window_bytes`: the
+    /// handshake share every connection keeps beside its kinds' shares.
+    pub node_receive_window_bytes: u32,
+    /// Every mirror's `[network.zakura.quic] send_window_bytes`: the most
+    /// unacknowledged stream bytes it keeps in flight and buffered on one
+    /// connection.
+    pub mirror_send_window_bytes: u64,
 }
 
 /// The node under test, with header sync, block sync and discovery behind
 /// one handler, and mirror peers behind their own. See the module doc.
 pub struct SyncWire {
     view: SyncView,
+
     /// The node's block storage's replies, cleared once the run ends.
     replies: Arc<LateHandle>,
     /// The actors, which live until the run ends.
@@ -127,6 +156,20 @@ impl TransportObserver for Unobserved {
 /// [`sync_config`]'s: each frame crosses QUIC's handshakes, acknowledgements
 /// and timers.
 const WIRE_STEPS_PER_BLOCK: u64 = 6_000;
+
+/// The node's and every mirror's network config: production defaults on
+/// `network`, with `windows`' QUIC windows if set.
+fn configs(
+    network: &zakura_chain::parameters::Network,
+    windows: Option<WireWindows>,
+) -> (zakura_network::Config, zakura_network::Config) {
+    let (mut node, mut mirror) = (wire_config_for(network), wire_config_for(network));
+    if let Some(windows) = windows {
+        node.zakura.quic.receive_window_bytes = windows.node_receive_window_bytes;
+        mirror.zakura.quic.send_window_bytes = windows.mirror_send_window_bytes;
+    }
+    (node, mirror)
+}
 
 /// [`sync_config`], with room for QUIC's own steps for each fixture block
 /// and each block a `Control` step grows or forks.
@@ -222,7 +265,7 @@ fn redial(
 
 impl Subsystem for SyncWire {
     const NAME: &'static str = "sync/wire";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncWireScenario;
     type Prepared = SyncPorts;
@@ -249,10 +292,28 @@ impl Subsystem for SyncWire {
         let names: Vec<String> = (0..scenario.sync.mirrors.len())
             .map(|index| format!("mirror-{index}"))
             .collect();
-        let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names);
+        let (observer, tap) = match scenario.windows {
+            Some(_) => TransportTap::sampling(sim, "node", net.clone(), names.clone()),
+            None => TransportTap::new(sim, "node", net.clone(), names.clone()),
+        };
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
+        let mut mirror_observers = Vec::new();
+        if scenario.windows.is_some() {
+            for name in &names {
+                let (observer, tap) = TransportTap::of_peer(sim, name, net.clone());
+                sim.add_source(Box::new(tap));
+                mirror_observers.push(observer);
+            }
+        }
         let network = ports.fixture.headers().network().clone();
+        let (node_config, mirror_config) = configs(&network, scenario.windows);
+        let wire = scenario.windows.map(|_| {
+            Rc::new(WireState::new(WireBounds {
+                node: zakura_network::zakura::ZakuraLocalLimits::from_config(&node_config),
+                peer_send_window: mirror_config.zakura.quic.send_window_bytes,
+            }))
+        });
         let handshake = ZakuraHandshakeConfig::for_network(&network);
         let seed = scenario.net.seed;
         let quic = QuicLinks {
@@ -278,14 +339,20 @@ impl Subsystem for SyncWire {
                 addr,
             };
             let slot = (index == 0).then(|| quic.supervisor.clone());
-            let (observer, dials): (Arc<dyn TransportObserver>, _) = if index == 0 {
-                (observer.clone(), Some(dials.clone()))
-            } else {
-                (Arc::new(Unobserved), None)
+            let (observer, dials, config): (Arc<dyn TransportObserver>, _, _) = match peer {
+                None => (observer.clone(), Some(dials.clone()), node_config.clone()),
+                Some(peer) => (
+                    mirror_observers
+                        .get(peer)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Unobserved)),
+                    None,
+                    mirror_config.clone(),
+                ),
             };
-            endpoints.push(WireEndpoint::spawn_at(
+            endpoints.push(WireEndpoint::spawn_configured(
                 sim,
-                &network,
+                config,
                 net.sim(),
                 seed,
                 peer,
@@ -332,6 +399,7 @@ impl Subsystem for SyncWire {
                 block: view,
                 cross: ports.cross,
                 header,
+                wire,
             },
             replies: ports.replies,
             _topology: topology,
@@ -340,10 +408,12 @@ impl Subsystem for SyncWire {
     }
 
     /// `sync/storage`'s properties ([`sync_properties`]), then the session
-    /// properties the shared connection reaches.
+    /// properties the shared connection reaches, then the connection
+    /// properties a run with sampling taps reaches.
     fn properties() -> Vec<Property<Self>> {
         let mut properties = sync_properties();
         properties.extend(session::wire_properties());
+        properties.extend(connection::wire_properties());
         properties
     }
 
@@ -395,7 +465,35 @@ pub enum SavedWire {
     /// by [`STALL_GROWTH`] blocks, so header sync has new tips to apply
     /// while block sync waits.
     StalledBlocks,
+    /// sim-9.3's saturating peers: [`SavedWire::Honest`]'s mirrors serve
+    /// [`SATURATED_BODY_BYTES`]-byte bodies through a QUIC send window of
+    /// [`SATURATED_WINDOW_BYTES`], so each mirror's block-sync writes keep
+    /// its send path full, and the node keeps a handshake share of the same
+    /// size, so its held block frames take more than that share. Once the
+    /// first range read is submitted, every mirror's chain grows by
+    /// [`STALL_GROWTH`] blocks, so the mirrors write header-sync pages while
+    /// their block-sync writes saturate.
+    Saturated,
 }
+
+/// Each body's size in [`SavedWire::Saturated`]: a quarter of the largest
+/// block, so one body takes several send windows.
+pub const SATURATED_BODY_BYTES: u32 = 500_000;
+
+/// Every link's one-way delay in [`SavedWire::Saturated`], in
+/// milliseconds: each send window takes a round trip, so a body takes some
+/// eight round trips, and the transfers span the header-sync and
+/// discovery frames of the next seconds.
+pub const SATURATED_DELAY_MS: u64 = 50;
+
+/// [`SavedWire::Saturated`]'s step budget: QUIC moves each body in some
+/// ten thousand steps, past [`wire_config`]'s allowance for small bodies.
+pub const SATURATED_STEPS: u64 = 400_000;
+
+/// The node's handshake share and every mirror's QUIC send window in
+/// [`SavedWire::Saturated`]: the smallest window `QuicConfig::validate`
+/// accepts.
+pub const SATURATED_WINDOW_BYTES: u32 = 64 * 1024;
 
 /// How long [`SavedWire::StalledBlocks`] holds each mirror read, in
 /// milliseconds of virtual time: under block sync's 8-second request
@@ -411,10 +509,11 @@ const TAG: u8 = 0xFC;
 
 impl SavedWire {
     /// Every saved scenario, in tag order.
-    pub const ALL: [SavedWire; 3] = [
+    pub const ALL: [SavedWire; 4] = [
         SavedWire::Honest,
         SavedWire::Replace,
         SavedWire::StalledBlocks,
+        SavedWire::Saturated,
     ];
 
     /// The fixture's name, `sync-wire-<name>.bin`.
@@ -423,6 +522,7 @@ impl SavedWire {
             SavedWire::Honest => "honest",
             SavedWire::Replace => "replace",
             SavedWire::StalledBlocks => "stalled-blocks",
+            SavedWire::Saturated => "saturated",
         }
     }
 
@@ -452,6 +552,11 @@ impl SavedWire {
             SavedWire::Honest => &[],
             SavedWire::Replace => &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")],
             SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, "holds")],
+            SavedWire::Saturated => &[
+                (connection::CREDIT_ISOLATED, "holds"),
+                (connection::SEND_ISOLATED, "holds"),
+                (connection::CONNECTION_SHARES_BOUND, "holds"),
+            ],
         }
     }
 
@@ -473,8 +578,33 @@ impl SavedWire {
             ],
             ..SyncScenario::default()
         };
+        let mut windows = None;
+        let mut net = NetScenario::default();
         let sync = match self {
             SavedWire::Honest => sync,
+            SavedWire::Saturated => {
+                windows = Some(WireWindows {
+                    node_receive_window_bytes: SATURATED_WINDOW_BYTES,
+                    mirror_send_window_bytes: u64::from(SATURATED_WINDOW_BYTES),
+                });
+                net.default_link = LinkSpec {
+                    min_delay_ms: SATURATED_DELAY_MS,
+                    max_delay_ms: SATURATED_DELAY_MS,
+                    ..LinkSpec::default()
+                };
+                SyncScenario {
+                    body_bytes: SATURATED_BODY_BYTES,
+                    steps: Some(SATURATED_STEPS),
+                    control: vec![SyncStep {
+                        action: SyncAction::Grow { len: STALL_GROWTH },
+                        when: Some(Trigger::Submitted(block_policy::Select {
+                            kind: Some(block_policy::BlockKind::MirrorRead),
+                            ..block_policy::Select::default()
+                        })),
+                    }],
+                    ..sync
+                }
+            }
             SavedWire::Replace => SyncScenario {
                 control: vec![SyncStep {
                     action: SyncAction::Close {
@@ -506,10 +636,7 @@ impl SavedWire {
                 }
             }
         };
-        SyncWireScenario {
-            net: NetScenario::default(),
-            sync,
-        }
+        SyncWireScenario { net, sync, windows }
     }
 }
 
@@ -589,5 +716,6 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
     SyncWireScenario {
         net: NetScenario::default(),
         sync,
+        windows: None,
     }
 }

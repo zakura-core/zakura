@@ -94,6 +94,7 @@ use crate::{
             semantic_properties, SemanticModel, SemanticView, FRONTIER_WORK_CONSISTENT,
             QUERY_WORK_AUTHORIZED,
         },
+        connection::{WireState, WireView},
         cross::{self, CrossModel, CrossView, Dag, ViewSample},
         header_sync::TeardownView,
     },
@@ -868,6 +869,16 @@ pub struct SyncView {
     pub cross: Rc<RefCell<CrossModel>>,
     /// The node's header-sync settlement, as its reactor tap keeps it.
     pub header: HeaderSettlement,
+    /// The wire bounds and the connection properties' fold, for a
+    /// `sync/wire` run whose taps sample loads.
+    pub wire: Option<Rc<WireState>>,
+}
+
+impl WireView for SyncView {
+    /// The wire state, if the run samples loads.
+    fn wire(&self) -> Option<&WireState> {
+        self.wire.as_deref()
+    }
 }
 
 /// The node's header-sync settlement evidence: the claim rules its reactor
@@ -1058,6 +1069,7 @@ impl Subsystem for SyncStorage {
                 block: view,
                 cross: ports.cross,
                 header,
+                wire: None,
             },
             replies: ports.replies,
             _topology: topology,

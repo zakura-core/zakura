@@ -1,6 +1,6 @@
-//! `sync/wire` (xsync-3): `sync/storage`'s node and mirrors on simulated
-//! QUIC, each behind a real handler that registers header sync, block sync
-//! and discovery, so all three services share each connection.
+//! `sync/wire` (xsync-3, sim-9.3): `sync/storage`'s node and mirrors on
+//! simulated QUIC, each behind a real handler that registers header sync,
+//! block sync and discovery, so all three services share each connection.
 //!
 //! Each saved scenario has a committed input. It replays to its pinned end
 //! record, repeats A/A and A/B/A, and replays Exact in a fresh process
@@ -23,7 +23,10 @@ use zakura_network::zakura::{
     ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_sim::{
-    domain::session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
+    domain::{
+        connection::{CONNECTION_SHARES_BOUND, CREDIT_ISOLATED, SEND_ISOLATED},
+        session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
+    },
     harness::{
         run_prepared,
         sync::SyncPorts,
@@ -282,6 +285,68 @@ fn stalls(log: &ObservationLog) -> Vec<std::ops::Range<u64>> {
     }
     assert!(!stalls.is_empty(), "no request waited {STALL_MS} ms");
     stalls
+}
+
+/// sim-9.3: [`SavedWire::Saturated`] runs the node's connections with its
+/// QUIC receive window at the control share and the mirrors' send windows
+/// at the same floor, so large bodies saturate each connection while the
+/// mirrors' chains grow and header sync and discovery share it.
+///
+/// The run holds [`CREDIT_ISOLATED`], [`SEND_ISOLATED`] and
+/// [`CONNECTION_SHARES_BOUND`], each with its trigger history. Each peer
+/// keeps one connection carrying every service, the node reads block-sync
+/// frames on both, so neither connection starves the other, and both tips
+/// reach the mirrors' grown tip.
+#[test]
+fn a_saturating_service_starves_no_other_on_its_connection() {
+    let (report, _, ports) = run(SavedWire::Saturated, Plan::from_fuzz(&[]));
+    let tip = ports.mirror_tip();
+    let fixture_tip = ports.chain.last().expect("the fixture has blocks").height.0;
+    assert_eq!(tip.height.0, fixture_tip + STALL_GROWTH, "{:?}", report.end);
+    assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
+    let sessions = sessions(&report.log);
+    let mut block_streams = BTreeSet::new();
+    for (peer, connections) in &sessions {
+        assert_eq!(connections.len(), 1, "{peer}: {connections:?}");
+        assert_eq!(connections[0].1, every_service(), "{peer}");
+    }
+    for entry in report.log.entries() {
+        if let Observation::Session {
+            connection,
+            quic_stream,
+            kind,
+            ..
+        } = &entry.obs
+        {
+            if *kind == ZAKURA_STREAM_BLOCK_SYNC {
+                block_streams.insert((*connection, *quic_stream));
+            }
+        }
+    }
+    let read_on: BTreeSet<u64> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Transport {
+                connection: Some(connection),
+                event: TransportFact::FrameRead { quic_stream, .. },
+                ..
+            } if block_streams.contains(&(*connection, *quic_stream)) => Some(*connection),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(read_on.len(), sessions.len(), "block frames read on {read_on:?}");
+    for property in [CREDIT_ISOLATED, SEND_ISOLATED, CONNECTION_SHARES_BOUND] {
+        assert!(
+            matches!(
+                outcome(&report, property),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{property}: {:?}",
+            outcome(&report, property)
+        );
+    }
 }
 
 /// fuzz-13's combined actions: each curated combination of a chain change

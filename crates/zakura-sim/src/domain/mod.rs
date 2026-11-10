@@ -3,6 +3,7 @@
 
 pub mod block_sync;
 pub mod block_sync_semantic;
+pub mod connection;
 pub mod cross;
 pub mod discovery;
 pub mod header_sync;

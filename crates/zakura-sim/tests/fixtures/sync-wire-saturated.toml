@@ -1,0 +1,21 @@
+# The committed fuzz input `sync-wire-saturated.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `saturated` scenario, and
+# `sync-wire-saturated.end.json` is its pinned end record.
+harness = "sync/wire"
+generator = 3
+sha256 = "de38543aa42c5543c98c7265c874e921977e93606991f44256f3ee33164ddb2e"
+scenario_sha256 = "a13ac40fd062f7fbf8afe7b0d6d58f3c45adfb1f00cae80d52b34328d321b9d6"
+source = "crates/zakura-sim/tests/sync_wire.rs"
+
+[[witness]]
+property = "session/credit-isolated"
+expect = "holds"
+
+[[witness]]
+property = "session/send-isolated"
+expect = "holds"
+
+[[witness]]
+property = "session/connection-shares-bound"
+expect = "holds"

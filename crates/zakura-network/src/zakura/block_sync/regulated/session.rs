@@ -55,19 +55,28 @@ pub(crate) fn serving_limits(config: &ZakuraBlockSyncConfig) -> ServeLimits {
 /// on every session that can serve at once. Those are the block-sync
 /// connections, which [`ZakuraBlockSyncConfig::block_sync_connections`] clamps
 /// to `max_connections`.
+///
+/// A running read holds an output grant for a whole response, so one peer runs
+/// at most as many reads as its output budget holds largest responses, up to
+/// [`PEER_EXECUTION`]. With 2 MB blocks the budget holds more than that; larger
+/// block limits lower the peer's share instead of growing the output budget.
 pub(crate) fn derived_serving_limits(
     config: &ZakuraBlockSyncConfig,
     max_connections: usize,
 ) -> ServeLimits {
     let largest = LARGEST_SERVED_RESPONSE.output_bytes();
+    let limits = sizing::serve_limits(
+        largest,
+        sizing::TARGET_RTT,
+        config.block_sync_connections(max_connections),
+    );
+    // `serve_limits` keeps the peer budget at or above one largest response, so
+    // the quotient is at least one.
+    let reads_in_budget = usize::try_from(limits.peer_output_bytes / largest).unwrap_or(usize::MAX);
     ServeLimits {
         node_execution: NODE_EXECUTION,
-        peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(
-            largest,
-            sizing::TARGET_RTT,
-            config.block_sync_connections(max_connections),
-        )
+        peer_execution: PEER_EXECUTION.min(reads_in_budget),
+        ..limits
     }
 }
 

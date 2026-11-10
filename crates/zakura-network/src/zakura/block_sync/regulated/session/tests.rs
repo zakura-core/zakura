@@ -477,7 +477,11 @@ fn the_largest_served_response_is_one_advertised_block() {
 /// One-block sizing leaves every default limit as the 128-block sizing set it:
 /// both responses fit the 64 MiB peer output floor (twice the send window), and
 /// the node funds that floor on each of its 92 default connections' sessions.
+///
+/// It pins the 2 MB defaults; [`getblocks_peer_execution_fits_the_peer_output_budget`]
+/// covers the 8 MB prototype's limits.
 #[test]
+#[cfg(not(feature = "experimental-8mb-blocks"))]
 fn one_block_sizing_keeps_the_default_serving_limits() {
     use crate::zakura::block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES};
     let config = ZakuraBlockSyncConfig::default();
@@ -721,6 +725,27 @@ async fn serving_bounds_commitments_workers_and_outputs() {
     })
     .await
     .expect("finished reads of a cancelled session return their workers and output grants");
+}
+
+/// A peer runs no more reads than its output budget holds largest responses, so
+/// the output grant never stops a peer below its execution share. With 2 MB
+/// blocks that is the whole [`PEER_EXECUTION`]; the 8 MB prototype keeps the
+/// output budget and lowers the share.
+#[test]
+fn getblocks_peer_execution_fits_the_peer_output_budget() {
+    let limits = serving_limits(&ZakuraBlockSyncConfig::default());
+    let largest = LARGEST_SERVED_RESPONSE.output_bytes();
+    let reads = u64::try_from(limits.peer_execution).unwrap();
+    assert!(reads >= 1);
+    assert!(reads * largest <= limits.peer_output_bytes);
+    assert_eq!(limits.peer_output_bytes, sizing::peer_output_bytes());
+    #[cfg(not(feature = "experimental-8mb-blocks"))]
+    assert_eq!(limits.peer_execution, PEER_EXECUTION);
+    #[cfg(feature = "experimental-8mb-blocks")]
+    assert_eq!(
+        limits.peer_execution, 8,
+        "64 MiB holds eight 8 MB responses"
+    );
 }
 
 /// Every session that can serve at once can hold a whole peer budget of unsent

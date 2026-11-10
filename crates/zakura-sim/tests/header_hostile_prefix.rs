@@ -24,9 +24,10 @@ use zakura_sim::{
         header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
+    observe::{StorageFact, StorageRequest},
     property::{CheckEvent, Inconclusive, Lifecycle},
-    Checker, MemorySink, ObservationLog, Outcome, PlanInput, PropertyReport, RunEnd, RunReport,
-    StepCtx, Violation,
+    By, Checker, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanChoice, PlanInput,
+    PropertyReport, Record, RunEnd, RunReport, StepCtx, Violation,
 };
 use zakura_storage::header::controlled::ControlledPort;
 
@@ -489,4 +490,173 @@ fn the_recovery_storage_bound_binds_under_slow_storage() {
             record.at
         );
     }
+}
+
+/// One run of the declared stall under `script`, then round-robin: its
+/// records, each step's pick and enabled set, the `recovered` pick's step,
+/// and the first step after it at which storage committed one of the node's
+/// applies, by its own facts.
+struct Scripted {
+    end: RunEnd,
+    records: Vec<Record>,
+    steps: Vec<(u64, String, Vec<String>)>,
+    recovered: u64,
+    applied: Option<u64>,
+}
+
+/// Runs `scenario` under `script`.
+fn scripted(scenario: &StorageScenario, script: Vec<PlanChoice>) -> Scripted {
+    let ports = Storage::prepare(scenario);
+    let recovery = ports.recovery.clone();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let into = seen.clone();
+    let mut checker = after_step(move |cx| {
+        let enabled = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
+        into.borrow_mut()
+            .push((cx.step, cx.pick.to_string(), enabled));
+        None
+    });
+    let mut sink = MemorySink::default();
+    let report = run_prepared::<Storage>(
+        scenario,
+        ports,
+        PlanInput::Script(Plan { choices: script }),
+        &mut sink,
+        Some(&mut checker),
+    )
+    .expect("the run starts");
+    let record = recovery.record().expect("the pick wrote its record");
+    // The node's applies, by operation, from its storage facts: the first
+    // one storage commits after the pick, held reply or not.
+    let mut applies = Vec::new();
+    let mut applied = None;
+    for entry in report.log.entries() {
+        match &entry.obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::ApplyHeaderTarget { .. },
+                        ..
+                    },
+                ..
+            } => applies.push(*id),
+            Observation::Storage {
+                fact: StorageFact::Committed { id, .. } | StorageFact::Completed { id, .. },
+                ..
+            } if entry.step > record.step && applies.contains(id) => {
+                applied = Some(entry.step);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Scripted {
+        end: report.end,
+        records: sink.records,
+        steps: seen.take(),
+        recovered: record.step,
+        applied,
+    }
+}
+
+/// The script that replays `records` up to, not including, step `until`:
+/// every choice the run made by input or default, picks by identity and
+/// draws by value, in the order it asked for them. Forced ones take no
+/// entry.
+fn replay(records: &[Record], until: u64) -> Vec<PlanChoice> {
+    let draws = |draws: &[zakura_sim::record::DrawRecord]| -> Vec<PlanChoice> {
+        draws
+            .iter()
+            .filter(|draw| draw.by != By::Forced)
+            .map(|draw| PlanChoice::Draw(draw.value))
+            .collect()
+    };
+    let mut script = Vec::new();
+    for record in records {
+        match record {
+            Record::Init(init) => script.extend(draws(&init.draws)),
+            Record::Step(step) if step.step < until => {
+                if step.by != By::Forced {
+                    script.push(PlanChoice::Pick(step.pick.clone()));
+                }
+                script.extend(draws(&step.draws));
+            }
+            _ => {}
+        }
+    }
+    script
+}
+
+/// The scheduling-only negative control, moved from fuzz-12.4b. The
+/// declared stall's fair run applies its first header `n` steps after the
+/// `recovered` pick. The same scenario and the same `Recover`, with the
+/// fair recovery policy off (`unfair`) and a scripted Plan that, after the
+/// pick, never completes the node's storage while any other action is
+/// ready, preferring to move time, applies nothing within those `n` steps.
+/// Only scheduling differs. It's a comparison in steps, not virtual time:
+/// the policy's bound is on picks. Both runs take the same round-robin
+/// defaults before the `Recover` pick, and the unfair Plan is built here
+/// pick by pick from each run's own records, so it follows the code as it
+/// changes. It prints both counts.
+#[test]
+#[allow(clippy::print_stdout)]
+fn an_unfair_plan_starves_the_recovery_the_fair_policy_completes() {
+    let fair = storage_witnesses::grown_source();
+    let fair_run = scripted(&fair, Vec::new());
+    let end = &fair_run.end;
+    assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+    let applied = fair_run.applied.expect("the fair run applies");
+    let steps = applied - fair_run.recovered;
+    let mut unfair = fair.clone();
+    unfair.policy.disruptions = vec![Disruption::Unfair];
+    let mut script = Vec::new();
+    let mut rounds = 0;
+    let run = loop {
+        let run = scripted(&unfair, script.clone());
+        let window = run.recovered + 1..=run.recovered + steps;
+        let starve = run.steps.iter().find(|(step, pick, enabled)| {
+            window.contains(step)
+                && pick.starts_with("storage:")
+                && enabled.iter().any(|option| !option.starts_with("storage:"))
+        });
+        let Some((step, _, enabled)) = starve else {
+            break run;
+        };
+        let other = enabled
+            .iter()
+            .find(|option| option.starts_with("advance-time:"))
+            .or_else(|| {
+                enabled
+                    .iter()
+                    .find(|option| !option.starts_with("storage:"))
+            })
+            .expect("the step had another option");
+        script = replay(&run.records, *step);
+        script.push(PlanChoice::Pick(other.clone()));
+        rounds += 1;
+        assert!(rounds < 10_000, "the adversary converges");
+    };
+    let window_end = run.recovered + steps;
+    // The unfair run is judged only if it ran clean through the window: a
+    // violation or failure that stopped it early would show no apply too.
+    let end = &run.end;
+    assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+    assert!(matches!(end.outcome, Outcome::Idle { .. }), "{end:?}");
+    assert!(
+        run.steps
+            .last()
+            .is_some_and(|(step, ..)| *step >= window_end),
+        "the unfair run ended before step {window_end}: {end:?}"
+    );
+    assert!(
+        run.applied.is_none_or(|step| step > window_end),
+        "the unfair run applied at {:?}, within {steps} steps of its pick at {}",
+        run.applied,
+        run.recovered
+    );
+    println!(
+        "fair: applied {steps} steps after its pick; unfair: {:?} after, in {rounds} rounds",
+        run.applied.map(|step| step - run.recovered)
+    );
 }

@@ -490,9 +490,10 @@ fn the_fork_fixture_settles_on_the_heaviest_tip() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-selection-<name>.json` with its Plan bytes
 /// beside it in `header-selection-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 3] {
+fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     [
         ("stronger-first", stronger_first()),
+        ("stronger-last", stronger_last()),
         ("heavier-offered-to-longer", heavier_offered_to_longer()),
         ("harness-commit", harness_commit()),
     ]

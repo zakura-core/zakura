@@ -404,11 +404,13 @@ fn the_recover_waits_for_earlier_steps() {
     }
 }
 
-/// A recover must come last, after no shutdown, churn or flood.
+/// A recover follows no shutdown, churn or flood, and only a close may
+/// follow it.
 #[test]
 fn a_recover_out_of_place_is_refused() {
+    // Only a close may follow a recover, hdr-13's loss path.
     let cases = [
-        vec![recover(None), step(SOURCE, ControlAction::Close, None)],
+        vec![recover(None), step(SOURCE, ControlAction::Relink, None)],
         vec![step(NODE, ControlAction::Shutdown, None), recover(None)],
         vec![step(SOURCE, ControlAction::Churn, None), recover(None)],
         vec![step(SOURCE, ControlAction::Flood, None), recover(None)],

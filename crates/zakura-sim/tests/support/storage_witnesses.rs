@@ -553,6 +553,22 @@ pub fn owed_recovery_witnesses() -> Vec<(&'static str, StorageScenario)> {
     ]
 }
 
+/// The node at A2 and the source at A8, which grows by two headers once the
+/// node's first apply completes, with the recover once it has grown. The
+/// grown tip reaches the node only behind the source's one-second status
+/// floor, so at the `recovered` pick the node still owes it: hdr-13's
+/// declared stall.
+pub fn grown_source() -> StorageScenario {
+    recovering(vec![
+        step(
+            SOURCE,
+            ControlAction::Grow { len: 2 },
+            Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+        ),
+        recover(Some(Trigger::Grown(SOURCE.to_owned()))),
+    ])
+}
+
 /// The departed owner, mirror A, in [`departure_recovery`].
 pub const OWNER: &str = "mirror-0";
 

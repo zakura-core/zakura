@@ -1525,7 +1525,11 @@ pub struct ControlStep {
 ///
 /// Each step it picks before a `Recover` counts in the recovery's hostile
 /// prefix ([`recovery::Prefix`]). Once that's full it offers only the
-/// `Recover` step, and the steps between are dropped.
+/// `Recover` step, and the steps between are dropped. The script stops at
+/// the `Recover` pick. A typed test's closes after the `Recover` step go on
+/// from the `recovered` pick, each the harness ending a member, which
+/// breaks recovery's membership assumption (hdr-13's loss path).
+/// The grammar can't encode one.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -1646,6 +1650,14 @@ impl Control {
             .is_some_and(|driver| driver.evidence.started().is_some())
     }
 
+    /// Whether the script goes on after its `Recover` step: from the
+    /// `recovered` pick on, so a typed test's closes after it can run.
+    fn resumed(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.record().is_some())
+    }
+
     /// The index of the script step to offer next: the next one, or once
     /// the hostile prefix is full ([`Prefix`]), the `Recover` step at or
     /// after it, skipping the steps between. `None` once the script is done,
@@ -1654,7 +1666,7 @@ impl Control {
         let full = self
             .recovery
             .as_ref()
-            .is_some_and(|driver| driver.evidence.prefix().full());
+            .is_some_and(|driver| driver.evidence.in_prefix() && driver.evidence.prefix().full());
         if !full {
             return (self.next < self.script.len()).then_some(self.next);
         }
@@ -1817,7 +1829,9 @@ pub(crate) fn harness_commit(
 
 impl ActionSource for Control {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        if self.recovering() {
+        // From the `Recover` pick the script stops, until the `recovered`
+        // pick lets a typed test's closes after it go on.
+        if self.recovering() && !self.resumed() {
             return;
         }
         let Some(index) = self.next_step() else {
@@ -1838,7 +1852,11 @@ impl ActionSource for Control {
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         if let Some(driver) = self.recovery.as_ref().filter(|_| self.recovering()) {
             driver.boundaries(now, out);
-            return;
+            // The steps after the `Recover` step go on from the `recovered`
+            // pick, their triggers' times with them.
+            if !self.resumed() {
+                return;
+            }
         }
         if let Some(when) = self
             .next_step()

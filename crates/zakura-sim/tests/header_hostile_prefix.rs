@@ -17,11 +17,11 @@ use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
     harness::{
-        header_node::recovery::RecoveryEvidence,
-        header_sync::{Storage, StorageScenario},
+        header_node::{recovery::RecoveryEvidence, ControlAction},
+        header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
-    property::{CheckEvent, Lifecycle},
+    property::{CheckEvent, Inconclusive, Lifecycle},
     Checker, MemorySink, ObservationLog, Outcome, PlanInput, PropertyReport, RunEnd, RunReport,
     StepCtx, Violation,
 };
@@ -259,6 +259,115 @@ fn the_surviving_peer_completes_a_departed_target() {
         println!(
             "departure: recovered at {:?}, met {waited:?} later",
             record.at
+        );
+    }
+}
+
+/// The loss path: the declared stall's recovery owes the node the grown
+/// tip, and the harness closes the source right after the `recovered`
+/// pick, a close only a typed scenario can take. That ends
+/// `StableMembership` and `HonestPeer` with the obligation open, so the
+/// property ends `Inconclusive` with `assumption-lost`, not violated, under
+/// 8 plans.
+#[test]
+fn closing_the_source_after_recovered_loses_the_assumptions() {
+    let mut scenario = storage_witnesses::grown_source();
+    scenario.controls.push(storage_witnesses::step(
+        storage_witnesses::SOURCE,
+        ControlAction::Close,
+        None,
+    ));
+    assert!(
+        grammar::encode(&scenario).is_err(),
+        "the grammar refuses it"
+    );
+    for input in inputs(8, 256) {
+        let run = run("loss", &scenario, input);
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Inconclusive {
+                reason: Inconclusive::AssumptionLost.to_string()
+            }
+        );
+        let record = run.recovery.record().expect("the pick wrote its record");
+        let close = run
+            .report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == format!("peer:{}:close", storage_witnesses::SOURCE))
+            .expect("the close is picked");
+        assert!(close.step > record.step, "the close comes after the pick");
+        let (_, objective) = run.recovery.objective().expect("the pick wrote its record");
+        let objective = objective.expect("a successor is owed");
+        let met_by_close = run
+            .tips
+            .iter()
+            .any(|(step, _, tip)| *step <= close.step && objective.met_by(tip));
+        assert!(!met_by_close, "the obligation was open at the close");
+    }
+}
+
+/// A typed close after `recovered` keeps its trigger's time boundary. The
+/// declared stall's close of its source is gated to half a second, so after
+/// the pick the clock stops at exactly 500 ms rather than running to the
+/// grown tip's status floor at one second. The close then comes before the
+/// deadline with the obligation open, so the assumptions are lost, under 8
+/// plans. (Time advances are actions too, so the close may follow one.)
+#[test]
+fn a_delayed_close_after_recovered_keeps_its_time() {
+    let mut scenario = storage_witnesses::grown_source();
+    scenario.controls.push(storage_witnesses::step(
+        storage_witnesses::SOURCE,
+        ControlAction::Close,
+        Some(zakura_sim::harness::header_node::policy::Trigger::VirtualTime(500)),
+    ));
+    for input in inputs(8, 256) {
+        let run = run("delayed close", &scenario, input);
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Inconclusive {
+                reason: Inconclusive::AssumptionLost.to_string()
+            }
+        );
+        let record = run.recovery.record().expect("the pick wrote its record");
+        assert!(
+            run.report.picks.iter().any(|pick| {
+                pick.step > record.step && pick.identity == "advance-time:500000000"
+            }),
+            "the clock stops at the close's time"
+        );
+    }
+}
+
+/// A close after `recovered` of a peer that was no member at the pick
+/// changes nothing recovery recorded, so it can't end the obligation. The
+/// declared stall gains a second mirror, which the harness closes before
+/// the recover and closes again after the pick, with the grown tip still
+/// owed. The obligation stays open, the node meets it, and the property
+/// holds, under 8 plans.
+#[test]
+fn closing_a_departed_peer_after_recovered_loses_nothing() {
+    let mut scenario = storage_witnesses::grown_source();
+    scenario.mirrors.push(storage_witnesses::mirror(
+        zakura_sim::harness::header_node::Chain::main(2),
+        zakura_sim::harness::header_sync::Dialer::Mirror,
+    ));
+    let close = |peer: &str| storage_witnesses::step(peer, ControlAction::Close, None);
+    scenario.controls.insert(0, close("mirror-1"));
+    scenario.controls.push(close("mirror-1"));
+    for input in inputs(8, 256) {
+        let run = run("departed close", &scenario, input);
+        let record = run.recovery.record().expect("the pick wrote its record");
+        assert!(
+            record
+                .membership
+                .iter()
+                .all(|member| member.peer != "mirror-1"),
+            "mirror-1 was no member"
+        );
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Held { applicable: 1 }
         );
     }
 }

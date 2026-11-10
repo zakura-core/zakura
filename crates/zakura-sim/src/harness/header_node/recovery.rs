@@ -236,6 +236,37 @@ pub struct RecoveryRecord {
     /// How many session facts the view held at the pick, so later ones are
     /// the ones after it.
     pub facts: usize,
+    /// Each member's connection, from its link, in membership order, so an
+    /// environment end joins the session it ends by identity.
+    pub links: Vec<Option<u64>>,
+}
+
+impl RecoveryRecord {
+    /// Whether a harness close of `peer`'s `connection` ended a recorded
+    /// session: a member's, or with `source_only` the source's. A close
+    /// whose connection the harness didn't name is judged by its peer.
+    fn closes(&self, peer: &str, connection: Option<u64>, source_only: bool) -> bool {
+        self.membership
+            .iter()
+            .zip(&self.links)
+            .filter(|(member, _)| !source_only || **member == self.source)
+            .any(|(member, link)| match connection {
+                Some(closed) => *link == Some(closed),
+                None => member.peer == peer,
+            })
+    }
+}
+
+/// The connection whose link carried session `session_id`, in `facts`.
+fn link_of(facts: &[SessionFact], session_id: u64) -> Option<u64> {
+    facts.iter().find_map(|fact| match fact {
+        SessionFact::LinkOpened {
+            connection,
+            session_id: carried,
+            ..
+        } if *carried == session_id => Some(*connection),
+        _ => None,
+    })
 }
 
 /// Where recovery is.
@@ -312,12 +343,16 @@ impl RecoveryEvidence {
     /// Whether `assume` holds after a step of a recovering run whose node's
     /// end facts are `ends`. None holds before the `recovered` pick. After
     /// it, only the environment breaks one (Rule 13 of the hdr-9 to hdr-13
-    /// plan): `StableMembership` holds until the harness closes or relinks
-    /// any peer, `HonestPeer` until it closes or relinks the source, and
-    /// both until it stops the node. The rest always hold, since recovery
-    /// enforces them. A session the node, or a mirror running the same
-    /// code, ends by itself breaks nothing, so an obligation the node owes
-    /// its honest source runs on to its deadline.
+    /// plan): `StableMembership` holds until the harness closes a recorded
+    /// member's connection or relinks any peer, `HonestPeer` until it
+    /// closes the source's connection or relinks it, and both until it
+    /// stops the node. A close is joined to the session it ends by its
+    /// connection ([`RecoveryRecord::links`]), so closing a peer that was no
+    /// member, or another link of a member, changes nothing recorded. The
+    /// rest always hold, since recovery enforces them. A session the node,
+    /// or a mirror running the same code, ends by itself breaks nothing, so
+    /// an obligation the node owes its honest source runs on to its
+    /// deadline.
     pub fn holds(&self, ends: &EndEvidence, assume: Assume) -> bool {
         let Some(record) = self.record() else {
             return false;
@@ -334,7 +369,18 @@ impl RecoveryEvidence {
                         action: EnvironmentAction::Shutdown,
                         ..
                     } => true,
-                    EndFact::Environment { peer, .. } => !source_only || peer == record.source.peer,
+                    // A relink admits a session, so it changes the
+                    // membership whoever's it is, and replaces the source's.
+                    EndFact::Environment {
+                        peer,
+                        action: EnvironmentAction::Relink,
+                        ..
+                    } => !source_only || peer == record.source.peer,
+                    // A close breaks one only if it ends a recorded
+                    // session, joined by its connection.
+                    EndFact::Environment {
+                        peer, connection, ..
+                    } => record.closes(&peer, connection, source_only),
                     EndFact::ReactorExited { .. } => false,
                 }
         })
@@ -650,6 +696,10 @@ impl RecoveryInputs {
                 })
             })
             .collect::<Result<_, String>>()?;
+        let links = membership
+            .iter()
+            .map(|member| link_of(&facts, member.session_id))
+            .collect();
         Ok(RecoveryRecord {
             step,
             at,
@@ -671,6 +721,7 @@ impl RecoveryInputs {
             ),
             source_chain: source_chain[shared.saturating_sub(1)..].to_vec(),
             facts: facts.len(),
+            links,
         })
     }
 }
@@ -902,6 +953,10 @@ mod tests {
             source_tip: tip,
             source_chain: vec![tip.0],
             facts: sessions.facts().len(),
+            links: live_sessions(&sessions.facts())
+                .iter()
+                .map(|member| link_of(&sessions.facts(), member.session_id))
+                .collect(),
         };
         if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));
@@ -959,6 +1014,31 @@ mod tests {
             ends.record(environment("mirror-1", action));
             assert_eq!(holding(&recovery, &ends), honest, "{action:?}");
         }
+
+        // A close joins the session it ends by its connection: closing
+        // another link of the source ends nothing recorded, and closing the
+        // source's own ends `StableMembership` and `HonestPeer`.
+        let close = |connection| EndFact::Environment {
+            peer: "mirror-0".to_owned(),
+            connection: Some(connection),
+            action: EnvironmentAction::Close,
+        };
+        let ends = EndEvidence::default();
+        let recovery = recovered(&sessions, &ends);
+        ends.record(close(9));
+        assert_eq!(holding(&recovery, &ends), DECLARED);
+        ends.record(close(1));
+        assert_eq!(holding(&recovery, &ends), rest);
+
+        // Closing a peer that was no member at the pick changes nothing
+        // recorded, so all five keep holding, and relinking one admits a
+        // session, which ends `StableMembership`.
+        let ends = EndEvidence::default();
+        let recovery = recovered(&sessions, &ends);
+        ends.record(environment("mirror-2", EnvironmentAction::Close));
+        assert_eq!(holding(&recovery, &ends), DECLARED);
+        ends.record(environment("mirror-2", EnvironmentAction::Relink));
+        assert_eq!(holding(&recovery, &ends), honest);
 
         // Closing or relinking the source ends `HonestPeer` too, and so does
         // stopping the node. The other three keep holding.
@@ -1108,22 +1188,24 @@ mod tests {
     /// A record whose members hold `members` and whose node holds `node`.
     fn record_of(members: Vec<SelectedChain>, node: SelectedChain) -> RecoveryRecord {
         let tip = |chain: &SelectedChain| (*chain.chain.last().unwrap(), chain.work);
+        let members: Vec<MemberChain> = members
+            .into_iter()
+            .enumerate()
+            .map(|(index, selected)| MemberChain {
+                member: Member {
+                    peer: format!("mirror-{index}"),
+                    session_id: u64::try_from(index).unwrap(),
+                },
+                selected,
+            })
+            .collect();
+        let count = members.len();
         RecoveryRecord {
             step: 7,
             at: at(2_000),
             stamp: 0,
-            membership: Vec::new(),
-            members: members
-                .into_iter()
-                .enumerate()
-                .map(|(index, selected)| MemberChain {
-                    member: Member {
-                        peer: format!("mirror-{index}"),
-                        session_id: u64::try_from(index).unwrap(),
-                    },
-                    selected,
-                })
-                .collect(),
+            membership: members.iter().map(|chain| chain.member.clone()).collect(),
+            members,
             source: Member {
                 peer: "mirror-0".into(),
                 session_id: 0,
@@ -1133,6 +1215,7 @@ mod tests {
             source_chain: Vec::new(),
             node_chain: node,
             facts: 0,
+            links: vec![None; count],
         }
     }
 
@@ -1214,13 +1297,14 @@ mod tests {
     }
 
     /// A recovery of `mirror-0` from a baseline at 3, recorded once
-    /// `adoption`'s and `ends`' facts so far are in, with one member at 4.
+    /// `adoption`'s and `ends`' facts so far are in, with its source at 4
+    /// and `mirror-1` at 3.
     fn owing(ends: &EndEvidence) -> RecoveryEvidence {
         let recovery = RecoveryEvidence::default();
         recovery.start("mirror-0".into(), at(0), chain(3, 0, 0));
         let record = RecoveryRecord {
             stamp: ends.stamps().issued(),
-            ..record_of(vec![chain(4, 0, 0)], chain(3, 0, 0))
+            ..record_of(vec![chain(4, 0, 0), chain(3, 0, 0)], chain(3, 0, 0))
         };
         if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));

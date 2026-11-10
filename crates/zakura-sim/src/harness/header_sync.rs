@@ -1093,9 +1093,12 @@ impl Subsystem for Storage {
     /// # Panics
     ///
     /// If a hold or control step waits for a trigger the node never records
-    /// ([`policy::undriven`]), or a `Recover` step is out of place: it must
-    /// be the last step, follow no `Shutdown`, and follow no churn or flood,
-    /// whose tasks keep acting after their step.
+    /// ([`policy::undriven`]), or a `Recover` step is out of place: only
+    /// closes may follow it, and it follows no `Shutdown`, and no churn or
+    /// flood, whose tasks keep acting after their step. A close after it is
+    /// hdr-13's loss path, which only a typed scenario takes: the control
+    /// source offers it from the `recovered` pick on, and the grammar can't
+    /// encode it.
     fn prepare(scenario: &StorageScenario) -> Ports {
         let triggers = scenario
             .policy
@@ -1149,8 +1152,11 @@ impl Subsystem for Storage {
             .iter()
             .position(|step| step.action == ControlAction::Recover)
         {
-            if let Some(after) = scenario.controls.get(at + 1) {
-                panic!("no control step follows a recover, but {after:?} does");
+            if let Some(after) = scenario.controls[at + 1..]
+                .iter()
+                .find(|step| step.action != ControlAction::Close)
+            {
+                panic!("only a close follows a recover, but {after:?} does");
             }
             if let Some(before) = scenario.controls[..at].iter().find(|step| {
                 matches!(

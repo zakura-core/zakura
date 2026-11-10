@@ -1844,6 +1844,32 @@ pub(crate) fn peer_transport_entries<'o>(
         .collect()
 }
 
+/// The entries the scripted peers' evidence logged in `observations`, in
+/// order: what [`crate::evidence::EvidenceKind::Peer`] covers. A run's peers
+/// share one checkpoint, so it names no instance.
+pub(crate) fn peer_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerFrame { .. }
+                    | Observation::PeerWritten { .. }
+                    | Observation::PeerReceived { .. }
+                    | Observation::PeerClosed { .. }
+                    | Observation::NodeFrame { .. }
+                    | Observation::FrameJudged { .. }
+                    | Observation::ConnectionClosed { .. }
+                    | Observation::Misbehavior { .. }
+                    | Observation::ActRan { .. }
+                    | Observation::ActSkipped { .. }
+            )
+        })
+        .collect()
+}
+
 /// The events that reactor tap `instance` logged in `observations`, in
 /// order.
 pub(crate) fn reactor_entries<'o>(

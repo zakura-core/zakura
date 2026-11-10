@@ -1645,7 +1645,13 @@ impl Subsystem for HeaderWire {
             dials,
         );
         let failure = PeerFailure::default();
-        let mut control = PeerControl::new(failure.clone(), ports.records.clone(), shared_ids);
+        let mut control = PeerControl::new(
+            sim,
+            "node",
+            failure.clone(),
+            ports.records.clone(),
+            shared_ids,
+        );
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =
                 control.add(&name, spec.script.clone(), spec.adversary.is_some());

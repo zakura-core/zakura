@@ -241,7 +241,9 @@ fn credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
     raw_credit_breaks(&honest(events))
 }
 
-/// [`credit_breaks`], with `events`' totals as given.
+/// [`credit_breaks`], with `events`' totals as given. Each apply call
+/// they dispatch completes `Applied` in storage, as the credit half reads
+/// it.
 fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
     let mut check = Authority::new(
         AuthorityEvidence::default(),
@@ -251,9 +253,41 @@ fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
     );
     read_starts(&mut check, events);
     for event in events {
+        if let ReactorEvent::Dispatched {
+            call,
+            op: zakura_network::zakura::observe::PortCall::Apply { .. },
+        } = event
+        {
+            for fact in &applied_in_storage(*call) {
+                check.credit.storage(fact);
+            }
+        }
         check.observe(event, true, false);
     }
     check.drain(1)
+}
+
+/// Storage's operation for reactor call `call`, completing `Applied`, as
+/// the credit half reads it.
+fn applied_in_storage(call: u64) -> [StorageFact; 2] {
+    [
+        StorageFact::Submitted {
+            id: 1_000 + call,
+            request: crate::observe::StorageRequest::SelectedChainContains {
+                hash: String::new(),
+            },
+            digest: String::new(),
+            call: Some(call),
+        },
+        StorageFact::Completed {
+            id: 1_000 + call,
+            outcome: "engine".to_owned(),
+            result: crate::observe::StorageResult::Applied,
+            delivered: true,
+            generation: 0,
+            state: String::new(),
+        },
+    ]
 }
 
 /// A page on a fork branch the scenario uses holds, and on one it doesn't
@@ -774,24 +808,9 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
         judged(applied(chain[2]), Some(StorageResult::Applied)),
         Vec::<String>::new()
     );
-    // Storage's result may reach the check a drain late, but an apply
-    // that reported none breaks at the drain after.
-    let mut credit = credit::Credit::default();
-    for event in &honest(&applied(chain[2])) {
-        if let ReactorEvent::CreditIssued {
-            kind: CreditKind::Open,
-            update,
-            ..
-        } = event
-        {
-            if let Some(first) = update.locator_hashes.first() {
-                credit.note_read(*first, update.acknowledged.height);
-            }
-        }
-        credit.observe(event, true, false);
-    }
-    assert_eq!(credit.take_breaks(), Vec::<String>::new());
-    let unreported = credit.take_breaks();
+    // Storage's facts reach the check before the drain that sees the
+    // acceptance, so an apply that reported none by then breaks there.
+    let unreported = judged(applied(chain[2]), None);
     assert!(
         matches!(&unreported[..], [only] if only.contains("reported no storage result")),
         "{unreported:?}"

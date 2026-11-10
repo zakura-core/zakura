@@ -43,8 +43,9 @@
 //!   `Submitted { call }`, must have completed `Applied`. Storage completes
 //!   an apply before its reply reaches the reactor, and each drain feeds
 //!   storage's facts before the reactor's, so the result is known by the
-//!   drain that sees the acceptance. One drain later, an acceptance whose
-//!   apply reported no storage result breaks too.
+//!   drain that sees the acceptance, which judges it. An acceptance whose
+//!   apply reported no storage result by then breaks too, so a run that
+//!   ends on that drain can't leave it unjudged.
 //! - **Operations.** An `Open`'s and a `Grant`'s credit comes in an update
 //!   of that operation, and a built `Close` is a `Close` that adds no
 //!   credit.
@@ -145,12 +146,12 @@ pub(super) struct Credit {
     /// The reactor call each storage operation was submitted for, by
     /// operation ID.
     operations: HashMap<u64, u64>,
-    /// Whether each apply call's storage operation completed `Applied`, by
-    /// call number.
+    /// Whether each reactor call's storage operation completed `Applied`,
+    /// by call number.
     applied: HashMap<u64, bool>,
-    /// Acceptances under an apply call whose storage result isn't known
-    /// yet, with the call and whether a drain has already found it unknown.
-    awaiting: Vec<(Subscription, u64, Frontier, bool)>,
+    /// Acceptances since the last drain, each under its apply call, for the
+    /// drain to judge against the call's storage result.
+    awaiting: Vec<(Subscription, u64, Frontier)>,
     breaks: Vec<String>,
 }
 
@@ -379,22 +380,20 @@ impl Credit {
         }
     }
 
-    /// The breaks found since the last call, judging first each awaited
-    /// acceptance whose apply result is known by now.
+    /// The breaks found since the last call, judging first each acceptance
+    /// since the last call against its apply's storage result.
     pub(super) fn take_breaks(&mut self) -> Vec<String> {
         self.judge_awaited();
         std::mem::take(&mut self.breaks)
     }
 
-    /// Breaks for each awaited acceptance whose apply call's storage
-    /// operation completed other than `Applied`, or that a second drain still
-    /// finds with no result, and forgets every one it judges.
+    /// Breaks for each acceptance since the last drain whose apply call's
+    /// storage operation completed other than `Applied`, or reported no
+    /// result.
     fn judge_awaited(&mut self) {
-        let mut waiting = Vec::new();
-        for (key, call, through, waited) in std::mem::take(&mut self.awaiting) {
+        for (key, call, through) in std::mem::take(&mut self.awaiting) {
             let (_, session, subscription) = &key;
             match self.applied.get(&call) {
-                None if !waited => waiting.push((key, call, through, true)),
                 None => self.breaks.push(format!(
                     "CommitOnlyAuthorized: session {session} subscription {subscription} \
                      accepted through {through:?} in apply call {call}'s completion, whose \
@@ -408,7 +407,6 @@ impl Credit {
                 )),
             }
         }
-        self.awaiting = waiting;
     }
 
     /// Judges the credit `update` adds to `key`'s subscription against its
@@ -547,12 +545,12 @@ impl Credit {
             } => {
                 self.operations.insert(*id, *call);
             }
+            // Kept for every call: a drain feeds storage's facts before the
+            // reactor's, so an apply's result can arrive before its dispatch.
             StorageFact::Completed { id, result, .. } => {
                 if let Some(call) = self.operations.get(id) {
-                    if self.applies.contains_key(call) {
-                        self.applied
-                            .insert(*call, matches!(result, StorageResult::Applied));
-                    }
+                    self.applied
+                        .insert(*call, matches!(result, StorageResult::Applied));
                 }
             }
             _ => {}
@@ -693,7 +691,7 @@ impl Credit {
                  page staged before that apply, {before:?} (now {last_staged:?})"
             ));
         }
-        self.awaiting.push((key.clone(), call, through, false));
+        self.awaiting.push((key.clone(), call, through));
     }
 }
 

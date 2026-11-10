@@ -25,7 +25,17 @@
 //! - **Changes advance the generation.** Every acted `Reset` names a header
 //!   generation above the engine's before the step that reset it. The
 //!   engine changes only in steps, one action each, so its generation read
-//!   at the end of the previous step's observation is the one before.
+//!   at the end of the previous step's observation is the one before. Every
+//!   apply execution that inserted a header leaves the engine's header
+//!   generation above where its run found it, from the durable state the
+//!   port recorded around the run. One that inserts nothing, such as an
+//!   all-duplicate apply or an alarm-only commit, is exempt.
+//! - **Locator results.** Each locator storage read gives the engine's
+//!   selected path as the durable state the port recorded at the read
+//!   holds it: its anchor is the finalized anchor, and its entries are
+//!   exactly the ones the spec's offsets (LC-WIRE-03) take from the
+//!   recorded selected projection, tip first, in order, then the anchor.
+//!   The read's generation doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
 //!   and the read storage answered it with has a generation and anchor no
@@ -39,8 +49,8 @@
 //!   subscription the subscriber never opened is another property's.
 //!
 //! The check applies once an adoption changes the generation while a
-//! current-started round is live, an ordinary round starts, or a reset is
-//! acted. A broken rule is a claim break, which the tap hands
+//! current-started round is live, an ordinary round starts, a reset is
+//! acted, an apply execution inserts headers, or a locator read is judged. A broken rule is a claim break, which the tap hands
 //! [`Claim::ResetInvalidatesWork`](super::claim::Claim) at its drain. A
 //! locator `Started` whose read storage never reported is missing evidence,
 //! which fails the run.
@@ -56,10 +66,41 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 
+use zakura_storage::header::controlled::{EngineRun, RunKind};
+
 use crate::{
     observe::{StorageFact, StorageResult},
-    storage::hash,
+    storage::{hash, point},
 };
+
+/// The distances below the tip a selected-path locator takes, as the
+/// header chain engine's spec sets them (LC-WIRE-03), restated so the check
+/// doesn't read the locator builder.
+const LOCATOR_OFFSETS: [u32; 12] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000];
+
+/// The locator `projection`, a selected path from the finalized anchor to
+/// the tip, gives: the entry at each offset below the tip that the path
+/// reaches, then the anchor if no offset landed on it.
+fn selected_locator(
+    projection: &[zakura_header_chain::Frontier],
+) -> Vec<zakura_header_chain::Frontier> {
+    let (Some(anchor), Some(tip)) = (projection.first(), projection.last()) else {
+        return Vec::new();
+    };
+    let distance = tip.height.0.saturating_sub(anchor.height.0);
+    let mut entries: Vec<zakura_header_chain::Frontier> = LOCATOR_OFFSETS
+        .iter()
+        .filter(|offset| **offset <= distance)
+        .filter_map(|offset| {
+            // Widening u32 to usize is lossless on supported targets.
+            projection.get((distance - offset) as usize).copied()
+        })
+        .collect();
+    if entries.last() != Some(anchor) {
+        entries.push(*anchor);
+    }
+    entries
+}
 
 /// A header generation and the finality anchor's hash, as authority names
 /// them.
@@ -277,12 +318,24 @@ impl RoundLife {
     /// Notes the node's storage facts one step's drain logged, in order,
     /// then that the engine's header generation is `engine` once the step
     /// is done.
+    #[cfg(test)]
     pub(super) fn storage<'f>(
         &mut self,
         facts: impl IntoIterator<Item = &'f StorageFact>,
         engine: u64,
     ) {
-        for fact in facts {
+        self.storage_runs(facts.into_iter().map(|fact| (fact, None)), engine);
+    }
+
+    /// [`storage`](Self::storage), with each fact's engine run, if it
+    /// carried one, judged right after it.
+    pub(super) fn storage_runs<'f>(
+        &mut self,
+        facts: impl IntoIterator<Item = (&'f StorageFact, Option<&'f EngineRun>)>,
+        engine: u64,
+    ) {
+        for (fact, run) in facts {
+            self.locator_result(fact, run);
             match fact {
                 StorageFact::Submitted {
                     id,
@@ -325,8 +378,93 @@ impl RoundLife {
                 }
                 _ => {}
             }
+            if let Some(run) = run {
+                self.run(run);
+            }
         }
         self.engine = engine;
+    }
+
+    /// Judges an apply's engine `run`, which must advance the header
+    /// generation if it inserted a header.
+    fn run(&mut self, run: &EngineRun) {
+        if let RunKind::Apply(id, _) = &run.kind {
+            let inserted = run
+                .after
+                .graph
+                .nodes
+                .keys()
+                .filter(|hash| !run.before.graph.nodes.contains_key(hash))
+                .count();
+            if inserted > 0 {
+                self.applies();
+                let before = run.before.metadata.header_generation.get();
+                let after = run.after.metadata.header_generation.get();
+                if after <= before {
+                    self.breaks.push(format!(
+                        "ResetInvalidatesWork: apply operation {} inserted {inserted} headers \
+                         and left the header generation at {after}, from {before}",
+                        id.0
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Judges a locator read in `fact` against the selected path of the
+    /// durable state its `run` recorded just before it read, which
+    /// `commit-only-authorized` requires the read to leave unchanged. The
+    /// selected projection always holds the finalized anchor, so the engine
+    /// must return a locator, and every entry, height and hash, must be the
+    /// one LC-WIRE-03's offsets take from that projection. The reported
+    /// result must give the same tip, hashes and anchor.
+    fn locator_result(&mut self, fact: &StorageFact, run: Option<&EngineRun>) {
+        let (
+            StorageFact::Completed { id, result, .. },
+            Some(EngineRun {
+                kind: RunKind::Locator(_, engine_entries),
+                before: durable,
+                ..
+            }),
+        ) = (fact, run)
+        else {
+            return;
+        };
+        // A judged read makes the check applicable, so a wrong first read
+        // keeps its trigger history.
+        self.applies();
+        let projection = &durable.selected_projection;
+        let anchor = point(durable.graph.finalized_frontier);
+        let expected = selected_locator(projection);
+        if engine_entries.as_ref() != Some(&expected) {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id}'s engine returned {engine_entries:?}, \
+                 but the engine's selected path gives {expected:?}"
+            ));
+        }
+        let expected_tip = expected.first().map(|entry| point(*entry));
+        let expected_hashes: Vec<String> = expected.iter().map(|entry| hash(entry.hash)).collect();
+        let StorageResult::Locator {
+            tip,
+            hashes,
+            finalized,
+            ..
+        } = result
+        else {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id} reported {result:?}, but the engine's \
+                 selected path gives {expected_hashes:?} at anchor {anchor:?}"
+            ));
+            return;
+        };
+        if expected_tip.as_ref() != Some(tip) || *finalized != anchor || *hashes != expected_hashes
+        {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id} gave {hashes:?} from tip {tip:?} at \
+                 anchor {finalized:?}, but the engine's selected path gives {expected_hashes:?} \
+                 at anchor {anchor:?}"
+            ));
+        }
     }
 
     /// The breaks found since the last call, or the first missing evidence.

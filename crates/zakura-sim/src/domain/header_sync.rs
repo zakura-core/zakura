@@ -338,7 +338,12 @@ where
 {
     Property {
         id: PropertyId::new(RESET_INVALIDATES_WORK),
-        claim: "a header round started under the adopted generation is retired by the end of                 the unit of work that adopts a newer one, a live round's prepare or apply                 carries the adopted generation, every reset advances the header generation,                 and every round starts from a locator read of its own generation",
+        claim: "a header round started under the adopted generation is retired by the end of \
+                the unit of work that adopts a newer one, a live round's prepare or apply \
+                carries the adopted generation, every reset and every apply that inserts \
+                headers advances the header generation, every round starts from a locator read \
+                of its own generation, and every locator read gives the engine's selected path \
+                as its durable state then holds it",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -512,7 +517,9 @@ where
                 subscriber's credit, updates and acceptances stay within what the node reserved \
                 and carry each subscription's state faithfully, and each prepare and apply hands \
                 on its round's staged work from its peer's source and reaches storage exactly as \
-                dispatched",
+                dispatched, and each apply or reset changes the engine's durable state only by \
+                its own submitted headers and the resets the port made, and each locator read \
+                leaves it unchanged",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],

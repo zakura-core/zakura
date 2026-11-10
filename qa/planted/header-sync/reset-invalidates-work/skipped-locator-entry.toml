@@ -1,0 +1,13 @@
+# Every selected-path locator leaves out the entry one below the tip,
+# keeping the tip, the deeper entries and the anchor, so a peer whose
+# branch forks there resends a header it could have skipped. The forks
+# witness's node holds more than one header above the anchor. The reactor,
+# the subscriber, the queue and the locator builder decide how the
+# witness's rounds start and stage, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/discovery"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

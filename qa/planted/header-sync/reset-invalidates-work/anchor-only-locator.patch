@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..eb2240bf07 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -647,7 +647,10 @@ impl EnginePort {
+         PortError,
+     > {
+         let engine = self.engine();
+-        let snapshot = engine.snapshot();
++        let mut snapshot = engine.snapshot();
++        // Mutation: every locator read stops at the finalized anchor, while
++        // reporting the generation and anchor it reads now.
++        snapshot.frontiers.header_best = snapshot.frontiers.finalized;
+         let locator = HeaderLocator::for_selected_path(&snapshot, |height| {
+             let projection = engine.selected_projection();
+             let index = projection

@@ -1,0 +1,69 @@
+diff --git a/crates/zakura-header-chain/src/graph/mod.rs b/crates/zakura-header-chain/src/graph/mod.rs
+index 3fb67ac561..2d4afeff59 100644
+--- a/crates/zakura-header-chain/src/graph/mod.rs
++++ b/crates/zakura-header-chain/src/graph/mod.rs
+@@ -433,6 +433,13 @@ impl MemHeaderStore {
+ }
+ 
+ impl MemHeaderStore {
++    /// Mutation: stores `header` under `at`'s key, keeping every index.
++    pub(crate) fn planted_swap_header(&mut self, at: block::Hash, header: Arc<block::Header>) {
++        if let Some(node) = self.nodes.get_mut(&at) {
++            node.header = header;
++        }
++    }
++
+     /// Construct a store rooted at one trusted, already-validated work origin.
+     pub fn new(
+         finalized_frontier: Frontier,
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..ca899aeb7a 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,29 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: a held side branch's tip stores the selected tip's header
++    /// under its own key.
++    pub fn planted_corrupt(&mut self) {
++        let selected: Vec<block::Hash> = self
++            .selected_projection
++            .iter()
++            .map(|entry| entry.hash)
++            .collect();
++        let tip = self
++            .selected_projection
++            .last()
++            .and_then(|tip| self.graph.header_node(tip.hash))
++            .map(|node| node.header.clone());
++        let side = self
++            .graph
++            .eligible_header_tips()
++            .into_iter()
++            .find(|tip| !selected.contains(&tip.hash));
++        if let (Some(header), Some(side)) = (tip, side) {
++            self.graph.planted_swap_header(side.hash, header);
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..ee3d06b5be 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,12 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: a node round's apply corrupts the engine after its
++        // install. The fixture's own preload, under its fixed source,
++        // applies faithfully.
++        if source != SourceId::from_digest([7; 32]) {
++            engine.planted_corrupt();
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);

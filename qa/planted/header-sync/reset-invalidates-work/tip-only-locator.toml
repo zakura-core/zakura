@@ -1,0 +1,12 @@
+# Every locator read holds only the selected tip, while still reporting
+# the real generation and finalized anchor, so a peer on another branch
+# finds no common ancestor in it. The forks witness's node holds headers
+# above the anchor, so its first read already lacks the anchor. The
+# reactor, the subscriber and the queue decide how the witness's rounds
+# start and stage, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

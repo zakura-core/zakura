@@ -216,6 +216,13 @@ impl EnginePort {
         self.engine().snapshot()
     }
 
+    /// The engine's whole durable state, for the simulator to judge an
+    /// execution against.
+    #[cfg(zakura_sim)]
+    pub fn durable_state(&self) -> zakura_header_chain::DurableState {
+        self.engine().durable_state()
+    }
+
     /// The selected chain, from the finalized anchor to the selected tip.
     pub fn selected_path(&self) -> Vec<zakura_header_chain::Frontier> {
         self.engine().selected_projection().to_vec()

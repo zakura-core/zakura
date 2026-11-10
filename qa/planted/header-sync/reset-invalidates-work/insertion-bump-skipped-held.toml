@@ -1,0 +1,11 @@
+# As insertion-bump-skipped, on the held-reply witness, whose first apply
+# commits with its reply held until a reset, so the insertion's generation
+# is judged at its `Committed` fact, before the reply is delivered. The
+# queue, the reactor and the planner decide how the witness's rounds apply,
+# so a change there can move the witness off it.
+checks = ["crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-reply.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-reply.plan"

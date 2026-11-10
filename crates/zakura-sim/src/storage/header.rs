@@ -27,7 +27,7 @@ use std::{
 use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
+    controlled::{ControlledPort, EngineRun, Fact, FactKind, OpId, ResetKind},
     evidence::{
         CallerPresence, CapacityClass, LeaseFact, LeaseKey, OperationStage, OwnerModel, OwnerState,
         PathPosition, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
@@ -103,6 +103,9 @@ pub struct HeaderStorage {
     label: String,
     /// What each failed prepare and apply blamed.
     attributions: FaultAttributions,
+    /// Each engine run the last observation logged, with the fact that
+    /// carried it, until [`take_runs`](Self::take_runs) takes them.
+    runs: Vec<(u64, Arc<EngineRun>)>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -231,6 +234,7 @@ impl HeaderStorage {
             },
             id,
             attributions: FaultAttributions::default(),
+            runs: Vec::new(),
         }
     }
 
@@ -531,6 +535,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id,
             generation,
             state_digest,
+            ..
         } => StorageFact::Committed {
             id: id.0,
             generation: generation.get(),
@@ -540,6 +545,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             kind,
             target,
             generation,
+            ..
         } => StorageFact::Reset {
             kind: match kind {
                 ResetKind::Invalidate => "invalidate",
@@ -711,6 +717,9 @@ impl ActionSource for HeaderStorage {
             }
         };
         let facts = self.port.take_facts();
+        // Only this observation's runs are kept, so a run no tap takes is
+        // dropped at the next one.
+        self.runs.clear();
         let actual = self.port.owner_state();
         // A model failure is returned only once the facts are logged and the
         // checkpoint names this step, so the run's evidence check passes and
@@ -724,6 +733,14 @@ impl ActionSource for HeaderStorage {
         let last = facts.last().map_or(delivered, |fact| fact.seq);
         for fact in &facts {
             self.attributions.record(self.id.index, fact);
+            let run = match &fact.kind {
+                FactKind::Completed(completion) => completion.executed.clone(),
+                FactKind::Committed { executed, .. } | FactKind::Reset { executed, .. } => {
+                    Some(executed.clone())
+                }
+                _ => None,
+            };
+            self.runs.extend(run.map(|run| (fact.seq, run)));
         }
         let mut sent: Vec<Observation> = facts
             .into_iter()
@@ -745,6 +762,14 @@ impl ActionSource for HeaderStorage {
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
         checked
+    }
+}
+
+impl HeaderStorage {
+    /// Each apply's and reset's engine run the observations since the last
+    /// call logged, with the sequence number of the fact that carried it.
+    pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
+        std::mem::take(&mut self.runs)
     }
 }
 

@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..04ff59d1ef 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -392,6 +392,14 @@ impl HeaderChainEngine {
+             &mut self.aux_delivery_index,
+             &plan.change_set().aux_changes,
+         );
++        // Mutation: the install also drops a held side branch's tip.
++        let selected: Vec<block::Hash> =
++            self.selected_projection.iter().map(|entry| entry.hash).collect();
++        if let Some(side) = self.graph.eligible_header_tips().into_iter().find(|tip| {
++            !selected.contains(&tip.hash) && self.graph.header_children(tip.hash).is_empty()
++        }) {
++            let _ = self.graph.remove_header_leaf(side.hash);
++        }
+         Ok(())
+     }
+ 

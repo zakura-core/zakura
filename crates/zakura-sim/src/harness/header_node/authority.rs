@@ -118,6 +118,7 @@ pub(super) struct Authority {
     staged: HashMap<Subscription, Frontier>,
     credit: credit::Credit,
     submission: submission::Submission,
+    contents: contents::Contents,
     breaks: Vec<String>,
     evidence: AuthorityEvidence,
 }
@@ -149,6 +150,7 @@ impl Authority {
             staged: HashMap::new(),
             credit: credit::Credit::default(),
             submission: submission::Submission::default(),
+            contents: contents::Contents::default(),
             breaks: Vec::new(),
             evidence,
         }
@@ -227,6 +229,7 @@ impl Authority {
         let mut breaks = std::mem::take(&mut self.breaks);
         breaks.extend(self.credit.take_breaks());
         breaks.extend(self.submission.take_breaks());
+        breaks.extend(self.contents.take_breaks());
         breaks
     }
 
@@ -236,8 +239,21 @@ impl Authority {
         let facts: Vec<&StorageFact> = facts.into_iter().collect();
         for fact in &facts {
             self.credit.storage(fact);
+            self.contents.storage(fact);
         }
         if self.submission.storage(facts) {
+            self.applies();
+        }
+    }
+
+    /// Judges each apply's and reset's engine run in `runs`, after the
+    /// drain's storage facts. Each makes the check applicable.
+    pub(super) fn engine_runs<'r>(
+        &mut self,
+        runs: impl IntoIterator<Item = &'r zakura_storage::header::controlled::EngineRun>,
+    ) {
+        for run in runs {
+            self.contents.run(run);
             self.applies();
         }
     }
@@ -395,6 +411,7 @@ impl Authority {
     }
 }
 
+mod contents;
 mod credit;
 mod submission;
 

@@ -1319,6 +1319,12 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "reset-inside-status-floor ",
                 "harness-commit ",
                 "sync ",
+                "served ",
+                "served-one-header ",
+                "served-from-a-lower-locator ",
+                "served-in-pages ",
+                "served-after-growth ",
+                "served-across-a-reset ",
             ]
             .iter()
             .flat_map(|name| plans(name, "inputs(8, 256)", 8))

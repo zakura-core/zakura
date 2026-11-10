@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fs, path::PathBuf, process::Command, rc::Rc};
 
 use support::{byte_inputs, inputs};
 use zakura_sim::{
@@ -20,7 +20,7 @@ use zakura_sim::{
         header_node::{
             adoption::AdoptionFact,
             policy::{Allow, Hold, OpKind, Select, Trigger},
-            Chain, ControlAction, ControlStep, Policy, Reset,
+            Chain, ControlAction, ControlStep, Fork, Policy, Reset,
         },
         header_sync::{
             storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
@@ -238,8 +238,90 @@ pub fn sync() -> StorageScenario {
     }
 }
 
+/// The node at A6 serving `mirror-0` at A1, which dials it and syncs the
+/// five headers it lacks: a served page of several headers.
+pub fn served() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(6),
+        mirrors: vec![mirror(Chain::main(1), Dialer::Mirror)],
+        ..startup_only()
+    }
+}
+
+/// [`served`] with `mirror-0` on a lighter fork of two headers from A2: its
+/// first locator is its own tip, which the node lacks, so storage starts
+/// the first page lower, at A2.
+pub fn served_from_a_lower_locator() -> StorageScenario {
+    StorageScenario {
+        mirrors: vec![mirror(
+            Chain {
+                main: 2,
+                fork: Some(Fork { branch: 1, len: 2 }),
+            },
+            Dialer::Mirror,
+        )],
+        ..served()
+    }
+}
+
+/// [`served`] with the node at A2, one header ahead: a one-header page.
+pub fn served_one_header() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(2),
+        ..served()
+    }
+}
+
+/// [`served`] with the node at A400, more than one page ahead: the
+/// mirror's subscription takes a later page, which declares the cursor its
+/// first page left.
+pub fn served_in_pages() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(400),
+        ..served()
+    }
+}
+
+/// The node at A4 serving `mirror-0` at A1, and three harness commits of
+/// one header each on the node from the first virtual second on. The
+/// mirror's subscriber closes each subscription at its target and opens
+/// the next from there, so it never follows one past its initial target;
+/// each growth is a one-header first page from the cursor the last one
+/// left.
+pub fn served_after_growth() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(4),
+        controls: (1..=3)
+            .map(|second| {
+                step(
+                    "node",
+                    ControlAction::Commit { len: 1 },
+                    Some(Trigger::VirtualTime(second * 1_000)),
+                )
+            })
+            .collect(),
+        ..served()
+    }
+}
+
+/// [`served`] with an invalidation of the node's tip offered once the
+/// publisher's first page read completes, so under some plans the node
+/// reorganizes between that read and its page's hand-off, and the page is
+/// still the read's ([`each_served_witness_serves_what_it_names`] checks
+/// the reset commits first).
+pub fn served_across_a_reset() -> StorageScenario {
+    StorageScenario {
+        controls: vec![step(
+            "node",
+            ControlAction::Reset(Reset::Invalidate { depth: 0 }),
+            Some(Trigger::Completed(Select::nth(OpKind::Read, 1))),
+        )],
+        ..served()
+    }
+}
+
 /// Every witness, by name.
-fn witnesses() -> [(&'static str, StorageScenario); 7] {
+fn witnesses() -> [(&'static str, StorageScenario); 13] {
     [
         ("startup-only", startup_only()),
         ("quiet-reset", quiet_reset()),
@@ -248,7 +330,76 @@ fn witnesses() -> [(&'static str, StorageScenario); 7] {
         ("reset-inside-status-floor", reset_inside_status_floor()),
         ("harness-commit", harness_commit()),
         ("sync", sync()),
+        ("served", served()),
+        ("served-one-header", served_one_header()),
+        ("served-from-a-lower-locator", served_from_a_lower_locator()),
+        ("served-in-pages", served_in_pages()),
+        ("served-after-growth", served_after_growth()),
+        ("served-across-a-reset", served_across_a_reset()),
     ]
+}
+
+/// Each served-page witness serves what it names: several headers in one
+/// page; one header; a first page from A2, below the mirror's own tip; a later page of
+/// one subscription from the cursor its first page left; one-header first
+/// pages after each growth; and a page across the reset. Each page is
+/// judged, and every page but a later one marks its target. The reset's
+/// page is queued at a newer state than the plain witness's, so after the
+/// reset, which only its read's completion offers.
+#[test]
+fn each_served_witness_serves_what_it_names() {
+    let mut versions: HashMap<&str, Vec<u64>> = HashMap::new();
+    for (name, scenario) in [
+        ("served", served()),
+        ("one", served_one_header()),
+        ("lower", served_from_a_lower_locator()),
+        ("pages", served_in_pages()),
+        ("growth", served_after_growth()),
+        ("reset", served_across_a_reset()),
+    ] {
+        for input in inputs(4, 256) {
+            let (_, view) = run(&scenario, input);
+            let pages = view.publication.pages();
+            let shape: Vec<(u64, u32, usize)> = pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.subscription_id,
+                        page.common_ancestor.height.0,
+                        page.headers,
+                    )
+                })
+                .collect();
+            match name {
+                "served" | "reset" => assert_eq!(shape, [(1, 1, 5)], "{name}"),
+                "one" => assert_eq!(shape, [(1, 1, 1)], "{name}"),
+                "lower" => assert_eq!(shape, [(1, 2, 4)], "{name}"),
+                "pages" => assert_eq!(shape, [(1, 1, 250), (1, 251, 149)], "{name}"),
+                "growth" => assert_eq!(
+                    shape,
+                    [(1, 1, 3), (2, 4, 1), (3, 5, 1), (4, 6, 1)],
+                    "{name}"
+                ),
+                other => unreachable!("{other}"),
+            }
+            versions
+                .entry(name)
+                .or_default()
+                .extend(pages.iter().map(|page| page.state_version));
+            let marked: Vec<bool> = pages.iter().map(|page| page.reaches_target).collect();
+            let expected: Vec<bool> = shape
+                .iter()
+                .enumerate()
+                .map(|(index, _)| !(name == "pages" && index == 0))
+                .collect();
+            assert_eq!(marked, expected, "{name}");
+        }
+    }
+    let (plain, reset) = (&versions["served"], &versions["reset"]);
+    assert!(
+        reset.iter().min() > plain.iter().max(),
+        "{plain:?} {reset:?}"
+    );
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or
@@ -359,8 +510,13 @@ fn a_quiet_startup_adopts_only_the_seeded_record() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-publication-<name>.json` with its Plan bytes
 /// beside it in `header-publication-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 2] {
-    [("invalidate-only", invalidate_only()), ("sync", sync())]
+fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
+    [
+        ("invalidate-only", invalidate_only()),
+        ("sync", sync()),
+        ("served-in-pages", served_in_pages()),
+        ("served-one-header", served_one_header()),
+    ]
 }
 
 /// The Plan bytes every committed witness runs under: a fixed draw.

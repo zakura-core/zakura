@@ -473,6 +473,7 @@ impl ActionSource for PolicySource {
                 // The storage source appends only its own port's facts, but
                 // a run may hold other services' storage too.
                 let runs = self.storage.take_runs();
+                tap.page_reads(&self.storage.take_page_reads());
                 tap.storage_facts(
                     log.entries()[before..]
                         .iter()

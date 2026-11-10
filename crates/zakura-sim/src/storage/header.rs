@@ -111,6 +111,14 @@ pub struct HeaderStorage {
     /// since the observation before the last, until
     /// [`take_publications`](Self::take_publications) takes them.
     publications: Vec<zakura_header_chain::EngineSnapshot>,
+    /// Each page read the last observation completed, by operation, with
+    /// each header's hash and its parent's, until
+    /// [`take_page_reads`](Self::take_page_reads) takes them. The log keeps
+    /// only a page's last header and count.
+    page_reads: Vec<(
+        u64,
+        Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+    )>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -241,6 +249,7 @@ impl HeaderStorage {
             attributions: FaultAttributions::default(),
             runs: Vec::new(),
             publications: Vec::new(),
+            page_reads: Vec::new(),
         }
     }
 
@@ -438,6 +447,8 @@ fn result(result: &ResultIdentity) -> StorageResult {
             last,
             count,
             complete,
+            // The served path is view-side evidence, kept out of the log.
+            links: _,
         } => StorageResult::Page {
             last: point(*last),
             count: *count,
@@ -726,6 +737,7 @@ impl ActionSource for HeaderStorage {
         // Only this observation's runs are kept, so a run no tap takes is
         // dropped at the next one.
         self.runs.clear();
+        self.page_reads.clear();
         // Taken every observation, so a run no tap reads keeps none.
         self.publications = self.port.engine().take_publications();
         let actual = self.port.owner_state();
@@ -741,6 +753,11 @@ impl ActionSource for HeaderStorage {
         let last = facts.last().map_or(delivered, |fact| fact.seq);
         for fact in &facts {
             self.attributions.record(self.id.index, fact);
+            if let FactKind::Completed(completion) = &fact.kind {
+                if let ResultIdentity::Page { links, .. } = &completion.result {
+                    self.page_reads.push((completion.id.0, links.clone()));
+                }
+            }
             let run = match &fact.kind {
                 FactKind::Completed(completion) => completion.executed.clone(),
                 FactKind::Committed { executed, .. } | FactKind::Reset { executed, .. } => {
@@ -787,6 +804,17 @@ impl HeaderStorage {
     /// fact that carried it, or 0 for a harness commit's.
     pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
         std::mem::take(&mut self.runs)
+    }
+
+    /// Each page read the last observation completed, by operation, with
+    /// each header's hash and its parent's.
+    pub(crate) fn take_page_reads(
+        &mut self,
+    ) -> Vec<(
+        u64,
+        Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+    )> {
+        std::mem::take(&mut self.page_reads)
     }
 
     /// Each snapshot the port's engine sent on its selected-chain watch in

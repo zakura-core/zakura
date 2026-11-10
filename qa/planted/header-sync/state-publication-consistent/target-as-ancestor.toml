@@ -1,0 +1,13 @@
+# A path job copies its first locator into its initial target, while it
+# still leases toward the right one. On the served-one-header witness the
+# node's only page starts at that locator, so the page carries its own
+# ancestor as its target, as a subscriber that already held its target
+# would have it, and its marker matches. Only the subscriber's own `Open`
+# can tell. The publisher's job state decides what a page carries, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.plan"

@@ -1265,15 +1265,18 @@ impl Subsystem for Storage {
             .zip(2..)
             .enumerate()
         {
+            let name = format!("mirror-{index}");
+            // The served-page rule reads each mirror's `Open`s.
+            let observer = ports.publication.subscriber(&name);
             nodes.push(HeaderNode::spawn(
                 sim,
-                &format!("mirror-{index}"),
+                &name,
                 seed,
                 port.clone(),
                 &ports.fixture,
                 spec.chain.tip(&ports.fixture),
                 dispatch.clone(),
-                None,
+                Some(observer),
             ));
         }
         let cooldown = nodes[0].startup.config.unproductive_peer_cooldown;

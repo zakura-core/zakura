@@ -38,6 +38,11 @@
 //! broken rule is a claim break, which the tap hands
 //! [`Claim::StatePublicationConsistent`](super::claim::Claim) at its drain.
 //!
+//! - **Served pages are what was read.** Every page a publisher hands its
+//!   writer is the page read it was built from, starts where its
+//!   subscription's previous page left off, and carries its subscription's
+//!   initial target ([`served`]).
+//!
 //! **Liveness facts.** A harness that arms the evidence
 //! ([`PublicationEvidence::armed`]) also gets stamped facts, which the
 //! property's obligations read: each commit ([`PublicationFact::Committed`])
@@ -63,8 +68,12 @@ use std::{
     time::Duration,
 };
 
+use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
-use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+use zakura_network::zakura::{
+    observe::{CreditKind, HeaderSyncObserver, ReactorEvent},
+    Status, ZakuraPeerId,
+};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::EngineRun;
 
@@ -72,6 +81,7 @@ use super::{
     adoption::{Adoption, STATUS_CHANGE_BOUND},
     stamp::Stamps,
 };
+use crate::observe::StorageFact;
 
 /// How long a session in a status fixture may be owed its `Status`: the
 /// publisher's change bound ([`STATUS_CHANGE_BOUND`], its
@@ -155,6 +165,28 @@ struct Store {
     /// Each node's peer ID and harness name, which the harness's
     /// environment facts name it by.
     names: Vec<(ZakuraPeerId, String)>,
+    /// Each page the served-page rule judged, in order.
+    pages: Vec<ServedPage>,
+    /// Each subscription's `Open`, as its subscriber built it, by
+    /// subscriber, session and subscription ([`SubscriberOpens`]).
+    opens: HashMap<served::SubscriptionKey, served::Opened>,
+}
+
+/// A page the served-page rule judged: what a witness reads of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedPage {
+    /// The session.
+    pub session_id: u64,
+    /// The subscription.
+    pub subscription_id: u64,
+    /// The common ancestor it declared.
+    pub common_ancestor: Frontier,
+    /// How many headers it held.
+    pub headers: usize,
+    /// Whether its marker said it reached the initial target.
+    pub reaches_target: bool,
+    /// The newest state version the node had committed when it was queued.
+    pub state_version: u64,
 }
 
 /// When the publication check first applied, and the tip it still owes,
@@ -252,6 +284,26 @@ impl PublicationEvidence {
         })
     }
 
+    /// Each page the served-page rule judged, in order.
+    pub fn pages(&self) -> Vec<ServedPage> {
+        self.with(|store| store.pages.clone())
+    }
+
+    /// The observer for the node named `subscriber`, a mirror the node
+    /// under test serves, which records each `Open` its subscriber builds
+    /// ([`SubscriberOpens`]).
+    pub fn subscriber(&self, subscriber: &str) -> Arc<dyn HeaderSyncObserver> {
+        Arc::new(SubscriberOpens {
+            subscriber: subscriber.to_owned(),
+            evidence: self.clone(),
+        })
+    }
+
+    /// `subscription`'s `Open`, if its subscriber recorded one.
+    fn opened(&self, subscription: &served::SubscriptionKey) -> Option<served::Opened> {
+        self.with(|store| store.opens.get(subscription).cloned())
+    }
+
     /// The peer whose session `session_id` was owed a `Status`, if it was.
     pub fn owed_peer(&self, session_id: u64) -> Option<ZakuraPeerId> {
         self.with(|store| {
@@ -312,6 +364,51 @@ impl PublicationEvidence {
     }
 }
 
+/// A mirror's observer, which records each `Open` the mirror's subscriber
+/// builds for a node, its `CreditIssued` of kind `Open`, so the served-page
+/// rule judges a page's target and first start by what the far end asked
+/// for ([`served`]). The subscriber reports credit only to a capacity handle,
+/// so this is its own. It ignores every other event and adds no
+/// scheduling point, so the mirror runs as it would unobserved.
+#[derive(Debug)]
+struct SubscriberOpens {
+    /// The mirror's harness name.
+    subscriber: String,
+    evidence: PublicationEvidence,
+}
+
+impl HeaderSyncObserver for SubscriberOpens {
+    /// Records `event`'s target, its height and locators if it's an
+    /// `Open`'s credit.
+    fn observe(&self, event: ReactorEvent) {
+        if let ReactorEvent::CreditIssued {
+            kind: CreditKind::Open,
+            session_id,
+            update,
+            target_height,
+            ..
+        } = event
+        {
+            let subscription = (self.subscriber.clone(), session_id, update.subscription_id);
+            let opened = served::Opened {
+                target: update.initial_target_tip_hash,
+                target_height,
+                locators: update.locator_hashes,
+            };
+            self.evidence
+                .with(|store| store.opens.insert(subscription, opened));
+        }
+    }
+
+    /// This observer, which the subscriber's credit reports go to.
+    fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+        Some(Arc::new(SubscriberOpens {
+            subscriber: self.subscriber.clone(),
+            evidence: self.evidence.clone(),
+        }))
+    }
+}
+
 /// The check's state.
 pub(super) struct Publication {
     /// Each engine record's snapshot, by its state version.
@@ -327,6 +424,8 @@ pub(super) struct Publication {
     unstored: Option<u64>,
     /// Each admitted session the node still holds, in a status fixture.
     sessions: HashMap<u64, Session>,
+    /// The served-page rule's state.
+    served: served::ServedPages,
     /// Whether the commit-contents check found a run corrupt, after which
     /// nothing is judged.
     tainted: bool,
@@ -346,6 +445,7 @@ impl Publication {
             adopted: None,
             unstored: None,
             sessions: HashMap::new(),
+            served: served::ServedPages::default(),
             tainted: false,
             breaks: Vec::new(),
             evidence,
@@ -375,6 +475,19 @@ impl Publication {
                 state_version: version,
                 at: now(),
             });
+        }
+    }
+
+    /// Notes the links of each page read that completed in the observation
+    /// whose storage facts the tap hands over next ([`served`]).
+    pub(super) fn page_reads(&mut self, reads: &[(u64, Vec<(block::Hash, block::Hash)>)]) {
+        self.served.page_reads(reads);
+    }
+
+    /// Notes one of the node's storage facts, for the served-page rule.
+    pub(super) fn storage(&mut self, fact: &StorageFact) {
+        if !self.tainted {
+            self.served.storage(fact);
         }
     }
 
@@ -413,7 +526,40 @@ impl Publication {
     /// Judges `event`, which the reactor's own task reported when
     /// `on_reactor`.
     pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool) {
-        if !on_reactor || self.tainted {
+        if self.tainted {
+            return;
+        }
+        // A publisher task reports its pages, not the reactor's.
+        let evidence = self.evidence.clone();
+        let opened = |subscriber: &ZakuraPeerId, session_id, subscription| {
+            let subscriber = evidence.peer_name(subscriber)?;
+            evidence.opened(&(subscriber, session_id, subscription))
+        };
+        if let Some(breaks) = self.served.queued(event, super::tap::peer, opened) {
+            if let ReactorEvent::PageQueued {
+                session_id,
+                subscription_id,
+                common_ancestor,
+                headers,
+                reaches_target,
+                ..
+            } = event
+            {
+                let page = ServedPage {
+                    session_id: *session_id,
+                    subscription_id: *subscription_id,
+                    common_ancestor: *common_ancestor,
+                    headers: headers.len(),
+                    reaches_target: *reaches_target,
+                    state_version: self.newest,
+                };
+                self.evidence.with(|store| store.pages.push(page));
+            }
+            self.applies();
+            self.breaks.extend(breaks);
+            return;
+        }
+        if !on_reactor {
             return;
         }
         match event {
@@ -683,6 +829,8 @@ struct Session {
 fn now() -> SimInstant {
     zakura_scheduler::hooks::now().unwrap_or_default()
 }
+
+mod served;
 
 #[cfg(test)]
 mod tests;

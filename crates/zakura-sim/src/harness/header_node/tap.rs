@@ -1333,6 +1333,27 @@ impl ReactorTap {
         (observer, tap)
     }
 
+    /// Hands the publication check the links of each page read that
+    /// completed in the observation whose storage facts come next
+    /// ([`super::publication`]).
+    pub(crate) fn page_reads(
+        &self,
+        reads: &[(
+            u64,
+            Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+        )],
+    ) {
+        if let Some(publication) = self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            publication.page_reads(reads);
+        }
+    }
+
     /// Hands the authority, fork-choice and publication checks each apply's,
     /// reset's and harness commit's engine run that the header storage
     /// source just logged, in order, and the publication check the port's
@@ -1387,6 +1408,17 @@ impl ReactorTap {
         runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
     ) {
         let facts: Vec<_> = facts.into_iter().collect();
+        if let Some(publication) = self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (_, fact) in &facts {
+                publication.storage(fact);
+            }
+        }
         let mut wake = self
             .state
             .wake

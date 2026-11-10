@@ -477,6 +477,83 @@ fn each_changed_state_field_is_a_mismatch() {
     }
 }
 
+/// An acquire whose path starts at a header that isn't one of its locators,
+/// here the target where the anchor was the only locator, is a head the
+/// model doesn't allow.
+#[test]
+fn an_acquire_off_its_locators_is_unexpected() {
+    let (port, chain) = chain(2);
+    let mut model = OwnerModel::new();
+    run(&port, port.acquire_header_path(acquire(&port, chain[1]))).expect("the acquire runs");
+    let mut facts = port.take_facts();
+    let head = facts
+        .iter()
+        .rposition(|fact| {
+            matches!(&fact.kind, FactKind::Completed(c) if matches!(c.result, ResultIdentity::Acquired { .. }))
+        })
+        .expect("the acquire completes with a path");
+    let FactKind::Completed(completion) = &mut facts[head].kind else {
+        unreachable!("the head was matched above");
+    };
+    let ResultIdentity::Acquired {
+        common_ancestor, ..
+    } = &mut completion.result
+    else {
+        unreachable!("the head was matched above");
+    };
+    assert_eq!(
+        *common_ancestor,
+        HeaderFixture::regtest().anchor(),
+        "the path starts at the anchor"
+    );
+    *common_ancestor = chain[0];
+    assert_eq!(
+        model.apply(&facts),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: facts[head].txn,
+            found: facts[head].kind.clone(),
+        })
+    );
+}
+
+/// A page read whose result isn't a path from its start, here its two
+/// headers in reverse with the count it read, is a head the model doesn't
+/// allow.
+#[test]
+fn a_page_that_isnt_a_path_is_unexpected() {
+    let (port, chain) = chain(2);
+    let mut model = OwnerModel::new();
+    let path = acquired(run(
+        &port,
+        port.acquire_header_path(acquire(&port, chain[1])),
+    ));
+    checked(&port, &mut model);
+    let anchor = HeaderFixture::regtest().anchor();
+    run(&port, port.read_header_path(path, page_after(anchor, 2))).expect("the page reads");
+    let mut facts = port.take_facts();
+    let head = facts
+        .iter()
+        .rposition(|fact| {
+            matches!(&fact.kind, FactKind::Completed(c) if matches!(c.result, ResultIdentity::Page { .. }))
+        })
+        .expect("the read completes with a page");
+    let FactKind::Completed(completion) = &mut facts[head].kind else {
+        unreachable!("the head was matched above");
+    };
+    let ResultIdentity::Page { links, .. } = &mut completion.result else {
+        unreachable!("the head was matched above");
+    };
+    assert_eq!(links.len(), 2, "the read served both headers");
+    links.reverse();
+    assert_eq!(
+        model.apply(&facts),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: facts[head].txn,
+            found: facts[head].kind.clone(),
+        })
+    );
+}
+
 /// Only an apply commits, so a `Committed` head for a membership read is an
 /// effect the model doesn't allow.
 #[test]

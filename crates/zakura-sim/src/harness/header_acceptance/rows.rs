@@ -71,6 +71,10 @@ const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 const HOLD: &str = "header-sync/hold-release-wakes";
 /// `header-sync/peer-retirement-progress`.
 const RETIREMENT: &str = "header-sync/peer-retirement-progress";
+/// `header-sync/expected-chain-selected`.
+const SELECTED: &str = "header-sync/expected-chain-selected";
+/// `header-sync/state-publication-consistent`.
+const PUBLICATION: &str = "header-sync/state-publication-consistent";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
 /// `header-sync/bounded-adversary-progress`.
@@ -90,7 +94,7 @@ const HONEST: &str = "session/honest-never-punished";
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
-const STORAGE_REGISTERS: [&str; 12] = [
+const STORAGE_REGISTERS: [&str; 14] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -102,6 +106,8 @@ const STORAGE_REGISTERS: [&str; 12] = [
     CHAIN,
     COMMIT,
     RETIREMENT,
+    SELECTED,
+    PUBLICATION,
     OUTSTANDING,
 ];
 
@@ -165,6 +171,8 @@ const G24: &[Gate] = &[Gate::G2, Gate::G4];
 const G3: &[Gate] = &[Gate::G3];
 /// Gates 3 and 4: sender cadence.
 const G34: &[Gate] = &[Gate::G3, Gate::G4];
+/// Gates 1, 3 and 4.
+const G134: &[Gate] = &[Gate::G1, Gate::G3, Gate::G4];
 /// Gate 5 alone.
 const G5: &[Gate] = &[Gate::G5];
 /// Gate 1 alone.
@@ -313,10 +321,39 @@ const CHAIN_CASES: [&str; 4] = [
     "reset-inside-status-floor ",
 ];
 /// Each authority witness's name, as its witness test prefixes its executions.
-const AUTHORITY_CASES: [&str; 3] = [
+const AUTHORITY_CASES: [&str; 4] = [
     "forks-sharing-a-header ",
     "multi-page-sync ",
     "relinked-mid-round ",
+    "harness-commit ",
+];
+/// Each fork-choice witness's name, as its witness test prefixes its
+/// executions.
+const SELECTED_CASES: [&str; 7] = [
+    "stronger-first ",
+    "stronger-last ",
+    "three-forks ",
+    "equal-work ",
+    "heavier-offered-to-longer ",
+    "invalidated-then-reconsidered ",
+    "harness-commit ",
+];
+/// Each publication witness's name, as its witness test prefixes its
+/// executions.
+const PUBLICATION_CASES: [&str; 13] = [
+    "startup-only ",
+    "quiet-reset ",
+    "invalidate-only ",
+    "grow ",
+    "reset-inside-status-floor ",
+    "harness-commit ",
+    "sync ",
+    "served ",
+    "served-one-header ",
+    "served-from-a-lower-locator ",
+    "served-in-pages ",
+    "served-after-growth ",
+    "served-across-a-reset ",
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
@@ -363,6 +400,28 @@ const AUTHORITY_WITNESSES: HistoryRef = HistoryRef {
         "every_witness_holds_and_applies",
     ),
     case: "forks-sharing-a-header plan 0 of inputs(8, 256)",
+};
+
+/// The fork-choice witnesses, each holding and applying
+/// `expected-chain-selected`.
+const SELECTED_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_chain_selected.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "stronger-first plan 0 of inputs(8, 256)",
+};
+
+/// The publication witnesses, each holding and applying
+/// `state-publication-consistent`.
+const PUBLICATION_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_publication.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "startup-only plan 0 of inputs(8, 256)",
 };
 
 /// The committed outstanding-work witnesses, each holding and applying
@@ -742,6 +801,8 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         (&RESET_CASES[..], RESET_WITNESSES, RESET),
         (&CHAIN_CASES[..], CHAIN_WITNESSES, CHAIN),
         (&AUTHORITY_CASES[..], AUTHORITY_WITNESSES, COMMIT),
+        (&SELECTED_CASES[..], SELECTED_WITNESSES, SELECTED),
+        (&PUBLICATION_CASES[..], PUBLICATION_WITNESSES, PUBLICATION),
     ] {
         for prefix in cases {
             for case in plan_cases(prefix, "inputs(8, 256)", 8) {
@@ -896,6 +957,8 @@ pub fn witness_tests() -> Vec<TestRef> {
         OUTSTANDING_WITNESSES.witness,
         HOLD_WITNESSES.witness,
         RETIRE_WITNESSES.witness,
+        SELECTED_WITNESSES.witness,
+        PUBLICATION_WITNESSES.witness,
         RECOVERY_WITNESS.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
@@ -1266,6 +1329,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "insertion-bump-skipped-by-commit",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "insertion-bump-skipped-held",
             STORAGE,
             &[RESET] as &'static [&'static str],
@@ -1440,6 +1509,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "corrupted-best-score",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-best-score-by-commit",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1935,8 +2010,6 @@ fn hand_written_rows() -> Vec<Row> {
         retirement,
     ));
 
-<<<<<<< HEAD
-=======
     let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
     for (index, (name, harness, set, found)) in [
         (
@@ -1983,6 +2056,30 @@ fn hand_written_rows() -> Vec<Row> {
     // mutations, moved here as cases of their own names.
     for (index, (name, harness, set, found)) in [
         (
+            "ancestor-field",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-locator-dropped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-page-height",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-page-target",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "mixed-adoption",
             STORAGE,
             &[PUBLICATION] as &'static [&'static str],
@@ -1990,6 +2087,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "old-fields-after-reset",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "page-order",
             STORAGE,
             &[PUBLICATION] as &'static [&'static str],
             Found::AtStep,
@@ -2030,6 +2133,12 @@ fn hand_written_rows() -> Vec<Row> {
             &[PUBLICATION] as &'static [&'static str],
             Found::AtStep,
         ),
+        (
+            "target-as-ancestor",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
         // The unsent tip shows only when the run comes to rest, as the
         // property's end finding.
         (
@@ -2050,6 +2159,12 @@ fn hand_written_rows() -> Vec<Row> {
             &[PUBLICATION] as &'static [&'static str],
             Found::AtStep,
         ),
+        (
+            "wrong-fork-served",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -2065,7 +2180,6 @@ fn hand_written_rows() -> Vec<Row> {
     }
     rows.push(sim_row(PUBLICATION, storage_harnesses, publication));
 
->>>>>>> 512faa2e1a (test(zakura-sim): oblige adoption and a timely status in state-publication-consistent)
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);
     for (index, name) in [

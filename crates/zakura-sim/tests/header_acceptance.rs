@@ -1239,6 +1239,73 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
         ),
         (
             STORAGE,
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/reset-invalidates-work"),
+            [
+                "held-locator ",
+                "held-prepare ",
+                "held-apply ",
+                "held-reply ",
+                "two-forks ",
+                "session-replaced-read ",
+                "tip-reuse ",
+                "completion-before-adoption ",
+                "quiet-reset ",
+                "quiet-reset-deep ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/stale-chain-effect-inert"),
+            [
+                "pre-reset-commit ",
+                "refused-across-reset ",
+                "fork-stale-apply ",
+                "reset-inside-status-floor ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/commit-only-authorized"),
+            [
+                "forks-sharing-a-header ",
+                "multi-page-sync ",
+                "relinked-mid-round ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+            Some("header-sync/outstanding-work-bounded"),
+            owned(&[
+                "header-authority-forks-sharing-a-header",
+                "header-authority-relinked-mid-round",
+                "header-reset-held-apply",
+                "header-reset-held-reply",
+                "header-reset-quiet-reset",
+                "header-reset-quiet-reset-deep",
+                "header-outstanding-churn",
+                "header-outstanding-serving-churn",
+                "header-outstanding-serving-replaced",
+            ]),
+        ),
+        (
+            STORAGE,
             "tests/header_node_capacity.rs",
             "the_close_relink_input_holds_chunk_budget_bound",
             Some("header-sync/chunk-budget-bound"),

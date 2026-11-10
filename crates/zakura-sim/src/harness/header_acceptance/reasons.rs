@@ -234,9 +234,45 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/header_sync.rs",
         function: "check_teardown",
-        fingerprint: "8f59ba6f6c2c8413",
+        fingerprint: "ea28e1a97e82f73d",
         constructions: &[step(
-            "no round was released or settled, and the node isn't settled",
+            "no round a claim left untainted was released or settled, and the node isn't settled",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_reset_invalidates_work",
+        fingerprint: "0e882cb7004ed34b",
+        constructions: &[step(
+            "the reactor hasn't adopted a reset or started a round under it by this step",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_stale_chain_effect",
+        fingerprint: "17d096f30924cecf",
+        constructions: &[step(
+            "no chain effect has been judged against a reset by this step",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_outstanding_work_bounded",
+        fingerprint: "4722d816dec8d8c8",
+        constructions: &[step(
+            "no drain has judged the reactor's container sizes by this step",
+            TAIL,
+        )],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_commit_only_authorized",
+        fingerprint: "e869cc220b2cc8ff",
+        constructions: &[step(
+            "the authority check hasn't judged a round's work by this step",
             TAIL,
         )],
     },
@@ -277,7 +313,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/table.rs",
         function: "check_generated",
-        fingerprint: "08aba84074181da9",
+        fingerprint: "26f09b8f3475e4e3",
         constructions: &[missing(RETURN)],
     },
     NaProducer {

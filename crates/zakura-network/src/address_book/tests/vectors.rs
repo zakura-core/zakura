@@ -149,8 +149,8 @@ fn peer_cache_excludes_known_non_node_services() {
         book.cacheable(Utc::now())
             .iter()
             .map(|peer| peer.addr)
-            .collect::<Vec<_>>(),
-        vec![full_node, unknown]
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([full_node, unknown])
     );
 }
 

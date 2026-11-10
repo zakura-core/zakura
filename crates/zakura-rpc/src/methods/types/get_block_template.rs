@@ -513,6 +513,7 @@ impl BlockTemplateResponse {
     /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
     /// check invariants that the caller already guarantees.
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
+    #[cfg(test)]
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
@@ -522,6 +523,35 @@ impl BlockTemplateResponse {
         mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
     ) -> Result<Self, TransactionError> {
+        Self::new_internal_cancellable(
+            net,
+            precomputed_coinbase,
+            miner_params,
+            chain_info,
+            long_poll_id,
+            mempool_txs,
+            submit_old,
+            Default::default(),
+        )
+    }
+
+    // The checked invariants are the same as the non-cancellable constructor.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
+    pub(crate) fn new_internal_cancellable(
+        net: &Network,
+        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
+        miner_params: &MinerParams,
+        chain_info: &GetBlockTemplateChainInfo,
+        long_poll_id: LongPollId,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
+        submit_old: Option<bool>,
+        cancellation: orchard::circuit::ProofCancellation,
+    ) -> Result<Self, TransactionError> {
+        if cancellation.is_cancelled() {
+            return Err(TransactionError::CoinbaseConstruction(
+                "template construction cancelled".into(),
+            ));
+        }
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -574,7 +604,7 @@ impl BlockTemplateResponse {
             Some(coinbase_txn) => coinbase_txn,
             // ZIP 234 derives the subsidy from the money reserve after the parent, which
             // is the chain tip this template builds on.
-            None => TransactionTemplate::new_coinbase(
+            None => TransactionTemplate::new_coinbase_cancellable(
                 net,
                 height,
                 miner_params,
@@ -586,9 +616,15 @@ impl BlockTemplateResponse {
                 } else {
                     None
                 },
+                cancellation.clone(),
             )?,
         };
 
+        if cancellation.is_cancelled() {
+            return Err(TransactionError::CoinbaseConstruction(
+                "template construction cancelled".into(),
+            ));
+        }
         let default_roots = DefaultRoots::from_coinbase(
             net,
             height,
@@ -893,18 +929,34 @@ where
         &self,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
-        let permit = tokio::time::timeout(
-            TEMPLATE_BUILD_WAIT,
-            self.template_build_slots.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            ErrorObject::new(
-                LegacyCode::Misc,
-                "timed out waiting for mining template construction capacity",
+        self.run_template_build_with_priority(false, build).await
+    }
+
+    /// Speculation uses only immediately available capacity, behind queued RPC work.
+    pub(crate) async fn run_template_build_with_priority<T: Send + 'static>(
+        &self,
+        speculative: bool,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        let permit = if speculative {
+            self.template_build_slots
+                .clone()
+                .try_acquire_owned()
+                .map_misc_error()?
+        } else {
+            tokio::time::timeout(
+                TEMPLATE_BUILD_WAIT,
+                self.template_build_slots.clone().acquire_owned(),
             )
-        })?
-        .map_misc_error()?;
+            .await
+            .map_err(|_| {
+                ErrorObject::new(
+                    LegacyCode::Misc,
+                    "timed out waiting for mining template construction capacity",
+                )
+            })?
+            .map_misc_error()?
+        };
 
         tokio::task::spawn_blocking(move || {
             // Dropping the RPC future cannot release capacity while this job still owns work.

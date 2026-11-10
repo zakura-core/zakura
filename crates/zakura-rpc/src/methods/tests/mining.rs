@@ -1969,3 +1969,92 @@ async fn shielded_template_rewards() {
     );
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }
+
+#[test]
+fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
+    mining_runtime(async {
+        let current = chain_info(3, 2, 0);
+        let (info_tx, info) = watch::channel(current.clone());
+        let (rpc, _tip_sender, _, _) = shared_template_rpc(info, mempool_txs(1));
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let changes = mempool::MempoolTxSubscriber::new(sender);
+        let rpc = rpc.with_mempool_change(changes.clone());
+        let worker_rpc = rpc.clone();
+        let worker = tokio::spawn(async move { worker_rpc.run_proactive_templates().await });
+        // No getblocktemplate call triggers this construction.
+        bounded(async {
+            loop {
+                let changed = rpc.gbt.shared_template.subscribe();
+                if rpc.gbt.shared_template.ready(current.tip_hash, 0).is_some() {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        let old_id = LongPollInput::new(Height(2), block::Hash([1; 32]), current.max_time, vec![])
+            .generate_id();
+        let response = bounded(long_poll(&rpc, old_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(!response.transactions.is_empty());
+        assert_eq!(response.previous_block_hash, current.tip_hash);
+        assert_eq!(response.submit_old, Some(false));
+        // Additions do not make existing selected transactions ineligible.
+        changes
+            .send(mempool::MempoolChange::added(Default::default()))
+            .unwrap();
+        assert!(rpc.ready_populated_template(&current, None).is_some());
+        let mut different_difficulty = current.clone();
+        different_difficulty.expected_difficulty =
+            CompactDifficulty::from(ExpandedDifficulty::from(U256::from(2)));
+        assert!(rpc
+            .ready_populated_template(&different_difficulty, None)
+            .is_none());
+        // Cache admission must see removal immediately, before the worker polls the event.
+        changes
+            .send(mempool::MempoolChange::invalidated(Default::default()))
+            .unwrap();
+        assert!(rpc.ready_populated_template(&current, None).is_none());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_none());
+
+        // A late completion after returning to the same parent cannot publish over its replacement.
+        let old = rpc.gbt.shared_template.claim(current.tip_hash).unwrap();
+        let cancelled = old.cancellation();
+        rpc.gbt.shared_template.invalidate();
+        let replacement = rpc.gbt.shared_template.claim(current.tip_hash).unwrap();
+        old.publish(response.clone());
+        assert!(cancelled.is_cancelled());
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_none());
+        replacement.publish(response);
+        assert!(rpc.gbt.shared_template.ready(current.tip_hash, 0).is_some());
+        drop(info_tx);
+    });
+}
+
+#[test]
+fn speculative_builds_do_not_queue_ahead_of_foreground_work() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(1, 1, 0));
+        let (rpc, _tip, _) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+        let mut occupied = Box::pin(rpc.gbt.run_template_build(|| ()));
+        assert!(futures::poll!(&mut occupied).is_pending());
+        let mut foreground = Box::pin(rpc.gbt.run_template_build(|| 7));
+        assert!(futures::poll!(&mut foreground).is_pending());
+        let result = rpc
+            .gbt
+            .run_template_build_with_priority(true, || {
+                panic!("speculation must not acquire occupied capacity")
+            })
+            .await;
+        assert!(result.is_err());
+        gate.release().await;
+        bounded(occupied).await.unwrap();
+        assert_eq!(bounded(foreground).await.unwrap(), 7);
+    });
+}

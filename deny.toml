@@ -170,7 +170,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+# Temporary cooperative proof-cancellation dependency; see common#733.
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

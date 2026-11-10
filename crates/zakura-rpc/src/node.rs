@@ -151,7 +151,21 @@ pub fn new_rpc_impl(
         .with_end_of_support_height(end_of_support_height)
         .with_mempool_change(mempool_change);
 
-    (rpc_impl, rpc_tx_queue_handle)
+    let worker = rpc_impl.clone();
+    let tasks = tokio::spawn(async move {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _queue = AbortOnDrop(rpc_tx_queue_handle.abort_handle());
+        tokio::select! {
+            result = rpc_tx_queue_handle => { result.expect("RPC queue task must not panic"); }
+            _ = worker.run_proactive_templates() => {}
+        }
+    });
+    (rpc_impl, tasks)
 }
 
 /// Starts the node's public RPC server. See [`RpcServer::start`].

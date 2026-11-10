@@ -527,17 +527,7 @@ impl QuicEndpoint {
             ));
         }
 
-        // DIAL-2: canonicalize, deduplicate in order, and keep dialable families.
-        let mut targets: Vec<(SocketAddr, &SocketHandle)> = Vec::new();
-        for raw in addr.direct {
-            let target = canonical_addr(raw);
-            if targets.iter().any(|(seen, _)| *seen == target) {
-                continue;
-            }
-            if let Some(socket) = self.socket_for(target) {
-                targets.push((target, socket));
-            }
-        }
+        let mut targets = self.dial_targets(&addr.direct);
         if targets.is_empty() {
             return Err(ConnectError::NoUsableAddress);
         }
@@ -695,6 +685,30 @@ impl QuicEndpoint {
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.inner.shared
+    }
+
+    /// Counts the address attempts a dial to `addr` would claim live slots
+    /// for (ADM-12): its canonical, deduplicated addresses in families this
+    /// endpoint has a socket for (DIAL-2).
+    pub fn dial_attempt_count(&self, addr: &NodeAddr) -> usize {
+        self.dial_targets(&addr.direct).len()
+    }
+
+    /// Returns the addresses of `direct` to dial with their sockets (DIAL-2):
+    /// canonicalized, deduplicated in order, and kept only in families this
+    /// endpoint has a socket for.
+    fn dial_targets(&self, direct: &[SocketAddr]) -> Vec<(SocketAddr, &SocketHandle)> {
+        let mut targets: Vec<(SocketAddr, &SocketHandle)> = Vec::new();
+        for &raw in direct {
+            let target = canonical_addr(raw);
+            if targets.iter().any(|(seen, _)| *seen == target) {
+                continue;
+            }
+            if let Some(socket) = self.socket_for(target) {
+                targets.push((target, socket));
+            }
+        }
+        targets
     }
 
     /// Picks the socket to dial `target` from: same family, and loopback for

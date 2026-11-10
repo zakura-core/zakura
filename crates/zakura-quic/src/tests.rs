@@ -463,6 +463,24 @@ async fn dial_without_a_matching_family_fails_fast() {
     ));
 }
 
+/// A dial's attempt count drops families with no socket and folds an
+/// IPv4-mapped address into its IPv4 form, as the dial itself does.
+#[tokio::test]
+async fn dial_attempts_count_only_addresses_the_dial_would_try() {
+    let client = client();
+    let peer = NodeAddr::with_addrs(
+        NodeSecretKey::generate().public(),
+        [
+            "127.0.0.1:8233".parse().unwrap(),
+            "[::ffff:127.0.0.1]:8233".parse().unwrap(),
+            "127.0.0.1:8234".parse().unwrap(),
+            "[::1]:8233".parse().unwrap(),
+            "[::1]:8234".parse().unwrap(),
+        ],
+    );
+    assert_eq!(client.dial_attempt_count(&peer), 2);
+}
+
 #[tokio::test]
 async fn wrong_identity_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {

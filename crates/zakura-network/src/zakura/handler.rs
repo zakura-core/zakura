@@ -4937,11 +4937,6 @@ async fn spawn_zakura_endpoint_inner(
         "Zakura node resource envelope"
     );
     validate_idle_invariant(&limits)?;
-    super::discovery::check_bootstrap_dials_fit(
-        &config.zakura.bootstrap_peers,
-        local_node_id,
-        limits.quic_bind_config(Vec::new()).dial_reserve,
-    )?;
     let discovery_secret_key = secret_key.clone();
     let supervisor = match peer_registry {
         Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
@@ -5099,10 +5094,13 @@ async fn spawn_zakura_endpoint_inner(
             registry_streams(&registry),
             limits.max_frame_bytes,
         )?;
-        let quic = QuicEndpoint::bind(
-            secret_key,
-            &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
-            &limits.quic,
+        let bind = limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr));
+        let quic = QuicEndpoint::bind(secret_key, &bind, &limits.quic)?;
+        super::discovery::check_bootstrap_dials_fit(
+            &config.zakura.bootstrap_peers,
+            local_node_id,
+            bind.dial_reserve,
+            |node_addr| quic.dial_attempt_count(node_addr),
         )?;
         Ok((registry, quic))
     });

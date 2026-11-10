@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index 01196a06de..583751dbaa 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -5681,6 +5681,11 @@ async fn persistent_stream_worker_with_policy(
+ ) {
+     let context = Arc::new(context);
+     let stream_kind = prelude.stream_kind;
++    // Send block bodies first: QUIC drains a block-sync stream before any
++    // other service's stream gets a turn.
++    if stream_kind == ZAKURA_STREAM_BLOCK_SYNC {
++        let _ = send.set_priority(1);
++    }
+ 
+     // Reading and forwarding may both block. Keep them independent of writes
+     // so waiting for inbound channel space cannot stall an outgoing response.

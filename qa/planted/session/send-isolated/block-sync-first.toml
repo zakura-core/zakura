@@ -1,0 +1,8 @@
+# Raises every block-sync stream's QUIC send priority, so QUIC sends a
+# block-sync stream's queued bodies before any other service's frame. The
+# input's mirrors queue large bodies behind a 64 KiB send window, so header
+# sync's and discovery's frames wait behind more block bytes than the bound.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-saturated.bin"
+# Besides handler.rs, which the patch changes, zakura-quic's stream
+# scheduling decides which stream's bytes go first.
+checks = ["crates/zakura-quic/src"]

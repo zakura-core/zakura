@@ -750,6 +750,7 @@ impl StartCmd {
                 sync_status: zakura_rpc::node::NodeSyncStatus::new(sync_status.clone()),
                 latest_chain_tip: latest_chain_tip.clone(),
                 address_book: address_book.clone(),
+                mempool_change: mempool_transaction_subscriber.clone(),
             },
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),

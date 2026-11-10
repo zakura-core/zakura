@@ -1072,6 +1072,9 @@ where
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: Tip,
 
+    /// Subscribes to changes in the mempool's verified transactions, if the node provides them.
+    mempool_change: Option<mempool::MempoolTxSubscriber>,
+
     // Tasks
     //
     /// A sender component of a channel used to send transactions to the mempool queue.
@@ -1432,6 +1435,7 @@ where
             state: state.clone(),
             read_state: read_state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            mempool_change: None,
             queue_sender,
             address_book,
             last_warn_error_log_rx,
@@ -2013,6 +2017,13 @@ where
     /// Shares one pending-block registry with peer serving.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.gbt.set_pending_blocks(pending_blocks);
+        self
+    }
+
+    /// Lets `getblocktemplate` long polls on a template without transactions return as soon as
+    /// the mempool changes, instead of at the next mempool poll.
+    pub fn with_mempool_change(mut self, mempool_change: mempool::MempoolTxSubscriber) -> Self {
+        self.mempool_change = Some(mempool_change);
         self
     }
 
@@ -3592,8 +3603,12 @@ where
                 // miner profits (and any delays can cause chain forks). So we don't wait between
                 // the chain tip changing and getting mempool transactions.
                 //
-                // Optional TODO:
-                // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
+                // Subscribe before the fetch, so no change after this snapshot is missed. A change
+                // made during the fetch wakes the wait below once, and the next fetch sees it.
+                let mempool_changes = self
+                    .mempool_change
+                    .as_ref()
+                    .map(mempool::MempoolTxSubscriber::subscribe);
                 let Some((mempool_txs, mempool_tx_deps)) =
                     fetch_mempool_transactions(mempool.clone(), tip_hash)
                         .await?
@@ -3659,48 +3674,63 @@ where
                 let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
                 // `+2`: we expect the tip to advance by one block before waking us up.
                 let precomputed_height = Height(chain_info.tip_height.0 + 2);
-                let wait_for_new_tip = async {
-                    // Precompute the coinbase tx for an empty block that will sit on the new tip. We
-                    // will return this provisional block upon a chain tip change so that miners can
-                    // mine on the newest tip, and don't waste their effort on a shorter chain while we
-                    // compute a new template for a properly filled block. We do this precomputation
-                    // before we start waiting for a new tip since computing the coinbase tx takes a few
-                    // seconds if the miner mines to a shielded address, and we want to return fast
-                    // when the tip changes.
-                    let precompute_coinbase = |network, height, params| {
-                        self.gbt.run_template_build(move || {
-                            TransactionTemplate::new_coinbase(
-                                &network,
-                                height,
-                                &params,
-                                Amount::zero(),
-                                None,
-                            )
-                        })
-                    };
 
-                    // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
-                    // are unknown until the tip arrives, so this optimization cannot construct
-                    // a valid post-activation coinbase in advance.
-                    let precomputed_coinbase =
-                        if is_zip234_active(&self.network, precomputed_height) {
-                            None
-                        } else {
-                            Some(
-                                precompute_coinbase(
-                                    self.network.clone(),
+                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
+                // will return this provisional block upon a chain tip change so that miners can
+                // mine on the newest tip, and don't waste their effort on a shorter chain while we
+                // compute a new template for a properly filled block. Computing the coinbase tx
+                // takes a few seconds if the miner mines to a shielded address.
+                //
+                // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                // are unknown until the tip arrives, so this optimization cannot construct
+                // a valid post-activation coinbase in advance.
+                let precompute_coinbase: OptionFuture<_> =
+                    (!is_zip234_active(&self.network, precomputed_height))
+                        .then(|| {
+                            let network = self.network.clone();
+                            let miner_params = miner_params.clone();
+                            self.gbt.run_template_build(move || {
+                                TransactionTemplate::new_coinbase(
+                                    &network,
                                     precomputed_height,
-                                    miner_params.clone(),
+                                    &miner_params,
+                                    Amount::zero(),
+                                    None,
                                 )
-                                .await?
-                                .map_misc_error()?,
-                            )
-                        };
+                            })
+                        })
+                        .into();
 
+                // The precompute can wait for construction capacity behind other builds, so a tip
+                // change must not wait for it. A tip change that comes first drops the precompute,
+                // and the tip arm builds the coinbase itself. A finished precompute is kept.
+                let wait_for_new_tip = async {
+                    tokio::pin!(wait_for_new_tip);
+                    let precomputed_coinbase = tokio::select! {
+                        biased;
+
+                        Some(coinbase) = precompute_coinbase => coinbase?.map_misc_error()?,
+                        _ = &mut wait_for_new_tip => return Ok(None),
+                    };
                     let _ = wait_for_new_tip.await;
 
-                    Ok::<_, ErrorObject>(precomputed_coinbase)
+                    Ok::<_, ErrorObject>(Some(precomputed_coinbase))
                 };
+
+                // A template without transactions is what a miner gets on a new tip, and what it
+                // keeps after a reorg empties the mempool. Replace it as soon as the mempool
+                // changes. A template with transactions waits for the next mempool poll, so a
+                // steady stream of new transactions doesn't churn miners' work.
+                let wait_for_mempool_change: OptionFuture<_> = mempool_changes
+                    .filter(|_| mempool_txs.is_empty())
+                    .map(|mut changes| async move {
+                        // A lagged receiver has missed changes, so it wakes too.
+                        // A closed channel means no more changes, so it never wakes.
+                        if let Err(broadcast::error::RecvError::Closed) = changes.recv().await {
+                            std::future::pending::<()>().await;
+                        }
+                    })
+                    .into();
 
                 // Wait for the template's time range to expire. On testnet, minimum difficulty
                 // becomes valid one second after `max_time`, because the last standard difficulty
@@ -3748,18 +3778,6 @@ where
 
                     _ = template_rejections.changed() => { continue; }
 
-                    // This timer elapses every few seconds
-                    _elapsed = wait_for_mempool_request => {
-                        tracing::debug!(
-                            ?max_time,
-                            ?cur_time,
-                            ?server_long_poll_id,
-                            ?client_long_poll_id,
-                            MEMPOOL_LONG_POLL_INTERVAL,
-                            "checking for a new mempool change after waiting a few seconds"
-                        );
-                    }
-
                     precomputed_coinbase = wait_for_new_tip => {
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
@@ -3790,6 +3808,20 @@ where
                             return Ok(template);
                         }
                         continue 'rebuild;
+                    }
+
+                    Some(()) = wait_for_mempool_change => {}
+
+                    // This timer elapses every few seconds
+                    _elapsed = wait_for_mempool_request => {
+                        tracing::debug!(
+                            ?max_time,
+                            ?cur_time,
+                            ?server_long_poll_id,
+                            ?client_long_poll_id,
+                            MEMPOOL_LONG_POLL_INTERVAL,
+                            "checking for a new mempool change after waiting a few seconds"
+                        );
                     }
 
                     // Testnet reaches this when minimum difficulty becomes valid.

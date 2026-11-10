@@ -22,9 +22,7 @@ use tower::{buffer::Buffer, BoxError};
 use zakura_chain::{block, chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_consensus::RouterError;
 use zakura_network::AddressBook;
-use zakura_node_services::mempool;
-#[cfg(feature = "indexer-rpc")]
-use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::mempool::{self, MempoolTxSubscriber};
 use zakura_state::{LatestChainTip, ReadStateService};
 
 #[cfg(feature = "indexer-rpc")]
@@ -98,12 +96,15 @@ pub struct NodeRpcServices {
     pub latest_chain_tip: LatestChainTip,
     /// The peer address book.
     pub address_book: NodeAddressBook,
+    /// Subscribes to changes in the mempool's verified transactions.
+    pub mempool_change: MempoolTxSubscriber,
 }
 
 /// Creates the node's RPC implementation and spawns its transaction queue.
 ///
-/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`] and
-/// [`RpcImpl::with_end_of_support_height`] for the arguments.
+/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`],
+/// [`RpcImpl::with_end_of_support_height`] and [`RpcImpl::with_mempool_change`] for the
+/// arguments.
 #[allow(clippy::too_many_arguments)]
 pub fn new_rpc_impl(
     network: Network,
@@ -125,6 +126,7 @@ pub fn new_rpc_impl(
         sync_status,
         latest_chain_tip,
         address_book,
+        mempool_change,
     } = services;
 
     let (rpc_impl, rpc_tx_queue_handle) = RpcImpl::new(
@@ -146,7 +148,8 @@ pub fn new_rpc_impl(
 
     let rpc_impl = rpc_impl
         .with_pending_blocks(pending_blocks)
-        .with_end_of_support_height(end_of_support_height);
+        .with_end_of_support_height(end_of_support_height)
+        .with_mempool_change(mempool_change);
 
     (rpc_impl, rpc_tx_queue_handle)
 }

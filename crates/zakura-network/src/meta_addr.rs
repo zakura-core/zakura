@@ -1186,7 +1186,13 @@ impl MetaAddrChange {
                 // This is a wall clock time, but we already checked that responses are in order.
                 // Even if the wall clock time has jumped, we want to use the latest time.
                 last_response: self.last_response(local_now).or(previous.last_response),
-                rtt: self.rtt(),
+                // Only measurements from the current connection remain useful.
+                rtt: match self {
+                    MetaAddrChange::UpdatePingSent { .. }
+                    | MetaAddrChange::UpdateResponded { .. }
+                    | MetaAddrChange::UpdateMisbehavior { .. } => self.rtt().or(previous.rtt),
+                    _ => None,
+                },
                 ping_sent_at: self.ping_sent_at(),
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),

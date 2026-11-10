@@ -1,7 +1,6 @@
 //! Fixed test vectors for zakura-network configuration.
 
 use std::{
-    collections::HashSet,
     fs,
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -29,6 +28,108 @@ use crate::{
     },
     CacheDir, Config, P2pStack, UnconditionalPeers,
 };
+
+/// Cache line order survives parsing, deduplication, and fallback peer discovery.
+#[tokio::test]
+async fn peer_cache_preserves_order_and_precedes_seeds() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_mainnet_peers: ["127.0.0.1:8233".to_owned(), "127.0.0.2:8233".to_owned()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    let ordered: indexmap::IndexSet<crate::PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    config.update_peer_cache(ordered.clone()).await.unwrap();
+    let file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "127.0.0.9:9000\n127.0.0.1:8233"
+    );
+    fs::write(
+        &file,
+        "127.0.0.9:9000\ninvalid\n127.0.0.1:8233\n127.0.0.9:9000\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config
+            .load_peer_cache()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ordered.iter().copied().collect::<Vec<_>>()
+    );
+    let expected: Vec<crate::PeerSocketAddr> =
+        ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.2:8233"]
+            .into_iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        expected
+    );
+    fs::remove_file(file).unwrap();
+    assert_eq!(config.initial_peers().await.len(), 2);
+    config.cache_dir = CacheDir::disabled();
+    assert_eq!(config.initial_peers().await.len(), 2);
+    assert!(config.load_peer_cache().await.unwrap().is_empty());
+}
+
+/// Truncation retains the first addresses, rather than an arbitrary set subset.
+#[tokio::test]
+async fn peer_cache_truncates_in_preference_order() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    let peers: indexmap::IndexSet<crate::PeerSocketAddr> = (10000..10310)
+        .rev()
+        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .collect();
+    config.update_peer_cache(peers.clone()).await.unwrap();
+    let saved = config.load_peer_cache().await.unwrap();
+    assert_eq!(
+        saved.into_iter().collect::<Vec<_>>(),
+        peers
+            .into_iter()
+            .take(crate::constants::MAX_PEER_DISK_CACHE_SIZE)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Regtest never imports cache entries or non-local seed addresses.
+#[tokio::test]
+async fn peer_cache_is_ignored_on_regtest() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        network: Network::new_regtest(Default::default()),
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_testnet_peers: ["127.0.0.1:18244".to_owned(), "192.0.2.1:18244".to_owned()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    config
+        .update_peer_cache(["127.0.0.9:18244".parse().unwrap()].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec!["127.0.0.1:18244".parse().unwrap()]
+    );
+}
 
 use super::super::load_or_generate_zakura_secret_key;
 
@@ -124,7 +225,7 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
     fs::write(&peer_cache_file, cached_peers).expect("pre-seeded peer cache should be writable");
 
     config
-        .update_peer_cache(HashSet::new())
+        .update_peer_cache(indexmap::IndexSet::new())
         .await
         .expect("an empty peer cache update should succeed");
 

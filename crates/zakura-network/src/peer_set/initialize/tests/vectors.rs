@@ -73,6 +73,67 @@ const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum wall-clock time to wait for peer-cache startup progress.
 const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Startup retains cache priority through limiting and actual staggered dial attempts.
+#[tokio::test]
+async fn peer_cache_order_controls_startup_dials_even_after_failure() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_mainnet_peers: ["127.0.0.1:8233".to_owned(), "127.0.0.2:8233".to_owned()]
+            .into_iter()
+            .collect(),
+        peerset_initial_target_size: 2,
+        ..test_defaults()
+    };
+    let cached: IndexSet<PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.8:9000"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    config.update_peer_cache(cached.clone()).await.unwrap();
+
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    let expected: Vec<_> = cached.iter().copied().take(2).collect();
+    assert_eq!(selected.into_iter().collect::<Vec<_>>(), expected);
+    let mut discovered = Vec::new();
+    while let Some(change) = book_rx.recv().await {
+        discovered.push(change.addr());
+    }
+    assert_eq!(
+        discovered.len(),
+        4,
+        "unselected peers remain available to discovery"
+    );
+    assert_eq!(&discovered[..3], cached.iter().copied().collect::<Vec<_>>());
+
+    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connector = service_fn(move |request: OutboundConnectorRequest| {
+        attempt_tx
+            .send((request.addr, tokio::time::Instant::now()))
+            .unwrap();
+        async { Err::<(PeerSocketAddr, peer::Client), BoxError>("peer unavailable".into()) }
+    });
+    let (peerset_tx, _peerset_rx) = mpsc::channel(10);
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    tokio::time::pause();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        add_initial_peers(config, connector, peerset_tx, book_tx),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let first = attempt_rx.recv().await.unwrap();
+    let second = attempt_rx.recv().await.unwrap();
+    assert_eq!([first.0, second.0], [expected[0], expected[1]]);
+    assert_eq!(
+        second.1 - first.1,
+        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+    );
+    assert!(attempt_rx.recv().await.is_none());
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

@@ -57,7 +57,7 @@ pub async fn update_peer_cache_once(
     config: &Config,
     address_book: &Arc<Mutex<AddressBook>>,
 ) -> io::Result<bool> {
-    let mut peer_list: std::collections::HashSet<_> = cacheable_peers(address_book)
+    let mut peer_list: indexmap::IndexSet<_> = cacheable_peers(address_book)
         .iter()
         .map(|meta_addr| meta_addr.addr)
         .collect();
@@ -115,8 +115,10 @@ mod tests {
             let banned: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
             let other_port: PeerSocketAddr = "127.0.0.1:8234".parse().unwrap();
             let safe: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
-            let mut cached = std::collections::HashSet::from([banned, other_port]);
+            let another_safe: PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+            let mut cached = indexmap::IndexSet::from([banned, other_port]);
             if retain_safe_peer {
+                cached.insert(another_safe);
                 cached.insert(safe);
             }
             config.update_peer_cache(cached).await.unwrap();
@@ -153,11 +155,19 @@ mod tests {
             let book = Arc::new(Mutex::new(book));
             update_peer_cache_once(&config, &book).await.unwrap();
             let expected = if retain_safe_peer {
-                std::collections::HashSet::from([safe])
+                indexmap::IndexSet::from([another_safe, safe])
             } else {
-                std::collections::HashSet::new()
+                indexmap::IndexSet::new()
             };
-            assert_eq!(config.load_peer_cache().await.unwrap(), expected);
+            assert_eq!(
+                config
+                    .load_peer_cache()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+            );
         }
     }
 }

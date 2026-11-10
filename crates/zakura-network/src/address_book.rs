@@ -599,7 +599,7 @@ impl AddressBook {
         let peers = self.peers.clone();
 
         // Get peers in preferred order, then keep the recently active ones
-        peers
+        let mut eligible: Vec<_> = peers
             .ordered_values()
             // # Security
             //
@@ -613,7 +613,11 @@ impl AddressBook {
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
             .cloned()
-            .collect()
+            .collect();
+
+        // Stable sorting keeps the address-book preference for equal or unknown RTTs.
+        eligible.sort_by_key(|peer| (peer.rtt().is_none(), peer.rtt()));
+        eligible
     }
 
     /// Look up `addr` in the address book, and return its [`MetaAddr`].

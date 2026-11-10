@@ -27,6 +27,61 @@ use super::{super::MetaAddr, check};
 /// [`DateTime32`]s.
 const TEST_TIME_ERROR_MARGIN: Duration32 = Duration32::from_seconds(1);
 
+/// RTT survives same-connection updates but never carries into another connection.
+#[test]
+fn peer_cache_rtt_survives_only_same_connection_updates() {
+    let addr = "127.0.0.1:8233".parse().unwrap();
+    let now = Instant::now();
+    let wall_now = Utc::now();
+    let original = MetaAddr::new_responded(addr, Some(Duration::from_millis(20)))
+        .apply_to_meta_addr(None, now, wall_now)
+        .unwrap();
+    let later = CONCURRENT_ADDRESS_CHANGE_PERIOD + Duration::from_secs(1);
+    for (change, expected) in [
+        (
+            MetaAddrChange::UpdatePingSent {
+                addr,
+                ping_sent_at: now + later,
+            },
+            Some(20),
+        ),
+        (MetaAddr::new_responded(addr, None), Some(20)),
+        (
+            MetaAddr::new_responded(addr, Some(Duration::from_millis(10))),
+            Some(10),
+        ),
+        (
+            MetaAddrChange::UpdateMisbehavior {
+                addr,
+                score_increment: 1,
+            },
+            Some(20),
+        ),
+        (MetaAddr::new_reconnect(addr), None),
+        (
+            MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false),
+            None,
+        ),
+        (
+            MetaAddr::new_errored(addr, PeerServices::NODE_NETWORK),
+            None,
+        ),
+    ] {
+        let updated = change
+            .apply_to_meta_addr(
+                Some(original.clone()),
+                now + later,
+                wall_now + chrono::Duration::from_std(later).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            updated.rtt(),
+            expected.map(Duration::from_millis),
+            "{change:?}"
+        );
+    }
+}
+
 #[test]
 fn peer_addr_labels_require_explicit_opt_in() {
     let ipv4 = PeerSocketAddr::from(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 8233));

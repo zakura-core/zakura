@@ -18,6 +18,59 @@ use crate::{
     AddressBook,
 };
 
+/// Cache ranking uses measured RTT, retaining book order for ties and unknowns.
+#[test]
+fn peer_cache_ranks_by_rtt_with_stable_ties() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for (ip, millis) in [
+        (1, None),
+        (2, Some(50)),
+        (3, Some(10)),
+        (4, Some(10)),
+        (5, None),
+    ] {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        book.update(MetaAddr::new_connected(
+            addr,
+            &PeerServices::NODE_NETWORK,
+            false,
+        ));
+        book.update(MetaAddr::new_responded(
+            addr,
+            millis.map(std::time::Duration::from_millis),
+        ));
+    }
+    let before: Vec<_> = book.peers.ordered_values().cloned().collect();
+    let ranked = book.cacheable(Utc::now());
+    assert_eq!(
+        ranked
+            .iter()
+            .map(|peer| peer.rtt().map(|rtt| rtt.as_millis()))
+            .collect::<Vec<_>>(),
+        vec![Some(10), Some(10), Some(50), None, None]
+    );
+    for rtt in [None, Some(std::time::Duration::from_millis(10))] {
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|peer| peer.rtt() == rtt)
+                .map(|peer| peer.addr)
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .filter(|peer| peer.rtt() == rtt)
+                .map(|peer| peer.addr)
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
 /// Make sure an empty address book is actually empty.
 #[test]
 fn address_book_empty() {

@@ -5,7 +5,7 @@
 //! [tower-balance]: https://github.com/tower-rs/tower/tree/master/tower/src/balance
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -22,7 +22,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use rand_10::seq::SliceRandom;
+use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
@@ -734,65 +734,26 @@ where
 async fn limit_initial_peers(
     config: &Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> HashSet<PeerSocketAddr> {
-    let all_peers: HashSet<PeerSocketAddr> = config.initial_peers().await;
-    let mut preferred_peers: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
+) -> IndexSet<PeerSocketAddr> {
+    let all_peers = config.initial_peers().await;
+    let mut initial_peers = IndexSet::new();
 
-    let all_peers_count = all_peers.len();
-    if all_peers_count > config.peerset_initial_target_size {
-        info!(
-            "limiting the initial peers list from {} to {}",
-            all_peers_count, config.peerset_initial_target_size,
-        );
-    }
-
-    // Filter out invalid initial peers, and prioritise valid peers for initial connections.
-    // (This treats initial peers the same way we treat gossiped peers.)
-    for peer_addr in all_peers {
-        let preference = PeerPreference::new(peer_addr, config.network.clone());
-
-        match preference {
-            Ok(preference) => preferred_peers
-                .entry(preference)
-                .or_default()
-                .push(peer_addr),
-            Err(error) => info!(
-                peer = %peer_addr.addr_label(config.expose_peer_addresses),
+    // Validate all addresses, retaining cached RTT order before fallback peers.
+    // Feed every valid candidate to discovery, even beyond the startup dial limit.
+    for peer in all_peers {
+        if let Err(error) = PeerPreference::new(peer, config.network.clone()) {
+            info!(
+                peer = %peer.addr_label(config.expose_peer_addresses),
                 ?error,
                 "invalid initial peer from DNS seeder, configured IP address, or disk cache",
-            ),
+            );
+            continue;
         }
-    }
-
-    // Send every initial peer to the address book, in preferred order.
-    // (This treats initial peers the same way we treat gossiped peers.)
-    //
-    // # Security
-    //
-    // Initial peers are limited because:
-    // - the number of initial peers is limited
-    // - this code only runs once at startup
-    for peer in preferred_peers.values().flatten() {
-        let peer_addr = MetaAddr::new_initial_peer(*peer);
-        // `send` only waits when the channel is full.
-        // The address book updater runs in its own thread, so we will only wait for a short time.
-        let _ = address_book_updater.send(peer_addr).await;
-    }
-
-    // Split out the `initial_peers` that will be shuffled and returned,
-    // choosing preferred peers first.
-    let mut initial_peers: HashSet<PeerSocketAddr> = HashSet::new();
-    for better_peers in preferred_peers.values() {
-        let mut better_peers = better_peers.clone();
-        let (chosen_peers, _unused_peers) = better_peers.partial_shuffle(
-            &mut rand_10::rng(),
-            config.peerset_initial_target_size - initial_peers.len(),
-        );
-
-        initial_peers.extend(chosen_peers.iter());
-
-        if initial_peers.len() >= config.peerset_initial_target_size {
-            break;
+        let _ = address_book_updater
+            .send(MetaAddr::new_initial_peer(peer))
+            .await;
+        if initial_peers.len() < config.peerset_initial_target_size {
+            initial_peers.insert(peer);
         }
     }
 

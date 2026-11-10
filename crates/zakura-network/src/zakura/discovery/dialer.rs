@@ -76,11 +76,21 @@ pub(crate) fn check_bootstrap_dials_fit(
     for node_addr in grouped_remote_bootstrap_peers(bootstrap_peers.to_vec(), local_node_id) {
         let attempts = attempts(&node_addr);
         if attempts > dial_reserve {
+            // The reserve never exceeds one record's addresses, so raising the
+            // limits helps only below that cap.
+            let remedy = if dial_reserve < super::MAX_DIRECT_ADDRS_PER_RECORD {
+                format!(
+                    "list at most {dial_reserve} for it, or raise max_connections or \
+                     max_pending_handshakes to reserve up to {}",
+                    super::MAX_DIRECT_ADDRS_PER_RECORD,
+                )
+            } else {
+                format!("list at most {dial_reserve} for it, the most one identity can use")
+            };
             return Err(format!(
                 "zakura.bootstrap_peers gives node {} {attempts} addresses this node can dial, \
                  but its connection limits reserve {dial_reserve} dial slots, so its \
-                 maintained dial could fail whenever inbound peers fill the table; list at \
-                 most {dial_reserve} for it or raise max_pending_handshakes",
+                 maintained dial could fail whenever inbound peers fill the table; {remedy}",
                 node_addr.id,
             ));
         }
@@ -224,8 +234,12 @@ mod tests {
         }
         check_bootstrap_dials_fit(&peers(remote, 8), local, defaults, every)
             .expect("a full record fits the default reserve");
-        check_bootstrap_dials_fit(&peers(remote, 9), local, defaults, every)
+        let error = check_bootstrap_dials_fit(&peers(remote, 9), local, defaults, every)
             .expect_err("a ninth address can't fit the default reserve");
+        assert!(
+            !error.contains("max_pending_handshakes"),
+            "raising limits can't grow a reserve already at its cap: {error}"
+        );
 
         let small = reserve(16, 4);
         assert_eq!(small, 5);
@@ -234,6 +248,7 @@ mod tests {
         let error = check_bootstrap_dials_fit(&peers(remote, 8), local, small, every)
             .expect_err("a full record can't fit a five-slot reserve");
         assert!(error.contains("zakura.bootstrap_peers"), "{error}");
+        assert!(error.contains("max_pending_handshakes"), "{error}");
 
         check_bootstrap_dials_fit(&peers(local, 9), local, small, every)
             .expect("the local identity is never dialed");

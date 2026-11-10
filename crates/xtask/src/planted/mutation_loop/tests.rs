@@ -1,15 +1,21 @@
 //! The loop runner's classes on synthetic runs, its run failures, and its
 //! report's schema. No test builds the simulator.
 
-use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
+
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+use super::{run_measured, Built, Runnable};
 
 use serde_json::json;
 
 use super::{
     build_failure,
     classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
-    parse_flags, run_measured, selects, summarize, test_executables, BaselineReport, BuildIdentity,
-    Built, CaseReport, LoopCase, Mutant, Report, Runnable, Runner, Slot, WitnessSpec,
+    parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
+    LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
 
 const NAMED: &str = "block-sync/retained-byte-bound";

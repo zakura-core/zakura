@@ -4,7 +4,7 @@
 # leaves the generation where it was. The queue, the reactor and the
 # planner decide how the witness's rounds apply, so a change there can
 # move the witness off it.
-checks = ["crates/zakura-header-chain/src/transition"]
+checks = ["crates/zakura-header-chain/src/transition", "crates/zakura-network/src/zakura/header_sync"]
 
 [typed]
 harness = "header-sync/storage"

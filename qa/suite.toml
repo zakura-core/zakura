@@ -154,6 +154,8 @@ file = "crates/zakura-sim/tests/header_stale_chain.rs"
 test = "regenerate_chain_witnesses"
 run = false
 reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false

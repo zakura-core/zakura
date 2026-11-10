@@ -223,7 +223,7 @@ fn disabled_trace_logging_does_no_payload_work() {
         let call = request('x', PAYLOAD_CHARS);
         let (call_response, stats) = measure(|| block_on(logger.call(call)));
         assert_no_payload_copy("a call", stats);
-        assert_eq!(call_response.as_json().get(), expected.get());
+        assert_eq!(call_response.as_json(), expected);
 
         let notification = notification('x', PAYLOAD_CHARS);
         let (notification_response, stats) =

@@ -178,7 +178,7 @@ pub(super) async fn answer_body<S: RpcServiceT>(
 
     response_with_body(
         StatusCode::OK,
-        response_from_json_rpc_2(version, response.into_json()),
+        response_from_json_rpc_2(version, response),
         JSON,
     )
 }
@@ -284,11 +284,7 @@ fn strip_leading_whitespace(body: &[u8]) -> Option<(&[u8], bool)> {
 
 /// Returns a response with `status` and a JSON-RPC `response` body.
 fn json_response(status: StatusCode, response: MethodResponse) -> HttpResponse {
-    response_with_body(
-        status,
-        String::from(Box::<str>::from(response.into_json())),
-        JSON,
-    )
+    response_with_body(status, response.into_json(), JSON)
 }
 
 /// Returns a response with `status` and a plain text `body`.

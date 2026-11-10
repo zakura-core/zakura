@@ -15,10 +15,11 @@ use tower::{BoxError, Layer, Service};
 use crate::server::{
     http::{HttpBody, HttpRequest, HttpResponse},
     http_request_compatibility::{
-        convert_to_json_rpc_2, request_to_json_rpc_2, response_from_json_rpc_2,
-        HttpRequestMiddleware, HttpRequestMiddlewareLayer, JsonRpc2Request, JsonRpcVersion,
+        convert_to_json_rpc_2, json_from_json_rpc_2, request_to_json_rpc_2,
+        response_from_json_rpc_2, HttpRequestMiddleware, HttpRequestMiddlewareLayer,
+        JsonRpc2Request, JsonRpcVersion,
     },
-    jsonrpc::Body,
+    jsonrpc::{Body, Id, MethodResponse},
 };
 
 /// A body that always returns an error, simulating a TCP RST during body collection.
@@ -339,7 +340,7 @@ fn legacy_overflow_ids_keep_parse_errors() {
                     panic!("{request} must return an error, not become a notification");
                 };
                 assert_eq!(
-                    response_from_json_rpc_2(version, response.into_json()),
+                    response_from_json_rpc_2(version, response),
                     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#,
                     "{request}",
                 );
@@ -387,10 +388,8 @@ fn submitblock_hex_is_parsed_in_place() {
 #[test]
 fn json_rpc_2_responses_are_unchanged() {
     let response = r#"{"jsonrpc":"2.0","id":3,"result":null}"#;
-    let json = serde_json::value::RawValue::from_string(response.to_string())
-        .expect("the response is JSON");
     assert_eq!(
-        response_from_json_rpc_2(JsonRpcVersion::TwoPointZero, json),
+        json_from_json_rpc_2(JsonRpcVersion::TwoPointZero, response.to_string(), None),
         response
     );
 }
@@ -480,9 +479,7 @@ fn unknown_bodies_are_unchanged() {
 
 /// Maps `response` to `version`, and parses it.
 fn response_in_version(version: JsonRpcVersion, response: &str) -> serde_json::Value {
-    let json = serde_json::value::RawValue::from_string(response.to_string())
-        .expect("the response is JSON");
-    serde_json::from_str(&response_from_json_rpc_2(version, json))
+    serde_json::from_str(&json_from_json_rpc_2(version, response.to_string(), None))
         .expect("the mapped response is JSON")
 }
 
@@ -541,4 +538,56 @@ fn lightwalletd_request_is_rewritten_to_json_rpc_2() {
         ),
         serde_json::json!({"jsonrpc": "1.0", "id": 7, "result": {"version": 1}, "error": null})
     );
+}
+
+/// Successful responses are mapped to JSON-RPC 1.0 and bitcoind clients without parsing their
+/// result, and the bytes are the same as parsing and re-encoding the whole response.
+#[test]
+fn success_responses_map_without_parsing_like_re_encoding() {
+    let ids = [
+        Id::Null,
+        Id::Number(0),
+        Id::Number(u64::MAX),
+        Id::Str("miner".into()),
+        Id::Str("quote \" backslash \\ newline \n tab \t nul \u{0} é 😀".into()),
+    ];
+    let results = [
+        serde_json::json!(null),
+        serde_json::json!("00ff".repeat(1000)),
+        serde_json::json!({"hash": "ab", "tx": ["01", "02"], "size": 7, "nested": {"x": [1.5, -2]}}),
+        serde_json::json!([true, false, "a\"b"]),
+    ];
+
+    for id in &ids {
+        for result in &results {
+            for version in [
+                JsonRpcVersion::Lightwalletd,
+                JsonRpcVersion::Bitcoind,
+                JsonRpcVersion::TwoPointZero,
+                JsonRpcVersion::Unknown,
+            ] {
+                let response = MethodResponse::response(id.clone(), &Ok(result), usize::MAX);
+                let re_encoded =
+                    json_from_json_rpc_2(version, response.as_json().to_string(), None);
+                assert_eq!(
+                    response_from_json_rpc_2(version, response),
+                    re_encoded,
+                    "{version:?} response with id {id:?} and result {result}",
+                );
+            }
+        }
+    }
+}
+
+/// Error responses keep being mapped by parsing and re-encoding them.
+#[test]
+fn error_responses_map_like_re_encoding() {
+    for version in [JsonRpcVersion::Lightwalletd, JsonRpcVersion::Bitcoind] {
+        let response = MethodResponse::error(
+            Id::Number(4),
+            crate::server::jsonrpc::ErrorObject::new(-8, "Block not found"),
+        );
+        let re_encoded = json_from_json_rpc_2(version, response.as_json().to_string(), None);
+        assert_eq!(response_from_json_rpc_2(version, response), re_encoded);
+    }
 }

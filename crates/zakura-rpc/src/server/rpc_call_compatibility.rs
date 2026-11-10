@@ -60,11 +60,10 @@ impl<S: RpcServiceT> RpcServiceT for FixRpcResponseMiddleware<S> {
                 message: String,
             }
 
-            let message = serde_json::from_str::<ErrorResponse>(response.as_json().get())
-                .map_or_else(
-                    |_| ErrorCode::InvalidParams.message().to_string(),
-                    |response| response.error.message,
-                );
+            let message = serde_json::from_str::<ErrorResponse>(response.as_json()).map_or_else(
+                |_| ErrorCode::InvalidParams.message().to_string(),
+                |response| response.error.message,
+            );
 
             MethodResponse::error(id, ErrorObject::new(new_error_code, message))
         }

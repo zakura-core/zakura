@@ -19,7 +19,9 @@ use tower::Service;
 use super::{
     cookie::Cookie,
     http::{HttpBody, HttpRequest, HttpResponse},
-    jsonrpc::{Body, ErrorObject, Id, Notification, Request, TwoPointZero},
+    jsonrpc::{
+        Body, ErrorObject, Id, MethodResponse, Notification, Request, ResultMembers, TwoPointZero,
+    },
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -307,18 +309,78 @@ pub(super) fn convert_to_json_rpc_2(body: &[u8]) -> (JsonRpcVersion, Cow<'_, [u8
 }
 
 /// Maps a JSON-RPC 2.0 response to the client's JSON-RPC `version`.
-pub(super) fn response_from_json_rpc_2(version: JsonRpcVersion, json: Box<RawValue>) -> String {
-    let json = String::from(Box::<str>::from(json));
+pub(super) fn response_from_json_rpc_2(
+    version: JsonRpcVersion,
+    response: MethodResponse,
+) -> String {
+    let (json, members) = response.into_json_and_members();
+    json_from_json_rpc_2(version, json, members.as_ref())
+}
+
+/// Maps the JSON-RPC 2.0 response `json` to the client's JSON-RPC `version`.
+///
+/// `members` locates the `id` and `result` values if `json` is a successful response to a
+/// single call.
+pub(super) fn json_from_json_rpc_2(
+    version: JsonRpcVersion,
+    json: String,
+    members: Option<&ResultMembers>,
+) -> String {
     if version == JsonRpcVersion::TwoPointZero {
         // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
         return json;
     }
+
+    // A successful response has a known layout, so its envelope can be rewritten without
+    // parsing the result, which can be megabytes of block hex.
+    let json = match members {
+        Some(members) => match success_response_in_version(version, json, members) {
+            Ok(json) => return json,
+            Err(json) => json,
+        },
+        None => json,
+    };
 
     match serde_json::from_str::<'_, JsonRpcResponse>(&json) {
         Ok(response) => serde_json::to_string(&response.into_version(version))
             .expect("values parsed from JSON serialize back to JSON"),
         Err(_) => json,
     }
+}
+
+/// Rewrites the successful JSON-RPC 2.0 response `json`, whose `id` and `result` member values
+/// are at `members`, for the client's `version`, without parsing the result.
+///
+/// Writes the same bytes as re-encoding the parsed response with [`JsonRpcResponse::into_version`],
+/// because `serde_json` wrote both members and re-encodes them unchanged. Returns `json`
+/// unchanged as an error for versions that keep the JSON-RPC 2.0 response, or if it does not
+/// have the layout `MethodResponse` writes.
+fn success_response_in_version(
+    version: JsonRpcVersion,
+    mut json: String,
+    members: &ResultMembers,
+) -> Result<String, String> {
+    const PREFIX: &str = r#"{"jsonrpc":"2.0","id":"#;
+    // Where `2.0` is in `PREFIX`.
+    const VERSION_START: usize = r#"{"jsonrpc":""#.len();
+    const RESULT: &str = r#","result":"#;
+
+    let has_expected_layout = json.get(..members.id.start) == Some(PREFIX)
+        && json.get(members.id.end..members.result.start) == Some(RESULT)
+        && json.get(members.result.end..) == Some("}");
+    if !has_expected_layout {
+        return Err(json);
+    }
+
+    match version {
+        // Same-length replacement, so the result is not moved.
+        JsonRpcVersion::Lightwalletd => json.replace_range(VERSION_START..VERSION_START + 3, "1.0"),
+        JsonRpcVersion::Bitcoind => json.replace_range(..members.id.start, r#"{"id":"#),
+        JsonRpcVersion::TwoPointZero | JsonRpcVersion::Unknown => return Err(json),
+    }
+    json.pop();
+    json.push_str(r#","error":null}"#);
+    Ok(json)
 }
 
 /// Parses `body` if [`convert_to_json_rpc_2`] would only re-encode it without changing what

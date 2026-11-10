@@ -199,7 +199,7 @@ where
         .unwrap_or_else(|| panic!("{method} is a method"))
         .await;
     let response: Response =
-        serde_json::from_str(response.as_json().get()).expect("responses are JSON-RPC responses");
+        serde_json::from_str(response.as_json()).expect("responses are JSON-RPC responses");
 
     match (response.result, response.error) {
         (_, Some(error)) => Err(super::jsonrpc::ErrorObject::new(error.code, error.message)),

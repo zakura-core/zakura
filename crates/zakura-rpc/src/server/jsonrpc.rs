@@ -3,7 +3,7 @@
 //! Requests are parsed and responses are encoded exactly like `jsonrpsee` 0.26, which Zakura used
 //! before, so clients see the same bytes. `server/tests/wire.rs` checks this.
 
-use std::{borrow::Cow, fmt, io, marker::PhantomData};
+use std::{borrow::Cow, fmt, io, marker::PhantomData, ops::Range};
 
 use serde::{
     de::{self, DeserializeOwned, Deserializer, Unexpected, Visitor},
@@ -573,11 +573,23 @@ pub fn log_invalid_params_object() {
 }
 
 /// A response to a method call, notification, or batch, encoded as JSON.
+///
+/// The JSON is written by `serde_json`, so it is valid without parsing it again.
 #[derive(Debug)]
 pub struct MethodResponse {
-    json: Box<RawValue>,
+    json: String,
+    /// Where the `id` and `result` members are in `json`, for a successful response to a
+    /// single call.
+    members: Option<ResultMembers>,
     error_code: Option<i32>,
     is_notification: bool,
+}
+
+/// The byte ranges of the `id` and `result` member values in a successful response.
+#[derive(Clone, Debug)]
+pub(crate) struct ResultMembers {
+    pub(crate) id: Range<usize>,
+    pub(crate) result: Range<usize>,
 }
 
 /// An error response, which is serialized with its members in `jsonrpsee`'s order.
@@ -639,17 +651,26 @@ impl MethodResponse {
             br#","result":"#
         };
         // The same bytes `serde_json` writes for a `Response` struct with these fields.
-        let written = (|| {
+        let written = (|| -> serde_json::Result<ResultMembers> {
             write_bytes(&mut writer, br#"{"jsonrpc":"2.0","id":"#)?;
+            let id_start = writer.buf.len();
             serde_json::to_writer(&mut writer, &id)?;
+            let id_end = writer.buf.len();
             write_bytes(&mut writer, member)?;
+            let member_start = writer.buf.len();
             write_member(&mut writer)?;
-            write_bytes(&mut writer, b"}")
+            let member_end = writer.buf.len();
+            write_bytes(&mut writer, b"}")?;
+            Ok(ResultMembers {
+                id: id_start..id_end,
+                result: member_start..member_end,
+            })
         })();
 
         match written {
-            Ok(()) => Self {
+            Ok(members) => Self {
                 json: writer.into_json(),
+                members: error_code.is_none().then_some(members),
                 error_code,
                 is_notification: false,
             },
@@ -707,11 +728,12 @@ impl MethodResponse {
 
     fn encode_error(id: &Id, error: WireError) -> Self {
         let code = error.code;
-        let json = serde_json::value::to_raw_value(&ErrorResponse { id, error })
+        let json = serde_json::to_string(&ErrorResponse { id, error })
             .expect("error responses only contain strings and integers");
 
         Self {
             json,
+            members: None,
             error_code: Some(code),
             is_notification: false,
         }
@@ -720,7 +742,8 @@ impl MethodResponse {
     /// Returns the response to a notification, which is `null`.
     pub fn notification() -> Self {
         Self {
-            json: RawValue::NULL.to_owned(),
+            json: "null".to_owned(),
+            members: None,
             error_code: None,
             is_notification: true,
         }
@@ -742,13 +765,19 @@ impl MethodResponse {
     }
 
     /// The response JSON.
-    pub fn as_json(&self) -> &RawValue {
+    pub fn as_json(&self) -> &str {
         &self.json
     }
 
     /// Returns the response JSON.
-    pub fn into_json(self) -> Box<RawValue> {
+    pub fn into_json(self) -> String {
         self.json
+    }
+
+    /// Returns the response JSON, and where its `id` and `result` members are if it is a
+    /// successful response to a single call.
+    pub(crate) fn into_json_and_members(self) -> (String, Option<ResultMembers>) {
+        (self.json, self.members)
     }
 }
 
@@ -772,7 +801,7 @@ impl BatchResponseBuilder {
 
     /// Appends `response`, or returns an error response if the batch response gets too long.
     pub(crate) fn append(&mut self, response: MethodResponse) -> Result<(), MethodResponse> {
-        let json = response.json.get();
+        let json = response.json.as_str();
         if self.json.len() + json.len() + 1 > self.max_response_size {
             return Err(MethodResponse::server_error(
                 Id::Null,
@@ -802,7 +831,8 @@ impl BatchResponseBuilder {
         self.json.push(']');
 
         MethodResponse {
-            json: RawValue::from_string(self.json).expect("a list of JSON responses is valid JSON"),
+            json: self.json,
+            members: None,
             error_code: None,
             is_notification: false,
         }
@@ -823,9 +853,8 @@ impl BoundedWriter {
         }
     }
 
-    fn into_json(self) -> Box<RawValue> {
-        let json = String::from_utf8(self.buf).expect("serde_json writes UTF-8");
-        RawValue::from_string(json).expect("serde_json writes valid JSON")
+    fn into_json(self) -> String {
+        String::from_utf8(self.buf).expect("serde_json writes UTF-8")
     }
 }
 

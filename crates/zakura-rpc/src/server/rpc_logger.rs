@@ -49,7 +49,7 @@ impl<S: RpcServiceT> RpcServiceT for RpcLoggerMiddleware<S> {
             tracing::trace!(
                 target: "jsonrpsee",
                 "response = {}",
-                Truncated(response.as_json().get(), max_chars)
+                Truncated(response.as_json(), max_chars)
             );
             response
         }

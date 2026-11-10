@@ -135,8 +135,8 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
-    matrix.push((STORAGE, RECOVERY_ID, Status::Draft));
-    matrix.push((LIVENESS, RECOVERY_ID, Status::Draft));
+    matrix.push((STORAGE, RECOVERY_ID, Status::Active));
+    matrix.push((LIVENESS, RECOVERY_ID, Status::Active));
     matrix
 }
 
@@ -2362,20 +2362,10 @@ fn hand_written_rows() -> Vec<Row> {
             &[RECOVERY_ID],
             Found::AtStep,
             NONE,
-            false,
+            name == "stalled-successor",
         ));
     }
-    rows.push(Row {
-        property: recovery,
-        tier: Tier::Sim,
-        harnesses: &[STORAGE, LIVENESS],
-        status: Status::Draft,
-        promotion: Some(Promotion {
-            condition: "hdr-13 adds the hostile prefixes and Evan agrees to promote it",
-            owner: "Evan",
-        }),
-        expected: recovering,
-    });
+    rows.push(sim_row(recovery, &[STORAGE, LIVENESS], recovering));
 
     let mut reactor = vec![result(
         vec![Key::passing(REACTOR)],

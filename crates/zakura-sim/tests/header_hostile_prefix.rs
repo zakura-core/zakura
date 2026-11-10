@@ -766,6 +766,63 @@ fn the_departure_recovery_hands_the_target_to_the_survivor() {
     }
 }
 
+/// Honest generated recoveries never violate the property, now that it's
+/// `Active`: 64 generator-3 scenarios drawn from fixed bytes, each given a
+/// `Recover` of `mirror-0` as its last step where the grammar allows one,
+/// run under the bytes after their prefix. No property is violated and no
+/// run fails, and the property holds on some and applies to more than one.
+#[test]
+fn generated_honest_recoveries_never_violate() {
+    let mut held = 0;
+    for mut bytes in support::byte_inputs(64, 2_048) {
+        bytes.resize(Storage::SCENARIO_BYTES + 512, 0);
+        bytes[0] = u8::try_from(grammar::GENERATOR).expect("the generator fits a byte");
+        let mut scenario = Storage::draw(&bytes[..Storage::SCENARIO_BYTES]);
+        if scenario.controls.iter().any(|step| {
+            matches!(
+                step.action,
+                ControlAction::Shutdown
+                    | ControlAction::Churn
+                    | ControlAction::Flood
+                    | ControlAction::StopStorage
+                    | ControlAction::Recover
+            )
+        }) {
+            continue;
+        }
+        scenario.controls.push(storage_witnesses::step(
+            storage_witnesses::SOURCE,
+            ControlAction::Recover,
+            None,
+        ));
+        if grammar::encode(&scenario).is_err() {
+            continue;
+        }
+        let plan = Plan::from_fuzz(&bytes[Storage::SCENARIO_BYTES..]);
+        let report = run_prepared::<Storage>(
+            &scenario,
+            Storage::prepare(&scenario),
+            plan,
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{scenario:?}: {error}"));
+        let end = &report.end;
+        assert_eq!(
+            (&end.violation, &end.harness),
+            (&None, &None),
+            "{scenario:?}: {end:?}"
+        );
+        if matches!(
+            outcome(&report, BOUNDED_ADVERSARY_PROGRESS),
+            PropertyOutcome::Held { .. }
+        ) {
+            held += 1;
+        }
+    }
+    assert!(held > 1, "only {held} generated recoveries applied");
+}
+
 /// Recovery ends within its stated window. Every class witness reaches its
 /// `recovered` pick within `recovery_window` of its `Recover` pick, at the
 /// node's default readmission cooldown, under 8 plans. (A node that never

@@ -217,10 +217,10 @@ pub fn recovery_deadline(recovered: SimInstant) -> SimInstant {
 /// [`BOUNDED_ADVERSARY_PROGRESS`]'s one obligation's subject.
 const RECOVERY_SUBJECT: &str = "recovery";
 
-/// [`BOUNDED_ADVERSARY_PROGRESS`], as `Draft` until Evan's agreement
-/// promotes it (ask 7). `header-sync/storage` registers it, so it applies to
-/// every scenario with a `Recover`, hostile prefix and all, and
-/// `header-sync/liveness` to its recovery fixtures.
+/// [`BOUNDED_ADVERSARY_PROGRESS`], `Active`, so a violation fails the run.
+/// `header-sync/storage` registers it, so it applies to every scenario with
+/// a `Recover`, hostile prefix and all, and `header-sync/liveness` to its
+/// recovery fixtures.
 ///
 /// A scenario without a `Recover` doesn't declare its assumptions, so it's
 /// `NotApplicable` there. Its assumptions hold from the `recovered` pick
@@ -249,7 +249,7 @@ pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<
             Assume::FairScheduling,
         ],
         needs: &[Source::View],
-        status: Status::Draft,
+        status: Status::Active,
         check: check_bounded_adversary_progress::<S>,
         witness: Some(TriggerHistory::View(recovered_owing)),
     }

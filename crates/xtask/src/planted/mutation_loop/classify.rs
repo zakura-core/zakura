@@ -243,6 +243,7 @@ pub(in crate::planted) enum Ended {
     /// This signal killed it.
     Signaled(i32),
     /// It passed its deadline, and the runner killed it.
+    #[cfg(any(unix, test))]
     TimedOut,
 }
 
@@ -274,6 +275,7 @@ fn run_failure(observed: &Observed) -> Option<Classified> {
         return harness(Reason::Oom, "the memory cap killed the run".to_owned());
     }
     match observed.ended {
+        #[cfg(any(unix, test))]
         Ended::TimedOut => {
             return harness(Reason::Timeout, "the run passed its deadline".to_owned())
         }

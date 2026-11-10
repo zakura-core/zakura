@@ -50,11 +50,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{atomic::Ordering, Mutex},
     thread,
     time::{Duration, Instant, SystemTime},
 };
+
+#[cfg(unix)]
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,6 +115,7 @@ const BASELINE_DEADLINE: Duration = Duration::from_secs(3600);
 const DEFAULT_JOBS: usize = 4;
 
 /// How often a running child is polled.
+#[cfg(unix)]
 const POLL: Duration = Duration::from_millis(50);
 
 /// A case's witness, as `cases.json` names it.
@@ -1338,6 +1342,7 @@ fn build_failure(end: Ended, log: &Path) -> BuildFailure {
     let end = match end {
         Ended::Exited(code) => ChildEnd::Exited(code),
         Ended::Signaled(signal) => ChildEnd::Signaled(signal),
+        #[cfg(any(unix, test))]
         Ended::TimedOut => ChildEnd::TimedOut,
     };
     let text = fs::read(log).unwrap_or_default();

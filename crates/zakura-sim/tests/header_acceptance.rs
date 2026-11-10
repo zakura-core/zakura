@@ -5188,6 +5188,22 @@ fn the_evaluator_refuses_each_single_defect() {
     refused(&catch, |r| {
         caught_runs(r, CASE).1.reports.insert("t/a".into(), held());
     });
+    // A Draft run with the right violated set, but another property
+    // Inconclusive or unexpectedly NotApplicable (rule 16).
+    refused(&catch, |r| {
+        caught_runs(r, CASE).2.reports.insert(
+            "t/b".into(),
+            Report::Inconclusive {
+                reason: "obligation-open".into(),
+            },
+        );
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE)
+            .2
+            .reports
+            .insert("t/b".into(), na("why"));
+    });
     // Stopped by a property outside its set, completed where its row says
     // a step, a harness failure, or a lost patched trigger.
     refused(&catch, |r| {

@@ -2284,3 +2284,49 @@ async fn adopted_state_and_its_publications_are_observed() {
         ]
     );
 }
+
+/// A session refused at the peer cap reports `SessionAtCapacity`, and its
+/// token is cancelled. With one inbound slot, peer 0x41's session holds it,
+/// so peer 0x42's is refused.
+#[test]
+fn a_session_refused_at_the_peer_cap_is_reported_and_cancelled() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    reactor.startup.config.peer_limits.max_inbound_peers = 1;
+    let (first, second) = (
+        ZakuraPeerId::new(vec![0x41; 32]).expect("the test peer ID has the required length"),
+        ZakuraPeerId::new(vec![0x42; 32]).expect("the test peer ID has the required length"),
+    );
+    let _first = connect(&mut reactor, &first, 1);
+    recorder.take_all();
+    let (send, _outbound) = framed_channel(8);
+    let cancel = CancellationToken::new();
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        second.clone(),
+        2,
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        CloseCause::new(),
+    ));
+    let refused: Vec<ReactorEvent> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| matches!(event, ReactorEvent::SessionAtCapacity { .. }))
+        .collect();
+    assert_eq!(
+        refused,
+        [ReactorEvent::SessionAtCapacity {
+            peer: second,
+            session_id: 2,
+        }]
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "the refused session's token is cancelled"
+    );
+}

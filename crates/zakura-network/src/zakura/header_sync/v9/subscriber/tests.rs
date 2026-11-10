@@ -1136,7 +1136,13 @@ fn grants_refill_half_window_prefixes() {
 struct Recorded(std::sync::Mutex<Vec<ReactorEvent>>);
 
 impl HeaderSyncObserver for Recorded {
+    /// Keeps every credit fact. The subscriber's container reports
+    /// (`SubscriberServing`) are the simulator's outstanding-work rule's to
+    /// judge, so the credit tests leave them out.
     fn observe(&self, event: ReactorEvent) {
+        if matches!(event, ReactorEvent::SubscriberServing { .. }) {
+            return;
+        }
         self.0
             .lock()
             .expect("no test panics holding it")

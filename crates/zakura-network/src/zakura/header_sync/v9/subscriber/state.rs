@@ -19,7 +19,7 @@ use super::{
     Admitted, Ended, Seal, SubscribeError, SubscriberFault,
 };
 #[cfg(any(test, zakura_sim))]
-use crate::zakura::header_sync::observe::{CreditKind, ReactorEvent};
+use crate::zakura::header_sync::observe::{CreditKind, ReactorEvent, SubscriberChange};
 use crate::zakura::transport::sim_chain;
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
@@ -290,7 +290,12 @@ impl SubscriberState {
             return false;
         }
         self.live = None;
-        tools.retract(&id)
+        let retracted = tools.retract(&id);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            serving(tap, tools, id, SubscriberChange::Retract);
+        }
+        retracted
     }
 
     /// Check a decoded page against its subscription, spend its exact credit
@@ -439,6 +444,7 @@ impl SubscriberState {
                 page_bytes: payload_len as u64,
                 totals: totals(tools, live.id),
             });
+            serving(tap, tools, live.id, SubscriberChange::Claim);
         }
         live.pages += 1;
         live.reached |= page.reaches_initial_target;
@@ -478,6 +484,10 @@ impl SubscriberState {
             return Err(SubscriberFault::OutcomeWindow(outcome.outcome));
         }
         tools.claim_end(&live.id)?;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            serving(tap, tools, live.id, SubscriberChange::Outcome);
+        }
         let live = self.live.take().expect("the live subscription matched");
         Ok(Ended {
             id: live.id,
@@ -527,6 +537,7 @@ impl SubscriberState {
                 ),
                 totals: totals(tools, id),
             });
+            serving(tap, tools, id, SubscriberChange::Accept);
         }
         Ok(self.grant_due(tools, staging))
     }
@@ -664,6 +675,33 @@ impl Live {
             tree_aux_schema: self.schema,
         }
     }
+}
+
+/// Reports `id`'s subscriber-side containers to `tap`
+/// ([`ReactorEvent::SubscriberServing`]), right after `change` changed
+/// them.
+#[cfg(any(test, zakura_sim))]
+pub(super) fn serving(
+    tap: &super::CreditTap,
+    tools: &Subscriptions<u64, Cursor>,
+    id: u64,
+    change: SubscriberChange,
+) {
+    let (unaccepted, ended) = tools.unaccepted(&id);
+    tap.observer.observe(ReactorEvent::SubscriberServing {
+        peer: tap.peer.clone(),
+        session_id: tap.session_id,
+        subscription: id,
+        change,
+        unaccepted: unaccepted.map(|unaccepted| {
+            unaccepted
+                .iter()
+                .map(|cursor| Frontier::new(cursor.height, cursor.hash))
+                .collect()
+        }),
+        live: tools.len(),
+        ended,
+    });
 }
 
 /// `tools`' credit totals for subscription `id`, or zeros if it holds none.

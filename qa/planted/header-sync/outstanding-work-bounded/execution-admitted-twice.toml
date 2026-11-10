@@ -1,0 +1,11 @@
+# Serving admits a ninth page job while eight hold the node's execution
+# slots. With 11 mirrors below the node and every serving read held until
+# 8 are submitted, a publisher pass finds 9 node execution slots in use.
+# The reactor, the service and the publishers decide when the witness's
+# reads start, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/serve"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-limit.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-limit.plan"

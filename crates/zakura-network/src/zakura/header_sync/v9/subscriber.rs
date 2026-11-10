@@ -261,7 +261,7 @@ pub(crate) struct Subscriber {
 
 /// Who a [`Subscriber`]'s credit reports to, and for which peer and session.
 #[cfg(any(test, zakura_sim))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CreditTap {
     pub(crate) observer: Arc<dyn HeaderSyncObserver>,
     pub(crate) peer: ZakuraPeerId,
@@ -372,6 +372,14 @@ impl Subscriber {
             let mut tools = self.tools.lock();
             let update = tools.open_fenced(plan.id, plan.window, plan.start, exchange)?;
             let totals = state::totals(&tools, plan.id);
+            if let Some(tap) = &self.state.credit {
+                state::serving(
+                    tap,
+                    &tools,
+                    plan.id,
+                    crate::zakura::header_sync::observe::SubscriberChange::Open,
+                );
+            }
             (update, totals)
         };
         Ok((sim_arg!(self.state.opened(plan, update); totals), writer))

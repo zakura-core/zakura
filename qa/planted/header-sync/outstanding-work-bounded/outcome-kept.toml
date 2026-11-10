@@ -1,0 +1,11 @@
+# A terminal outcome consumes its subscription but the subscriber's table
+# keeps the entry, so the next SubscriberServing for it still lists
+# cursors after its Outcome. The reactor and the subscriber decide when
+# the witness's subscriptions end, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

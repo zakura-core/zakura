@@ -31,6 +31,7 @@ use crate::zakura::{ServicePeerDirection, SessionOrigin, ZakuraPeerId};
 
 mod ledger;
 
+pub use crate::zakura::regulation::ServeInUse;
 pub use ledger::{ClaimBreak, ClaimRule, HeaderWorkLedger};
 
 /// The header chunk budget's capacity, so a model can pin its own constant
@@ -63,6 +64,22 @@ pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// names a handle, since the service keeps sessions past the reactor.
     fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
         None
+    }
+
+    /// Takes the token that cancels `peer`'s session `session_id`, which the
+    /// session's publisher waits on, as the publisher is spawned, before the
+    /// service queues the session's admission. An observer
+    /// that keeps it should keep a child token instead, so the session
+    /// token's pending hooks still drop with its last owner. The default
+    /// drops it.
+    #[cfg(any(test, zakura_sim))]
+    fn session_cancel(
+        &self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        cancel: zakura_rt::sync::CancellationToken,
+    ) {
+        let _ = (peer, session_id, cancel);
     }
 
     /// Takes the reactor's [`HeaderResourceProbe`], which the reactor hands
@@ -454,6 +471,130 @@ pub enum ReactorEvent {
         /// fetched.
         already_known: bool,
     },
+    /// A session's subscriber opened, claimed a page on, accepted cursors of,
+    /// took the terminal outcome of or retracted `subscription`, and these
+    /// are its subscription table's containers right after, read under the
+    /// table's lock. A claim's or an acceptance's report follows its
+    /// `CursorClaimed` or `CursorsAccepted`.
+    SubscriberServing {
+        /// The peer the subscription is with.
+        peer: ZakuraPeerId,
+        /// The session the subscription is on.
+        session_id: u64,
+        /// The subscription.
+        subscription: u64,
+        /// What changed the table.
+        change: SubscriberChange,
+        /// The header of each cursor the subscription received and hasn't
+        /// accepted, oldest first, or `None` once the subscription left the
+        /// table.
+        unaccepted: Option<Vec<Frontier>>,
+        /// The live subscriptions the session's table holds.
+        live: usize,
+        /// The ended keys the table remembers.
+        ended: usize,
+    },
+    /// A session's publication ledger opened or ended `subscription`, as
+    /// the ledger itself returned it. Reported by the publisher, under the
+    /// lock that orders the ledger, where its regulation reporter reports the
+    /// same transition.
+    PublicationChanged {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+        /// The subscription.
+        subscription: u64,
+        /// Whether it opened or ended.
+        change: PublicationChange,
+    },
+    /// A session's publisher changed its containers at `site`, and these
+    /// are its containers then. Reported by the publisher, under the lock
+    /// that orders them, right after each operation that can grow them.
+    PublisherServing {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+        /// Where the publisher reported.
+        site: PublisherSite,
+        /// The publication ledger's live and closing subscriptions, each
+        /// with how many sent pages its subscriber hasn't acknowledged.
+        live: Vec<(u64, usize)>,
+        /// The subscriptions the publisher's state tracks, which should be
+        /// the ledger's live and closing ones.
+        subscriptions: Vec<u64>,
+        /// The ledger's tombstones.
+        tombstones: usize,
+        /// The terminal outcomes queued and not yet taken to write.
+        terminals: usize,
+        /// Whether a page job is in progress.
+        job: bool,
+        /// The publication slots held.
+        slots: usize,
+        /// The capacity waits the publisher keeps signals for, after the
+        /// pruning at a pass, or before it elsewhere.
+        waits: Vec<u64>,
+        /// The capacity waits its subscriptions are stalled on.
+        stalls: Vec<u64>,
+        /// The serving budgets in use, the node's and this peer's, at a
+        /// pass.
+        in_use: Option<ServeInUse>,
+    },
+    /// A lookup pruned the serving capacity's peer-budget map, which drops
+    /// every peer no session or unfinished response holds, or replaced a
+    /// peer's budgets any of which was still alive, which it reports with no
+    /// expired peers and that peer removed and alive. Reported by the
+    /// capacity, through the reactor observer's capacity handle.
+    ServingPeers {
+        /// The peers whose budgets had expired just before the pruning.
+        expired: Vec<ZakuraPeerId>,
+        /// The peers the pruning removed, or the one whose budgets the
+        /// lookup replaced.
+        removed: Vec<ZakuraPeerId>,
+        /// The removed peers any of whose budgets is still alive, which a
+        /// session or unfinished response still holds, so a replacement
+        /// session would get budgets apart from theirs.
+        removed_live: Vec<ZakuraPeerId>,
+    },
+    /// A serving push took one of its budgets (a response slot, output
+    /// bytes or an execution slot, the peer's or the node's), and these are
+    /// the serving budgets in use then, the node's and `peer`'s, read with no
+    /// simulator preemption point. Reported by the capacity, through the
+    /// reactor observer's capacity handle, after each acquisition, so a
+    /// short-lived excess, or one a cancelled push leaves while waiting for
+    /// its next budget, can't pass between publisher passes.
+    ServingAcquired {
+        /// The pushing peer.
+        peer: ZakuraPeerId,
+        /// The serving budgets in use.
+        in_use: ServeInUse,
+    },
+    /// A session's publisher task started. Reported by the task itself, as
+    /// it begins, through the reactor observer's capacity handle.
+    PublisherStarted {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+    },
+    /// A session's publisher task ended, however it ended: it returned, was
+    /// dropped, or unwound. Reported as the task's future drops.
+    PublisherEnded {
+        /// The session's peer.
+        peer: ZakuraPeerId,
+        /// The session.
+        session_id: u64,
+    },
+    /// The service's `Status` cadence map changed: `add_peer` inserted a
+    /// connection's cadence, or `remove_peer` removed one. Reported by the
+    /// service, through the reactor observer's capacity handle, under the
+    /// map's lock.
+    ServiceSizes {
+        /// Every key the map holds after the change, by peer and connection,
+        /// sorted.
+        cadences: Vec<(ZakuraPeerId, u64)>,
+    },
     /// The reactor's growable containers as a unit of work ends, reported
     /// just before the `CauseSet` that ends it.
     Sizes {
@@ -513,6 +654,15 @@ pub enum ReactorEvent {
         point: TakePoint,
         /// The events left in the queue.
         queued: usize,
+    },
+    /// The reactor refused a session from `peer` because the admitted peers
+    /// of its direction are at their limit, and cancels it right after.
+    /// Nothing else about the reactor changes.
+    SessionAtCapacity {
+        /// The refused peer.
+        peer: ZakuraPeerId,
+        /// The refused session's ID, as its service handed it over.
+        session_id: u64,
     },
     /// The reactor refused a session from `peer` because `peer`'s readmission
     /// cooldown still holds. Nothing else about the reactor changes.
@@ -876,6 +1026,47 @@ pub enum ReservationEnd {
     Released,
     /// It dropped any other way, as the queue's own drop at teardown does.
     Dropped,
+}
+
+/// What a [`ReactorEvent::PublicationChanged`] reports.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PublicationChange {
+    /// The ledger applied the subscription's `Open`.
+    Opened,
+    /// The ledger ended the subscription, releasing its slot.
+    Ended,
+}
+
+/// Where a publisher reported its containers
+/// ([`ReactorEvent::PublisherServing`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PublisherSite {
+    /// Right after an `Open` the ledger applied.
+    Open,
+    /// Right after ending every subscription that was due, which grows the
+    /// terminal queue and the tombstones.
+    EndDue,
+    /// Right after a page job's page was committed, which grows its
+    /// subscription's sent-cursor ring.
+    Commit,
+    /// At the end of a loop pass, right after the capacity waits' pruning.
+    Pass,
+}
+
+/// What changed a subscriber's table, as a
+/// [`ReactorEvent::SubscriberServing`] reports it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SubscriberChange {
+    /// An `Open` recorded the subscription.
+    Open,
+    /// A page was claimed on it.
+    Claim,
+    /// Its cursors were accepted.
+    Accept,
+    /// Its terminal outcome ended it.
+    Outcome,
+    /// Its `Open` failed to send and was retracted.
+    Retract,
 }
 
 /// What a [`ReactorEvent::BudgetChanged`] was for.

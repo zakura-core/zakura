@@ -544,6 +544,21 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         })
     }
 
+    /// The cursors of `key`'s received pages the handler hasn't accepted,
+    /// oldest first, or `None` once `key` isn't live, and how many ended
+    /// keys the table remembers.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn unaccepted(&self, key: &K) -> (Option<Vec<C>>, usize) {
+        let unaccepted = self.live.get(key).map(|subscribed| {
+            subscribed
+                .unaccepted
+                .iter()
+                .map(|(cursor, _)| cursor.clone())
+                .collect()
+        });
+        (unaccepted, self.ended.len())
+    }
+
     /// The cursor `key` last accepted.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn accepted(&self, key: &K) -> Option<&C> {

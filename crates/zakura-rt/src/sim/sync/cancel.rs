@@ -145,6 +145,12 @@ impl CancellationToken {
         self.inner.is_cancelled()
     }
 
+    /// [`Self::is_cancelled`], read with no preemption point, for an
+    /// observer's report that mustn't add a scheduling point to its run.
+    pub fn peek_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
     /// Waits until cancelled.
     #[track_caller]
     pub fn cancelled(&self) -> WaitForCancellationFuture<'_> {

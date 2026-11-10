@@ -66,11 +66,11 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, commit_only_authorized, outstanding_work_bounded,
-            reset_invalidates_work, stale_chain_effect_inert, stale_completion_inert,
-            teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
-            BudgetView, ChainView, OutstandingView, ResetView, StaleView, TeardownView, WakeView,
-            OUTSTANDING_WORK_BOUNDED,
+            chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
+            outstanding_work_bounded, reset_invalidates_work, stale_chain_effect_inert,
+            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
+            AdoptionView, AuthorityView, BudgetView, ChainView, OutstandingView, ResetView,
+            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -822,12 +822,15 @@ impl HasView for Storage {
         self.adoption.end(end);
         self.faults.end(end);
         self.rounds.end(end);
+        self.outstanding.end(end);
     }
 
-    /// [`fault_end_violations`] and [`teardown_end_violations`].
+    /// [`fault_end_violations`], [`teardown_end_violations`] and
+    /// [`outstanding_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
+        found.extend(outstanding_end_violations(&self.outstanding));
         found
     }
 

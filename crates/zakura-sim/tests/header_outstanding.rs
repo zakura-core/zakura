@@ -22,7 +22,7 @@ use zakura_sim::{
 
 /// Every committed storage witness the outstanding-work gate runs, by its
 /// fixture stem.
-const WITNESSES: [&str; 7] = [
+const WITNESSES: [&str; 9] = [
     "header-authority-forks-sharing-a-header",
     "header-authority-relinked-mid-round",
     "header-reset-held-apply",
@@ -30,6 +30,8 @@ const WITNESSES: [&str; 7] = [
     "header-reset-quiet-reset",
     "header-reset-quiet-reset-deep",
     "header-outstanding-churn",
+    "header-outstanding-serving-churn",
+    "header-outstanding-serving-replaced",
 ];
 
 /// The committed fixture `<stem>.<extension>`.
@@ -102,19 +104,29 @@ fn the_witnesses_hold_under_generated_plans() {
     }
 }
 
-/// The limit fixtures: 17 mirrors, each at its own height of the main
-/// chain so each offers a distinct target. In the slot fixture storage holds
+/// The limit fixtures. The slot and locator fixtures have 17 mirrors, each
+/// at its own height of the main chain so each offers a distinct target. In
+/// the slot fixture storage holds
 /// every prepare for the run, so the queue fills its 16 slots and the 17th
 /// offer waits. In the locator fixture storage holds every locator read
 /// until 16 are submitted, so the reads fill the 16 permits and the 17th
-/// waits. Each row reaches its limit and no further. The harness's step
-/// budget ends a run of 17 mirrors before release and reuse, which the
-/// committed witnesses cover at their own scale.
+/// waits. In the serving fixture 11 mirrors sit below the node, so the
+/// node serves each of them, and storage holds every serving read until 8
+/// are submitted, so the reads fill the node's 8 execution slots and the
+/// rest wait. Each row reaches its limit and no further. The harness's step
+/// budget ends these runs before release and reuse, which the committed
+/// witnesses cover at their own scale.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
-    for (stem, row) in [
-        ("header-outstanding-slot-limit", "work slots"),
-        ("header-outstanding-locator-limit", "locator reads"),
+    for (stem, row, limit, sessions) in [
+        ("header-outstanding-slot-limit", "work slots", 16, 17),
+        ("header-outstanding-locator-limit", "locator reads", 16, 17),
+        (
+            "header-outstanding-serving-limit",
+            "node execution slots",
+            8,
+            11,
+        ),
     ] {
         let scenario = scenario(stem);
         let prepared = Storage::prepare(&scenario);
@@ -133,7 +145,11 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
         assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
         held(stem, &report);
         let peaks = evidence.peaks();
-        assert_eq!(peaks.get(row), Some(&16), "{stem}: {peaks:?}");
-        assert_eq!(peaks.get("session handles"), Some(&17), "{stem}: {peaks:?}");
+        assert_eq!(peaks.get(row), Some(&limit), "{stem}: {peaks:?}");
+        assert_eq!(
+            peaks.get("session handles"),
+            Some(&sessions),
+            "{stem}: {peaks:?}"
+        );
     }
 }

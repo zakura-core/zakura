@@ -3,16 +3,19 @@
 use std::num::NonZeroU64;
 
 use zakura_chain::block;
-use zakura_header_chain::{BranchId, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority};
+use zakura_header_chain::{
+    BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority,
+};
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderTargetPhase, PortCall, ReactorCause, ReactorEvent, ReactorSizes, RequestRef,
-        ReservationPurpose,
+        CallEnd, HeaderRequestTerminal, HeaderTargetPhase, PortCall, ReactorCause, ReactorEvent,
+        ReactorSizes, RequestRef, ReservationPurpose, ServeInUse, SubscriberChange,
     },
     HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
 
 use super::*;
+use zakura_rt::sync::CancellationToken;
 
 /// A named change to a reactor's sizes report.
 type Mutation = Box<dyn Fn(&mut ReactorSizes)>;
@@ -215,10 +218,10 @@ fn started(incarnation: u64) -> ReactorEvent {
     }
 }
 
-/// An active slot whose round was released breaks the rule, and so does
-/// one whose session was replaced unless it's a repair's local operation;
-/// an unstarted slot needs its admitted session and an open locator read;
-/// a completed target holds once a `TargetCompleted` names it.
+/// A slot's lifetime is the round-life properties', so an active slot whose
+/// round was released, or whose session ended, breaks nothing here; an
+/// unstarted slot needs an open locator read; a completed target holds
+/// once a `TargetCompleted` names it.
 #[test]
 fn slots_and_completions_join_their_facts() {
     let mut rule = rule();
@@ -236,57 +239,31 @@ fn slots_and_completions_join_their_facts() {
     rule.observe(&sizes(|sizes| sizes.completed_targets = vec![target]));
     assert_eq!(rule.drain(1), Vec::<String>::new());
 
+    // A released round's slot, and one whose session was replaced, are
+    // reset-invalidates-work's and peer-retirement-progress's.
     rule.observe(&ReactorEvent::RoundReleased {
         peer: mirror(2),
         incarnation: 4,
         queue_owned: 0,
     });
-    rule.observe(&sizes(|_| {}));
-    let breaks = rule.drain(2);
-    assert_eq!(breaks.len(), 1, "{breaks:?}");
-    assert!(
-        breaks[0].contains("round 4, which isn't a started"),
-        "{breaks:?}"
-    );
-
-    // An ordinary round's slot doesn't outlive its session, but a repair's
-    // preparing or applying one does.
     rule.observe(&admitted(mirror(2), 2));
-    rule.observe(&started(5));
-    rule.observe(&active_slot(5));
+    rule.observe(&sizes(|_| {}));
+    assert_eq!(rule.drain(2), Vec::<String>::new());
+
+    // An unstarted slot needs an open locator read.
+    rule.observe(&unstarted_slot(2));
     rule.observe(&sizes(|_| {}));
     let breaks = rule.drain(3);
-    assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(
-        breaks[0].contains("Receiving slot") && breaks[0].contains("session 1"),
+        matches!(&breaks[..], [only] if only.contains("no open locator read")),
         "{breaks:?}"
     );
-    let ReactorEvent::Slots { mut slots } = active_slot(5) else {
-        unreachable!("active_slot reports slots")
-    };
-    slots[0].repair = true;
-    slots[0].phase = Some(HeaderTargetPhase::Applying);
-    rule.observe(&ReactorEvent::Slots { slots });
-    rule.observe(&sizes(|sizes| sizes.staged_entries = vec![(mirror(2), 0)]));
-    assert_eq!(rule.drain(3), Vec::<String>::new());
-
-    // An unstarted slot needs its admitted session and an open locator read.
-    rule.observe(&unstarted_slot(1));
-    rule.observe(&sizes(|_| {}));
-    let breaks = rule.drain(4);
-    assert_eq!(breaks.len(), 2, "{breaks:?}");
-    assert!(
-        breaks[0].contains("session 1, which isn't admitted"),
-        "{breaks:?}"
-    );
-    assert!(breaks[1].contains("no open locator read"), "{breaks:?}");
-    rule.observe(&unstarted_slot(2));
     rule.observe(&locator(7, mirror(2)));
     rule.observe(&sizes(|sizes| {
         sizes.storage_calls = vec![7];
         sizes.port_futures = 1;
     }));
-    assert_eq!(rule.drain(5), Vec::<String>::new());
+    assert_eq!(rule.drain(4), Vec::<String>::new());
 }
 
 /// Mirror 2's only slot, awaiting its locator for session `session_id`.
@@ -502,4 +479,507 @@ fn only_the_current_sessions_end_removes_a_peer() {
     let breaks = rule.drain(2);
     assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(breaks[0].contains("cached offers"), "{breaks:?}");
+}
+
+/// Mirror 2's publisher pass on session 1, with `change` applied to an
+/// honest one.
+fn publisher_pass(
+    change: impl FnOnce(&mut Vec<u64>, &mut Vec<u64>, &mut ServeInUse),
+) -> ReactorEvent {
+    let (mut waits, mut stalls, mut in_use) = (vec![3], vec![3], ServeInUse::default());
+    in_use.node_execution = NODE_EXECUTION;
+    in_use.peer_execution = PEER_EXECUTION;
+    change(&mut waits, &mut stalls, &mut in_use);
+    ReactorEvent::PublisherServing {
+        peer: mirror(2),
+        session_id: 1,
+        site: PublisherSite::Pass,
+        live: vec![(1, SENT_CURSOR_RING)],
+        subscriptions: vec![1],
+        tombstones: PUBLICATION_SLOTS,
+        terminals: PUBLICATION_SLOTS,
+        job: true,
+        slots: PUBLICATION_SLOTS,
+        waits,
+        stalls,
+        in_use: Some(in_use),
+    }
+}
+
+/// Mirror 2's session 1 ledger's `change` of `subscription`.
+fn publication(subscription: u64, change: PublicationChange) -> ReactorEvent {
+    ReactorEvent::PublicationChanged {
+        peer: mirror(2),
+        session_id: 1,
+        subscription,
+        change,
+    }
+}
+
+/// The serving rows (hdr-9d.2): a publisher pass at its bounds holds, a kept
+/// wait no subscription stalls on breaks, and so do a ninth node execution
+/// slot and a peer's output past 64 MiB. Every site judges the containers
+/// against the ledger's open and end facts and the bounds, and only a pass
+/// judges the waits.
+#[test]
+fn a_publisher_pass_holds_at_its_bounds_and_breaks_past_them() {
+    let mut rule = rule();
+    rule.observe(&publication(1, PublicationChange::Opened));
+    rule.observe(&publisher_pass(|_, _, _| {}));
+    assert_eq!(rule.drain(1), Vec::<String>::new());
+    let cases: [(&str, PassChange); 3] = [
+        (
+            "which no subscription is",
+            Box::new(|_, stalls, _| stalls.clear()),
+        ),
+        (
+            "9 node execution slots",
+            Box::new(|_, _, in_use| in_use.node_execution = NODE_EXECUTION + 1),
+        ),
+        (
+            "output bytes, past its",
+            Box::new(|_, _, in_use| in_use.peer_output = SERVE_PEER_OUTPUT_BYTES + 1),
+        ),
+    ];
+    for (step, (needle, change)) in (2..).zip(cases) {
+        rule.observe(&publisher_pass(change));
+        let breaks = rule.drain(step);
+        assert_eq!(breaks.len(), 1, "{needle}: {breaks:?}");
+        assert!(breaks[0].contains(needle), "{needle}: {breaks:?}");
+    }
+    // Right after an end: a stray wait isn't judged before its pruning, but
+    // a third terminal outcome or tombstone breaks.
+    let at_end = |change: &dyn Fn(&mut ReactorEvent)| {
+        let mut event = publisher_pass(|_, stalls, _| stalls.clear());
+        if let ReactorEvent::PublisherServing { site, in_use, .. } = &mut event {
+            *site = PublisherSite::EndDue;
+            *in_use = None;
+        }
+        change(&mut event);
+        event
+    };
+    rule.observe(&at_end(&|_| {}));
+    assert_eq!(rule.drain(5), Vec::<String>::new());
+    for (step, needle, change) in [
+        (
+            6,
+            "3 publisher terminal outcomes, past its 2",
+            &(|event: &mut ReactorEvent| {
+                if let ReactorEvent::PublisherServing { terminals, .. } = event {
+                    *terminals += 1;
+                }
+            }) as &dyn Fn(&mut ReactorEvent),
+        ),
+        (
+            7,
+            "3 publisher tombstones, past its 2",
+            &|event: &mut ReactorEvent| {
+                if let ReactorEvent::PublisherServing { tombstones, .. } = event {
+                    *tombstones += 1;
+                }
+            },
+        ),
+        (
+            8,
+            "4097 sent-cursor ring, past its 4096",
+            &|event: &mut ReactorEvent| {
+                if let ReactorEvent::PublisherServing { site, live, .. } = event {
+                    *site = PublisherSite::Commit;
+                    live[0].1 += 1;
+                }
+            },
+        ),
+    ] {
+        rule.observe(&at_end(change));
+        let breaks = rule.drain(step);
+        assert!(
+            matches!(&breaks[..], [only] if only.contains(needle)),
+            "{needle}: {breaks:?}"
+        );
+    }
+    // An ended subscription kept in both containers breaks against the
+    // ledger's own end, though the two containers agree.
+    rule.observe(&publication(1, PublicationChange::Ended));
+    rule.observe(&at_end(&|_| {}));
+    let breaks = rule.drain(9);
+    assert_eq!(breaks.len(), 2, "{breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|only| only.contains("but its ledger opened and hasn't ended []")),
+        "{breaks:?}"
+    );
+}
+
+/// A change to an honest publisher pass's waits, stalls and budgets.
+type PassChange = Box<dyn Fn(&mut Vec<u64>, &mut Vec<u64>, &mut ServeInUse)>;
+
+/// The service and publisher rows (hdr-9d.2): a cadence report raises no
+/// break, since the row is listed, not checked, a second publisher for a
+/// live session breaks, a pruning that keeps an expired peer's budgets
+/// breaks, and the subscriber's unaccepted cursors must be its claims past
+/// its acceptance.
+#[test]
+fn service_and_session_rows_join_their_facts() {
+    let mut rule = rule();
+    // The cadence row is listed, not checked.
+    rule.observe(&ReactorEvent::ServiceSizes {
+        cadences: vec![(mirror(9), 4)],
+    });
+    assert_eq!(rule.drain(1), Vec::<String>::new());
+
+    let started = ReactorEvent::PublisherStarted {
+        peer: mirror(2),
+        session_id: 1,
+    };
+    rule.observe(&started);
+    rule.observe(&started);
+    let breaks = rule.drain(2);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("a second publisher")),
+        "{breaks:?}"
+    );
+
+    rule.observe(&ReactorEvent::ServingPeers {
+        expired: vec![mirror(7)],
+        removed: vec![mirror(7), mirror(8)],
+        removed_live: Vec::new(),
+    });
+    assert_eq!(rule.drain(3), Vec::<String>::new());
+    // Removing a live entry in an expired one's place keeps that one, and
+    // gives the live peer's next session budgets apart from its live ones.
+    rule.observe(&ReactorEvent::ServingPeers {
+        expired: vec![mirror(7)],
+        removed: vec![mirror(8)],
+        removed_live: vec![mirror(8)],
+    });
+    let breaks = rule.drain(3);
+    assert_eq!(breaks.len(), 2, "{breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .any(|only| only.contains("replaced the live budgets of")),
+        "{breaks:?}"
+    );
+    assert!(
+        breaks
+            .iter()
+            .any(|only| only.contains("kept the expired budgets of")),
+        "{breaks:?}"
+    );
+    // A lookup that replaces budgets it could have reused reports that
+    // peer removed and alive.
+    rule.observe(&ReactorEvent::ServingPeers {
+        expired: Vec::new(),
+        removed: vec![mirror(8)],
+        removed_live: vec![mirror(8)],
+    });
+    let breaks = rule.drain(3);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("replaced the live budgets of")),
+        "{breaks:?}"
+    );
+    rule.observe(&ReactorEvent::ServingAcquired {
+        peer: mirror(2),
+        in_use: ServeInUse {
+            node_execution: NODE_EXECUTION + 1,
+            ..ServeInUse::default()
+        },
+    });
+    let breaks = rule.drain(3);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("9 node execution slots in use")),
+        "{breaks:?}"
+    );
+
+    let cursor = |height: u32| {
+        Frontier::new(
+            block::Height(height),
+            block::Hash([u8::try_from(height).expect("the test's heights fit a byte"); 32]),
+        )
+    };
+    let claimed = |height| ReactorEvent::CursorClaimed {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        through: cursor(height),
+        headers: 0,
+        bytes: 0,
+        page_last: cursor(height),
+        page_headers: 1,
+        page_bytes: 0,
+        totals: Default::default(),
+    };
+    let serving = |unaccepted: Vec<Frontier>| ReactorEvent::SubscriberServing {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        change: SubscriberChange::Claim,
+        unaccepted: Some(unaccepted),
+        live: 1,
+        ended: 0,
+    };
+    rule.observe(&claimed(1));
+    rule.observe(&claimed(2));
+    rule.observe(&ReactorEvent::CursorsAccepted {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        through: cursor(1),
+        headers: 0,
+        bytes: 0,
+        stored: (cursor(1), 0, 0),
+        totals: Default::default(),
+    });
+    rule.observe(&serving(vec![cursor(2)]));
+    assert_eq!(rule.drain(4), Vec::<String>::new());
+    // A stored cursor that isn't the page's last is commit-only-authorized's
+    // to judge, so the row joins by the page's own last header.
+    rule.observe(&ReactorEvent::CursorClaimed {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        through: cursor(2),
+        headers: 0,
+        bytes: 0,
+        page_last: cursor(3),
+        page_headers: 1,
+        page_bytes: 0,
+        totals: Default::default(),
+    });
+    rule.observe(&serving(vec![cursor(2), cursor(3)]));
+    assert_eq!(rule.drain(4), Vec::<String>::new());
+    // So is a stored height that miscounts the page.
+    let miscounted = Frontier::new(block::Height(2), cursor(3).hash);
+    rule.observe(&serving(vec![cursor(2), miscounted]));
+    assert_eq!(rule.drain(4), Vec::<String>::new());
+    rule.observe(&serving(vec![cursor(1), cursor(2)]));
+    let breaks = rule.drain(5);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("but its claims past its acceptance")),
+        "{breaks:?}"
+    );
+    // An ended subscription's report carries no cursors, but its table
+    // can't remember two ended keys.
+    rule.observe(&ReactorEvent::SubscriberServing {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        change: SubscriberChange::Outcome,
+        unaccepted: None,
+        live: 0,
+        ended: 2,
+    });
+    let breaks = rule.drain(6);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("2 ended keys, past its 1")),
+        "{breaks:?}"
+    );
+}
+
+/// Round 2's rows (hdr-9d.2): a subscription kept after its outcome breaks;
+/// once the reactor's shutdown ran, a run at rest with a publisher still
+/// running is lingering; and a slot kept past its round's release breaks
+/// for a reason no other property owns, but not for an obsolete one.
+#[test]
+fn ended_subscriptions_shutdown_and_released_slots() {
+    let mut ended = rule();
+    ended.observe(&ReactorEvent::SubscriberServing {
+        peer: mirror(2),
+        session_id: 1,
+        subscription: 1,
+        change: SubscriberChange::Outcome,
+        unaccepted: Some(Vec::new()),
+        live: 1,
+        ended: 1,
+    });
+    let breaks = ended.drain(1);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("keeps subscription 1 after its Outcome")),
+        "{breaks:?}"
+    );
+
+    let evidence = OutstandingEvidence::default();
+    let mut shut = Outstanding::new(evidence.clone(), 8, held());
+    shut.observe(&ReactorEvent::PublisherStarted {
+        peer: mirror(2),
+        session_id: 1,
+    });
+    shut.observe(&ReactorEvent::CauseSet {
+        cause: ReactorCause::Shutdown,
+    });
+    evidence.end(&crate::RunEnd {
+        outcome: crate::Outcome::Idle {
+            status: crate::IdleStatus::Quiescent,
+        },
+        steps: 1,
+        violation: None,
+        drain: None,
+        harness: None,
+    });
+    assert_eq!(evidence.lingering_at_rest(), [(mirror(2), 1)]);
+
+    // A publisher whose session's token was cancelled lingers at rest,
+    // whatever cancelled it, and one whose token holds doesn't.
+    let evidence = OutstandingEvidence::default();
+    let mut cancelled = Outstanding::new(evidence.clone(), 8, held());
+    for session_id in [6, 7] {
+        cancelled.observe(&ReactorEvent::PublisherStarted {
+            peer: mirror(3),
+            session_id,
+        });
+    }
+    let (six, seven) = (CancellationToken::new(), CancellationToken::new());
+    cancelled.session_cancel(&mirror(3), 6, six.clone());
+    cancelled.session_cancel(&mirror(3), 7, seven);
+    six.cancel();
+    evidence.end(&crate::RunEnd {
+        outcome: crate::Outcome::Idle {
+            status: crate::IdleStatus::Quiescent,
+        },
+        steps: 1,
+        violation: None,
+        drain: None,
+        harness: None,
+    });
+    assert_eq!(evidence.lingering_at_rest(), [(mirror(3), 6)]);
+
+    // A session the reactor ended must have its token cancelled by the end
+    // of that unit's `Sizes`.
+    // A session that ends before its token is known waits for it.
+    let mut ended = rule();
+    let token = CancellationToken::new();
+    ended.observe(&ReactorEvent::SessionEnded {
+        peer: mirror(3),
+        session_id: 8,
+        reason: "test",
+    });
+    ended.observe(&sizes(|_| {}));
+    assert_eq!(ended.drain(1), Vec::<String>::new());
+    ended.session_cancel(&mirror(3), 8, token.clone());
+    ended.observe(&sizes(|_| {}));
+    let breaks = ended.drain(1);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("but its token isn't cancelled")),
+        "{breaks:?}"
+    );
+    // So must a session refused at the peer cap.
+    let capped = CancellationToken::new();
+    ended.session_cancel(&mirror(4), 10, capped);
+    ended.observe(&ReactorEvent::SessionAtCapacity {
+        peer: mirror(4),
+        session_id: 10,
+    });
+    ended.observe(&sizes(|_| {}));
+    let breaks = ended.drain(1);
+    assert!(
+        matches!(&breaks[..], [only] if only.contains("session 10, but its token isn't cancelled")),
+        "{breaks:?}"
+    );
+    ended.session_cancel(&mirror(3), 9, token.clone());
+    token.cancel();
+    ended.observe(&ReactorEvent::SessionRefused {
+        peer: mirror(3),
+        session_id: 9,
+    });
+    ended.observe(&sizes(|_| {}));
+    assert_eq!(ended.drain(2), Vec::<String>::new());
+
+    for (reason, breaks) in [
+        (HeaderRequestTerminal::TargetAdmitted, 1),
+        (HeaderRequestTerminal::SnapshotObsolete, 0),
+    ] {
+        let mut released = rule();
+        released.observe(&started(4));
+        released.observe(&active_slot(4));
+        released.observe(&ReactorEvent::RoundReleased {
+            peer: mirror(2),
+            incarnation: 4,
+            queue_owned: 0,
+        });
+        released.observe(&ReactorEvent::Retired {
+            request: round(4),
+            phase: HeaderTargetPhase::Receiving,
+            purpose: HeaderTargetPurpose::Normal,
+            reason,
+        });
+        released.observe(&sizes(|_| {}));
+        let found = released.drain(1);
+        assert_eq!(found.len(), breaks, "{reason:?}: {found:?}");
+    }
+}
+
+/// The retained-path rows (hdr-9d.2): 16 open leases and 16 cached paths
+/// hold, a 17th of either breaks, and each one's end frees its room, so a
+/// 17th after an end holds.
+#[test]
+fn retained_paths_hold_at_sixteen_and_break_past_it() {
+    use crate::observe::{StorageBranch, StorageFact, StorageLease, StoragePoint, WorkScope};
+
+    let lease = |lease_id| StorageLease {
+        peer: "mirror-2".to_owned(),
+        session_id: 1,
+        lease_id,
+    };
+    let point = || StoragePoint {
+        height: 1,
+        hash: "00".to_owned(),
+    };
+    let leased = |lease_id| StorageFact::Leased {
+        lease: lease(lease_id),
+        scope: WorkScope {
+            header_generation: 0,
+            branch: StorageBranch {
+                anchor: "00".to_owned(),
+                target: "00".to_owned(),
+            },
+        },
+        target: point(),
+        common_ancestor: point(),
+        next: None,
+        capacity: "general".to_owned(),
+        continued_from: None,
+    };
+    let cached = |lease_id| StorageFact::RetentionCached {
+        lease: lease(lease_id),
+        last: point(),
+        next: None,
+    };
+    for (row, fact, end, needle) in [
+        (
+            "leases",
+            &leased as &dyn Fn(u64) -> StorageFact,
+            &(|lease_id| StorageFact::CapabilityEnded {
+                lease: lease(lease_id),
+                release: "lease-released".to_owned(),
+            }) as &dyn Fn(u64) -> StorageFact,
+            "holds 17 retained-path leases, past its 16",
+        ),
+        (
+            "cached paths",
+            &cached,
+            &|lease_id| StorageFact::RetentionEnded {
+                lease: lease(lease_id),
+                why: "with-capability".to_owned(),
+                into: None,
+            },
+            "cache holds 17 retained paths, past its 16",
+        ),
+    ] {
+        let mut rule = rule();
+        for lease_id in 0..16 {
+            rule.storage(&fact(lease_id));
+        }
+        assert_eq!(rule.drain(1), Vec::<String>::new(), "{row}");
+        rule.storage(&fact(16));
+        let breaks = rule.drain(2);
+        assert!(
+            matches!(&breaks[..], [only] if only.contains(needle)),
+            "{row}: {breaks:?}"
+        );
+        rule.storage(&end(16));
+        rule.storage(&end(15));
+        rule.storage(&fact(17));
+        assert_eq!(rule.drain(3), Vec::<String>::new(), "{row}");
+    }
 }

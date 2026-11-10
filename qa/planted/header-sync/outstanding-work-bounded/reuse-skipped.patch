@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/serve/capacity.rs b/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
+index 03630e6e15..168ff51a94 100644
+--- a/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
++++ b/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
+@@ -326,9 +326,7 @@ impl ServeCapacity {
+         if let Some(reports) = &self.reports {
+             (reports.pruned)(expired, removed, removed_live);
+         }
+-        if let Some(budgets) = peers.get(peer).and_then(WeakPeerBudgets::upgrade) {
+-            return budgets;
+-        }
++        // Mutation: every lookup builds fresh budgets, even over live ones.
+         let budgets = PeerBudgets {
+             output_responses: SlotBudget::new(self.limits.peer_output_responses)
+                 .expect("peer output responses were validated when the capacity was built"),

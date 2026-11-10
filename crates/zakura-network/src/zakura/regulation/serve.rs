@@ -104,11 +104,15 @@ use zakura_rt::sync::{
     mpsc, watch, CancellationToken, Mutex, PoisonError,
 };
 
+#[cfg(any(test, zakura_sim))]
+pub(crate) use capacity::ServeReports;
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
 #[cfg(any(test, zakura_sim))]
 pub(crate) use lease::ReleaseReport;
 pub(crate) use lease::{ExecutionSlots, WorkLease};
+#[cfg(any(test, zakura_sim))]
+pub use push::ServeInUse;
 pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 

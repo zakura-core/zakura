@@ -33,7 +33,7 @@ use crate::zakura::{
         header_sync_trace as hs_trace, peer_label as trace_peer_label,
         queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
     },
-    transport::sim_arg,
+    transport::{sim_arg, sim_chain},
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
@@ -262,7 +262,34 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: v9::serving_capacity(header_peers, startup.config.node_serve_output_bytes),
+        serving: sim_chain!(v9::serving_capacity(
+            header_peers,
+            startup.config.node_serve_output_bytes,
+        ) => with_reports(
+            startup
+                .observer
+                .0
+                .as_ref()
+                .and_then(|observer| observer.capacity_observer())
+                .map(|observer| {
+                    let acquired = observer.clone();
+                    crate::zakura::regulation::ServeReports::new(
+                        move |expired, removed, removed_live| {
+                            observer.observe(super::observe::ReactorEvent::ServingPeers {
+                                expired,
+                                removed,
+                                removed_live,
+                            });
+                        },
+                        move |peer, in_use| {
+                            acquired.observe(super::observe::ReactorEvent::ServingAcquired {
+                                peer: peer.clone(),
+                                in_use,
+                            });
+                        },
+                    )
+                })
+        )),
         page_limits,
         #[cfg(any(test, zakura_sim))]
         credit_observer: startup
@@ -1054,6 +1081,13 @@ impl HeaderSyncReactor {
                     }
                 };
         if at_capacity {
+            observe!(
+                self,
+                ReactorEvent::SessionAtCapacity {
+                    peer: peer.clone(),
+                    session_id: session.session_id(),
+                }
+            );
             session.cancel_token().cancel();
             return;
         }

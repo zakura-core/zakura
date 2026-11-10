@@ -18,13 +18,75 @@
 //!   `ReservationEnded`, for its peer, and backs that peer's active round,
 //!   by the round its opening or its `ReservationBound` names, so one kept
 //!   past its round breaks even when the peer's next round reuses it.
-//! - Work slots: every active slot's round has a `Started` and no
-//!   `RoundReleased`, and its peer is admitted with the slot's session,
-//!   except a repair's preparing or applying round, which a disconnect or
-//!   replacement leaves to finish its local operation. Every unstarted
-//!   slot's peer is admitted with the slot's session and has an open
-//!   locator read, which is all an unstarted slot waits for: every other
-//!   wait removes it.
+//! - Work slots: at most the queue's 16, and every unstarted slot's peer
+//!   has an open locator read, which is all an unstarted slot waits for:
+//!   every other wait removes it. A slot's lifetime belongs to the
+//!   round-life properties, by the plan's rule partition: a round retired
+//!   while the queue still holds it is its retirement reason's property's,
+//!   `reset-invalidates-work` for an obsolete one and
+//!   `peer-retirement-progress` for a departure, timeout or shutdown. So
+//!   this row breaks on an active slot whose round the queue released
+//!   (`RoundReleased`) only when its `Retired` gave any other reason.
+//! - Status cadences (hdr-9d.2): listed, not checked. `ServiceSizes`
+//!   reports the service's cadence keys at each insert and removal, and
+//!   the report carries their peak. The map's only removal is the
+//!   transport's `remove_peer`, and this harness has no transport, so no
+//!   entry is ever removed here. The peak equals the connections the run
+//!   opened and says nothing about production. Whether a closed
+//!   connection's entry goes is the transport cleanup's contract
+//!   (`RegisteredPeerCleanupGuard`). See Open coverage.
+//! - Publisher tasks (hdr-9d.2): at most one runs per session, by
+//!   `PublisherStarted` and `PublisherEnded`, and a run that comes to rest
+//!   has none running whose session's token is cancelled, whatever
+//!   cancelled it, or any at all once the reactor's `Shutdown` unit ran,
+//!   which ends every session without cancelling their tokens. Each
+//!   publisher hands its session's token to the tap as it's spawned, before
+//!   the service queues the session's admission
+//!   (`HeaderSyncObserver::session_cancel`), so no session ends unknown.
+//!   Conversely, every session the reactor ends (`SessionEnded`,
+//!   `SessionRefused`, `SessionAtCapacity`, or a replacement's
+//!   `SessionAdmitted`) has its token cancelled by the end of that unit's
+//!   `Sizes`. A publisher returns as soon as its session is cancelled.
+//! - Subscriber cursors (hdr-9d.2): each subscription's unaccepted
+//!   cursors, as `SubscriberServing` lists them after every claim and
+//!   acceptance, are exactly the pages' last headers `CursorClaimed` gave
+//!   it past the last `CursorsAccepted`, at most 4,000. Cursors are joined
+//!   by hash alone: their heights and totals are commit-only-authorized's. After every open, terminal
+//!   outcome and retraction too, a session's subscriber holds at most one
+//!   live subscription and remembers at most one ended key, and after an
+//!   outcome or a retraction the subscription is out of the table.
+//! - Publisher state and serving budgets (hdr-9d.2), as `PublisherServing`
+//!   reports them right after each operation that can grow them, under
+//!   the lock that orders them: an `Open` the ledger applied, the ending of
+//!   every subscription that was due, a committed page, and each loop pass,
+//!   right after the capacity waits' pruning. At every site the ledger's live and closing
+//!   subscriptions, and the subscriptions the publisher's state tracks, are
+//!   each exactly the ones the ledger's own `PublicationChanged` facts
+//!   opened and haven't ended, never judged against each other (Rule A).
+//!   At most 2 of those, tombstones, unwritten terminal outcomes and
+//!   publication slots, since each holds a slot, and each subscription's
+//!   sent-cursor ring within 4,096. At a pass, at most 2 kept waits, every
+//!   one a subscription is stalled on, at most 8 node and 2 peer execution
+//!   slots, and at most 64 MiB of a peer's output. The node output bytes
+//!   and the response slots are listed, not checked: their limits follow
+//!   the node's configured session count through the toolkit's sizing.
+//! - Serving peer budgets (hdr-9d.2): no size bound, since production has
+//!   none (Rule 6), but each lookup's pruning removes every peer whose
+//!   budgets had expired just before it, and none with any budget still
+//!   alive, and no lookup replaces budgets any of which is still alive.
+//!   Either would give the peer's next session budgets apart from its live
+//!   ones, as `ServingPeers` names them. An expired entry never comes alive
+//!   again, so an entry that expires during the pruning only adds to what
+//!   it removes.
+//! - Serving budgets at acquisition (hdr-9d.2): every push's acquisition
+//!   (`ServingAcquired`) leaves at most 8 node and 2 peer execution slots
+//!   and 64 MiB of the peer's output in use, so an excess that's acquired
+//!   and released between publisher passes still breaks.
+//! - Retained-path leases (hdr-9d.2): the node's storage holds at most 16
+//!   open leases at once, by its `Leased` and `CapabilityEnded` facts, and
+//!   at most 16 paths in its continuation cache, by `RetentionCached` and
+//!   `RetentionEnded`, since a lease whose capability ends can leave its
+//!   path cached.
 //! - Staged entries: a receiving round holds exactly the headers its
 //!   `PageStaged` facts carried, and a preparing or applying one holds
 //!   none, since preparation takes them.
@@ -75,7 +137,7 @@
 //! are capped by #2131.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
 };
 
@@ -83,11 +145,13 @@ use zakura_chain::block;
 use zakura_header_chain::{BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner};
 use zakura_network::zakura::{
     observe::{
-        HeaderTargetPhase, PortCall, ReactorCause, ReactorEvent, ReactorSizes, StorageCallKind,
+        HeaderRequestTerminal, HeaderTargetPhase, PortCall, PublicationChange, PublisherSite,
+        ReactorCause, ReactorEvent, ReactorSizes, ServeInUse, StorageCallKind, SubscriberChange,
         WorkSlot,
     },
     ZakuraPeerId,
 };
+use zakura_rt::sync::CancellationToken;
 
 /// The queue's slot limit, `MAX_STAGED_TARGETS_V1`.
 pub const MAX_STAGED_TARGETS: usize = 16;
@@ -95,8 +159,38 @@ pub const MAX_STAGED_TARGETS: usize = 16;
 /// The reactor's locator permits.
 pub const LOCATOR_PERMITS: usize = 16;
 
-/// The header chunk budget's capacity.
+/// The header chunk budget's capacity. It also bounds a subscription's
+/// unaccepted cursors, since every page carries at least one header and
+/// the window is at most `MAX_HS_PUSH_CREDIT_HEADERS`, 4,000.
 pub const CHUNK_HEADERS: usize = 4_000;
+
+/// A session's live subscriptions, and the ended keys its subscriber
+/// remembers: `MAX_HS_SUBSCRIPTIONS`.
+pub const MAX_SUBSCRIPTIONS: usize = 1;
+
+/// A session's publication slots, `2 × MAX_HS_SUBSCRIPTIONS`, which also
+/// bound its publisher's live and closing subscriptions, its tombstones,
+/// its queued terminal outcomes and the capacity waits it keeps, at most
+/// one per subscription.
+pub const PUBLICATION_SLOTS: usize = 2;
+
+/// Each subscription's sent-cursor ring, `HS_SENT_CURSOR_RING`.
+pub const SENT_CURSOR_RING: usize = 4_096;
+
+/// The retained-path leases the node's storage holds at once,
+/// `MAX_RETAINED_PATH_LEASES`.
+pub const MAX_RETAINED_PATH_LEASES: usize = 16;
+
+/// Page reads that may run at once across the node, `NODE_EXECUTION`.
+pub const NODE_EXECUTION: usize = 8;
+
+/// Page reads that may run at once for one peer, across its replacement
+/// sessions, `PEER_EXECUTION`.
+pub const PEER_EXECUTION: usize = 2;
+
+/// Unsent page bytes one peer may hold, `SERVE_PEER_OUTPUT_BYTES`, the
+/// toolkit's 64 MiB default.
+pub const SERVE_PEER_OUTPUT_BYTES: u64 = 64 << 20;
 
 /// The peers the reactor admits at once, as production derives it from
 /// `max_inbound_peers + max_outbound_peers`, capped by the node's
@@ -121,6 +215,15 @@ struct Store {
     applicable: Option<u64>,
     /// Whether a `Sizes` was judged since the last drain.
     pending: bool,
+    /// The publisher tasks running, by peer and session, each with the
+    /// token that cancels its session, once its start handed it over.
+    running: Vec<(ZakuraPeerId, u64, Option<CancellationToken>)>,
+    /// Whether the reactor began its shutdown, which ends every session
+    /// without cancelling their tokens.
+    shut_down: bool,
+    /// Whether the run came to rest: it ended idle, or at its budget after
+    /// a drain that ran out of ready tasks.
+    at_rest: bool,
 }
 
 impl OutstandingEvidence {
@@ -138,6 +241,39 @@ impl OutstandingEvidence {
     /// Whether a drain up to and including `step`'s judged a `Sizes`.
     pub fn applicable_by(&self, step: u64) -> bool {
         self.with(|store| store.applicable.is_some_and(|found| found <= step))
+    }
+
+    /// Records how the run ended, as [`super::adoption::settled`] judges it.
+    pub fn end(&self, end: &crate::RunEnd) {
+        let at_rest = super::adoption::settled(end);
+        self.with(|store| store.at_rest = at_rest);
+    }
+
+    /// The publisher tasks still running when the run came to rest, if it
+    /// did, whose session's token is cancelled, or every one once the
+    /// reactor began its shutdown. A publisher returns as soon as its
+    /// session is cancelled, so a run at rest has none. The tokens are read
+    /// with no preemption point, after the run.
+    pub fn lingering_at_rest(&self) -> Vec<(ZakuraPeerId, u64)> {
+        self.with(|store| {
+            if !store.at_rest {
+                return Vec::new();
+            }
+            let mut lingering: Vec<(ZakuraPeerId, u64)> = store
+                .running
+                .iter()
+                .filter(|(_, _, cancel)| {
+                    store.shut_down
+                        || cancel
+                            .as_ref()
+                            .is_some_and(CancellationToken::peek_cancelled)
+                })
+                .map(|(peer, session_id, _)| (peer.clone(), *session_id))
+                .collect();
+            lingering
+                .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+            lingering
+        })
     }
 
     /// Whether any drain judged a `Sizes`.
@@ -204,6 +340,35 @@ pub(super) struct Outstanding {
     /// Completed targets' tips a `Sizes` showed that aren't yet seen held,
     /// for the next drain to look up.
     unseen_tips: HashSet<block::Hash>,
+    /// The hashes of each subscription's claimed pages' last headers past
+    /// its accepted cursor, by peer, session and subscription, from
+    /// `CursorClaimed` and `CursorsAccepted`.
+    claimed: HashMap<(ZakuraPeerId, u64, u64), Vec<block::Hash>>,
+    /// The node's open retained-path leases, by peer, session and lease ID,
+    /// from its storage's `Leased` and `CapabilityEnded`.
+    leases: HashSet<(String, u64, u64)>,
+    /// The retained paths in the node's continuation cache, by the lease
+    /// they came from, from `RetentionCached` and `RetentionEnded`.
+    cached: HashSet<(String, u64, u64)>,
+    /// The publisher tasks running, by peer and session, from
+    /// `PublisherStarted` and `PublisherEnded`.
+    publishers: HashSet<(ZakuraPeerId, u64)>,
+    /// The subscriptions each session's publication ledger opened and hasn't
+    /// ended, by peer and session, from `PublicationChanged`.
+    publications: HashMap<(ZakuraPeerId, u64), BTreeSet<u64>>,
+    /// The token that cancels each session, by peer and session, as its
+    /// publisher's start handed it over.
+    cancels: HashMap<(ZakuraPeerId, u64), CancellationToken>,
+    /// The sessions the reactor ended since its last `Sizes`: by
+    /// `SessionEnded`, `SessionRefused`, `SessionAtCapacity`, or a
+    /// replacement's `SessionAdmitted`. Each one's token must be cancelled by the end of
+    /// the unit that ended it.
+    ended_unchecked: Vec<(ZakuraPeerId, u64)>,
+    /// Each round the queue released, by peer and incarnation, with the
+    /// reason its `Retired` gave, once it did.
+    released: HashMap<(ZakuraPeerId, u64), Option<HeaderRequestTerminal>>,
+    /// Whether the reactor began its shutdown, which ends every session.
+    shut_down: bool,
     /// The unit of work the reactor is in, by its last `CauseSet`.
     cause: Option<ReactorCause>,
     /// The owner each started round's `Started` gave it, by peer and
@@ -236,6 +401,15 @@ impl Outstanding {
             unseen_tips: HashSet::new(),
             rounds: HashMap::new(),
             cause: None,
+            released: HashMap::new(),
+            shut_down: false,
+            publishers: HashSet::new(),
+            leases: HashSet::new(),
+            cached: HashSet::new(),
+            claimed: HashMap::new(),
+            publications: HashMap::new(),
+            cancels: HashMap::new(),
+            ended_unchecked: Vec::new(),
             reserved: HashMap::new(),
             slots: Vec::new(),
             adopted: None,
@@ -248,9 +422,15 @@ impl Outstanding {
     pub(super) fn observe(&mut self, event: &ReactorEvent) {
         match event {
             ReactorEvent::SessionAdmitted {
-                peer, session_id, ..
+                peer,
+                session_id,
+                replaced,
+                ..
             } => {
                 self.admitted.insert(peer.clone(), *session_id);
+                if let Some(replaced) = replaced {
+                    self.ended_unchecked.push((peer.clone(), *replaced));
+                }
             }
             ReactorEvent::SessionEnded {
                 peer, session_id, ..
@@ -258,6 +438,223 @@ impl Outstanding {
                 if self.admitted.get(peer) == Some(session_id) {
                     self.admitted.remove(peer);
                 }
+                self.ended_unchecked.push((peer.clone(), *session_id));
+            }
+            ReactorEvent::SessionRefused { peer, session_id }
+            | ReactorEvent::SessionAtCapacity { peer, session_id } => {
+                self.ended_unchecked.push((peer.clone(), *session_id));
+            }
+            // Joined by the page's own last header, not the stored cursor,
+            // which commit-only-authorized judges, as are the heights.
+            ReactorEvent::CursorClaimed {
+                peer,
+                session_id,
+                subscription,
+                page_last,
+                ..
+            } => self
+                .claimed
+                .entry((peer.clone(), *session_id, *subscription))
+                .or_default()
+                .push(page_last.hash),
+            ReactorEvent::CursorsAccepted {
+                peer,
+                session_id,
+                subscription,
+                through,
+                ..
+            } => {
+                if let Some(claimed) =
+                    self.claimed
+                        .get_mut(&(peer.clone(), *session_id, *subscription))
+                {
+                    if let Some(index) = claimed.iter().position(|hash| *hash == through.hash) {
+                        claimed.drain(..=index);
+                    }
+                }
+            }
+            ReactorEvent::SubscriberServing {
+                peer,
+                session_id,
+                subscription,
+                change,
+                unaccepted,
+                live,
+                ended,
+            } => {
+                self.peak("subscriber live subscriptions", *live);
+                self.peak("subscriber ended keys", *ended);
+                let key = (peer.clone(), *session_id, *subscription);
+                if unaccepted.is_some()
+                    && matches!(
+                        change,
+                        SubscriberChange::Outcome | SubscriberChange::Retract
+                    )
+                {
+                    self.breaks.push(format!(
+                        "OutstandingWork: {peer:?} session {session_id}'s subscriber keeps \
+                         subscription {subscription} after its {change:?}"
+                    ));
+                }
+                let held = match unaccepted {
+                    Some(unaccepted) => {
+                        let expected = self.claimed.get(&key).map_or(&[][..], Vec::as_slice);
+                        if !unaccepted.iter().map(|cursor| &cursor.hash).eq(expected) {
+                            self.breaks.push(format!(
+                                "OutstandingWork: {peer:?} session {session_id} subscription \
+                                 {subscription} holds unaccepted cursors {unaccepted:?}, but its \
+                                 claims past its acceptance are {expected:?}"
+                            ));
+                        }
+                        unaccepted.len()
+                    }
+                    // The subscription left the table, and its cursors with it.
+                    None => {
+                        self.claimed.remove(&key);
+                        0
+                    }
+                };
+                self.peak("subscriber unaccepted cursors", held);
+                for (row, size, bound) in [
+                    ("unaccepted cursors", held, CHUNK_HEADERS),
+                    ("live subscriptions", *live, MAX_SUBSCRIPTIONS),
+                    ("ended keys", *ended, MAX_SUBSCRIPTIONS),
+                ] {
+                    if size > bound {
+                        self.breaks.push(format!(
+                            "OutstandingWork: {peer:?} session {session_id}'s subscriber holds \
+                             {size} {row}, past its {bound}"
+                        ));
+                    }
+                }
+            }
+            ReactorEvent::PublicationChanged {
+                peer,
+                session_id,
+                subscription,
+                change,
+            } => {
+                let live = self
+                    .publications
+                    .entry((peer.clone(), *session_id))
+                    .or_default();
+                match change {
+                    PublicationChange::Opened => live.insert(*subscription),
+                    PublicationChange::Ended => live.remove(subscription),
+                };
+            }
+            ReactorEvent::PublisherServing {
+                peer,
+                session_id,
+                site,
+                live,
+                subscriptions,
+                tombstones,
+                terminals,
+                job: _,
+                slots,
+                waits,
+                stalls,
+                in_use,
+            } => {
+                // Each container against the ledger's own open and end
+                // facts, never against the other container (Rule A).
+                let opened: Vec<u64> = self
+                    .publications
+                    .get(&(peer.clone(), *session_id))
+                    .map(|live| live.iter().copied().collect())
+                    .unwrap_or_default();
+                let ledger: Vec<u64> = live.iter().map(|(key, _)| *key).collect();
+                for (container, keys) in [("ledger", &ledger), ("state", subscriptions)] {
+                    if *keys != opened {
+                        self.breaks.push(format!(
+                            "OutstandingWork: {peer:?} session {session_id}'s publisher {container} \
+                             holds subscriptions {keys:?} at its {site:?}, but its ledger opened \
+                             and hasn't ended {opened:?}"
+                        ));
+                    }
+                }
+                let ring = live.iter().map(|(_, sent)| *sent).max().unwrap_or(0);
+                for (row, size, bound) in [
+                    ("publisher subscriptions", live.len(), PUBLICATION_SLOTS),
+                    ("publisher tombstones", *tombstones, PUBLICATION_SLOTS),
+                    ("publisher terminal outcomes", *terminals, PUBLICATION_SLOTS),
+                    ("publication slots", *slots, PUBLICATION_SLOTS),
+                    ("sent-cursor ring", ring, SENT_CURSOR_RING),
+                ] {
+                    self.publisher_bound(peer, *session_id, row, size, bound);
+                }
+                // The waits are pruned only at a pass, so only a pass's are
+                // judged, and the budgets are read only there.
+                if *site == PublisherSite::Pass {
+                    self.publisher_pass(peer, *session_id, waits, stalls, in_use.as_ref());
+                }
+            }
+            ReactorEvent::ServingPeers {
+                expired,
+                removed,
+                removed_live,
+            } => {
+                self.peak("expired serving peer budgets", expired.len());
+                if !removed_live.is_empty() {
+                    self.breaks.push(format!(
+                        "OutstandingWork: a serving lookup removed or replaced the live budgets \
+                         of {removed_live:?}, so their next session gets budgets apart from them"
+                    ));
+                }
+                let kept: Vec<&ZakuraPeerId> = expired
+                    .iter()
+                    .filter(|peer| !removed.contains(peer))
+                    .collect();
+                if !kept.is_empty() {
+                    self.breaks.push(format!(
+                        "OutstandingWork: a serving lookup's pruning kept the expired budgets of \
+                         {kept:?}"
+                    ));
+                }
+            }
+            ReactorEvent::ServingAcquired { peer, in_use } => {
+                let peer_output = usize::try_from(in_use.peer_output).unwrap_or(usize::MAX);
+                for (row, size, bound) in [
+                    (
+                        "node execution slots",
+                        in_use.node_execution,
+                        NODE_EXECUTION,
+                    ),
+                    (
+                        "peer execution slots",
+                        in_use.peer_execution,
+                        PEER_EXECUTION,
+                    ),
+                    (
+                        "peer output bytes",
+                        peer_output,
+                        usize::try_from(SERVE_PEER_OUTPUT_BYTES).unwrap_or(usize::MAX),
+                    ),
+                ] {
+                    self.peak(row, size);
+                    if size > bound {
+                        self.breaks.push(format!(
+                            "OutstandingWork: a serving acquisition for {peer:?} leaves {size} \
+                             {row} in use, past its {bound}"
+                        ));
+                    }
+                }
+            }
+            ReactorEvent::PublisherStarted { peer, session_id } => {
+                let key = (peer.clone(), *session_id);
+                if !self.publishers.insert(key) {
+                    self.breaks.push(format!(
+                        "OutstandingWork: the service runs a second publisher for {peer:?} \
+                         session {session_id}, whose first hasn't ended"
+                    ));
+                }
+                self.peak("publisher tasks", self.publishers.len());
+                self.note_running();
+            }
+            ReactorEvent::PublisherEnded { peer, session_id } => {
+                self.publishers.remove(&(peer.clone(), *session_id));
+                self.note_running();
             }
             ReactorEvent::Dispatched { call, op } => {
                 let open = match op {
@@ -275,7 +672,19 @@ impl Outstanding {
                 self.rounds
                     .insert((request.peer.clone(), request.incarnation), request.owner);
             }
-            ReactorEvent::CauseSet { cause } => self.cause = Some(*cause),
+            ReactorEvent::CauseSet { cause } => {
+                self.cause = Some(*cause);
+                if *cause == ReactorCause::Shutdown && !self.shut_down {
+                    self.shut_down = true;
+                    self.evidence.with(|store| store.shut_down = true);
+                }
+            }
+            ReactorEvent::Retired {
+                request, reason, ..
+            } => {
+                self.released
+                    .insert((request.peer.clone(), request.incarnation), Some(*reason));
+            }
             ReactorEvent::TargetCompleted {
                 header_generation,
                 branch,
@@ -336,6 +745,9 @@ impl Outstanding {
             } => {
                 self.pages.remove(&(peer.clone(), *incarnation));
                 self.rounds.remove(&(peer.clone(), *incarnation));
+                self.released
+                    .entry((peer.clone(), *incarnation))
+                    .or_insert(None);
             }
             ReactorEvent::HeadersEnded { call, .. } => {
                 self.holding.remove(call);
@@ -355,8 +767,185 @@ impl Outstanding {
                     ));
                 }
             }
-            ReactorEvent::Sizes { sizes } => self.judge(sizes),
+            ReactorEvent::Sizes { sizes } => {
+                self.judge_cancels();
+                self.judge(sizes);
+            }
+            // Listed, not checked: see the module doc.
+            ReactorEvent::ServiceSizes { cadences } => {
+                self.peak("status cadences", cadences.len());
+            }
             _ => {}
+        }
+    }
+
+    /// Notes the node's storage `fact`: a retained-path lease beginning or
+    /// its handle ending. More open leases than storage's 16 break the rule.
+    pub(super) fn storage(&mut self, fact: &crate::observe::StorageFact) {
+        use crate::observe::StorageFact;
+        match fact {
+            StorageFact::Leased { lease, .. } => {
+                self.leases
+                    .insert((lease.peer.clone(), lease.session_id, lease.lease_id));
+                self.peak("retained-path leases", self.leases.len());
+                if self.leases.len() > MAX_RETAINED_PATH_LEASES {
+                    self.breaks.push(format!(
+                        "OutstandingWork: the node's storage holds {} retained-path leases, past \
+                         its {MAX_RETAINED_PATH_LEASES}",
+                        self.leases.len()
+                    ));
+                }
+            }
+            StorageFact::CapabilityEnded { lease, .. } => {
+                self.leases
+                    .remove(&(lease.peer.clone(), lease.session_id, lease.lease_id));
+            }
+            StorageFact::RetentionCached { lease, .. } => {
+                self.cached
+                    .insert((lease.peer.clone(), lease.session_id, lease.lease_id));
+                self.peak("cached retained paths", self.cached.len());
+                if self.cached.len() > MAX_RETAINED_PATH_LEASES {
+                    self.breaks.push(format!(
+                        "OutstandingWork: the node's continuation cache holds {} retained paths, \
+                         past its {MAX_RETAINED_PATH_LEASES}",
+                        self.cached.len()
+                    ));
+                }
+            }
+            StorageFact::RetentionEnded { lease, .. } => {
+                self.cached
+                    .remove(&(lease.peer.clone(), lease.session_id, lease.lease_id));
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps `cancel`, the token that cancels `peer`'s session
+    /// `session_id`, which its publisher handed over as it started.
+    pub(super) fn session_cancel(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        cancel: CancellationToken,
+    ) {
+        self.cancels.insert((peer.clone(), session_id), cancel);
+        self.note_running();
+    }
+
+    /// Breaks for each session the reactor ended since its last `Sizes`
+    /// whose token isn't cancelled, read with no preemption point. The
+    /// reactor cancels a refused or replaced session's token in the unit
+    /// that ends it, and the transport cancels a departed one's before the
+    /// reactor hears of it. A session whose token isn't known yet waits for
+    /// it, and is judged at the first `Sizes` after.
+    fn judge_cancels(&mut self) {
+        let mut unknown = Vec::new();
+        for (peer, session_id) in std::mem::take(&mut self.ended_unchecked) {
+            let Some(cancel) = self.cancels.get(&(peer.clone(), session_id)) else {
+                unknown.push((peer, session_id));
+                continue;
+            };
+            if !cancel.peek_cancelled() {
+                self.breaks.push(format!(
+                    "OutstandingWork: the reactor ended {peer:?} session {session_id}, but its \
+                     token isn't cancelled, so its publisher can run on"
+                ));
+            }
+        }
+        self.ended_unchecked = unknown;
+    }
+
+    /// Keeps the running publishers, with their sessions' tokens, in the
+    /// evidence, for the run's end to judge.
+    fn note_running(&self) {
+        let running = self
+            .publishers
+            .iter()
+            .map(|(peer, session_id)| {
+                let cancel = self.cancels.get(&(peer.clone(), *session_id)).cloned();
+                (peer.clone(), *session_id, cancel)
+            })
+            .collect();
+        self.evidence.with(|store| store.running = running);
+    }
+
+    /// Judges a publisher pass's kept waits, right after their pruning, and
+    /// the serving budgets `in_use` then.
+    fn publisher_pass(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        waits: &[u64],
+        stalls: &[u64],
+        in_use: Option<&ServeInUse>,
+    ) {
+        self.publisher_bound(
+            peer,
+            session_id,
+            "publisher capacity waits",
+            waits.len(),
+            PUBLICATION_SLOTS,
+        );
+        let stray: Vec<&u64> = waits.iter().filter(|wait| !stalls.contains(wait)).collect();
+        if !stray.is_empty() {
+            self.breaks.push(format!(
+                "OutstandingWork: {peer:?} session {session_id}'s publisher keeps \
+                 capacity waits {stray:?} after pruning, which no subscription is \
+                 stalled on"
+            ));
+        }
+        let Some(in_use) = in_use else {
+            return;
+        };
+        self.publisher_bound(
+            peer,
+            session_id,
+            "node execution slots",
+            in_use.node_execution,
+            NODE_EXECUTION,
+        );
+        self.publisher_bound(
+            peer,
+            session_id,
+            "peer execution slots",
+            in_use.peer_execution,
+            PEER_EXECUTION,
+        );
+        let peer_output = usize::try_from(in_use.peer_output).unwrap_or(usize::MAX);
+        self.peak("peer output bytes", peer_output);
+        if in_use.peer_output > SERVE_PEER_OUTPUT_BYTES {
+            self.breaks.push(format!(
+                "OutstandingWork: {peer:?}'s serving holds {} output bytes, past its \
+                 {SERVE_PEER_OUTPUT_BYTES}",
+                in_use.peer_output
+            ));
+        }
+        // Listed, not checked: their limits follow the node's configured
+        // session count through the toolkit's sizing.
+        self.peak(
+            "node output bytes",
+            usize::try_from(in_use.node_output).unwrap_or(usize::MAX),
+        );
+        self.peak("node response slots", in_use.node_responses);
+        self.peak("peer response slots", in_use.peer_responses);
+    }
+
+    /// Notes `size` as `peer` session `session_id`'s publisher's `row`, and
+    /// breaks if it's past `bound`.
+    fn publisher_bound(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        row: &'static str,
+        size: usize,
+        bound: usize,
+    ) {
+        self.peak(row, size);
+        if size > bound {
+            self.breaks.push(format!(
+                "OutstandingWork: {peer:?} session {session_id}'s publisher holds {size} {row}, \
+                 past its {bound}"
+            ));
         }
     }
 
@@ -459,38 +1048,33 @@ impl Outstanding {
                 ));
             }
         }
-        for slot in &self.slots {
-            if let Some(phase) = slot.phase {
-                if !self
-                    .rounds
-                    .contains_key(&(slot.peer.clone(), slot.incarnation))
-                {
-                    found.push(format!(
-                        "holds an active slot for {:?} round {}, which isn't a started, \
-                         unreleased round",
-                        slot.peer, slot.incarnation
-                    ));
-                }
-                let local_repair = slot.repair
-                    && matches!(
-                        phase,
-                        HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying
-                    );
-                if !local_repair && self.admitted.get(&slot.peer) != Some(&slot.session_id) {
-                    found.push(format!(
-                        "holds a {phase:?} slot for {:?} session {}, which isn't admitted \
-                         and isn't a repair's local operation",
-                        slot.peer, slot.session_id
-                    ));
-                }
+        // A slot's lifetime is the round-life properties' (the plan's rule
+        // partition): a round retired while the queue holds it is its
+        // retirement reason's. An obsolete one's is reset-invalidates-work's,
+        // and a departure's, timeout's or shutdown's peer-retirement-
+        // progress's, so a slot kept past its round's release breaks here
+        // only for any other reason.
+        for slot in self.slots.iter().filter(|slot| slot.phase.is_some()) {
+            let Some(Some(reason)) = self.released.get(&(slot.peer.clone(), slot.incarnation))
+            else {
                 continue;
-            }
-            if self.admitted.get(&slot.peer) != Some(&slot.session_id) {
+            };
+            let owned_elsewhere = matches!(
+                reason,
+                HeaderRequestTerminal::SnapshotObsolete
+                    | HeaderRequestTerminal::Disconnected
+                    | HeaderRequestTerminal::SessionReplaced
+                    | HeaderRequestTerminal::TimedOut
+                    | HeaderRequestTerminal::Shutdown
+            );
+            if !owned_elsewhere {
                 found.push(format!(
-                    "holds an unstarted slot for {:?} session {}, which isn't admitted",
-                    slot.peer, slot.session_id
+                    "holds a slot for {:?}'s round {}, which the queue released as {reason:?}",
+                    slot.peer, slot.incarnation
                 ));
             }
+        }
+        for slot in self.slots.iter().filter(|slot| slot.phase.is_none()) {
             let reading = self
                 .calls
                 .values()

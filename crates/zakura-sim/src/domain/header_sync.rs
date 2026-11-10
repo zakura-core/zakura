@@ -422,7 +422,10 @@ where
                 entries, deadlines, closes, locator reads, storage calls, port futures, cached \
                 offers, supplier order, strikes and cooldowns stay within their production \
                 bounds, and every key kept for a peer or call names one that still has what \
-                the entry is for",
+                the entry is for; the serving side's publishers, subscriber cursors, \
+                publication containers, serving budgets, serving peer budgets and retained \
+                paths stay within theirs and match their owners' facts, and no publisher \
+                outlives its session's cancellation",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -442,7 +445,8 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let expected = "the reactor's containers stay within their bounds and keep only live keys";
+    let expected = "the reactor's and the serving side's containers stay within their bounds \
+                    and keep only live keys, and no publisher outlives its session";
     let mut breaks = view
         .claims()
         .at(step, &[Claim::OutstandingWork])
@@ -955,6 +959,23 @@ pub fn teardown_end_violations(rounds: &SettlementEvidence) -> Vec<EndViolation>
         })
         .into_iter()
         .collect()
+}
+
+/// [`OUTSTANDING_WORK_BOUNDED`]'s end check: a run that came to rest has
+/// no publisher task still running for a session that ended.
+pub fn outstanding_end_violations(evidence: &OutstandingEvidence) -> Vec<EndViolation> {
+    let lingering = evidence.lingering_at_rest();
+    if lingering.is_empty() {
+        return Vec::new();
+    }
+    vec![EndViolation {
+        property: PropertyId::new(OUTSTANDING_WORK_BOUNDED),
+        expected: "a run at rest runs no publisher for a session that ended".to_owned(),
+        actual: format!(
+            "OutstandingWork: the run came to rest with publishers still running for the \
+             ended sessions {lingering:?}"
+        ),
+    }]
 }
 
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the queue released a

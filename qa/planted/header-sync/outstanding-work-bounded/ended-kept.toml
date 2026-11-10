@@ -1,0 +1,12 @@
+# Ending a due subscription releases its ledger entry and queues its
+# terminal outcome, but the publisher's state keeps the subscription. The
+# report right after the ending finds the state holding a subscription the
+# ledger's own facts ended. The reactor, the subscriber and the publisher
+# decide when the witness's subscriptions end, so a change there can move
+# the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

@@ -15,6 +15,27 @@ use crate::zakura::{Frame, FrameGuard, FramedSend, ZakuraPeerId, FRAME_HEADER_BY
 pub(crate) struct Push {
     capacity: ServeCapacity,
     peer: PeerBudgets,
+    /// The pushing peer, for the capacity's acquisition report.
+    #[cfg(any(test, zakura_sim))]
+    peer_id: ZakuraPeerId,
+}
+
+/// The serving budgets in use, as [`Push::in_use`] reads them.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServeInUse {
+    /// Node execution slots held.
+    pub node_execution: usize,
+    /// The peer's execution slots held.
+    pub peer_execution: usize,
+    /// Node output response slots held.
+    pub node_responses: usize,
+    /// The peer's output response slots held.
+    pub peer_responses: usize,
+    /// Node output bytes granted.
+    pub node_output: u64,
+    /// The peer's output bytes granted.
+    pub peer_output: u64,
 }
 
 /// Capacity for one pushed frame.
@@ -32,11 +53,28 @@ impl ServeCapacity {
         Push {
             capacity: self.clone(),
             peer: self.peer(peer),
+            #[cfg(any(test, zakura_sim))]
+            peer_id: peer.clone(),
         }
     }
 }
 
 impl Push {
+    /// The serving budgets in use now, the node's and this push's peer's:
+    /// execution slots, output response slots and output bytes, read with
+    /// no simulator preemption point.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn in_use(&self) -> ServeInUse {
+        ServeInUse {
+            node_execution: self.capacity.node_execution.peek_reserved(),
+            peer_execution: self.peer.execution.peek_reserved(),
+            node_responses: self.capacity.node_output_responses.peek_reserved(),
+            peer_responses: self.peer.output_responses.peek_reserved(),
+            node_output: self.capacity.node_output.peek_granted(),
+            peer_output: self.peer.output.peek_granted(),
+        }
+    }
+
     /// Wait for output for a frame of `payload_len` bytes and for execution
     /// slots. Cancelling the wait takes nothing.
     pub(crate) async fn acquire(&self, payload_len: usize) -> PushPermit {
@@ -47,20 +85,28 @@ impl Push {
             delayed("peer_output_responses")
         })
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         let node_response = wait(self.capacity.node_output_responses.reserve(), || {
             delayed("node_output_responses")
         })
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         let peer_output = &self.peer.output;
         let node_output = &self.capacity.node_output;
         let peer = wait(peer_output.grant(peer_output.clamp(bytes)), || {
             delayed("peer_output")
         })
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         let node = wait(node_output.grant(node_output.clamp(bytes)), || {
             delayed("node_output")
         })
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         let grants = ResponseGrants {
             _node: node,
             _node_response: node_response,
@@ -83,11 +129,25 @@ impl Push {
     pub(crate) async fn execution(&self) -> ExecutionSlots {
         let delayed = |bound| self.capacity.metrics.delayed(bound);
         let peer = wait(self.peer.execution.reserve(), || delayed("peer_execution")).await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         let node = wait(self.capacity.node_execution.reserve(), || {
             delayed("node_execution")
         })
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.report_acquired();
         ExecutionSlots::new(peer, node, self.peer.clone())
+    }
+
+    /// Tells the capacity's acquisition report the budgets in use, right
+    /// after this push took one of them, so an excess shows even if the
+    /// push is cancelled waiting for the next.
+    #[cfg(any(test, zakura_sim))]
+    fn report_acquired(&self) {
+        if let Some(reports) = &self.capacity.reports {
+            (reports.acquired)(&self.peer_id, self.in_use());
+        }
     }
 }
 

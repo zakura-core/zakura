@@ -53,6 +53,10 @@ mod cadence;
 pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend};
 
 mod serve;
+#[cfg(any(test, zakura_sim))]
+pub use serve::ServeInUse;
+#[cfg(any(test, zakura_sim))]
+pub(crate) use serve::ServeReports;
 pub(crate) use serve::{
     Completion, CompletionId, Completions, ExecutionSlots, OutputOrder, Produce, Push, PushPermit,
     PushSend, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,

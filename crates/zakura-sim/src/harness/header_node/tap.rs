@@ -740,9 +740,43 @@ impl HeaderSyncObserver for TapAccounting {
     fn observe(&self, event: ReactorEvent) {
         self.0.record(event);
     }
+
+    /// [`TapState::session_cancel`].
+    fn session_cancel(
+        &self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        cancel: zakura_rt::sync::CancellationToken,
+    ) {
+        self.0.session_cancel(peer, session_id, cancel);
+    }
 }
 
 impl TapState {
+    /// Hands the outstanding-work rule `cancel`, the token that cancels
+    /// `peer`'s session `session_id`, or refuses it outside the tap's run.
+    fn session_cancel(
+        &self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        cancel: zakura_rt::sync::CancellationToken,
+    ) {
+        if zakura_rt::sim::run_id() != Some(self.run) {
+            return;
+        }
+        if let Some(outstanding) = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            // A child token, cancelled with the session's, so the tap holds
+            // no clone that would keep the session token's pending hooks
+            // alive past its last owner.
+            outstanding.session_cancel(peer, session_id, cancel.child_token());
+        }
+    }
+
     /// Buffers `event` with the port's last fact, or refuses it outside the
     /// tap's run. Neither step yields.
     fn record(self: &Arc<Self>, event: ReactorEvent) {
@@ -800,10 +834,12 @@ impl TapState {
             }
         }
         // Budget changes, credit and built closes, causes, headroom waits,
-        // deferred passes, taken events, watch reads, the reactor's sizes and
-        // completed targets, the queue's slots and cursor claims and
-        // acceptances stay out of the log, whose format pinned Plans fix, and
-        // a teardown's returns after the run are expected.
+        // deferred passes, taken events, watch reads, the reactor's and the
+        // service's sizes, completed targets, publisher starts and ends, the
+        // queue's slots, cursor claims and acceptances and the subscriber's
+        // and publisher's containers and the serving reports stay out of the
+        // log, whose format pinned Plans fix, and a teardown's returns after
+        // the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -815,6 +851,15 @@ impl TapState {
                 | ReactorEvent::WatchObserved { .. }
                 | ReactorEvent::Slots { .. }
                 | ReactorEvent::Sizes { .. }
+                | ReactorEvent::ServiceSizes { .. }
+                | ReactorEvent::SubscriberServing { .. }
+                | ReactorEvent::PublisherServing { .. }
+                | ReactorEvent::PublicationChanged { .. }
+                | ReactorEvent::SessionAtCapacity { .. }
+                | ReactorEvent::ServingPeers { .. }
+                | ReactorEvent::ServingAcquired { .. }
+                | ReactorEvent::PublisherStarted { .. }
+                | ReactorEvent::PublisherEnded { .. }
                 | ReactorEvent::TargetCompleted { .. }
                 | ReactorEvent::CursorsAccepted { .. }
                 | ReactorEvent::CursorClaimed { .. }
@@ -1181,6 +1226,17 @@ impl ReactorTap {
             wake.storage(fact);
         }
         drop(wake);
+        if let Some(outstanding) = self
+            .state
+            .outstanding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (_, fact) in &facts {
+                outstanding.storage(fact);
+            }
+        }
         if let Some(rounds) = self
             .state
             .round_life

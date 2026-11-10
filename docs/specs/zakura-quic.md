@@ -419,12 +419,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
   ignores attempts once shutdown starts.
 
-  Inbound peers get three quarters of Zakura's `max_connections` and
-  `max_pending_handshakes` caps, rounded up: 69 connections and 24
-  handshakes at the defaults. The acceptor refuses once inbound connections
+  Inbound peers get Zakura's `max_connections` and `max_pending_handshakes`
+  caps less an outbound reserve of a quarter, rounded down but at least one
+  slot once a cap is 2 or more: 69 connections and 24 handshakes at the
+  defaults. The acceptor refuses once inbound connections
   fill their share. Rule 4 also counts `pending_total` with the inbound control
-  handshakes against the inbound handshake share. The rest of each cap, a
-  quarter rounded down, stays free for this node's dials, so peers that dial
+  handshakes against the inbound handshake share. The reserve stays free for
+  this node's dials, so peers that dial
   in can't take the capacity its own peers need. Dials may still use any free
   slot. Zakura has no IP ban list yet, so
   rule 1 never fires.
@@ -1435,9 +1436,9 @@ eclipse resistance.
 
 Changed:
 
-- **ADM-3.** Inbound connections and inbound handshakes each get three
-  quarters of Zakura's cap, rounded up. A quarter, rounded down, stays for
-  dials. Bitcoin Core, geth, reth and Zebra all bound inbound below the total
+- **ADM-3.** Inbound connections and inbound handshakes each get Zakura's
+  cap less a quarter, rounded down but at least one slot once the cap is 2
+  or more. That reserve stays for dials. Bitcoin Core, geth, reth and Zebra all bound inbound below the total
   in the same way.
 - **§16.** Adds the inbound share test.
 

@@ -9,11 +9,11 @@ mod support;
 use support::inputs;
 use zakura_sim::{
     domain::{
-        block_sync::TEARDOWN_RETURNS_BASELINE,
+        block_sync::TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
         block_sync_semantic::{SemanticModel, FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED},
         cross::{
             EpochHistory, BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK,
-            TIPS_CONSISTENT,
+            TEARDOWN_RETURNS_BASELINE, TIPS_CONSISTENT,
         },
     },
     harness::{
@@ -176,8 +176,10 @@ fn a_reorg_at_each_pipeline_stage_retires_old_epoch_work() {
 /// its first needed-block query, and while it holds its second body's apply.
 /// Each held operation completes after the shutdown. Once both settle,
 /// `block-sync/teardown-returns-baseline` holds: no block-sync charge
-/// remains, session slots included. Neither storage holds an operation of
-/// the node's at the end, and no active property is violated.
+/// remains, session slots included. `sync/teardown-returns-baseline` holds
+/// too: header sync's tap saw its teardown settle, with no reservation,
+/// lease, budget charge or locator permit left. Neither storage holds an
+/// operation of the node's at the end, and no active property is violated.
 #[test]
 fn teardown_across_held_work_returns_baseline() {
     let committed = Plan::from_fuzz(&[]);
@@ -185,6 +187,7 @@ fn teardown_across_held_work_returns_baseline() {
         for input in std::iter::once(committed.clone()).chain(inputs(4, 256)) {
             let (report, ports) = run_with_ports(saved, input);
             assert_eq!(report.end.violation, None, "{}", saved.name());
+            applicable_and_held(&report, BLOCK_TEARDOWN_RETURNS_BASELINE);
             applicable_and_held(&report, TEARDOWN_RETURNS_BASELINE);
             assert_eq!(ports.port.pending(), Vec::new(), "{}", saved.name());
             assert_eq!(ports.service.pending(), Vec::new(), "{}", saved.name());

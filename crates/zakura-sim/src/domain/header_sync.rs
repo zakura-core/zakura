@@ -208,7 +208,7 @@ where
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
 /// round-level case relies on that.
-fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+pub(crate) fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: TeardownView,

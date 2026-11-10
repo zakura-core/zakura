@@ -244,6 +244,7 @@ impl Subsystem for SyncWire {
         sim.add_source(Box::new(net.clone()));
         let (actors, predicates) = spawn_actors(sim, &scenario.sync, &ports);
         let view = actors.view.clone();
+        let header = actors.header.clone();
         let names: Vec<String> = (0..scenario.sync.mirrors.len())
             .map(|index| format!("mirror-{index}"))
             .collect();
@@ -329,6 +330,7 @@ impl Subsystem for SyncWire {
             view: SyncView {
                 block: view,
                 cross: ports.cross,
+                header,
             },
             replies: ports.replies,
             _topology: topology,

@@ -979,6 +979,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("stream-scoped-session-ids"),
     },
     Coverage {
+        property: crate::domain::cross::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "teardown_across_held_work_returns_baseline",
+        ),
+        bypass: Bypass::Planted("leaked-reservation-entry"),
+    },
+    Coverage {
         property: crate::domain::session::STALLED_SERVICE_ISOLATED,
         passing: passes(
             "tests/sync_wire.rs",

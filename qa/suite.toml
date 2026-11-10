@@ -473,12 +473,6 @@ kind = "property"
 owner = "P8b"
 plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
 
-[[pending]]
-id = "sync/teardown-returns-baseline"
-kind = "property"
-owner = "P8d"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
 # The protocol-state features of the G1–G3 plan's feature table, whose
 # first eight rows campaign.md's generator coverage map repeats. G2a and G2b
 # add the actions that reach them, and E2b collects them as fuzzer feedback.

@@ -1507,7 +1507,7 @@ where
 /// not a violation. `receiver-serving-bounded` catches a leaked serving
 /// lease. A serving lease gap leaves settlement unknown, so it is missing
 /// evidence.
-fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+pub(crate) fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {

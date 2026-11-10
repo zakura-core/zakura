@@ -72,6 +72,11 @@ use super::{
     },
     header_node::{
         self,
+        capacity::CapacityEvidence,
+        claim::{ClaimEvidence, SettlementEvidence},
+        reservation::ReservationEvidence,
+        session::SessionEvidence,
+        stale::StaleEvidence,
         tap::{ReactorTap, TapShutdown},
         DispatchFlag, HeaderNode, LINK_DEPTH,
     },
@@ -90,6 +95,7 @@ use crate::{
             QUERY_WORK_AUTHORIZED,
         },
         cross::{self, CrossModel, CrossView, Dag, ViewSample},
+        header_sync::TeardownView,
     },
     property::{Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status},
     storage::HEADER_SERVICE,
@@ -860,6 +866,30 @@ pub struct SyncView {
     pub block: Rc<RefCell<BlockSyncView>>,
     /// The cross properties' model.
     pub cross: Rc<RefCell<CrossModel>>,
+    /// The node's header-sync settlement, as its reactor tap keeps it.
+    pub header: HeaderSettlement,
+}
+
+/// The node's header-sync settlement evidence: the claim rules its reactor
+/// tap found broken, and its released rounds and own teardown at each
+/// drain. The tap reads the reactor's resource probe, so the teardown half
+/// covers the chunk budget and the locator permits.
+#[derive(Clone, Default)]
+pub struct HeaderSettlement {
+    claims: ClaimEvidence,
+    rounds: SettlementEvidence,
+}
+
+impl TeardownView for SyncView {
+    /// The header reactor's broken claim rules.
+    fn claims(&self) -> &ClaimEvidence {
+        &self.header.claims
+    }
+
+    /// The header reactor's released rounds and teardown.
+    fn rounds(&self) -> &SettlementEvidence {
+        &self.header.rounds
+    }
 }
 
 impl SemanticView for SyncView {
@@ -1008,6 +1038,7 @@ impl Subsystem for SyncStorage {
     fn build(sim: &mut Sim, scenario: &SyncScenario, ports: SyncPorts) -> Self {
         let (actors, predicates) = spawn_actors(sim, scenario, &ports);
         let view = actors.view.clone();
+        let header = actors.header.clone();
         let topology = Rc::new(SyncTopology::new(
             actors,
             scenario,
@@ -1026,6 +1057,7 @@ impl Subsystem for SyncStorage {
             view: SyncView {
                 block: view,
                 cross: ports.cross,
+                header,
             },
             replies: ports.replies,
             _topology: topology,
@@ -1059,6 +1091,8 @@ pub(crate) struct Actors {
     pub(crate) nodes: Vec<SyncNode>,
     /// The node's block-sync view, as its tap folds it.
     pub(crate) view: Rc<RefCell<BlockSyncView>>,
+    /// The node's header-sync settlement, as its reactor tap keeps it.
+    pub(crate) header: HeaderSettlement,
     wire: Wire,
     header_tap: TapShutdown,
     block_tap: TapTeardown,
@@ -1081,7 +1115,21 @@ pub(crate) fn spawn_actors(
         scenario.header_policy.clone(),
         header_node::Effects::default(),
     );
-    let (header_observer, header_tap) = ReactorTap::new(sim, &ports.port, "node");
+    let rounds = SettlementEvidence::default();
+    let (header_observer, header_tap) = ReactorTap::with_evidence(
+        sim,
+        &ports.port,
+        "node",
+        SessionEvidence::default(),
+        ReservationEvidence::default(),
+        CapacityEvidence::default(),
+        rounds.clone(),
+        StaleEvidence::default(),
+    );
+    let header = HeaderSettlement {
+        claims: header_tap.claims(),
+        rounds,
+    };
     let header_shutdown = header_tap.shutdown();
     sim.add_source(Box::new(header_storage.with_tap(header_tap)));
     // The block side.
@@ -1195,6 +1243,7 @@ pub(crate) fn spawn_actors(
         Actors {
             nodes,
             view,
+            header,
             wire,
             header_tap: header_shutdown,
             block_tap: block_teardown,
@@ -1228,6 +1277,7 @@ pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>>
     properties.extend(resource_properties());
     properties.extend(semantic_properties());
     properties.extend(cross::storage_properties());
+    properties.extend(cross::teardown_properties());
     properties
 }
 
@@ -1358,9 +1408,10 @@ impl SavedSync {
                 (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
             ],
             SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, "holds")],
-            SavedSync::TeardownQuery | SavedSync::TeardownSubmission => {
-                &[(BLOCK_TEARDOWN_RETURNS_BASELINE, "holds")]
-            }
+            SavedSync::TeardownQuery | SavedSync::TeardownSubmission => &[
+                (BLOCK_TEARDOWN_RETURNS_BASELINE, "holds"),
+                (cross::TEARDOWN_RETURNS_BASELINE, "holds"),
+            ],
         }
     }
 

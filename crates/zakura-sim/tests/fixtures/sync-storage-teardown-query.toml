@@ -11,3 +11,7 @@ source = "crates/zakura-sim/tests/sync_harness.rs"
 [[witness]]
 property = "block-sync/teardown-returns-baseline"
 expect = "holds"
+
+[[witness]]
+property = "sync/teardown-returns-baseline"
+expect = "holds"

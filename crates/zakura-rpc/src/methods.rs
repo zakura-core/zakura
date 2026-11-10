@@ -124,7 +124,7 @@ use types::{
             NEW_TIP_MEMPOOL_WAIT, ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
-        trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
+        trace::{next_request_id, BuildTimes, MiningTemplateTrace, NewTipMempool, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse,
     },
@@ -1649,31 +1649,50 @@ where
     /// template, so the mempool never delays work on a new tip by more than that wait.
     async fn populated_mempool_on_new_tip(
         &self,
+        request_id: u64,
         tip_hash: block::Hash,
     ) -> Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)> {
         let mempool_fetch =
             types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
 
-        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_fetch).await {
+        let started = std::time::Instant::now();
+        let (outcome, populated_mempool) = match tokio::time::timeout(
+            NEW_TIP_MEMPOOL_WAIT,
+            mempool_fetch,
+        )
+        .await
+        {
             Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
-                Some((transactions, dependencies))
+                (NewTipMempool::Populated, Some((transactions, dependencies)))
             }
-            Ok(Ok(_empty_or_on_an_older_tip)) => None,
+            Ok(Ok(Some(_no_transactions))) => (NewTipMempool::Empty, None),
+            Ok(Ok(None)) => (NewTipMempool::OlderTip, None),
             Ok(Err(error)) => {
                 tracing::debug!(
-                    ?error,
-                    "mempool request failed on a new tip; answering with the coinbase-only template"
-                );
-                None
+                        ?error,
+                        "mempool request failed on a new tip; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::Failed, None)
             }
             Err(_elapsed) => {
                 tracing::debug!(
-                    ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
-                );
-                None
+                        ?NEW_TIP_MEMPOOL_WAIT,
+                        "mempool did not answer in time on a new tip; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::TimedOut, None)
             }
-        }
+        };
+        self.gbt.trace.new_tip_mempool(
+            request_id,
+            tip_hash,
+            outcome,
+            populated_mempool
+                .as_ref()
+                .map_or(0, |(transactions, _)| transactions.len()),
+            started.elapsed(),
+        );
+
+        populated_mempool
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template
@@ -3679,9 +3698,17 @@ where
                             && coinbase_needs_proof(&self.network, next_height, miner_params, None)
                                 .map_misc_error()?;
                         let populated_mempool = if coinbase_has_head_start {
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::Skipped,
+                                0,
+                                Duration::ZERO,
+                            );
                             None
                         } else {
-                            self.populated_mempool_on_new_tip(tip_hash).await
+                            self.populated_mempool_on_new_tip(request_id, tip_hash)
+                                .await
                         };
 
                         let Some(populated_mempool) = populated_mempool else {

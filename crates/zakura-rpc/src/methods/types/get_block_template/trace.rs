@@ -1,8 +1,9 @@
 //! The `mining_template` JSONL trace table.
 //!
 //! Each `getblocktemplate` call gets a process-wide `request_id`. A long poll that sees a new
-//! tip writes `gbt_tip_woke` and then `gbt_empty_returned` for the coinbase-only template it
-//! returns. Every other template a call returns writes `gbt_full_returned`.
+//! tip writes `gbt_tip_woke`, then `gbt_new_tip_mempool` for the one mempool request it makes
+//! there, and then either `gbt_empty_returned` for the coinbase-only template or
+//! `gbt_full_returned`. Every other template a call returns writes `gbt_full_returned`.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -40,6 +41,24 @@ pub(crate) enum WaitReason {
     MaxTime,
 }
 
+/// What the mempool offered for a long poll's first answer on a new tip.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NewTipMempool {
+    /// The mempool was on the new tip and held transactions.
+    Populated,
+    /// The mempool was on the new tip and held no transactions.
+    Empty,
+    /// The mempool had not processed the new tip's block yet.
+    OlderTip,
+    /// The mempool did not answer within the wait.
+    TimedOut,
+    /// The mempool request failed.
+    Failed,
+    /// The mempool was not asked, because a shielded coinbase was built in advance.
+    Skipped,
+}
+
 /// How long one template build waited to start, and how long it ran.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BuildTimes {
@@ -58,6 +77,14 @@ enum MiningTemplateEvent<'a> {
         request_id: u64,
         tip_height: u32,
         tip_hash: JsonlDisplay<'a, block::Hash>,
+    },
+    #[serde(rename = "gbt_new_tip_mempool")]
+    NewTipMempool {
+        request_id: u64,
+        tip_hash: JsonlDisplay<'a, block::Hash>,
+        outcome: NewTipMempool,
+        tx_count: u64,
+        wait_us: u64,
     },
     #[serde(rename = "gbt_empty_returned")]
     EmptyReturned {
@@ -97,6 +124,25 @@ impl MiningTemplateTrace {
             request_id,
             tip_height: tip_height.0,
             tip_hash: JsonlDisplay(&tip_hash),
+        });
+    }
+
+    /// Records what the mempool offered request `request_id` for its first answer on the new
+    /// tip `tip_hash`: the `outcome`, the number of transactions, and how long the request waited.
+    pub(crate) fn new_tip_mempool(
+        &self,
+        request_id: u64,
+        tip_hash: block::Hash,
+        outcome: NewTipMempool,
+        tx_count: usize,
+        wait: Duration,
+    ) {
+        self.0.emit_event(|| MiningTemplateEvent::NewTipMempool {
+            request_id,
+            tip_hash: JsonlDisplay(&tip_hash),
+            outcome,
+            tx_count: saturating_count(tx_count),
+            wait_us: saturating_micros(wait),
         });
     }
 

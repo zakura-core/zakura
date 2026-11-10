@@ -4078,7 +4078,7 @@ async fn template_trace_records_the_tip_to_template_path() {
             serde_json::from_slice(&written.line).expect("each trace row is JSON");
         rows.push(row);
     }
-    assert_eq!(rows.len(), 5, "{rows:#?}");
+    assert_eq!(rows.len(), 7, "{rows:#?}");
 
     let full = &rows[0];
     assert_eq!(full["event"], "gbt_full_returned");
@@ -4090,11 +4090,17 @@ async fn template_trace_records_the_tip_to_template_path() {
         assert!(full[field].is_u64(), "{field}: {full}");
     }
 
-    for (rows, template) in [(&rows[1..3], &woken), (&rows[3..5], &stale)] {
-        let (woke, empty) = (&rows[0], &rows[1]);
+    for (rows, template) in [(&rows[1..4], &woken), (&rows[4..7], &stale)] {
+        let (woke, mempool, empty) = (&rows[0], &rows[1], &rows[2]);
         assert_eq!(woke["event"], "gbt_tip_woke");
         assert_eq!(woke["tip_height"], new_height.0);
         assert_eq!(woke["tip_hash"], new_tip.to_string());
+        assert_eq!(mempool["event"], "gbt_new_tip_mempool");
+        assert_eq!(mempool["request_id"], woke["request_id"]);
+        assert_eq!(mempool["tip_hash"], new_tip.to_string());
+        assert_eq!(mempool["outcome"], "older_tip");
+        assert_eq!(mempool["tx_count"], 0);
+        assert!(mempool["wait_us"].is_u64(), "{mempool}");
         assert_eq!(empty["event"], "gbt_empty_returned");
         assert_eq!(empty["request_id"], woke["request_id"]);
         assert_ne!(empty["request_id"], full["request_id"]);
@@ -4104,7 +4110,7 @@ async fn template_trace_records_the_tip_to_template_path() {
         assert!(empty["build_us"].is_u64(), "{empty}");
         assert!(template.transactions.is_empty());
     }
-    assert_ne!(rows[1]["request_id"], rows[3]["request_id"]);
+    assert_ne!(rows[1]["request_id"], rows[4]["request_id"]);
 }
 
 #[tokio::test]

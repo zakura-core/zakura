@@ -358,8 +358,8 @@ const RESOURCE_PROBE: &str = "the header resource probe's handles, which a bound
 /// `cfg(zakura_sim)`, and read only inside a boundary read, which
 /// `zakura_rt`'s `Weak::upgrade` would fail with its preemption point.
 const TRANSPORT_PROBE: &str = "a transport probe's handles to a connection's gates and \
-     load, which a boundary read upgrades and so must take no scheduling point, not code \
-     under test";
+     load: a simulated run's boundary read upgrades them, so they must take no scheduling \
+     point, and they are harness code, not code under test";
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 

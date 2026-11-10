@@ -49,8 +49,9 @@ whose target has no harness or no campaign.
 - `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
   simulated QUIC behind real handlers, so header sync, block sync and
   discovery share each connection. Its two-byte prefix picks a saved
-  scenario, or fuzz-13's combined actions: the mirrors' fork at one stage
-  of the block pipeline, a connection replacement, and a read stall. Its
+  scenario (`0xFC`), fuzz-13's combined actions (`0xFB`, then a byte of
+  actions: the mirrors' fork at one stage of the block pipeline, a
+  connection replacement, and a read stall), or the honest scenario. Its
   committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.

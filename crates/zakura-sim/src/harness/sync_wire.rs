@@ -370,7 +370,7 @@ impl Subsystem for SyncWire {
     }
 
     /// The saved scenario `prefix` tags ([`SavedWire::from_tag`]), or the
-    /// combination of actions an untagged prefix picks ([`combined`]).
+    /// scenario [`combined`] decodes from it.
     fn draw(prefix: &[u8]) -> SyncWireScenario {
         SavedWire::from_tag(prefix).map_or_else(|| combined(prefix), SavedWire::scenario)
     }
@@ -455,8 +455,7 @@ impl SavedWire {
         }
     }
 
-    /// The scenario of an empty input: [`SavedWire::Honest`]'s, which
-    /// [`combined`] picks with no action.
+    /// The scenario of an untagged input: [`SavedWire::Honest`]'s.
     pub fn default_scenario() -> SyncWireScenario {
         SavedWire::Honest.scenario()
     }
@@ -514,42 +513,49 @@ impl SavedWire {
     }
 }
 
-/// Curated untagged prefixes for the `sync_wire` fuzz target's seeds, each
-/// a combination of [`combined`]'s actions, by name. Each has a committed
-/// input under `tests/fixtures/sync-wire-<name>.bin`.
+/// Curated combinations for the `sync_wire` fuzz target's seeds, each a
+/// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a
+/// committed input under `tests/fixtures/sync-wire-<name>.bin`.
 pub const CURATED: [(&str, [u8; 2]); 3] = [
     // The fork while storage holds a submission, and the node's
     // connection to mirror-1 replaced once storage admits two bodies.
-    ("combined-reorg-submit-replace", [0b0_1100, 0b011]),
-    // The fork while storage holds a needed-block query, with mirror-0's
+    ("combined-reorg-submit-replace", [COMBINED_TAG, 0b0110_1100]),
+    // The fork while storage holds a needed-block query, and mirror-0's
     // connection replaced once storage admits one body.
-    ("combined-reorg-query-replace", [0b0_1010, 0]),
+    ("combined-reorg-query-replace", [COMBINED_TAG, 0b0000_1010]),
     // Mirror-0's connection replaced once storage admits one body, with
     // every read stalled.
-    ("combined-replace-stall", [0b1_1000, 0]),
+    ("combined-replace-stall", [COMBINED_TAG, 0b0001_1000]),
 ];
 
-/// The scenario an untagged two-byte prefix picks: fuzz-13's combined
-/// actions on [`SavedWire::Honest`]'s mirrors. The first byte's bits pick
-/// the actions, and the second byte their parameters.
+/// The first byte of a prefix that picks fuzz-13's combined actions
+/// ([`combined`]). Other untagged prefixes pick [`SavedWire::Honest`], so a
+/// campaign's random inputs stay on the honest scenario's schedule.
+pub const COMBINED_TAG: u8 = 0xFB;
+
+/// The scenario a prefix picks when it tags no saved scenario: fuzz-13's
+/// combined actions on [`SavedWire::Honest`]'s mirrors if its first byte is
+/// [`COMBINED_TAG`], or [`SavedWire::Honest`]'s scenario. The second
+/// byte's bits pick the actions and their parameters, from the low bit:
 ///
-/// - The low three bits pick a chain change: none, the mirrors' fork once
-///   storage admits four bodies, or the fork while storage holds the node's
-///   work at one stage of the block pipeline, as `sync/storage`'s saved
-///   reorg scenarios hold it ([`SavedSync`]): a needed-block query, a
-///   mirror's range read, a submission, or a verdict. Values past those
-///   pick none.
+/// - Bits 0–2 pick a chain change: none, the mirrors' fork once storage
+///   admits four bodies, or the fork while storage holds the node's work at
+///   one stage of the block pipeline, as `sync/storage`'s saved reorg
+///   scenarios hold it ([`SavedSync`]): a needed-block query, a mirror's
+///   range read, a submission, or a verdict. Values past those pick none.
 /// - Bit 3 replaces a connection: it closes the node's connection to the
-///   mirror the second byte's low bit names once storage admits one to
-///   four bodies, as its next two bits say. The dialer redials it.
+///   mirror bit 5 names once storage admits one to four bodies, as bits 6–7
+///   say. The dialer redials it.
 /// - Bit 4 stalls every mirror's range reads for [`STALL_MS`].
 ///
 /// A service stream can't be replaced on its own connection: no `Control`
 /// action reaches a single stream on QUIC, so connection replacement stands
 /// in for it.
 pub fn combined(prefix: &[u8]) -> SyncWireScenario {
-    let actions = prefix.first().copied().unwrap_or(0);
-    let parameters = prefix.get(1).copied().unwrap_or(0);
+    let actions = match prefix {
+        [COMBINED_TAG, actions, ..] => *actions,
+        _ => return SavedWire::Honest.scenario(),
+    };
     let mut sync = match actions & 0b111 {
         1 => SavedSync::Reorg,
         2 => SavedSync::ReorgQuery,
@@ -560,8 +566,8 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
     }
     .scenario();
     if actions & 0b1000 != 0 {
-        let mirror = parameters & 1;
-        let admitted = 1 + u32::from((parameters >> 1) & 0b11);
+        let mirror = (actions >> 5) & 1;
+        let admitted = 1 + u32::from(actions >> 6);
         sync.control.push(SyncStep {
             action: SyncAction::Close {
                 peer: format!("mirror-{mirror}"),

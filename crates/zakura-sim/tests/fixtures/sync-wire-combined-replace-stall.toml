@@ -4,6 +4,6 @@
 # `sync_wire` fuzz target.
 harness = "sync/wire"
 generator = 2
-sha256 = "78a23af8da46b1b37e8767921a2d3f528fdc8eca37cea8aea775fd2b283d3776"
+sha256 = "4521c21e2b6700e8ad9684fcb3ee92c6824f76f089b1cd7808bfb01d478c95b4"
 scenario_sha256 = "d772eb4a95881812bcf4970d9675eda9b6e7cf9210ae70d469c98af400737d0a"
 source = "crates/zakura-sim/tests/sync_wire.rs"

@@ -263,9 +263,10 @@ name = "sync_storage"
 smoke-secs = 60
 timeout-secs = 1800
 
-# `sync/wire`'s two-byte prefix picks a saved scenario, or fuzz-13's
-# combined actions: a chain change at a pipeline stage, a connection
-# replacement and a read stall. The target fuzzes the schedule of each.
+# `sync/wire`'s two-byte prefix picks a saved scenario, fuzz-13's combined
+# actions (a chain change at a pipeline stage, a connection replacement and
+# a read stall), or the honest scenario. The target fuzzes the schedule of
+# each.
 [[target]]
 package = "sim"
 name = "sync_wire"

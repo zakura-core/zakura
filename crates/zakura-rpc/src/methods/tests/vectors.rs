@@ -4409,19 +4409,20 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         }
     };
 
-    let make_mock_mempool_request_handler = |transactions, last_seen_tip_hash| {
-        let mut mempool = mempool.clone();
-        async move {
-            mempool
-                .expect_request(mempool::Request::FullTransactions)
-                .await
-                .respond(mempool::Response::FullTransactions {
-                    transactions: transactions.into(),
-                    transaction_dependencies: Default::default(),
-                    last_seen_tip_hash,
-                });
-        }
-    };
+    let make_mock_mempool_request_handler =
+        |transactions: Vec<VerifiedUnminedTx>, last_seen_tip_hash| {
+            let mut mempool = mempool.clone();
+            async move {
+                mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await
+                    .respond(mempool::Response::FullTransactions {
+                        transactions: transactions.into(),
+                        transaction_dependencies: Default::default(),
+                        last_seen_tip_hash,
+                    });
+            }
+        };
 
     let get_block_template_fut = rpc.get_block_template(None);
     let (get_block_template, ..) = tokio::join!(

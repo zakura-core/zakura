@@ -344,7 +344,7 @@ fn populated_mining_rpc(
         let hash = mempool_info.borrow().tip_hash;
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![fake_verified_mempool_tx()],
+                transactions: vec![fake_verified_mempool_tx()].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: hash,
             })

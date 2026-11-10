@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "16.0.0"
+version = "16.0.1"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -64,7 +64,7 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "5.1.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "14.0.0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
@@ -80,7 +80,7 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
-zakura-node-services = { path = "../zakura-node-services", version = "5.1.0", features = ["test-support"] }
+zakura-node-services = { path = "../zakura-node-services", version = "6.0.0", features = ["test-support"] }
 tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2", features = ["test-support"] }

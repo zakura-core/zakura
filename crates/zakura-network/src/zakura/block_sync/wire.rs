@@ -219,6 +219,29 @@ pub(super) fn decode_block_payload(
     Ok((decode_block(&raw)?, raw))
 }
 
+/// [`decode_block_payload`], also keeping the decoded block's encoding, which
+/// shares the payload's allocation, when the block re-encodes to exactly those bytes.
+pub(super) fn decode_block_payload_keeping_encoding(
+    payload: Vec<u8>,
+) -> Result<(Arc<block::Block>, Arc<[u8]>, Option<block::BlockEncoding>), BlockSyncWireError> {
+    let raw = Arc::<[u8]>::from(payload.into_boxed_slice());
+    validate_payload_len(raw.len())?;
+    if raw.first() != Some(&MSG_BS_BLOCK) {
+        return Err(WireError::OutOfRange("a Block payload starts with its type").into());
+    }
+    let (block, encoding) =
+        block::BlockEncoding::decode(raw.clone(), BLOCK_SYNC_MESSAGE_TYPE_BYTES).map_err(
+            |error| match error {
+                zakura_chain::serialization::SerializationError::Parse(
+                    "trailing bytes after a block",
+                ) => BlockSyncWireError::TrailingBytes,
+                error => error.into(),
+            },
+        )?;
+    validate_encoded_block_len(raw.len() - BLOCK_SYNC_MESSAGE_TYPE_BYTES)?;
+    Ok((Arc::new(block), raw, encoding))
+}
+
 /// [`decode_block_payload`] for controlled storage, which decodes fixture
 /// payloads as a routine does.
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]

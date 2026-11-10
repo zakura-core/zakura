@@ -1,6 +1,6 @@
 use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
 use zakura_node_services::block_memory::{
-    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock,
+    Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, MeasuredBlock, OwnedBlock,
 };
 
 #[derive(Clone, Debug)]
@@ -477,7 +477,7 @@ impl BufferedBlockBody {
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
                 let block = pool
-                    .try_admit(decode_raw_frame_payload(payload), admission)
+                    .try_admit_measured(decode_raw_frame_payload(payload), admission)
                     .map_err(|rejected| DecodeRefusal {
                         reason: rejected.reason,
                         decoded_bytes: rejected.decoded_bytes,
@@ -503,9 +503,14 @@ pub(super) struct DecodeRefusal {
     pub(super) decoded_bytes: u64,
 }
 
-fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {
-    let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    block::Block::zcash_deserialize_from_slice(&mut reader).expect(
-        "raw block bytes deserialize because the peer routine decoded them before buffering",
-    )
+/// Decode the block in `payload`, keeping its encoding, which shares `payload`'s allocation.
+fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> MeasuredBlock {
+    let (block, encoding) =
+        block::BlockEncoding::decode(payload.clone(), BLOCK_SYNC_MESSAGE_TYPE_BYTES).expect(
+            "raw block bytes deserialize because the peer routine decoded them before buffering",
+        );
+    match encoding {
+        Some(encoding) => MeasuredBlock::with_encoding(block, encoding),
+        None => MeasuredBlock::new(block),
+    }
 }

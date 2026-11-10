@@ -45,7 +45,7 @@ use super::{
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration};
-use zakura_chain::block;
+use zakura_chain::{block, transaction};
 
 mod fill;
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -119,12 +119,9 @@ fn record_decoded_memory_size(decoded_attributed_memory_size_bytes: u64, seriali
 /// peer serves the block its header names, so a mismatch is unambiguous. It is
 /// checked before the body enters the pipeline, because a body of junk
 /// transactions can decode to many times the memory of the real block.
-fn transactions_match_header(block: &block::Block) -> bool {
-    let hashes: Vec<_> = block
-        .transactions
-        .iter()
-        .map(|transaction| transaction.hash())
-        .collect();
+///
+/// `hashes` are the block's transaction IDs in block order.
+fn transactions_match_header(block: &block::Block, hashes: &[transaction::Hash]) -> bool {
     let root: block::merkle::Root = hashes.iter().copied().collect();
     root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
@@ -141,11 +138,15 @@ enum FrameBodyReject {
 /// The checks a routine runs, in order, on a body decoded from a frame
 /// authorized for `height`.
 #[inline]
-fn check_frame_body(block: &block::Block, height: block::Height) -> Result<(), FrameBodyReject> {
+fn check_frame_body(
+    block: &block::Block,
+    height: block::Height,
+    transaction_hashes: &[transaction::Hash],
+) -> Result<(), FrameBodyReject> {
     if block.coinbase_height() != Some(height) {
         return Err(FrameBodyReject::CoinbaseHeight);
     }
-    if !transactions_match_header(block) {
+    if !transactions_match_header(block, transaction_hashes) {
         return Err(FrameBodyReject::Transactions);
     }
     Ok(())
@@ -162,7 +163,8 @@ pub fn routine_accepts_body(
     height: block::Height,
     expected: Option<block::Hash>,
 ) -> bool {
-    check_frame_body(block, height).is_ok() && check_requested_hash(expected, block.hash()).is_ok()
+    check_frame_body(block, height, &block.transaction_hashes()).is_ok()
+        && check_requested_hash(expected, block.hash()).is_ok()
 }
 
 fn header_hash_payload_mismatch(
@@ -637,27 +639,33 @@ impl PeerRoutine {
                 .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
         )
         .unwrap_or(u64::MAX);
-        let (block, raw_payload) = match super::wire::decode_block_payload(frame.payload) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                // A malformed body is `MalformedMessage` misbehavior AND a fatal
-                // protocol reject for the whole connection. Report via the shared
-                // channel, then reject; the report is best-effort and never blocks.
-                let protocol_error =
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                tracing::debug!(peer = ?self.io.peer, ?error, "malformed Zakura block-sync frame");
-                let _ = self
-                    .io
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::Misbehavior {
-                        peer: self.io.peer.clone(),
-                        reason: BlockSyncMisbehavior::MalformedMessage,
-                    });
-                return Err(SinkReject::protocol(protocol_error));
-            }
-        };
+        let (block, raw_payload, encoding) =
+            match super::wire::decode_block_payload_keeping_encoding(frame.payload) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    // A malformed body is `MalformedMessage` misbehavior AND a fatal
+                    // protocol reject for the whole connection. Report via the shared
+                    // channel, then reject; the report is best-effort and never blocks.
+                    let protocol_error =
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                    tracing::debug!(peer = ?self.io.peer, ?error, "malformed Zakura block-sync frame");
+                    let _ = self
+                        .io
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::Misbehavior {
+                            peer: self.io.peer.clone(),
+                            reason: BlockSyncMisbehavior::MalformedMessage,
+                        });
+                    return Err(SinkReject::protocol(protocol_error));
+                }
+            };
         self.trace_message_received("block");
-        match check_frame_body(&block, height) {
+        // Hashed once here: the verifier and state reuse these IDs.
+        let transaction_hashes = match &encoding {
+            Some(encoding) => encoding.transaction_hashes(&block),
+            None => block.transaction_hashes(),
+        };
+        match check_frame_body(&block, height, &transaction_hashes) {
             Ok(()) => {}
             Err(FrameBodyReject::CoinbaseHeight) => {
                 return Err(SinkReject::protocol(
@@ -684,6 +692,8 @@ impl PeerRoutine {
             previous_block_hash: block.header.previous_block_hash,
             block,
             raw_payload,
+            encoding,
+            transaction_hashes,
             serialized_bytes,
             permit,
         });
@@ -4165,7 +4175,11 @@ mod tests {
         cancel.cancel();
         let result = timeout(Duration::from_secs(1), running).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
-        Some((body.attributed_memory_size_bytes(), sequenced, queued))
+        Some((
+            crate::zakura::block_sync::tests::received_decoded_bytes(&body),
+            sequenced,
+            queued,
+        ))
     }
 
     /// Measure one native framed receipt per peer connection. Run manually in release mode.
@@ -4279,7 +4293,7 @@ mod tests {
                 matches!(block, BlockHandle::Owned(_)),
                 "the real frame decoder must retain an admitted owner"
             );
-            assert_eq!(block.attributed_memory_size_bytes(), pool.reserved_bytes());
+            assert_eq!(block.decoded_bytes(), pool.reserved_bytes());
             let retained = block.transaction(0).unwrap();
             let hash = retained.hash();
             drop(block);
@@ -4363,7 +4377,7 @@ mod tests {
                 .body
                 .decoded_block(&pool, Admission::PipelineExempt)
                 .unwrap();
-            assert_eq!(block.attributed_memory_size_bytes(), bytes);
+            assert_eq!(block.decoded_bytes(), bytes);
             assert_eq!(pool.pipeline_bytes(), bytes);
         }
     }

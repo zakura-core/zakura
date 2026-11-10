@@ -5251,7 +5251,7 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         seq.applying_decoded_attributed_memory_bytes(),
         block1
             .attributed_memory_size_bytes()
-            .saturating_add(block2.attributed_memory_size_bytes())
+            .saturating_add(received_decoded_bytes(&block2))
     );
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -5782,7 +5782,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         .iter()
         .chain(initial_submissions.iter().map(|(_, block)| block))
         .chain(std::iter::once(&block_402))
-        .map(|block| block.attributed_memory_size_bytes())
+        .map(|block| block.decoded_bytes())
         .sum();
     assert_eq!(pool.reserved_bytes(), held_bytes);
     drop(initial_submissions);
@@ -15685,4 +15685,18 @@ async fn sequencer_panic_closes_the_reactor_action_channel() {
     .await
     .expect("sequencer and reactor exit must close the driver action channel");
     drop(handle);
+}
+
+/// The decoded bytes a block charges when it is decoded from a received frame:
+/// its attributed size plus the received encoding it keeps.
+pub(super) fn received_decoded_bytes(block: &block::Block) -> u64 {
+    let bytes: Arc<[u8]> = block
+        .zcash_serialize_to_vec()
+        .expect("vec writes succeed")
+        .into();
+    let length = bytes.len();
+    let encoding = block::BlockEncoding::for_block(block, bytes, 0..length)
+        .expect("a block re-encodes to its own serialization");
+    zakura_node_services::block_memory::MeasuredBlock::with_encoding(block.clone(), encoding)
+        .bytes()
 }

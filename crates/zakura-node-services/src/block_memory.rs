@@ -42,12 +42,17 @@
 //! retention can never refuse the work that would let downstream stores release
 //! their blocks.
 
-use std::{fmt, io, num::NonZeroU64, ops::Deref, sync::Arc};
+use std::{
+    fmt, io,
+    num::NonZeroU64,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 use zakura_chain::{
-    block::{Block, BlockRef, Header},
+    block::{Block, BlockEncoding, BlockRef, Header},
     serialization::ZcashSerialize,
-    transaction::Transaction,
+    transaction::{self, Transaction},
 };
 use zakura_rt::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -135,19 +140,89 @@ impl From<ReadMemoryExhausted> for AdmissionFailure {
 }
 
 /// A decoded block and its attributed size, measured once when the block is
-/// wrapped. Only [`MeasuredBlock::new`] builds one, so the size always
-/// matches the block.
+/// wrapped. Only [`MeasuredBlock::new`] and [`MeasuredBlock::with_encoding`]
+/// build one, so the size always matches what the block retains.
 #[derive(Debug)]
 pub struct MeasuredBlock {
     block: Block,
     bytes: u64,
+    encoding: Option<BlockEncoding>,
+    transaction_hashes: Option<Arc<[transaction::Hash]>>,
 }
 
 impl MeasuredBlock {
     /// Measure `block`'s attributed size.
     pub fn new(block: Block) -> Self {
         let bytes = block.attributed_memory_size_bytes();
-        Self { block, bytes }
+        Self {
+            block,
+            bytes,
+            encoding: None,
+            transaction_hashes: None,
+        }
+    }
+
+    /// Measure `block` and keep `encoding`, the bytes it was decoded from, with it.
+    ///
+    /// The kept bytes count toward the attributed size, because the block keeps
+    /// them alive until its last handle drops.
+    ///
+    /// # Panics
+    ///
+    /// If `encoding` is not `block`'s encoding.
+    pub fn with_encoding(block: Block, encoding: BlockEncoding) -> Self {
+        assert_eq!(
+            encoding.transaction_count(),
+            block.transactions.len(),
+            "the encoding was built from this block"
+        );
+        // A block's encoding is at most a few megabytes, so its length fits in a u64.
+        let encoding_bytes = encoding.len() as u64;
+        let bytes = block
+            .attributed_memory_size_bytes()
+            .saturating_add(encoding_bytes);
+        Self {
+            block,
+            bytes,
+            encoding: Some(encoding),
+            transaction_hashes: None,
+        }
+    }
+
+    /// Every transaction's mined ID, computed once and kept with the block.
+    ///
+    /// Hashes pre-v5 transactions from the kept encoding when there is one.
+    pub fn transaction_hashes(&mut self) -> Arc<[transaction::Hash]> {
+        let block = &self.block;
+        let encoding = self.encoding.as_ref();
+        self.transaction_hashes
+            .get_or_insert_with(|| match encoding {
+                Some(encoding) => encoding.transaction_hashes(block),
+                None => block.transaction_hashes(),
+            })
+            .clone()
+    }
+
+    /// Keep `hashes`, the transaction IDs a caller already computed for this block.
+    ///
+    /// # Correctness
+    ///
+    /// `hashes` must be this block's transaction IDs in block order, as
+    /// [`BlockEncoding::transaction_hashes`] or [`BlockRef::transaction_hashes`]
+    /// return them. Debug builds check this.
+    pub fn with_transaction_hashes(mut self, hashes: Arc<[transaction::Hash]>) -> Self {
+        debug_assert_eq!(
+            hashes,
+            self.block.transaction_hashes(),
+            "the hashes were computed from this block"
+        );
+        self.transaction_hashes = Some(hashes);
+        self
+    }
+
+    /// The block, for checks that run before it is admitted.
+    pub fn block(&self) -> &Block {
+        &self.block
     }
 
     /// The attributed size measured when the block was wrapped.
@@ -240,6 +315,8 @@ impl DecodedBlockPool {
         }
         Ok(Some(OwnedBlock(Arc::new(RetainedBlock {
             block,
+            encoding: None,
+            transaction_hashes: OnceLock::new(),
             _retained: retained,
             bytes,
             charge,
@@ -282,7 +359,12 @@ impl DecodedBlockPool {
         block: MeasuredBlock,
         admission: Admission,
     ) -> Result<OwnedBlock, RejectedBlock> {
-        let MeasuredBlock { mut block, bytes } = block;
+        let MeasuredBlock {
+            mut block,
+            bytes,
+            encoding,
+            transaction_hashes,
+        } = block;
         if Arc::get_mut(&mut block.header).is_none()
             || block
                 .transactions
@@ -307,6 +389,8 @@ impl DecodedBlockPool {
         };
         Ok(OwnedBlock(Arc::new(RetainedBlock {
             block,
+            encoding,
+            transaction_hashes: transaction_hashes.map(OnceLock::from).unwrap_or_default(),
             _retained: None,
             bytes,
             charge,
@@ -542,6 +626,10 @@ impl Drop for Charge {
 struct RetainedBlock {
     // Fields drop in declaration order: payload destruction precedes settlement.
     block: Block,
+    /// The bytes the block was decoded from, if they were kept.
+    encoding: Option<BlockEncoding>,
+    /// Every transaction's mined ID, computed on first use.
+    transaction_hashes: OnceLock<Arc<[transaction::Hash]>>,
     _retained: Option<ByteLease>,
     bytes: u64,
     charge: Charge,
@@ -608,6 +696,22 @@ impl OwnedBlock {
     pub fn leave_pipeline(&self) {
         self.0.charge.leave_pipeline();
     }
+
+    /// The bytes this block was decoded from, if they were kept.
+    pub fn encoding(&self) -> Option<&BlockEncoding> {
+        self.0.encoding.as_ref()
+    }
+
+    /// Every transaction's mined ID, computed once for all of this block's handles.
+    pub fn transaction_hashes(&self) -> Arc<[transaction::Hash]> {
+        self.0
+            .transaction_hashes
+            .get_or_init(|| match &self.0.encoding {
+                Some(encoding) => encoding.transaction_hashes(&self.0.block),
+                None => self.0.block.transaction_hashes(),
+            })
+            .clone()
+    }
 }
 
 /// A retained block passed between verification, state, and readers.
@@ -640,6 +744,32 @@ impl BlockHandle {
     pub fn leave_pipeline(&self) {
         if let Self::Owned(block) = self {
             block.leave_pipeline();
+        }
+    }
+
+    /// The bytes this block was decoded from, if its owner kept them.
+    pub fn encoding(&self) -> Option<&BlockEncoding> {
+        match self {
+            Self::Shared(_) => None,
+            Self::Owned(block) => block.encoding(),
+        }
+    }
+
+    /// The block's serialized size: its kept encoding's length, or a sizing pass
+    /// over the block when no encoding was kept.
+    pub fn serialized_size(&self) -> usize {
+        match self.encoding() {
+            Some(encoding) => encoding.len(),
+            None => self.block().zcash_serialized_size(),
+        }
+    }
+
+    /// Every transaction's mined ID. An owned block computes them once for all its
+    /// handles; a shared block computes them on each call.
+    pub fn transaction_hashes(&self) -> Arc<[transaction::Hash]> {
+        match self {
+            Self::Shared(block) => block.transaction_hashes(),
+            Self::Owned(block) => block.transaction_hashes(),
         }
     }
 
@@ -1283,6 +1413,44 @@ mod tests {
 
     fn pipeline_pool(limit: u64) -> DecodedBlockPool {
         DecodedBlockPool::for_pipeline(NonZeroU64::new(8).unwrap(), limit)
+    }
+
+    /// A block admitted with its encoding keeps it, charges its bytes, and computes
+    /// its transaction IDs once for every handle.
+    #[test]
+    fn admitted_encoding_is_kept_and_charged() {
+        let block = block();
+        let bytes: Arc<[u8]> = block
+            .zcash_serialize_to_vec()
+            .expect("vec writes succeed")
+            .into();
+        let length = bytes.len();
+        let encoding =
+            zakura_chain::block::BlockEncoding::for_block(&block, bytes.clone(), 0..length)
+                .expect("the block re-encodes to its bytes");
+        let expected_hashes = block.transaction_hashes();
+        let decoded_bytes = block.attributed_memory_size_bytes();
+
+        let pool = byte_pool(u64::MAX);
+        let measured = MeasuredBlock::with_encoding(block, encoding);
+        assert_eq!(measured.bytes(), decoded_bytes + length as u64);
+        let owner = pool
+            .try_admit_measured(measured, Admission::WithinLimit)
+            .unwrap();
+        assert_eq!(pool.reserved_bytes(), decoded_bytes + length as u64);
+
+        let handle = BlockHandle::from(owner.clone());
+        assert_eq!(
+            handle.encoding().map(BlockEncoding::as_bytes),
+            Some(&bytes[..])
+        );
+        assert_eq!(handle.serialized_size(), length);
+        let first = handle.transaction_hashes();
+        assert_eq!(first, expected_hashes);
+        assert!(Arc::ptr_eq(&first, &owner.transaction_hashes()));
+
+        drop((handle, owner, first));
+        assert_eq!(pool.reserved_bytes(), 0);
     }
 
     /// `has_room_for` agrees with admission on the count and pipeline limits.

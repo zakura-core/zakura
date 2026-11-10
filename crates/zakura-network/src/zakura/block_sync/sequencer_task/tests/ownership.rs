@@ -408,7 +408,9 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         Arc::new(decode(BLOCK_MAINNET_2_BYTES.as_slice())),
     );
     let id = payloads.retained_ids().next().unwrap();
-    let size = decode(BLOCK_MAINNET_2_BYTES.as_slice()).attributed_memory_size_bytes();
+    let size = crate::zakura::block_sync::tests::received_decoded_bytes(&decode(
+        BLOCK_MAINNET_2_BYTES.as_slice(),
+    ));
     let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(4).unwrap(), size);
     let hold = |bytes: &[u8]| {
         pool.try_admit(decode(bytes), Admission::PipelineExempt)
@@ -724,7 +726,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     else {
         panic!("the commit-window body must submit");
     };
-    let decoded_bytes = submitted.attributed_memory_size_bytes();
+    let decoded_bytes = submitted.decoded_bytes();
     assert_eq!(
         task.state
             .sequencer()
@@ -780,7 +782,7 @@ async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submiss
     else {
         panic!("the body must submit");
     };
-    let decoded_bytes = submitted.attributed_memory_size_bytes();
+    let decoded_bytes = submitted.decoded_bytes();
     assert_eq!(
         view.borrow().applying_decoded_attributed_memory_bytes,
         decoded_bytes
@@ -807,7 +809,9 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
     use zakura_node_services::block_memory::Admission;
 
     let block = test_block();
-    let bytes = block.attributed_memory_size_bytes();
+    // The blocker is admitted without an encoding; the raw body keeps its own.
+    let blocker_bytes = block.attributed_memory_size_bytes();
+    let bytes = crate::zakura::block_sync::tests::received_decoded_bytes(&block);
     let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(8).unwrap(), bytes);
     let blocker = pool
         .try_admit(
@@ -826,7 +830,7 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
     );
     assert!(!body.is_decoded(), "refusal keeps the raw fallback");
     assert_eq!(body.decoded_attributed_memory_size_bytes(), 0);
-    assert_eq!(pool.pipeline_bytes(), bytes);
+    assert_eq!(pool.pipeline_bytes(), blocker_bytes);
 
     blocker.leave_pipeline();
     assert_eq!(pool.pipeline_bytes(), 0);
@@ -835,14 +839,18 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
     assert_eq!(pool.pipeline_bytes(), bytes);
     let reused = body.decoded_block(&pool, Admission::WithinLimit).unwrap();
     assert_eq!(pool.pipeline_bytes(), bytes, "reuse does not decode again");
-    assert_eq!(pool.reserved_bytes(), 2 * bytes);
+    assert_eq!(pool.reserved_bytes(), blocker_bytes + bytes);
 
     body.retain_for_backlog_in_place();
     assert_eq!(body.decoded_attributed_memory_size_bytes(), 0);
     assert_eq!(pool.pipeline_bytes(), bytes, "live handles keep the charge");
     drop((decoded, reused));
     assert_eq!(pool.pipeline_bytes(), 0);
-    assert_eq!(pool.reserved_bytes(), bytes, "the backend holder remains");
+    assert_eq!(
+        pool.reserved_bytes(),
+        blocker_bytes,
+        "the backend holder remains"
+    );
     drop(blocker);
     assert_eq!(pool.reserved_bytes(), 0);
     assert!(!pool.is_closed());

@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use zakura_chain::block;
+use zakura_chain::{block, transaction};
 use zakura_node_services::block_memory::{
     Admission, AdmissionFailure, DecodedBlockPool, MeasuredBlock, OwnedBlock,
 };
@@ -267,10 +267,13 @@ impl PeerIO {
             previous_block_hash,
             block,
             raw_payload,
+            encoding,
+            transaction_hashes,
             serialized_bytes,
             permit,
         } = body;
-        let (block, decoded_bytes) = self.admit_block(block)?;
+        let (block, decoded_bytes) =
+            self.admit_block(block, encoding, transaction_hashes.clone())?;
         Ok((
             ReceivedBody {
                 height,
@@ -278,6 +281,9 @@ impl PeerIO {
                 previous_block_hash,
                 block,
                 raw_payload,
+                // An admitted block keeps its encoding; a refused one keeps only the raw payload.
+                encoding: None,
+                transaction_hashes,
                 serialized_bytes,
                 permit,
             },
@@ -285,9 +291,12 @@ impl PeerIO {
         ))
     }
 
+    /// Admit `block`, keeping its `encoding` and `transaction_hashes` with it.
     fn admit_block(
         &self,
         block: Arc<block::Block>,
+        encoding: Option<block::BlockEncoding>,
+        transaction_hashes: Arc<[transaction::Hash]>,
     ) -> Result<(Option<AdmittedBody>, u64), AdmissionFailure> {
         if self.decoded_pool.is_closed() {
             self.cancel.cancel();
@@ -297,7 +306,11 @@ impl PeerIO {
             Ok(block) => block,
             Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
         };
-        let block = MeasuredBlock::new(block);
+        let block = match encoding {
+            Some(encoding) => MeasuredBlock::with_encoding(block, encoding),
+            None => MeasuredBlock::new(block),
+        }
+        .with_transaction_hashes(transaction_hashes);
         let bytes = block.bytes();
         let Some(charge) = charge_decoded_handoff(
             &self.sequencer_input_decoded_attributed_memory_bytes,
@@ -337,6 +350,8 @@ impl PeerIO {
             previous_block_hash,
             block,
             raw_payload,
+            encoding: _,
+            transaction_hashes: _,
             serialized_bytes,
             permit,
         } = received;
@@ -437,6 +452,10 @@ pub(super) struct ReceivedBody<B = Arc<block::Block>> {
     pub(super) block: B,
     /// The frame payload `block` was decoded from.
     pub(super) raw_payload: Arc<[u8]>,
+    /// `block`'s encoding, sharing `raw_payload`'s allocation.
+    pub(super) encoding: Option<block::BlockEncoding>,
+    /// `block`'s transaction IDs, computed when the body was checked.
+    pub(super) transaction_hashes: Arc<[transaction::Hash]>,
     /// The length of `raw_payload`, measured on the per-peer task.
     pub(super) serialized_bytes: u64,
     pub(super) permit: mpsc::OwnedPermit<SequencedBody>,

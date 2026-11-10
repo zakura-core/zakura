@@ -25,7 +25,7 @@ a schema. [`release_notes.py`](../scripts/release_notes.py) renders the rest
 and adds every PR link, so the layout cannot drift. It rejects a draft that
 cites a PR the section does not link, writes its own links, or skips the
 highlights, and asks the model once to fix it. Entries longer than the
-longest hand-written v1.8 ones, and any `Security`, `Removed`, or
+longest hand-written v1.8 ones, and any `Added`, `Security`, `Removed`, or
 `Deprecated` entry that the summary leaves out, also get that one retry; if
 they remain, the draft is kept and the run summary lists them for review.
 

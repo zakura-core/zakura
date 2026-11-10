@@ -43,8 +43,10 @@ PLACEHOLDER_BODIES = frozenset({
     "Release created by release-binaries.",
 })
 
-# Changelog categories whose entries the summary must cite somewhere.
-COVERED_CATEGORIES = ("Security", "Removed", "Deprecated")
+# Changelog categories whose entries the summary must cite somewhere: new
+# features operators can't use unless they hear about them, and changes they
+# can't afford to miss.
+COVERED_CATEGORIES = ("Added", "Security", "Removed", "Deprecated")
 
 # Character limits just above the longest entries of the hand-written v1.8
 # notes. A longer entry gets one retry to shorten it, then is kept with a

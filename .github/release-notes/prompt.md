@@ -62,6 +62,11 @@ the renderer adds the links.
   their proofs."
 - Cover every `Removed` and `Deprecated` entry: in `before_you_upgrade` when
   operators notice it, or in `library_users` when it only affects crate APIs.
+- Mention every `Added` entry, since operators can only use features they
+  know about. Put new settings, RPC methods, commands, and metrics in
+  `highlights`, or in `before_you_upgrade` when operators must act on them,
+  and crate API additions in `library_users`. Group related additions into
+  one item.
 - Leave out changes with no operator-visible effect, such as tests, CI,
   internal refactors, and remarks about version numbering.
 - Keep Rust API details out of `highlights`; they belong in `library_users`.
@@ -116,6 +121,10 @@ v1.8.4, which needed upgrade notes:
     {
       "text": "Less verification and mempool work: v5/v6 transaction digests are computed once per block, mempool cleanup no longer rescans the pool, and `getblocktemplate` selection is cheaper on large mempools.",
       "prs": [2022, 2048, 2054]
+    },
+    {
+      "text": "An optional loopback-only `GET /traces` endpoint streams the JSONL trace tables, so collectors can follow them over HTTP. It is disabled by default and requires `trace_dir`.",
+      "prs": [2072]
     }
   ],
   "library_users": {"text": "", "prs": []}

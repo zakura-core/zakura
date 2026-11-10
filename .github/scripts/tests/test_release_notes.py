@@ -147,7 +147,7 @@ class ChangelogTests(unittest.TestCase):
         self.assertTrue(parsed.body.startswith("### Added"))
         self.assertNotIn("Candidate fix", parsed.body)
         self.assertEqual(parsed.prs, {11, 12, 13})
-        self.assertEqual(parsed.covered, {"Removed": (12,), "Security": (13,)})
+        self.assertEqual(parsed.covered, {"Added": (11,), "Removed": (12,), "Security": (13,)})
         self.assertFalse(parsed.is_prerelease)
 
     def test_release_candidates_use_their_own_section(self):
@@ -322,7 +322,7 @@ Also in [CHANGELOG.md](https://github.com/zakura-core/zakura/blob/v1.2.0/CHANGEL
         self.assertEqual(warnings, [f"highlights[0].text has {len(long_text.strip())} characters; "
                                     "shorten it to at most 400"])
 
-    def test_reports_uncovered_security_and_removed_entries(self):
+    def test_reports_uncovered_added_security_and_removed_entries(self):
         summary, errors, gaps = self.parse(summary_json(
             before_you_upgrade=[], highlights=[{"text": "New setting.", "prs": [11]}],
         ))
@@ -330,6 +330,8 @@ Also in [CHANGELOG.md](https://github.com/zakura-core/zakura/blob/v1.2.0/CHANGEL
         self.assertIsNotNone(summary)
         self.assertEqual(gaps, ["Removed entry 12 is not cited by any summary entry",
                                 "Security entry 13 is not cited by any summary entry"])
+        _, _, gaps = self.parse(summary_json(highlights=[{"text": "**Security:** bounded.", "prs": [13]}]))
+        self.assertEqual(gaps, ["Added entry 11 is not cited by any summary entry"])
 
     def test_prompt_examples_pass_validation(self):
         examples = re.findall(r"```json\n(.*?)```", release_notes.PROMPT.read_text(), re.DOTALL)
@@ -362,6 +364,7 @@ class DraftTests(unittest.TestCase):
         message = calls[0][1]["content"]
         self.assertIn("Release tag: v1.2.0 (stable release)", message)
         self.assertIn("PR numbers you may cite: 11, 12, 13", message)
+        self.assertIn("Added entries to cover: 11", message)
         self.assertIn("Security entries to cover: 13", message)
         self.assertIn("<changelog>\n### Added", message)
 
@@ -378,7 +381,8 @@ class DraftTests(unittest.TestCase):
         (summary, gaps), calls = self.draft([uncovered, "not json"])
         self.assertEqual(len(calls), 2)
         self.assertIn("Removed entry 12", calls[1][3]["content"])
-        self.assertEqual(gaps, ["Removed entry 12 is not cited by any summary entry"])
+        self.assertEqual(gaps, ["Added entry 11 is not cited by any summary entry",
+                                "Removed entry 12 is not cited by any summary entry"])
         self.assertEqual(summary.highlights[0].prs, (13,))
 
     def test_asks_once_to_shorten_then_keeps_the_draft(self):

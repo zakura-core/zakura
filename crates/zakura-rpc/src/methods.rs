@@ -6279,8 +6279,7 @@ pub mod arrayhex {
     where
         S: Serializer,
     {
-        let hex_string = hex::encode(data);
-        serializer.serialize_str(&hex_string)
+        super::hex_data::serialize(data, serializer)
     }
 
     #[allow(missing_docs)]

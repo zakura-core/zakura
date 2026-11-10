@@ -19,7 +19,7 @@ use crate::{
         CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
     },
     record::machine::{BodyAuthority, ReactorAction},
-    storage::{hash, BLOCK_SERVICE},
+    storage::{hash, BLOCK_SERVICE, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -423,7 +423,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_tips_consistent::<S>,
-            witness: Some(TriggerHistory::Log(epoch_changed)),
+            witness: Some(TriggerHistory::Log(fork_prepared)),
         },
         Property {
             id: PropertyId::new(BLOCK_REQUESTS_FOLLOW_HEADERS),
@@ -589,10 +589,34 @@ impl EpochHistory {
     }
 }
 
-/// [`TIPS_CONSISTENT`]'s trigger history: the reactor adopted a new
-/// body-work epoch, so a view replaced the last one's path.
-fn epoch_changed(log: &ObservationLog) -> bool {
-    EpochHistory::of(log).epoch_changed
+/// [`TIPS_CONSISTENT`]'s trigger history: the node's header storage took a
+/// prepare whose branch forks below a target it prepared before, so the
+/// engine's selection can leave its old path. The history reads only the
+/// node's own header requests, so an engine that keeps the old epoch keeps
+/// it too.
+fn fork_prepared(log: &ObservationLog) -> bool {
+    let mut highest = None;
+    log.entries().iter().any(|entry| match &entry.obs {
+        Observation::Storage {
+            service,
+            fact:
+                StorageFact::Submitted {
+                    request:
+                        StorageRequest::PrepareHeaderTarget {
+                            common_ancestor,
+                            target,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        } if service == HEADER_SERVICE => {
+            let forks = highest.is_some_and(|highest| common_ancestor.height < highest);
+            highest = highest.max(Some(target.height));
+            forks
+        }
+        _ => false,
+    })
 }
 
 /// [`BLOCK_REQUESTS_FOLLOW_HEADERS`]'s trigger history: the node published a

@@ -101,8 +101,9 @@ fn an_epoch_change_retires_the_old_epochs_work() {
 }
 
 /// `sync/tips-consistent`'s witness: the mirrors' fork reaches the engine
-/// through the node's header sync, and the engine publishes a view whose
-/// selected path replaced the last one's under a new body-work epoch.
+/// through the node's header sync, which prepares a branch forking below
+/// its earlier target, and the engine publishes a view whose selected path
+/// replaced the last one's under a new body-work epoch.
 #[test]
 fn a_replaced_selection_starts_a_new_body_work_epoch() {
     let committed = Plan::from_fuzz(&[]);

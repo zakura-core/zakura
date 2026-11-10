@@ -396,6 +396,33 @@ pub enum Observation {
         /// The QUIC stream of the peer's header stream then.
         quic_stream: u64,
     },
+    /// Every adversary act the run's peer scripts hold, in script order,
+    /// peer by peer. Logged at setup, so a witness test can tell which acts
+    /// never ran.
+    ActsScripted {
+        /// The acts' names.
+        acts: Vec<String>,
+    },
+    /// A scripted adversary's act ran: the peer wrote its frames.
+    ActRan {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+        /// The act's name.
+        act: String,
+    },
+    /// A scripted adversary's act was skipped: its precondition held when
+    /// the Plan offered it and no longer did when the peer ran it, so it
+    /// sent nothing. A witness test fails on it, since its act never ran.
+    ActSkipped {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+        /// The act's name.
+        act: String,
+    },
     /// A scripted peer read and decoded one frame the node wrote.
     PeerReceived {
         /// The connection, from the identity map.
@@ -963,7 +990,12 @@ pub enum StorageResult {
     /// No locator.
     NoLocator,
     /// A resolved VCT repair context.
-    VctResolved,
+    VctResolved {
+        /// The context's locator entry. Kept view-side and off the trace,
+        /// where the variant reads as before.
+        #[serde(skip)]
+        locator: Option<StoragePoint>,
+    },
     /// A stale VCT repair context.
     VctStale,
     /// A leased path.

@@ -398,7 +398,9 @@ fn result(result: &ResultIdentity) -> StorageResult {
             finalized: point(*finalized),
         },
         ResultIdentity::NoLocator => StorageResult::NoLocator,
-        ResultIdentity::VctResolved => StorageResult::VctResolved,
+        ResultIdentity::VctResolved { locator } => StorageResult::VctResolved {
+            locator: locator.map(point),
+        },
         ResultIdentity::VctStale => StorageResult::VctStale,
         ResultIdentity::Acquired {
             lease: key,
@@ -704,9 +706,13 @@ impl ActionSource for HeaderStorage {
         };
         let facts = self.port.take_facts();
         let actual = self.port.owner_state();
-        self.model
+        // A model failure is returned only once the facts are logged and the
+        // checkpoint names this step, so the run's evidence check passes and
+        // a claim another source found this step still reports first.
+        let checked = self
+            .model
             .check_boundary(&facts, &actual)
-            .map_err(|failure| format!("{failure:?}"))?;
+            .map_err(|failure| format!("{failure:?}"));
         // After setup, the state is logged only when it may have changed.
         let with_state = self.delivered.is_none() || !facts.is_empty();
         let last = facts.last().map_or(delivered, |fact| fact.seq);
@@ -732,7 +738,7 @@ impl ActionSource for HeaderStorage {
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        Ok(())
+        checked
     }
 }
 

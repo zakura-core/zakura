@@ -189,6 +189,10 @@ struct TapState {
     cooldowns: CooldownEvidence,
     /// The claim rules its drains found broken, for the view.
     claims: ClaimEvidence,
+    /// An evidence failure held back because its step's drain found a
+    /// claim break, so the claim's property reports first
+    /// ([`TapState::fail_after_claims`]).
+    deferred: Arc<Mutex<Option<String>>>,
     /// Set once a drain found the stopped reactor's teardown done.
     settled: AtomicBool,
     /// The teardown claims reads after the stopped reactor was gone found,
@@ -231,6 +235,9 @@ enum ProbeSlot {
 struct WorkCheck {
     ledger: HeaderWorkLedger,
     broken: Option<String>,
+    /// Whether a drain followed the first integrity failure, after which
+    /// the ledger folds nothing more.
+    stopped: bool,
     claims: Vec<ClaimBreak>,
     /// Whether the teardown check ran.
     finished: bool,
@@ -256,11 +263,16 @@ impl TapState {
     }
 
     /// Feeds `event` to the ownership check, keeping the first broken
-    /// integrity rule and every claim break.
+    /// integrity rule and every claim break. After an integrity failure the
+    /// ledger still folds the rest of that step's events, so a claim later
+    /// in the step drains ahead of the failure. It stops at the step's
+    /// drain.
     fn check_work(&self, event: &ReactorEvent) {
         let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        if work.broken.is_none() {
-            work.broken = work.ledger.observe(event).err();
+        if !work.stopped {
+            if let Err(rule) = work.ledger.observe(event) {
+                work.broken.get_or_insert(rule);
+            }
             let claims = work.ledger.take_claims();
             work.claims.extend(claims);
         }
@@ -274,13 +286,11 @@ impl TapState {
         if let Some(record) = self.claims.unreported(Some(step)) {
             return Err(record.detail);
         }
-        let claims = mem::take(
-            &mut self
-                .work
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .claims,
-        );
+        let claims = {
+            let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+            work.stopped |= work.broken.is_some();
+            mem::take(&mut work.claims)
+        };
         for broken in claims {
             self.claims.record(ClaimRecord {
                 step,
@@ -300,13 +310,19 @@ impl TapState {
                 detail,
             });
         }
+        // An integrity failure here waits until every claim break is
+        // recorded, so it can't hide one.
+        let mut broken = None;
         let reset = match self
             .round_life
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            Some(rounds) => rounds.drain(step)?,
+            Some(rounds) => rounds.drain(step).unwrap_or_else(|error| {
+                broken.get_or_insert(error);
+                rounds.take_breaks()
+            }),
             None => Vec::new(),
         };
         for detail in reset {
@@ -322,7 +338,10 @@ impl TapState {
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            Some(chain) => chain.drain(step)?,
+            Some(chain) => chain.drain(step).unwrap_or_else(|error| {
+                broken.get_or_insert(error);
+                chain.take_breaks()
+            }),
             None => Vec::new(),
         };
         for detail in chain {
@@ -358,9 +377,25 @@ impl TapState {
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
             stuck: work.ledger.stuck_rounds(),
+            tainted: work.ledger.tainted_rounds(),
             shutdown: self.shutdown.load(Ordering::Relaxed),
             settled: self.settled.load(Ordering::Relaxed),
         });
+        broken.map_or(Ok(()), Err)
+    }
+
+    /// Fails with `error`, an evidence failure at step `step`, unless that
+    /// step's drain found a claim break. Then `error` waits, so the claim's
+    /// property reports first. The next observation fails with it, and so
+    /// does a run that ends without a violation.
+    fn fail_after_claims(&self, step: u64, error: String) -> Result<(), String> {
+        if !self.claims.found_at(step) {
+            return Err(error);
+        }
+        self.deferred
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(error);
         Ok(())
     }
 
@@ -424,10 +459,12 @@ impl TapState {
     }
 
     /// The headers the ownership check's accounting holds reserved and
-    /// owned.
-    fn accounted(&self) -> (usize, usize) {
+    /// owned, unless a claim tainted them or an integrity failure stopped
+    /// the ledger.
+    fn accounted(&self) -> Option<(usize, usize)> {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        (work.ledger.reserved(), work.ledger.owned())
+        (work.broken.is_none() && !work.ledger.accounting_tainted())
+            .then(|| (work.ledger.reserved(), work.ledger.owned()))
     }
 
     /// The call or retained headers that a finished reactor left open.
@@ -630,11 +667,11 @@ impl TapState {
         if in_run {
             state.sessions.reactor(&event);
             let on_reactor = state.on_reactor();
-            state
-                .stale
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .observe(&event, on_reactor);
+            let stale_handler = {
+                let mut stale = state.stale.lock().unwrap_or_else(PoisonError::into_inner);
+                stale.observe(&event, on_reactor);
+                stale.in_stale_handler()
+            };
             if let Some(rounds) = state
                 .round_life
                 .lock()
@@ -657,7 +694,7 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
             {
-                authority.observe(&event, on_reactor);
+                authority.observe(&event, on_reactor, stale_handler);
             }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
@@ -668,10 +705,10 @@ impl TapState {
                     .observe(&event, now);
             }
         }
-        // Budget changes, credit, causes, headroom waits, deferred passes,
-        // taken events, watch reads, the queue's slots and cursor
-        // acceptances stay out of the log, whose format pinned Plans fix,
-        // and a teardown's returns after the run are expected.
+        // Budget changes, credit and built closes, causes, headroom waits,
+        // deferred passes, taken events, watch reads, the queue's slots and
+        // cursor claims and acceptances stay out of the log, whose format pinned Plans
+        // fix, and a teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -683,6 +720,8 @@ impl TapState {
                 | ReactorEvent::WatchObserved { .. }
                 | ReactorEvent::Slots { .. }
                 | ReactorEvent::CursorsAccepted { .. }
+                | ReactorEvent::CursorClaimed { .. }
+                | ReactorEvent::CloseBuilt { .. }
         ) {
             if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
                 state
@@ -808,6 +847,12 @@ impl TapState {
 }
 
 impl ReactorTap {
+    /// [`TapState::fail_after_claims`], for an evidence failure that
+    /// another source of the same node found at step `step`.
+    pub(crate) fn fail_after_claims(&self, step: u64, error: String) -> Result<(), String> {
+        self.state.fail_after_claims(step, error)
+    }
+
     /// A tap on the reactor of the node named `node`, whose storage is
     /// `port`. Returns the observer, for the reactor's startup and nothing
     /// else, and the reader. Its checkpoint is registered with `sim` now, so
@@ -943,6 +988,7 @@ impl ReactorTap {
                 off_reactor: Mutex::default(),
                 cooldowns,
                 claims: ClaimEvidence::default(),
+                deferred: Arc::default(),
                 settled: AtomicBool::new(false),
                 teardown_claims: Mutex::default(),
                 rounds,
@@ -964,21 +1010,26 @@ impl ReactorTap {
         let id = sim.register(checkpoint.clone());
         // A claim break no property reported by the run's end fails it, as
         // a later drain would have.
+        // So does a failure held back behind a claim, unless the claim's
+        // violation ended the run.
         sim.on_end({
             let claims = state.claims.clone();
+            let deferred = state.deferred.clone();
             let failure = sim.failure();
             let source = checkpoint.kind().source(id.index);
             move |end, _, _| {
                 if end.outcome == Outcome::Harness {
                     return;
                 }
-                if let Some(record) = claims.unreported(None) {
+                let held = deferred
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .filter(|_| end.outcome != Outcome::Violation);
+                if let Some(detail) = claims.unreported(None).map(|record| record.detail).or(held) {
                     failure
                         .borrow_mut()
-                        .get_or_insert(HarnessFailure::SourceEvidence {
-                            source,
-                            detail: record.detail,
-                        });
+                        .get_or_insert(HarnessFailure::SourceEvidence { source, detail });
                 }
             }
         });
@@ -1034,6 +1085,15 @@ impl ReactorTap {
             if let Some(engine) = self.state.engine_at() {
                 chain.storage(facts.iter().map(|(_, fact)| *fact), engine);
             }
+        }
+        if let Some(authority) = self
+            .state
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            authority.storage(facts.iter().map(|(_, fact)| *fact));
         }
         self.pairer.facts(facts);
     }
@@ -1220,7 +1280,11 @@ impl ReactorTap {
             }
         } else {
             Expected::Live {
-                accounted: (!mid_poll).then(|| self.state.accounted()),
+                accounted: if mid_poll {
+                    None
+                } else {
+                    self.state.accounted()
+                },
             }
         };
         self.state
@@ -1558,15 +1622,24 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        if let Some(rule) = self
+        let step = log.step();
+        let held = self
             .state
-            .broken_work_rule()
-            .or_else(|| self.state.sessions.broken())
-        {
-            return Err(rule);
+            .deferred
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(error) = held {
+            return Err(error);
         }
-        match paired {
-            Ok(()) => match self.pairer.waiting_drop() {
+        let checked = match (
+            self.state
+                .broken_work_rule()
+                .or_else(|| self.state.sessions.broken()),
+            paired,
+        ) {
+            (Some(rule), _) => Err(rule),
+            (None, Ok(())) => match self.pairer.waiting_drop() {
                 Some((call, op)) if self.state.reactor_gone() => Err(format!(
                     "UnpairedDrop: the reactor's teardown is done with call {call} dropped and \
                      its operation {op} given no drop receipt, and no shutdown removed it while \
@@ -1582,16 +1655,14 @@ impl ActionSource for ReactorTap {
                     }
                 }),
                 _ => Ok(()),
-            }
-            .and_then(|()| self.read_capacity(log.step()))
-            .and_then(|()| self.state.drain_claims(log.step())),
+            },
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or
             // `PortGone`, so the crash isn't read as a pairing bug.
-            Err(PairError::Evidence(_)) if self.state.health().is_some() => Ok(()),
-            Err(PairError::Evidence(detail)) => Err(detail),
-            Err(PairError::PortPanicked { call }) => {
+            (None, Err(PairError::Evidence(_))) if self.state.health().is_some() => return Ok(()),
+            (None, Err(PairError::Evidence(detail))) => Err(detail),
+            (None, Err(PairError::PortPanicked { call })) => {
                 // The run checks this after the step, ahead of any evidence
                 // failure the same step reports.
                 self.failure
@@ -1600,8 +1671,17 @@ impl ActionSource for ReactorTap {
                         source: self.checkpoint.kind().source(self.id.index),
                         call,
                     });
-                Ok(())
+                return Ok(());
             }
+        };
+        // The probe is read, and its claims found, even when the step's
+        // other evidence failed. Then the step's claim breaks drain, and the
+        // failure waits behind them.
+        let capacity = self.read_capacity(step);
+        let drained = self.state.drain_claims(step);
+        match checked.and(capacity).and(drained) {
+            Ok(()) => Ok(()),
+            Err(error) => self.state.fail_after_claims(step, error),
         }
     }
 }

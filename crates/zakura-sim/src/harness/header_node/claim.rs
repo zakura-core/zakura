@@ -62,6 +62,8 @@ pub enum Claim {
     ForeignPage,
     /// A staged page left its round holding other headers than it carried.
     UnstagedPage,
+    /// A page spent more headers than its reservation held.
+    OverReservation,
 }
 
 impl Claim {
@@ -76,6 +78,7 @@ impl Claim {
             ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
             ClaimRule::ForeignPage => Claim::ForeignPage,
             ClaimRule::UnstagedPage => Claim::UnstagedPage,
+            ClaimRule::OverReservation => Claim::OverReservation,
         }
     }
 }
@@ -96,6 +99,9 @@ pub struct Settlement {
     /// headers still unended, so storage has nothing left that could settle
     /// them.
     pub stuck: usize,
+    /// How many released rounds a claim tainted. Such a round never
+    /// settles, and its teardown isn't judged.
+    pub tainted: usize,
     /// Whether the harness began stopping the reactor.
     pub shutdown: bool,
     /// Whether the stopped reactor's teardown is done: the reactor is gone
@@ -250,6 +256,15 @@ impl ClaimEvidence {
             .iter()
             .find(|(record, reported)| !reported && before.is_none_or(|step| record.step < step))
             .map(|(record, _)| record.clone())
+    }
+
+    /// Whether step `step`'s drain found a break.
+    pub(super) fn found_at(&self, step: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(record, _)| record.step == step)
     }
 
     /// Every break so far, in order.

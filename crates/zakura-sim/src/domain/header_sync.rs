@@ -212,7 +212,8 @@ where
 /// `ShutdownIncomplete`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
-/// round-level case relies on that.
+/// round-level case relies on that. A step with a released round a claim
+/// tainted isn't judged, so it never counts as holding.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -234,7 +235,8 @@ where
         }
         return cx.violated(expected, first.detail);
     }
-    if row.is_some_and(|row| row.released > 0 || row.settled) {
+    // A tainted round's settlement isn't judged, so the step doesn't pass.
+    if row.is_some_and(|row| row.tainted == 0 && (row.released > 0 || row.settled)) {
         Verdict::Holds
     } else {
         Verdict::NotApplicable
@@ -459,17 +461,19 @@ fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
     view.chain_effect().any()
 }
 
-/// The node stages, prepares and commits only headers it asked for: each
-/// round's owner is bound to the `Open` the node built for it, and each
-/// staged page belongs to its round's session and subscription and lies
-/// on the requested path.
+/// The node stages, prepares and commits only headers it asked for, and
+/// credits only what it reserved: each round's owner is bound to the `Open`
+/// the node built for it, each staged page belongs to its round's session
+/// and subscription and lies on the requested path, and every credit fact,
+/// update and acceptance carries its subscription's state faithfully.
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
-const AUTHORITY_CLAIMS: [Claim; 3] = [
+const AUTHORITY_CLAIMS: [Claim; 4] = [
     Claim::CommitOnlyAuthorized,
     Claim::ForeignPage,
     Claim::UnstagedPage,
+    Claim::OverReservation,
 ];
 
 /// What the authority check reads: one reactor's claim breaks and when the
@@ -492,8 +496,10 @@ where
     Property {
         id: PropertyId::new(COMMIT_ONLY_AUTHORIZED),
         claim: "each header round's owner is bound to the Open the node built for it, the node \
-                admits each session under its link's identity, and each staged page belongs to \
-                its round's session and subscription and lies on the path it asked for",
+                admits each session under its link's identity, each staged page belongs to its \
+                round's session and subscription and lies on the path it asked for, and the \
+                subscriber's credit, updates and acceptances stay within what the node reserved \
+                and carry each subscription's state faithfully",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -506,11 +512,12 @@ where
 /// Checks [`COMMIT_ONLY_AUTHORIZED`] at the boundary after a step.
 ///
 /// The tap's authority check ([`crate::harness::header_node::authority`])
-/// judges each `Started` and `PageStaged`, the ledger reports a foreign or
-/// unstaged page, and the session view an admission under another
-/// identity than its link's. A break the step's drain found violates at
-/// once. It applies once a drain found a start, a staged page or an
-/// admission's identity join.
+/// judges each `Started` and `PageStaged` and, in its credit half, each
+/// credit fact, built update and acceptance; the ledger reports a foreign
+/// or unstaged page or an over-spent reservation, and the session view an
+/// admission under another identity than its link's. A break the step's
+/// drain found violates at once. It applies once a drain found a start, a
+/// staged page, a credit fact or an admission's identity join.
 fn check_commit_only_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -518,7 +525,8 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let expected = "the node stages only headers it asked for, under the owner it bound";
+    let expected = "the node stages only headers it asked for, under the owner it bound, and \
+                    credits only what it reserved, as each subscription's state says";
     let mut breaks = view.claims().at(step, &AUTHORITY_CLAIMS).into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {
@@ -975,6 +983,8 @@ mod tests {
         Stop {
             settled: bool,
         },
+        /// A released round a claim tainted, unsettled.
+        Tainted,
         Broke(Claim),
         Breaks(&'static [Claim]),
     }
@@ -1020,6 +1030,7 @@ mod tests {
                     released,
                     unsettled,
                     stuck,
+                    tainted: 0,
                     shutdown: false,
                     settled: false,
                 }),
@@ -1028,8 +1039,18 @@ mod tests {
                     released: 0,
                     unsettled: 0,
                     stuck: 0,
+                    tainted: 0,
                     shutdown: true,
                     settled,
+                }),
+                Some(Scripted::Tainted) => self.probe.rounds.record(Settlement {
+                    step,
+                    released: 1,
+                    unsettled: 1,
+                    stuck: 0,
+                    tainted: 1,
+                    shutdown: false,
+                    settled: false,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -1042,6 +1063,7 @@ mod tests {
                         released: 1,
                         unsettled: 0,
                         stuck: 0,
+                        tainted: 0,
                         shutdown: false,
                         settled: false,
                     });
@@ -1159,6 +1181,27 @@ mod tests {
         assert_eq!(
             violation.actual,
             "the probe reads 4001 reserved and 0 owned"
+        );
+    }
+
+    /// A step whose released round a claim tainted doesn't count as a
+    /// passing evaluation: of these two steps only the settled one does.
+    #[test]
+    fn a_tainted_round_is_not_counted_as_held() {
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[
+                Scripted::Tainted,
+                Scripted::Settlement {
+                    released: 1,
+                    unsettled: 0,
+                    stuck: 0,
+                },
+            ],
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Held { applicable: 1 }
         );
     }
 

@@ -1,0 +1,28 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/credit.rs b/crates/zakura-network/src/zakura/regulation/subscription/credit.rs
+index 7198c5bb03..820831b172 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/credit.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/credit.rs
+@@ -87,10 +87,8 @@ impl ResponseCredit {
+     /// Whether the unspent credit covers `objects` and `bytes`. Run it before
+     /// allocating or waiting for handler capacity.
+     pub(crate) fn check(&self, objects: u64, bytes: u64) -> Result<(), CreditExceeded> {
+-        let unspent = self.unspent();
+-        if objects > unspent.objects || bytes > unspent.bytes {
+-            return Err(CreditExceeded);
+-        }
++        // Mutation: the credit guard admits every spend.
++        let _ = (objects, bytes);
+         Ok(())
+     }
+ 
+@@ -118,8 +116,8 @@ impl ResponseCredit {
+     /// Credit granted and not yet spent.
+     pub(crate) fn unspent(&self) -> Totals {
+         Totals {
+-            objects: self.granted.objects - self.consumed.objects,
+-            bytes: self.granted.bytes - self.consumed.bytes,
++            objects: self.granted.objects.saturating_sub(self.consumed.objects),
++            bytes: self.granted.bytes.saturating_sub(self.consumed.bytes),
+         }
+     }
+ }

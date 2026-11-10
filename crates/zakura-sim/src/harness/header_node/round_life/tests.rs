@@ -123,6 +123,7 @@ fn open() -> ReactorEvent {
             tree_aux_schema: zakura_network::zakura::AuxSchema::None,
         }),
         target_height: block::Height(3),
+        totals: Default::default(),
     }
 }
 
@@ -133,6 +134,10 @@ fn accepted(hash: block::Hash) -> ReactorEvent {
         session_id: 7,
         subscription: 1,
         through: Frontier::new(block::Height(1), hash),
+        headers: 1,
+        bytes: 263,
+        stored: (Frontier::new(block::Height(1), hash), 1, 263),
+        totals: Default::default(),
     }
 }
 
@@ -378,6 +383,33 @@ fn a_start_from_an_unreported_read_is_missing_evidence() {
         .drain(1)
         .expect_err("the read is missing")
         .starts_with("RoundLifeJoin"));
+}
+
+/// A break found alongside missing evidence is still taken, so the tap
+/// reports it ahead of the failure.
+#[test]
+fn a_break_survives_missing_evidence() {
+    let evidence = RoundLifeEvidence::default();
+    let mut check = RoundLife::new(evidence.clone(), 1);
+    check.storage(&[reset(1)], 1);
+    for event in [
+        adopted(1),
+        locator(1, 1),
+        cause(ReactorCause::Completion { call: 1 }),
+        started(1, 1),
+    ] {
+        check.observe(&event, true);
+    }
+    assert!(check.drain(1).is_err(), "the read is missing");
+    let found = check.take_breaks();
+    assert!(
+        matches!(&found[..], [only] if only.contains("left the header generation at 1")),
+        "{found:?}"
+    );
+    assert!(
+        evidence.applicable_by(1),
+        "the break keeps its trigger history"
+    );
 }
 
 /// A reset that leaves the generation where the engine had it breaks the

@@ -1359,7 +1359,8 @@ impl HasView for HeaderWire {
 
 impl Subsystem for HeaderWire {
     const NAME: &'static str = "header-sync/wire";
-    const GENERATOR: u32 = 2;
+    // 3: scenario tag 0xFE 0x10 picks the lower-locator saved Plan.
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = WirePorts;

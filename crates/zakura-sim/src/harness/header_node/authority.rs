@@ -30,7 +30,10 @@
 //! is the ledger's `ForeignPage`, and the session view's identity joins are
 //! the session evidence's, both claims of the same property.
 //!
-//! The check applies once it judged a `Started` or a `PageStaged`, or the
+//! The credit the subscriber builds is judged beside these, in [`credit`].
+//!
+//! The check applies once it judged a `Started`, a `PageStaged` or a credit
+//! fact, or the
 //! session view joined an admission's identity to its link or transport
 //! row, so a run whose wrong identity starts no round still applies. A broken
 //! rule is a claim break, which the tap hands
@@ -48,6 +51,8 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_storage::header::fixture::HeaderFixture;
+
+use crate::observe::StorageFact;
 
 /// A subscription, by its peer, session and ID.
 type Subscription = (ZakuraPeerId, u64, u64);
@@ -109,6 +114,7 @@ pub(super) struct Authority {
     started: HashSet<Subscription>,
     /// Each subscription's last staged header.
     staged: HashMap<Subscription, Frontier>,
+    credit: credit::Credit,
     breaks: Vec<String>,
     evidence: AuthorityEvidence,
 }
@@ -138,14 +144,19 @@ impl Authority {
             opens: HashMap::new(),
             started: HashSet::new(),
             staged: HashMap::new(),
+            credit: credit::Credit::default(),
             breaks: Vec::new(),
             evidence,
         }
     }
 
     /// Judges `event`, which the reactor's own task reported when
-    /// `on_reactor`, then notes what it says.
-    pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool) {
+    /// `on_reactor`, in a stale call's handler when `stale_handler`, then
+    /// notes what it says.
+    pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool, stale_handler: bool) {
+        if self.credit.observe(event, on_reactor, stale_handler) {
+            self.applies();
+        }
         if !on_reactor {
             return;
         }
@@ -206,7 +217,23 @@ impl Authority {
                 store.applicable.get_or_insert(step);
             }
         });
-        std::mem::take(&mut self.breaks)
+        let mut breaks = std::mem::take(&mut self.breaks);
+        breaks.extend(self.credit.take_breaks());
+        breaks
+    }
+
+    /// Notes one drain's storage `facts`.
+    pub(super) fn storage<'f>(&mut self, facts: impl IntoIterator<Item = &'f StorageFact>) {
+        for fact in facts {
+            self.credit.storage(fact);
+        }
+    }
+
+    /// Notes that storage gave `hash` at `height` as a locator's entry, as
+    /// a test feeds it.
+    #[cfg(test)]
+    fn note_read(&mut self, hash: block::Hash, height: block::Height) {
+        self.credit.note_read(hash, height);
     }
 
     /// Notes that a fact made the check applicable.
@@ -354,6 +381,8 @@ impl Authority {
             .collect()
     }
 }
+
+mod credit;
 
 #[cfg(test)]
 mod tests;

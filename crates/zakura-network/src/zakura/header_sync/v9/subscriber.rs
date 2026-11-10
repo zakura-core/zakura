@@ -83,7 +83,7 @@ use crate::zakura::{
         ExchangeWriter, SharedSubscriptions, SubscribeRefused, SubscriptionFault,
         SubscriptionLimits, Subscriptions, WriterFence,
     },
-    transport::sim_chain,
+    transport::{sim_arg, sim_chain},
     Frame, FramedRecv,
 };
 
@@ -360,11 +360,21 @@ impl Subscriber {
         let plan = self.state.plan_open(status, locators, schema, staging)?;
         let exchange = self.fence.open().ok_or(SubscribeError::Fenced)?;
         let writer = exchange.writer();
+        #[cfg(not(any(test, zakura_sim)))]
         let update = self
             .tools
             .lock()
             .open_fenced(plan.id, plan.window, plan.start, exchange)?;
-        Ok((self.state.opened(plan, update), writer))
+        // The totals are read under the lock that recorded the `Open`, which
+        // a second lock would add a scheduling point to.
+        #[cfg(any(test, zakura_sim))]
+        let (update, totals) = {
+            let mut tools = self.tools.lock();
+            let update = tools.open_fenced(plan.id, plan.window, plan.start, exchange)?;
+            let totals = state::totals(&tools, plan.id);
+            (update, totals)
+        };
+        Ok((sim_arg!(self.state.opened(plan, update); totals), writer))
     }
 
     /// Remove a subscription whose `Open` failed to send. If no byte was

@@ -183,15 +183,24 @@ impl ChainEffect {
     /// Marks the check applicable at `step` if a fact since the last call
     /// made it so.
     pub(super) fn drain(&mut self, step: u64) -> Result<Vec<String>, String> {
-        if let Some(missing) = &self.missing {
-            return Err(missing.clone());
-        }
+        // Marked even with evidence missing, so a break the tap takes ahead
+        // of that failure keeps its trigger history.
         self.evidence.with(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
         });
+        if let Some(missing) = &self.missing {
+            return Err(missing.clone());
+        }
         Ok(std::mem::take(&mut self.breaks))
+    }
+
+    /// The breaks found since the last call, taken even when
+    /// [`drain`](Self::drain) failed with missing evidence, so the tap can
+    /// report them ahead of that failure.
+    pub(super) fn take_breaks(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.breaks)
     }
 
     /// Notes that a fact made the check applicable.

@@ -251,7 +251,11 @@ pub enum ResultIdentity {
     /// No locator, which the engine port never gives.
     NoLocator,
     /// The VCT repair context resolved.
-    VctResolved,
+    VctResolved {
+        /// The context's locator entry, the repair target's selected
+        /// predecessor, or `None` for an empty locator.
+        locator: Option<Frontier>,
+    },
     /// The VCT repair context was stale.
     VctStale,
     /// A leased path.
@@ -343,8 +347,10 @@ impl ResultIdentity {
                 }
             }
             HeaderReply::ContinuationLocator(Ok(None)) => ResultIdentity::NoLocator,
-            HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Resolved(_))) => {
-                ResultIdentity::VctResolved
+            HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Resolved(context))) => {
+                ResultIdentity::VctResolved {
+                    locator: context.locator.entries().first().copied(),
+                }
             }
             HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale)) => {
                 ResultIdentity::VctStale

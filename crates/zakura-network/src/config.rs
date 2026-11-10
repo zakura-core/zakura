@@ -425,8 +425,8 @@ pub struct Config {
     /// with peer discovery and delivery tracking. A delay that exhausts that budget can prevent
     /// announcements to the remaining peers.
     ///
-    /// The previous name `advert_delay_max` still loads. The previous `advert_delay_min` is
-    /// ignored.
+    /// The previous name `advert_delay_max` still loads, and applies only when `advert_delay`
+    /// is unset. The previous `advert_delay_min` is ignored.
     ///
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
@@ -1252,11 +1252,21 @@ struct DConfig {
     advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
+    /// `None` if the config does not set it, so the delay falls back to `advert_delay_max`.
     #[serde(
-        alias = "advert_delay_max",
-        with = "zakura_chain::serialization::serde_adapters::duration"
+        skip_serializing_if = "Option::is_none",
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
     )]
-    advert_delay: Duration,
+    advert_delay: Option<Duration>,
+    /// The previous name of `advert_delay`, used only when `advert_delay` is unset.
+    ///
+    /// Not a serde alias: the node loader merges sources by key name, so an old file key plus
+    /// an `advert_delay` environment override would otherwise fail as a duplicate field.
+    #[serde(
+        skip_serializing,
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
+    )]
+    advert_delay_max: Option<Duration>,
     /// Ignored. Versions before the single `advert_delay` interpolated the delay from this value
     /// for small blocks.
     #[serde(skip_serializing)]
@@ -1289,7 +1299,8 @@ impl Default for DConfig {
             advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
-            advert_delay: config.advert_delay,
+            advert_delay: None,
+            advert_delay_max: None,
             advert_delay_min: None,
         }
     }
@@ -1412,7 +1423,8 @@ impl From<Config> for DConfig {
             advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay,
+            advert_delay: Some(advert_delay),
+            advert_delay_max: None,
             advert_delay_min: None,
         }
     }
@@ -1447,10 +1459,14 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay,
+            advert_delay_max,
             advert_delay_min: _,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let advert_delay = advert_delay
+            .or(advert_delay_max)
+            .unwrap_or(DEFAULT_ADVERT_DELAY);
         let (advert_window_full_block, advert_window_small_block) =
             resolve_advert_windows(advert_window_full_block, advert_window_small_block);
         validate_advert_fanout(

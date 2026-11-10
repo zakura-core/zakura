@@ -1934,6 +1934,12 @@ fn previous_advert_delay_names_load() {
     let config: Config =
         toml::from_str("advert_delay_min = '0s'\nadvert_delay_max = '500ms'").unwrap();
     assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay_max = '0s'\nadvert_delay = '250ms'").unwrap();
+    assert_eq!(
+        config.advert_delay,
+        Duration::from_millis(250),
+        "the new name wins over the previous name"
+    );
     let config: Config = toml::from_str("advert_delay_min = '25ms'").unwrap();
     assert_eq!(config.advert_delay, Duration::from_millis(500));
     let serialized = toml::to_string(&config).unwrap();

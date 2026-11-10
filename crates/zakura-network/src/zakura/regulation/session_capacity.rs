@@ -57,13 +57,55 @@ pub(crate) struct SessionCapacity {
 }
 
 /// Free slots of each kind.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FreeSlots {
-    pub(crate) inbound: usize,
-    pub(crate) outbound: usize,
-    pub(crate) setup: usize,
-    pub(crate) inbound_setup: usize,
+pub struct FreeSlots {
+    /// Free inbound direction slots.
+    pub inbound: usize,
+    /// Free outbound direction slots.
+    pub outbound: usize,
+    /// Free setup slots.
+    pub setup: usize,
+    /// Free setup slots that inbound sessions may take.
+    pub inbound_setup: usize,
+}
+
+/// A read of a [`SessionCapacity`]'s free slots for the simulator's
+/// harness, which keeps it past the capacity.
+///
+/// It holds the capacity's semaphores and nothing else, so it keeps no
+/// service or waiter alive. Every reservation holds the same semaphores, so
+/// a read once the service is gone still sees a slot a stray reservation
+/// holds.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug)]
+pub struct SessionSlotsProbe {
+    inbound: Arc<Semaphore>,
+    outbound: Arc<Semaphore>,
+    setup: Arc<Semaphore>,
+    inbound_setup: Arc<Semaphore>,
+}
+
+#[cfg(zakura_sim)]
+impl SessionSlotsProbe {
+    /// The free slots of each kind, read through peeks, so the read adds no
+    /// scheduling point.
+    ///
+    /// # Panics
+    ///
+    /// Outside a [`boundary_read`](zakura_rt::sim::boundary_read).
+    pub fn read(&self) -> FreeSlots {
+        assert!(
+            zakura_rt::sim::in_boundary_read(),
+            "a session slots probe reads only inside a boundary read"
+        );
+        FreeSlots {
+            inbound: self.inbound.peek_available(),
+            outbound: self.outbound.peek_available(),
+            setup: self.setup.peek_available(),
+            inbound_setup: self.inbound_setup.peek_available(),
+        }
+    }
 }
 
 impl SessionCapacity {
@@ -171,6 +213,17 @@ impl SessionCapacity {
             setup: Mutex::new(Some(setup)),
             changed: self.changed.clone(),
         }))
+    }
+
+    /// A probe of these slots for the simulator's harness.
+    #[cfg(zakura_sim)]
+    pub(crate) fn probe(&self) -> SessionSlotsProbe {
+        SessionSlotsProbe {
+            inbound: self.inbound.clone(),
+            outbound: self.outbound.clone(),
+            setup: self.setup.clone(),
+            inbound_setup: self.inbound_setup.clone(),
+        }
     }
 
     /// Free slots of each kind.

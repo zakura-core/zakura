@@ -407,11 +407,21 @@ pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     .into())
 }
 
-#[derive(Default)]
 struct Findings {
     files: usize,
     violations: Vec<Violation>,
     allowances_used: [bool; ALLOWED.len()],
+}
+
+// Std derives `Default` only for arrays of at most 32 elements.
+impl Default for Findings {
+    fn default() -> Self {
+        Findings {
+            files: 0,
+            violations: Vec::new(),
+            allowances_used: [false; ALLOWED.len()],
+        }
+    }
 }
 
 fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {

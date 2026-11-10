@@ -336,7 +336,11 @@ fn a_saturating_service_starves_no_other_on_its_connection() {
             _ => None,
         })
         .collect();
-    assert_eq!(read_on.len(), sessions.len(), "block frames read on {read_on:?}");
+    assert_eq!(
+        read_on.len(),
+        sessions.len(),
+        "block frames read on {read_on:?}"
+    );
     for property in [CREDIT_ISOLATED, SEND_ISOLATED, CONNECTION_SHARES_BOUND] {
         assert!(
             matches!(

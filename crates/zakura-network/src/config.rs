@@ -1,7 +1,7 @@
 //! Configuration for Zakura's network communication.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
@@ -798,7 +798,8 @@ impl Config {
     }
 
     /// Atomically writes a new `peer_list` to the peer list cache file, if configured.
-    /// Retains insertion order, truncating the least-preferred tail at the cache limit.
+    /// Retains insertion order within the per-IP connection limit, then truncates
+    /// the least-preferred tail at the cache limit.
     /// If the list is empty, keeps the previous cache file.
     ///
     /// Also creates the peer cache directory, if it doesn't already exist.
@@ -830,8 +831,17 @@ impl Config {
             return Ok(());
         };
 
+        let mut selected_per_ip = HashMap::new();
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
+            .filter(|peer| {
+                let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+                if *count >= self.max_connections_per_ip {
+                    return false;
+                }
+                *count += 1;
+                true
+            })
             .take(MAX_PEER_DISK_CACHE_SIZE)
             .copied()
             .collect();

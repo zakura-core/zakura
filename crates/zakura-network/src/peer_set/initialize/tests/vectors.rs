@@ -221,6 +221,64 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
     assert_eq!(discovered, IndexSet::from([seed, cached]));
 }
 
+/// Even an old cache with many ports on one IP cannot consume all startup attempts.
+#[tokio::test]
+async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: Vec<PeerSocketAddr> = [
+        "127.0.0.1:9000",
+        "127.0.0.1:9001",
+        "127.0.0.1:9002",
+        "127.0.0.2:9000",
+        "127.0.0.3:9000",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    for max_connections_per_ip in [1, 2] {
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: 3,
+            max_connections_per_ip,
+            // A seed on the same IP must share the cache's per-IP budget.
+            initial_mainnet_peers: ["127.0.0.1:8233".to_owned()].into_iter().collect(),
+            ..test_defaults()
+        };
+        let file = config
+            .cache_dir
+            .peer_cache_file_path(&config.network)
+            .unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            file,
+            cached
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+        let selected = super::super::limit_initial_peers(&config, book_tx).await;
+        let expected = if max_connections_per_ip == 1 {
+            IndexSet::from([cached[0], cached[3], cached[4]])
+        } else {
+            IndexSet::from([cached[0], "127.0.0.1:8233".parse().unwrap(), cached[3]])
+        };
+        assert_eq!(selected, expected);
+        let mut discovered = IndexSet::new();
+        while let Some(change) = book_rx.recv().await {
+            discovered.insert(change.addr());
+        }
+        assert_eq!(
+            discovered.len(),
+            cached.len() + 1,
+            "all candidates still reach discovery"
+        );
+    }
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

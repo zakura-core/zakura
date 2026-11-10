@@ -728,7 +728,8 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// preserving the alternation between cached peers and shuffled seeds.
+/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
+/// do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
@@ -737,6 +738,7 @@ async fn limit_initial_peers(
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
+    let mut selected_per_ip = HashMap::new();
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
@@ -745,7 +747,11 @@ async fn limit_initial_peers(
             .send(MetaAddr::new_initial_peer(peer))
             .await;
         if initial_peers.len() < config.peerset_initial_target_size {
-            initial_peers.insert(peer);
+            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+            if *count < config.max_connections_per_ip {
+                initial_peers.insert(peer);
+                *count += 1;
+            }
         }
     }
 

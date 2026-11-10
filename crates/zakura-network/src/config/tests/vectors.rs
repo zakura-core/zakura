@@ -219,7 +219,7 @@ async fn peer_cache_truncates_in_preference_order() {
     };
     let peers: indexmap::IndexSet<crate::PeerSocketAddr> = (10000..10310)
         .rev()
-        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .map(|ip| SocketAddr::from((std::net::Ipv4Addr::from(0x7f00_0000_u32 + ip), 9000)).into())
         .collect();
     config.update_peer_cache(peers.clone()).await.unwrap();
     let saved = config.load_peer_cache().await.unwrap();
@@ -230,6 +230,38 @@ async fn peer_cache_truncates_in_preference_order() {
             .take(crate::constants::MAX_PEER_DISK_CACHE_SIZE)
             .collect::<Vec<_>>()
     );
+}
+
+/// Many ports on one IP cannot crowd independent peers out of the saved cache.
+#[tokio::test]
+async fn peer_cache_limits_ports_per_ip_before_truncation() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    for max_connections_per_ip in [1, 2] {
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            max_connections_per_ip,
+            ..Config::default()
+        };
+        let peers: indexmap::IndexSet<crate::PeerSocketAddr> = (10000..10310)
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .chain(["127.0.0.2:9000".parse().unwrap()])
+            .collect();
+        config.update_peer_cache(peers.clone()).await.unwrap();
+        let saved: Vec<_> = config
+            .load_peer_cache()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let expected: Vec<_> = peers
+            .iter()
+            .take(max_connections_per_ip)
+            .copied()
+            .chain(["127.0.0.2:9000".parse().unwrap()])
+            .collect();
+        assert_eq!(saved, expected);
+    }
 }
 
 /// Regtest never imports cache entries or non-local seed addresses.

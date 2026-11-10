@@ -70,7 +70,7 @@ impl PeerPreference {
         // This check only prefers the configured network, because
         // address_is_valid_for_outbound_connections() rejects the port used by the other network.
         let canonical_port =
-            AttributePreference::preferred_from([8232, 18232].contains(&peer_addr.port()));
+            AttributePreference::preferred_from([8233, 18233].contains(&peer_addr.port()));
 
         Ok(PeerPreference { canonical_port })
     }
@@ -118,11 +118,11 @@ pub fn address_is_valid_for_inbound_listeners(
             return Ok(());
         }
 
-        if listener_addr.port() == 8232 {
+        if listener_addr.port() == 8233 {
             return Err(
                 "invalid peer port: port is for Mainnet, but this node is configured for Testnet",
             );
-        } else if listener_addr.port() == 18232 {
+        } else if listener_addr.port() == 18233 {
             return Err(
                 "invalid peer port: port is for Testnet, but this node is configured for Mainnet",
             );
@@ -143,4 +143,30 @@ pub fn address_is_valid_for_inbound_listeners(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default P2P ports are preferred on their network and rejected on the other network.
+    #[test]
+    fn default_ports_are_preferred_only_on_the_matching_network() {
+        let mainnet = Network::Mainnet;
+        let testnet = Network::new_default_testnet();
+        for (network, other_network) in [(&mainnet, &testnet), (&testnet, &mainnet)] {
+            let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
+            let preferred = PeerPreference::new(addr(network.default_port()), network.clone())
+                .expect("the network's default P2P port is valid");
+            let ordinary = PeerPreference::new(addr(9000), network.clone())
+                .expect("custom listening ports are valid");
+            assert_eq!(preferred.canonical_port, Preferred);
+            assert_eq!(ordinary.canonical_port, Acceptable);
+            assert!(preferred < ordinary);
+            assert!(
+                PeerPreference::new(addr(other_network.default_port()), network.clone()).is_err()
+            );
+            assert!(PeerPreference::new(addr(0), network.clone()).is_err());
+        }
+    }
 }

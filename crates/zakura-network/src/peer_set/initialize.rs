@@ -727,8 +727,8 @@ where
 /// Limit the number of `initial_peers` addresses entries to the configured
 /// `peerset_initial_target_size`.
 ///
-/// Returns randomly chosen entries from the provided set of addresses,
-/// in a random order.
+/// Returns the first candidates in the order provided by [`Config::initial_peers`],
+/// preserving the alternation between cached peers and preferred seeds.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(

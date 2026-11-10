@@ -84,6 +84,41 @@ async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     assert!(config.load_peer_cache().await.unwrap().is_empty());
 }
 
+/// Cached peers retain their turns while canonical-port seeds precede other seeds.
+#[tokio::test]
+async fn peer_cache_alternates_with_both_seed_preference_groups() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        let preferred = format!("127.0.0.2:{}", network.default_port());
+        let ordinary = "127.0.0.3:9000".to_owned();
+        let seeds = [ordinary.clone(), preferred.clone()].into_iter().collect();
+        let mut config = Config {
+            network,
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            ..Config::default()
+        };
+        if config.network == Network::Mainnet {
+            config.initial_mainnet_peers = seeds;
+        } else {
+            config.initial_testnet_peers = seeds;
+        }
+        let cached = "127.0.0.9:9000";
+        config
+            .update_peer_cache([cached.parse().unwrap()].into_iter().collect())
+            .await
+            .unwrap();
+        let expected: Vec<crate::PeerSocketAddr> = [cached, &preferred, &ordinary]
+            .into_iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect();
+        assert_eq!(
+            config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+            expected,
+        );
+    }
+}
+
 /// Invalid addresses do not consume turns, and either source can exhaust first.
 #[tokio::test]
 async fn peer_cache_alternation_handles_exhaustion_and_invalid_addresses() {

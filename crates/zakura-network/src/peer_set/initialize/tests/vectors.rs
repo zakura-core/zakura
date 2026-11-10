@@ -73,7 +73,7 @@ const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum wall-clock time to wait for peer-cache startup progress.
 const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Startup retains cache priority through limiting and actual staggered dial attempts.
+/// Measured RTT order survives caching and fresh startup, including failed dial attempts.
 #[tokio::test]
 async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     let _init_guard = zakura_test::init();
@@ -94,7 +94,40 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
         .into_iter()
         .map(|addr| addr.parse().unwrap())
         .collect();
-    config.update_peer_cache(cached.clone()).await.unwrap();
+    let address_book = Arc::new(std::sync::Mutex::new(AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &config.network,
+        config.max_connections_per_ip,
+        tracing::Span::none(),
+    )));
+    // Insert in reverse RTT order; neither insertion nor address order matches preference.
+    for (addr, rtt) in [
+        (cached[2], Duration::from_millis(50)),
+        (cached[1], Duration::from_millis(30)),
+        (cached[0], Duration::from_millis(10)),
+    ] {
+        address_book
+            .lock()
+            .unwrap()
+            .update(MetaAddr::new_responded(addr, Some(rtt)))
+            .unwrap();
+    }
+    assert!(update_peer_cache_once(&config, &address_book)
+        .await
+        .unwrap());
+    let cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(cache_file).await.unwrap(),
+        "127.0.0.9:9000\n127.0.0.1:8233\n127.0.0.8:9000",
+    );
+    // Only the file crosses the restart boundary: discard all measured peer state.
+    drop(address_book);
+    let saved_config = toml::to_string(&config).unwrap();
+    drop(config);
+    let config: Config = toml::from_str(&saved_config).unwrap();
 
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
     let selected = super::super::limit_initial_peers(&config, book_tx).await;

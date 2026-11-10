@@ -451,6 +451,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("stale-adoption"),
     },
     Coverage {
+        property: super::super::domain::header_sync::OUTSTANDING_WORK_BOUNDED,
+        passing: passes(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
+        bypass: Bypass::Planted("call-kept"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::COMMIT_ONLY_AUTHORIZED,
         passing: passes(
             "tests/header_authority.rs",

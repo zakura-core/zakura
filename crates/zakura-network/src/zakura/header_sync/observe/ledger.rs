@@ -133,6 +133,10 @@ pub enum ClaimRule {
     /// A round a new snapshot made obsolete retired while the queue still
     /// held it.
     UnreleasedObsoleteRound,
+    /// A round retired while the queue still held it, for a reason other
+    /// than a new snapshot, its peer's departure or a timeout, which stay
+    /// refusals until their own property takes them.
+    UnreleasedRound,
     /// A page was staged on a round another session or subscription
     /// requested.
     ForeignPage,
@@ -369,22 +373,36 @@ impl HeaderWorkLedger {
                     .is_some_and(|round| !round.released)
                 {
                     // An obsolete round's retirement is the reset property's
-                    // claim. Every other reason stays an integrity rule until
-                    // its own property takes it.
-                    if *reason != HeaderRequestTerminal::SnapshotObsolete {
-                        return Err(format!(
-                            "UnreleasedRound: round {} retired while the queue still holds it",
-                            request.incarnation
-                        ));
+                    // claim, and a departure's or timeout's stays an integrity
+                    // rule until its own property takes it. Every other
+                    // reason is the outstanding-work claim.
+                    match reason {
+                        HeaderRequestTerminal::SnapshotObsolete => self.claims.push(ClaimBreak {
+                            rule: ClaimRule::UnreleasedObsoleteRound,
+                            detail: format!(
+                                "UnreleasedObsoleteRound: obsolete round {} retired while the \
+                                 queue still holds it",
+                                request.incarnation
+                            ),
+                        }),
+                        HeaderRequestTerminal::Disconnected
+                        | HeaderRequestTerminal::SessionReplaced
+                        | HeaderRequestTerminal::TimedOut
+                        | HeaderRequestTerminal::Shutdown => {
+                            return Err(format!(
+                                "UnreleasedRound: round {} retired while the queue still holds it",
+                                request.incarnation
+                            ));
+                        }
+                        _ => self.claims.push(ClaimBreak {
+                            rule: ClaimRule::UnreleasedRound,
+                            detail: format!(
+                                "UnreleasedRound: round {} retired as {reason:?} while the queue \
+                                 still holds it",
+                                request.incarnation
+                            ),
+                        }),
                     }
-                    self.claims.push(ClaimBreak {
-                        rule: ClaimRule::UnreleasedObsoleteRound,
-                        detail: format!(
-                            "UnreleasedObsoleteRound: obsolete round {} retired while the queue \
-                             still holds it",
-                            request.incarnation
-                        ),
-                    });
                 }
             }
             ReactorEvent::ReservationOpened {
@@ -2883,6 +2901,32 @@ mod tests {
                 queue_owned: 0,
             })
             .expect("the round's release still applies");
+    }
+
+    /// A round retired for a reason no other property owns, while the
+    /// queue still holds it, is the outstanding-work claim, and the ledger
+    /// goes on.
+    #[test]
+    fn an_unreleased_round_for_another_reason_is_a_claim() {
+        let mut rejected = retired(1, 1);
+        if let ReactorEvent::Retired { reason, .. } = &mut rejected {
+            *reason = super::super::HeaderRequestTerminal::TargetRejected;
+        }
+        let mut ledger = fold(vec![
+            opened(1, 1, 5),
+            bound(1, 1, 1),
+            started(1, 1),
+            staged(1, 1, 1, 3, 2, 3),
+            rejected,
+        ])
+        .expect("a rejected round's early retirement is a claim break");
+        let claims = ledger.take_claims();
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].rule, ClaimRule::UnreleasedRound);
+        assert!(
+            claims[0].detail.starts_with("UnreleasedRound"),
+            "{claims:?}"
+        );
     }
 
     /// At teardown every reservation has ended, which is a claim rule.

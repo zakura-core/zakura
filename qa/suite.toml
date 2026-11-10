@@ -407,12 +407,6 @@ owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
 
 [[pending]]
-id = "header-sync/outstanding-work-bounded"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
 id = "header-sync/hold-release-wakes"
 kind = "property"
 owner = "H2"

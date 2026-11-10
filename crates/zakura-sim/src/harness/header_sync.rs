@@ -44,6 +44,7 @@ use super::{
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
+        outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
@@ -65,10 +66,11 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, commit_only_authorized, reset_invalidates_work,
-            stale_chain_effect_inert, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, AdoptionView, AuthorityView, BudgetView, ChainView,
-            ResetView, StaleView, TeardownView, WakeView,
+            chunk_budget_bound, commit_only_authorized, outstanding_work_bounded,
+            reset_invalidates_work, stale_chain_effect_inert, stale_completion_inert,
+            teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
+            BudgetView, ChainView, OutstandingView, ResetView, StaleView, TeardownView, WakeView,
+            OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -584,6 +586,9 @@ pub struct Ports {
     /// When the node's authority check first applied, which its tap finds
     /// during the run.
     pub authority: AuthorityEvidence,
+    /// The reactor's container peaks and when the outstanding-work rule
+    /// first applied, which its tap finds during the run.
+    pub outstanding: OutstandingEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
 }
@@ -616,6 +621,8 @@ pub struct Storage {
     chain_effect: ChainEffectEvidence,
     /// When the node's authority check first applied, from its tap.
     authority: AuthorityEvidence,
+    /// The reactor's container peaks, from its tap.
+    outstanding: OutstandingEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -671,6 +678,9 @@ pub struct StorageView {
     pub chain_effect: ChainEffectEvidence,
     /// When the node's authority check first applied.
     pub authority: AuthorityEvidence,
+    /// Each of the reactor's container peaks, and when the outstanding-work
+    /// rule first applied.
+    pub outstanding: OutstandingEvidence,
 }
 
 impl AuthorityView for StorageView {
@@ -682,6 +692,18 @@ impl AuthorityView for StorageView {
     /// [`StorageView::authority`].
     fn authority(&self) -> &AuthorityEvidence {
         &self.authority
+    }
+}
+
+impl OutstandingView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::outstanding`].
+    fn outstanding(&self) -> &OutstandingEvidence {
+        &self.outstanding
     }
 }
 
@@ -789,6 +811,7 @@ impl HasView for Storage {
             round_life: self.round_life.clone(),
             chain_effect: self.chain_effect.clone(),
             authority: self.authority.clone(),
+            outstanding: self.outstanding.clone(),
             recovery: self.recovery.clone(),
         }
     }
@@ -926,6 +949,7 @@ impl Subsystem for Storage {
             round_life: RoundLifeEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
             authority: AuthorityEvidence::default(),
+            outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -970,6 +994,7 @@ impl Subsystem for Storage {
             .flat_map(|mirror| mirror.chain.branches())
             .chain(scenario.node.branches());
         tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
+        tap.watch_outstanding(ports.outstanding.clone(), storage_peer_limit());
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1058,6 +1083,7 @@ impl Subsystem for Storage {
             round_life: ports.round_life,
             chain_effect: ports.chain_effect,
             authority: ports.authority,
+            outstanding: ports.outstanding,
             ends,
             stamps,
             faults,
@@ -1328,6 +1354,8 @@ impl HasView for HeaderWire {
             round_life: self.round_life.clone(),
             chain_effect: self.chain_effect.clone(),
             authority: self.authority.clone(),
+            // The wire harness doesn't register outstanding-work-bounded.
+            outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -1756,7 +1784,9 @@ pub fn storage_config() -> RunConfig {
 /// The family header sync's generated property IDs name.
 pub const FAMILY: &str = "header-sync";
 
-/// `header-sync/wire`'s properties: [`storage_properties`], then
+/// `header-sync/wire`'s properties: [`storage_properties`] less
+/// [`OUTSTANDING_WORK_BOUNDED`], whose tap only the storage harness
+/// watches, then
 /// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
 /// sender properties (M5-Q13), then `session/honest-never-punished`, then
 /// `header-sync/honest-progress` (hdr-8), which only the
@@ -1766,6 +1796,7 @@ pub const FAMILY: &str = "header-sync";
 /// fails preparation, so no run or fuzz seed there could apply it.
 pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
+    properties.retain(|property| property.id.as_str() != OUTSTANDING_WORK_BOUNDED);
     properties.push(header_fault_penalized());
     properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
     properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
@@ -1816,7 +1847,19 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         reset_invalidates_work(),
         stale_chain_effect_inert(),
         commit_only_authorized(),
+        outstanding_work_bounded(),
     ]
+}
+
+/// The peers the storage harness's node admits at once, from the config
+/// and connection limit [`HeaderNode::spawn`] gives it.
+fn storage_peer_limit() -> usize {
+    let limits = ZakuraHeaderSyncConfig::default().peer_limits;
+    admitted_peer_limit(
+        limits.max_inbound_peers,
+        limits.max_outbound_peers,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    )
 }
 
 /// What [`storage_properties`] read: the node's storage facts and the
@@ -2234,6 +2277,7 @@ mod tests {
                 round_life: RoundLifeEvidence::default(),
                 chain_effect: ChainEffectEvidence::default(),
                 authority: AuthorityEvidence::default(),
+                outstanding: OutstandingEvidence::default(),
                 recovery: RecoveryEvidence::default(),
             }
         }

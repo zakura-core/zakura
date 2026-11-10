@@ -54,7 +54,7 @@ impl PortOperations {
     }
 
     /// The number of calls still running.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn len(&self) -> usize {
         self.others.len() + usize::from(self.vct_local.is_some())
     }

@@ -11,7 +11,7 @@ use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync
 
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
-    BodyWorkOwner, EngineSnapshot, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
+    BodyWorkOwner, BranchId, EngineSnapshot, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
     HeaderWorkAuthority, SourceId, StateVersion, VerifiedGeneration,
 };
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
@@ -442,6 +442,25 @@ pub enum ReactorEvent {
         /// The subscription primitive's totals after the acceptance.
         totals: CreditTotals,
     },
+    /// The reactor marked a target completed for `header_generation` and
+    /// `branch`: an apply admitted it, or, when `already_known`, the peer's
+    /// locator read already held its tip. Reported right after the mark.
+    TargetCompleted {
+        /// The generation the completion is keyed by.
+        header_generation: HeaderGeneration,
+        /// The completed branch.
+        branch: BranchId,
+        /// Whether the locator already held the target, so nothing was
+        /// fetched.
+        already_known: bool,
+    },
+    /// The reactor's growable containers as a unit of work ends, reported
+    /// just before the `CauseSet` that ends it.
+    Sizes {
+        /// Each container's size, and the keys of each one keyed by peer or
+        /// call.
+        sizes: ReactorSizes,
+    },
     /// The reactor started or finished a unit of work, and `cause` is the
     /// one it's in now. Every fact the reactor's task reports after this,
     /// until the next `CauseSet`, belongs to `cause`.
@@ -606,6 +625,56 @@ impl ReactorEvent {
             reason,
         }
     }
+}
+
+/// The reactor's growable containers, as [`ReactorEvent::Sizes`] reports
+/// them. Every key list is sorted, except the supplier order, which is the
+/// queue's own order, and the repair episodes' owners, which have no order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReactorSizes {
+    /// The peers with a session handle.
+    pub sessions: Vec<ZakuraPeerId>,
+    /// The peers with scheduling state, one per admitted session.
+    pub scheduled: Vec<ZakuraPeerId>,
+    /// The peers whose latest `Status` the reactor still holds as an offer.
+    pub cached_offers: Vec<ZakuraPeerId>,
+    /// The peers holding a request reservation in the work queue, each
+    /// with its reservation's number, or `None` for one opened unobserved.
+    pub reservations: Vec<(ZakuraPeerId, Option<u64>)>,
+    /// The peers holding staged-capacity leases in the work queue, each
+    /// with how many leases the queue holds for it.
+    pub staged_capacity: Vec<(ZakuraPeerId, usize)>,
+    /// Each started round's peer with the headers staged in its entries.
+    pub staged_entries: Vec<(ZakuraPeerId, usize)>,
+    /// The owners of the repair episodes the work policy holds.
+    pub repair_episodes: Vec<HeaderSyncWorkOwner>,
+    /// The peers with a request deadline.
+    pub request_deadlines: Vec<ZakuraPeerId>,
+    /// The peers with a close deadline, each with the session it closes.
+    pub close_deadlines: Vec<(ZakuraPeerId, u64)>,
+    /// The peers whose `Close` waits to be retried, each with the session
+    /// it closes.
+    pub pending_closes: Vec<(ZakuraPeerId, u64)>,
+    /// Each pending locator read, by peer, with its call's number.
+    pub locator_reads: Vec<(ZakuraPeerId, u64)>,
+    /// The numbers of the storage calls the reactor counts as pending.
+    pub storage_calls: Vec<u64>,
+    /// The port futures the reactor polls.
+    pub port_futures: usize,
+    /// The VCT supplier order, in its order.
+    pub supplier_order: Vec<ZakuraPeerId>,
+    /// The departed peers whose strikes the reactor keeps, each with its
+    /// strikes and how long its hold has left, zero once it ended.
+    pub departed_strikes: Vec<(ZakuraPeerId, u32, std::time::Duration)>,
+    /// The peers under a readmission cooldown, each with how long it has
+    /// left, zero once it ended.
+    pub cooldowns: Vec<(ZakuraPeerId, std::time::Duration)>,
+    /// The peers `HistoryPruned` taught the reactor about.
+    pub pruned_peers: Vec<ZakuraPeerId>,
+    /// Each completed target, by generation and branch.
+    pub completed_targets: Vec<(HeaderGeneration, BranchId)>,
+    /// The entries of the VCT repair requirement's source sets and maps.
+    pub repair_sources: usize,
 }
 
 /// One peer's slot in the work queue, as [`ReactorEvent::Slots`] lists it.

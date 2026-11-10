@@ -585,6 +585,36 @@ impl std::ops::Deref for PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
+    /// The peers holding a request reservation with each one's number, and
+    /// the peers holding staged-capacity leases with each one's lease
+    /// count, each sorted by peer, then the policy's staged headers by round and
+    /// repair episodes' owners ([`WorkPolicy::staged_sizes`]).
+    #[cfg(any(test, zakura_sim))]
+    #[allow(clippy::type_complexity)]
+    pub(in crate::zakura::header_sync) fn sizes(
+        &self,
+    ) -> (
+        Vec<(ZakuraPeerId, Option<u64>)>,
+        Vec<(ZakuraPeerId, usize)>,
+        Vec<(ZakuraPeerId, usize)>,
+        Vec<HeaderSyncWorkOwner>,
+    ) {
+        let mut reservations: Vec<(ZakuraPeerId, Option<u64>)> = self
+            .request_reservations
+            .iter()
+            .map(|(peer, reservation)| (peer.clone(), reservation.0.tag.as_ref().map(|tag| tag.id)))
+            .collect();
+        reservations.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut staged: Vec<(ZakuraPeerId, usize)> = self
+            .staged_capacity
+            .iter()
+            .map(|(peer, leases)| (peer.clone(), leases.len()))
+            .collect();
+        staged.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let (entries, episodes) = self.policy.staged_sizes();
+        (reservations, staged, entries, episodes)
+    }
+
     pub(in crate::zakura::header_sync) fn capacity_releases(&self) -> watch::Receiver<u64> {
         self.budget.0.released.subscribe()
     }

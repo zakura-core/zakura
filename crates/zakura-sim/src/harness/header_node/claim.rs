@@ -50,6 +50,13 @@ pub enum Claim {
     /// A round a new snapshot made obsolete retired while the queue still
     /// held it.
     UnreleasedObsoleteRound,
+    /// One of the reactor's growable containers grew past its bound, or
+    /// kept a key that no longer has what its entry is for
+    /// ([`super::outstanding`]), or the work books didn't balance: a
+    /// reservation, round or call that held headers broke the ledger's
+    /// accounting ([`super::tap`]'s `WORK_BOOKS`), or a round retired
+    /// unreleased for a reason no other property owns.
+    OutstandingWork,
     /// An apply changed the engine under an older generation or anchor, or
     /// the reactor's adoption moved back ([`super::chain_effect`]).
     StaleChainEffect,
@@ -94,6 +101,7 @@ impl Claim {
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
             ClaimRule::OpenReservation => Claim::OpenReservation,
             ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
+            ClaimRule::UnreleasedRound => Claim::OutstandingWork,
             ClaimRule::ForeignPage => Claim::ForeignPage,
             ClaimRule::UnstagedPage => Claim::UnstagedPage,
             ClaimRule::OverReservation => Claim::OverReservation,

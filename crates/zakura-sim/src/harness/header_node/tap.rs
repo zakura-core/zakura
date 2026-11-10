@@ -108,6 +108,7 @@ use super::{
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
+    outstanding::{HeldHeaders, Outstanding, OutstandingEvidence},
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
@@ -212,6 +213,9 @@ struct TapState {
     /// Checks that no stale apply changes the engine and adoption never
     /// moves back. None until [`ReactorTap::watch_chain`].
     chain_effect: Mutex<Option<ChainEffect>>,
+    /// Checks the reactor's growable containers. None until
+    /// [`ReactorTap::watch_outstanding`].
+    outstanding: Mutex<Option<Outstanding>>,
     /// Checks rounds' owner binding and pages' paths. None until
     /// [`ReactorTap::watch_authority`].
     authority: Mutex<Option<Authority>>,
@@ -229,12 +233,57 @@ enum ProbeSlot {
     Replaced,
 }
 
+/// The ledger's and the pairer's rules that keep the work books: a
+/// reservation's limits and binding, its rounds, and the calls that hold
+/// their headers. A break of one is `outstanding-work-bounded`'s claim, not
+/// an integrity failure, since a production defect alone can break it with
+/// every fact truthful.
+const WORK_BOOKS: [&str; 24] = [
+    "OverFairShare",
+    "OverRequestLimit",
+    "SecondReservation",
+    "WrongPurpose",
+    "WrongReservation",
+    "UnreservedStart",
+    "ReleaseMismatch",
+    "LeaseReturnedEarly",
+    "ReservationReused",
+    "UnknownReservation",
+    "UnresolvedBinding",
+    "RoundGap",
+    "UnknownRound",
+    "UnheldCall",
+    "HeldTwice",
+    "NotHeld",
+    "EndedTwice",
+    "UnknownCall",
+    "CallReused",
+    "CallEndedTwice",
+    "MissingCallEnd",
+    "UnendedCall",
+    "UnresolvedHandoff",
+    "PairedTwice",
+];
+
+/// Whether `detail`, a refusal led by its rule's name, is a work-books rule.
+fn work_books(detail: &str) -> bool {
+    WORK_BOOKS.iter().any(|rule| {
+        detail
+            .strip_prefix(rule)
+            .is_some_and(|rest| rest.starts_with(':'))
+    })
+}
+
 /// The tap's ownership check, the first integrity rule a history broke,
-/// and the claim breaks not yet drained.
+/// the first work-books rule it broke, and the claim breaks not yet
+/// drained.
 #[derive(Default)]
 struct WorkCheck {
     ledger: HeaderWorkLedger,
     broken: Option<String>,
+    /// The first [`WORK_BOOKS`] rule the history broke, for the next drain
+    /// to record as an `OutstandingWork` claim.
+    books: Option<String>,
     /// Whether a drain followed the first integrity failure, after which
     /// the ledger folds nothing more.
     stopped: bool,
@@ -271,7 +320,11 @@ impl TapState {
         let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         if !work.stopped {
             if let Err(rule) = work.ledger.observe(event) {
-                work.broken.get_or_insert(rule);
+                if work_books(&rule) {
+                    work.books.get_or_insert(rule);
+                } else {
+                    work.broken.get_or_insert(rule);
+                }
             }
             let claims = work.ledger.take_claims();
             work.claims.extend(claims);
@@ -286,16 +339,23 @@ impl TapState {
         if let Some(record) = self.claims.unreported(Some(step)) {
             return Err(record.detail);
         }
-        let claims = {
+        let (claims, books) = {
             let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-            work.stopped |= work.broken.is_some();
-            mem::take(&mut work.claims)
+            work.stopped |= work.broken.is_some() || work.books.is_some();
+            (mem::take(&mut work.claims), work.books.take())
         };
         for broken in claims {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::of(broken.rule),
                 detail: broken.detail,
+            });
+        }
+        if let Some(rule) = books {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::OutstandingWork,
+                detail: format!("OutstandingWork: the work books don't balance: {rule}"),
             });
         }
         let stale = self
@@ -329,6 +389,20 @@ impl TapState {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::ResetInvalidatesWork,
+                detail,
+            });
+        }
+        let outstanding = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|outstanding| outstanding.drain(step))
+            .unwrap_or_default();
+        for detail in outstanding {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::OutstandingWork,
                 detail,
             });
         }
@@ -397,6 +471,13 @@ impl TapState {
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert(error);
         Ok(())
+    }
+
+    /// Notes `rule`, a [`WORK_BOOKS`] rule another check broke, for the
+    /// next drain to record.
+    fn note_books(&self, rule: String) {
+        let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.books.get_or_insert(rule);
     }
 
     /// The first rule this run's history broke.
@@ -473,7 +554,12 @@ impl TapState {
         if mem::replace(&mut work.finished, true) {
             return Ok(());
         }
-        work.ledger.finish()?;
+        if let Err(rule) = work.ledger.finish() {
+            if !work_books(&rule) {
+                return Err(rule);
+            }
+            work.books.get_or_insert(rule);
+        }
         let claims = work.ledger.take_claims();
         work.claims.extend(claims);
         Ok(())
@@ -680,6 +766,14 @@ impl TapState {
             {
                 rounds.observe(&event, on_reactor);
             }
+            if let Some(outstanding) = state
+                .outstanding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                outstanding.observe(&event);
+            }
             if let Some(chain) = state
                 .chain_effect
                 .lock()
@@ -706,9 +800,10 @@ impl TapState {
             }
         }
         // Budget changes, credit and built closes, causes, headroom waits,
-        // deferred passes, taken events, watch reads, the queue's slots and
-        // cursor claims and acceptances stay out of the log, whose format pinned Plans
-        // fix, and a teardown's returns after the run are expected.
+        // deferred passes, taken events, watch reads, the reactor's sizes and
+        // completed targets, the queue's slots and cursor claims and
+        // acceptances stay out of the log, whose format pinned Plans fix, and
+        // a teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -719,6 +814,8 @@ impl TapState {
                 | ReactorEvent::EventTaken { .. }
                 | ReactorEvent::WatchObserved { .. }
                 | ReactorEvent::Slots { .. }
+                | ReactorEvent::Sizes { .. }
+                | ReactorEvent::TargetCompleted { .. }
                 | ReactorEvent::CursorsAccepted { .. }
                 | ReactorEvent::CursorClaimed { .. }
                 | ReactorEvent::CloseBuilt { .. }
@@ -996,6 +1093,7 @@ impl ReactorTap {
                 wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
+                outstanding: Mutex::default(),
                 authority: Mutex::default(),
             }))
         });
@@ -1148,6 +1246,27 @@ impl ReactorTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) =
             Some(RoundLife::new(evidence, self.state.engine_generation()));
+    }
+
+    /// Checks from now on that this reactor's growable containers stay
+    /// within their bounds and keep only live keys, as
+    /// [`super::outstanding`] describes, for a node that admits
+    /// `peer_limit` peers, keeping each row's peak in `evidence`. Call it
+    /// before the run starts.
+    pub fn watch_outstanding(&self, evidence: OutstandingEvidence, peer_limit: usize) {
+        let port = self.state.port.clone();
+        *self
+            .state
+            .outstanding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Outstanding::new(
+            evidence,
+            peer_limit,
+            HeldHeaders::new(move || {
+                let state = port.upgrade()?.engine().durable_state();
+                Some(state.graph.nodes.into_keys().collect())
+            }),
+        ));
     }
 
     /// Checks from now on that no stale apply changes the node's engine and
@@ -1688,6 +1807,10 @@ impl ActionSource for ReactorTap {
             // check then reports the tap's own health, `ReactorGone` or
             // `PortGone`, so the crash isn't read as a pairing bug.
             (None, Err(PairError::Evidence(_))) if self.state.health().is_some() => return Ok(()),
+            (None, Err(PairError::Evidence(detail))) if work_books(&detail) => {
+                self.state.note_books(detail);
+                Ok(())
+            }
             (None, Err(PairError::Evidence(detail))) => Err(detail),
             (None, Err(PairError::PortPanicked { call })) => {
                 // The run checks this after the step, ahead of any evidence

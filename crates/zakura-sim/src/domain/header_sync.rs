@@ -13,6 +13,7 @@ use crate::{
         capacity::{BoundaryRead, CapacityEvidence},
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        outstanding::OutstandingEvidence,
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
@@ -392,6 +393,77 @@ where
 /// [`RESET_INVALIDATES_WORK`]'s trigger history: the check applied.
 fn reset_applied<V: ResetView>(view: &V, _: &ObservationLog) -> bool {
     view.round_life().any()
+}
+
+/// `header-sync/outstanding-work-bounded`: the reactor's growable
+/// containers stay within their bounds and keep only live keys.
+pub const OUTSTANDING_WORK_BOUNDED: &str = "header-sync/outstanding-work-bounded";
+
+/// A view that keeps the reactor's container peaks, for
+/// [`OUTSTANDING_WORK_BOUNDED`].
+pub trait OutstandingView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// Each container's peak, and when the rule first applied.
+    fn outstanding(&self) -> &OutstandingEvidence;
+}
+
+/// [`OUTSTANDING_WORK_BOUNDED`], as a harness whose view is an
+/// [`OutstandingView`] registers it.
+pub fn outstanding_work_bounded<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: OutstandingView,
+{
+    Property {
+        id: PropertyId::new(OUTSTANDING_WORK_BOUNDED),
+        claim: "at the end of each unit of work the reactor's slots, reservations, staged \
+                entries, deadlines, closes, locator reads, storage calls, port futures, cached \
+                offers, supplier order, strikes and cooldowns stay within their production \
+                bounds, and every key kept for a peer or call names one that still has what \
+                the entry is for",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_outstanding_work_bounded::<S>,
+        witness: Some(TriggerHistory::View(outstanding_applied::<S::View>)),
+    }
+}
+
+/// Checks [`OUTSTANDING_WORK_BOUNDED`] at the boundary after a step: it's
+/// violated by an `OutstandingWork` claim break the tap found at this
+/// step, and holds once a drain judged a `Sizes`.
+fn check_outstanding_work_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: OutstandingView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the reactor's containers stay within their bounds and keep only live keys";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::OutstandingWork])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.outstanding().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`OUTSTANDING_WORK_BOUNDED`]'s trigger history: the rule judged a
+/// `Sizes`.
+fn outstanding_applied<V: OutstandingView>(view: &V, _: &ObservationLog) -> bool {
+    view.outstanding().any()
 }
 
 /// A stale apply never changes the node's engine, and the reactor's

@@ -36,7 +36,7 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, capacity accounting, the queue's slots, budget changes, credit, causes,
+    /// reservations, capacity accounting, the queue's slots, budget changes, credit, causes, sizes,
     /// session admissions, refusals and ends, readmission cooldowns, or the
     /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
@@ -59,6 +59,7 @@ impl Recorder {
                         | ReactorEvent::CursorClaimed { .. }
                         | ReactorEvent::CloseBuilt { .. }
                         | ReactorEvent::CauseSet { .. }
+                        | ReactorEvent::Sizes { .. }
                         | ReactorEvent::HeadroomWait { .. }
                         | ReactorEvent::CachedPassDeferred { .. }
                         | ReactorEvent::EventTaken { .. }
@@ -767,8 +768,82 @@ async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
     );
 }
 
-/// A nested unit of work reports its cause, then restores the outer one,
-/// which restores the reactor's own.
+/// The last [`ReactorEvent::Sizes`] in `events`.
+fn last_sizes(events: &[ReactorEvent]) -> observe::ReactorSizes {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ReactorEvent::Sizes { sizes } => Some(sizes.clone()),
+            _ => None,
+        })
+        .expect("a unit of work ended")
+}
+
+/// Each unit of work ends with the reactor's containers: an admitted
+/// session with an applying round holds its session, scheduling state,
+/// reservation and staged entries, and a dispatched apply counts as one
+/// pending call with one future until its completion is handled.
+#[tokio::test]
+async fn each_unit_ends_with_the_reactors_sizes() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (..) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    recorder.take_all();
+
+    let apply = apply_operation(&reactor, &peer);
+    assert!(matches!(
+        reactor.dispatch_action(apply),
+        StorageDispatch::Started(_)
+    ));
+    caused!(reactor, ReactorCause::Event, ());
+    let sizes = last_sizes(&recorder.take_all());
+    assert_eq!(sizes.sessions, std::slice::from_ref(&peer));
+    assert_eq!(sizes.scheduled, std::slice::from_ref(&peer));
+    assert_eq!(sizes.storage_calls, [1]);
+    assert_eq!(sizes.port_futures, 1);
+    assert!(
+        matches!(&sizes.staged_entries[..], [(staged, headers)] if *staged == peer && *headers > 0),
+        "{sizes:?}"
+    );
+    assert!(sizes.locator_reads.is_empty(), "{sizes:?}");
+
+    complete_next(&mut reactor).await;
+    let events = recorder.take_all();
+    let sizes = last_sizes(&events);
+    assert!(sizes.storage_calls.is_empty(), "{sizes:?}");
+    assert_eq!(sizes.port_futures, 0);
+    assert!(sizes.staged_entries.is_empty(), "{sizes:?}");
+    assert!(sizes.reservations.is_empty(), "{sizes:?}");
+    // The completion's handler ends with its own sizes, before its cause
+    // gives way.
+    let completion = events
+        .iter()
+        .position(|event| {
+            *event
+                == ReactorEvent::CauseSet {
+                    cause: ReactorCause::Completion { call: 1 },
+                }
+        })
+        .expect("the completion ran under its cause");
+    assert!(matches!(
+        events[completion + 1..].iter().find(|event| matches!(
+            event,
+            ReactorEvent::Sizes { .. } | ReactorEvent::CauseSet { .. }
+        )),
+        Some(ReactorEvent::Sizes { .. })
+    ));
+}
+
+/// A nested unit of work reports its cause, then the reactor's sizes and
+/// the outer cause it restores, which restores the reactor's own the same
+/// way.
 #[test]
 fn a_nested_cause_restores_the_outer_one() {
     let recorder = Arc::new(Recorder::default());
@@ -784,12 +859,17 @@ fn a_nested_cause_restores_the_outer_one() {
         caused!(reactor, ReactorCause::Watch, ())
     );
     let cause = |cause| ReactorEvent::CauseSet { cause };
+    let sizes = || ReactorEvent::Sizes {
+        sizes: observe::ReactorSizes::default(),
+    };
     assert_eq!(
         recorder.take_all(),
         [
             cause(ReactorCause::Startup),
             cause(ReactorCause::Watch),
+            sizes(),
             cause(ReactorCause::Startup),
+            sizes(),
             cause(ReactorCause::Idle),
         ]
     );

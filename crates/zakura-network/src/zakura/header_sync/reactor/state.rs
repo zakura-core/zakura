@@ -1051,6 +1051,14 @@ pub(super) struct StorageCalls {
 }
 
 impl StorageCalls {
+    /// The numbers of the calls counted as pending, sorted.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn pending_numbers(&self) -> Vec<u64> {
+        let mut numbers: Vec<u64> = self.pending.keys().copied().collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
     /// Number a new call of `kind`. The call has not started.
     pub(super) fn propose(&mut self, kind: StorageCallKind) -> StorageCall {
         self.last = self.last.wrapping_add(1);
@@ -1140,6 +1148,18 @@ pub(super) struct LocatorQueries {
 }
 
 impl LocatorQueries {
+    /// Each pending read's peer and call number, sorted by peer.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn pending_calls(&self) -> Vec<(ZakuraPeerId, u64)> {
+        let mut reads: Vec<(ZakuraPeerId, u64)> = self
+            .pending
+            .iter()
+            .map(|(peer, query)| (peer.clone(), query.call.number))
+            .collect();
+        reads.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        reads
+    }
+
     /// The read pending for `peer`, with its call and authority.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn pending_read(

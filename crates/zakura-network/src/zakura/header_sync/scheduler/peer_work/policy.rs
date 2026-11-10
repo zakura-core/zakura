@@ -748,6 +748,26 @@ pub(in crate::zakura::header_sync) struct WorkPolicy {
 }
 
 impl WorkPolicy {
+    /// Each started round's peer with the headers staged in its entries,
+    /// sorted by peer, and the owners of the repair episodes held.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn staged_sizes(
+        &self,
+    ) -> (Vec<(ZakuraPeerId, usize)>, Vec<HeaderSyncWorkOwner>) {
+        let mut staged: Vec<(ZakuraPeerId, usize)> = self
+            .work_by_peer
+            .iter()
+            .filter_map(|(peer, work)| match work {
+                PeerWorkState::Active { request, .. } => {
+                    Some((peer.clone(), request.entries.len()))
+                }
+                PeerWorkState::AwaitingLocator { .. } => None,
+            })
+            .collect();
+        staged.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        (staged, self.repair_episodes.keys().copied().collect())
+    }
+
     /// Changes whenever target ownership or a peer's awaiting/active state changes.
     /// These changes invalidate cached offers. The reactor separately tracks effective
     /// virtual claims using negotiated limits.

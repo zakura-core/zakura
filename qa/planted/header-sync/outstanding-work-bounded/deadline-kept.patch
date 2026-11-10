@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4ba2e67b9f..018c113e1e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -562,7 +562,8 @@ impl ReactorState {
+     }
+ 
+     pub(super) fn clear_request_deadline(&mut self, peer: &ZakuraPeerId) {
+-        self.request_deadlines.remove(peer);
++        // Mutation: a retired round's request deadline stays.
++        let _ = peer;
+     }
+ 
+     /// Forget the `Close` this node sent to `peer`'s `session_id` once that session's

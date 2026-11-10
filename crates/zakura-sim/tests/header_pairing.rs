@@ -24,8 +24,8 @@ use zakura_header_chain::{
 };
 use zakura_network::zakura::{
     observe::{
-        as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent, RequestRef, ReservationEnd,
-        ReservationPurpose, StorageCallKind,
+        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase, PortCall,
+        ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose, StorageCallKind,
     },
     spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
@@ -513,12 +513,17 @@ fn evidence_failure(report: &RunReport) -> &str {
 }
 
 /// A call that reports no end fails the run once the reactor's teardown is
-/// done, though it never reached a drop for the pairer to wait on.
+/// done, though it never reached a drop for the pairer to wait on: the
+/// work books don't balance, which is `outstanding-work-bounded`'s claim,
+/// and with no property to report it the run fails at its end.
 #[test]
 fn a_call_left_unended_fails_at_teardown() {
     let report = teardown_after(open_work(1).into(), false, false);
     let detail = evidence_failure(&report);
-    assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
+    assert!(
+        detail.starts_with("OutstandingWork: the work books don't balance: UnendedCall: call 1"),
+        "{detail}"
+    );
 }
 
 /// A call that ended and kept its headers fails the run once the stopped
@@ -603,12 +608,15 @@ fn a_reactor_that_returns_is_recorded_not_failed() {
 }
 
 /// An announced stop still runs the teardown checks: work it leaves open
-/// fails the run as the ledger names it.
+/// fails the run as the ledger names it, under the work-books claim.
 #[test]
 fn an_announced_stop_still_fails_open_work() {
     let report = teardown_after(open_work(4).into(), false, true);
     let detail = evidence_failure(&report);
-    assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
+    assert!(
+        detail.starts_with("OutstandingWork: the work books don't balance: UnendedCall: call 1"),
+        "{detail}"
+    );
 }
 
 /// A run that ends at its budget while an announced stop is still under way
@@ -1279,6 +1287,25 @@ fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
     )
 }
 
+/// The retirement, on its peer's disconnect, of the round `events` started,
+/// which the queue still holds: an integrity failure until its own property
+/// takes it.
+fn disconnected(events: &[ReactorEvent]) -> ReactorEvent {
+    let request = events
+        .iter()
+        .find_map(|event| match event {
+            ReactorEvent::Started { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("the work starts a round");
+    ReactorEvent::Retired {
+        request,
+        phase: HeaderTargetPhase::Receiving,
+        purpose: HeaderTargetPurpose::Normal,
+        reason: HeaderRequestTerminal::Disconnected,
+    }
+}
+
 /// A claim break and an integrity failure in one step, in either order: the
 /// claim drains that step, so its property can report it first, and the
 /// failure waits. A step with no claim fails at once.
@@ -1289,8 +1316,8 @@ fn a_claim_drains_before_its_steps_integrity_failure() {
     if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
         *reserved_left = 1;
     }
-    let reused = events[5].clone();
-    events.push(reused.clone());
+    let unreleased = disconnected(&events);
+    events.push(unreleased.clone());
     let (report, claims) = claims_after(events);
     let found: Vec<_> = claims.records();
     assert!(
@@ -1303,26 +1330,26 @@ fn a_claim_drains_before_its_steps_integrity_failure() {
     assert!(detail.starts_with("OverReservation"), "{detail}");
 
     let mut events = Vec::from(open_work(4));
-    events.push(reused);
+    events.push(unreleased);
     let (report, claims) = claims_after(events);
     assert_eq!(claims.records(), []);
     let detail = evidence_failure(&report);
-    assert!(detail.starts_with("CallReused: call 1"), "{detail}");
+    assert!(detail.starts_with("UnreleasedRound: round 1"), "{detail}");
 
-    // The failure first, from a reservation number reused before the page,
-    // then the claim: the ledger still folds the rest of the step.
+    // The failure first, from the round's retirement before its page, then
+    // the claims its page and call make on the retired round: the ledger
+    // still folds the rest of the step, and they drain ahead of it.
     let mut events = Vec::from(open_work(4));
-    if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
-        *reserved_left = 1;
-    }
-    let reopened = events[0].clone();
-    events.insert(3, reopened);
+    let early = disconnected(&events);
+    events.insert(3, early);
     let (report, claims) = claims_after(events);
     let found = claims.records();
     assert!(
-        matches!(&found[..], [only] if only.detail.starts_with("OverReservation")),
+        found
+            .iter()
+            .any(|record| record.detail.starts_with("WrongRound: call 1")),
         "{found:?}"
     );
     let detail = evidence_failure(&report);
-    assert!(detail.starts_with("OverReservation"), "{detail}");
+    assert_eq!(detail, found[0].detail, "{found:?}");
 }

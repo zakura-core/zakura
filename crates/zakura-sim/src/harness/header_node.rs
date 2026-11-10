@@ -24,6 +24,7 @@ pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;
+pub mod outstanding;
 mod pair;
 pub mod policy;
 pub mod recovery;
@@ -579,6 +580,8 @@ pub struct StartupFacts {
     pub status_refresh_interval: Duration,
     /// The largest frame the reactor writes.
     pub max_frame_bytes: u32,
+    /// The connections the node admits, which caps its admitted peers.
+    pub max_connections: usize,
 }
 
 impl HeaderNode {
@@ -624,6 +627,7 @@ impl HeaderNode {
             request_timeout: startup.request_timeout,
             status_refresh_interval: startup.status_refresh_interval,
             max_frame_bytes: startup.max_frame_bytes,
+            max_connections: startup.max_connections,
         };
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");

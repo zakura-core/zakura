@@ -18,6 +18,7 @@ use support::{
 use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     domain::{
+        header_sync::OUTSTANDING_WORK_BOUNDED,
         header_sync_progress::HONEST_PROGRESS,
         session::{honest_never_punished, HonestPeers, HONEST_NEVER_PUNISHED},
     },
@@ -238,7 +239,9 @@ fn generated() -> Vec<String> {
 
 /// The harness registers header sync's generated receiver and sender IDs,
 /// then `session/honest-never-punished` and `header-sync/honest-progress`,
-/// after the storage properties and `header-sync/header-fault-penalized`.
+/// after the storage properties, less `header-sync/outstanding-work-bounded`,
+/// whose tap only the storage harness watches, and
+/// `header-sync/header-fault-penalized`.
 /// No downstream template is registered, since the adapter observes none
 /// of their effects.
 #[test]
@@ -258,17 +261,18 @@ fn the_harness_registers_the_generated_header_ids() {
         .collect();
     expected.push(HONEST_NEVER_PUNISHED.to_owned());
     expected.push(HONEST_PROGRESS.to_owned());
-    // The storage harness's properties come first, then the fault
+    // The storage harness's properties but one come first, then the fault
     // property, then the generated ones.
+    let storage: Vec<String> = storage_properties::<HeaderWire>()
+        .into_iter()
+        .map(|property| property.id.to_string())
+        .filter(|id| id != OUTSTANDING_WORK_BOUNDED)
+        .collect();
     let fault = registered
         .iter()
         .position(|id| id == HEADER_FAULT_PENALIZED)
         .expect("the wire harness registers the fault property");
-    assert_eq!(
-        fault,
-        storage_properties::<HeaderWire>().len(),
-        "{registered:?}"
-    );
+    assert_eq!(registered[..fault], storage[..], "{registered:?}");
     assert_eq!(registered[fault + 1..], expected[..]);
 }
 

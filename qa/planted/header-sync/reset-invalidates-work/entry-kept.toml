@@ -5,6 +5,9 @@
 # starts and retires around the reset, so a change there can move the
 # witness off it.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The kept entry is an active slot whose round the queue already released,
+# which outstanding-work-bounded's slot row breaks on too, possibly first.
+also_violates = ["header-sync/outstanding-work-bounded"]
 
 [typed]
 harness = "header-sync/storage"

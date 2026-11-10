@@ -1,6 +1,6 @@
 # A stale request's body is credited to the height's current owner
 
-`stale-body-credits-current-owner.patch` is a mutation-loop patch for the `submit-only-requested` work-list
+`stale-body-credits-current-owner.patch` is a mutation-loop patch for the `block-sync-table` work-list
 entry. Fault class: ownership.
 
 ## What it breaks
@@ -14,31 +14,38 @@ reservation, and the body reaches the sequencer under the current owner.
 
 ## Witness
 
-The witness is `qa/planted/block-sync/submit-only-requested/height-only.toml`, which runs
-`crates/zakura-sim/tests/fixtures/block-sync-reset-mid-flight.bin`.
+The witness is the `block_table` test
+`the_stale_request_body_input_holds_receiver_work_authorized`. It runs
+`crates/zakura-sim/tests/fixtures/block-sync-stale-request-body.bin`, which
+a seeded random search on the remote host found. The input resets the
+chain to a fork from height 8 once the node submits its third body, while
+two mirrors serve. One routine judges an old-chain body for height 14
+after the other routine's fork request reserved height 14, while the first
+routine's old request is still local. The test asserts that order. The
+patch credits that body to the fork request.
 
-The input resets the chain to a fork from height 8 once the node submits
-its third body, while two mirrors serve. Old-epoch bodies still on the wire
-match their old requests after the reset. A body at or above the fork
-height then carries the old chain's hash under a new-epoch owner whose
-request asked for the fork's hash. The sequencer accepts it, since its
-owner's epoch is current, and submits it. No needed-blocks answer of the
-new epoch listed that hash, and the body crossed in the old request's
-exchange.
+`block-sync/s6v3/block/receiver-work-authorized` judges the body when it
+enters the sequencer's input queue. The credited request's connection
+carried no frame for the body, so the rule fails there.
+`block-sync/submit-only-requested` judges only the later submission, so it
+never sees the body first.
+
+`qa/planted/block-sync/submit-only-requested/height-only.toml`
+(`block-sync-reset-mid-flight.bin`) never drives this order: every
+old-epoch body crosses before the reset.
 
 ## Remaining guards
 
 The sequencer's epoch check in `offer_body` still holds, but the
-re-owned body carries the current epoch. The transport's authorization
-checks the body against the old request it answers, which it does.
+re-owned body carries the current epoch.
 
 ## Reproduce
 
 ```sh
 git apply qa/native-mutations/submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch
-cargo xtask planted loop --out "$TMPDIR/loop" --only block-sync/submit-only-requested
+cargo xtask planted loop --out "$TMPDIR/loop" --only block-sync/s6v3/block/receiver-work-authorized
 ```
 
-Required failure: the run ends at `block-sync/submit-only-requested` with a violation.
+Required failure: the run ends at `block-sync/s6v3/block/receiver-work-authorized` with a violation.
 A compiler error, timeout, panic, or another rule's violation is not
 detection.

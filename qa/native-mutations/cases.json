@@ -170,7 +170,7 @@
     "entry": "bounds",
     "property": "block-sync/reserved-byte-bound",
     "witness": {
-      "planted": "qa/planted/block-sync/reserved-byte-bound/above-floor-charge.toml"
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin"
     },
     "fault_class": "boundary-accounting"
   },
@@ -306,10 +306,12 @@
   },
   {
     "patch": "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch",
-    "entry": "submit-only-requested",
-    "property": "block-sync/submit-only-requested",
+    "entry": "block-sync-table",
+    "table": "block-sync/s6v3",
+    "property": "block-sync/s6v3/block/receiver-work-authorized",
     "witness": {
-      "planted": "qa/planted/block-sync/submit-only-requested/height-only.toml"
+      "test": "the_stale_request_body_input_holds_receiver_work_authorized",
+      "test_target": "block_table"
     },
     "fault_class": "ownership"
   },

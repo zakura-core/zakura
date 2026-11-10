@@ -255,6 +255,8 @@ witnesses = [
     { test = "faults_inside_the_nodes_exchange_reach_their_exact_ids", test_target = "block_table" },
     { test = "requests_past_twice_the_serving_limit_reach_over_margin", test_target = "block_table" },
     { test = "honest_runs_hold_every_generated_id_they_reach", test_target = "block_table" },
+    { test = "old_chain_bodies_after_a_reset_hold_receiver_work_authorized", test_target = "block_table" },
+    { test = "the_stale_request_body_input_holds_receiver_work_authorized", test_target = "block_table" },
 ]
 
 [[entry]]

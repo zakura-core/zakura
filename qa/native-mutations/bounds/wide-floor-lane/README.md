@@ -20,10 +20,19 @@ it counts as floor requests.
 
 ## Witness
 
-`qa/planted/block-sync/reserved-byte-bound/above-floor-charge.toml`: the committed input `block-sync-paused-handoffs.bin`.
-Its `M` is `1.5·B` and every estimate is `B`, so each request past the
-first refuses its reservation. Four mirrors ask for heights just above the
-floor, and each such request now charges `B` past `M`.
+The committed input `crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin`
+(paused handoffs), which the test
+`block_resource_properties::the_floor_lane_race_input_holds_reserved_byte_bound`
+also runs. A seeded random search on the remote host found it. In its run,
+one routine probes the floor's next height, another routine takes that
+height first, and the first routine's floor take then starts above it. The
+unpatched node refuses that take for capacity. The patch counts it as a
+floor request, so it charges past `M` and the run ends at the reserved
+bound.
+
+`above-floor-charge.toml`'s input never drives that race. The patch
+survived on it and on `every_worker_count_holds_the_resource_bounds` and
+`the_floor_churn_holds_the_reserved_bound`.
 
 ## Reproduce
 

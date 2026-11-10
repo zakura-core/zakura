@@ -17,7 +17,7 @@ use support::{
     inputs,
     script::{run_under, Node, OBSERVED},
 };
-use zakura_network::zakura::{block_sync_streams, BlockSyncMessage};
+use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
 use zakura_sim::{
     harness::{
         block_node::{
@@ -30,7 +30,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     model::Label,
-    observe::{RowAt, StorageFact, StorageRequest, StreamId},
+    observe::{BlockSyncFact, RowAt, StorageFact, StorageRequest, StreamId},
     table::{GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -291,6 +291,93 @@ fn honest_runs_hold_every_generated_id_they_reach() {
 /// Plan bytes.
 const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-mid-flight.bin");
 
+/// The committed input whose reset-mid-flight run reads an old-epoch body
+/// for a height past the fork while the routine's old request is still
+/// local, after another routine's fork request reserved that height.
+const STALE_REQUEST_BODY_INPUT: &[u8] =
+    include_bytes!("fixtures/block-sync-stale-request-body.bin");
+
+/// True if a routine judged an old-chain body of a height past
+/// `scenario`'s fork after a request of a later body work epoch published
+/// that height. The body then answers a stale request for a height that
+/// the fork's work reserves. Each connection's judged block frames pair,
+/// in order, with the bodies that crossed its relay.
+fn old_body_judged_after_a_fork_request(
+    report: &RunReport,
+    ports: &Ports,
+    scenario: &BlockScenario,
+) -> bool {
+    let fork = scenario
+        .control
+        .iter()
+        .find_map(|step| match &step.action {
+            ControlAction::Reset { fork, .. } => Some(fork.at),
+            _ => None,
+        })
+        .expect("the scenario resets to a fork");
+    let old_chain: Vec<(u32, String)> = ports
+        .chain
+        .iter()
+        .filter(|block| block.height.0 > fork)
+        .map(|block| {
+            let hash = block
+                .hash()
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            (block.height.0, hash)
+        })
+        .collect();
+    let mut first_epoch = None;
+    let mut fork_heights = Vec::new();
+    let mut crossed: Vec<(u64, u32, &String)> = Vec::new();
+    report.log.entries().iter().any(|entry| match &entry.obs {
+        Observation::BlockSync {
+            event:
+                BlockSyncFact::Request {
+                    owner,
+                    heights,
+                    step,
+                    ..
+                },
+            ..
+        } if step == "published" => {
+            if let Some(epoch) = owner.body_work_epoch {
+                if epoch > *first_epoch.get_or_insert(epoch) {
+                    fork_heights.extend(heights.iter().copied());
+                }
+            }
+            false
+        }
+        Observation::PeerBody {
+            connection,
+            height,
+            hash,
+            ..
+        } => {
+            crossed.push((*connection, *height, hash));
+            false
+        }
+        Observation::BlockSync {
+            event:
+                BlockSyncFact::FrameJudged {
+                    connection,
+                    message_type,
+                    ..
+                },
+            ..
+        } if *message_type == u16::from(MSG_BS_BLOCK) => {
+            let Some(next) = crossed.iter().position(|(on, ..)| on == connection) else {
+                return false;
+            };
+            let (_, height, hash) = crossed.remove(next);
+            fork_heights.contains(&height) && old_chain.contains(&(height, hash.clone()))
+        }
+        _ => false,
+    })
+}
+
 /// A reset while old-chain bodies are on the wire credits none of them to
 /// the fork's work. The reset-mid-flight scenario resets once the mirrors
 /// have completed 14 range reads instead of at the third submission, so
@@ -302,12 +389,40 @@ const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-
 fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
     let mut scenario = BlockScenario::reset_mid_flight();
     scenario.control[0].when = Some(Trigger::Completed(Select::nth(BlockKind::MirrorRead, 14)));
-    let (report, _) = run(&scenario, Plan::from_fuzz(&RESET_MID_FLIGHT_INPUT[2..]));
+    let (report, ports) = run(&scenario, Plan::from_fuzz(&RESET_MID_FLIGHT_INPUT[2..]));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert!(
         held(&report, &id("block/receiver-work-authorized")),
         "{:?}",
         report.properties
+    );
+    assert!(
+        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
+        "no routine judged an old-chain body after a fork request reserved its height"
+    );
+}
+
+/// The stale-request-body input holds `receiver-work-authorized` after an
+/// old-chain body answers a stale request for a height that a fork request
+/// reserves. With
+/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
+/// the routine credits that body to the fork request, and the same input
+/// violates it.
+#[test]
+fn the_stale_request_body_input_holds_receiver_work_authorized() {
+    let (prefix, plan) = STALE_REQUEST_BODY_INPUT.split_at(Storage::SCENARIO_BYTES);
+    let scenario = Storage::draw(prefix);
+    assert_eq!(scenario, BlockScenario::reset_mid_flight());
+    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert!(
+        held(&report, &id("block/receiver-work-authorized")),
+        "{:?}",
+        report.properties
+    );
+    assert!(
+        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
+        "no routine judged an old-chain body after a fork request reserved its height"
     );
 }
 

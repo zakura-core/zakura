@@ -1445,7 +1445,7 @@ Changed:
 
 Zakura counted every per-IP limit by exact address. A host with a /64,
 which most IPv6 hosting gives each server, has 2^64 addresses, so it could
-use a fresh one per identity and fill the node. Zebra and Monero count a
+use a fresh one per identity and fill the node. Zebra counts a
 global IPv6 /64 as one host, and the draft Zcash P2P QUIC ZIP calls a /64 a
 reasonable default for IPv6 limits.
 

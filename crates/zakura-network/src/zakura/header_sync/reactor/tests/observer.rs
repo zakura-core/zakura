@@ -36,7 +36,7 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, capacity accounting, budget changes, credit, causes,
+    /// reservations, capacity accounting, the queue's slots, budget changes, credit, causes, sizes,
     /// session admissions, refusals and ends, readmission cooldowns, or the
     /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
@@ -55,11 +55,16 @@ impl Recorder {
                         | ReactorEvent::RoundReleased { .. }
                         | ReactorEvent::BudgetChanged { .. }
                         | ReactorEvent::CreditIssued { .. }
+                        | ReactorEvent::CursorsAccepted { .. }
+                        | ReactorEvent::CursorClaimed { .. }
+                        | ReactorEvent::CloseBuilt { .. }
                         | ReactorEvent::CauseSet { .. }
+                        | ReactorEvent::Sizes { .. }
                         | ReactorEvent::HeadroomWait { .. }
                         | ReactorEvent::CachedPassDeferred { .. }
                         | ReactorEvent::EventTaken { .. }
                         | ReactorEvent::WatchObserved { .. }
+                        | ReactorEvent::Slots { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }
@@ -449,6 +454,14 @@ fn assert_released_before_retired(events: &[ReactorEvent], active: &ActiveHeader
     );
 }
 
+/// The tip `operation`, an apply call, seals.
+fn sealed_tip(operation: &HeaderPortOperation) -> block::Hash {
+    let HeaderPortOperation::ApplyHeaderTarget { target, .. } = operation else {
+        unreachable!("only an apply seals a tip")
+    };
+    target.target_tip_hash()
+}
+
 /// The apply call for `peer`'s active request, sealed as its own preparation.
 fn apply_operation(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> HeaderPortOperation {
     let active = active(reactor, peer);
@@ -714,8 +727,9 @@ async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
     let seeded = active(&reactor, &peer);
     recorder.take_all();
 
+    let apply = apply_operation(&reactor, &peer);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     complete_next(&mut reactor).await;
@@ -754,8 +768,82 @@ async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
     );
 }
 
-/// A nested unit of work reports its cause, then restores the outer one,
-/// which restores the reactor's own.
+/// The last [`ReactorEvent::Sizes`] in `events`.
+fn last_sizes(events: &[ReactorEvent]) -> observe::ReactorSizes {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ReactorEvent::Sizes { sizes } => Some(sizes.clone()),
+            _ => None,
+        })
+        .expect("a unit of work ended")
+}
+
+/// Each unit of work ends with the reactor's containers: an admitted
+/// session with an applying round holds its session, scheduling state,
+/// reservation and staged entries, and a dispatched apply counts as one
+/// pending call with one future until its completion is handled.
+#[tokio::test]
+async fn each_unit_ends_with_the_reactors_sizes() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (..) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    recorder.take_all();
+
+    let apply = apply_operation(&reactor, &peer);
+    assert!(matches!(
+        reactor.dispatch_action(apply),
+        StorageDispatch::Started(_)
+    ));
+    caused!(reactor, ReactorCause::Event, ());
+    let sizes = last_sizes(&recorder.take_all());
+    assert_eq!(sizes.sessions, std::slice::from_ref(&peer));
+    assert_eq!(sizes.scheduled, std::slice::from_ref(&peer));
+    assert_eq!(sizes.storage_calls, [1]);
+    assert_eq!(sizes.port_futures, 1);
+    assert!(
+        matches!(&sizes.staged_entries[..], [(staged, headers)] if *staged == peer && *headers > 0),
+        "{sizes:?}"
+    );
+    assert!(sizes.locator_reads.is_empty(), "{sizes:?}");
+
+    complete_next(&mut reactor).await;
+    let events = recorder.take_all();
+    let sizes = last_sizes(&events);
+    assert!(sizes.storage_calls.is_empty(), "{sizes:?}");
+    assert_eq!(sizes.port_futures, 0);
+    assert!(sizes.staged_entries.is_empty(), "{sizes:?}");
+    assert!(sizes.reservations.is_empty(), "{sizes:?}");
+    // The completion's handler ends with its own sizes, before its cause
+    // gives way.
+    let completion = events
+        .iter()
+        .position(|event| {
+            *event
+                == ReactorEvent::CauseSet {
+                    cause: ReactorCause::Completion { call: 1 },
+                }
+        })
+        .expect("the completion ran under its cause");
+    assert!(matches!(
+        events[completion + 1..].iter().find(|event| matches!(
+            event,
+            ReactorEvent::Sizes { .. } | ReactorEvent::CauseSet { .. }
+        )),
+        Some(ReactorEvent::Sizes { .. })
+    ));
+}
+
+/// A nested unit of work reports its cause, then the reactor's sizes and
+/// the outer cause it restores, which restores the reactor's own the same
+/// way.
 #[test]
 fn a_nested_cause_restores_the_outer_one() {
     let recorder = Arc::new(Recorder::default());
@@ -771,12 +859,17 @@ fn a_nested_cause_restores_the_outer_one() {
         caused!(reactor, ReactorCause::Watch, ())
     );
     let cause = |cause| ReactorEvent::CauseSet { cause };
+    let sizes = || ReactorEvent::Sizes {
+        sizes: observe::ReactorSizes::default(),
+    };
     assert_eq!(
         recorder.take_all(),
         [
             cause(ReactorCause::Startup),
             cause(ReactorCause::Watch),
+            sizes(),
             cause(ReactorCause::Startup),
+            sizes(),
             cause(ReactorCause::Idle),
         ]
     );
@@ -797,8 +890,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
+    let apply = apply_operation(&reactor, &peer);
+    let target_tip_hash = sealed_tip(&apply);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     complete_next(&mut reactor).await;
@@ -812,6 +907,7 @@ async fn handled_follows_the_callbacks_effects() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target_tip_hash,
                 },
             },
             ReactorEvent::CallEnded {
@@ -865,12 +961,15 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
         .phase = phase;
     let old = active(&reactor, &peer);
     let (operation, op) = if phase == HeaderTargetPhase::Applying {
+        let operation = apply_operation(&reactor, &peer);
+        let target_tip_hash = sealed_tip(&operation);
         (
-            apply_operation(&reactor, &peer),
+            operation,
             PortCall::Apply {
                 peer: peer.clone(),
                 source,
                 owner,
+                target_tip_hash,
             },
         )
     } else {
@@ -880,16 +979,22 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
             HeaderTargetPurpose::Normal,
             old.entries.clone(),
         );
-        let HeaderPortOperation::PrepareHeaderTarget { target, .. } = &operation else {
+        let HeaderPortOperation::PrepareHeaderTarget {
+            common_ancestor,
+            target,
+            ..
+        } = &operation
+        else {
             unreachable!("`prepare_operation` always builds a prepare")
         };
-        let target = *target;
+        let (common_ancestor, target) = (*common_ancestor, *target);
         (
             operation,
             PortCall::Prepare {
                 peer: peer.clone(),
                 source,
                 owner,
+                common_ancestor,
                 target,
                 hashes: old
                     .entries
@@ -1131,12 +1236,16 @@ async fn synthetic_prepare_ends_not_submitted() {
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
         let HeaderPortOperation::PrepareHeaderTarget {
-            target, entries, ..
+            common_ancestor,
+            target,
+            entries,
+            ..
         } = &operation
         else {
             unreachable!("`prepare_operation` always builds a prepare")
         };
-        let (target, hashes) = (
+        let (common_ancestor, target, hashes) = (
+            *common_ancestor,
             *target,
             entries
                 .iter()
@@ -1155,6 +1264,7 @@ async fn synthetic_prepare_ends_not_submitted() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    common_ancestor,
                     target,
                     hashes,
                 },
@@ -1205,8 +1315,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
+        let apply = apply_operation(&reactor, &peer);
+        let target_tip_hash = sealed_tip(&apply);
         assert!(matches!(
-            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            reactor.dispatch_action(apply),
             StorageDispatch::Started(_)
         ));
         complete_next(&mut reactor).await;
@@ -1220,6 +1332,7 @@ async fn port_panic_before_and_after_submission() {
                         peer: peer.clone(),
                         source,
                         owner,
+                        target_tip_hash,
                     },
                 },
                 ReactorEvent::CallEnded {
@@ -1272,8 +1385,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
+    let apply = apply_operation(&reactor, &peer);
+    let target_tip_hash = sealed_tip(&apply);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
@@ -1293,6 +1408,7 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target_tip_hash,
                 },
             },
             ReactorEvent::CallEnded {
@@ -1323,8 +1439,9 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
+        let apply = apply_operation(&reactor, &peer);
         assert!(matches!(
-            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            reactor.dispatch_action(apply),
             StorageDispatch::Started(_)
         ));
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
@@ -2165,5 +2282,51 @@ async fn adopted_state_and_its_publications_are_observed() {
             adopted(&newest),
             published(newest.frontiers.header_best, false)
         ]
+    );
+}
+
+/// A session refused at the peer cap reports `SessionAtCapacity`, and its
+/// token is cancelled. With one inbound slot, peer 0x41's session holds it,
+/// so peer 0x42's is refused.
+#[test]
+fn a_session_refused_at_the_peer_cap_is_reported_and_cancelled() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    reactor.startup.config.peer_limits.max_inbound_peers = 1;
+    let (first, second) = (
+        ZakuraPeerId::new(vec![0x41; 32]).expect("the test peer ID has the required length"),
+        ZakuraPeerId::new(vec![0x42; 32]).expect("the test peer ID has the required length"),
+    );
+    let _first = connect(&mut reactor, &first, 1);
+    recorder.take_all();
+    let (send, _outbound) = framed_channel(8);
+    let cancel = CancellationToken::new();
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        second.clone(),
+        2,
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        CloseCause::new(),
+    ));
+    let refused: Vec<ReactorEvent> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| matches!(event, ReactorEvent::SessionAtCapacity { .. }))
+        .collect();
+    assert_eq!(
+        refused,
+        [ReactorEvent::SessionAtCapacity {
+            peer: second,
+            session_id: 2,
+        }]
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "the refused session's token is cancelled"
     );
 }

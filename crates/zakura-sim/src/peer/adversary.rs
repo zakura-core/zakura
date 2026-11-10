@@ -6,11 +6,20 @@
 //! setup history. [`AdversarySpec`] can keep it from announcing, so the node
 //! never subscribes, or from serving, so the node's subscription stays live
 //! with its credit unspent. An act is offered only once its setup history
-//! is done ([`Adversary::wake`]). When it runs, it asserts its precondition
+//! is done ([`Adversary::wake`]). When it runs, it checks its precondition
 //! from the models again, computes its boundary from the models' state at
 //! that moment, and checks that the models give the frame exactly the label
 //! set the act is for before sending it. A frame with a fault is labelled
 //! on a copy of the models, so it changes no model state.
+//!
+//! A frame can arrive between the offer and the run and end the
+//! precondition. Then the act is skipped: it sends nothing and the peer
+//! logs [`crate::Observation::ActSkipped`]. An act that ran logs
+//! [`crate::Observation::ActRan`] once its frames are written. A witness
+//! test fails unless its acts ran (see `witness::acts_ran`). A fuzz
+//! campaign sees a skipped act as not covered: no frame, so the properties
+//! it targets stay not applicable. A frame the act can't build or label
+//! still fails the run.
 
 use std::{collections::BTreeSet, time::Duration};
 
@@ -18,10 +27,10 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_network::zakura::{
     v9::{
-        Cursor, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status,
-        SubscribeHeaders,
+        Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage,
+        Status, SubscribeHeaders,
     },
-    AuxSchema, Credit,
+    AuxSchema, Credit, HeaderEntry,
 };
 use zakura_rt::time::Instant;
 
@@ -141,13 +150,18 @@ pub enum ContentRule {
     /// A page whose first header doesn't link to its parent: a fixture
     /// header with a byte of its parent hash flipped.
     Linkage,
+    /// A one-header first page from the header below the `Open`'s first
+    /// locator, carrying that locator's own header: a page that ends at a
+    /// locator before the target. Only before the subscription's first page,
+    /// and only when this peer holds that first locator.
+    LowerLocator,
     /// `SubscriptionClosed` before the node sent `Close`.
     OutcomeWindow,
 }
 
 impl ContentRule {
     /// Every rule, by row.
-    pub const ALL: [ContentRule; 10] = [
+    pub const ALL: [ContentRule; 11] = [
         ContentRule::StatusAnchor,
         ContentRule::StatusRetention,
         ContentRule::StatusHeaderCap,
@@ -157,6 +171,7 @@ impl ContentRule {
         ContentRule::OpenLocators,
         ContentRule::OpenCursor,
         ContentRule::Linkage,
+        ContentRule::LowerLocator,
         ContentRule::OutcomeWindow,
     ];
 
@@ -170,7 +185,7 @@ impl ContentRule {
             | ContentRule::StatusSchema
             | ContentRule::StatusCap => Row::Status,
             ContentRule::OpenLocators | ContentRule::OpenCursor => Row::SubscribeHeaders,
-            ContentRule::Linkage => Row::Headers,
+            ContentRule::Linkage | ContentRule::LowerLocator => Row::Headers,
             ContentRule::OutcomeWindow => Row::HeadersOutcome,
         }
     }
@@ -460,6 +475,18 @@ impl Adversary {
             .as_ref()
             .filter(|sub| !sub.ended && !sub.close_sent);
         let ready = match act {
+            // Only the documented first page: none sent yet, from a first
+            // locator this peer holds above genesis.
+            Act::BadContent {
+                rule: ContentRule::LowerLocator,
+            } => node_subscription
+                .filter(|id| {
+                    models
+                        .unspent(SESSION, *id)
+                        .is_some_and(|unspent| unspent.objects >= 1)
+                })
+                .and_then(|id| honest.unserved_first_locator(id))
+                .is_some_and(|first| first > 0),
             _ if act.needs_node_subscription() => node_subscription
                 .and_then(|id| models.unspent(SESSION, id))
                 .is_some_and(|unspent| unspent.objects >= 1),
@@ -499,12 +526,17 @@ impl Adversary {
         ready.then_some(past)
     }
 
-    /// Carries out `act`: asserts its precondition, builds its frames from
+    /// Carries out `act`: checks its precondition, builds its frames from
     /// the models' state now, and labels each, failing unless the models
-    /// give the act's frame exactly its label set.
-    pub(crate) fn act(&mut self, act: Act, honest: &mut Honest) -> Result<Vec<Outgoing>, String> {
+    /// give the act's frame exactly its label set. Returns `None`, sending
+    /// nothing, if the precondition no longer holds (see the module doc).
+    pub(crate) fn act(
+        &mut self,
+        act: Act,
+        honest: &mut Honest,
+    ) -> Result<Option<Vec<Outgoing>>, String> {
         if self.wake(act, honest).is_none() {
-            return Err(format!("{}'s precondition doesn't hold", act.name()));
+            return Ok(None);
         }
         let mut out = Vec::new();
         let frame = match act {
@@ -628,7 +660,7 @@ impl Adversary {
                         break;
                     }
                 }
-                return Ok(vec![Outgoing::burst(burst)]);
+                return Ok(Some(vec![Outgoing::burst(burst)]));
             }
             Act::BadContent { rule } => self.bad_content(rule, honest)?,
         };
@@ -641,7 +673,7 @@ impl Adversary {
             sent.withhold();
         }
         out.push(sent);
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Follows a node frame before the honest script does: a page for one
@@ -901,6 +933,41 @@ impl Adversary {
                 }
                 Ok(Crafted::of(message))
             }
+            ContentRule::LowerLocator => {
+                let (id, _) = live(honest)?;
+                let first = honest.unserved_first_locator(id).ok_or(
+                    "lower-locator: the subscription already has a page, or this peer doesn't \
+                     hold its first locator",
+                )?;
+                let parent = first
+                    .checked_sub(1)
+                    .ok_or("lower-locator: the first locator is genesis")?;
+                let target = honest
+                    .serving
+                    .get(&id)
+                    .ok_or("lower-locator: nothing served")?
+                    .target;
+                let below = honest.chain.at(parent);
+                // The first locator's header is the chain's at that height.
+                let header = usize::try_from(parent)
+                    .ok()
+                    .and_then(|index| honest.chain.headers.get(index))
+                    .ok_or(SHORT_CHAIN)?
+                    .clone();
+                Ok(Crafted::of(RegtestMessage::Headers(Headers {
+                    subscription_id: id,
+                    initial_target_tip_hash: target,
+                    common_ancestor_height: below.height,
+                    common_ancestor_hash: below.hash,
+                    reaches_initial_target: false,
+                    tree_aux_schema: AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header,
+                        body_size: 0,
+                        tree_aux: None,
+                    }],
+                })))
+            }
             ContentRule::OutcomeWindow => {
                 let (id, _) = live(honest)?;
                 let closed = ending(honest, id, HeadersOutcomeCode::SubscriptionClosed);
@@ -1070,5 +1137,30 @@ mod tests {
         assert!(long_page.labels().contains(Label::OverCredit));
         assert_eq!(Act::SecondOpen.label(), Label::Conformant);
         assert_eq!(Act::ExtraEnding.label(), Label::Unsolicited);
+    }
+
+    /// An act whose precondition no longer holds is skipped: it sends
+    /// nothing and doesn't fail the run.
+    #[test]
+    fn an_expired_act_is_skipped() {
+        let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
+        let spec = crate::peer::HonestSpec {
+            chain: 5,
+            subscribe: None,
+        };
+        let chain = std::sync::Arc::new(crate::peer::HonestChain::new(&fixture, 5));
+        let mut honest = Honest::with(spec, chain, true, true);
+        let mut adversary = Adversary::new(AdversarySpec {
+            announce: true,
+            serve: true,
+            withhold: false,
+        });
+        for act in [Act::AfterClose, Act::SecondOpen, Act::OverLive] {
+            assert!(adversary.wake(act, &honest).is_none(), "{act:?}");
+            assert!(
+                matches!(adversary.act(act, &mut honest), Ok(None)),
+                "{act:?}"
+            );
+        }
     }
 }

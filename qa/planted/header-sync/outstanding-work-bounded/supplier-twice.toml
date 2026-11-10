@@ -1,0 +1,11 @@
+# A session replacement appends its peer to the VCT supplier order again
+# without removing the old entry, so the order holds the peer twice. The
+# witness relinks a mirror mid-round. The reactor and the queue decide
+# when the witness's calls and rounds run, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-relinked-mid-round.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-relinked-mid-round.plan"

@@ -33,7 +33,7 @@ use crate::zakura::{
         header_sync_trace as hs_trace, peer_label as trace_peer_label,
         queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
     },
-    transport::sim_arg,
+    transport::{sim_arg, sim_chain},
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
@@ -76,14 +76,15 @@ macro_rules! observe {
 }
 
 /// Evaluates `$body` as the reactor's unit of work `$cause`: reports
-/// `$cause` as the body starts and the cause before it as the body ends,
-/// through [`HeaderSyncReactor::set_cause`]. The body must not leave early.
+/// `$cause` as the body starts, through [`HeaderSyncReactor::set_cause`],
+/// and the reactor's sizes and the cause before it as the body ends,
+/// through [`HeaderSyncReactor::end_cause`]. The body must not leave early.
 #[cfg(any(test, zakura_sim))]
 macro_rules! caused {
     ($reactor:expr, $cause:expr, $body:expr) => {{
         let outer = $reactor.set_cause($cause);
         let result = $body;
-        $reactor.set_cause(outer);
+        $reactor.end_cause(outer);
         result
     }};
 }
@@ -261,7 +262,34 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: v9::serving_capacity(header_peers, startup.config.node_serve_output_bytes),
+        serving: sim_chain!(v9::serving_capacity(
+            header_peers,
+            startup.config.node_serve_output_bytes,
+        ) => with_reports(
+            startup
+                .observer
+                .0
+                .as_ref()
+                .and_then(|observer| observer.capacity_observer())
+                .map(|observer| {
+                    let acquired = observer.clone();
+                    crate::zakura::regulation::ServeReports::new(
+                        move |expired, removed, removed_live| {
+                            observer.observe(super::observe::ReactorEvent::ServingPeers {
+                                expired,
+                                removed,
+                                removed_live,
+                            });
+                        },
+                        move |peer, in_use| {
+                            acquired.observe(super::observe::ReactorEvent::ServingAcquired {
+                                peer: peer.clone(),
+                                in_use,
+                            });
+                        },
+                    )
+                })
+        )),
         page_limits,
         #[cfg(any(test, zakura_sim))]
         credit_observer: startup
@@ -737,6 +765,91 @@ impl HeaderSyncReactor {
         outer
     }
 
+    /// Ends the unit of work in progress: reports the reactor's growable
+    /// containers ([`ReactorEvent::Sizes`]), then makes `outer` its unit of
+    /// work again. Only `caused!` calls it.
+    #[cfg(any(test, zakura_sim))]
+    fn end_cause(&mut self, outer: ReactorCause) {
+        if self.startup.observer.0.is_some() {
+            observe!(
+                self,
+                ReactorEvent::Sizes {
+                    sizes: self.sizes()
+                }
+            );
+        }
+        self.set_cause(outer);
+    }
+
+    /// The reactor's growable containers, as [`ReactorEvent::Sizes`]
+    /// reports them.
+    #[cfg(any(test, zakura_sim))]
+    fn sizes(&self) -> super::observe::ReactorSizes {
+        fn sorted<'p>(peers: impl Iterator<Item = &'p ZakuraPeerId>) -> Vec<ZakuraPeerId> {
+            let mut peers: Vec<ZakuraPeerId> = peers.cloned().collect();
+            peers.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            peers
+        }
+        fn sessions<'p>(
+            closes: impl Iterator<Item = (&'p ZakuraPeerId, &'p (u64, Instant))>,
+        ) -> Vec<(ZakuraPeerId, u64)> {
+            let mut closes: Vec<(ZakuraPeerId, u64)> = closes
+                .map(|(peer, (session_id, _))| (peer.clone(), *session_id))
+                .collect();
+            closes.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            closes
+        }
+        let state = &self.state;
+        let now = Instant::now();
+        let (reservations, staged_capacity, staged_entries, repair_episodes) =
+            self.peer_work_queue.sizes();
+        super::observe::ReactorSizes {
+            sessions: sorted(self.sessions.keys()),
+            scheduled: sorted(state.peers.keys()),
+            cached_offers: sorted(
+                state
+                    .peers
+                    .iter()
+                    .filter(|(_, schedule)| schedule.last_status.is_some())
+                    .map(|(peer, _)| peer),
+            ),
+            reservations,
+            staged_capacity,
+            staged_entries,
+            repair_episodes,
+            request_deadlines: sorted(state.request_deadlines.keys()),
+            close_deadlines: sessions(state.close_deadlines.iter()),
+            pending_closes: sessions(state.pending_closes.iter()),
+            locator_reads: state.locators.pending_calls(),
+            storage_calls: state.calls.pending_numbers(),
+            port_futures: self.pending_port_operations.len(),
+            supplier_order: state.vct_supplier_order.iter().cloned().collect(),
+            departed_strikes: {
+                let mut strikes: Vec<(ZakuraPeerId, u32, std::time::Duration)> = state
+                    .departed_strikes
+                    .iter()
+                    .map(|(peer, (strikes, until))| {
+                        (peer.clone(), *strikes, until.saturating_duration_since(now))
+                    })
+                    .collect();
+                strikes.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                strikes
+            },
+            cooldowns: {
+                let mut cooldowns: Vec<(ZakuraPeerId, std::time::Duration)> = state
+                    .unproductive_peer_cooldowns
+                    .iter()
+                    .map(|(peer, until)| (peer.clone(), until.saturating_duration_since(now)))
+                    .collect();
+                cooldowns.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                cooldowns
+            },
+            pruned_peers: sorted(state.pruned_peers.keys()),
+            completed_targets: state.completed_targets.keys(),
+            repair_sources: state.vct_repair.source_entries(),
+        }
+    }
+
     /// Acknowledge admission only after the reactor has installed or refused the session.
     fn handle_lifecycle(&mut self, event: super::events::LifecycleEvent) {
         self.handle_event(event.event);
@@ -968,6 +1081,13 @@ impl HeaderSyncReactor {
                     }
                 };
         if at_capacity {
+            observe!(
+                self,
+                ReactorEvent::SessionAtCapacity {
+                    peer: peer.clone(),
+                    session_id: session.session_id(),
+                }
+            );
             session.cancel_token().cancel();
             return;
         }
@@ -2083,6 +2203,14 @@ impl HeaderSyncReactor {
                     completion_authority.header_generation,
                     completion_authority.branch,
                 );
+                observe!(
+                    self,
+                    ReactorEvent::TargetCompleted {
+                        header_generation: completion_authority.header_generation,
+                        branch: completion_authority.branch,
+                        already_known: false,
+                    }
+                );
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
@@ -2329,6 +2457,14 @@ impl HeaderSyncReactor {
             self.state
                 .completed_targets
                 .mark(target.scope.header_generation, target.scope.branch);
+            observe!(
+                self,
+                ReactorEvent::TargetCompleted {
+                    header_generation: target.scope.header_generation,
+                    branch: target.scope.branch,
+                    already_known: true,
+                }
+            );
             self.peer_work_queue.remove_unstarted(&peer);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;

@@ -1598,6 +1598,53 @@ fn every_serving_peer_can_hold_its_output_budget_at_once() {
     assert_eq!(capacity.node_output_held(), 0);
 }
 
+/// A lookup's pruning reports each peer it removes and, read at that
+/// removal's own decision, whether any of its budgets was still alive: peer
+/// 1's session dropped its budgets but a bare output grant still holds its
+/// byte pool, so the pruning removes it with a live budget, and peer 2,
+/// whose budgets all dropped, is removed dead.
+#[test]
+fn pruning_reports_each_removal_with_its_liveness() {
+    type Pruned = Vec<(Vec<ZakuraPeerId>, Vec<ZakuraPeerId>, Vec<ZakuraPeerId>)>;
+    let pruned: Arc<std::sync::Mutex<Pruned>> = Arc::default();
+    let record = pruned.clone();
+    let capacity = capacity(LIMITS).with_reports(Some(ServeReports::new(
+        move |expired, removed, removed_live| {
+            record
+                .lock()
+                .expect("no test panics while holding it")
+                .push((expired, removed, removed_live));
+        },
+        |_, _| {},
+    )));
+    let (live, dead) = (capacity.peer(&peer(1)), capacity.peer(&peer(2)));
+    let grant = live.output.try_grant(1).expect("the peer budget is free");
+    drop((live, dead));
+    pruned
+        .lock()
+        .expect("no test panics while holding it")
+        .clear();
+    let _ = capacity.peer(&peer(3));
+    let mut last = pruned
+        .lock()
+        .expect("no test panics while holding it")
+        .pop()
+        .expect("the lookup reported its pruning");
+    last.0
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    last.1
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(
+        last,
+        (
+            vec![peer(1), peer(2)],
+            vec![peer(1), peer(2)],
+            vec![peer(1)]
+        )
+    );
+    drop(grant);
+}
+
 /// Records each commitment transition a stream tap reports.
 #[derive(Debug, Default)]
 struct Transitions(std::sync::Mutex<Vec<crate::zakura::Transition>>);

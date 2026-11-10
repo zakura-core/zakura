@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index f6ba4a2e8c..bc4a3c7a87 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -614,7 +614,11 @@ impl PeerWorkQueue {
+         self.policy
+             .obsolete_active(current)
+             .iter()
+-            .filter_map(|peer| self.remove(peer))
++            .filter_map(|peer| {
++                self.release_capacity(peer);
++                self.report_released(peer);
++                self.policy.active(peer).cloned()
++            })
+             .collect()
+     }
+ 

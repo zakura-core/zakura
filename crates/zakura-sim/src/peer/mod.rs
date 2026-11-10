@@ -400,6 +400,8 @@ impl Slot {
 /// while that peer is ready for it.
 pub struct PeerControl {
     slots: Vec<Slot>,
+    /// Whether it logged the scripts' acts yet.
+    acts_logged: bool,
     failure: PeerFailure,
     /// What the peers' tasks recorded, until the identity map places it.
     records: PeerRecords,
@@ -413,6 +415,7 @@ impl PeerControl {
     pub(crate) fn new(failure: PeerFailure, records: PeerRecords, shared_ids: SharedIds) -> Self {
         PeerControl {
             slots: Vec::new(),
+            acts_logged: false,
             failure,
             records,
             evidence: WireEvidence::new(shared_ids),
@@ -499,6 +502,20 @@ impl ActionSource for PeerControl {
     /// source is added after the transport tap, so the identity rows it
     /// reads are logged first.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if !std::mem::replace(&mut self.acts_logged, true) {
+            let acts: Vec<String> = self
+                .slots
+                .iter()
+                .flat_map(|slot| &slot.script)
+                .filter_map(|action| match action {
+                    PeerAction::Act { act } => Some(act.name().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            if !acts.is_empty() {
+                log.push(crate::Observation::ActsScripted { acts });
+            }
+        }
         let observed = self.evidence.observe(&self.records, log);
         if let Some(failure) = self.failure.get() {
             return Err(format!("PeerActionFailed: {failure}"));
@@ -1529,6 +1546,7 @@ impl PeerTask {
                 (deadline, None) | (None, deadline) => deadline,
             };
             let mut frames = Vec::new();
+            let mut ran = None;
             let mut answers = Vec::new();
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
@@ -1642,7 +1660,27 @@ impl PeerTask {
                                 return self.fail("only an adversary can act");
                             };
                             match adversary.act(act, honest) {
-                                Ok(acted) => frames = acted,
+                                Ok(Some(acted)) => {
+                                    frames = acted;
+                                    ran = Some(act.name());
+                                }
+                                // Its precondition expired after it was
+                                // offered. The skip is logged on the
+                                // header stream, so a witness test can see
+                                // the act never ran.
+                                Ok(None) => match &header {
+                                    Some(stream) => self.record(
+                                        remote,
+                                        stream.id,
+                                        RecordBody::ActSkipped { act: act.name() },
+                                    ),
+                                    None => {
+                                        return self.fail(format!(
+                                            "{} was skipped with no header stream to log it on",
+                                            act.name()
+                                        ))
+                                    }
+                                },
                                 Err(why) => return self.fail(why),
                             }
                         }
@@ -1691,6 +1729,11 @@ impl PeerTask {
             if let Some(stream) = header.as_mut() {
                 if !frames.is_empty() && !self.write(remote, stream, frames).await {
                     return Ended::Closed;
+                }
+                // Only once its frames are written, so "ran" means they
+                // went out.
+                if let Some(act) = ran.take() {
+                    self.record(remote, stream.id, RecordBody::ActRan { act });
                 }
             }
             if let Some(stream) = discovery.as_mut() {

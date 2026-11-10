@@ -437,6 +437,38 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("stale-release"),
     },
     Coverage {
+        property: super::super::domain::header_sync::RESET_INVALIDATES_WORK,
+        passing: passes(
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("skipped-retirement"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::STALE_CHAIN_EFFECT_INERT,
+        passing: passes(
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("stale-adoption"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::OUTSTANDING_WORK_BOUNDED,
+        passing: passes(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
+        bypass: Bypass::Planted("call-kept"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::COMMIT_ONLY_AUTHORIZED,
+        passing: passes(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("wrong-request"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",

@@ -448,6 +448,19 @@ impl RepairRequirement {
 pub(in crate::zakura::header_sync) struct RepairRequirementSlot(Option<RepairRequirement>);
 
 impl RepairRequirementSlot {
+    /// The entries of the current requirement's source sets and maps, or 0
+    /// with none.
+    #[cfg(any(test, zakura_sim))]
+    pub fn source_entries(&self) -> usize {
+        self.0.as_ref().map_or(0, |requirement| {
+            requirement.tried_sources.len()
+                + requirement.excluded_input_sources.len()
+                + requirement.busy_sources.len()
+                + requirement.target_refusals.len()
+                + requirement.departed_sources.len()
+        })
+    }
+
     /// Return the sole current task.
     pub fn current(&self) -> Option<&RepairRequirement> {
         self.0.as_ref()

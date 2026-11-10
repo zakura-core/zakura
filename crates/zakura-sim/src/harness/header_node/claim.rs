@@ -33,16 +33,62 @@ pub enum Claim {
     OpenOwnership,
     /// A reservation never ended by teardown.
     OpenReservation,
-    /// The stopped reactor is gone with headers still reserved.
+    /// The reactor is gone with headers still reserved.
     TeardownReserved,
-    /// The stopped reactor is gone with headers still owned.
+    /// The reactor is gone with headers still owned.
     TeardownOwned,
-    /// The stopped reactor is gone with a locator permit missing that no
+    /// The reactor is gone with a locator permit missing that no
     /// pending storage read holds.
     TeardownLocatorPermits,
     /// A stale prepare or apply's handler had an effect on other work
     /// ([`super::stale`]).
     StaleCompletionEffect,
+    /// The reactor's work outlived a reset it adopted, ran under an older
+    /// generation, or started from the wrong locator read, or a reset
+    /// didn't advance the generation ([`super::round_life`]).
+    ResetInvalidatesWork,
+    /// A round a new snapshot made obsolete retired while the queue still
+    /// held it.
+    UnreleasedObsoleteRound,
+    /// One of the reactor's growable containers grew past its bound, or
+    /// kept a key that no longer has what its entry is for
+    /// ([`super::outstanding`]), or the work books didn't balance: a
+    /// reservation, round or call that held headers broke the ledger's
+    /// accounting ([`super::tap`]'s `WORK_BOOKS`), or a round retired
+    /// unreleased for a reason no other property owns.
+    OutstandingWork,
+    /// An apply changed the engine under an older generation or anchor, or
+    /// the reactor's adoption moved back ([`super::chain_effect`]).
+    StaleChainEffect,
+    /// A round's owner isn't bound to its `Open`, a staged page isn't on
+    /// its requested path ([`super::authority`]), or the node admitted a
+    /// session under another identity than its link's.
+    CommitOnlyAuthorized,
+    /// A page was staged on a round another session or subscription
+    /// requested.
+    ForeignPage,
+    /// A staged page left its round holding other headers than it carried.
+    UnstagedPage,
+    /// A page spent more headers than its reservation held.
+    OverReservation,
+    /// A call held a round's headers for another owner than its pages'.
+    WrongOwner,
+    /// A prepare sent other headers than its round's staged ones.
+    WrongPayload,
+    /// A prepare handed its headers to an apply for other work.
+    BadHandoff,
+    /// A call held or ended another round than it should.
+    WrongRound,
+    /// A call that isn't the prepare or apply it names held headers.
+    WrongCall,
+    /// A call held headers with another round's lease.
+    ForeignLease,
+    /// A round's calls held more headers than it owns.
+    HeldUnowned,
+    /// A call held a round that staged no page.
+    UnstagedHeaders,
+    /// A prepare supplied its round from another source than its peer's.
+    WrongSource,
 }
 
 impl Claim {
@@ -54,6 +100,20 @@ impl Claim {
             ClaimRule::LeakedLease => Claim::LeakedLease,
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
             ClaimRule::OpenReservation => Claim::OpenReservation,
+            ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
+            ClaimRule::UnreleasedRound => Claim::OutstandingWork,
+            ClaimRule::ForeignPage => Claim::ForeignPage,
+            ClaimRule::UnstagedPage => Claim::UnstagedPage,
+            ClaimRule::OverReservation => Claim::OverReservation,
+            ClaimRule::WrongOwner => Claim::WrongOwner,
+            ClaimRule::WrongPayload => Claim::WrongPayload,
+            ClaimRule::BadHandoff => Claim::BadHandoff,
+            ClaimRule::WrongRound => Claim::WrongRound,
+            ClaimRule::WrongCall => Claim::WrongCall,
+            ClaimRule::ForeignLease => Claim::ForeignLease,
+            ClaimRule::HeldUnowned => Claim::HeldUnowned,
+            ClaimRule::UnstagedHeaders => Claim::UnstagedHeaders,
+            ClaimRule::WrongSource => Claim::WrongSource,
         }
     }
 }
@@ -74,6 +134,9 @@ pub struct Settlement {
     /// headers still unended, so storage has nothing left that could settle
     /// them.
     pub stuck: usize,
+    /// How many released rounds a claim tainted. Such a round never
+    /// settles, and its teardown isn't judged.
+    pub tainted: usize,
     /// Whether the harness began stopping the reactor.
     pub shutdown: bool,
     /// Whether the stopped reactor's teardown is done: the reactor is gone
@@ -228,6 +291,15 @@ impl ClaimEvidence {
             .iter()
             .find(|(record, reported)| !reported && before.is_none_or(|step| record.step < step))
             .map(|(record, _)| record.clone())
+    }
+
+    /// Whether step `step`'s drain found a break.
+    pub(super) fn found_at(&self, step: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(record, _)| record.step == step)
     }
 
     /// Every break so far, in order.

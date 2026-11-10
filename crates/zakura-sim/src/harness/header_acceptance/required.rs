@@ -496,10 +496,16 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         | "header-sync/watch-observed-under-flood"
         | "header-sync/watch-observed-under-lifecycle-flood" => vec![G1],
         "header-sync/header-fault-penalized" | "session/honest-never-punished" => vec![G2],
+        // Downstream effects judged at the owner boundary (Rule 10): which
+        // authority survives a reset, and what stages, prepares and
+        // commits, whose credit and update rules are exchange rules too.
+        "header-sync/reset-invalidates-work" | "header-sync/stale-chain-effect-inert" => vec![G2],
+        "header-sync/commit-only-authorized" => vec![G2, G3],
         "header-sync/chunk-budget-bound"
         | "header-sync/teardown-returns-baseline"
         | "header-sync/stale-completion-inert"
         | "header-sync/capacity-release-wakes"
+        | "header-sync/outstanding-work-bounded"
         | "header/reactor-policy"
         | "header/publisher-policy" => vec![G5],
         // Liveness and the step loop's own claims serve no single gate. The

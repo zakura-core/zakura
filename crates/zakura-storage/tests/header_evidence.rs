@@ -496,6 +496,13 @@ fn a_commit_of_a_read_is_unexpected() {
         id: OpId(1),
         generation: port.engine().snapshot().header_generation,
         state_digest: port.engine().state_digest(),
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc::new(zakura_storage::header::controlled::EngineRun {
+            kind: zakura_storage::header::controlled::RunKind::Reset,
+            clock: zakura_rt::time::utc_now().into(),
+            before: port.engine().durable_state(),
+            after: port.engine().durable_state(),
+        }),
     };
     assert_eq!(
         model.apply(std::slice::from_ref(&forged)),
@@ -557,6 +564,13 @@ fn a_reset_after_shutdown_is_unexpected() {
         kind: ResetKind::Invalidate,
         target: chain[0].hash,
         generation: port.engine().snapshot().header_generation,
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc::new(zakura_storage::header::controlled::EngineRun {
+            kind: zakura_storage::header::controlled::RunKind::Reset,
+            clock: zakura_rt::time::utc_now().into(),
+            before: port.engine().durable_state(),
+            after: port.engine().durable_state(),
+        }),
     };
     assert_eq!(
         model.apply(std::slice::from_ref(&forged)),

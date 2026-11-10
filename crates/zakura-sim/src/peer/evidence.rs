@@ -160,6 +160,10 @@ pub(crate) enum RecordBody {
     Written { seq: u64 },
     /// [`Observation::PeerClosed`].
     Closed,
+    /// [`Observation::ActRan`].
+    ActRan { act: &'static str },
+    /// [`Observation::ActSkipped`].
+    ActSkipped { act: &'static str },
     /// [`Observation::PeerReceived`], with the frame and when the peer
     /// read it, since the run's start, for its `NodeFrame`.
     Received {
@@ -473,6 +477,16 @@ impl WireEvidence {
             RecordBody::Closed => Observation::PeerClosed {
                 connection,
                 quic_stream,
+            },
+            RecordBody::ActRan { act } => Observation::ActRan {
+                connection,
+                quic_stream,
+                act: act.to_owned(),
+            },
+            RecordBody::ActSkipped { act } => Observation::ActSkipped {
+                connection,
+                quic_stream,
+                act: act.to_owned(),
             },
             RecordBody::Received {
                 seq,
@@ -1465,6 +1479,7 @@ mod tests {
                 headers: 1,
                 work: None,
                 first: None,
+                hashes: Vec::new(),
             },
             digest: String::new(),
             call: None,

@@ -27,6 +27,8 @@ libc = { workspace = true }
 # future.
 futures = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
+# Header times and the scenario clock, for the header admission time rule.
+chrono = { workspace = true }
 zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network", features = ["p2p-fuzz"] }
 zakura-node-services = { path = "../zakura-node-services" }

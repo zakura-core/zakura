@@ -3441,6 +3441,7 @@ dependencies = [
 name = "zakura-sim"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "futures",
  "libc",
  "proc-macro2",

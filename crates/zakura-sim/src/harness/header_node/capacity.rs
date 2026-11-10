@@ -18,7 +18,8 @@
 //!   Accounting reported from another task fails as `AccountingOffReactor`,
 //!   since then no boundary is known quiet.
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
-//!   a reactor the harness stopped is gone, nothing stays reserved or owned,
+//!   the reactor is gone without unwinding, stopped by the harness or
+//!   exited by itself, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
 //!   storage still holds pending. They're claim rules too, checked on every
 //!   read after the reactor is gone against what storage holds then, and
@@ -55,7 +56,8 @@ pub struct CapacityReading {
     pub locator_permits: usize,
     /// Whether it was compared with the queue's accounting.
     pub compared: bool,
-    /// Whether it was a teardown read, after a stopped reactor was gone.
+    /// Whether it was a teardown read, after the reactor was gone without
+    /// unwinding.
     pub teardown: bool,
 }
 
@@ -237,7 +239,7 @@ pub(super) fn check(
                 broken.push((
                     Claim::TeardownReserved,
                     format!(
-                        "TeardownReserved: the stopped reactor is gone with {} headers still \
+                        "TeardownReserved: the reactor is gone with {} headers still \
                          reserved",
                         read.reserved
                     ),
@@ -247,7 +249,7 @@ pub(super) fn check(
                 broken.push((
                     Claim::TeardownOwned,
                     format!(
-                        "TeardownOwned: the stopped reactor is gone with {} headers still owned",
+                        "TeardownOwned: the reactor is gone with {} headers still owned",
                         read.owned
                     ),
                 ));
@@ -256,7 +258,7 @@ pub(super) fn check(
                 broken.push((
                     Claim::TeardownLocatorPermits,
                     format!(
-                        "TeardownLocatorPermits: the stopped reactor is gone with {} of {} \
+                        "TeardownLocatorPermits: the reactor is gone with {} of {} \
                          locator permits free, and storage holds {storage_permits}",
                         read.locator_permits, limits.locator_capacity
                     ),
@@ -336,9 +338,9 @@ mod tests {
         assert_eq!(
             details,
             [
-                "TeardownReserved: the stopped reactor is gone with 1 headers still reserved",
-                "TeardownOwned: the stopped reactor is gone with 2 headers still owned",
-                "TeardownLocatorPermits: the stopped reactor is gone with 2 of 4 locator \
+                "TeardownReserved: the reactor is gone with 1 headers still reserved",
+                "TeardownOwned: the reactor is gone with 2 headers still owned",
+                "TeardownLocatorPermits: the reactor is gone with 2 of 4 locator \
                  permits free, and storage holds 1",
             ]
         );

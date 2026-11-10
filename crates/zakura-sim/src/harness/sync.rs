@@ -1156,6 +1156,7 @@ pub(crate) fn spawn_actors(
         CapacityEvidence::default(),
         rounds.clone(),
         StaleEvidence::default(),
+        header_node::ends::EndEvidence::default(),
     );
     let header = HeaderSettlement {
         claims: header_tap.claims(),

@@ -78,6 +78,7 @@ fn started(owner: HeaderSyncWorkOwner) -> ReactorEvent {
             target_tip_hash: block::Hash([1; 32]),
         },
         purpose: HeaderTargetPurpose::Normal,
+        locator: Vec::new(),
     }
 }
 
@@ -91,12 +92,17 @@ fn dispatched(apply: bool, owner: HeaderSyncWorkOwner) -> ReactorEvent {
                 peer,
                 source,
                 owner,
+                target_tip_hash: zakura_chain::block::Hash([1; 32]),
             }
         } else {
             PortCall::Prepare {
                 peer,
                 source,
                 owner,
+                common_ancestor: zakura_header_chain::Frontier::new(
+                    zakura_chain::block::Height(0),
+                    zakura_chain::block::Hash([0; 32]),
+                ),
                 target: zakura_header_chain::Frontier::new(
                     zakura_chain::block::Height(1),
                     zakura_chain::block::Hash([0; 32]),
@@ -194,8 +200,9 @@ fn an_admission_joins_its_link() {
 }
 
 /// An admission with no origin, an origin naming no link, the wrong
-/// generation or a QUIC stream, a wrong session ID, peer or direction, and a
-/// second admission of one link each break the join.
+/// generation or a QUIC stream, and a second admission of one link each
+/// break the join. A wrong session ID, peer or direction joins, and is
+/// `header-sync/commit-only-authorized`'s claim instead.
 #[test]
 fn every_join_mismatch_breaks() {
     let other = ZakuraPeerId::new(vec![3; 32]).expect("32 bytes is a valid peer ID");
@@ -231,9 +238,6 @@ fn every_join_mismatch_breaks() {
             "its link has origin",
         ),
         (vec![admitted(1, None, with_stream)], "its link has origin"),
-        (vec![admitted(2, None, origin(1))], "its link has session 1"),
-        (vec![wrong_peer], "its link has peer mirror-0"),
-        (vec![outbound], "its link has direction Inbound"),
         (
             vec![admitted(1, None, origin(1)), admitted(1, None, origin(1))],
             "admitted connection 1 twice",
@@ -245,6 +249,26 @@ fn every_join_mismatch_breaks() {
             "{why}"
         );
     }
+    for (event, expected) in [
+        (admitted(2, None, origin(1)), "its link has session 1"),
+        (wrong_peer, "its link has peer mirror-0"),
+        (outbound, "its link has direction Inbound"),
+    ] {
+        let view = linked(&[1]);
+        assert_eq!(broken(&view, &[event]), None);
+        let claims = view.take_claims();
+        assert!(
+            matches!(&claims[..], [claim]
+                if claim.starts_with("CommitOnlyAuthorized:") && claim.contains(expected)),
+            "{claims:?}"
+        );
+        assert!(view.take_joined(), "a mismatched identity still joins");
+    }
+    let view = linked(&[1]);
+    assert_eq!(broken(&view, &[admitted(1, None, origin(1))]), None);
+    assert_eq!(view.take_claims(), Vec::<String>::new());
+    assert!(view.take_joined(), "a matching identity joins");
+    assert!(!view.take_joined(), "the join is drained once");
 }
 
 /// Without links reported, the view keeps the facts and doesn't join.
@@ -295,7 +319,10 @@ fn departed_session_work_breaks() {
 
 /// The retirement of `owner`'s request.
 fn retired(owner: HeaderSyncWorkOwner) -> ReactorEvent {
-    let ReactorEvent::Started { request, purpose } = started(owner) else {
+    let ReactorEvent::Started {
+        request, purpose, ..
+    } = started(owner)
+    else {
         unreachable!("`started` builds a start");
     };
     ReactorEvent::Retired {
@@ -479,9 +506,11 @@ fn own9_retires_a_session_in_either_order() {
 }
 
 /// An admission with no QUIC stream, on a stream with no row or two rows,
-/// whose row has another kind, peer or session ID, whose generation was
-/// installed never or twice, or whose generation isn't its session ID, each
-/// break the join. So does a row that only arrives after the admission.
+/// whose row has another kind or names no scripted peer, or whose
+/// generation was installed never or twice, each break the join. So does a
+/// row that only arrives after the admission. A row with another session
+/// ID, or a generation that isn't the session ID, joins, and is
+/// `header-sync/commit-only-authorized`'s claim instead.
 #[test]
 fn every_own9_mismatch_breaks() {
     let own9_with = |change: &dyn Fn(&mut SessionLedger)| {
@@ -513,9 +542,8 @@ fn every_own9_mismatch_breaks() {
                 ledger.generation_installed(2, 5);
             }),
             admitted(5, None, wire(2, 8, 5)),
-            "has peer None",
+            "names no scripted peer",
         ),
-        (own9(), admitted(6, None, wire(1, 8, 6)), "has session 5"),
         (
             own9_with(&|ledger| ledger.session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6)),
             admitted(6, None, wire(1, 9, 6)),
@@ -526,6 +554,18 @@ fn every_own9_mismatch_breaks() {
             admitted(5, None, wire(1, 8, 5)),
             "installed 2 times",
         ),
+    ];
+    for (view, event, why) in cases {
+        let rule = broken(&view, &[event]).expect("the join breaks");
+        assert!(rule.starts_with("Own9Join: "), "{rule}");
+        assert!(rule.contains(why), "{why}: {rule}");
+    }
+    let claimed: Vec<(SessionEvidence, ReactorEvent, &str)> = vec![
+        (
+            own9_with(&|ledger| ledger.generation_installed(1, 6)),
+            admitted(6, None, wire(1, 8, 6)),
+            "has session 5",
+        ),
         (
             own9_with(&|ledger| {
                 ledger.session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6);
@@ -535,10 +575,15 @@ fn every_own9_mismatch_breaks() {
             "under its session ID",
         ),
     ];
-    for (view, event, why) in cases {
-        let rule = broken(&view, &[event]).expect("the join breaks");
-        assert!(rule.starts_with("Own9Join: "), "{rule}");
-        assert!(rule.contains(why), "{why}: {rule}");
+    for (view, event, why) in claimed {
+        assert_eq!(broken(&view, &[event]), None);
+        let claims = view.take_claims();
+        assert!(
+            matches!(&claims[..], [claim]
+                if claim.starts_with("CommitOnlyAuthorized: ") && claim.contains(why)),
+            "{why}: {claims:?}"
+        );
+        assert!(view.take_joined(), "a mismatched identity still joins");
     }
     let late = own9();
     let rule = broken(&late, &[admitted(6, None, wire(1, 9, 6))]).expect("no row yet");

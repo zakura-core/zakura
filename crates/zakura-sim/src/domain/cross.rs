@@ -875,6 +875,7 @@ mod tests {
             released: 2,
             unsettled: 1,
             stuck: 1,
+            tainted: 0,
             shutdown: true,
             settled: false,
         });

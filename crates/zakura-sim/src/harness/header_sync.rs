@@ -38,15 +38,21 @@ use super::{
     header_node::StartupFacts,
     header_node::{
         adoption::{AdoptionEvidence, SessionLife},
+        authority::AuthorityEvidence,
         capacity::CapacityEvidence,
+        chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
+        ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
+        outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
+        round_life::RoundLifeEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
+        stamp::Stamps,
         tap::ReactorTap,
         wake::WakeEvidence,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
@@ -60,8 +66,11 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, AdoptionView, BudgetView, StaleView, TeardownView, WakeView,
+            chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
+            outstanding_work_bounded, reset_invalidates_work, stale_chain_effect_inert,
+            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
+            AdoptionView, AuthorityView, BudgetView, ChainView, OutstandingView, ResetView,
+            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -564,6 +573,22 @@ pub struct Ports {
     /// unless whoever prepared the ports declared a wake fixture
     /// ([`WakeEvidence::new`]).
     pub wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, which
+    /// the harness and the node's tap record during the run. It holds the
+    /// node's stamps.
+    pub ends: EndEvidence,
+    /// When the node's reset check first applied, which its tap finds
+    /// during the run.
+    pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, which its tap
+    /// finds during the run.
+    pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, which its tap finds
+    /// during the run.
+    pub authority: AuthorityEvidence,
+    /// The reactor's container peaks and when the outstanding-work rule
+    /// first applied, which its tap finds during the run.
+    pub outstanding: OutstandingEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
 }
@@ -585,6 +610,19 @@ pub struct Storage {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, from
+    /// its tap.
+    ends: EndEvidence,
+    /// The node's stamps, from its tap.
+    stamps: Stamps,
+    /// When the node's reset check first applied, from its tap.
+    round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, from its tap.
+    chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, from its tap.
+    authority: AuthorityEvidence,
+    /// The reactor's container peaks, from its tap.
+    outstanding: OutstandingEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -630,6 +668,67 @@ pub struct StorageView {
     /// The run's recovery: its source, where it is, and once the conditions
     /// held, their record. Only `header-sync/storage` recovers.
     pub recovery: RecoveryEvidence,
+    /// The harness's environment actions and the reactor's own exit.
+    pub ends: EndEvidence,
+    /// The node's stamps, which every view-side fact above takes.
+    pub stamps: Stamps,
+    /// When the node's reset check first applied.
+    pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied.
+    pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied.
+    pub authority: AuthorityEvidence,
+    /// Each of the reactor's container peaks, and when the outstanding-work
+    /// rule first applied.
+    pub outstanding: OutstandingEvidence,
+}
+
+impl AuthorityView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::authority`].
+    fn authority(&self) -> &AuthorityEvidence {
+        &self.authority
+    }
+}
+
+impl OutstandingView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::outstanding`].
+    fn outstanding(&self) -> &OutstandingEvidence {
+        &self.outstanding
+    }
+}
+
+impl ChainView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::chain_effect`].
+    fn chain_effect(&self) -> &ChainEffectEvidence {
+        &self.chain_effect
+    }
+}
+
+impl ResetView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::round_life`].
+    fn round_life(&self) -> &RoundLifeEvidence {
+        &self.round_life
+    }
 }
 
 impl BudgetView for StorageView {
@@ -707,6 +806,12 @@ impl HasView for Storage {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            ends: self.ends.clone(),
+            stamps: self.stamps.clone(),
+            round_life: self.round_life.clone(),
+            chain_effect: self.chain_effect.clone(),
+            authority: self.authority.clone(),
+            outstanding: self.outstanding.clone(),
             recovery: self.recovery.clone(),
         }
     }
@@ -717,18 +822,22 @@ impl HasView for Storage {
         self.adoption.end(end);
         self.faults.end(end);
         self.rounds.end(end);
+        self.outstanding.end(end);
     }
 
-    /// [`fault_end_violations`] and [`teardown_end_violations`].
+    /// [`fault_end_violations`], [`teardown_end_violations`] and
+    /// [`outstanding_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
+        found.extend(outstanding_end_violations(&self.outstanding));
         found
     }
 
-    /// The node's wake facts' stamps ([`WakeEvidence::stamps_after`]).
+    /// The node's stamps after `after` ([`Stamps::after`]), from every
+    /// view-side store its tap and harness keep.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
-        Some(self.wake.stamps_after(after))
+        Some(self.stamps.after(after))
     }
 }
 
@@ -839,6 +948,11 @@ impl Subsystem for Storage {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            ends: EndEvidence::default(),
+            round_life: RoundLifeEvidence::default(),
+            chain_effect: ChainEffectEvidence::default(),
+            authority: AuthorityEvidence::default(),
+            outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -868,10 +982,22 @@ impl Subsystem for Storage {
             ports.capacity.clone(),
             ports.rounds.clone(),
             ports.stale_calls.clone(),
+            ports.ends.clone(),
         );
         tap.watch_wakes(ports.wake.clone());
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let ends = tap.ends();
+        let stamps = tap.stamps();
+        tap.watch_rounds(ports.round_life.clone());
+        tap.watch_chain(ports.chain_effect.clone());
+        let branches = scenario
+            .mirrors
+            .iter()
+            .flat_map(|mirror| mirror.chain.branches())
+            .chain(scenario.node.branches());
+        tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
+        tap.watch_outstanding(ports.outstanding.clone(), storage_peer_limit());
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -957,6 +1083,12 @@ impl Subsystem for Storage {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            round_life: ports.round_life,
+            chain_effect: ports.chain_effect,
+            authority: ports.authority,
+            outstanding: ports.outstanding,
+            ends,
+            stamps,
             faults,
             topology,
             sessions: ports.sessions,
@@ -1128,6 +1260,18 @@ pub struct WirePorts {
     pub stale_calls: StaleEvidence,
     /// The node's wake facts, which its tap finds during the run.
     pub wake: WakeEvidence,
+    /// The node's end facts, which its tap records during the run. It holds
+    /// the node's stamps.
+    pub ends: EndEvidence,
+    /// When the node's reset check first applied, which its tap finds
+    /// during the run.
+    pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, which its tap
+    /// finds during the run.
+    pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, which its tap finds
+    /// during the run.
+    pub authority: AuthorityEvidence,
 }
 
 impl WirePorts {
@@ -1166,6 +1310,17 @@ pub struct HeaderWire {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, from
+    /// its tap.
+    ends: EndEvidence,
+    /// The node's stamps, from its tap.
+    stamps: Stamps,
+    /// When the node's reset check first applied, from its tap.
+    round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, from its tap.
+    chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, from its tap.
+    authority: AuthorityEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1197,6 +1352,13 @@ impl HasView for HeaderWire {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            ends: self.ends.clone(),
+            stamps: self.stamps.clone(),
+            round_life: self.round_life.clone(),
+            chain_effect: self.chain_effect.clone(),
+            authority: self.authority.clone(),
+            // The wire harness doesn't register outstanding-work-bounded.
+            outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -1218,18 +1380,18 @@ impl HasView for HeaderWire {
         found
     }
 
-    /// The node's adoption facts after `after`
-    /// ([`AdoptionEvidence::stamps_after`]), which answer
-    /// `header-sync/honest-progress`'s obligation. They're the only facts
-    /// the wire harness stamps.
+    /// The node's stamps after `after` ([`Stamps::after`]), from every
+    /// view-side store its tap keeps. Its adoption facts answer
+    /// `header-sync/honest-progress`'s obligation.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
-        Some(self.adoption.stamps_after(after))
+        Some(self.stamps.after(after))
     }
 }
 
 impl Subsystem for HeaderWire {
     const NAME: &'static str = "header-sync/wire";
-    const GENERATOR: u32 = 2;
+    // 3: scenario tag 0xFE 0x10 picks the lower-locator saved Plan.
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = WirePorts;
@@ -1304,6 +1466,10 @@ impl Subsystem for HeaderWire {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            ends: EndEvidence::default(),
+            round_life: RoundLifeEvidence::default(),
+            chain_effect: ChainEffectEvidence::default(),
+            authority: AuthorityEvidence::default(),
         }
     }
 
@@ -1341,9 +1507,26 @@ impl Subsystem for HeaderWire {
             ports.capacity.clone(),
             ports.rounds.clone(),
             ports.stale_calls.clone(),
+            ports.ends.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let ends = tap.ends();
+        let stamps = tap.stamps();
+        tap.watch_rounds(ports.round_life.clone());
+        tap.watch_chain(ports.chain_effect.clone());
+        let declared = ports
+            .chains
+            .iter()
+            .flatten()
+            .filter_map(|chain| chain.invalid_link());
+        // Every peer serves an honest chain on branch 0.
+        tap.watch_authority(
+            ports.authority.clone(),
+            ports.fixture.clone(),
+            scenario.node.branches(),
+            declared,
+        );
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -1425,6 +1608,11 @@ impl Subsystem for HeaderWire {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            round_life: ports.round_life,
+            chain_effect: ports.chain_effect,
+            authority: ports.authority,
+            ends,
+            stamps,
             faults,
             sessions: ports.sessions,
             closed: ports.closed,
@@ -1599,7 +1787,9 @@ pub fn storage_config() -> RunConfig {
 /// The family header sync's generated property IDs name.
 pub const FAMILY: &str = "header-sync";
 
-/// `header-sync/wire`'s properties: [`storage_properties`], then
+/// `header-sync/wire`'s properties: [`storage_properties`] less
+/// [`OUTSTANDING_WORK_BOUNDED`], whose tap only the storage harness
+/// watches, then
 /// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
 /// sender properties (M5-Q13), then `session/honest-never-punished`, then
 /// `header-sync/honest-progress` (hdr-8), which only the
@@ -1609,6 +1799,7 @@ pub const FAMILY: &str = "header-sync";
 /// fails preparation, so no run or fuzz seed there could apply it.
 pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
+    properties.retain(|property| property.id.as_str() != OUTSTANDING_WORK_BOUNDED);
     properties.push(header_fault_penalized());
     properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
     properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
@@ -1619,13 +1810,17 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 
 /// The storage harness's properties, [`OPERATION_IDS`],
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
-/// [`TEARDOWN_RETURNS_BASELINE`] and [`STALE_COMPLETION_INERT`], all
-/// active. A test harness that wraps [`Storage`] with its view registers
+/// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
+/// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`] and
+/// [`COMMIT_ONLY_AUTHORIZED`], all active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
 /// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
+/// [`RESET_INVALIDATES_WORK`]: crate::domain::header_sync::RESET_INVALIDATES_WORK
+/// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
+/// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1652,7 +1847,22 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         chunk_budget_bound(),
         teardown_returns_baseline(),
         stale_completion_inert(),
+        reset_invalidates_work(),
+        stale_chain_effect_inert(),
+        commit_only_authorized(),
+        outstanding_work_bounded(),
     ]
+}
+
+/// The peers the storage harness's node admits at once, from the config
+/// and connection limit [`HeaderNode::spawn`] gives it.
+fn storage_peer_limit() -> usize {
+    let limits = ZakuraHeaderSyncConfig::default().peer_limits;
+    admitted_peer_limit(
+        limits.max_inbound_peers,
+        limits.max_outbound_peers,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    )
 }
 
 /// What [`storage_properties`] read: the node's storage facts and the
@@ -1932,6 +2142,7 @@ mod tests {
             headers: 1,
             work: None,
             first: None,
+            hashes: vec!["bb".to_owned()],
         };
         let failed = StorageResult::PrepareFailed {
             category: "invalid_header".to_owned(),
@@ -2064,6 +2275,12 @@ mod tests {
                 rounds: SettlementEvidence::default(),
                 stale_calls: StaleEvidence::default(),
                 wake: WakeEvidence::default(),
+                ends: EndEvidence::default(),
+                stamps: Stamps::default(),
+                round_life: RoundLifeEvidence::default(),
+                chain_effect: ChainEffectEvidence::default(),
+                authority: AuthorityEvidence::default(),
+                outstanding: OutstandingEvidence::default(),
                 recovery: RecoveryEvidence::default(),
             }
         }

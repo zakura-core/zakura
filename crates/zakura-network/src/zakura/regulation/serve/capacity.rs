@@ -196,6 +196,48 @@ pub(crate) struct ServeCapacity {
     pub(super) node_output_responses: SlotBudget,
     peers: Arc<Mutex<HashMap<ZakuraPeerId, WeakPeerBudgets>>>,
     pub(super) metrics: Arc<ServeMetrics>,
+    /// Told each lookup's pruning and each push's acquisition, in test and
+    /// simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) reports: Option<ServeReports>,
+}
+
+/// What a [`ServeCapacity`] tells in test and simulator builds: after each
+/// lookup's pruning, the peers whose budgets had expired just before it, the
+/// peers it removed and those of them with any budget still alive, after a
+/// lookup that replaces budgets any of which is still alive, that peer as
+/// removed and alive,
+/// and after each budget a push takes, the
+/// pushing peer and the budgets in use then. An expired entry never comes
+/// alive again, so an honest pruning removes every peer it found expired.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone)]
+pub(crate) struct ServeReports {
+    pruned: Arc<dyn Fn(Vec<ZakuraPeerId>, Vec<ZakuraPeerId>, Vec<ZakuraPeerId>) + Send + Sync>,
+    pub(super) acquired: Arc<dyn Fn(&ZakuraPeerId, super::push::ServeInUse) + Send + Sync>,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl ServeReports {
+    /// Reports that call `pruned` with the expired peers, the removed ones
+    /// and the removed ones still alive, and `acquired` with each acquiring
+    /// peer and the budgets in use.
+    pub(crate) fn new(
+        pruned: impl Fn(Vec<ZakuraPeerId>, Vec<ZakuraPeerId>, Vec<ZakuraPeerId>) + Send + Sync + 'static,
+        acquired: impl Fn(&ZakuraPeerId, super::push::ServeInUse) + Send + Sync + 'static,
+    ) -> Self {
+        ServeReports {
+            pruned: Arc::new(pruned),
+            acquired: Arc::new(acquired),
+        }
+    }
+}
+
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for ServeReports {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ServeReports")
+    }
 }
 
 impl ServeCapacity {
@@ -240,14 +282,50 @@ impl ServeCapacity {
                 waiting: AtomicUsize::new(0),
                 over_limit: AtomicU64::new(0),
             }),
+            #[cfg(any(test, zakura_sim))]
+            reports: None,
         })
+    }
+
+    /// This capacity, telling `reports` each lookup's pruning and each
+    /// push's acquisition.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_reports(self, reports: Option<ServeReports>) -> Self {
+        Self { reports, ..self }
     }
 
     /// The live budgets for `peer`, created if none are live.
     pub(super) fn peer(&self, peer: &ZakuraPeerId) -> PeerBudgets {
         let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
         // Drop expired identities on each lookup so churn cannot grow the map.
-        peers.retain(|_, budgets| budgets.execution.is_alive());
+        // The report's reads peek, so they add no scheduling point.
+        #[cfg(any(test, zakura_sim))]
+        let expired: Vec<ZakuraPeerId> = peers
+            .iter()
+            .filter(|(_, budgets)| !budgets.execution.peek_alive())
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        #[cfg(any(test, zakura_sim))]
+        let (mut removed, mut removed_live) = (Vec::new(), Vec::new());
+        peers.retain(|peer, budgets| {
+            let keep = budgets.execution.is_alive();
+            // Each removal, with its liveness at its own decision, since
+            // the other entries' checks are scheduling points.
+            #[cfg(any(test, zakura_sim))]
+            if !keep {
+                if budgets.peek_any_alive() {
+                    removed_live.push(peer.clone());
+                }
+                removed.push(peer.clone());
+            }
+            #[cfg(not(any(test, zakura_sim)))]
+            let _ = peer;
+            keep
+        });
+        #[cfg(any(test, zakura_sim))]
+        if let Some(reports) = &self.reports {
+            (reports.pruned)(expired, removed, removed_live);
+        }
         if let Some(budgets) = peers.get(peer).and_then(WeakPeerBudgets::upgrade) {
             return budgets;
         }
@@ -259,7 +337,19 @@ impl ServeCapacity {
             output: OutputByteBudget::new(self.limits.peer_output_bytes)
                 .expect("peer output bytes were validated when the capacity was built"),
         };
+        #[cfg(not(any(test, zakura_sim)))]
         peers.insert(peer.clone(), budgets.downgrade());
+        #[cfg(any(test, zakura_sim))]
+        {
+            let replaced = peers.insert(peer.clone(), budgets.downgrade());
+            // Any live budget of the replaced family is live work's, which
+            // the new family now serves apart from.
+            if let (Some(reports), Some(replaced)) = (&self.reports, replaced) {
+                if replaced.peek_any_alive() {
+                    (reports.pruned)(Vec::new(), vec![peer.clone()], vec![peer.clone()]);
+                }
+            }
+        }
         budgets
     }
 
@@ -348,6 +438,17 @@ struct WeakPeerBudgets {
 }
 
 impl WeakPeerBudgets {
+    /// Whether any of these budgets is still alive, read with no simulator
+    /// preemption point, for an observer's report. Every permit and grant
+    /// drops before the family it keeps, so an honest family's budgets live
+    /// and die together.
+    #[cfg(any(test, zakura_sim))]
+    fn peek_any_alive(&self) -> bool {
+        self.output_responses.peek_alive()
+            || self.execution.peek_alive()
+            || self.output.peek_alive()
+    }
+
     fn upgrade(&self) -> Option<PeerBudgets> {
         Some(PeerBudgets {
             output_responses: self.output_responses.upgrade()?,

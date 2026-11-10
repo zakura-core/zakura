@@ -9,8 +9,12 @@ use zakura_network::zakura::observe::EventQueue;
 use crate::{
     harness::header_node::{
         adoption::{AdoptionEvidence, WatchRead},
+        authority::AuthorityEvidence,
         capacity::{BoundaryRead, CapacityEvidence},
+        chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        outstanding::OutstandingEvidence,
+        round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
     },
@@ -193,7 +197,9 @@ where
 /// `OpenOwnership`, `LeakedLease` in the ledger's teardown check), and the
 /// budget holds nothing and every locator permit is free but those storage
 /// still holds for pending reads (`TeardownReserved`, `TeardownOwned`,
-/// `TeardownLocatorPermits` on the probe reads once it's gone).
+/// `TeardownLocatorPermits` on the probe reads once it's gone). A reactor
+/// that exits by itself, without unwinding, gets the same probe reads and
+/// claims, though only a stopped one settles the node.
 ///
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a
@@ -207,7 +213,8 @@ where
 /// `ShutdownIncomplete`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
-/// round-level case relies on that.
+/// round-level case relies on that. A step with a released round a claim
+/// tainted isn't judged, so it never counts as holding.
 pub(crate) fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -229,7 +236,8 @@ where
         }
         return cx.violated(expected, first.detail);
     }
-    if row.is_some_and(|row| row.released > 0 || row.settled) {
+    // A tainted round's settlement isn't judged, so the step doesn't pass.
+    if row.is_some_and(|row| row.tainted == 0 && (row.released > 0 || row.settled)) {
         Verdict::Holds
     } else {
         Verdict::NotApplicable
@@ -303,6 +311,338 @@ where
     } else {
         Verdict::NotApplicable
     }
+}
+
+/// A reset the reactor adopts invalidates its work: no round started under
+/// the old generation outlives the unit of work that adopts the new one,
+/// every live round's dispatch carries the adopted generation, every reset
+/// advances the generation, and every round starts from a locator read of
+/// its own generation.
+pub const RESET_INVALIDATES_WORK: &str = "header-sync/reset-invalidates-work";
+
+/// What the reset check reads: one reactor's claim breaks and when the
+/// check first applied.
+pub trait ResetView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's reset check first applied.
+    fn round_life(&self) -> &RoundLifeEvidence;
+}
+
+/// [`RESET_INVALIDATES_WORK`], as a harness whose view is a [`ResetView`]
+/// registers it.
+pub fn reset_invalidates_work<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ResetView,
+{
+    Property {
+        id: PropertyId::new(RESET_INVALIDATES_WORK),
+        claim: "a header round started under the adopted generation is retired by the end of \
+                the unit of work that adopts a newer one, a live round's prepare or apply \
+                carries the adopted generation, every reset and every apply that inserts \
+                headers advances the header generation, every round starts from a locator read \
+                of its own generation, and every locator read gives the engine's selected path \
+                as its durable state then holds it",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_reset_invalidates_work::<S>,
+        witness: Some(TriggerHistory::View(reset_applied::<S::View>)),
+    }
+}
+
+/// Checks [`RESET_INVALIDATES_WORK`] at the boundary after a step.
+///
+/// The tap's reset check ([`crate::harness::header_node::round_life`])
+/// judges the reactor's facts and the node's storage facts as they arrive,
+/// and the ownership ledger reports an obsolete round retired before the
+/// queue released it. A break the step's drain found violates at once. It
+/// applies once a drain found an adoption that changed the generation under
+/// a live round, an ordinary start, or a reset.
+fn check_reset_invalidates_work<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ResetView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the reactor's work follows every reset it adopts";
+    let mut breaks = view
+        .claims()
+        .at(
+            step,
+            &[Claim::ResetInvalidatesWork, Claim::UnreleasedObsoleteRound],
+        )
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.round_life().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`RESET_INVALIDATES_WORK`]'s trigger history: the check applied.
+fn reset_applied<V: ResetView>(view: &V, _: &ObservationLog) -> bool {
+    view.round_life().any()
+}
+
+/// `header-sync/outstanding-work-bounded`: the reactor's growable
+/// containers stay within their bounds and keep only live keys.
+pub const OUTSTANDING_WORK_BOUNDED: &str = "header-sync/outstanding-work-bounded";
+
+/// A view that keeps the reactor's container peaks, for
+/// [`OUTSTANDING_WORK_BOUNDED`].
+pub trait OutstandingView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// Each container's peak, and when the rule first applied.
+    fn outstanding(&self) -> &OutstandingEvidence;
+}
+
+/// [`OUTSTANDING_WORK_BOUNDED`], as a harness whose view is an
+/// [`OutstandingView`] registers it.
+pub fn outstanding_work_bounded<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: OutstandingView,
+{
+    Property {
+        id: PropertyId::new(OUTSTANDING_WORK_BOUNDED),
+        claim: "at the end of each unit of work the reactor's slots, reservations, staged \
+                entries, deadlines, closes, locator reads, storage calls, port futures, cached \
+                offers, supplier order, strikes and cooldowns stay within their production \
+                bounds, and every key kept for a peer or call names one that still has what \
+                the entry is for; the serving side's publishers, subscriber cursors, \
+                publication containers, serving budgets, serving peer budgets and retained \
+                paths stay within theirs and match their owners' facts, and no publisher \
+                outlives its session's cancellation",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_outstanding_work_bounded::<S>,
+        witness: Some(TriggerHistory::View(outstanding_applied::<S::View>)),
+    }
+}
+
+/// Checks [`OUTSTANDING_WORK_BOUNDED`] at the boundary after a step: it's
+/// violated by an `OutstandingWork` claim break the tap found at this
+/// step, and holds once a drain judged a `Sizes`.
+fn check_outstanding_work_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: OutstandingView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the reactor's and the serving side's containers stay within their bounds \
+                    and keep only live keys, and no publisher outlives its session";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::OutstandingWork])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.outstanding().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`OUTSTANDING_WORK_BOUNDED`]'s trigger history: the rule judged a
+/// `Sizes`.
+fn outstanding_applied<V: OutstandingView>(view: &V, _: &ObservationLog) -> bool {
+    view.outstanding().any()
+}
+
+/// A stale apply never changes the node's engine, and the reactor's
+/// adoption never moves back.
+pub const STALE_CHAIN_EFFECT_INERT: &str = "header-sync/stale-chain-effect-inert";
+
+/// What the stale-chain check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait ChainView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's stale-chain check first applied.
+    fn chain_effect(&self) -> &ChainEffectEvidence;
+}
+
+/// [`STALE_CHAIN_EFFECT_INERT`], as a harness whose view is a [`ChainView`]
+/// registers it.
+pub fn stale_chain_effect_inert<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ChainView,
+{
+    Property {
+        id: PropertyId::new(STALE_CHAIN_EFFECT_INERT),
+        claim: "an apply changes the node's header engine only under the engine's own \
+                generation and anchor, and the reactor's adopted state version and header \
+                generation never decrease",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_stale_chain_effect::<S>,
+        witness: Some(TriggerHistory::View(chain_applied::<S::View>)),
+    }
+}
+
+/// Checks [`STALE_CHAIN_EFFECT_INERT`] at the boundary after a step.
+///
+/// The tap's stale-chain check ([`crate::harness::header_node::chain_effect`])
+/// judges each apply's execution against the engine just before it, and
+/// each adoption against the one before it. A break the step's drain found
+/// violates at once. It applies once a drain found an apply that changed
+/// the engine or a second adoption.
+fn check_stale_chain_effect<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ChainView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "no stale apply changes the engine, and adoption never moves back";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::StaleChainEffect])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.chain_effect().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`STALE_CHAIN_EFFECT_INERT`]'s trigger history: the check applied.
+fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
+    view.chain_effect().any()
+}
+
+/// The node stages, prepares and commits only headers it asked for, and
+/// credits only what it reserved: each round's owner is bound to the `Open`
+/// the node built for it, each staged page belongs to its round's session
+/// and subscription and lies on the requested path, every credit fact,
+/// update and acceptance carries its subscription's state faithfully, and
+/// each prepare and apply hands on its round's work and reaches storage as
+/// dispatched.
+pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
+
+/// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
+const AUTHORITY_CLAIMS: [Claim; 13] = [
+    Claim::CommitOnlyAuthorized,
+    Claim::ForeignPage,
+    Claim::UnstagedPage,
+    Claim::OverReservation,
+    Claim::WrongOwner,
+    Claim::WrongPayload,
+    Claim::BadHandoff,
+    Claim::WrongRound,
+    Claim::WrongCall,
+    Claim::ForeignLease,
+    Claim::HeldUnowned,
+    Claim::UnstagedHeaders,
+    Claim::WrongSource,
+];
+
+/// What the authority check reads: one reactor's claim breaks and when the
+/// check first applied.
+pub trait AuthorityView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's authority check first applied.
+    fn authority(&self) -> &AuthorityEvidence;
+}
+
+/// [`COMMIT_ONLY_AUTHORIZED`], as a harness whose view is an
+/// [`AuthorityView`] registers it.
+pub fn commit_only_authorized<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AuthorityView,
+{
+    Property {
+        id: PropertyId::new(COMMIT_ONLY_AUTHORIZED),
+        claim: "each header round's owner is bound to the Open the node built for it, the node \
+                admits each session under its link's identity, each staged page belongs to its \
+                round's session and subscription and lies on the path it asked for, and the \
+                subscriber's credit, updates and acceptances stay within what the node reserved \
+                and carry each subscription's state faithfully, and each prepare and apply hands \
+                on its round's staged work from its peer's source and reaches storage exactly as \
+                dispatched, and each apply or reset changes the engine's durable state only by \
+                its own submitted headers and the resets the port made, and each locator read \
+                leaves it unchanged",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_commit_only_authorized::<S>,
+        witness: Some(TriggerHistory::View(authority_applied::<S::View>)),
+    }
+}
+
+/// Checks [`COMMIT_ONLY_AUTHORIZED`] at the boundary after a step.
+///
+/// The tap's authority check ([`crate::harness::header_node::authority`])
+/// judges each `Started` and `PageStaged` and, in its credit half, each
+/// credit fact, built update and acceptance, and in its submission rule
+/// each prepare's and apply's request storage received; the ledger reports
+/// a foreign or unstaged page, an over-spent reservation, and a handoff to
+/// another owner, payload, source, round or apply, and the session view an
+/// admission under another identity than its link's. A break the step's
+/// drain found violates at once. It applies once a drain found a start, a
+/// staged page, a credit fact or an admission's identity join.
+fn check_commit_only_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AuthorityView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the node stages, prepares and applies only headers it asked for, under the \
+                    owner it bound and as dispatched, and credits only what it reserved, as each \
+                    subscription's state says";
+    let mut breaks = view.claims().at(step, &AUTHORITY_CLAIMS).into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.authority().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`COMMIT_ONLY_AUTHORIZED`]'s trigger history: the check applied.
+fn authority_applied<V: AuthorityView>(view: &V, _: &ObservationLog) -> bool {
+    view.authority().any()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer
@@ -621,6 +961,23 @@ pub fn teardown_end_violations(rounds: &SettlementEvidence) -> Vec<EndViolation>
         .collect()
 }
 
+/// [`OUTSTANDING_WORK_BOUNDED`]'s end check: a run that came to rest has
+/// no publisher task still running for a session that ended.
+pub fn outstanding_end_violations(evidence: &OutstandingEvidence) -> Vec<EndViolation> {
+    let lingering = evidence.lingering_at_rest();
+    if lingering.is_empty() {
+        return Vec::new();
+    }
+    vec![EndViolation {
+        property: PropertyId::new(OUTSTANDING_WORK_BOUNDED),
+        expected: "a run at rest runs no publisher for a session that ended".to_owned(),
+        actual: format!(
+            "OutstandingWork: the run came to rest with publishers still running for the \
+             ended sessions {lingering:?}"
+        ),
+    }]
+}
+
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the queue released a
 /// round, or a stopped node settled.
 fn teardown_reached<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
@@ -742,6 +1099,8 @@ mod tests {
         Stop {
             settled: bool,
         },
+        /// A released round a claim tainted, unsettled.
+        Tainted,
         Broke(Claim),
         Breaks(&'static [Claim]),
     }
@@ -787,6 +1146,7 @@ mod tests {
                     released,
                     unsettled,
                     stuck,
+                    tainted: 0,
                     shutdown: false,
                     settled: false,
                 }),
@@ -795,8 +1155,18 @@ mod tests {
                     released: 0,
                     unsettled: 0,
                     stuck: 0,
+                    tainted: 0,
                     shutdown: true,
                     settled,
+                }),
+                Some(Scripted::Tainted) => self.probe.rounds.record(Settlement {
+                    step,
+                    released: 1,
+                    unsettled: 1,
+                    stuck: 0,
+                    tainted: 1,
+                    shutdown: false,
+                    settled: false,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -809,6 +1179,7 @@ mod tests {
                         released: 1,
                         unsettled: 0,
                         stuck: 0,
+                        tainted: 0,
                         shutdown: false,
                         settled: false,
                     });
@@ -926,6 +1297,27 @@ mod tests {
         assert_eq!(
             violation.actual,
             "the probe reads 4001 reserved and 0 owned"
+        );
+    }
+
+    /// A step whose released round a claim tainted doesn't count as a
+    /// passing evaluation: of these two steps only the settled one does.
+    #[test]
+    fn a_tainted_round_is_not_counted_as_held() {
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[
+                Scripted::Tainted,
+                Scripted::Settlement {
+                    released: 1,
+                    unsettled: 0,
+                    stuck: 0,
+                },
+            ],
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Held { applicable: 1 }
         );
     }
 

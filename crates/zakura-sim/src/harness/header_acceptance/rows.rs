@@ -56,6 +56,14 @@ const TEARDOWN: &str = "header-sync/teardown-returns-baseline";
 const STALE: &str = "header-sync/stale-completion-inert";
 /// `header-sync/capacity-release-wakes`.
 const WAKES: &str = "header-sync/capacity-release-wakes";
+/// `header-sync/reset-invalidates-work`.
+const RESET: &str = "header-sync/reset-invalidates-work";
+/// `header-sync/stale-chain-effect-inert`.
+const CHAIN: &str = "header-sync/stale-chain-effect-inert";
+/// `header-sync/commit-only-authorized`.
+const COMMIT: &str = "header-sync/commit-only-authorized";
+/// `header-sync/outstanding-work-bounded`.
+const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
 /// `header-sync/watch-observed-under-flood`.
@@ -70,9 +78,10 @@ const PENALIZED: &str = "header-sync/header-fault-penalized";
 /// `session/honest-never-punished`.
 const HONEST: &str = "session/honest-never-punished";
 
-/// What the storage harness registers, which the release-wake, wire, flood
-/// and repair harnesses register too.
-const STORAGE_REGISTERS: [&str; 7] = [
+/// What the storage harness registers, which the release-wake, flood and
+/// repair harnesses register too, and the wire harness all but its last,
+/// `outstanding-work-bounded`.
+const STORAGE_REGISTERS: [&str; 11] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -80,6 +89,10 @@ const STORAGE_REGISTERS: [&str; 7] = [
     CHUNK,
     TEARDOWN,
     STALE,
+    RESET,
+    CHAIN,
+    COMMIT,
+    OUTSTANDING,
 ];
 
 /// Every `(harness, ID, status)` the header harnesses must register, written
@@ -95,7 +108,7 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(STORAGE, &STORAGE_REGISTERS);
     add(RELEASE_WAKE, &STORAGE_REGISTERS);
     add(RELEASE_WAKE, &[WAKES]);
-    add(WIRE, &STORAGE_REGISTERS);
+    add(WIRE, &STORAGE_REGISTERS[..STORAGE_REGISTERS.len() - 1]);
     add(WIRE, &[PENALIZED, HONEST]);
     add(WIRE, generated_ids());
     add(FLOOD, &STORAGE_REGISTERS);
@@ -264,6 +277,90 @@ const STALE_PREPARE: HistoryRef = HistoryRef {
         "the_stale_prepare_input_holds_stale_completion_inert",
     ),
     case: "committed stale-prepare input",
+};
+
+/// Each reset witness's name, as its witness test prefixes its executions.
+const RESET_CASES: [&str; 10] = [
+    "held-locator ",
+    "held-prepare ",
+    "held-apply ",
+    "held-reply ",
+    "two-forks ",
+    "session-replaced-read ",
+    "tip-reuse ",
+    "completion-before-adoption ",
+    "quiet-reset ",
+    "quiet-reset-deep ",
+];
+/// Each stale-chain witness's name, as its witness test prefixes its executions.
+const CHAIN_CASES: [&str; 4] = [
+    "pre-reset-commit ",
+    "refused-across-reset ",
+    "fork-stale-apply ",
+    "reset-inside-status-floor ",
+];
+/// Each authority witness's name, as its witness test prefixes its executions.
+const AUTHORITY_CASES: [&str; 3] = [
+    "forks-sharing-a-header ",
+    "multi-page-sync ",
+    "relinked-mid-round ",
+];
+/// Each committed outstanding-work witness, by its fixture stem, which its
+/// witness test runs under its committed Plan.
+const OUTSTANDING_CASES: [&str; 9] = [
+    "header-authority-forks-sharing-a-header",
+    "header-authority-relinked-mid-round",
+    "header-reset-held-apply",
+    "header-reset-held-reply",
+    "header-reset-quiet-reset",
+    "header-reset-quiet-reset-deep",
+    "header-outstanding-churn",
+    "header-outstanding-serving-churn",
+    "header-outstanding-serving-replaced",
+];
+
+/// The committed reset witnesses, each holding and applying
+/// `reset-invalidates-work`, the first one's first plan.
+const RESET_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_reset_invalidates.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "held-locator plan 0 of inputs(8, 256)",
+};
+
+/// The committed stale-chain witnesses, each holding and applying
+/// `stale-chain-effect-inert`.
+const CHAIN_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_stale_chain.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "pre-reset-commit plan 0 of inputs(8, 256)",
+};
+
+/// The committed authority witnesses, each holding and applying
+/// `commit-only-authorized`.
+const AUTHORITY_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_authority.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "forks-sharing-a-header plan 0 of inputs(8, 256)",
+};
+
+/// The committed outstanding-work witnesses, each holding and applying
+/// `outstanding-work-bounded` under its committed Plan.
+const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_outstanding.rs",
+        "the_committed_witnesses_hold_outstanding_work_bounded",
+    ),
+    case: "header-authority-forks-sharing-a-header",
 };
 
 /// The flood witness test, which runs both committed flood inputs.
@@ -571,6 +668,28 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
     for case in CONTROL_CASES {
         histories.push((wire_history(CONTROL, case), generated_ids()[0]));
     }
+    // Each witness of hdr-9's IDs under each of eight generated plans,
+    // and outstanding-work-bounded's under its committed Plan.
+    for (cases, history, id) in [
+        (&RESET_CASES[..], RESET_WITNESSES, RESET),
+        (&CHAIN_CASES[..], CHAIN_WITNESSES, CHAIN),
+        (&AUTHORITY_CASES[..], AUTHORITY_WITNESSES, COMMIT),
+    ] {
+        for prefix in cases {
+            for case in plan_cases(prefix, "inputs(8, 256)", 8) {
+                histories.push((HistoryRef { case, ..history }, id));
+            }
+        }
+    }
+    for case in OUTSTANDING_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..OUTSTANDING_WITNESSES
+            },
+            OUTSTANDING,
+        ));
+    }
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
@@ -693,6 +812,10 @@ pub fn witness_tests() -> Vec<TestRef> {
         CLOSE_RELINK_CAPACITY.witness,
         CLOSE_RELINK_TEARDOWN.witness,
         STALE_PREPARE.witness,
+        RESET_WITNESSES.witness,
+        CHAIN_WITNESSES.witness,
+        AUTHORITY_WITNESSES.witness,
+        OUTSTANDING_WITNESSES.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
         MID_PREPARE.witness,
@@ -997,6 +1120,8 @@ fn hand_written_rows() -> Vec<Row> {
         "stale-credit",
         "stale-release",
         "stale-retirement",
+        "stale-acceptance",
+        "stale-close",
     ]
     .into_iter()
     .enumerate()
@@ -1011,6 +1136,671 @@ fn hand_written_rows() -> Vec<Row> {
         ));
     }
     rows.push(sim_row(STALE, storage_harnesses, stale));
+
+    let mut reset = holds(RESET, G2, RESET_WITNESSES);
+    // `entry-kept` keeps a round's entry past its reset, which also leaves
+    // outstanding work, so its case lists both.
+    for (index, (name, harness, set, found)) in [
+        (
+            "anchor-only-locator",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "awaiting-kept",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "bump-skipped",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "bump-skipped-quiet",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "cross-generation-locator",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "entry-kept",
+            STORAGE,
+            &[RESET, OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "insertion-bump-skipped",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "insertion-bump-skipped-held",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "no-locator",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "old-hashes",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "old-locator",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "owner-refreshed",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "skipped-locator-entry",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "skipped-retirement",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-read",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "tip-only-locator",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "unreleased-obsolete",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-locator-height",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        reset.extend(caught(
+            harness,
+            case(RESET, name),
+            set,
+            found,
+            G2,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(RESET, storage_harnesses, reset));
+
+    let mut chain = holds(CHAIN, G2, CHAIN_WITNESSES);
+    for (index, (name, harness, set, found)) in [
+        (
+            "stale-adoption",
+            STORAGE,
+            &[CHAIN] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-commit",
+            STORAGE,
+            &[CHAIN] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        chain.extend(caught(
+            harness,
+            case(CHAIN, name),
+            set,
+            found,
+            G2,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(CHAIN, storage_harnesses, chain));
+
+    let mut commit = holds(COMMIT, G23, AUTHORITY_WITNESSES);
+    // Three cases run a saved wire Plan, on the wire harness.
+    for (index, (name, harness, set, found)) in [
+        (
+            "accepted-before-apply",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "accepted-not-stored",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "acknowledged-bytes",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "added-reason",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "advanced-verified-best",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "applied-without-tip",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "apply-source-changed",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "byte-overgrant",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "changed-held-validation",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "cleared-preferred-tip",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-best-score",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-projection-entry",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-side-eligibility",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-side-parent",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-verified-projection",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "dropped-payload-header",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "failed-projection-entry",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "failed-side-eligibility",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "failure-after-mutation",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "flattened-side-coordinate",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "forwarded-length",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "grant-after-cancellation",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "grant-other-target",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "later-ancestor",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "locator-mutates",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "locator-swapped",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "lower-locator-allowed",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "mischarged-page",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "miscounted-cursor",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "miscounted-page",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "misdated-admission",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "new-node-body-state",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "off-path-page",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "open-drops-locator",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "open-other-target",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "overcredit-guard",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "overgrant",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "projection-to-side-tip",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "sealed-batch-truncated",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "session-id-changed",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "skipped-sequence",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stored-excess-credit",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stored-order",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "submitted-source-changed",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "swapped-side-header",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "truncated-projection",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "unrelated-branch-deleted",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "unstored-cursor",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-acknowledgement",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-anchor",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-close",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-inheritance",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-invalidation-id",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-peer",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-request",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-source",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        commit.extend(caught(
+            harness,
+            case(COMMIT, name),
+            set,
+            found,
+            G23,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(COMMIT, storage_harnesses, commit));
+
+    let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
+    // The two cancellation cases' publishers linger at rest, which the end
+    // check finds.
+    for (index, (name, harness, set, found)) in [
+        (
+            "accepted-cursors-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "call-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "cancellation-ignored",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtEnd,
+        ),
+        (
+            "cancellation-ignored-at-capacity",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtEnd,
+        ),
+        (
+            "close-kept-on-replace",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "completed-targets-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "deadline-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "ended-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "entries-cloned",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "execution-admitted-twice",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "extra-future",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "locator-entry-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "marked-at-prepare",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "outcome-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "pruning-skipped",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "publisher-token-detached",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "retention-skipped",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "reuse-skipped",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "spare-publisher",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "staged-key-kept",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "supplier-twice",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "unknown-as-known",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        outstanding.extend(caught(
+            harness,
+            case(OUTSTANDING, name),
+            set,
+            found,
+            G5,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(
+        OUTSTANDING,
+        &[STORAGE, RELEASE_WAKE, FLOOD, REPAIR],
+        outstanding,
+    ));
 
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);
@@ -1203,6 +1993,11 @@ pub struct Nest {
 /// includes punishing a peer marked honest. `session/honest-never-punished`
 /// covers those only for a peer marked honest.
 pub static NESTS: &[Nest] = &[
+    Nest {
+        broader: "header-sync/outstanding-work-bounded",
+        over: &["header-sync/reset-invalidates-work"],
+        when: "the reactor keeps a container entry for a round the reset retired",
+    },
     Nest {
         broader: "header-sync/s5v9/conformant-never-closes",
         over: &[
@@ -1574,11 +2369,6 @@ const fn to_move(
         class: NativeClass::ToMove { property, until },
     }
 }
-
-/// `commit-only-authorized`.
-const COMMIT: &str = "header-sync/commit-only-authorized";
-/// `outstanding-work-bounded`.
-const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 
 /// Every native mutation on `main`, classified. The ledger rules each one
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule

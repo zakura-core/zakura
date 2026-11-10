@@ -302,6 +302,12 @@ impl HasView for Planted {
             rounds: Default::default(),
             stale_calls: Default::default(),
             wake: Default::default(),
+            ends: Default::default(),
+            stamps: Default::default(),
+            round_life: Default::default(),
+            chain_effect: Default::default(),
+            authority: Default::default(),
+            outstanding: Default::default(),
             recovery: Default::default(),
         }
     }

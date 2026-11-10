@@ -612,6 +612,8 @@ impl AddressBook {
             .filter(|addr| addr.is_active_for_gossip(now))
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
+            // Address-only persistence must not forget a known rejection.
+            .filter(|addr| addr.last_known_info_is_valid_for_outbound(&self.network))
             .cloned()
             .collect();
 

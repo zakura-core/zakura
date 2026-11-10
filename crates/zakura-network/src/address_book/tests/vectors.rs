@@ -114,6 +114,47 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     );
 }
 
+/// Known non-nodes remain recorded at runtime but are not saved for restart.
+#[test]
+fn peer_cache_excludes_known_non_node_services() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let non_node = "127.0.0.1:8233".parse().unwrap();
+    let full_node = "127.0.0.2:8233".parse().unwrap();
+    let unknown = "127.0.0.3:8233".parse().unwrap();
+    for (addr, services) in [
+        (non_node, PeerServices::empty()),
+        (full_node, PeerServices::NODE_NETWORK),
+    ] {
+        book.update(MetaAddr::new_connected(addr, &services, false));
+        book.update(MetaAddr::new_responded(
+            addr,
+            Some(std::time::Duration::from_millis(10)),
+        ));
+    }
+    book.update(MetaAddr::new_responded(
+        unknown,
+        Some(std::time::Duration::from_millis(20)),
+    ));
+    assert!(!book
+        .get(non_node)
+        .unwrap()
+        .last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(book.get(unknown).unwrap().services(), None);
+    assert_eq!(
+        book.cacheable(Utc::now())
+            .iter()
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+        vec![full_node, unknown]
+    );
+}
+
 /// Make sure an empty address book is actually empty.
 #[test]
 fn address_book_empty() {

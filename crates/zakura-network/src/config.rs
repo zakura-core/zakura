@@ -1594,9 +1594,6 @@ impl<'de> Deserialize<'de> for Config {
             zakura
                 .validate_stream_receive_window()
                 .map_err(de::Error::custom)?;
-            zakura
-                .validate_bootstrap_peers()
-                .map_err(de::Error::custom)?;
         }
         if p2p_stack.resolve(&network).runs_zakura() {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint

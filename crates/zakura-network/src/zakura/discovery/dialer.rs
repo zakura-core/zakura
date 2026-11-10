@@ -60,6 +60,33 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     tasks
 }
 
+/// Refuses a remote bootstrap identity that `bootstrap_peers` lists with more
+/// distinct addresses than `dial_reserve`, grouped as the bootstrap dialer
+/// groups them.
+///
+/// A maintained dial claims a transport slot for each address at once
+/// (zakura-quic ADM-12), so a longer list could never start while inbound
+/// peers and discovery fill every slot outside the reserve.
+pub(crate) fn check_bootstrap_dials_fit(
+    bootstrap_peers: &[String],
+    local_node_id: NodeId,
+    dial_reserve: usize,
+) -> Result<(), String> {
+    for node_addr in grouped_remote_bootstrap_peers(bootstrap_peers.to_vec(), local_node_id) {
+        if node_addr.direct.len() > dial_reserve {
+            return Err(format!(
+                "zakura.bootstrap_peers lists {} addresses for node {}, but this node's \
+                 connection limits reserve {dial_reserve} dial slots, so its maintained dial \
+                 could fail whenever inbound peers fill the table; list at most \
+                 {dial_reserve} addresses for it or raise max_pending_handshakes",
+                node_addr.direct.len(),
+                node_addr.id,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn grouped_remote_bootstrap_peers(
     bootstrap_peers: Vec<String>,
     local_node_id: NodeId,
@@ -156,6 +183,55 @@ mod tests {
     use crate::{BoxError, Config};
 
     use crate::zakura::{DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS};
+
+    /// Startup refuses a remote bootstrap identity whose distinct addresses
+    /// outnumber the dial reserve its limits give, at the defaults and at
+    /// small caps, and ignores the local identity.
+    #[test]
+    fn bootstrap_dials_must_fit_the_dial_reserve() {
+        let remote = zakura_quic::NodeSecretKey::generate().public();
+        let local = zakura_quic::NodeSecretKey::generate().public();
+        let peers = |node_id: NodeId, count: u16| {
+            (0..count)
+                .map(|port| format!("{node_id}@127.0.0.1:{}", 8233 + port))
+                // A repeated address counts once.
+                .chain([format!("{node_id}@127.0.0.1:8233")])
+                .collect::<Vec<_>>()
+        };
+        let reserve = |connections: usize, pending: usize| {
+            let mut config = Config::default();
+            config.zakura.max_connections = connections;
+            config.zakura.max_pending_handshakes = pending;
+            ZakuraLocalLimits::from_config(&config)
+                .quic_bind_config(Vec::new())
+                .dial_reserve
+        };
+
+        let defaults = reserve(92, 32);
+        assert_eq!(defaults, 8);
+        for list in [
+            DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+            DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        ] {
+            let list = list.iter().map(|peer| peer.to_string()).collect::<Vec<_>>();
+            check_bootstrap_dials_fit(&list, local, 1)
+                .expect("default peers list one address each");
+        }
+        check_bootstrap_dials_fit(&peers(remote, 8), local, defaults)
+            .expect("a full record fits the default reserve");
+        check_bootstrap_dials_fit(&peers(remote, 9), local, defaults)
+            .expect_err("a ninth address can't fit the default reserve");
+
+        let small = reserve(16, 4);
+        assert_eq!(small, 5);
+        check_bootstrap_dials_fit(&peers(remote, 5), local, small).expect("five addresses fit");
+        let error = check_bootstrap_dials_fit(&peers(remote, 8), local, small)
+            .expect_err("a full record can't fit a five-slot reserve");
+        assert!(error.contains("zakura.bootstrap_peers"), "{error}");
+
+        check_bootstrap_dials_fit(&peers(local, 9), local, small)
+            .expect("the local identity is never dialed");
+    }
 
     /// The discovery caller uses the lower transport ceiling and reports a
     /// local limit when a small configuration has room only for inbound peers.

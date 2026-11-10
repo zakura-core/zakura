@@ -548,13 +548,17 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   dial of a full record. That holds whenever the handshake reserve is at
   least 8, so from 32 pending handshakes up. Below that the reserve keeps its
   full record first, and discovery gets what's left above inbound, which is
-  zero when inbound can't hold only 8 slots or fewer. Discovery records and
-  legacy upgrade hand-offs carry at most 8 addresses, and config load refuses
-  a `zakura.bootstrap_peers` identity listed with more than 8 distinct
-  addresses, so one maintained dial always fits the reserve whenever nothing
-  else holds it. A maintained dial that doesn't fit right now, because other
-  maintained dials hold the reserve, fails with `ConnectionLimit` and retries
-  without counting an attempt.
+  zero when inbound can't hold only 8 slots or fewer. Endpoint startup
+  refuses a remote `zakura.bootstrap_peers` identity listed with more
+  distinct addresses than the reserve, so each bootstrap dial fits it
+  whenever nothing else holds it. Discovery records and legacy upgrade
+  hand-offs carry at most 8 addresses, so they fit too unless the reserve is
+  smaller than 8. Below that, one of them with more addresses than the
+  reserve can start only while inbound peers leave it room. That costs
+  little: a discovery candidate is one of many, and a hand-off upgrades a
+  peer that keeps its legacy connection. A maintained dial that doesn't fit
+  right now fails with `ConnectionLimit` and retries without counting an
+  attempt.
 - **ADM-13.** When a connection closes, its connection task MUST release the
   stream payload `quinn-proto` still holds, then move its slot from ADM-12's
   live count to `QuicBindConfig::max_closing_connections`.
@@ -1087,7 +1091,7 @@ this release tolerates, and keep each hard change explicit.
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
 | Inbound connections stop at their own cap and count until they close, even when the acceptor closes them right after TLS; with inbound at its cap, discovery reaches the reserve and a maintained dial still fits it | ADM-12 |
-| Config load refuses a bootstrap identity listed with more distinct addresses than one discovery record holds | ADM-12 |
+| Endpoint startup refuses a remote bootstrap identity listed with more distinct addresses than the dial reserve, at the defaults and at small caps | ADM-12 |
 | Racing inbound claims and closes never let discovery take the slot it leaves for inbound | ADM-12 |
 | Zakura's dial reserve fits one full address record and leaves discovery the whole outbound share with inbound at both of its shares | ADM-3, ADM-12 |
 | Cancelling discovery before or after its second address attempt starts returns all slots, sends no packet to an unstarted address, and lets a subsequent whole dial reserve capacity | ADM-12, ADM-13 |
@@ -1530,8 +1534,9 @@ Changed:
   slots inbound can't hold, capped at one discovery record's 8 addresses
   (8, down from 16). Discovery then keeps the whole outbound share (23)
   with inbound full, and one maintained dial of a full record still fits
-  the reserve. Config load refuses a bootstrap identity listed with more
-  than 8 distinct addresses, which could never fit the smaller reserve. The
+  the reserve. Endpoint startup refuses a remote bootstrap identity listed
+  with more distinct addresses than the reserve, whose dial could never start
+  while inbound peers fill the table. The
   live and inbound counts share one atomic word, so discovery's ceiling
   can't race an inbound claim or close.
 - **§16.** Adds the inbound cap, race, dial reserve and bootstrap address

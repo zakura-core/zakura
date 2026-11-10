@@ -1231,6 +1231,23 @@ where
     }
 }
 
+/// Returns the long poll ID of a template on `chain_info`'s tip, built from `mempool_txs`.
+fn template_long_poll_id(
+    chain_info: &zakura_state::GetBlockTemplateChainInfo,
+    mempool_txs: &[zakura_chain::transaction::VerifiedUnminedTx],
+    revision: u64,
+) -> types::long_poll::LongPollId {
+    let mut long_poll_id = LongPollInput::new(
+        chain_info.tip_height,
+        chain_info.tip_hash,
+        chain_info.max_time,
+        mempool_txs.iter().map(|tx| tx.transaction.id()),
+    )
+    .generate_id();
+    long_poll_id.revision = revision;
+    long_poll_id
+}
+
 /// Prepares one queued server template, and returns once its computation is over.
 ///
 /// Returning is the signal that the speculative worker is free again, so this must not return
@@ -1592,15 +1609,8 @@ where
     ) -> Result<Option<GetBlockTemplateResponse>> {
         let mut state = self.gbt.template_rejections.borrow().clone();
 
-        // Transaction selection ran after the chain state was fetched, so re-check both the
-        // rejection state's parent and the chain tip itself: neither request retargets the other.
-        if state.parent != Some(chain_info.tip_hash)
-            || self
-                .latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != chain_info.tip_hash)
-            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
-        {
+        // Transaction selection ran after the chain state was fetched, so re-check it.
+        if self.template_superseded(&state, chain_info.tip_hash, template.long_poll_id.revision) {
             return Ok(None);
         }
 
@@ -1623,6 +1633,178 @@ where
 
         self.recover_template(template, chain_info, miner_params, &state)
             .await
+    }
+
+    /// Whether a template on `parent` with rejection `revision` no longer matches `state` or the
+    /// chain tip.
+    ///
+    /// Both the rejection state's parent and the chain tip itself are checked, because neither
+    /// request retargets the other. Fallback mode keeps a parent's revision moving, so the
+    /// revision only counts outside it.
+    fn template_superseded(
+        &self,
+        state: &types::get_block_template::TemplateRejections,
+        parent: block::Hash,
+        revision: u64,
+    ) -> bool {
+        state.parent != Some(parent)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != parent)
+            || (!state.needs_fallback() && state.revision != revision)
+    }
+
+    /// Selects mempool transactions for the next block on `chain_info`'s tip and builds its
+    /// template, with no `submit_old`.
+    async fn build_full_template(
+        &self,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: Vec<zakura_chain::transaction::VerifiedUnminedTx>,
+        mempool_tx_deps: mempool::TransactionDependencies,
+    ) -> Result<BlockTemplateResponse> {
+        use types::get_block_template::zip317::select_mempool_transactions;
+
+        tracing::debug!(
+            mempool_tx_hashes = ?mempool_txs
+                .iter()
+                .map(|tx| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>(),
+            "selecting transactions for the template from the mempool"
+        );
+
+        let height = chain_info.tip_height.next().map_misc_error()?;
+
+        // Randomly select some mempool transactions.
+        let mempool_txs = select_mempool_transactions(
+            &self.network,
+            height,
+            miner_params,
+            if is_zip234_active(&self.network, height) {
+                Some(
+                    parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                        .map_misc_error()?,
+                )
+            } else {
+                None
+            },
+            mempool_txs,
+            mempool_tx_deps,
+        )
+        .map_misc_error()?;
+
+        tracing::debug!(
+            selected_mempool_tx_hashes = ?mempool_txs
+                .iter()
+                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>(),
+            "selected transactions for the template from the mempool"
+        );
+
+        self.build_mining_template(
+            None,
+            miner_params,
+            chain_info,
+            long_poll_id,
+            mempool_txs,
+            None,
+        )
+        .await
+    }
+
+    /// Starts building the full template for a new tip in a detached task, and shares it.
+    ///
+    /// A long poll that sees the new tip returns a template without transactions, and the miner's
+    /// next long poll asks for the full one. Building it now overlaps the build with that round
+    /// trip, and the shared slot gives every long poll on this tip the one result. A failed build
+    /// leaves the slot empty, so those long polls build their own templates.
+    fn start_shared_template_build(
+        &self,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        revision: u64,
+    ) {
+        let Some(build) = self.gbt.shared_template.claim(chain_info.tip_hash) else {
+            return;
+        };
+        let rpc = self.clone();
+        let miner_params = miner_params.clone();
+        let chain_info = chain_info.clone();
+        tokio::spawn(
+            async move {
+                let template = async {
+                    let (mempool_txs, mempool_tx_deps) =
+                        types::get_block_template::fetch_mempool_transactions(
+                            rpc.mempool.clone(),
+                            chain_info.tip_hash,
+                        )
+                        .await?
+                        .ok_or_misc_error("the mempool has not reached the new tip")?;
+                    let long_poll_id = template_long_poll_id(&chain_info, &mempool_txs, revision);
+                    rpc.build_full_template(
+                        &miner_params,
+                        &chain_info,
+                        long_poll_id,
+                        mempool_txs,
+                        mempool_tx_deps,
+                    )
+                    .await
+                }
+                .await;
+                let template = match template {
+                    Ok(template) => template,
+                    Err(error) => {
+                        tracing::debug!(
+                            ?error,
+                            tip_hash = ?chain_info.tip_hash,
+                            "shared full template build failed; long polls build their own"
+                        );
+                        return;
+                    }
+                };
+
+                let state = rpc.gbt.template_rejections.borrow().clone();
+                if !state.needs_fallback()
+                    && !rpc.template_superseded(
+                        &state,
+                        chain_info.tip_hash,
+                        template.long_poll_id.revision,
+                    )
+                {
+                    rpc.prepare_template_in_background(&template);
+                    build.publish(template);
+                }
+            }
+            .in_current_span(),
+        );
+    }
+
+    /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
+    /// superseded it.
+    ///
+    /// The template's builder already queued its background preparation, so this does not.
+    fn reuse_shared_template(
+        &self,
+        template: &BlockTemplateResponse,
+        submit_old: Option<bool>,
+    ) -> Option<GetBlockTemplateResponse> {
+        {
+            let state = self.gbt.template_rejections.borrow();
+            if state.needs_fallback()
+                || self.template_superseded(
+                    &state,
+                    template.previous_block_hash,
+                    template.long_poll_id.revision,
+                )
+            {
+                return None;
+            }
+        }
+        let mut template = template.clone();
+        template.submit_old = submit_old;
+        Some(template.into())
     }
 
     /// Builds the coinbase-only template a long poll returns once it sees a new tip.
@@ -3473,7 +3655,7 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal,
         };
 
         // Clone Services
@@ -3621,14 +3803,8 @@ where
                 };
 
                 // - Long poll ID calculation
-                let mut server_long_poll_id = LongPollInput::new(
-                    tip_height,
-                    tip_hash,
-                    max_time,
-                    mempool_txs.iter().map(|tx| tx.transaction.id()),
-                )
-                .generate_id();
-                server_long_poll_id.revision = rejection_state.revision;
+                let server_long_poll_id =
+                    template_long_poll_id(&chain_info, &mempool_txs, rejection_state.revision);
 
                 // The loop finishes if:
                 // - the client didn't pass a long poll ID,
@@ -3795,6 +3971,11 @@ where
                             .then_some(precomputed_coinbase)
                             .flatten();
 
+                        self.start_shared_template_build(
+                            miner_params,
+                            &chain_info,
+                            rejection_state.revision,
+                        );
                         if let Some(template) = self
                             .new_tip_template(
                                 precomputed_coinbase,
@@ -3841,60 +4022,48 @@ where
                 }
             };
 
+            // - Sharing one template between long polls
+            //
+            // Long polls that ask for the same work share one template: the one a new tip started
+            // building, or the one the first of them builds. A caller without a long poll ID asks
+            // for a template now, and a template past its time range must be rebuilt, so neither
+            // shares.
+            let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
+                if let Some(template) = self
+                    .gbt
+                    .shared_template
+                    .wait_for(chain_info.tip_hash, &server_long_poll_id)
+                    .await
+                {
+                    if let Some(template) = self.reuse_shared_template(&template, submit_old) {
+                        return Ok(template);
+                    }
+                }
+                self.gbt.shared_template.claim(chain_info.tip_hash)
+            } else {
+                None
+            };
+
             // - Processing fetched data to create a transaction template
             //
             // Apart from random weighted transaction selection,
             // the template only depends on the previously fetched data.
             // This processing fails only if the coinbase transaction cannot be built.
-
-            tracing::debug!(
-                mempool_tx_hashes = ?mempool_txs
-                    .iter()
-                    .map(|tx| tx.transaction.id().mined_id())
-                    .collect::<Vec<_>>(),
-                "selecting transactions for the template from the mempool"
-            );
-
-            let height = chain_info.tip_height.next().map_misc_error()?;
-
-            // Randomly select some mempool transactions.
-            let mempool_txs = select_mempool_transactions(
-                &self.network,
-                height,
-                miner_params,
-                if is_zip234_active(&self.network, height) {
-                    Some(
-                        parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
-                            .map_misc_error()?,
-                    )
-                } else {
-                    None
-                },
-                mempool_txs,
-                mempool_tx_deps,
-            )
-            .map_misc_error()?;
-
-            tracing::debug!(
-                selected_mempool_tx_hashes = ?mempool_txs
-                    .iter()
-                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
-                    .collect::<Vec<_>>(),
-                "selected transactions for the template from the mempool"
-            );
-
-            // - After this point, the template only depends on the previously fetched data.
-
-            let template = self
-                .build_mining_template(
-                    None,
+            let mut template = self
+                .build_full_template(
                     miner_params,
                     &chain_info,
                     server_long_poll_id,
                     mempool_txs,
-                    submit_old,
+                    mempool_tx_deps,
                 )
                 .await?;
+            // Waiting long polls can take the template before this caller's checks below, because
+            // every caller checks a shared template again before it serves it.
+            if let Some(shared_build) = shared_build {
+                shared_build.publish(template.clone());
+            }
+            template.submit_old = submit_old;
             if let Some(template) = self
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?

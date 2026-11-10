@@ -1443,6 +1443,283 @@ fn tip_change_does_not_wait_for_queued_coinbase_precompute() {
     });
 }
 
+/// What the next mempool fetch waits for before it answers. An error fails the fetch.
+#[derive(Clone, Default)]
+struct NextFetch(
+    Arc<std::sync::Mutex<Option<BoxFuture<'static, std::result::Result<(), BoxError>>>>>,
+);
+
+impl NextFetch {
+    /// Holds the next fetch until the returned sender sends or drops.
+    fn hold(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, held) = tokio::sync::oneshot::channel();
+        self.set(async move { held.await.or(Ok(())) }.boxed());
+        release
+    }
+
+    fn fail(&self) {
+        self.set(async { Err("mempool fetch failed".into()) }.boxed());
+    }
+
+    fn set(&self, wait: BoxFuture<'static, std::result::Result<(), BoxError>>) {
+        *self.0.lock().unwrap() = Some(wait);
+    }
+
+    fn take(&self) -> Option<BoxFuture<'static, std::result::Result<(), BoxError>>> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+/// Returns a mining RPC whose mempool serves `txs` at the tip it sees when a fetch starts, with
+/// its tip sender, a count of mempool fetches, and control over the next fetch.
+fn shared_template_rpc(
+    info: watch::Receiver<GetBlockTemplateChainInfo>,
+    txs: Vec<zakura_chain::transaction::VerifiedUnminedTx>,
+) -> (
+    TestRpcImpl,
+    zakura_chain::chain_tip::mock::MockChainTipSender,
+    Arc<AtomicUsize>,
+    NextFetch,
+) {
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(info.borrow().tip_height);
+    sender.send_best_tip_hash(info.borrow().tip_hash);
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let fetches = fetch_count.clone();
+    let next_fetch = NextFetch::default();
+    let next = next_fetch.clone();
+    let mempool_info = info.clone();
+    let mempool = tower::service_fn(move |_| {
+        fetches.fetch_add(1, Ordering::SeqCst);
+        let transactions = txs.clone();
+        let hash = mempool_info.borrow().tip_hash;
+        let wait = next.take();
+        async move {
+            if let Some(wait) = wait {
+                wait.await?;
+            }
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions,
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: hash,
+            })
+        }
+    });
+    let read = tower::service_fn(move |request| {
+        let info = info.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let (rpc, _) = rpc(network(), mempool, read, tip);
+    (rpc, sender, fetch_count, next_fetch)
+}
+
+fn long_poll(
+    rpc: &TestRpcImpl,
+    long_poll_id: types::long_poll::LongPollId,
+) -> BoxFuture<'_, Result<GetBlockTemplateResponse>> {
+    rpc.get_block_template(Some(GetBlockTemplateParameters {
+        long_poll_id: Some(long_poll_id),
+        ..Default::default()
+    }))
+    .boxed()
+}
+
+fn move_tip(
+    info: &watch::Sender<GetBlockTemplateChainInfo>,
+    tip: &zakura_chain::chain_tip::mock::MockChainTipSender,
+    next: &GetBlockTemplateChainInfo,
+) {
+    info.send_replace(next.clone());
+    tip.send_best_tip_height(next.tip_height);
+    tip.send_best_tip_hash(next.tip_hash);
+}
+
+/// Returns `count` long polls waiting on the current tip's template.
+async fn parked_long_polls(
+    rpc: &TestRpcImpl,
+    count: usize,
+) -> Vec<BoxFuture<'_, Result<GetBlockTemplateResponse>>> {
+    let initial = bounded(rpc.get_block_template(None))
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    let mut parked: Vec<_> = (0..count)
+        .map(|_| long_poll(rpc, initial.long_poll_id))
+        .collect();
+    for request in &mut parked {
+        assert!(futures::poll!(request).is_pending());
+    }
+    parked
+}
+
+/// Moves the tip to `next`, and returns the templates without transactions that the `parked`
+/// long polls answer with.
+async fn empty_templates_on_new_tip(
+    parked: Vec<BoxFuture<'_, Result<GetBlockTemplateResponse>>>,
+    info: &watch::Sender<GetBlockTemplateChainInfo>,
+    tip: &zakura_chain::chain_tip::mock::MockChainTipSender,
+    next: &GetBlockTemplateChainInfo,
+) -> Vec<BlockTemplateResponse> {
+    move_tip(info, tip, next);
+    bounded(futures::future::join_all(parked))
+        .await
+        .into_iter()
+        .map(|response| {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert!(template.transactions.is_empty());
+            template
+        })
+        .collect()
+}
+
+/// A tip change starts one full template build. The miners' next long polls, made with the
+/// empty template's ID, all receive that one template.
+#[test]
+fn tip_change_starts_one_full_build_shared_by_next_long_polls() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, fetches, _) = shared_template_rpc(info, mempool_txs(1));
+        let parked = parked_long_polls(&rpc, 4).await;
+        let fetched = fetches.load(Ordering::SeqCst);
+        let next = chain_info(3, 2, 0);
+        let empty = empty_templates_on_new_tip(parked, &info_tx, &tip, &next).await;
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            fetched + 1,
+            "the tip change must start exactly one full build"
+        );
+
+        let full: Vec<_> = bounded(futures::future::join_all(
+            (0..4).map(|_| long_poll(&rpc, empty[0].long_poll_id)),
+        ))
+        .await
+        .into_iter()
+        .map(|response| response.unwrap().try_into_template().unwrap())
+        .collect();
+        for template in &full {
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert_eq!(template.transactions.len(), 1);
+            assert_eq!(template.submit_old, Some(true));
+            assert_eq!(
+                template.work_id(),
+                full[0].work_id(),
+                "every long poll must receive the one shared build"
+            );
+        }
+        // Each long poll still fetches the mempool once, to compute its own long poll ID.
+        assert_eq!(fetches.load(Ordering::SeqCst), fetched + 1 + 4);
+    });
+}
+
+/// A newer tip while the shared build is still running: the long polls waiting for that build
+/// answer with work on the newest parent, not with the stale build.
+#[test]
+fn newer_tip_during_shared_build_answers_on_newest_parent() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, fetches, next_fetch) = shared_template_rpc(info, mempool_txs(1));
+        let parked = parked_long_polls(&rpc, 2).await;
+        let release = next_fetch.hold();
+        let next = chain_info(3, 2, 0);
+        let empty = empty_templates_on_new_tip(parked, &info_tx, &tip, &next).await;
+        assert!(
+            next_fetch.take().is_none(),
+            "the shared build's mempool fetch is the one held"
+        );
+        let fetched = fetches.load(Ordering::SeqCst);
+
+        let mut waiting: Vec<_> = (0..2)
+            .map(|_| long_poll(&rpc, empty[0].long_poll_id))
+            .collect();
+        for request in &mut waiting {
+            assert!(
+                futures::poll!(request).is_pending(),
+                "a long poll waits for the shared build instead of building"
+            );
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), fetched + 2);
+
+        let newest = chain_info(4, 3, 0);
+        move_tip(&info_tx, &tip, &newest);
+        release.send(()).unwrap();
+        for response in bounded(futures::future::join_all(waiting)).await {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, newest.tip_hash);
+            assert_eq!(template.submit_old, Some(false));
+        }
+    });
+}
+
+/// `generate` randomizes the coinbase data on a clone of the handler. The clone must not share
+/// templates built with the original miner parameters.
+#[test]
+fn randomized_miner_params_do_not_share_templates() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, _, _) = shared_template_rpc(info, mempool_txs(1));
+        let parked = parked_long_polls(&rpc, 1).await;
+        let next = chain_info(3, 2, 0);
+        let empty = empty_templates_on_new_tip(parked, &info_tx, &tip, &next).await;
+        let shared = bounded(long_poll(&rpc, empty[0].long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let again = bounded(long_poll(&rpc, empty[0].long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(again.work_id(), shared.work_id());
+
+        let mut randomized = rpc.clone();
+        randomized.gbt.randomize_coinbase_data();
+        let own = bounded(long_poll(&randomized, empty[0].long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(own.previous_block_hash, next.tip_hash);
+        assert_ne!(own.work_id(), shared.work_id());
+        assert_ne!(own.coinbase_txn.data, shared.coinbase_txn.data);
+    });
+}
+
+/// A shared build that fails leaves each long poll to build its own template.
+#[test]
+fn failed_shared_build_falls_back_to_per_caller_build() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, _, next_fetch) = shared_template_rpc(info, mempool_txs(1));
+        let parked = parked_long_polls(&rpc, 1).await;
+        next_fetch.fail();
+        let next = chain_info(3, 2, 0);
+        let empty = empty_templates_on_new_tip(parked, &info_tx, &tip, &next).await;
+        assert!(
+            next_fetch.take().is_none(),
+            "the shared build's mempool fetch is the one that fails"
+        );
+
+        for response in bounded(futures::future::join_all(
+            (0..2).map(|_| long_poll(&rpc, empty[0].long_poll_id)),
+        ))
+        .await
+        {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert_eq!(template.transactions.len(), 1);
+            assert_eq!(template.submit_old, Some(true));
+        }
+    });
+}
+
 #[test]
 fn rejection_during_construction_rebuilds_template() {
     mining_runtime(async {

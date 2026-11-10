@@ -55,3 +55,20 @@ pub const FAULT_CAUSES: &[&str] = &[
 pub fn is_fault_cause(cause: &str) -> bool {
     FAULT_CAUSES.contains(&cause)
 }
+
+/// The close causes of a rate limit: the reader closed the connection
+/// because a frame found its bucket empty. They're neutral, so they assign
+/// no fault. A cadence row records exhaustion without rejecting the frame,
+/// so `cadence-never-closes` counts them as a punishment.
+///
+/// The close names no stream. That count assumes no harness carries a
+/// stream without a table beside a tabled one: such a stream's message
+/// bucket does throttle, so a peer that floods it gets a justified
+/// rate-limit close that the check would blame on the cadence row. No
+/// harness carries one today.
+pub const RATE_LIMIT_CAUSES: &[&str] = &["ordered_rate_limited"];
+
+/// True if a close with first recorded cause `cause` is a rate limit.
+pub fn is_rate_limit_cause(cause: &str) -> bool {
+    RATE_LIMIT_CAUSES.contains(&cause)
+}

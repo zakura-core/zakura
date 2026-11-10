@@ -1,0 +1,26 @@
+diff --git a/crates/zakura-network/src/zakura/transport/guard.rs b/crates/zakura-network/src/zakura/transport/guard.rs
+index 1c6086946f..98245100e7 100644
+--- a/crates/zakura-network/src/zakura/transport/guard.rs
++++ b/crates/zakura-network/src/zakura/transport/guard.rs
+@@ -363,9 +363,8 @@ impl ByteBudget {
+         if self.is_closed() {
+             return 0;
+         }
+-        self.inner
+-            .max_bytes
+-            .saturating_sub(self.inner.reserved_bytes.load(Ordering::Acquire))
++        // Mutation: capacity reads forget the bytes already reserved.
++        self.inner.max_bytes
+     }
+ 
+     #[cfg(test)]
+@@ -385,7 +384,8 @@ impl ByteBudget {
+         }
+         let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
+         loop {
+-            let available = self.inner.max_bytes.saturating_sub(reserved);
++            // Mutation: admission forgets the bytes already reserved.
++            let available = self.inner.max_bytes;
+             if bytes > available {
+                 return false;
+             }

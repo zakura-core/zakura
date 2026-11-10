@@ -1918,24 +1918,36 @@ fn previous_advert_window_names_still_load() {
 }
 
 #[test]
-fn advert_delays_roundtrip_and_validate() {
+fn advert_delay_roundtrips_and_validates() {
     let _init_guard = zakura_test::init();
-    let config: Config =
-        toml::from_str("advert_delay_min = '25ms'\nadvert_delay_max = '500ms'").unwrap();
-    assert_eq!(config.advert_delay_min, Duration::from_millis(25));
-    assert_eq!(config.advert_delay_max, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay = '250ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(250));
     let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
     assert_eq!(config, roundtrip);
     let default: Config = toml::from_str("").unwrap();
-    assert_eq!(default.advert_delay_min, Duration::ZERO);
-    assert_eq!(default.advert_delay_max, Duration::ZERO);
-    for text in [
-        "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
-        "advert_delay_min = '-1s'",
-        "advert_delay_max = '-1s'",
-    ] {
-        assert!(toml::from_str::<Config>(text).is_err(), "{text}");
-    }
+    assert_eq!(default.advert_delay, Duration::from_millis(500));
+    assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
+}
+
+/// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
+/// the maximum becomes the delay, and the minimum is ignored.
+#[test]
+fn previous_advert_delay_names_load() {
+    let _init_guard = zakura_test::init();
+    let config: Config =
+        toml::from_str("advert_delay_min = '0s'\nadvert_delay_max = '500ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay_max = '0s'\nadvert_delay = '250ms'").unwrap();
+    assert_eq!(
+        config.advert_delay,
+        Duration::from_millis(250),
+        "the new name wins over the previous name"
+    );
+    let config: Config = toml::from_str("advert_delay_min = '25ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("advert_delay = "), "{serialized}");
+    assert!(!serialized.contains("advert_delay_m"), "{serialized}");
 }
 
 #[test]

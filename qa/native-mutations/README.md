@@ -13,6 +13,12 @@ and intended assertion. Most cases use library tests. The handoff case uses
 the `zakura-sim` integration test named in its `test_target` field and needs
 `RUSTFLAGS="--cfg zakura_sim"`.
 
+The mutation loop's patches live in `<entry>/<name>/`, one directory per
+patch, where `<entry>` is a `work-list.toml` entry. A generator writes them
+from `PROMPT.md`. Their `cases.json` entries name a property and its witness
+instead of a native test. `cargo xtask planted loop` runs them on the remote
+host. `python3 scripts/mutation_inventory.py --loop` checks them.
+
 Run `python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"`
 from the repository root to check patch application and binding metadata.
 The command does not apply patches or compile tests. A matching source symbol

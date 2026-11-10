@@ -5,24 +5,29 @@
 //! drains the transaction IDs that still need gossip from the mempool service,
 //! and advertises them to peers. Draining from the mempool service lets the task
 //! recover the IDs behind any wakeups dropped by a lagged channel.
+//!
+//! Each advertisement completes in its own task, so a slow peer delays only its
+//! own broadcast, never the next batch of transaction IDs.
 
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
-use tokio::sync::broadcast::{
-    self,
-    error::{RecvError, TryRecvError},
+use tokio::{
+    sync::broadcast::{
+        self,
+        error::{RecvError, TryRecvError},
+    },
+    task::JoinSet,
 };
 use tower::{timeout::Timeout, Service, ServiceExt};
 
 use zakura_network::MAX_TX_INV_IN_SENT_MESSAGE;
 
-use zakura_chain::transaction::UnminedTxId;
 use zakura_network as zn;
 use zakura_node_services::mempool::{MempoolChange, Request, Response};
 
 use crate::{components::sync::TIPS_RESPONSE_TIMEOUT, BoxError};
 
-/// Controls how long we wait between gossiping successive batches of transaction IDs.
+/// Controls how long we wait between starting successive batches of transaction ID gossip.
 ///
 /// Block gossip has no delay, so this delay only applies to transactions. It is a third of
 /// Zcash's historical 7 second gossip delay, matching the 25 second block spacing in ZIP 218.
@@ -33,6 +38,12 @@ use crate::{components::sync::TIPS_RESPONSE_TIMEOUT, BoxError};
 ///
 /// If this delay is set too low, the peer set and remote peers can get overloaded.
 pub const TRANSACTION_GOSSIP_DELAY: Duration = Duration::from_secs(2);
+
+/// How long the gossip task waits for the network to accept a broadcast.
+///
+/// The task waits for the network before it takes any pending transaction IDs,
+/// so a timeout leaves them in the mempool for the next attempt.
+pub const BROADCAST_READY_TIMEOUT: Duration = TIPS_RESPONSE_TIMEOUT;
 
 /// The maximum number of channel messages we will combine into a single peer broadcast.
 pub const MAX_CHANGES_BEFORE_SEND: usize = 10;
@@ -47,10 +58,12 @@ const MAX_TX_INV_IN_SENT_MESSAGE_USIZE: usize = MAX_TX_INV_IN_SENT_MESSAGE as us
 /// up a large backlog of stale notifications.
 pub(super) const MEMPOOL_CHANGE_CHANNEL_CAPACITY: usize = MAX_CHANGES_BEFORE_SEND * 4;
 
-/// Runs continuously, gossiping new [`UnminedTxId`] to peers.
+/// Runs continuously, gossiping new [`UnminedTxId`](zakura_chain::transaction::UnminedTxId)s to peers.
 ///
-/// Broadcasts any new [`UnminedTxId`]s that
-/// are stored in the mempool to multiple ready peers.
+/// Broadcasts any new transaction IDs that are stored in the mempool to
+/// multiple ready peers. Broadcasts start at most once per
+/// [`TRANSACTION_GOSSIP_DELAY`], and each one finishes in the background within
+/// [`TIPS_RESPONSE_TIMEOUT`], so only a few broadcasts are ever in flight.
 pub(crate) async fn run_mempool_transaction_id_gossip<ZN, ZM>(
     mut receiver: broadcast::Receiver<MempoolChange>,
     broadcast_network: ZN,
@@ -58,15 +71,16 @@ pub(crate) async fn run_mempool_transaction_id_gossip<ZN, ZM>(
 ) -> Result<(), BoxError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
+    ZN::Future: Send + 'static,
     ZM: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
     ZM::Future: Send + 'static,
 {
     info!("initializing transaction gossip task");
 
     // use the same timeout as tips requests,
-    // so broadcasts don't delay the syncer too long
+    // so broadcasts don't occupy peers the syncer needs for too long
     let mut broadcast_network = Timeout::new(broadcast_network, TIPS_RESPONSE_TIMEOUT);
+    let mut in_flight_broadcasts = JoinSet::new();
     let mut drain_pending_without_wakeup = false;
 
     loop {
@@ -131,38 +145,81 @@ where
             drain_pending_without_wakeup = false;
         }
 
-        let advertised_count = advertise_pending_mempool_transaction_ids(
+        reap_finished_broadcasts(&mut in_flight_broadcasts);
+
+        let advertised_count = match start_pending_mempool_transaction_id_broadcast(
             &mut mempool,
             &mut broadcast_network,
+            &mut in_flight_broadcasts,
             combined_changes,
         )
-        .await?;
-
-        if advertised_count == 0 {
-            continue;
-        }
+        .await?
+        {
+            BroadcastStart::Started { tx_count } => tx_count,
+            BroadcastStart::NothingPending => continue,
+            BroadcastStart::NetworkNotReady => {
+                // The pending IDs are still in the mempool, so retry without
+                // waiting for another wakeup.
+                drain_pending_without_wakeup = true;
+                continue;
+            }
+        };
 
         // A full batch means more transaction IDs may still be pending, so
         // drain again after the delay instead of waiting for another wakeup.
         drain_pending_without_wakeup = advertised_count == MAX_TX_INV_IN_SENT_MESSAGE;
 
         // Waiting between batches can delay transaction propagation, in order to reduce peer load.
+        // The delay runs from the start of the broadcast, not from its completion.
         tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
     }
 }
 
-/// Advertise transaction IDs waiting in the mempool's pending gossip set.
-async fn advertise_pending_mempool_transaction_ids<ZN, ZM>(
+/// The outcome of one attempt to start a pending transaction ID broadcast.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BroadcastStart {
+    /// A broadcast of `tx_count` transaction IDs is running in the background.
+    Started { tx_count: u64 },
+
+    /// The mempool had no transaction IDs waiting for gossip.
+    NothingPending,
+
+    /// The network was not ready within [`BROADCAST_READY_TIMEOUT`],
+    /// so no pending transaction IDs were taken from the mempool.
+    NetworkNotReady,
+}
+
+/// Takes up to one inv worth of transaction IDs from the mempool's pending
+/// gossip set, and starts advertising them in a task in `in_flight_broadcasts`.
+///
+/// Waits for the network to be ready before taking any IDs, so that a network
+/// that stays unready leaves them pending.
+async fn start_pending_mempool_transaction_id_broadcast<ZN, ZM>(
     mempool: &mut ZM,
     broadcast_network: &mut Timeout<ZN>,
+    in_flight_broadcasts: &mut JoinSet<()>,
     combined_changes: usize,
-) -> Result<u64, BoxError>
+) -> Result<BroadcastStart, BoxError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
+    ZN::Future: Send + 'static,
     ZM: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
     ZM::Future: Send + 'static,
 {
+    // `Timeout` only bounds the response future, so readiness needs its own timeout.
+    let Ok(broadcast_network) =
+        tokio::time::timeout(BROADCAST_READY_TIMEOUT, broadcast_network.ready()).await
+    else {
+        info!(
+            timeout = ?BROADCAST_READY_TIMEOUT,
+            "network was not ready for a transaction broadcast, retrying"
+        );
+        metrics::counter!("mempool.gossip.network.unready.total").increment(1);
+
+        return Ok(BroadcastStart::NetworkNotReady);
+    };
+    let broadcast_network = broadcast_network?;
+
     let Response::TransactionIds(tx_ids) = mempool
         .ready()
         .await?
@@ -177,47 +234,15 @@ where
         .into());
     };
 
-    let mut advertised_count = 0;
-    let mut chunk = HashSet::<UnminedTxId>::new();
-
-    for tx_id in tx_ids {
-        chunk.insert(tx_id);
-
-        if chunk.len() >= MAX_TX_INV_IN_SENT_MESSAGE_USIZE {
-            advertised_count +=
-                advertise_transaction_id_chunk(broadcast_network, &mut chunk, combined_changes)
-                    .await?;
-        }
+    if tx_ids.is_empty() {
+        return Ok(BroadcastStart::NothingPending);
     }
 
-    if !chunk.is_empty() {
-        advertised_count +=
-            advertise_transaction_id_chunk(broadcast_network, &mut chunk, combined_changes).await?;
-    }
-
-    if advertised_count > 0 {
-        metrics::counter!("mempool.gossip.pending.transactions.total").increment(advertised_count);
-        metrics::counter!("mempool.gossiped.transactions.total").increment(advertised_count);
-    }
-
-    Ok(advertised_count)
-}
-
-/// Advertise a single bounded transaction ID chunk and clear it for reuse.
-async fn advertise_transaction_id_chunk<ZN>(
-    broadcast_network: &mut Timeout<ZN>,
-    chunk: &mut HashSet<UnminedTxId>,
-    combined_changes: usize,
-) -> Result<u64, BoxError>
-where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
-{
-    let txs_len: u64 = chunk
+    let tx_count: u64 = tx_ids
         .len()
         .try_into()
-        .expect("transaction ID chunk length fits in u64");
-    let request = zn::Request::AdvertiseTransactionIds(std::mem::take(chunk), None);
+        .expect("the mempool returns at most one inv of transaction IDs, which fits in u64");
+    let request = zn::Request::AdvertiseTransactionIds(tx_ids, None);
 
     info!(%request, changes = %combined_changes, "sending pending mempool transaction broadcast");
     debug!(
@@ -226,9 +251,34 @@ where
         "full list of pending mempool transactions in broadcast"
     );
 
-    let _ = broadcast_network.ready().await?.call(request).await;
+    // The response only reports that the selected peers finished, so waiting
+    // for it here would let one slow peer hold back the next batch. The task
+    // must still poll the response: dropping it could cancel a buffered
+    // request before it reaches any peers.
+    let response = broadcast_network.call(request);
+    in_flight_broadcasts.spawn(async move {
+        if let Err(error) = response.await {
+            debug!(%error, "transaction broadcast did not finish");
+        }
+    });
 
-    Ok(txs_len)
+    metrics::counter!("mempool.gossip.pending.transactions.total").increment(tx_count);
+    metrics::counter!("mempool.gossiped.transactions.total").increment(tx_count);
+
+    Ok(BroadcastStart::Started { tx_count })
+}
+
+/// Removes finished broadcast tasks, and propagates any panic from them.
+fn reap_finished_broadcasts(in_flight_broadcasts: &mut JoinSet<()>) {
+    while let Some(result) = in_flight_broadcasts.try_join_next() {
+        if let Err(error) = result {
+            // Only the gossip task's own exit aborts these tasks, so any other
+            // join error is a panic.
+            if let Ok(panic) = error.try_into_panic() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,10 +289,14 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::{broadcast, mpsc};
+    use futures::future;
+    use tokio::{
+        sync::{broadcast, mpsc},
+        time::Instant,
+    };
     use tower::service_fn;
 
-    use zakura_chain::transaction;
+    use zakura_chain::transaction::{self, UnminedTxId};
 
     use super::*;
 
@@ -303,7 +357,8 @@ mod tests {
     }
 
     fn peer_set_service() -> (
-        impl Service<zn::Request, Response = zn::Response, Error = BoxError, Future: Send> + Clone,
+        impl Service<zn::Request, Response = zn::Response, Error = BoxError, Future: Send + 'static>
+            + Clone,
         mpsc::Receiver<zn::Request>,
     ) {
         let (advertised_sender, advertised_receiver) = mpsc::channel(16);
@@ -519,6 +574,145 @@ mod tests {
         assert!(
             !gossip_task.is_finished(),
             "gossip task should remain alive after an empty pending drain",
+        );
+
+        gossip_task.abort();
+    }
+
+    /// A peer set that records each request and its start time, then never responds,
+    /// like a broadcast that is stuck on a slow peer.
+    fn stalled_peer_set_service() -> (
+        impl Service<zn::Request, Response = zn::Response, Error = BoxError, Future: Send + 'static>
+            + Clone,
+        mpsc::Receiver<(zn::Request, Instant)>,
+    ) {
+        let (advertised_sender, advertised_receiver) = mpsc::channel(16);
+
+        let service = service_fn(move |request| {
+            let advertised_sender = advertised_sender.clone();
+
+            async move {
+                advertised_sender
+                    .send((request, Instant::now()))
+                    .await
+                    .expect("advertised request receiver should be open");
+
+                future::pending::<Result<zn::Response, BoxError>>().await
+            }
+        });
+
+        (service, advertised_receiver)
+    }
+
+    /// Returns the next transaction IDs sent to a stalled peer set, and when they were sent.
+    async fn expect_stalled_advertised_transaction_ids(
+        advertised_receiver: &mut mpsc::Receiver<(zn::Request, Instant)>,
+    ) -> (HashSet<UnminedTxId>, Instant) {
+        // The paused clock auto-advances, so this only needs to exceed the gossip delay.
+        let (request, started_at) =
+            tokio::time::timeout(Duration::from_secs(30), advertised_receiver.recv())
+                .await
+                .expect("gossip task should advertise pending mempool txids")
+                .expect("peer set should advertise a request before the task exits");
+        let zn::Request::AdvertiseTransactionIds(tx_ids, None) = request else {
+            panic!("unexpected advertised request: {request:?}");
+        };
+
+        (tx_ids, started_at)
+    }
+
+    /// A peer set that never becomes ready.
+    #[derive(Clone)]
+    struct NeverReadyPeerSet;
+
+    impl Service<zn::Request> for NeverReadyPeerSet {
+        type Response = zn::Response;
+        type Error = BoxError;
+        type Future = future::Ready<Result<zn::Response, BoxError>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), BoxError>> {
+            std::task::Poll::Pending
+        }
+
+        fn call(&mut self, request: zn::Request) -> Self::Future {
+            panic!("a peer set that is never ready must not be called: {request:?}")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_broadcast_does_not_delay_next_batch() {
+        let _init_guard = zakura_test::init();
+
+        // A full first batch makes the task drain again without another wakeup.
+        let first_batch = test_tx_ids(MAX_TX_INV_IN_SENT_MESSAGE_USIZE, 1);
+        let second_batch = test_tx_ids(2, 2);
+        let (mempool, _limit_receiver) =
+            mempool_service(vec![first_batch.clone(), second_batch.clone()]);
+        let (peer_set, mut advertised_receiver) = stalled_peer_set_service();
+        let (sender, receiver) = broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
+
+        sender
+            .send(MempoolChange::added(test_tx_ids(1, 3)))
+            .expect("receiver should be subscribed");
+
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
+
+        let (advertised_tx_ids, first_started_at) =
+            expect_stalled_advertised_transaction_ids(&mut advertised_receiver).await;
+        assert_eq!(advertised_tx_ids, first_batch);
+
+        let (advertised_tx_ids, second_started_at) =
+            expect_stalled_advertised_transaction_ids(&mut advertised_receiver).await;
+        assert_eq!(advertised_tx_ids, second_batch);
+
+        let gap = second_started_at.duration_since(first_started_at);
+        assert!(
+            gap >= TRANSACTION_GOSSIP_DELAY,
+            "batches should still be paced by the gossip delay, gap: {gap:?}",
+        );
+        assert!(
+            gap < TIPS_RESPONSE_TIMEOUT,
+            "a stalled broadcast should not hold back the next batch, gap: {gap:?}",
+        );
+
+        gossip_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unready_network_leaves_pending_ids_in_mempool() {
+        let _init_guard = zakura_test::init();
+
+        let (mempool, mut limit_receiver) = mempool_service(vec![test_tx_ids(2, 1)]);
+        let (sender, receiver) = broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
+
+        sender
+            .send(MempoolChange::added(test_tx_ids(1, 2)))
+            .expect("receiver should be subscribed");
+
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver,
+            NeverReadyPeerSet,
+            mempool,
+        ));
+
+        // Long enough for several readiness timeouts and retries.
+        tokio::time::sleep(BROADCAST_READY_TIMEOUT * 3).await;
+
+        assert!(
+            matches!(
+                limit_receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "the task should not take pending txids while the network is unready",
+        );
+        assert!(
+            !gossip_task.is_finished(),
+            "gossip task should keep retrying while the network is unready",
         );
 
         gossip_task.abort();

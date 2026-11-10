@@ -889,15 +889,6 @@ impl BlockNode {
     fn torn_down(&self) -> bool {
         self.live.borrow().is_none()
     }
-
-    /// A probe of the session slots its service reserves, until a teardown
-    /// drops the service.
-    pub fn session_slots(&self) -> Option<SessionSlotsProbe> {
-        self.live
-            .borrow()
-            .as_ref()
-            .map(|live| live.service.session_slots())
-    }
 }
 
 /// The peer identity seeded by `seed`.
@@ -938,6 +929,17 @@ impl Link {
     /// a routine that rejects a frame does.
     pub fn is_closed(&self) -> bool {
         self.tokens.iter().any(CancellationToken::is_cancelled)
+    }
+}
+
+impl BlockNode {
+    /// A probe of the session slots its service reserves, until a teardown
+    /// drops the service.
+    pub fn session_slots(&self) -> Option<SessionSlotsProbe> {
+        self.live
+            .borrow()
+            .as_ref()
+            .map(|live| live.service.session_slots())
     }
 }
 

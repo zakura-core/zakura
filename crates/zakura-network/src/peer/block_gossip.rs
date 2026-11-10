@@ -681,9 +681,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                 }
                 dispatching = false;
                 if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, mined, delayed_at)
-                        .await
-                    {
+                    match broadcast_block(candidates, block.hash, window, mined, delayed_at).await {
                         Err(error) if error.is::<RevokedCandidates>() => {}
                         Err(error) => {
                             let minimum_version = minimum.current();
@@ -2093,7 +2091,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_snapshot_retries_replacement_without_resetting_deadline() {
+    async fn revoked_snapshot_retries_replacement_without_resetting_deadline() {
         for replace_before_failure in [false, true] {
             let (first, mut first_rx) = peer();
             let (published, peers) = watch::channel(vec![first]);
@@ -2111,6 +2109,7 @@ mod tests {
                 ),
                 bans: BannedIps::default(),
                 refresh: None,
+                readiness: Readiness::Idle,
             };
             let start = Instant::now();
             let hash = block::Hash([82; 32]);
@@ -2124,7 +2123,10 @@ mod tests {
                 published.send_replace(later.clone());
             }
             drop(first_rx);
-            drop(advert);
+            advert
+                .result
+                .send(Err(BlockAdvertError::AuthorizationRevoked))
+                .unwrap();
             tokio::task::yield_now().await;
             if !replace_before_failure {
                 assert!(!broadcast.is_finished());
@@ -2214,7 +2216,7 @@ mod tests {
         let mut advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: BlockUploadSlots::new(1),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,
@@ -2254,7 +2256,7 @@ mod tests {
         let mut advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: BlockUploadSlots::new(1),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,
@@ -2292,7 +2294,7 @@ mod tests {
         let mut advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: BlockUploadSlots::new(1),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,
@@ -2338,7 +2340,7 @@ mod tests {
         let mut advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: BlockUploadSlots::new(1),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,
@@ -2380,7 +2382,7 @@ mod tests {
         let mut advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: BlockUploadSlots::new(2),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,

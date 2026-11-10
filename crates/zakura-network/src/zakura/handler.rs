@@ -328,8 +328,8 @@ pub struct ZakuraConfig {
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
     ///
-    /// Inbound peers hold at most three quarters of it, rounded up, so a
-    /// quarter, rounded down, always stays free for this node's dials (see
+    /// Inbound peers leave a quarter of it, rounded down but at least one
+    /// slot once it is 2 or more, free for this node's dials (see
     /// [`ZakuraLocalLimits::max_inbound_connections`]).
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
@@ -362,7 +362,7 @@ pub struct ZakuraConfig {
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
     ///
-    /// Inbound handshakes hold at most three quarters of it, rounded up, like
+    /// Inbound handshakes leave the same reserve free as
     /// [`max_connections`](Self::max_connections).
     ///
     /// Also the QUIC connections that
@@ -839,7 +839,8 @@ impl ZakuraLocalLimits {
     }
 
     /// Connections inbound peers may hold at once: `max_connections` less the
-    /// outbound reserve, a quarter rounded down (69 of the default 92).
+    /// outbound reserve (69 of the default 92). See
+    /// [`without_outbound_reserve`] for the reserve's size.
     ///
     /// Peers that dial this node can't take the slots its own dials need, so
     /// they can't crowd out the peers it chose. Dials may still use any free
@@ -857,9 +858,16 @@ impl ZakuraLocalLimits {
 }
 
 /// One cap's share left to inbound peers after reserving a quarter of it,
-/// rounded down, for this node's dials.
+/// rounded down, for this node's dials. Any cap of 2 or more reserves at least
+/// one slot, so small caps still leave dials room. A cap of 1 stays inbound's,
+/// since a node that accepts nothing can't be reached.
 fn without_outbound_reserve(cap: usize) -> usize {
-    cap.saturating_sub(cap / OUTBOUND_RESERVE_DIVISOR)
+    let reserve = if cap >= 2 {
+        (cap / OUTBOUND_RESERVE_DIVISOR).max(1)
+    } else {
+        0
+    };
+    cap - reserve
 }
 
 /// Inbound peers leave `1 / OUTBOUND_RESERVE_DIVISOR` of the connection and
@@ -14010,8 +14018,19 @@ mod tests {
     }
 
     #[test]
-    fn outbound_reserve_rounds_down() {
-        for (cap, inbound) in [(1, 1), (3, 3), (4, 3), (16, 12), (32, 24), (92, 69)] {
+    fn outbound_reserve_rounds_down_but_keeps_one_slot() {
+        for (cap, inbound) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (7, 6),
+            (8, 6),
+            (16, 12),
+            (32, 24),
+            (92, 69),
+        ] {
             assert_eq!(without_outbound_reserve(cap), inbound, "cap {cap}");
         }
     }

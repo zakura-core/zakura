@@ -221,7 +221,6 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     let (_lock, kept) = lock_out(&out)?;
     mark_descendants(&out);
     let mut sessions = track_sessions(&out);
-    own_exe()?;
     contain();
     check_out_dir(repo_root, &options)?;
     let subject = subject_of(repo_root, &options)?;
@@ -733,7 +732,6 @@ fn run_in_subject(
         )
         .into());
     }
-    own_exe()?;
     let contained = contain();
     let subject = subject_of(repo_root, &options)?;
     if subject.commit != commit {
@@ -953,21 +951,23 @@ fn run_id() -> String {
     format!("{nanos:x}-{}", std::process::id())
 }
 
-/// A private copy of this xtask binary, made on first use, which the run
-/// does at its start: a rebuild of the caller's xtask during the run can't
-/// change the code a helper runs, or remove it.
-fn own_exe() -> Result<&'static Path, BoxError> {
-    static COPY: OnceLock<Result<(tempfile::TempDir, PathBuf), String>> = OnceLock::new();
-    let copy = COPY.get_or_init(|| {
-        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let path = dir.path().join("xtask");
-        let exe = env::current_exe().map_err(|error| error.to_string())?;
-        fs::copy(&exe, &path).map_err(|error| format!("{}: {error}", exe.display()))?;
-        Ok((dir, path))
-    });
-    match copy {
-        Ok((_, path)) => Ok(path),
-        Err(why) => Err(why.clone().into()),
+/// This xtask binary, for the helpers it runs ([`source_digest`]), so a
+/// rebuild of the caller's xtask during the run can't change the code a
+/// helper runs, or remove it. On Linux it's `/proc/<this process's ID>/exe`,
+/// which runs the file this process runs even after it's replaced or
+/// deleted, with nothing copied. It names this process's ID, not `self`,
+/// because a child execs it from inside its `sh` gate ([`gated`]), where
+/// `/proc/self/exe` is the shell. Elsewhere it's `current_exe()`, whose
+/// file a rebuild can replace: best-effort, like containment there, and a
+/// best-effort record never counts for acceptance.
+fn own_exe() -> Result<PathBuf, BoxError> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from(format!("/proc/{}/exe", std::process::id())))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(env::current_exe()?)
     }
 }
 
@@ -3113,14 +3113,104 @@ mod tests {
         }
     }
 
-    /// The private copy of the xtask binary is made once and is a file of
-    /// its own.
+    /// Helpers run this process's own binary: on Linux through its
+    /// `/proc/<ID>/exe`, elsewhere its path.
     #[test]
-    fn helpers_run_a_private_copy_of_xtask() {
-        let first = own_exe().unwrap();
-        assert_eq!(own_exe().unwrap(), first);
-        assert!(first.is_file());
-        assert_ne!(first, env::current_exe().unwrap().as_path());
+    fn helpers_run_this_process_s_binary() {
+        let exe = own_exe().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            exe,
+            PathBuf::from(format!("/proc/{}/exe", std::process::id()))
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(exe, env::current_exe().unwrap());
+        assert!(exe.exists());
+    }
+
+    /// The variable that has [`exe_runner_helper`] run, naming its
+    /// directory.
+    #[cfg(target_os = "linux")]
+    const EXE_RUNNER: &str = "XTASK_EXE_RUNNER";
+
+    /// The variable that has [`exe_marker_helper`] write its marker there.
+    #[cfg(target_os = "linux")]
+    const EXE_MARKER: &str = "XTASK_EXE_MARKER";
+
+    /// A helper still runs the runner's own code after the runner's file is
+    /// replaced and then removed: a copy of this test binary stands for the
+    /// runner ([`exe_runner_helper`]), renames `true` over its own path,
+    /// removes it, and then runs [`exe_marker_helper`] through [`own_exe`]
+    /// and the `sh` gate. Through the file on disk that would run `true`,
+    /// or nothing, and write no marker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_runs_the_runner_s_code_after_its_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = dir.path().join("runner");
+        fs::copy(env::current_exe().unwrap(), &runner).unwrap();
+        let status = Command::new(&runner)
+            .args([
+                "--exact",
+                "header_acceptance::tests::exe_runner_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EXE_RUNNER, dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!runner.exists(), "the runner's file was removed");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("end")).unwrap(),
+            "exited with code 0"
+        );
+        assert!(
+            dir.path().join("marker").exists(),
+            "the helper ran the runner's code"
+        );
+    }
+
+    /// The runner, run only by
+    /// [`a_helper_runs_the_runner_s_code_after_its_file_is_replaced`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exe_runner_helper() {
+        let Some(dir) = env::var_os(EXE_RUNNER).map(PathBuf::from) else {
+            return;
+        };
+        let _sessions = track_sessions(&dir);
+        let runner = dir.join("runner");
+        let replacement = dir.join("replacement");
+        fs::copy("/bin/true", &replacement).unwrap();
+        fs::rename(&replacement, &runner).unwrap();
+        fs::remove_file(&runner).unwrap();
+        let mut helper = Command::new(own_exe().unwrap());
+        helper
+            .args([
+                "--exact",
+                "header_acceptance::tests::exe_marker_helper",
+                "--nocapture",
+            ])
+            .env(EXE_MARKER, dir.join("marker"));
+        let ended = child(
+            &mut helper,
+            &dir.join("helper.log"),
+            Duration::from_secs(60),
+        );
+        fs::write(dir.join("end"), ended.end.to_string()).unwrap();
+    }
+
+    /// Writes the marker [`EXE_MARKER`] names, run only by
+    /// [`exe_runner_helper`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exe_marker_helper() {
+        if let Some(marker) = env::var_os(EXE_MARKER) {
+            fs::write(marker, "ran").unwrap();
+        }
     }
 
     /// A repository in a temp dir with one commit, for the worktree and

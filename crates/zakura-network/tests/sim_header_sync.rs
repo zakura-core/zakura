@@ -867,6 +867,33 @@ fn frame_header(message_type: u16, payload_len: u32) -> Vec<u8> {
     .concat()
 }
 
+/// The plans a wire test runs under, so its outcome can't hang on one
+/// plan's order of racing tasks.
+const PLANS: std::ops::Range<u64> = 0..16;
+
+/// A `Status` frame from a peer at Regtest genesis. Encoding runs the checks
+/// the node's decoder applies, so the node accepts it.
+fn genesis_status_frame() -> Vec<u8> {
+    let network = Network::new_regtest(Default::default());
+    let genesis = (zakura_chain::block::Height(0), network.genesis_hash());
+    let status = v9::Status {
+        work_anchor_height: genesis.0,
+        work_anchor_hash: genesis.1,
+        selected_tip_height: genesis.0,
+        selected_tip_hash: genesis.1,
+        suffix_cumulative_work: Default::default(),
+        oldest_retained_height: genesis.0,
+        max_headers_per_response: 160,
+        max_subscriptions: 1,
+        max_message_bytes: 1 << 20,
+        tree_aux_schema_mask: 0,
+    };
+    encode_frame(&RegtestMessage::Status(status))
+        .expect("the status encodes")
+        .encode(RegtestMessage::LAYOUT[0].frame_cap)
+        .expect("a status fits the frame cap")
+}
+
 /// The `Status` row's payload length.
 fn status_len() -> u32 {
     let row = RegtestMessage::ROWS
@@ -879,8 +906,12 @@ fn status_len() -> u32 {
 /// A header cut after 5 bytes reaches neither reader stage, and a frame cut
 /// mid-payload reaches only `HeaderRead`, at a point after all ready work
 /// ran and before the reader's deadline for the missing bytes. Past that
-/// deadline, under production timeouts, each closes with the reader's
-/// neutral timeout cause.
+/// deadline, under production timeouts, each closes with a neutral timeout
+/// cause, under every plan in [`PLANS`].
+///
+/// No frame is admitted, so the connection's freshness reaper and the
+/// reader's deadline both run out the idle timeout, here from the same
+/// instant. Which one records its cause is the plan's choice.
 ///
 /// This fails if `HeaderRead` moves before the header is read, or if a
 /// partial frame gets a fault cause.
@@ -896,11 +927,15 @@ fn partial_frames_reach_only_their_stage() {
             1,
         ),
     ];
-    for (case, bytes, stages) in cases {
+    for ((case, bytes, stages), seed) in cases
+        .iter()
+        .flat_map(|case| PLANS.map(move |seed| (case, seed)))
+    {
+        let (case, stages) = (format!("{case}, plan {seed}"), *stages);
         let mut wire = Wire::start(
-            11,
+            seed,
             Script {
-                first: bytes,
+                first: bytes.clone(),
                 ..Script::default()
             },
         );
@@ -923,14 +958,17 @@ fn partial_frames_reach_only_their_stage() {
         wire.run_until(Duration::from_secs(160));
         let events = wire.events();
         assert_eq!(reads(&events, quic_stream), expected[..stages], "{case}");
-        assert_eq!(
-            closes(&events),
-            vec![TransportEvent::CloseDecided {
-                remote: peer_addr(),
-                conn_id: Some(conn_id),
-                cause: Some("ordered_read_timeout"),
-            }],
-            "{case}: the timeout is neutral"
+        let closes = closes(&events);
+        assert!(
+            ["ordered_read_timeout", "idle_timeout"]
+                .iter()
+                .any(|cause| closes
+                    == [TransportEvent::CloseDecided {
+                        remote: peer_addr(),
+                        conn_id: Some(conn_id),
+                        cause: Some(cause),
+                    }]),
+            "{case}: the timeout is neutral: {closes:?}"
         );
         wire.finish();
     }
@@ -1374,38 +1412,37 @@ fn a_timed_out_drain_reports_no_teardown() {
     wire.finish();
 }
 
-/// Installing the transport observer adds no scheduling point: one plan takes
-/// the same steps with and without it, through the handshake, admission,
-/// a whole frame and the regulation checks of a page header.
+/// Installing the transport observer adds no scheduling point: each plan in
+/// [`PLANS`] takes the same steps with and without it, through the handshake,
+/// admission, a whole frame and the regulation checks of a page header.
+///
+/// The whole frame is a valid `Status`, so header sync never closes the
+/// connection before the reader checks the page header.
 ///
 /// This fails if attaching a tap takes a simulator lock.
 #[test]
 fn the_observer_adds_no_scheduling_point() {
-    let status = status_len();
     let script = Script {
-        first: [
-            frame_header(1, status),
-            vec![0; usize::try_from(status).expect("u32 fits usize")],
-            frame_header(3, 300),
-        ]
-        .concat(),
+        first: [genesis_status_frame(), frame_header(3, 300)].concat(),
         ..Script::default()
     };
-    let mut steps = Vec::new();
-    for observed in [true, false] {
-        let mut wire = Wire::start_observed(29, script.clone(), observed);
-        wire.run_until(Duration::from_secs(5));
-        assert_eq!(
-            wire.events()
-                .iter()
-                .any(|event| matches!(event, TransportEvent::Regulated { .. })),
-            observed,
-            "only the observed run reports, and it reached the regulation checks"
-        );
-        steps.push(std::mem::take(&mut wire.steps));
-        wire.finish();
+    for seed in PLANS {
+        let mut steps = Vec::new();
+        for observed in [true, false] {
+            let mut wire = Wire::start_observed(seed, script.clone(), observed);
+            wire.run_until(Duration::from_secs(5));
+            assert_eq!(
+                wire.events()
+                    .iter()
+                    .any(|event| matches!(event, TransportEvent::Regulated { .. })),
+                observed,
+                "plan {seed}: only the observed run reports, and it reached the regulation checks"
+            );
+            steps.push(std::mem::take(&mut wire.steps));
+            wire.finish();
+        }
+        assert_eq!(steps[0], steps[1], "plan {seed}");
     }
-    assert_eq!(steps[0], steps[1]);
 }
 
 /// A peer that answers the node's dial: it acks the node's hello with the

@@ -252,6 +252,11 @@ impl ChainTipSender {
         }
     }
 
+    /// Returns the hash of the last published best tip.
+    pub(crate) fn best_tip_hash(&self) -> Option<block::Hash> {
+        self.sender.borrow().as_ref().map(|tip| tip.hash)
+    }
+
     /// Update the latest finalized tip.
     ///
     /// May trigger an update to the best tip.

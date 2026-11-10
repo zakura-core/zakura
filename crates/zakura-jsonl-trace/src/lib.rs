@@ -141,7 +141,7 @@ impl JsonlEventEmitter {
         Self {
             tracer,
             node: node.into(),
-            started: Instant::now(),
+            started: process_origin(),
         }
     }
 
@@ -232,6 +232,15 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
 }
 
+/// Returns the instant this process created its first emitter.
+///
+/// Every emitter measures `ts` from this origin, so rows from different tables in one process
+/// can be ordered and subtracted.
+fn process_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
 /// Returns the process-wide node identifier used to tag JSONL trace records.
 ///
 /// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
@@ -256,7 +265,7 @@ pub fn node_id() -> &'static str {
 /// Returns an opaque identifier shared by every JSONL emitter in this process.
 ///
 /// The identifier disambiguates appended trace rows across process restarts.
-/// Emitter-local monotonic timestamps restart from zero after each restart.
+/// Process-relative monotonic timestamps restart from zero after each restart.
 /// The identifier provides only a correlation label.
 /// The identifier does not provide randomness or security identity.
 pub fn process_trace_id() -> &'static str {
@@ -863,6 +872,34 @@ mod tests {
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
         assert!(row["ts"].is_u64());
+    }
+
+    #[test]
+    fn emitters_share_the_process_ts_origin() {
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let first = JsonlEventEmitter::new(JsonlTracer::new(first_tx), "first");
+        std::thread::sleep(Duration::from_millis(20));
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let second = JsonlEventEmitter::new(JsonlTracer::new(second_tx), "second");
+
+        let event = || TestEvent {
+            event: "origin",
+            value: 0,
+            optional: None,
+        };
+        second.emit_event(event);
+        first.emit_event(event);
+
+        let ts = |written: JsonlWriteEvent| {
+            let row: Value = serde_json::from_slice(&written.line).expect("valid event JSON");
+            row["ts"].as_u64().expect("ts is an integer")
+        };
+        let second_ts = ts(second_rx.try_recv().expect("second emitter writes a row"));
+        let first_ts = ts(first_rx.try_recv().expect("first emitter writes a row"));
+
+        // A per-emitter origin would start the second emitter's `ts` near zero.
+        assert!(second_ts >= 20_000, "{second_ts} < 20000");
+        assert!(second_ts <= first_ts, "{second_ts} > {first_ts}");
     }
 
     #[test]

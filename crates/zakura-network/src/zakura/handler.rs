@@ -2968,6 +2968,7 @@ impl ZakuraProtocolHandler {
             super::TransportEvent::Registered {
                 conn_id,
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
             }
         );
     }
@@ -2980,6 +2981,7 @@ impl ZakuraProtocolHandler {
             self.transport_observer,
             super::TransportEvent::HandshakeRefused {
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
                 reason: reason.to_string(),
             }
         );

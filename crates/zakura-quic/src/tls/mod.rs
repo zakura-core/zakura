@@ -219,6 +219,25 @@ pub(crate) fn remote_node_id(session: &dyn quinn_proto::crypto::Session) -> Opti
     }
 }
 
+/// The length of [`shared_id`].
+#[cfg(any(test, zakura_sim, feature = "test-support"))]
+pub(crate) const SHARED_ID_LEN: usize = 16;
+
+/// The exporter label of [`shared_id`].
+#[cfg(any(test, zakura_sim, feature = "test-support"))]
+const SHARED_ID_LABEL: &[u8] = b"EXPORTER-zakura-quic-shared-id";
+
+/// The ID both ends of a completed handshake derive from it: the keying
+/// material `session` exports under [`SHARED_ID_LABEL`] (RFC 8446 §7.5).
+#[cfg(any(test, zakura_sim, feature = "test-support"))]
+pub(crate) fn shared_id(session: &dyn quinn_proto::crypto::Session) -> [u8; SHARED_ID_LEN] {
+    let mut id = [0; SHARED_ID_LEN];
+    session
+        .export_keying_material(&mut id, SHARED_ID_LABEL, &[])
+        .expect("TLS 1.3 exports far more than 16 bytes once the handshake completes");
+    id
+}
+
 /// Returns the ALPN a completed handshake negotiated.
 pub(crate) fn negotiated_alpn(session: &dyn quinn_proto::crypto::Session) -> Option<Vec<u8>> {
     session

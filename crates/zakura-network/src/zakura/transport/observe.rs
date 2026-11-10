@@ -65,6 +65,9 @@ pub enum TransportEvent {
     HandshakeRefused {
         /// The remote address the connection was admitted from.
         remote: SocketAddr,
+        /// The ID both ends derive from the connection's TLS handshake
+        /// ([`zakura_quic::Conn::shared_id`]).
+        shared_id: [u8; 16],
         /// The handshake error, or the refusal's trace label.
         reason: String,
     },
@@ -74,6 +77,9 @@ pub enum TransportEvent {
         conn_id: ZakuraConnId,
         /// The remote address the connection was admitted from.
         remote: SocketAddr,
+        /// The ID both ends derive from the connection's TLS handshake
+        /// ([`zakura_quic::Conn::shared_id`]).
+        shared_id: [u8; 16],
     },
     /// A service session's stream started, with the limits and queue depths
     /// its worker installed.

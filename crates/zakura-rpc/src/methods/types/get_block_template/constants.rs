@@ -9,6 +9,7 @@ use zakura_chain::parameters::subsidy::FundingStreamReceiver::{self, *};
 ///
 /// State tip changes make long polling return immediately. But miners can re-use old work
 /// with an old set of transactions, so they don't need to know about mempool changes immediately.
+/// The exception is a template without transactions, which returns as soon as the mempool changes.
 ///
 /// Sync status changes are rare, and the blocks they download cause a chain tip change anyway.
 ///

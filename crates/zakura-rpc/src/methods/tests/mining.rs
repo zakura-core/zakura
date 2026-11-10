@@ -1175,6 +1175,274 @@ async fn long_poll_preserves_negative_balance_error() {
     assert!(error.message().contains("NSM value balance is negative"));
 }
 
+/// Returns `count` distinct transparent transactions that pay the conventional fee.
+fn mempool_txs(count: usize) -> Vec<zakura_chain::transaction::VerifiedUnminedTx> {
+    Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .filter(|tx| {
+            let tx = tx.transaction.transaction();
+            !tx.is_coinbase() && !tx.has_shielded_inputs() && !tx.has_shielded_outputs()
+        })
+        .take(count)
+        .map(|tx| {
+            let tx = tx.transaction;
+            let actions = zakura_chain::transaction::zip317::conventional_actions(tx.transaction());
+            let fee = Amount::try_from(i64::from(actions) * 400).unwrap();
+            zakura_chain::transaction::VerifiedUnminedTx::new(tx, fee, 0, 0, Arc::new(Vec::new()))
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Returns a mining RPC whose mempool serves `txs` and announces changes on the returned sender,
+/// with its tip sender and a count of mempool fetches.
+fn mempool_change_rpc(
+    info: watch::Receiver<GetBlockTemplateChainInfo>,
+    txs: watch::Receiver<Vec<zakura_chain::transaction::VerifiedUnminedTx>>,
+) -> (
+    TestRpcImpl,
+    zakura_chain::chain_tip::mock::MockChainTipSender,
+    broadcast::Sender<mempool::MempoolChange>,
+    Arc<AtomicUsize>,
+) {
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(info.borrow().tip_height);
+    sender.send_best_tip_hash(info.borrow().tip_hash);
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let fetches = fetch_count.clone();
+    let mempool_info = info.clone();
+    let mempool = tower::service_fn(move |_| {
+        fetches.fetch_add(1, Ordering::SeqCst);
+        let transactions = txs.borrow().clone();
+        let hash = mempool_info.borrow().tip_hash;
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions,
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: hash,
+            })
+        }
+    });
+    let read = tower::service_fn(move |request| {
+        let info = info.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let (rpc, _) = rpc(network(), mempool, read, tip);
+    let (changes, _) = broadcast::channel(16);
+    let rpc = rpc.with_mempool_change(mempool::MempoolTxSubscriber::new(changes.clone()));
+    (rpc, sender, changes, fetch_count)
+}
+
+/// A reorg empties the mempool, so a miner's next long poll holds a template without
+/// transactions. The long poll returns as soon as the mempool accepts a transaction, instead of
+/// at the next mempool poll.
+#[test]
+fn empty_template_long_poll_returns_on_mempool_change() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (txs, mempool) = watch::channel(vec![]);
+        let (rpc, _tip, changes, fetches) = mempool_change_rpc(info, mempool);
+        let empty = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(empty.transactions.is_empty());
+        tokio::time::pause();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(empty.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        let fetched = fetches.load(Ordering::SeqCst);
+
+        let added = mempool_txs(1);
+        txs.send_replace(added.clone());
+        changes
+            .send(mempool::MempoolChange::added(
+                [added[0].transaction.id()].into(),
+            ))
+            .unwrap();
+        let response = futures::poll!(&mut request);
+        assert!(
+            fetches.load(Ordering::SeqCst) > fetched,
+            "the mempool change must wake the long poll before the next mempool poll"
+        );
+
+        tokio::time::resume();
+        let response = match response {
+            Poll::Ready(response) => response,
+            Poll::Pending => bounded(request).await,
+        };
+        let template = response.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, empty.previous_block_hash);
+        assert_eq!(template.transactions.len(), 1);
+        assert_eq!(template.submit_old, Some(true));
+    });
+}
+
+/// A mempool change that leaves the mempool's transactions as they were wakes a long poll on a
+/// template without transactions once, and the long poll keeps waiting.
+#[test]
+fn empty_template_long_poll_waits_while_mempool_is_unchanged() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (_txs, mempool) = watch::channel(vec![]);
+        let (rpc, _tip, changes, fetches) = mempool_change_rpc(info, mempool);
+        let empty = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        tokio::time::pause();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(empty.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let fetched = fetches.load(Ordering::SeqCst);
+
+        let rejected = mempool_txs(1)[0].transaction.id();
+        changes
+            .send(mempool::MempoolChange::invalidated([rejected].into()))
+            .unwrap();
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            fetched + 1,
+            "the change wakes the long poll once"
+        );
+
+        tokio::time::advance(
+            Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "an unchanged template keeps the long poll waiting"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), fetched + 2);
+    });
+}
+
+/// A long poll on a template with transactions ignores mempool changes until the next mempool
+/// poll, so a steady stream of new transactions doesn't churn miners' work.
+#[test]
+fn long_poll_with_transactions_waits_for_mempool_poll() {
+    mining_runtime(async {
+        let all = mempool_txs(2);
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (txs, mempool) = watch::channel(all[..1].to_vec());
+        let (rpc, _tip, changes, fetches) = mempool_change_rpc(info, mempool);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(initial.transactions.len(), 1);
+        tokio::time::pause();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let fetched = fetches.load(Ordering::SeqCst);
+
+        txs.send_replace(all.clone());
+        let _ = changes.send(mempool::MempoolChange::added(
+            [all[1].transaction.id()].into(),
+        ));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(fetches.load(Ordering::SeqCst), fetched);
+
+        tokio::time::advance(
+            Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
+        )
+        .await;
+        let response = futures::poll!(&mut request);
+        assert!(fetches.load(Ordering::SeqCst) > fetched);
+        tokio::time::resume();
+        let response = match response {
+            Poll::Ready(response) => response,
+            Poll::Pending => bounded(request).await,
+        };
+        let template = response.unwrap().try_into_template().unwrap();
+        assert_eq!(template.transactions.len(), 2);
+        assert_eq!(template.submit_old, Some(true));
+    });
+}
+
+/// A long poll's coinbase precompute can wait for construction capacity behind other builds.
+/// A tip change during that wait reaches the tip arm without waiting for the precompute.
+#[test]
+fn tip_change_does_not_wait_for_queued_coinbase_precompute() {
+    mining_runtime(async {
+        // The precompute targets height 2, before ZIP 234 makes the coinbase depend on the parent.
+        let (info_tx, info) = watch::channel(chain_info(0, 1, 0));
+        let (rpc, tip, read_count, _) = counting_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+
+        // Another build holds the construction capacity.
+        let handler = rpc.gbt.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let build = tokio::spawn(async move {
+            handler
+                .run_template_build(move || {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+                .await
+        });
+        bounded(started).await.unwrap();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads = read_count.load(Ordering::SeqCst);
+
+        let next = chain_info(1, 2, 0);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_height(next.tip_height);
+        tip.send_best_tip_hash(next.tip_hash);
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "the empty template still needs construction capacity"
+        );
+        assert!(
+            read_count.load(Ordering::SeqCst) > reads,
+            "the tip change must not wait for the queued precompute"
+        );
+
+        release.send(()).unwrap();
+        bounded(build).await.unwrap().unwrap();
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, next.tip_hash);
+        assert_eq!(template.height, 2);
+        assert!(template.transactions.is_empty());
+    });
+}
+
 #[test]
 fn rejection_during_construction_rebuilds_template() {
     mining_runtime(async {

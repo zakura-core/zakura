@@ -3778,6 +3778,151 @@ async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
     drop(mempool_tip);
 }
 
+/// A block solved from the coinbase-only template a long poll returns on a new tip is accepted
+/// after the full template on the same tip has been issued. Miners keep hashing on the empty
+/// template until the full one arrives, so a solution found in between must not be lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_template_block_is_accepted_after_full_template_on_same_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        ..
+    } = zakura_state::init_test_services(&network).await;
+    let (verifier, _, _, _) = zakura_consensus::router::init_test(
+        zakura_consensus::Config::default(),
+        &network,
+        state.clone(),
+    )
+    .await;
+    verifier
+        .clone()
+        .oneshot(zakura_consensus::Request::Commit(
+            zakura_chain::block::genesis::regtest_genesis_block().into(),
+        ))
+        .await
+        .expect("the regtest genesis block is valid");
+
+    // The mempool serves whatever the test puts in `txs`, as of the current tip.
+    let (txs, mempool_txs) = tokio::sync::watch::channel(Vec::<VerifiedUnminedTx>::new());
+    let mempool_tip = latest_chain_tip.clone();
+    let mempool = tower::service_fn(move |_| {
+        let transactions = mempool_txs.borrow().clone();
+        let last_seen_tip_hash = mempool_tip.best_tip_hash().expect("genesis is committed");
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions,
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash,
+            })
+        }
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
+        network.clone(),
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Regtest,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "empty template submission test",
+        Buffer::new(mempool, 1),
+        state,
+        Buffer::new(read_state, 1),
+        verifier,
+        MockSyncStatus::default(),
+        latest_chain_tip.clone(),
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let rpc = Arc::new(rpc);
+    let long_poll = |long_poll_id| {
+        let rpc = rpc.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                rpc.get_block_template(Some(GetBlockTemplateParameters {
+                    long_poll_id: Some(long_poll_id),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("the long poll returns")
+            .unwrap()
+            .try_into_template()
+            .unwrap()
+        }
+    };
+
+    // A miner long polls on the current tip. Another block lands, so the long poll returns
+    // the coinbase-only template on the new tip.
+    let old_template = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    let waiting = tokio::spawn(long_poll(old_template.long_poll_id));
+    rpc.generate(1).await.unwrap();
+    let empty_template = waiting.await.unwrap();
+    assert_eq!(
+        Some(empty_template.previous_block_hash),
+        latest_chain_tip.best_tip_hash()
+    );
+    assert!(empty_template.transactions.is_empty());
+
+    // The mempool catches up, and the miner's next long poll gets the full template.
+    let unmined_tx = Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|tx| {
+            let tx = tx.transaction.transaction();
+            !tx.is_coinbase() && !tx.has_shielded_inputs() && !tx.has_shielded_outputs()
+        })
+        .expect("test network has an unmined transaction")
+        .transaction;
+    let miner_fee =
+        Amount::try_from(i64::from(zip317::conventional_actions(unmined_tx.transaction())) * 400)
+            .expect("fee fits in amount");
+    txs.send_replace(vec![VerifiedUnminedTx::new(
+        unmined_tx,
+        miner_fee,
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("transaction pays the conventional fee")]);
+    let full_template = long_poll(empty_template.long_poll_id).await;
+    assert_eq!(
+        full_template.previous_block_hash,
+        empty_template.previous_block_hash
+    );
+    assert_eq!(full_template.transactions.len(), 1);
+    assert_eq!(
+        full_template.submit_old,
+        Some(true),
+        "the server promises that work on the empty template is still accepted"
+    );
+
+    // The miner solves the empty template.
+    let block =
+        proposal_block_from_template(&empty_template, BlockTemplateTimeSource::CurTime, &network)
+            .unwrap();
+    let response = rpc
+        .submit_block(HexData(block.zcash_serialize_to_vec().unwrap()), None)
+        .await
+        .unwrap();
+    assert_eq!(response, SubmitBlockResponse::Accepted);
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(block.hash()));
+    queue.abort();
+}
+
 #[tokio::test]
 async fn template_rejection_wakes_long_poll_and_validates_recovery() {
     check_template_rejection_recovery(false).await;

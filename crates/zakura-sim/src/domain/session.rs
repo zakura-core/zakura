@@ -199,7 +199,7 @@ fn replacement_preserves_authorization<S: HasView>() -> Property<S> {
         needs: &[Source::Datagrams, Source::View],
         status: Status::Active,
         check: check_replacement_preserves_authorization::<S>,
-        witness: Some(TriggerHistory::Log(replaced_while_superseded_lived)),
+        witness: Some(TriggerHistory::Log(replaced_or_superseded_wrote)),
     }
 }
 
@@ -376,25 +376,23 @@ fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S
     }
 }
 
-/// [`REPLACEMENT_PRESERVES_AUTHORIZATION`]'s trigger history: the node
-/// admitted a session on a connection that replaces an earlier one to the
-/// same peer, and a block-sync routine's registry writes met an entry its
-/// peer's newer generation owns: the routine ended after block sync
-/// admitted that generation, or one of its writes landed on the entry.
-fn replaced_while_superseded_lived(log: &ObservationLog) -> bool {
+/// [`REPLACEMENT_PRESERVES_AUTHORIZATION`]'s trigger history: either half
+/// of its claim met its condition. The node admitted a session on a
+/// connection that replaces an earlier one to the same peer, or a
+/// block-sync routine's registry writes met an entry its peer's newer
+/// generation owns: the routine ended after block sync admitted that
+/// generation, or one of its writes landed on the entry. A violation of
+/// one half can end a run before the other half's condition arrives, so
+/// each suffices.
+fn replaced_or_superseded_wrote(log: &ObservationLog) -> bool {
     let mut sessions = Sessions::default();
-    let replaced = log
-        .entries()
-        .iter()
-        .filter_map(|entry| session_row(&entry.obs))
-        .any(|row| sessions.fold(row).is_some());
     let mut generations = Generations::default();
-    replaced
-        && log
-            .entries()
-            .iter()
-            .filter_map(|entry| block_fact(&entry.obs))
-            .any(|fact| generations.fold(fact))
+    log.entries()
+        .iter()
+        .any(|entry| match block_fact(&entry.obs) {
+            Some(fact) => generations.fold(fact),
+            None => session_row(&entry.obs).is_some_and(|row| sessions.fold(row).is_some()),
+        })
 }
 
 /// One block-sync request's wait: the connection its routine runs on and

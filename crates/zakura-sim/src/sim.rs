@@ -343,12 +343,9 @@ impl Sim {
             _ => (end, properties),
         };
         let cleanup = self.shut_down();
-        sink.record(Record::End(end_record(
-            &end,
-            &properties,
-            cleanup,
-            &state.picks,
-        )));
+        let record = end_record(&end, &properties, cleanup, &state.picks);
+        crate::trace::end_records::write_end(&record);
+        sink.record(Record::End(record));
         RunReport {
             end,
             properties,

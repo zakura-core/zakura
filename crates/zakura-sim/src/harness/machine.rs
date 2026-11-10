@@ -397,7 +397,9 @@ fn run_checked(
         picks,
         resolved: decider.resolved(),
     };
-    sink.record(Record::End(report.end_record()));
+    let record = report.end_record();
+    crate::trace::end_records::write_end(&record);
+    sink.record(Record::End(record));
     match report.end.harness.clone() {
         Some(failure) => Err(HarnessError::Run {
             failure,

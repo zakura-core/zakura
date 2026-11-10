@@ -26,7 +26,7 @@ use crate::server::jsonrpc::{ErrorCode, ErrorObject};
 use derive_new::new;
 use getset::{CopyGetters, Getters};
 use rand_10::Rng;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_protocol::memo::MemoBytes;
 
@@ -69,8 +69,8 @@ use crate::{
 };
 
 use constants::{
-    CAPABILITIES_FIELD, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD, NONCE_RANGE_FIELD,
-    NOT_SYNCED_ERROR_CODE,
+    CAPABILITIES_FIELD, MAX_FULL_FIRST_ANSWERS, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD,
+    NONCE_RANGE_FIELD, NOT_SYNCED_ERROR_CODE,
 };
 pub use miner_address::MinerAddress;
 pub use parameters::{
@@ -837,6 +837,9 @@ where
     /// Shared by foreground construction and long-poll coinbase precomputation.
     template_build_slots: Arc<Semaphore>,
 
+    /// Limits how many long polls answered on a new tip build a full template at once.
+    full_first_answer_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 
@@ -875,6 +878,7 @@ where
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
+            full_first_answer_slots: Arc::new(Semaphore::new(MAX_FULL_FIRST_ANSWERS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
             trace: trace::MiningTemplateTrace::default(),
@@ -911,6 +915,20 @@ where
         })
         .await
         .map_misc_error()
+    }
+
+    /// Reserves one of the [`MAX_FULL_FIRST_ANSWERS`] places for a long poll that answers on a
+    /// new tip with the full template, or returns `None` when they are all taken.
+    ///
+    /// The caller holds the place from before it asks the mempool until its template is built,
+    /// so a tip change that wakes many long polls starts a bounded amount of that work. This
+    /// never waits: a long poll that gets `None` answers with the coinbase-only template.
+    /// Dropping the place releases it.
+    pub(crate) fn try_reserve_full_first_answer(&self) -> Option<OwnedSemaphorePermit> {
+        self.full_first_answer_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     pub(crate) fn reserve_mined_submission(

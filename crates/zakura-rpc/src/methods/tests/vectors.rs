@@ -3670,7 +3670,7 @@ struct MockMempoolView {
 }
 
 /// Returns a verified mempool transaction with no inputs or outputs.
-fn fake_verified_mempool_tx() -> VerifiedUnminedTx {
+pub(super) fn fake_verified_mempool_tx() -> VerifiedUnminedTx {
     let transaction: UnminedTx = Arc::new(Transaction::V1 {
         inputs: vec![],
         outputs: vec![],

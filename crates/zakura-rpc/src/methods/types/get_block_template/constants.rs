@@ -25,6 +25,17 @@ pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 /// received and decoded both answers.
 pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// How many long polls answered on a new tip may build a full template at the same time.
+///
+/// Each one takes a copy of the mempool, selects from it and queues a template build. Without
+/// a limit, every long poll woken by one tip change would do that at once. A long poll over
+/// the limit answers with the coinbase-only template instead of waiting.
+///
+/// Three covers a pool that keeps a few long polls open on one node. The limit stays small
+/// because templates are built one at a time: a larger one queues more builds, some for a tip
+/// a reorg has already replaced, ahead of work on the newest tip.
+pub const MAX_FULL_FIRST_ANSWERS: usize = 3;
+
 /// The maximum number of times `getblocktemplate` rebuilds a template that was
 /// superseded by a tip, parent selection, or rejection revision change.
 ///

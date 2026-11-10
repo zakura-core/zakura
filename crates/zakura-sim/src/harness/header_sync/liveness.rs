@@ -2,13 +2,13 @@
 //! liveness fixtures ([`LivenessScenario`]). Its one scenario byte picks the
 //! fixture, and the rest of an input is Plan bytes. It checks
 //! `header-sync/hold-release-wakes` besides `header-sync/storage`'s
-//! properties, since only it arms the node's hold-wake evidence, and
-//! `header-sync/bounded-adversary-progress`, since only its recovery
-//! fixtures declare `BoundedAdversary` beside the recovery assumptions. It
-//! also arms the node's publication evidence, so
-//! `header-sync/state-publication-consistent` obliges each commit's
-//! adoption here, and in hdr-12b's status fixtures each changed `Status` in
-//! time.
+//! properties, since only it arms the node's hold-wake evidence. Its
+//! recovery fixtures declare `BoundedAdversary` beside the recovery
+//! assumptions, so `header-sync/bounded-adversary-progress`'s deadline
+//! there ends idle rather than at a budget. It also arms the node's
+//! publication evidence, so `header-sync/state-publication-consistent`
+//! obliges each commit's adoption here, and in hdr-12b's status fixtures
+//! each changed `Status` in time.
 //!
 //! Its fixtures declare `BoundedAdversary` (Rule 13 of the hdr-9 to hdr-13
 //! plan). Every peer is an honest mirror or a scripted control, so the
@@ -1177,16 +1177,15 @@ impl RecoveryProgressInputs {
 }
 
 /// Offers a time boundary one millisecond past each open request-deadline
-/// arm's deadline ([`open_retirement`]), past an owed recovery's
-/// ([`RecoveryEvidence::progress`]) and past each unpaid `Status` debt's
-/// ([`status_deadlines`]), so the clock reaches it even when no other timer
-/// would, and the registry can expire the obligation before the finish
-/// could answer it (plan's acceptance: deadlines reach the clock). It
-/// offers no action.
+/// arm's deadline ([`open_retirement`]) and past each unpaid `Status`
+/// debt's ([`status_deadlines`]), so the clock reaches it even when no
+/// other timer would, and the registry can expire the obligation before
+/// the finish could answer it (plan's acceptance: deadlines reach the
+/// clock). It offers no action. The storage harness offers an owed
+/// recovery's.
 struct Deadlines {
     retirement: RetirementEvidence,
     ends: EndEvidence,
-    recovery: RecoveryProgressInputs,
     /// The finish, whose unpaid `Status` debts' deadlines it also offers.
     publication: PublicationEvidence,
 }
@@ -1197,16 +1196,11 @@ impl ActionSource for Deadlines {
 
     /// One millisecond past each open deadline still ahead of `now`.
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
-        let owed = match self.recovery.progress(&self.ends) {
-            RecoveryProgress::Owed { since } => Some(recovery_deadline(since)),
-            RecoveryProgress::Pending | RecoveryProgress::Concluded => None,
-        };
         out.extend(
             open_retirement(&self.retirement, &self.ends)
                 .into_iter()
                 .filter(|open| open.timed)
                 .map(|open| open.deadline)
-                .chain(owed)
                 .filter_map(|deadline| deadline.checked_add(std::time::Duration::from_millis(1)))
                 .filter(|at| *at > now)
                 .map(Boundary::Opens),
@@ -1334,8 +1328,9 @@ impl Subsystem for Liveness {
     /// The storage harness's ports for the fixture, with the hold-wake
     /// evidence armed, the publication evidence armed as the fixture says
     /// ([`LivenessScenario::arming`]), a departure or timeout fixture's
-    /// hand-off rule for its mirrors ([`LivenessScenario::roles`]), and the
-    /// late-page fixture's page delay on [`OWNER`].
+    /// hand-off rule for its mirrors ([`LivenessScenario::roles`]), the
+    /// late-page fixture's page delay on [`OWNER`], and the storage
+    /// harness's recovery finish off, since [`Finish`] ends every fixture.
     fn prepare(scenario: &LivenessScenario) -> Ports {
         let retirement = scenario
             .roles()
@@ -1349,6 +1344,7 @@ impl Subsystem for Liveness {
             publication: PublicationEvidence::armed(scenario.arming()),
             retirement,
             delayed_page,
+            finishes: false,
             ..Storage::prepare(&scenario.storage())
         }
     }
@@ -1391,7 +1387,6 @@ impl Subsystem for Liveness {
         sim.add_source(Box::new(Deadlines {
             retirement: retirement.clone(),
             ends: ends.clone(),
-            recovery: recovery.clone(),
             publication: publication.clone(),
         }));
         sim.add_source(Box::new(Finish {
@@ -1415,8 +1410,9 @@ impl Subsystem for Liveness {
     }
 
     /// The storage harness's properties, then
-    /// `header-sync/hold-release-wakes` and
-    /// `header-sync/bounded-adversary-progress`, which apply only here.
+    /// `header-sync/hold-release-wakes`, which applies only here, and
+    /// `header-sync/bounded-adversary-progress`, as `header-sync/storage`
+    /// registers it.
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
         properties.push(hold_release_wakes());
@@ -1439,8 +1435,7 @@ impl Subsystem for Liveness {
         let mut declared = vec![bounded_adversary()];
         declared.extend(recovery_assumptions(&source));
         Assumptions::declare(declared).holds_when(|liveness, assume| {
-            assume == Assume::BoundedAdversary
-                || liveness.0.recovery.holds(&liveness.0.ends, assume)
+            assume == Assume::BoundedAdversary || liveness.0.recovery_holds(assume)
         })
     }
 

@@ -135,6 +135,7 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
+    matrix.push((STORAGE, RECOVERY_ID, Status::Draft));
     matrix.push((LIVENESS, RECOVERY_ID, Status::Draft));
     matrix
 }
@@ -2338,7 +2339,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(Row {
         property: recovery,
         tier: Tier::Sim,
-        harnesses: &[LIVENESS],
+        harnesses: &[STORAGE, LIVENESS],
         status: Status::Draft,
         promotion: Some(Promotion {
             condition: "hdr-13 adds the hostile prefixes and Evan agrees to promote it",

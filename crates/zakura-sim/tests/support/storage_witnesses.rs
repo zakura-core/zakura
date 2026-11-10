@@ -521,6 +521,90 @@ pub fn recovery_witnesses() -> Vec<(&'static str, StorageScenario)> {
     ]
 }
 
+/// hdr-13's recovery witnesses for the classes whose fuzz-12 witness owes
+/// the node nothing at its `recovered` pick, so
+/// `header-sync/bounded-adversary-progress` doesn't apply there. Each owes a
+/// header past the node's baseline.
+///
+/// - **Reply holds.** fuzz-12's recovers once its held apply commits, which
+///   leaves the baseline at the source's tip. Here the source grows by two
+///   headers once the apply commits, and the recover comes once it has
+///   grown, with the reply still held. The grown tip reaches the node only
+///   behind the source's one-second status floor, so the node meets it
+///   after the `recovered` pick.
+/// - **Departure.** The close class as hdr-10's departure fixture
+///   completes it ([`departure_recovery`]).
+pub fn owed_recovery_witnesses() -> Vec<(&'static str, StorageScenario)> {
+    let mut reply_holds = recovering(vec![
+        step(
+            SOURCE,
+            ControlAction::Grow { len: 2 },
+            Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
+        ),
+        recover(Some(Trigger::Grown(SOURCE.to_owned()))),
+    ]);
+    reply_holds.policy.reply_holds.push(ReplyHold {
+        select: Select::nth(OpKind::Apply, 1),
+        until: Trigger::VirtualTime(3_600_000),
+    });
+    vec![
+        ("reply holds", reply_holds),
+        ("departure", departure_recovery()),
+    ]
+}
+
+/// The departed owner, mirror A, in [`departure_recovery`].
+pub const OWNER: &str = "mirror-0";
+
+/// The surviving taker, mirror B, in [`departure_recovery`].
+pub const TAKER: &str = "mirror-1";
+
+/// hdr-13's close class as the departure's completion: hdr-10's departure
+/// fixture, mirrors A ([`OWNER`]) and B ([`TAKER`]) on one chain, with A
+/// closed while its round holds the target and then a recover of B. The
+/// node is at A3. B starts at A3 and grows to A6 once A's locator read is
+/// submitted, then is relinked, so its new session's first `Status` carries
+/// the target at once. A's first locator read is held until that
+/// admission, so A owns the target before B offers it, and A's round
+/// reserves its first request only after it. A is closed once it has. Only
+/// B, the one member left, can then supply the target.
+pub fn departure_recovery() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![
+            mirror(Chain::main(6), Dialer::Mirror),
+            mirror(Chain::main(3), Dialer::Mirror),
+        ],
+        policy: Policy {
+            holds: vec![hold(
+                Select::nth(OpKind::Locator, 1),
+                Trigger::Count(2, Box::new(Trigger::SessionAdmitted(TAKER.to_owned()))),
+                Allow::Engine,
+            )],
+            ..Policy::converging()
+        },
+        controls: vec![
+            step(
+                TAKER,
+                ControlAction::Grow { len: 3 },
+                Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
+            ),
+            step(
+                TAKER,
+                ControlAction::Relink,
+                Some(Trigger::Grown(TAKER.to_owned())),
+            ),
+            step(
+                OWNER,
+                ControlAction::Close,
+                Some(Trigger::ReservationOpened(OWNER.to_owned())),
+            ),
+            step(TAKER, ControlAction::Recover, None),
+        ],
+        weights: Weights::default(),
+    }
+}
+
 /// [`StorageScenario::holds`], the scenario whose node releases a header
 /// path, with its first release completing with `fault` once `after`
 /// milliseconds pass.
@@ -609,6 +693,12 @@ pub fn witness_seeds() -> Vec<(String, StorageScenario)> {
     for (class, scenario) in recovery_witnesses() {
         seeds.push((
             format!("header-storage-w-recover-{}", class.replace(' ', "-")),
+            scenario,
+        ));
+    }
+    for (class, scenario) in owed_recovery_witnesses() {
+        seeds.push((
+            format!("header-storage-w-owed-{}", class.replace(' ', "-")),
             scenario,
         ));
     }

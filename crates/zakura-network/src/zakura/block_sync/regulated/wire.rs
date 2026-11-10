@@ -42,6 +42,15 @@ const fn response(
     }
 }
 
+/// The largest `Block` payload: a maximum-size block after its type byte.
+///
+/// Derived from [`block::MAX_BLOCK_BYTES`], so the frame filter admits every block
+/// the decoder accepts. A larger frame is a framing violation that disconnects the
+/// peer before the payload is read.
+// MAX_BLOCK_BYTES is a few megabytes, so it fits in a usize.
+const MAX_BLOCK_PAYLOAD_BYTES: usize =
+    block::MAX_BLOCK_BYTES as usize + BLOCK_SYNC_MESSAGE_TYPE_BYTES;
+
 pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
     MessageRule {
         name: "status",
@@ -60,7 +69,7 @@ pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
         "block",
         MSG_BS_BLOCK,
         false,
-        PayloadLen::between(2, 2_000_001),
+        PayloadLen::between(2, MAX_BLOCK_PAYLOAD_BYTES),
     ),
     response(
         "blocks-done",

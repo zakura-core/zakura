@@ -449,10 +449,22 @@ fn the_largest_served_response_is_one_advertised_block() {
         LARGEST_SERVED_RESPONSE,
         ResponseCap {
             frames: 1,
-            bytes: 2_000_000 + 1 + 9,
+            bytes: if cfg!(feature = "experimental-8mb-blocks") {
+                8_000_000
+            } else {
+                2_000_000
+            } + 1
+                + 9,
         }
     );
-    assert_eq!(LARGEST_SERVED_RESPONSE.output_bytes(), 2_000_026);
+    assert_eq!(
+        LARGEST_SERVED_RESPONSE.output_bytes(),
+        if cfg!(feature = "experimental-8mb-blocks") {
+            8_000_026
+        } else {
+            2_000_026
+        }
+    );
     let largest_request = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST).unwrap();
     assert_eq!(
         largest_request

@@ -280,7 +280,13 @@ fn stream_six_fixed_fixtures_cover_every_kind_and_rule() {
     const MAX_BLOCKS: u32 = 128;
     const MAX_INFLIGHT: u32 = 32_768;
     const MAX_BYTES: u32 = 33_554_432;
-    const MAX_BLOCK_PAYLOAD: usize = 2_000_001;
+    // Hardcoded on purpose, per protocol limit: 2 MB blocks, or 8 MB blocks in
+    // `experimental-8mb-blocks` builds.
+    const MAX_BLOCK_PAYLOAD: usize = if cfg!(feature = "experimental-8mb-blocks") {
+        8_000_001
+    } else {
+        2_000_001
+    };
     let max_height = block::Height::MAX.0;
     // The fixtures hardcode the protocol limits, so a constant change fails here.
     assert_eq!(

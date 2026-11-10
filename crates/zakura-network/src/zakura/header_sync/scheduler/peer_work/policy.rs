@@ -17,6 +17,8 @@ use zakura_header_chain::{
 };
 use zakura_rt::collections::HashMap;
 
+#[cfg(any(test, zakura_sim))]
+use super::super::super::observe::WorkSlot;
 use super::super::super::{
     events::HeaderPortOperation, v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Headers,
     Status, ZakuraPeerId, MAX_HS_RANGE,
@@ -1219,6 +1221,39 @@ impl WorkPolicy {
             }
             _ => false,
         }
+    }
+
+    /// Every slot, ordered by peer, as [`ReactorEvent::Slots`] lists them.
+    ///
+    /// [`ReactorEvent::Slots`]: super::super::super::observe::ReactorEvent::Slots
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn slots(&self) -> Vec<WorkSlot> {
+        let mut slots: Vec<WorkSlot> = self
+            .work_by_peer
+            .iter()
+            .map(|(peer, work)| match work {
+                PeerWorkState::AwaitingLocator { target, .. } => WorkSlot {
+                    peer: peer.clone(),
+                    session_id: target.session_id,
+                    target_tip_hash: target.status.selected_tip_hash,
+                    phase: None,
+                    incarnation: WorkIncarnation::UNSTARTED.get(),
+                    repair: false,
+                    authority: target.scope,
+                },
+                PeerWorkState::Active { request, .. } => WorkSlot {
+                    peer: peer.clone(),
+                    session_id: request.owner.session_id(),
+                    target_tip_hash: request.target.status.selected_tip_hash,
+                    phase: Some(request.phase),
+                    incarnation: request.incarnation.get(),
+                    repair: matches!(request.owner, HeaderSyncWorkOwner::BodyRepair(_)),
+                    authority: request.owner.header_authority(),
+                },
+            })
+            .collect();
+        slots.sort_by(|left, right| left.peer.as_bytes().cmp(right.peer.as_bytes()));
+        slots
     }
 
     /// Headers owned in each phase, where `owned` reads one peer's count.

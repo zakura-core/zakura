@@ -33,11 +33,11 @@ pub enum Claim {
     OpenOwnership,
     /// A reservation never ended by teardown.
     OpenReservation,
-    /// The stopped reactor is gone with headers still reserved.
+    /// The reactor is gone with headers still reserved.
     TeardownReserved,
-    /// The stopped reactor is gone with headers still owned.
+    /// The reactor is gone with headers still owned.
     TeardownOwned,
-    /// The stopped reactor is gone with a locator permit missing that no
+    /// The reactor is gone with a locator permit missing that no
     /// pending storage read holds.
     TeardownLocatorPermits,
     /// A stale prepare or apply's handler had an effect on other work

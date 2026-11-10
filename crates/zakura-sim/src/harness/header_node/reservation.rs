@@ -85,6 +85,7 @@ mod tests {
             CapacityEvidence::default(),
             SettlementEvidence::default(),
             StaleEvidence::default(),
+            Default::default(),
         );
         let capacity = observer
             .capacity_observer()

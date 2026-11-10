@@ -386,6 +386,9 @@ enum Verdict {
     PatchesWitness(Vec<PathBuf>),
     /// The patched build or run failed before it wrote a trace.
     Failed(String),
+    /// The patched binary doesn't embed the patched checkout's source
+    /// digest, so it may be another case's or an older build.
+    StaleBinary(String),
     /// The patched run ended at a harness failure.
     Harness(String),
     /// The patched run violated another property.
@@ -449,6 +452,9 @@ impl fmt::Display for Verdict {
                 Ok(())
             }
             Verdict::Failed(why) => write!(f, "the patched run failed: {why}"),
+            Verdict::StaleBinary(why) => {
+                write!(f, "the patched binary isn't the patched checkout's: {why}")
+            }
             Verdict::Harness(why) => write!(f, "the patched run hit a harness failure: {why}"),
             Verdict::Unrelated(property) => {
                 write!(f, "the patched run violated {property} instead")
@@ -791,6 +797,15 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
     // its own copy of the binary.
     let baseline = work.join("baseline-zakura-sim");
     fs::copy(target.join(PROFILE).join("zakura-sim"), &baseline)?;
+    // Every catch is judged against this baseline, so it must be the clean
+    // checkout's own build, never one an earlier run left behind.
+    if let Err(why) = built_from(&baseline, worktree)? {
+        return Err(format!(
+            "the baseline simulator isn't {}'s: {why}",
+            worktree.display()
+        )
+        .into());
+    }
     let mut failed = 0;
     for (index, case) in cases.iter().enumerate() {
         let scratch = work.join(format!("case-{index}"));
@@ -842,13 +857,13 @@ fn check_case(
             "the patched build failed: {error}"
         )));
     }
-    let verdict = judge_patched(
-        &target.join(PROFILE).join("zakura-sim"),
-        &harness,
-        &input,
-        case,
-        scratch,
-    )?;
+    let patched = target.join(PROFILE).join("zakura-sim");
+    // The patched builds reuse the target directory, so a catch counts only
+    // from a binary built from this case's patched checkout (C5).
+    if let Err(why) = built_from(&patched, worktree)? {
+        return Ok(Verdict::StaleBinary(why));
+    }
+    let verdict = judge_patched(&patched, &harness, &input, case, scratch)?;
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
@@ -1004,6 +1019,14 @@ fn through_target(
         out.join(sim_minimize::REPORT_FILE).display()
     );
     Ok(None)
+}
+
+/// Whether the binary at `binary` was built from `checkout` as it stands:
+/// it embeds the checkout's source digest ([`names_source`]). An unknown
+/// digest, which git couldn't compute, never matches.
+fn built_from(binary: &Path, checkout: &Path) -> Result<Result<(), String>, BoxError> {
+    let source = provenance::Provenance::read(checkout, provenance::SOURCE_PATHS).source;
+    Ok(names_source(&fs::read(binary)?, &source))
 }
 
 /// Checks that `binary` embeds `source`, the patched checkout's source
@@ -1905,6 +1928,39 @@ mod tests {
         remove_worktree(root, &worktree).expect("the worktree is removed");
         assert!(!worktree.exists());
         assert_eq!(fs::read(&built).expect("the build is kept"), b"binary");
+    }
+
+    /// C5: a binary counts only for the checkout it embeds the digest of.
+    /// A patch that changes the checkout makes the earlier build stale, and
+    /// a checkout whose digest git can't compute matches no binary, not even
+    /// one that embeds the `unknown` marker.
+    #[test]
+    fn a_binary_must_be_its_checkouts_own() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        fs::create_dir_all(root.join("crates")).unwrap();
+        fs::write(root.join("crates/lib.rs"), "fn a() {}\n").unwrap();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-qm", "source"]);
+        let source = provenance::Provenance::read(root, provenance::SOURCE_PATHS).source;
+        let bin_dir = tempfile::tempdir().expect("a binary directory");
+        let binary = bin_dir.path().join("zakura-sim");
+        fs::write(
+            &binary,
+            [b"head".as_slice(), source.as_bytes(), b"tail"].concat(),
+        )
+        .unwrap();
+        assert_eq!(built_from(&binary, root).unwrap(), Ok(()));
+        // A patch changes the checkout's digest, so the unpatched build is
+        // stale for it.
+        fs::write(root.join("crates/lib.rs"), "fn b() {}\n").unwrap();
+        assert!(built_from(&binary, root).unwrap().is_err());
+        // Outside a checkout the digest is unknown, which matches nothing,
+        // not even a binary that embeds the marker.
+        let elsewhere = tempfile::tempdir().expect("a directory outside git");
+        fs::write(&binary, provenance::UNKNOWN).unwrap();
+        assert!(built_from(&binary, elsewhere.path()).unwrap().is_err());
     }
 
     /// A confirmation's binaries must embed the patched checkout's source

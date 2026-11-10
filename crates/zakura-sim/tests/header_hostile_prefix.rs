@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::{sync::Arc, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use support::{
     inputs,
@@ -14,10 +14,13 @@ use support::{
 use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
-    check::PropertyOutcome,
+    check::{after_step, PropertyOutcome},
     domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
     harness::{
-        header_node::{recovery::RecoveryEvidence, ControlAction},
+        header_node::{
+            recovery::{Disruption, RecoveryEvidence, RECOVERY_BOUND},
+            ControlAction,
+        },
         header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
@@ -113,6 +116,11 @@ impl Checker for Watch {
                 _ => None,
             }));
     }
+}
+
+/// `at` as virtual time since the run's start.
+fn since_start(at: SimInstant) -> Duration {
+    at.saturating_duration_since(SimInstant::from_start(Duration::ZERO))
 }
 
 /// Runs `scenario` under `input` with no violation or harness failure, and
@@ -405,6 +413,79 @@ fn the_node_reaches_the_source_tip_after_the_conditions_point() {
         );
         println!(
             "stall: recovered at {:?}, at the source's tip {waited:?} later",
+            record.at
+        );
+    }
+}
+
+/// A binding recovery deadline, moved from fuzz-12.4b. A fair recovery
+/// completes each storage operation long before its 1 s bound. Under the
+/// declared `slow-storage` disruption each completes only at its deadline,
+/// a second after the later of the `Recover` pick and its submission. Under
+/// 8 plans an operation is still pending when time reaches its deadline,
+/// time never passes a deadline while its operation is pending, and the
+/// node still meets the objective within 30 s, so the property holds.
+#[test]
+#[allow(clippy::print_stdout)]
+fn the_recovery_storage_bound_binds_under_slow_storage() {
+    let mut scenario = storage_witnesses::recovering(vec![storage_witnesses::recover(None)]);
+    scenario.policy.disruptions = vec![Disruption::SlowStorage];
+    assert!(
+        grammar::encode(&scenario).is_err(),
+        "the grammar refuses it"
+    );
+    for input in inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let (recovery, node) = (ports.recovery.clone(), ports.node.clone());
+        // Each step's time and the operations pending after it, each with
+        // when it was submitted, both since the run's start.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let into = seen.clone();
+        let mut checker = after_step(move |cx| {
+            let now = since_start(cx.now);
+            let pending: Vec<(u64, Duration)> = node
+                .pending()
+                .iter()
+                .map(|op| (op.id.0, now.saturating_sub(op.since_submit)))
+                .collect();
+            into.borrow_mut().push((cx.step, now, pending));
+            None
+        });
+        let report = run_prepared::<Storage>(
+            &scenario,
+            ports,
+            input,
+            &mut MemorySink::default(),
+            Some(&mut checker),
+        )
+        .expect("the run starts");
+        let end = &report.end;
+        assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+        assert!(matches!(end.outcome, Outcome::Idle { .. }), "{end:?}");
+        assert_eq!(
+            outcome(&report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Held { applicable: 1 }
+        );
+        let started = since_start(recovery.started().expect("the recover is picked"));
+        let deadline = |submitted: Duration| submitted.max(started) + RECOVERY_BOUND;
+        let seen = seen.take();
+        let mut bound = 0;
+        for (step, now, pending) in seen.iter().filter(|(_, now, _)| *now >= started) {
+            for (id, submitted) in pending {
+                let due = deadline(*submitted);
+                assert!(
+                    *now <= due,
+                    "step {step}: operation {id} pending past {due:?}"
+                );
+                if *now == due {
+                    bound += 1;
+                }
+            }
+        }
+        assert!(bound > 0, "some operation is pending at its deadline");
+        let record = recovery.record().expect("the pick wrote its record");
+        println!(
+            "slow storage: {bound} steps at a deadline, recovered at {:?}",
             record.at
         );
     }

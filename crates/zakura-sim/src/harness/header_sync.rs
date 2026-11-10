@@ -468,6 +468,7 @@ impl StorageScenario {
                     },
                 ],
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             ..StorageScenario::default()
         }
@@ -582,7 +583,7 @@ pub const FORK_FIXTURE_MAX_HEADERS: u32 = 1_000;
 /// judges: the node at genesis, two or three mirrors whose initial chains
 /// are forks from one ancestor, none a prefix of another, holding at most
 /// [`FORK_FIXTURE_MAX_HEADERS`] headers together, storage success-only
-/// within a 10 ms bound, no holds and no controls. A mirror runs header
+/// within a 10 ms bound, no holds, disruptions or controls. A mirror runs header
 /// sync too, so it may take a fork from the node later, but only one some
 /// mirror held at the start, so no mirror ever holds more work than the
 /// heaviest initial chain. See
@@ -593,6 +594,7 @@ pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
         bound_ms,
         holds,
         reply_holds,
+        disruptions,
     } = &scenario.policy;
     let declared = scenario.node == Chain::default()
         && (2..=3).contains(&scenario.mirrors.len())
@@ -600,6 +602,7 @@ pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
         && bound_ms.is_some_and(|bound| bound <= 10)
         && holds.is_empty()
         && reply_holds.is_empty()
+        && disruptions.is_empty()
         && scenario.controls.is_empty()
         && scenario
             .mirrors
@@ -1098,7 +1101,8 @@ impl Subsystem for Storage {
     /// flood, whose tasks keep acting after their step. A close after it is
     /// hdr-13's loss path, which only a typed scenario takes: the control
     /// source offers it from the `recovered` pick on, and the grammar can't
-    /// encode it.
+    /// encode it. Also if the policy declares a disruption with no `Recover`
+    /// step to disrupt.
     fn prepare(scenario: &StorageScenario) -> Ports {
         let triggers = scenario
             .policy
@@ -1167,6 +1171,12 @@ impl Subsystem for Storage {
                 panic!("a recover can't follow {before:?}");
             }
         }
+        if recovery_source(scenario).is_none() && !scenario.policy.disruptions.is_empty() {
+            panic!(
+                "a disruption takes something away from a recovery, but {:?} has no recover",
+                scenario.policy.disruptions
+            );
+        }
         let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
         // Read just before, so a header the preload defers is deferred at
@@ -1201,7 +1211,7 @@ impl Subsystem for Storage {
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
             recovery: if recovery_source(scenario).is_some() {
-                RecoveryEvidence::bounded()
+                RecoveryEvidence::bounded(&scenario.policy.disruptions)
             } else {
                 RecoveryEvidence::default()
             },
@@ -2067,6 +2077,7 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
                 bound_ms: Some(PROGRESS_STORAGE_BOUND_MS),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             }
 }
 
@@ -2622,6 +2633,7 @@ mod tests {
                 bound_ms: Some(10),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: Vec::new(),
             weights: Weights::default(),

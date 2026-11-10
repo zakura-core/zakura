@@ -38,6 +38,7 @@ fn fork_policy() -> Policy {
         bound_ms: Some(10),
         holds: Vec::new(),
         reply_holds: Vec::new(),
+        disruptions: Vec::new(),
     }
 }
 

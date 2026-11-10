@@ -13,7 +13,7 @@ use support::{inputs, storage_witnesses};
 use zakura_sim::{
     domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
     harness::{
-        header_node::recovery::RecoveryEvidence,
+        header_node::recovery::{Disruption, RecoveryEvidence},
         header_sync::{
             recovered_bound, recovery_assumptions, recovery_source, storage_properties,
             storage_sources, Ports, Storage, StorageScenario, StorageView, RECOVERY_BUDGET,
@@ -27,7 +27,8 @@ use zakura_sim::{
 };
 
 /// Every storage recovery witness hdr-13 runs: fuzz-12's five classes,
-/// hdr-13's owed reply hold and departure, and the declared stall.
+/// hdr-13's owed reply hold and departure, the declared stall, and the
+/// stall under slow storage.
 fn witnesses() -> Vec<(String, StorageScenario)> {
     let mut all: Vec<(String, StorageScenario)> = storage_witnesses::recovery_witnesses()
         .into_iter()
@@ -35,6 +36,9 @@ fn witnesses() -> Vec<(String, StorageScenario)> {
         .map(|(class, scenario)| (class.to_owned(), scenario))
         .collect();
     all.push(("stall".to_owned(), storage_witnesses::grown_source()));
+    let mut slow = storage_witnesses::grown_source();
+    slow.policy.disruptions = vec![Disruption::SlowStorage];
+    all.push(("slow stall".to_owned(), slow));
     all
 }
 

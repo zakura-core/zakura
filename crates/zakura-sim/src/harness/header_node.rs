@@ -82,8 +82,8 @@ use self::{
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     recovery::{
-        Driver, Hostile, Prefix, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED,
-        RELINK, UNREACHED,
+        Disruption, Driver, Hostile, Prefix, RecoveryEvidence, RecoveryInputs, SelectedChain,
+        RECOVERED, RELINK, UNREACHED,
     },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -254,6 +254,11 @@ pub struct Policy {
     /// older scenarios keep their encoding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_holds: Vec<ReplyHold>,
+    /// What a typed test takes away from recovery after its `Recover` step
+    /// (hdr-13). Left out of a scenario that declares none, so others keep
+    /// their encoding. The grammar can't encode one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disruptions: Vec<Disruption>,
 }
 
 impl Policy {
@@ -264,6 +269,7 @@ impl Policy {
             bound_ms: Some(5_000),
             holds: Vec::new(),
             reply_holds: Vec::new(),
+            disruptions: Vec::new(),
         }
     }
 }
@@ -358,7 +364,8 @@ impl PolicySource {
     /// on each operation is offered only `engine`, or `rejected` where
     /// that's the only legal outcome, each held reply is delivered, and each
     /// must be done within [`recovery::RECOVERY_BOUND`] of the later of its
-    /// submission, or its commit, and the `Recover` pick. Before that it
+    /// submission, or its commit, and the `Recover` pick. Under
+    /// [`Disruption::SlowStorage`] each is offered only at that deadline. Before that it
     /// counts each hold's catch and each fault it executes in `recovery`'s
     /// prefix ([`recovery::Prefix`]), and once the prefix is full it catches
     /// and offers as recovery will.
@@ -412,28 +419,42 @@ impl ActionSource for PolicySource {
         let pending = self.port.pending();
         let committed = self.port.committed();
         let predicates = self.predicates.borrow();
-        let recovering = self.recovery.started().is_some();
+        let started = self.recovery.started();
+        let recovering = started.is_some();
         let full = self.recovery.prefix().full();
+        // Under `SlowStorage`, an operation is offered only once its
+        // recovery deadline, `own` after its submission or commit, comes.
+        let due = |own: Duration| {
+            !self.recovery.disrupts(Disruption::SlowStorage)
+                || started.is_none_or(|started| recovery::deadline(now, started, own) <= now)
+        };
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
-        out.extend(offered.into_iter().filter(|(_, local)| {
-            match crate::storage::decode(*local) {
-                StorageAction::Complete(id, outcome) => {
-                    pending.iter().find(|op| op.id == id).is_some_and(|op| {
-                        let success = Base::SuccessOnly.offers(&op.enabled, outcome);
-                        if recovering {
-                            success
-                        } else {
-                            predicates.offers(self.base, op, outcome) && (success || !full)
-                        }
-                    })
-                }
-                StorageAction::Deliver(id) => committed
-                    .iter()
-                    .find(|op| op.id == id)
-                    .is_some_and(|op| recovering || predicates.delivers(op)),
-            }
-        }));
+        out.extend(
+            offered
+                .into_iter()
+                .filter(|(_, local)| match crate::storage::decode(*local) {
+                    StorageAction::Complete(id, outcome) => {
+                        pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                            let success = Base::SuccessOnly.offers(&op.enabled, outcome);
+                            if recovering {
+                                success && due(op.since_submit)
+                            } else {
+                                predicates.offers(self.base, op, outcome) && (success || !full)
+                            }
+                        })
+                    }
+                    StorageAction::Deliver(id) => {
+                        committed.iter().find(|op| op.id == id).is_some_and(|op| {
+                            if recovering {
+                                due(op.since_commit)
+                            } else {
+                                predicates.delivers(op)
+                            }
+                        })
+                    }
+                }),
+        );
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
@@ -1876,9 +1897,14 @@ impl ActionSource for Control {
         }
     }
 
-    /// True from the `Recover` pick on.
+    /// True from the `Recover` pick on, which turns on the fair recovery
+    /// policy, unless the scenario declares [`Disruption::Unfair`].
     fn recovering(&self) -> bool {
         Control::recovering(self)
+            && !self
+                .recovery
+                .as_ref()
+                .is_some_and(|driver| driver.evidence.disrupts(Disruption::Unfair))
     }
 
     /// Checks the next step and queues it for the control task, or carries

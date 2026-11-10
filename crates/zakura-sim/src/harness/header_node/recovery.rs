@@ -37,6 +37,7 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use zakura_header_chain::{Frontier, SuffixWork};
 use zakura_network::zakura::ZakuraPeerId;
 use zakura_scheduler::SimInstant;
@@ -285,11 +286,34 @@ pub enum RecoveryState {
     Unreached,
 }
 
+/// A disruption a typed test declares for its recovery, in its policy's
+/// `disruptions` (hdr-13). Each takes away something recovery guarantees,
+/// so a test can show what happens without it. The grammar can't encode
+/// one, so the fuzzer never draws one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Disruption {
+    /// From the `Recover` pick, each storage operation completes, and each
+    /// held reply is delivered, only once its recovery deadline
+    /// ([`RECOVERY_BOUND`]) comes. Time stops there until it does. A fair
+    /// recovery completes each long before, so without this the bound never
+    /// binds. `BoundedStorage` still holds.
+    SlowStorage,
+    /// The fair recovery policy stays off from the `Recover` pick, so the
+    /// run's Plan keeps choosing. `FairScheduling` doesn't hold.
+    Unfair,
+}
+
 /// A run's recovery, shared by the control source, the storage source and
 /// the harness's view: the recovery, empty until a `Recover` step is
-/// picked, and the hostile prefix before it. Cloning shares both.
+/// picked, the hostile prefix before it, and the disruptions the scenario
+/// declares. Cloning shares them.
 #[derive(Clone, Default)]
-pub struct RecoveryEvidence(Rc<RefCell<Option<Recovery>>>, Prefix);
+pub struct RecoveryEvidence {
+    recovery: Rc<RefCell<Option<Recovery>>>,
+    prefix: Prefix,
+    disruptions: Rc<[Disruption]>,
+}
 
 /// One recovery: its source, when it started, and where it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,14 +330,23 @@ pub struct Recovery {
 
 impl RecoveryEvidence {
     /// The evidence for a scenario with a `Recover` step, whose prefix is
-    /// bounded.
-    pub fn bounded() -> Self {
-        RecoveryEvidence(Rc::default(), Prefix::bounded())
+    /// bounded, with the `disruptions` it declares.
+    pub fn bounded(disruptions: &[Disruption]) -> Self {
+        RecoveryEvidence {
+            recovery: Rc::default(),
+            prefix: Prefix::bounded(),
+            disruptions: disruptions.into(),
+        }
     }
 
     /// The run's hostile prefix.
     pub fn prefix(&self) -> &Prefix {
-        &self.1
+        &self.prefix
+    }
+
+    /// Whether the scenario declares `disruption`.
+    pub fn disrupts(&self, disruption: Disruption) -> bool {
+        self.disruptions.contains(&disruption)
     }
 
     /// Whether the prefix is still open: the `Recover` step isn't picked
@@ -324,17 +357,20 @@ impl RecoveryEvidence {
 
     /// The recovery, if a `Recover` step was picked.
     pub fn get(&self) -> Option<Recovery> {
-        self.0.borrow().clone()
+        self.recovery.borrow().clone()
     }
 
     /// When the `Recover` step was picked, if one was.
     pub fn started(&self) -> Option<SimInstant> {
-        self.0.borrow().as_ref().map(|recovery| recovery.started)
+        self.recovery
+            .borrow()
+            .as_ref()
+            .map(|recovery| recovery.started)
     }
 
     /// The record, once the `recovered` pick wrote it.
     pub fn record(&self) -> Option<RecoveryRecord> {
-        match &self.0.borrow().as_ref()?.state {
+        match &self.recovery.borrow().as_ref()?.state {
             RecoveryState::Recovered(record) => Some((**record).clone()),
             RecoveryState::Establishing { .. } | RecoveryState::Unreached => None,
         }
@@ -348,11 +384,11 @@ impl RecoveryEvidence {
     /// closes the source's connection or relinks it, and both until it
     /// stops the node. A close is joined to the session it ends by its
     /// connection ([`RecoveryRecord::links`]), so closing a peer that was no
-    /// member, or another link of a member, changes nothing recorded. The
-    /// rest always hold, since recovery enforces them. A session the node,
-    /// or a mirror running the same code, ends by itself breaks nothing, so
-    /// an obligation the node owes its honest source runs on to its
-    /// deadline.
+    /// member, or another link of a member, changes nothing recorded. The rest always
+    /// hold, since recovery enforces them, except `FairScheduling` under
+    /// [`Disruption::Unfair`]. A session the node, or a mirror running the
+    /// same code, ends by itself breaks nothing, so an obligation the node
+    /// owes its honest source runs on to its deadline.
     pub fn holds(&self, ends: &EndEvidence, assume: Assume) -> bool {
         let Some(record) = self.record() else {
             return false;
@@ -360,6 +396,7 @@ impl RecoveryEvidence {
         let source_only = match assume {
             Assume::StableMembership => false,
             Assume::HonestPeer => true,
+            Assume::FairScheduling => return !self.disrupts(Disruption::Unfair),
             _ => return true,
         };
         !ends.facts().into_iter().any(|(stamp, fact)| {
@@ -436,7 +473,7 @@ impl RecoveryEvidence {
 
     /// The node's baseline, once a `Recover` step was picked.
     pub fn baseline(&self) -> Option<Baseline> {
-        self.0
+        self.recovery
             .borrow()
             .as_ref()
             .map(|recovery| recovery.baseline.clone())
@@ -446,14 +483,17 @@ impl RecoveryEvidence {
     /// live source. It offers nothing more then.
     pub fn unreached(&self) -> bool {
         matches!(
-            self.0.borrow().as_ref().map(|recovery| &recovery.state),
+            self.recovery
+                .borrow()
+                .as_ref()
+                .map(|recovery| &recovery.state),
             Some(RecoveryState::Unreached)
         )
     }
 
     /// Counts a relink pick and returns the source to relink.
     pub(super) fn relinked(&self) -> String {
-        let mut recovery = self.0.borrow_mut();
+        let mut recovery = self.recovery.borrow_mut();
         let recovery = recovery
             .as_mut()
             .expect("a relink is offered only while recovery establishes");
@@ -465,7 +505,7 @@ impl RecoveryEvidence {
 
     /// Ends recovery unreached, at the `recovery-unreached` pick.
     pub(super) fn give_up(&self) {
-        if let Some(recovery) = self.0.borrow_mut().as_mut() {
+        if let Some(recovery) = self.recovery.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Unreached;
         }
     }
@@ -473,7 +513,7 @@ impl RecoveryEvidence {
     /// Starts recovery from `source` at `started`, from the node's
     /// `baseline`.
     pub(super) fn start(&self, source: String, started: SimInstant, baseline: Baseline) {
-        *self.0.borrow_mut() = Some(Recovery {
+        *self.recovery.borrow_mut() = Some(Recovery {
             source,
             started,
             baseline,
@@ -793,7 +833,7 @@ impl Driver {
         let at = zakura_scheduler::hooks::now()
             .ok_or_else(|| "a recovery is recorded inside a run".to_owned())?;
         let record = self.inputs.record((step, at), &source, session)?;
-        if let Some(recovery) = self.evidence.0.borrow_mut().as_mut() {
+        if let Some(recovery) = self.evidence.recovery.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));
         }
         Ok(())
@@ -931,7 +971,16 @@ mod tests {
     /// `mirror-0`'s recovery, `recovered` at `sessions`' current facts, with
     /// every stamp `ends` handed out so far before the pick.
     fn recovered(sessions: &SessionEvidence, ends: &EndEvidence) -> RecoveryEvidence {
-        let recovery = RecoveryEvidence::default();
+        recovered_with(sessions, ends, &[])
+    }
+
+    /// [`recovered`], for a scenario that declares `disruptions`.
+    fn recovered_with(
+        sessions: &SessionEvidence,
+        ends: &EndEvidence,
+        disruptions: &[Disruption],
+    ) -> RecoveryEvidence {
+        let recovery = RecoveryEvidence::bounded(disruptions);
         recovery.start("mirror-0".into(), at(0), empty());
         let source = Member {
             peer: "mirror-0".into(),
@@ -958,7 +1007,7 @@ mod tests {
                 .map(|member| link_of(&sessions.facts(), member.session_id))
                 .collect(),
         };
-        if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
+        if let Some(recovery) = recovery.recovery.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));
         }
         recovery
@@ -1068,6 +1117,23 @@ mod tests {
         link(&sessions, 4, "mirror-2", 3);
         ends.record(EndFact::ReactorExited { step: 9 });
         assert_eq!(holding(&recovery, &ends), DECLARED);
+    }
+
+    /// Under `Unfair` the fair recovery policy stays off, so
+    /// `FairScheduling` never holds, and the other four hold as they would.
+    /// `SlowStorage` keeps every operation within its bound, so all five
+    /// hold.
+    #[test]
+    fn only_an_unfair_recovery_loses_fair_scheduling() {
+        let (sessions, ends) = (two_links(), EndEvidence::default());
+        let unfair = recovered_with(&sessions, &ends, &[Disruption::Unfair]);
+        let rest: Vec<Assume> = DECLARED
+            .into_iter()
+            .filter(|assume| *assume != Assume::FairScheduling)
+            .collect();
+        assert_eq!(holding(&unfair, &ends), rest);
+        let slow = recovered_with(&sessions, &ends, &[Disruption::SlowStorage]);
+        assert_eq!(holding(&slow, &ends), DECLARED);
     }
 
     #[test]
@@ -1306,7 +1372,7 @@ mod tests {
             stamp: ends.stamps().issued(),
             ..record_of(vec![chain(4, 0, 0), chain(3, 0, 0)], chain(3, 0, 0))
         };
-        if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
+        if let Some(recovery) = recovery.recovery.borrow_mut().as_mut() {
             recovery.state = RecoveryState::Recovered(Box::new(record));
         }
         recovery

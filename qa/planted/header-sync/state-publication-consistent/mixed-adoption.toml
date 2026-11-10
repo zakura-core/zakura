@@ -1,7 +1,9 @@
-# The reactor adopts a new generation with the previous snapshot's tip and
-# score, so on the quiet-reset witness its adoption of the invalidation
-# matches no engine record. The reactor's watch reads decide when it adopts,
-# so a change there can move the witness off it.
+# `observe_latest_committed_snapshot` stores a new generation with the
+# previous snapshot's tip and score, while its adoption, `Status` and tip
+# publication carry the new snapshot. On the quiet-reset witness the stored
+# copy of the invalidation differs from its adoption. The reactor's watch
+# reads decide when it adopts, so a change there can move the witness off
+# it.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
 
 [typed]

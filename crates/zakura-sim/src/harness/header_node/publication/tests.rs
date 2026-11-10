@@ -53,6 +53,20 @@ fn adopted(snapshot: &EngineSnapshot) -> ReactorEvent {
     }
 }
 
+/// The `SnapshotStored` event that reports `snapshot` as stored.
+fn stored(snapshot: &EngineSnapshot) -> ReactorEvent {
+    ReactorEvent::SnapshotStored {
+        snapshot: Some(snapshot.clone()),
+    }
+}
+
+/// Feeds `check` the reactor's adoption of `snapshot` and its faithful
+/// store.
+fn adopt(check: &mut Publication, snapshot: &EngineSnapshot) {
+    check.observe(&adopted(snapshot), true);
+    check.observe(&stored(snapshot), true);
+}
+
 /// The `TipPublished` event for `snapshot`'s tip.
 fn tip_published(snapshot: &EngineSnapshot, delivered: bool) -> ReactorEvent {
     ReactorEvent::TipPublished {
@@ -68,12 +82,12 @@ fn tip_published(snapshot: &EngineSnapshot, delivered: bool) -> ReactorEvent {
 fn a_faithful_history_holds() {
     let (fixture, port, mut check, evidence) = seeded();
     let seed = port.snapshot();
-    check.observe(&adopted(&seed), true);
+    adopt(&mut check, &seed);
     check.observe(&tip_published(&seed, true), true);
     let run = commit(&fixture, &port, 2);
     check.run(&run, false);
     check.publications(&port.take_publications());
-    check.observe(&adopted(&run.snapshot), true);
+    adopt(&mut check, &run.snapshot);
     check.observe(&tip_published(&run.snapshot, true), true);
     assert_eq!(check.drain(1), Vec::<String>::new());
     assert!(evidence.applicable_by(1));
@@ -118,6 +132,7 @@ fn an_unfaithful_adoption_breaks() {
     mixed.frontiers.header_best = seed.frontiers.header_best;
     mixed.header_best_score = seed.header_best_score;
     check.observe(&adopted(&mixed), true);
+    check.observe(&stored(&mixed), true);
     let breaks = check.drain(1);
     assert!(
         breaks
@@ -141,7 +156,7 @@ fn an_unfaithful_adoption_breaks() {
 fn the_tip_rules() {
     let (fixture, port, mut check, evidence) = seeded();
     let seed = port.snapshot();
-    check.observe(&adopted(&seed), true);
+    adopt(&mut check, &seed);
     assert_eq!(evidence.owed(), Some(seed.frontiers.header_best));
     check.observe(&tip_published(&seed, false), true);
     assert_eq!(evidence.owed(), None);
@@ -150,18 +165,18 @@ fn the_tip_rules() {
     let run = commit(&fixture, &port, 2);
     check.run(&run, false);
     check.publications(&port.take_publications());
-    check.observe(&adopted(&run.snapshot), true);
+    adopt(&mut check, &run.snapshot);
     check.observe(&tip_published(&seed, true), true);
     assert!(check.drain(2)[0].starts_with("StaleTip"));
 
     let next = commit(&fixture, &port, 1);
     check.run(&next, false);
     check.publications(&port.take_publications());
-    check.observe(&adopted(&next.snapshot), true);
+    adopt(&mut check, &next.snapshot);
     let later = commit(&fixture, &port, 1);
     check.run(&later, false);
     check.publications(&port.take_publications());
-    check.observe(&adopted(&later.snapshot), true);
+    adopt(&mut check, &later.snapshot);
     assert!(check.drain(3)[0].starts_with("UnpublishedTip"));
     evidence.end(false);
     assert_eq!(evidence.unpublished_at_settled_end(), None);
@@ -207,7 +222,7 @@ fn a_corrupt_run_taints_the_check() {
     port.take_publications();
     check.run(&run, true);
     check.publications(&[]);
-    check.observe(&adopted(&run.snapshot), true);
+    adopt(&mut check, &run.snapshot);
     assert_eq!(check.drain(1), Vec::<String>::new());
     assert!(evidence.tainted_by(1));
     assert!(!evidence.any());
@@ -286,7 +301,7 @@ fn status_debts_open_at_admission_and_at_a_change() {
         status: true,
     });
     let seed = port.snapshot();
-    check.observe(&adopted(&seed), true);
+    adopt(&mut check, &seed);
     check.observe(&tip_published(&seed, true), true);
     check.observe(&admitted_one(), true);
     check.observe(&status_queued(&seed), true);
@@ -294,7 +309,7 @@ fn status_debts_open_at_admission_and_at_a_change() {
         let run = commit(&fixture, &port, len);
         check.run(&run, false);
         check.publications(&port.take_publications());
-        check.observe(&adopted(&run.snapshot), true);
+        adopt(&mut check, &run.snapshot);
         check.observe(&tip_published(&run.snapshot, true), true);
     }
     check.observe(&status_queued(&port.snapshot()), true);
@@ -363,7 +378,7 @@ fn only_a_status_fixture_keeps_status_debts() {
     ] {
         let (_, port, mut check, evidence) = armed(arming);
         let seed = port.snapshot();
-        check.observe(&adopted(&seed), true);
+        adopt(&mut check, &seed);
         check.observe(&admitted_one(), true);
         check.observe(&status_queued(&seed), true);
         assert_eq!(kinds(&evidence), expected, "{arming:?}");
@@ -383,7 +398,7 @@ fn a_stale_status_breaks_and_pays_nothing() {
     let run = commit(&fixture, &port, 2);
     check.run(&run, false);
     check.publications(&port.take_publications());
-    check.observe(&adopted(&run.snapshot), true);
+    adopt(&mut check, &run.snapshot);
     check.observe(&status_queued(&seed), true);
     let breaks = check.drain(1);
     assert!(breaks[0].starts_with("StaleStatus"), "{breaks:?}");
@@ -400,7 +415,75 @@ fn a_taint_is_kept_and_ends_the_facts() {
     });
     let run = commit(&fixture, &port, 2);
     check.run(&run, true);
-    check.observe(&adopted(&run.snapshot), true);
+    adopt(&mut check, &run.snapshot);
     check.observe(&admitted_one(), true);
     assert_eq!(kinds(&evidence), ["tainted"]);
+}
+
+/// A store that differs from the adoption it follows breaks, and so does an
+/// adoption still unstored when its unit of work ends or the next adoption
+/// comes.
+#[test]
+fn the_store_must_equal_its_adoption() {
+    let (fixture, port, mut check, _) = seeded();
+    let seed = port.snapshot();
+    adopt(&mut check, &seed);
+    check.observe(&tip_published(&seed, true), true);
+    let run = commit(&fixture, &port, 2);
+    check.run(&run, false);
+    check.publications(&port.take_publications());
+    check.observe(&adopted(&run.snapshot), true);
+    check.observe(&tip_published(&run.snapshot, true), true);
+    // The new state stored with the old tip.
+    let mut kept = run.snapshot.clone();
+    kept.frontiers.header_best = seed.frontiers.header_best;
+    check.observe(&stored(&kept), true);
+    let breaks = check.drain(1);
+    assert_eq!(breaks.len(), 1, "{breaks:?}");
+    assert!(breaks[0].contains("stored"), "{breaks:?}");
+
+    let next = commit(&fixture, &port, 1);
+    check.run(&next, false);
+    check.publications(&port.take_publications());
+    check.observe(&adopted(&next.snapshot), true);
+    check.observe(&tip_published(&next.snapshot, true), true);
+    check.observe(
+        &ReactorEvent::Sizes {
+            sizes: Default::default(),
+        },
+        true,
+    );
+    let breaks = check.drain(2);
+    assert_eq!(breaks.len(), 1, "{breaks:?}");
+    assert!(
+        breaks[0].contains("hadn't stored it when its unit"),
+        "{breaks:?}"
+    );
+}
+
+/// A store that left nothing breaks, and so does one whose copy differs
+/// from the engine's record in a field the adoption doesn't carry, such as
+/// its mode.
+#[test]
+fn a_store_must_be_the_whole_record() {
+    let (_, port, mut check, _) = seeded();
+    let seed = port.snapshot();
+    check.observe(&adopted(&seed), true);
+    check.observe(&tip_published(&seed, true), true);
+    check.observe(&ReactorEvent::SnapshotStored { snapshot: None }, true);
+    let breaks = check.drain(1);
+    assert!(
+        breaks[0].contains("stored no committed snapshot"),
+        "{breaks:?}"
+    );
+    let mut moded = seed.clone();
+    moded.mode = match seed.mode {
+        zakura_header_chain::EngineMode::HeadersOnly => zakura_header_chain::EngineMode::Integrated,
+        _ => zakura_header_chain::EngineMode::HeadersOnly,
+    };
+    check.observe(&adopted(&seed), true);
+    check.observe(&stored(&moded), true);
+    let breaks = check.drain(2);
+    assert_eq!(breaks.len(), 1, "{breaks:?}");
+    assert!(breaks[0].contains("whose engine record is"), "{breaks:?}");
 }

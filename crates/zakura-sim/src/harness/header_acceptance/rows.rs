@@ -1979,8 +1979,8 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(sim_row(SELECTED, storage_harnesses, selected));
 
     let mut publication = holds(PUBLICATION, G134, PUBLICATION_WITNESSES);
-    // `stale-status-cache` is the adopted-state native
-    // mutation, moved here as a case of their own name.
+    // `stale-status-cache` and `unsent-tip` are the adopted-state native
+    // mutations, moved here as cases of their own names.
     for (index, (name, harness, set, found)) in [
         (
             "mixed-adoption",
@@ -2019,8 +2019,34 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "store-dropped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stored-version-kept",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        // The unsent tip shows only when the run comes to rest, as the
+        // property's end finding.
+        (
+            "unsent-tip",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtEnd,
+        ),
+        (
             "watch-ignored",
             LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "watch-ignored-in-storage",
+            STORAGE,
             &[PUBLICATION] as &'static [&'static str],
             Found::AtStep,
         ),
@@ -2713,11 +2739,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "unreleased-retirement",
         },
     },
-    to_move(
-        "unsent-tip",
-        "header-sync/state-publication-consistent",
-        "hdr-12b",
-    ),
+    NativeMutation {
+        patch: "unsent-tip",
+        class: NativeClass::Moved {
+            property: "header-sync/state-publication-consistent",
+            case: "unsent-tip",
+        },
+    },
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,

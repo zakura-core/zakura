@@ -359,8 +359,8 @@ fn a_quiet_startup_adopts_only_the_seeded_record() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-publication-<name>.json` with its Plan bytes
 /// beside it in `header-publication-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 1] {
-    [("invalidate-only", invalidate_only())]
+fn committed_witnesses() -> [(&'static str, StorageScenario); 2] {
+    [("invalidate-only", invalidate_only()), ("sync", sync())]
 }
 
 /// The Plan bytes every committed witness runs under: a fixed draw.

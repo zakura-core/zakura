@@ -12,7 +12,13 @@
 //! - **Adoption is faithful.** Every `SnapshotAdopted` names a state version
 //!   some engine record holds, and equals that record's snapshot in
 //!   generation, anchor, tip, work, retention and the verified frontier and
-//!   generation.
+//!   generation. The reactor's stored copy, which its `SnapshotStored`
+//!   reports whole right after the store, is the engine's record of the
+//!   adoption it follows, in every field, and an
+//!   adoption is stored before its unit of work ends (the reactor's next
+//!   `Sizes`) or the next adoption. The adoption, its `Status` and its tip
+//!   come from the reactor's input, and the stored copy has readers of its
+//!   own, so a defect in the store alone shows only here.
 //! - **Status names the adoption.** Every queued `Status` advertises the
 //!   latest adoption's anchor, tip, work and retention. `Status` has no
 //!   generation field, so a mixed-generation `Status` shows as fields that
@@ -317,6 +323,8 @@ pub(super) struct Publication {
     committed: Vec<EngineSnapshot>,
     /// The latest adoption.
     adopted: Option<Adoption>,
+    /// The state version of an adoption not yet stored.
+    unstored: Option<u64>,
     /// Each admitted session the node still holds, in a status fixture.
     sessions: HashMap<u64, Session>,
     /// Whether the commit-contents check found a run corrupt, after which
@@ -336,6 +344,7 @@ impl Publication {
             newest,
             committed: Vec::new(),
             adopted: None,
+            unstored: None,
             sessions: HashMap::new(),
             tainted: false,
             breaks: Vec::new(),
@@ -416,6 +425,8 @@ impl Publication {
                 };
                 self.adopted_one(adoption);
             }
+            ReactorEvent::SnapshotStored { .. } => self.stored(event),
+            ReactorEvent::Sizes { .. } => self.unit_ended("its unit of work ended"),
             ReactorEvent::SessionAdmitted {
                 peer, session_id, ..
             } => self.admitted(peer, *session_id),
@@ -473,7 +484,9 @@ impl Publication {
     /// Judges `adoption`, the reactor's newest.
     fn adopted_one(&mut self, adoption: Adoption) {
         self.applies();
+        self.unit_ended("it adopted another");
         let version = adoption.state_version.get();
+        self.unstored = Some(version);
         match self.records.get(&version) {
             None => self.breaks.push(format!(
                 "StatePublicationConsistent: the reactor adopted state version {version}, \
@@ -552,6 +565,43 @@ impl Publication {
             }
         }
         self.adopted = Some(adoption);
+    }
+
+    /// Judges the reactor's stored copy `event` reports
+    /// (`SnapshotStored`): it must be the engine's record of the adoption
+    /// it follows, whole, so a store that differs in any field, the mode
+    /// included, or that left nothing breaks.
+    fn stored(&mut self, event: &ReactorEvent) {
+        let ReactorEvent::SnapshotStored { snapshot } = event else {
+            return;
+        };
+        let adopted = self.unstored.take();
+        let Some(stored) = snapshot else {
+            self.breaks.push(format!(
+                "StatePublicationConsistent: the reactor stored no committed snapshot after \
+                 adopting state version {adopted:?}"
+            ));
+            return;
+        };
+        let version = stored.state_version.get();
+        if adopted != Some(version) || self.records.get(&version) != Some(stored) {
+            self.breaks.push(format!(
+                "StatePublicationConsistent: the reactor stored {stored:?} as its committed \
+                 snapshot after adopting state version {adopted:?}, whose engine record is \
+                 {:?}",
+                adopted.and_then(|adopted| self.records.get(&adopted))
+            ));
+        }
+    }
+
+    /// Breaks if an adoption is still unstored when `why` ends its chance.
+    fn unit_ended(&mut self, why: &str) {
+        if let Some(version) = self.unstored.take() {
+            self.breaks.push(format!(
+                "StatePublicationConsistent: the reactor adopted state version {version} and \
+                 hadn't stored it when {why}"
+            ));
+        }
     }
 
     /// Notes `peer`'s admitted session `session_id`, which is owed its

@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index e4c6d7bee1..d474b2295b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2648,6 +2648,13 @@ impl HeaderSyncReactor {
+         };
+         let status = Status::from_snapshot(&snapshot, self.page_limits);
+         let now = Instant::now();
++        // Mutation: the stored copy keeps the previous state version, while
++        // the adoption, its `Status` and its tip publication carry the new
++        // snapshot. Every other field is the new one.
++        let mut snapshot = snapshot;
++        if let Some(old) = self.committed_snapshot.as_ref() {
++            snapshot.state_version = old.state_version;
++        }
+         self.committed_snapshot = Some(snapshot);
+         observe!(self, ReactorEvent::stored(self.committed_snapshot.as_ref()));
+         self.schedule_current_vct_repair();

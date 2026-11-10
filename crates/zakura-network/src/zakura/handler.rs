@@ -9398,6 +9398,50 @@ mod tests {
         drop(endpoint);
     }
 
+    /// Startup refuses a bootstrap identity whose dial would need more slots
+    /// than the dial reserve (8 at the defaults), counting only the
+    /// addresses the bound endpoint would dial.
+    #[tokio::test]
+    async fn startup_refuses_a_bootstrap_dial_wider_than_the_reserve() {
+        let _guard = zakura_test::init();
+        let remote = NodeSecretKey::generate().public();
+        let config_with = |addrs: &[String]| {
+            let mut config = Config::for_test(P2pStack::Zakura);
+            config.zakura.bootstrap_peers = addrs
+                .iter()
+                .map(|addr| format!("{remote}@{addr}"))
+                .collect();
+            config
+        };
+        let v4 = |port: u16| format!("127.0.0.1:{port}");
+        let mapped = |port: u16| format!("[::ffff:127.0.0.1]:{port}");
+        let spawn = |config: Config| async move {
+            spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+                Arc::new(NoopService) as Arc<dyn Service>
+            })
+            .await
+        };
+
+        let nine = (8233..8242).map(v4).collect::<Vec<_>>();
+        let error = spawn(config_with(&nine))
+            .await
+            .expect_err("a nine-address dial can't fit the eight-slot reserve");
+        assert!(
+            error.to_string().contains("zakura.bootstrap_peers"),
+            "unexpected error: {error}",
+        );
+
+        // Sixteen configured addresses, but the mapped ones fold into their
+        // IPv4 forms, so the dial makes eight attempts.
+        let folded = (8233..8241)
+            .flat_map(|port| [v4(port), mapped(port)])
+            .collect::<Vec<_>>();
+        let endpoint = spawn(config_with(&folded))
+            .await
+            .expect("eight attempts fit the reserve");
+        drop(endpoint);
+    }
+
     /// Config load checks only native kinds, so startup must refuse a custom
     /// kind whose frame exceeds its share.
     #[tokio::test]

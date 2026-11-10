@@ -8,8 +8,8 @@ use serde_json::json;
 use super::{
     build_failure,
     classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
-    parse_flags, run_measured, summarize, test_executables, BaselineReport, BuildIdentity, Built,
-    CaseReport, LoopCase, Mutant, Report, Runnable, Runner, Slot, WitnessSpec,
+    parse_flags, run_measured, selects, summarize, test_executables, BaselineReport, BuildIdentity,
+    Built, CaseReport, LoopCase, Mutant, Report, Runnable, Runner, Slot, WitnessSpec,
 };
 
 const NAMED: &str = "block-sync/retained-byte-bound";
@@ -613,6 +613,7 @@ fn a_rejected_patch_does_not_apply_and_a_failing_baseline_runs_no_mutant() {
     let mutant = Mutant {
         patch: patch.clone(),
         cases: vec![0],
+        alone: false,
     };
     let cases = [case];
     let reports = runner
@@ -814,4 +815,24 @@ fn a_child_reports_its_exit_or_its_deadline() {
     )
     .unwrap();
     assert_eq!(ended, Ended::TimedOut);
+}
+
+/// `--planted` selects whole path components or one case, so a prefix that
+/// names a directory doesn't also select a sibling that starts the same way.
+#[test]
+fn planted_prefixes_end_at_a_component() {
+    let case = "block-sync/reserved-byte-bound/above-floor-charge.patch";
+    assert!(selects("block-sync/", case));
+    assert!(selects("block-sync", case));
+    assert!(selects("block-sync/reserved-byte-bound", case));
+    assert!(selects(
+        "block-sync/reserved-byte-bound/above-floor-charge",
+        case
+    ));
+    assert!(!selects("block", case));
+    assert!(!selects("block-sync/reserved", case));
+    assert!(selects(
+        "block",
+        "block/work-funding/lost-reservation-release.patch"
+    ));
 }

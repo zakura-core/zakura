@@ -450,6 +450,14 @@ pub(super) fn native_cases(repo_root: &Path, dir: &Path) -> Result<Vec<LoopCase>
 
 /// Every retained planted case whose property starts with one of
 /// `prefixes`, with its own committed witness.
+/// True if `--planted <prefix>` selects the planted case whose patch is at
+/// `path` under `qa/planted/`. The prefix ends at a path component or at the
+/// case's `.patch`, so `block` selects `block/…` and not `block-sync/…`.
+pub(super) fn selects(prefix: &str, path: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/') || rest.starts_with('.'))
+}
+
 fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>, BoxError> {
     if prefixes.is_empty() {
         return Ok(Vec::new());
@@ -462,14 +470,10 @@ fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>,
             continue;
         };
         let path = relative_label(&root, &patch);
-        if !prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+        if !prefixes.iter().any(|prefix| selects(prefix, &path)) {
             continue;
         }
-        matched.extend(
-            prefixes
-                .iter()
-                .filter(|prefix| path.starts_with(prefix.as_str())),
-        );
+        matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
         let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
@@ -628,6 +632,9 @@ struct Ran {
 struct Mutant {
     patch: PathBuf,
     cases: Vec<usize>,
+    /// True for a rerun alone after the memory cap killed a case. Its
+    /// evidence goes under `mutants-alone/`, beside the first run's.
+    alone: bool,
 }
 
 impl Runner {
@@ -647,15 +654,23 @@ impl Runner {
         cases: &[LoopCase],
         slots: &[Slot],
     ) -> Result<(String, Vec<CaseReport>), BoxError> {
-        let runnables = cases
+        // Each slot reads its witnesses' inputs from its own tree, which no
+        // other slot resets.
+        let slot_runnables = slots
             .iter()
-            .map(|case| runnable(&slots[0].tree, &case.witness, &case.property))
+            .map(|slot| {
+                cases
+                    .iter()
+                    .map(|case| runnable(&slot.tree, &case.witness, &case.property))
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        let runnables = &slot_runnables[0];
         let source = provenance::Provenance::read(&slots[0].tree, provenance::SOURCE_PATHS).source;
         let all: Vec<usize> = (0..cases.len()).collect();
         let host_jobs = thread::available_parallelism().map_or(1, usize::from);
         let baseline_dir = self.out.join("baseline");
-        let built = match self.build(&slots[0], &runnables, &all, &baseline_dir, host_jobs)? {
+        let built = match self.build(&slots[0], runnables, &all, &baseline_dir, host_jobs)? {
             Ok(built) => built,
             Err(failure) => return Err(format!("the unpatched build fails: {failure}").into()),
         };
@@ -680,7 +695,7 @@ impl Runner {
                 .open(slot.tree.join("crates/zakura-sim/build.rs"))?
                 .set_modified(SystemTime::now())?;
         }
-        let baselines = self.baselines(cases, &runnables, &slots[0], &built, &source)?;
+        let baselines = self.baselines(cases, runnables, &slots[0], &built, &source)?;
         let mut mutants: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, case) in cases.iter().enumerate() {
             mutants.entry(case.patch.clone()).or_default().push(index);
@@ -688,16 +703,20 @@ impl Runner {
         let queue: Mutex<VecDeque<Mutant>> = Mutex::new(
             mutants
                 .into_iter()
-                .map(|(patch, cases)| Mutant { patch, cases })
+                .map(|(patch, cases)| Mutant {
+                    patch,
+                    cases,
+                    alone: false,
+                })
                 .collect(),
         );
         let results: Mutex<BTreeMap<usize, CaseReport>> = Mutex::new(BTreeMap::new());
         thread::scope(|scope| {
             let workers: Vec<_> = slots
                 .iter()
-                .map(|slot| {
-                    let (queue, results, baselines, runnables) =
-                        (&queue, &results, &baselines, &runnables);
+                .zip(&slot_runnables)
+                .map(|(slot, runnables)| {
+                    let (queue, results, baselines) = (&queue, &results, &baselines);
                     scope.spawn(move || -> Result<(), String> {
                         loop {
                             let Some(mutant) = queue.lock().expect("no worker panics").pop_front()
@@ -732,12 +751,13 @@ impl Runner {
             let mutant = Mutant {
                 patch: cases[index].patch.clone(),
                 cases: vec![index],
+                alone: true,
             };
             for (index, mut report) in self.mutant(
                 &slots[0],
                 &mutant,
                 cases,
-                &runnables,
+                runnables,
                 &baselines,
                 self.alone_cap(),
             )? {
@@ -870,7 +890,12 @@ impl Runner {
             return Err(INTERRUPTED_ERROR.into());
         }
         let first = &cases[mutant.cases[0]];
-        let dir = self.out.join("mutants").join(key(&first.label));
+        let runs = if mutant.alone {
+            "mutants-alone"
+        } else {
+            "mutants"
+        };
+        let dir = self.out.join(runs).join(key(&first.label));
         fs::create_dir_all(&dir)?;
         let patch_sha256 = file_sha256(&mutant.patch).unwrap_or_default();
         let report = |index: usize, result: Classified, ran: Option<&Ran>| {

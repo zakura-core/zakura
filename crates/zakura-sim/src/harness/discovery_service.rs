@@ -241,13 +241,15 @@ fn spawn_with(
         .collect();
     let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
     let dials = tap.dials();
+    let shared_ids = tap.shared_ids();
     sim.add_source(Box::new(tap));
     spawn_node(sim, spec, &network, net.sim(), seed, observer, dials, node);
     // Read before any task runs, since building it draws from the run.
     let stream = discovery_stream();
     let failure = PeerFailure::default();
     let records = PeerRecords::default();
-    let mut control = PeerControl::new(failure.clone(), records.clone()).with_discovery(&stream);
+    let mut control =
+        PeerControl::new(failure.clone(), records.clone(), shared_ids).with_discovery(&stream);
     for ((index, peer), name) in peers.iter().enumerate().zip(names) {
         assert!(
             peer.honest.is_none(),

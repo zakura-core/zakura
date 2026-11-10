@@ -318,7 +318,9 @@ impl SessionEvidence {
             return;
         };
         match event {
-            TransportEvent::Registered { conn_id, remote } => {
+            TransportEvent::Registered {
+                conn_id, remote, ..
+            } => {
                 ledger.registered(*conn_id, *remote);
             }
             TransportEvent::Admitted {

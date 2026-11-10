@@ -2,24 +2,24 @@
 //! node's evidence means for P3b's close checks (M5-D).
 //!
 //! A peer's task records each frame it sends and reads with its own
-//! [`Remote`], its address and the connection's incarnation there, and the
-//! QUIC stream, which both ends share. [`WireEvidence`] holds each record
-//! until the transport tap has logged the connection's `registered` event
-//! and the stream's `Session` row, then logs it as a `PeerFrame`,
-//! `PeerWritten` or `PeerReceived` with that connection (M5-Q4). Records of
-//! one stream keep their order. A record whose stream can no longer be
-//! admitted, because the node refused it or its handshake, or tore its
-//! connection down, fails the run, so a peer's frames can't drop out of the
-//! log unseen.
+//! [`Remote`], its address and the connection's shared ID, and the QUIC
+//! stream, which both ends share. [`WireEvidence`] holds each record until
+//! the transport tap has logged the `registered` event of the connection
+//! with that shared ID and the stream's `Session` row, then logs it as a
+//! `PeerFrame`, `PeerWritten` or `PeerReceived` with that connection
+//! (M5-Q4). Records of one stream keep their order. A record whose stream
+//! can no longer be admitted, because the node refused it or its handshake,
+//! or tore its connection down, fails the run, so a peer's frames can't drop
+//! out of the log unseen.
 //!
-//! A dialing peer binds a fresh address per dial, so each of its addresses
-//! has one incarnation. A node that redials a listening peer reaches it at
-//! the same address each time (disc-2.2). The peer holds one connection at
-//! a time and refuses the node's other attempts before their handshake, so
-//! the `n`-th connection whose handshake the node reports from that
-//! address is the peer's `n`-th connection. A connection's `Negotiated`
-//! starts it, so one the node cancels during registration, which reports
-//! only `CloseDecided`, still counts.
+//! Both ends derive the shared ID from the connection's TLS handshake
+//! (`zakura_quic::Conn::shared_id`), so neither end counts connections. A
+//! node that redials a listening peer reaches it at the same address each
+//! time (disc-2.2), with QUIC stream IDs counting from 0 again, and a redial
+//! whose QUIC handshake completes at the node but not at the peer is one
+//! the node refuses and the peer never serves. The log doesn't hold the
+//! shared ID: the tap hands over the ID of each `registered` and
+//! `handshake-refused` event it logs in [`SharedIds`].
 //!
 //! Each `PeerReceived` on a header stream is followed by the frame's
 //! `NodeFrame`, which the [`SenderAdapter`] labels under the sender's rules
@@ -87,7 +87,7 @@ use crate::{
         PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
         TransportFact,
     },
-    storage::{hash, HEADER_SERVICE},
+    storage::{hash, hex, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -107,23 +107,22 @@ struct Waiting {
 /// oldest first.
 pub(crate) type PeerRecords = Rc<RefCell<VecDeque<PeerRecord>>>;
 
+/// The ID both ends of a connection derive from its TLS handshake.
+pub(crate) type SharedId = [u8; 16];
+
+/// The shared ID of each connection whose `registered` or
+/// `handshake-refused` event the transport tap logged, by the event's
+/// number. The tap adds each ID as it logs the event, and [`WireEvidence`]
+/// takes it as it reads the event.
+pub(crate) type SharedIds = Rc<RefCell<BTreeMap<u64, SharedId>>>;
+
 /// The peer's end of one connection, as the node sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Remote {
     /// The peer's address, which the node sees as the remote.
     pub(crate) addr: SocketAddr,
-    /// How many connections the peer had at `addr` before this one.
-    pub(crate) incarnation: u64,
-}
-
-impl Remote {
-    /// The first connection at `addr`.
-    pub(crate) fn first(addr: SocketAddr) -> Self {
-        Remote {
-            addr,
-            incarnation: 0,
-        }
-    }
+    /// The connection's shared ID.
+    pub(crate) shared_id: SharedId,
 }
 
 /// One thing a peer did on a header or discovery stream.
@@ -180,27 +179,16 @@ pub(crate) struct InvalidPage {
     pub(crate) subscription: u64,
 }
 
-/// The connections the node reported from one remote address.
-#[derive(Clone, Copy, Debug, Default)]
-struct Incarnations {
-    /// The next connection's incarnation.
-    next: u64,
-    /// The connection whose control handshake succeeded and whose
-    /// registration hasn't ended, and whether a cancellation decided its
-    /// close meanwhile.
-    negotiated: Option<(u64, bool)>,
-}
-
 /// The identity map as the log has it, and the labels logged so far.
 #[derive(Debug, Default)]
 pub(crate) struct WireEvidence {
     /// How many log entries it has read.
     seen: usize,
+    /// The shared IDs the transport tap hands over.
+    shared_ids: SharedIds,
     /// Each registered connection, by its remote address as the log writes
-    /// it and its incarnation there.
-    connections: BTreeMap<(String, u64), u64>,
-    /// The connections the node reported from each remote address so far.
-    incarnations: BTreeMap<String, Incarnations>,
+    /// it and its shared ID.
+    connections: BTreeMap<(String, SharedId), u64>,
     /// Each admitted stream's kind and version, by connection and QUIC
     /// stream.
     streams: BTreeMap<(u64, u64), StreamId>,
@@ -211,8 +199,9 @@ pub(crate) struct WireEvidence {
     /// Each logged `PeerFrame`'s label, by connection, QUIC stream and
     /// `seq`.
     labels: BTreeMap<(u64, u64, u64), Label>,
-    /// Remote incarnations whose handshake the node refused.
-    refused_handshakes: BTreeSet<(String, u64)>,
+    /// The remote addresses and shared IDs of the connections whose
+    /// handshake the node refused.
+    refused_handshakes: BTreeSet<(String, SharedId)>,
     /// Streams the node refused, by connection and QUIC stream.
     refused_streams: BTreeSet<(u64, u64)>,
     /// Connections the node tore down.
@@ -271,13 +260,21 @@ struct Margin {
 }
 
 impl WireEvidence {
-    /// Evidence that also logs the peers' frames on `discovery`'s stream,
-    /// which it judges none of.
-    pub(crate) fn with_discovery(discovery: StreamId) -> Self {
+    /// Evidence that reads each connection's shared ID from `shared_ids`.
+    pub(crate) fn new(shared_ids: SharedIds) -> Self {
+        WireEvidence {
+            shared_ids,
+            ..WireEvidence::default()
+        }
+    }
+
+    /// This evidence, also logging the peers' frames on `discovery`'s
+    /// stream, which it judges none of.
+    pub(crate) fn with_discovery(self, discovery: StreamId) -> Self {
         WireEvidence {
             discovery: Some(discovery),
             discovery_sender: Some(DiscoverySender::new(discovery)),
-            ..WireEvidence::default()
+            ..self
         }
     }
 
@@ -304,36 +301,25 @@ impl WireEvidence {
             }
             match &entry.obs {
                 Observation::Transport {
-                    connection: None,
-                    remote,
-                    event: TransportFact::Negotiated { .. },
-                    ..
-                } => self.negotiated(remote),
-                Observation::Transport {
-                    connection: None,
-                    remote,
-                    event: TransportFact::CloseDecided { .. },
-                    ..
-                } => self.cancelled(remote),
-                Observation::Transport {
+                    seq,
                     connection: Some(connection),
                     remote,
                     event: TransportFact::Registered,
                     ..
                 } => {
-                    let incarnation = self.outcome(remote, true);
+                    let shared_id = self.shared_id(*seq)?;
                     self.connections
-                        .insert((remote.clone(), incarnation), *connection);
+                        .insert((remote.clone(), shared_id), *connection);
                 }
                 Observation::Transport {
+                    seq,
                     connection: None,
                     remote,
                     event: TransportFact::HandshakeRefused { .. },
                     ..
                 } => {
-                    let incarnation = self.outcome(remote, false);
-                    self.refused_handshakes
-                        .insert((remote.clone(), incarnation));
+                    let shared_id = self.shared_id(*seq)?;
+                    self.refused_handshakes.insert((remote.clone(), shared_id));
                 }
                 Observation::Transport {
                     connection: Some(connection),
@@ -403,44 +389,12 @@ impl WireEvidence {
         Ok(())
     }
 
-    /// The control handshake of `remote`'s next connection succeeded: that
-    /// connection takes the next incarnation.
-    fn negotiated(&mut self, remote: &str) {
-        let at = self.incarnations.entry(remote.to_owned()).or_default();
-        at.negotiated = Some((at.next, false));
-        at.next += 1;
-    }
-
-    /// The node cancelled `remote`'s negotiated connection before it
-    /// registered. Its registration may still succeed, but a refusal
-    /// reports nothing more.
-    fn cancelled(&mut self, remote: &str) {
-        if let Some((_, cancelled)) = self
-            .incarnations
-            .get_mut(remote)
-            .and_then(|at| at.negotiated.as_mut())
-        {
-            *cancelled = true;
-        }
-    }
-
-    /// The incarnation of the connection whose handshake outcome from
-    /// `remote` the node reported: `registered`, or refused. A node that
-    /// redials a listening peer reaches it at the same address, with QUIC
-    /// stream IDs counting from 0 again, so the incarnation keeps a record
-    /// left from the old connection off the new one's stream. A refusal
-    /// after a cancellation is the next connection's, refused before its
-    /// handshake succeeded.
-    fn outcome(&mut self, remote: &str, registered: bool) -> u64 {
-        let at = self.incarnations.entry(remote.to_owned()).or_default();
-        match at.negotiated.take() {
-            Some((incarnation, cancelled)) if registered || !cancelled => incarnation,
-            _ => {
-                let incarnation = at.next;
-                at.next += 1;
-                incarnation
-            }
-        }
+    /// The shared ID of the connection whose handshake outcome the tap
+    /// logged as event `seq`, which the tap handed over as it logged it.
+    fn shared_id(&mut self, seq: u64) -> Result<SharedId, String> {
+        self.shared_ids.borrow_mut().remove(&seq).ok_or_else(|| {
+            format!("AmbiguousIdentity: transport event {seq} came with no shared ID")
+        })
     }
 
     /// Whether `event` names a QUIC stream of `connection` admitted as the
@@ -457,8 +411,8 @@ impl WireEvidence {
     }
 
     /// The key of `remote` in [`WireEvidence::connections`].
-    fn key(remote: Remote) -> (String, u64) {
-        (remote.addr.to_string(), remote.incarnation)
+    fn key(remote: Remote) -> (String, SharedId) {
+        (remote.addr.to_string(), remote.shared_id)
     }
 
     /// `record` as its observations, once its stream is admitted: one, or
@@ -560,9 +514,11 @@ impl WireEvidence {
         };
         gone.then(|| {
             format!(
-                "UnplacedRecord: {remote}'s record on stream {} of incarnation {} can't get an \
+                "UnplacedRecord: {remote}'s record on stream {} of connection {} can't get an \
                  identity, since the node refused or closed it before admitting the stream: {:?}",
-                record.quic_stream, record.remote.incarnation, record.body
+                record.quic_stream,
+                hex(&record.remote.shared_id),
+                record.body
             )
         })
     }
@@ -1084,10 +1040,25 @@ mod tests {
         }
     }
 
+    /// Peer 0's end of its connection whose shared ID is `[n; 16]`.
+    fn remote(n: u8) -> Remote {
+        Remote {
+            addr: peer_addr(0, 0),
+            shared_id: [n; 16],
+        }
+    }
+
+    /// Evidence whose transport tap handed over the shared ID `[n; 16]` of
+    /// event `seq`, for each `(seq, n)` in `ids`.
+    fn with_ids(ids: &[(u64, u8)]) -> WireEvidence {
+        let ids = ids.iter().map(|&(seq, n)| (seq, [n; 16])).collect();
+        WireEvidence::new(Rc::new(RefCell::new(ids)))
+    }
+
     /// Peer 0's `PeerFrame` record for its first frame on QUIC stream 4.
     fn status_record() -> PeerRecords {
         Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: Remote::first(peer_addr(0, 0)),
+            remote: remote(0),
             quic_stream: 4,
             body: RecordBody::Written { seq: 0 },
         }])))
@@ -1104,7 +1075,7 @@ mod tests {
             payload: Vec::new(),
         };
         let records = Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: Remote::first(peer_addr(0, 0)),
+            remote: remote(0),
             quic_stream: 4,
             body: RecordBody::Received {
                 seq: 0,
@@ -1134,7 +1105,7 @@ mod tests {
                 message_type: frame.message_type,
             },
         ));
-        WireEvidence::default()
+        with_ids(&[(1, 0)])
             .observe(&records, &mut log)
             .expect("the record is placed");
         let logged: Vec<_> = log.entries()[3..].iter().map(|entry| &entry.obs).collect();
@@ -1174,7 +1145,7 @@ mod tests {
         ];
         for (connection, ending) in cases {
             let records = status_record();
-            let mut evidence = WireEvidence::default();
+            let mut evidence = with_ids(&[(1, 0), (2, 0)]);
             let mut log = ObservationLog::default();
             if connection.is_some() {
                 log.push(transport(1, connection, TransportFact::Registered));
@@ -1203,7 +1174,7 @@ mod tests {
         };
         let records = PeerRecords::default();
         records.borrow_mut().extend((0..4).map(|seq| PeerRecord {
-            remote: Remote::first(peer_addr(0, 0)),
+            remote: remote(0),
             quic_stream: 4,
             body: RecordBody::Frame {
                 seq,
@@ -1216,7 +1187,7 @@ mod tests {
                 prepares: None,
             },
         }));
-        let mut evidence = WireEvidence::default();
+        let mut evidence = with_ids(&[(1, 0)]);
         let mut log = ObservationLog::default();
         log.push(transport(1, Some(1), TransportFact::Registered));
         log.push(Observation::Session {
@@ -1286,14 +1257,14 @@ mod tests {
         assert_eq!(feed(&mut log, read(3)), [0, 1, 2, 3]);
     }
 
-    /// The node's `n`-th handshake outcome from one remote address is the
-    /// peer's `n`-th connection there, as a node redialing a listening peer
-    /// gives. A record still waiting on the first connection's stream 4
-    /// stays off the second's stream 4, and a record of the second is
-    /// placed on it. After a refused first handshake, the second
-    /// connection's record is placed, and the first's can never be.
+    /// A redialed listening peer reaches the node at one address, so only
+    /// the shared ID tells its connections apart. A record still waiting
+    /// on the first connection's stream 4 stays off the second's stream 4,
+    /// and a record of the second is placed on it. After a refused first
+    /// handshake, the second connection's record is placed, and the
+    /// first's can never be.
     #[test]
-    fn each_incarnation_of_one_remote_has_its_own_connection() {
+    fn each_connection_of_one_remote_has_its_own_shared_id() {
         let refused = || TransportFact::HandshakeRefused {
             reason: "Zakura control nonce mismatch".to_owned(),
         };
@@ -1305,11 +1276,8 @@ mod tests {
             session_id: connection,
             peer: "peer-0".to_owned(),
         };
-        let written = |incarnation, seq| PeerRecord {
-            remote: Remote {
-                addr: peer_addr(0, 0),
-                incarnation,
-            },
+        let written = |n, seq| PeerRecord {
+            remote: remote(n),
             quic_stream: 4,
             body: RecordBody::Written { seq },
         };
@@ -1327,7 +1295,7 @@ mod tests {
 
         let records = PeerRecords::default();
         records.borrow_mut().push_back(written(0, 0));
-        let mut evidence = WireEvidence::default();
+        let mut evidence = with_ids(&[(1, 0), (2, 1)]);
         let mut log = ObservationLog::default();
         log.push(transport(1, Some(1), TransportFact::Registered));
         evidence.observe(&records, &mut log).unwrap();
@@ -1343,7 +1311,7 @@ mod tests {
 
         let records = PeerRecords::default();
         records.borrow_mut().push_back(written(1, 3));
-        let mut evidence = WireEvidence::default();
+        let mut evidence = with_ids(&[(1, 0), (2, 1)]);
         let mut log = ObservationLog::default();
         log.push(transport(1, None, refused()));
         log.push(transport(2, Some(2), TransportFact::Registered));
@@ -1357,14 +1325,15 @@ mod tests {
         assert!(error.starts_with("UnplacedRecord"), "{error}");
     }
 
-    /// A connection the node cancels during registration reports
-    /// `Negotiated` and then only `CloseDecided` if its registration is
-    /// refused, or `CloseDecided` and then `Registered`. Either way it keeps
-    /// its incarnation, so the next connection's records are placed on the
-    /// next connection, not the one after. A refusal after a cancellation is
-    /// the next connection's.
+    /// The node's handshake outcomes from one address place no record by
+    /// their count. A connection cancelled during registration reports
+    /// `Negotiated` and only `CloseDecided` if its registration is refused,
+    /// or `CloseDecided` and then `Registered`. A redial whose QUIC
+    /// handshake completed at the node alone is refused at the node and
+    /// never served by the peer, so the peer records nothing of it.
+    /// Each connection's records are still placed on it.
     #[test]
-    fn a_cancelled_registration_keeps_its_incarnation() {
+    fn handshake_outcomes_place_no_record_by_their_count() {
         let negotiated = |seq| {
             transport(
                 seq,
@@ -1377,6 +1346,15 @@ mod tests {
             )
         };
         let cancelled = |seq| transport(seq, None, TransportFact::CloseDecided { cause: None });
+        let refused = |seq| {
+            transport(
+                seq,
+                None,
+                TransportFact::HandshakeRefused {
+                    reason: "Zakura control handshake timed out".to_owned(),
+                },
+            )
+        };
         let session = |connection| Observation::Session {
             connection,
             quic_stream: 4,
@@ -1385,11 +1363,8 @@ mod tests {
             session_id: connection,
             peer: "peer-0".to_owned(),
         };
-        let written = |incarnation, seq| PeerRecord {
-            remote: Remote {
-                addr: peer_addr(0, 0),
-                incarnation,
-            },
+        let written = |n, seq| PeerRecord {
+            remote: remote(n),
             quic_stream: 4,
             body: RecordBody::Written { seq },
         };
@@ -1406,52 +1381,38 @@ mod tests {
         };
 
         let records = PeerRecords::default();
-        let mut evidence = WireEvidence::default();
+        let mut evidence = with_ids(&[(2, 0), (7, 2), (9, 3), (12, 4)]);
         let mut log = ObservationLog::default();
-        // Incarnation 0 registers as connection 1.
+        // Shared ID 0 registers as connection 1.
         log.push(negotiated(1));
         log.push(transport(2, Some(1), TransportFact::Registered));
         log.push(transport(3, Some(1), TransportFact::TornDown));
-        // Incarnation 1 is cancelled, and its registration refused.
+        // Shared ID 1 is cancelled, and its registration refused.
         log.push(negotiated(4));
         log.push(cancelled(5));
-        // Incarnation 2 registers as connection 2.
+        // Shared ID 2 registers as connection 2.
         log.push(negotiated(6));
         log.push(transport(7, Some(2), TransportFact::Registered));
         log.push(session(2));
         records.borrow_mut().push_back(written(2, 5));
         evidence.observe(&records, &mut log).unwrap();
-        assert_eq!(placed(&log), [(2, 5)], "incarnation 2 is connection 2");
-        // Incarnation 3 is cancelled, and registers as connection 3.
+        assert_eq!(placed(&log), [(2, 5)], "shared ID 2 is connection 2");
+        // Shared ID 3's QUIC handshake completed at the node alone, so the
+        // node refuses it and the peer records nothing.
         log.push(transport(8, Some(2), TransportFact::TornDown));
-        log.push(negotiated(9));
-        log.push(cancelled(10));
-        log.push(transport(11, Some(3), TransportFact::Registered));
+        log.push(refused(9));
+        // Shared ID 4 is cancelled, and registers as connection 3.
+        log.push(negotiated(10));
+        log.push(cancelled(11));
+        log.push(transport(12, Some(3), TransportFact::Registered));
         log.push(session(3));
-        records.borrow_mut().push_back(written(3, 0));
+        records.borrow_mut().push_back(written(4, 0));
         evidence.observe(&records, &mut log).unwrap();
         assert_eq!(
             placed(&log),
             [(2, 5), (3, 0)],
-            "incarnation 3 is connection 3"
+            "shared ID 4 is connection 3"
         );
-        // Incarnation 4 is cancelled, and incarnation 5 is refused before
-        // its handshake succeeds.
-        log.push(transport(12, Some(3), TransportFact::TornDown));
-        log.push(negotiated(13));
-        log.push(cancelled(14));
-        log.push(transport(
-            15,
-            None,
-            TransportFact::HandshakeRefused {
-                reason: "Zakura control nonce mismatch".to_owned(),
-            },
-        ));
-        records.borrow_mut().push_back(written(5, 0));
-        let error = evidence
-            .observe(&records, &mut log)
-            .expect_err("incarnation 5's record can never be placed");
-        assert!(error.starts_with("UnplacedRecord"), "{error}");
     }
 
     /// A preparation the node's storage ran judges only the pages of its own
@@ -1581,7 +1542,7 @@ mod tests {
             .expect("discovery has get-peers");
         let records = PeerRecords::default();
         records.borrow_mut().extend((0..3).map(|seq| PeerRecord {
-            remote: Remote::first(peer_addr(0, 0)),
+            remote: remote(0),
             quic_stream: 4,
             body: RecordBody::Frame {
                 seq,
@@ -1598,7 +1559,7 @@ mod tests {
                 prepares: None,
             },
         }));
-        let mut evidence = WireEvidence::with_discovery(stream);
+        let mut evidence = with_ids(&[(1, 0)]).with_discovery(stream);
         let mut log = ObservationLog::default();
         log.push(transport(1, Some(1), TransportFact::Registered));
         log.push(Observation::Session {

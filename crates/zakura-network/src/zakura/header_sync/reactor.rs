@@ -218,13 +218,10 @@ fn build_header_sync_reactor(
     }
 
     let (events_tx, events_rx) = mpsc::channel(128);
-    let (lifecycle_tx, lifecycle_rx) = super::events::LifecycleSender::channel(
-        startup
-            .config
-            .peer_limits
-            .max_inbound_peers
-            .saturating_add(startup.config.peer_limits.max_outbound_peers),
-    );
+    // Both are sized for the header-sync peers this node can actually admit,
+    // not the configured limits alone or the default connection count.
+    let header_peers = startup.config.serving_sessions(startup.max_connections);
+    let (lifecycle_tx, lifecycle_rx) = super::events::LifecycleSender::channel(header_peers);
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let initial_tip = startup.best_header_tip.unwrap_or(startup.anchor);
     let (tip_tx, tip_rx) = watch::channel(initial_tip);
@@ -264,12 +261,7 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: v9::serving_capacity(
-            startup
-                .config
-                .serving_sessions(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS),
-            startup.config.node_serve_output_bytes,
-        ),
+        serving: v9::serving_capacity(header_peers, startup.config.node_serve_output_bytes),
         page_limits,
         #[cfg(any(test, zakura_sim))]
         credit_observer: startup

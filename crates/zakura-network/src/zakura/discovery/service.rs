@@ -1022,6 +1022,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         spawn_header_sync_reactor(startup).map_err(Into::into)
     }

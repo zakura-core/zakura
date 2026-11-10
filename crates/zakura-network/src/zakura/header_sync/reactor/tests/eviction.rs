@@ -884,6 +884,81 @@ async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
     }
 }
 
+/// Header serving and the lifecycle queue are sized for the header-sync peers
+/// the node can admit: the smaller of the peer limits and the admitted
+/// connections.
+#[test]
+fn serving_and_lifecycle_follow_the_admitted_header_peers() {
+    let cases = [
+        // (inbound, outbound, admitted connections, header peers)
+        (256, 256, 16, 16),
+        (256, 256, 200, 200),
+        (256, 256, 512, 512),
+        (6, 6, 92, 12),
+    ];
+    for (inbound, outbound, connections, peers) in cases {
+        let mut startup = startup(CancellationToken::new());
+        startup.config.peer_limits.max_inbound_peers = inbound;
+        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.max_connections = connections;
+        let (handle, _actions, _reactor) =
+            build_header_sync_reactor(startup).expect("the sizing fixture builds");
+        let case = format!("{inbound} inbound, {outbound} outbound, {connections} connections");
+        assert_eq!(
+            handle.serving.limits(),
+            v9::serving_limits(v9::SERVE_PEER_OUTPUT_BYTES, peers, None),
+            "{case}"
+        );
+        assert_eq!(
+            handle.lifecycle.capacity(),
+            super::super::events::LIFECYCLE_SLOTS_PER_PEER * peers,
+            "{case}"
+        );
+    }
+}
+
+/// The test node builder sizes header sync from its own connection limit, as
+/// the production handler does.
+#[tokio::test]
+async fn the_test_node_sizes_header_sync_from_its_connection_limit() {
+    use crate::zakura::{testkit::ZakuraTestNode, ZakuraLocalLimits};
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
+    limits.max_connections = 16;
+    let node = ZakuraTestNode::builder(86500)
+        .limits(limits)
+        .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
+        .header_sync_driver(
+            network,
+            anchor,
+            FullStateFrontiers {
+                finalized_height: anchor.0,
+                verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
+            },
+            Some(anchor),
+        )
+        .spawn()
+        .await
+        .expect("the test node starts");
+    let handle = node.header_sync().expect("the node runs header sync");
+    let config = ZakuraHeaderSyncConfig::default().for_node_connections(16);
+
+    assert_eq!(
+        handle.serving.limits(),
+        v9::serving_limits(
+            v9::SERVE_PEER_OUTPUT_BYTES,
+            16,
+            config.node_serve_output_bytes
+        )
+    );
+    assert_eq!(
+        handle.lifecycle.capacity(),
+        super::super::events::LIFECYCLE_SLOTS_PER_PEER * 16
+    );
+}
+
 /// Past the cap the cooldown that ends first is evicted, never the one just
 /// started, and refreshing a held cooldown evicts nothing.
 #[tokio::test(start_paused = true)]

@@ -1527,9 +1527,34 @@ where
         mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
     ) -> Result<BlockTemplateResponse> {
+        self.build_mining_template_cancellable(
+            precomputed_coinbase,
+            miner_params,
+            chain_info,
+            long_poll_id,
+            mempool_txs,
+            submit_old,
+            Default::default(),
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_mining_template_cancellable(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
+        submit_old: Option<bool>,
+        cancellation: orchard::circuit::ProofCancellation,
+        speculative: bool,
+    ) -> Result<BlockTemplateResponse> {
         // An empty template with a completed coinbase has no proof work to queue.
         if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
-            return BlockTemplateResponse::new_internal(
+            return BlockTemplateResponse::new_internal_cancellable(
                 &self.network,
                 precomputed_coinbase,
                 miner_params,
@@ -1537,6 +1562,7 @@ where
                 long_poll_id,
                 mempool_txs,
                 submit_old,
+                cancellation.clone(),
             )
             .map_misc_error();
         }
@@ -1545,8 +1571,8 @@ where
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
         self.gbt
-            .run_template_build(move || {
-                BlockTemplateResponse::new_internal(
+            .run_template_build_with_priority(speculative, move || {
+                BlockTemplateResponse::new_internal_cancellable(
                     &network,
                     precomputed_coinbase,
                     &miner_params,
@@ -1554,6 +1580,7 @@ where
                     long_poll_id,
                     mempool_txs,
                     submit_old,
+                    cancellation.clone(),
                 )
             })
             .await?
@@ -1664,6 +1691,8 @@ where
         long_poll_id: types::long_poll::LongPollId,
         mempool_txs: Vec<zakura_chain::transaction::VerifiedUnminedTx>,
         mempool_tx_deps: mempool::TransactionDependencies,
+        cancellation: orchard::circuit::ProofCancellation,
+        speculative: bool,
     ) -> Result<BlockTemplateResponse> {
         use types::get_block_template::zip317::select_mempool_transactions;
 
@@ -1675,6 +1704,12 @@ where
             "selecting transactions for the template from the mempool"
         );
 
+        if cancellation.is_cancelled() {
+            return Err(ErrorObject::new(
+                crate::server::error::LegacyCode::Misc,
+                "template build superseded",
+            ));
+        }
         let height = chain_info.tip_height.next().map_misc_error()?;
 
         // Randomly select some mempool transactions.
@@ -1703,31 +1738,40 @@ where
             "selected transactions for the template from the mempool"
         );
 
-        self.build_mining_template(
+        self.build_mining_template_cancellable(
             None,
             miner_params,
             chain_info,
             long_poll_id,
             mempool_txs,
             None,
+            cancellation,
+            speculative,
         )
         .await
     }
 
-    /// Starts building the full template for a new tip in a detached task, and shares it.
-    ///
-    /// A long poll that sees the new tip returns a template without transactions, and the miner's
-    /// next long poll asks for the full one. Building it now overlaps the build with that round
-    /// trip, and the shared slot gives every long poll on this tip the one result. A failed build
-    /// leaves the slot empty, so those long polls build their own templates.
+    /// Coalesces speculative work for the current parent, independently of RPC requests.
+    /// Completed work remains available while a replacement is being constructed.
     fn start_shared_template_build(
         &self,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         revision: u64,
-    ) {
-        let Some(build) = self.gbt.shared_template.claim(chain_info.tip_hash) else {
-            return;
+    ) -> bool {
+        let validity = match self.mempool_change.as_ref() {
+            Some(changes) => match changes.validity_revision() {
+                Some(revision) => revision,
+                None => return false,
+            },
+            None => 0,
+        };
+        let Some(build) = self
+            .gbt
+            .shared_template
+            .claim_snapshot(chain_info.tip_hash, validity)
+        else {
+            return false;
         };
         let rpc = self.clone();
         let miner_params = miner_params.clone();
@@ -1749,6 +1793,8 @@ where
                         long_poll_id,
                         mempool_txs,
                         mempool_tx_deps,
+                        build.cancellation(),
+                        true,
                     )
                     .await
                 }
@@ -1766,7 +1812,12 @@ where
                 };
 
                 let state = rpc.gbt.template_rejections.borrow().clone();
-                if !state.needs_fallback()
+                let snapshot_current = rpc
+                    .mempool_change
+                    .as_ref()
+                    .is_none_or(|changes| changes.validity_revision() == Some(validity));
+                if snapshot_current
+                    && !state.needs_fallback()
                     && !rpc.template_superseded(
                         &state,
                         chain_info.tip_hash,
@@ -1779,6 +1830,140 @@ where
             }
             .in_current_span(),
         );
+        true
+    }
+
+    /// Proactively refreshes mining work without requiring an incoming RPC request.
+    /// The owning RPC task must poll this future for its entire lifetime.
+    pub(crate) async fn run_proactive_templates(&self) {
+        let Some(miner_params) = self.gbt.miner_params() else {
+            return std::future::pending().await;
+        };
+        let Some(changes) = self.mempool_change.as_ref() else {
+            return std::future::pending().await;
+        };
+        struct CancelOnDrop(types::get_block_template::shared_template::SharedTemplate);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.invalidate();
+            }
+        }
+        let _shutdown = CancelOnDrop(self.gbt.shared_template.clone());
+        let mut tip = self.latest_chain_tip.clone();
+        let mut mempool = changes.subscribe();
+        let mut rejections = self.gbt.template_rejections.subscribe();
+        let mut dirty = true;
+        let mut previous = None;
+        loop {
+            tip.mark_best_tip_seen();
+            let completed = self.gbt.shared_template.subscribe();
+            let chain_info = tokio::select! {
+                result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    types::get_block_template::fetch_chain_info(self.read_state.clone()),
+                ) => result,
+                result = tip.best_tip_changed() => {
+                    self.gbt.shared_template.invalidate();
+                    if result.is_err() { return; }
+                    dirty = true;
+                    continue;
+                }
+                change = mempool.recv() => {
+                    match change {
+                        Ok(change) if change.is_added() => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        _ => self.gbt.shared_template.invalidate(),
+                    }
+                    dirty = true;
+                    continue;
+                }
+                result = rejections.changed() => {
+                    if result.is_err() { return; }
+                    if previous.as_ref().is_some_and(|(_, _, revision)| *revision != rejections.borrow().revision) {
+                        self.gbt.shared_template.invalidate();
+                        dirty = true;
+                    }
+                    continue;
+                }
+            };
+            if let Ok(Ok(chain_info)) = chain_info {
+                let current = (
+                    chain_info.tip_hash,
+                    changes.validity_revision(),
+                    rejections.borrow().revision,
+                );
+                if current.1.is_some() && previous.as_ref().is_some_and(|old| old != &current) {
+                    self.gbt.shared_template.invalidate();
+                    dirty = true;
+                }
+                if current.1.is_some() {
+                    previous = Some(current);
+                }
+                if dirty
+                    && types::get_block_template::check_synced_to_tip(&self.network, tip.clone())
+                        .is_ok()
+                {
+                    if let Some(state) =
+                        self.track_template_parent(chain_info.tip_hash, &mut rejections)
+                    {
+                        if !state.needs_fallback()
+                            && self.start_shared_template_build(
+                                miner_params,
+                                &chain_info,
+                                state.revision,
+                            )
+                        {
+                            dirty = false;
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                result = tip.best_tip_changed() => {
+                    self.gbt.shared_template.invalidate();
+                    if result.is_err() { return; }
+                    dirty = true;
+                }
+                change = mempool.recv() => {
+                    match change {
+                        Ok(change) if change.is_added() => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        _ => self.gbt.shared_template.invalidate(),
+                    }
+                    dirty = true;
+                }
+                result = rejections.changed() => {
+                    if result.is_err() { return; }
+                    // Preparation notifications do not invalidate work; compare revisions above.
+                }
+                _ = completed => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => { dirty = true; }
+            }
+        }
+    }
+
+    /// Returns populated work without fetching or waiting for the mempool.
+    fn ready_populated_template(
+        &self,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        client_id: Option<&types::long_poll::LongPollId>,
+    ) -> Option<GetBlockTemplateResponse> {
+        let changes = self.mempool_change.as_ref()?;
+        let validity = changes.validity_revision()?;
+        let template = self
+            .gbt
+            .shared_template
+            .ready(chain_info.tip_hash, validity)?;
+        if template.max_time != chain_info.max_time
+            || template.cur_time < chain_info.min_time
+            || chain_info.cur_time > template.max_time
+            || Some(&template.long_poll_id) == client_id
+            || changes.validity_revision() != Some(validity)
+        {
+            return None;
+        }
+        let submit_old = client_id.map(|id| template.long_poll_id.submit_old(id));
+        self.reuse_shared_template(&template, submit_old)
     }
 
     /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
@@ -1790,6 +1975,16 @@ where
         template: &BlockTemplateResponse,
         submit_old: Option<bool>,
     ) -> Option<GetBlockTemplateResponse> {
+        if let Some(changes) = &self.mempool_change {
+            let validity = changes.validity_revision()?;
+            let ready = self
+                .gbt
+                .shared_template
+                .ready(template.previous_block_hash, validity)?;
+            if ready.work_id() != template.work_id() {
+                return None;
+            }
+        }
         {
             let state = self.gbt.template_rejections.borrow();
             if state.needs_fallback()
@@ -1821,6 +2016,9 @@ where
         rejection_state: &types::get_block_template::TemplateRejections,
         client_long_poll_id: Option<&types::long_poll::LongPollId>,
     ) -> Result<Option<GetBlockTemplateResponse>> {
+        if let Some(template) = self.ready_populated_template(chain_info, client_long_poll_id) {
+            return Ok(Some(template));
+        }
         let mut long_poll_id = LongPollInput::new(
             chain_info.tip_height,
             chain_info.tip_hash,
@@ -3750,6 +3948,12 @@ where
                     continue;
                 };
 
+                if client_long_poll_id.is_none() {
+                    if let Some(template) = self.ready_populated_template(&chain_info, None) {
+                        return Ok(template);
+                    }
+                }
+
                 // A long poll whose ID names an older tip has missed the tip change it waits for:
                 // the client sent it after the change, or this loop came back around after it.
                 // Answer the way the tip arm below does, instead of waiting for the mempool to
@@ -4029,17 +4233,23 @@ where
             // for a template now, and a template past its time range must be rebuilt, so neither
             // shares.
             let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
-                if let Some(template) = self
-                    .gbt
-                    .shared_template
-                    .wait_for(chain_info.tip_hash, &server_long_poll_id)
-                    .await
-                {
+                let mut changed_tip = latest_chain_tip.clone();
+                let shared = tokio::select! {
+                    _ = changed_tip.best_tip_changed() => continue 'rebuild,
+                    _ = template_rejections.changed() => continue 'rebuild,
+                    result = tokio::time::timeout(Duration::from_secs(30), self.gbt.shared_template.wait_for(chain_info.tip_hash, &server_long_poll_id)) => result.ok().flatten(),
+                };
+                if let Some(template) = shared {
                     if let Some(template) = self.reuse_shared_template(&template, submit_old) {
                         return Ok(template);
                     }
                 }
-                self.gbt.shared_template.claim(chain_info.tip_hash)
+                // Only the proactive builder captures validity before fetching its snapshot.
+                // Callers without freshness notifications retain request-driven sharing.
+                self.mempool_change
+                    .is_none()
+                    .then(|| self.gbt.shared_template.claim(chain_info.tip_hash))
+                    .flatten()
             } else {
                 None
             };
@@ -4056,6 +4266,8 @@ where
                     server_long_poll_id,
                     mempool_txs,
                     mempool_tx_deps,
+                    Default::default(),
+                    false,
                 )
                 .await?;
             // Waiting long polls can take the template before this caller's checks below, because

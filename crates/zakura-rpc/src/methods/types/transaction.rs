@@ -365,6 +365,26 @@ impl TransactionTemplate<NegativeOrZero> {
         txs_fee: Amount<NonNegative>,
         nsm_value_balance: Option<Amount<NonNegative>>,
     ) -> Result<Self, TransactionError> {
+        Self::new_coinbase_cancellable(
+            net,
+            height,
+            miner_params,
+            txs_fee,
+            nsm_value_balance,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Constructs a coinbase with cancellation checkpoints in its proof computation.
+    pub(crate) fn new_coinbase_cancellable(
+        net: &Network,
+        height: Height,
+        miner_params: &MinerParams,
+        txs_fee: Amount<NonNegative>,
+        nsm_value_balance: Option<Amount<NonNegative>>,
+        cancellation: ::orchard::circuit::ProofCancellation,
+    ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net, nsm_value_balance)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
         let miner_fees = miner_fee_share(height, net, txs_fee);
@@ -438,8 +458,9 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        let build_result =
-            builder.build_coinbase(rand_10::rng(), &NoSaplingProver, &NoSaplingProver)?;
+        let build_result = builder
+            .with_proof_cancellation(cancellation)
+            .build_coinbase(rand_10::rng(), &NoSaplingProver, &NoSaplingProver)?;
 
         let tx = build_result.transaction();
         let mut data = vec![];

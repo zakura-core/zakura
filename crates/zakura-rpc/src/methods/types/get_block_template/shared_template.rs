@@ -1,106 +1,205 @@
-//! One full block template per tip, shared by every long poll that asks for the same work.
-
-use std::sync::Arc;
-
-use tokio::sync::watch;
-use zakura_chain::block;
+//! Completed mining work and ownership of one coalesced speculative build.
 
 use super::BlockTemplateResponse;
 use crate::methods::types::long_poll::LongPollId;
+use orchard::circuit::ProofCancellation;
+use std::sync::Arc;
+use tokio::sync::watch;
+use zakura_chain::block;
 
-/// The newest full template, or the tip that a build for one is running on.
-///
-/// A caller takes the template only when its long poll ID matches the caller's own. The ID names
-/// the tip, the time limit, the mempool transactions and the rejection revision, so a template
-/// built for an older tip or an older mempool never matches. A build on a newer tip replaces the
-/// slot, and a build that finishes after that is dropped.
 #[derive(Clone, Debug)]
-pub(crate) struct SharedTemplate(watch::Sender<SharedTemplateState>);
+pub(crate) struct SharedTemplate(watch::Sender<State>);
+
+#[derive(Clone, Debug)]
+struct Running {
+    parent: block::Hash,
+    generation: Arc<()>,
+    cancellation: ProofCancellation,
+}
+
+#[derive(Clone, Debug)]
+struct Ready {
+    template: Arc<BlockTemplateResponse>,
+    validity: u64,
+}
 
 #[derive(Debug, Default)]
-enum SharedTemplateState {
-    #[default]
-    Empty,
-    Building(block::Hash),
-    Ready(Arc<BlockTemplateResponse>),
+struct State {
+    running: Option<Running>,
+    ready: Option<Ready>,
 }
 
 impl Default for SharedTemplate {
     fn default() -> Self {
-        Self(watch::Sender::new(SharedTemplateState::default()))
+        Self(watch::Sender::new(State::default()))
     }
 }
 
 impl SharedTemplate {
-    /// Claims the build on `tip`, unless another build on `tip` is already running.
-    pub(crate) fn claim(&self, tip: block::Hash) -> Option<SharedTemplateBuild> {
+    pub(crate) fn subscribe(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut receiver = self.0.subscribe();
+        async move {
+            let _ = receiver.changed().await;
+        }
+    }
+
+    /// Invalidates completed work and signals cancellation without releasing CPU capacity.
+    pub(crate) fn invalidate(&self) {
+        self.0.send_modify(|state| {
+            if let Some(running) = &state.running {
+                running.cancellation.cancel();
+            }
+            state.ready = None;
+        });
+    }
+
+    /// Takes immediately available populated work from the current validity revision.
+    pub(crate) fn ready(
+        &self,
+        parent: block::Hash,
+        validity: u64,
+    ) -> Option<Arc<BlockTemplateResponse>> {
+        self.0
+            .borrow()
+            .ready
+            .as_ref()
+            .filter(|ready| {
+                ready.validity == validity
+                    && ready.template.previous_block_hash == parent
+                    && !ready.template.transactions.is_empty()
+            })
+            .map(|ready| ready.template.clone())
+    }
+
+    pub(crate) fn claim(&self, parent: block::Hash) -> Option<SharedTemplateBuild> {
+        self.claim_snapshot(parent, 0)
+    }
+
+    /// Retains completed work while refreshing; a cancelled build still owns its CPU permit.
+    pub(crate) fn claim_snapshot(
+        &self,
+        parent: block::Hash,
+        validity: u64,
+    ) -> Option<SharedTemplateBuild> {
+        let running = Running {
+            parent,
+            generation: Arc::new(()),
+            cancellation: ProofCancellation::default(),
+        };
         let mut claimed = false;
         self.0.send_if_modified(|state| {
-            claimed = !matches!(state, SharedTemplateState::Building(building) if *building == tip);
-            if claimed {
-                *state = SharedTemplateState::Building(tip);
+            if let Some(active) = &state.running {
+                if active.parent == parent && !active.cancellation.is_cancelled() {
+                    return false;
+                }
+                active.cancellation.cancel();
             }
-            claimed
+            state.running = Some(running.clone());
+            claimed = true;
+            true
         });
         claimed.then(|| SharedTemplateBuild {
             slot: self.0.clone(),
-            tip,
+            running,
+            validity,
         })
     }
 
-    /// Returns the template with `long_poll_id`, waiting while a build on `tip` is running.
-    ///
-    /// Returns `None` when the slot holds no such template and no build on `tip` is running, so
-    /// the caller builds its own.
     pub(crate) async fn wait_for(
         &self,
-        tip: block::Hash,
-        long_poll_id: &LongPollId,
+        parent: block::Hash,
+        id: &LongPollId,
     ) -> Option<Arc<BlockTemplateResponse>> {
         let mut slot = self.0.subscribe();
         loop {
-            match &*slot.borrow_and_update() {
-                SharedTemplateState::Ready(template) if template.long_poll_id == *long_poll_id => {
-                    return Some(template.clone());
+            {
+                let state = slot.borrow_and_update();
+                if let Some(ready) = &state.ready {
+                    if ready.template.long_poll_id == *id {
+                        return Some(ready.template.clone());
+                    }
                 }
-                SharedTemplateState::Building(building) if *building == tip => {}
-                _ => return None,
+                if !state.running.as_ref().is_some_and(|running| {
+                    running.parent == parent && !running.cancellation.is_cancelled()
+                }) {
+                    return None;
+                }
             }
-            // Every build ends by publishing or by emptying the slot when its claim drops, and
-            // `self` keeps the channel open.
             slot.changed().await.ok()?;
         }
     }
 }
 
-/// A running build's claim on the [`SharedTemplate`] slot.
-///
-/// Dropping the claim without publishing empties the slot, so the callers waiting for the build
-/// build their own templates.
 pub(crate) struct SharedTemplateBuild {
-    slot: watch::Sender<SharedTemplateState>,
-    tip: block::Hash,
+    slot: watch::Sender<State>,
+    running: Running,
+    validity: u64,
 }
 
 impl SharedTemplateBuild {
-    /// Shares `template`, unless a build on another tip has replaced this one.
-    pub(crate) fn publish(self, template: BlockTemplateResponse) {
-        self.replace(SharedTemplateState::Ready(Arc::new(template)));
+    pub(crate) fn cancellation(&self) -> ProofCancellation {
+        self.running.cancellation.clone()
     }
 
-    fn replace(&self, next: SharedTemplateState) {
+    pub(crate) fn publish(self, template: BlockTemplateResponse) {
         self.slot.send_if_modified(|state| {
-            let claimed = matches!(state, SharedTemplateState::Building(tip) if *tip == self.tip);
-            if claimed {
-                *state = next;
+            if !self.owns(state) || self.running.cancellation.is_cancelled() {
+                return false;
             }
-            claimed
+            state.ready = Some(Ready {
+                template: Arc::new(template),
+                validity: self.validity,
+            });
+            state.running = None;
+            true
         });
+    }
+
+    fn owns(&self, state: &State) -> bool {
+        state
+            .running
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.generation, &self.running.generation))
     }
 }
 
 impl Drop for SharedTemplateBuild {
     fn drop(&mut self) {
-        self.replace(SharedTemplateState::Empty);
+        self.running.cancellation.cancel();
+        self.slot.send_if_modified(|state| {
+            if !self.owns(state) {
+                return false;
+            }
+            state.running = None;
+            true
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returning_to_a_parent_does_not_restore_old_build_ownership() {
+        let shared = SharedTemplate::default();
+        let parent = block::Hash([1; 32]);
+        let old = shared.claim(parent).unwrap();
+        let old_signal = old.cancellation();
+        shared.invalidate();
+        let replacement = shared.claim(parent).unwrap();
+        assert!(old_signal.is_cancelled());
+        drop(old);
+        assert!(shared.claim(parent).is_none());
+        assert!(!replacement.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn dropping_a_build_cancels_its_cpu_work() {
+        let shared = SharedTemplate::default();
+        let build = shared.claim(block::Hash([1; 32])).unwrap();
+        let cancellation = build.cancellation();
+        drop(build);
+        assert!(cancellation.is_cancelled());
     }
 }

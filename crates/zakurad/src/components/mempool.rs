@@ -30,7 +30,7 @@ use std::{
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tower::{
     buffer::Buffer,
     timeout::Timeout,
@@ -616,7 +616,7 @@ pub struct Mempool {
 
     /// Sender part of a gossip transactions channel.
     /// Used to broadcast transaction ids to peers.
-    transaction_sender: broadcast::Sender<MempoolChange>,
+    transaction_sender: MempoolTxSubscriber,
 
     /// Peers whose transactions are ignored after they relayed invalid
     /// transactions. Shared with the download tasks, and kept across mempool
@@ -670,7 +670,7 @@ impl Mempool {
             read_state,
             _state_guard: state,
             tx_verifier,
-            transaction_sender,
+            transaction_sender: transaction_subscriber.clone(),
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
             unconditional_peers,
@@ -759,6 +759,7 @@ impl Mempool {
     /// Replaces the active state with a freshly-initialised [`ActiveState::Enabled`],
     /// using `tip_action`'s best tip hash as the `last_seen_tip_hash`.
     fn enable_at_tip(&mut self, tip_action: &TipAction, reason: &'static str) {
+        self.transaction_sender.invalidate();
         let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
 
         info!(?tip_height, reason, "activating mempool");
@@ -833,6 +834,7 @@ impl Mempool {
                             .send(MempoolChange::invalidated(invalidated_ids));
                     }
                 }
+                self.transaction_sender.invalidate();
                 self.active_state = ActiveState::Disabled;
             }
 
@@ -858,6 +860,7 @@ impl Service<Request> for Mempool {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let _update = self.transaction_sender.begin_update();
         let is_caught_up_to_start = self.is_caught_up_to_start();
         let should_check_tip = self.is_enabled() || is_caught_up_to_start;
         let tip_action = should_check_tip
@@ -1120,6 +1123,11 @@ impl Service<Request> for Mempool {
 
                     invalidated_ids.extend(expired_transactions);
                 }
+            }
+
+            // Retain invalidation even if an earlier broadcast fails without receivers.
+            if !invalidated_ids.is_empty() || !mined_mempool_ids.is_empty() {
+                self.transaction_sender.invalidate();
             }
 
             // Send transactions that were not rejected nor expired to peers and RPC listeners.

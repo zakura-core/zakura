@@ -1969,3 +1969,40 @@ async fn shielded_template_rewards() {
     );
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }
+
+#[test]
+fn proactive_worker_builds_before_requests_and_serves_populated_work_first() {
+    mining_runtime(async {
+        let current = chain_info(3, 2, 0);
+        let (info_tx, info) = watch::channel(current.clone());
+        let (rpc, _tip_sender, _, _) = shared_template_rpc(info, mempool_txs(1));
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let rpc = rpc.with_mempool_change(mempool::MempoolTxSubscriber::new(sender));
+        let worker_rpc = rpc.clone();
+        let worker = tokio::spawn(async move { worker_rpc.run_proactive_templates().await });
+        // No getblocktemplate call triggers this construction.
+        bounded(async {
+            loop {
+                let changed = rpc.gbt.shared_template.subscribe();
+                if rpc.gbt.shared_template.ready(current.tip_hash, 0).is_some() {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        let old_id = LongPollInput::new(Height(2), block::Hash([1; 32]), current.max_time, vec![])
+            .generate_id();
+        let response = bounded(long_poll(&rpc, old_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(!response.transactions.is_empty());
+        assert_eq!(response.previous_block_hash, current.tip_hash);
+        assert_eq!(response.submit_old, Some(false));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(info_tx);
+    });
+}

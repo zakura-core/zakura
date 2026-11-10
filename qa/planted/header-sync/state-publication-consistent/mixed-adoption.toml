@@ -1,0 +1,10 @@
+# The reactor adopts a new generation with the previous snapshot's tip and
+# score, so on the quiet-reset witness its adoption of the invalidation
+# matches no engine record. The reactor's watch reads decide when it adopts,
+# so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.plan"

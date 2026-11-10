@@ -52,6 +52,7 @@ use super::{
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
+        publication::PublicationEvidence,
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
@@ -74,11 +75,11 @@ use crate::{
         header_sync::{
             chunk_budget_bound, commit_only_authorized, expected_chain_selected,
             outstanding_end_violations, outstanding_work_bounded, peer_retirement_progress,
-            reset_invalidates_work, retirement_end_violations, stale_chain_effect_inert,
-            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
-            AdoptionView, AuthorityView, BudgetView, ChainView, ForkView, HoldWakeView,
-            OutstandingView, ResetView, RetirementView, StaleView, TeardownView, WakeView,
-            OUTSTANDING_WORK_BOUNDED,
+            publication_end_violations, reset_invalidates_work, retirement_end_violations,
+            stale_chain_effect_inert, stale_completion_inert, state_publication_consistent,
+            teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
+            BudgetView, ChainView, ForkView, HoldWakeView, OutstandingView, PublicationView,
+            ResetView, RetirementView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -706,6 +707,9 @@ pub struct Ports {
     /// When the node's fork-choice check first applied, which its tap finds
     /// during the run.
     pub fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, and the tip it
+    /// still owes, which its tap finds during the run.
+    pub publication: PublicationEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -744,6 +748,8 @@ pub struct Storage {
     outstanding: OutstandingEvidence,
     /// When the node's fork-choice check first applied, from its tap.
     fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, from its tap.
+    publication: PublicationEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -808,6 +814,22 @@ pub struct StorageView {
     /// When the node's fork-choice check first applied. A harness that
     /// doesn't run the check leaves it never applied.
     pub fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, and the tip it
+    /// still owes. A harness that doesn't run the check leaves it never
+    /// applied.
+    pub publication: PublicationEvidence,
+}
+
+impl PublicationView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::publication`].
+    fn publication(&self) -> &PublicationEvidence {
+        &self.publication
+    }
 }
 
 impl ForkView for StorageView {
@@ -984,26 +1006,31 @@ impl HasView for Storage {
             outstanding: self.outstanding.clone(),
             recovery: self.recovery.clone(),
             fork_choice: self.fork_choice.clone(),
+            publication: self.publication.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption, fault and round
-    /// evidence, for the tip, penalty and teardown rules.
+    /// Records the run's end in the node's adoption, fault, round and
+    /// publication evidence, for the tip, penalty and teardown rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
         self.rounds.end(end);
         self.outstanding.end(end);
         self.retirement.end(end);
+        self.publication
+            .end(super::header_node::adoption::settled(end));
     }
 
     /// [`fault_end_violations`], [`teardown_end_violations`],
-    /// [`outstanding_end_violations`] and [`retirement_end_violations`].
+    /// [`outstanding_end_violations`], [`retirement_end_violations`] and
+    /// [`publication_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
         found.extend(outstanding_end_violations(&self.outstanding));
         found.extend(retirement_end_violations(&self.retirement));
+        found.extend(publication_end_violations(&self.publication));
         found
     }
 
@@ -1135,6 +1162,7 @@ impl Subsystem for Storage {
             recovery: RecoveryEvidence::default(),
             delayed_page: None,
             fork_choice: ForkChoiceEvidence::default(),
+            publication: PublicationEvidence::default(),
         }
     }
 
@@ -1193,6 +1221,7 @@ impl Subsystem for Storage {
             ports.preloaded_at,
             fork_fixture(scenario),
         );
+        tap.watch_publication(ports.publication.clone());
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1290,6 +1319,7 @@ impl Subsystem for Storage {
             authority: ports.authority,
             outstanding: ports.outstanding,
             fork_choice: ports.fork_choice,
+            publication: ports.publication,
             ends,
             stamps,
             faults,
@@ -1544,8 +1574,9 @@ impl HasView for HeaderWire {
             // The wire harness doesn't register outstanding-work-bounded.
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
-            // The wire harness doesn't judge fork choice.
+            // The wire harness doesn't judge fork choice or publication.
             fork_choice: ForkChoiceEvidence::default(),
+            publication: PublicationEvidence::default(),
         }
     }
 
@@ -2047,9 +2078,10 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
 /// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
 /// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`],
-/// [`COMMIT_ONLY_AUTHORIZED`], [`PEER_RETIREMENT_PROGRESS`] and
-/// [`EXPECTED_CHAIN_SELECTED`], all active. A test harness that wraps
-/// [`Storage`] with its view registers them too.
+/// [`COMMIT_ONLY_AUTHORIZED`], [`PEER_RETIREMENT_PROGRESS`],
+/// [`EXPECTED_CHAIN_SELECTED`] and [`STATE_PUBLICATION_CONSISTENT`], all
+/// active. A test harness that wraps [`Storage`] with its view registers
+/// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
@@ -2059,6 +2091,7 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
 /// [`PEER_RETIREMENT_PROGRESS`]: crate::domain::header_sync::PEER_RETIREMENT_PROGRESS
 /// [`EXPECTED_CHAIN_SELECTED`]: crate::domain::header_sync::EXPECTED_CHAIN_SELECTED
+/// [`STATE_PUBLICATION_CONSISTENT`]: crate::domain::header_sync::STATE_PUBLICATION_CONSISTENT
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -2091,6 +2124,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         outstanding_work_bounded(),
         peer_retirement_progress(),
         expected_chain_selected(),
+        state_publication_consistent(),
     ]
 }
 
@@ -2582,6 +2616,7 @@ mod tests {
                 outstanding: OutstandingEvidence::default(),
                 recovery: RecoveryEvidence::default(),
                 fork_choice: ForkChoiceEvidence::default(),
+                publication: PublicationEvidence::default(),
             }
         }
     }

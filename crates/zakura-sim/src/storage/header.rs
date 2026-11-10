@@ -107,6 +107,10 @@ pub struct HeaderStorage {
     /// of the fact that carried it, or 0 for a harness commit's, which no
     /// fact carries, until [`take_runs`](Self::take_runs) takes them.
     runs: Vec<(u64, Arc<EngineRun>)>,
+    /// Each snapshot the port's engine sent on its selected-chain watch
+    /// since the observation before the last, until
+    /// [`take_publications`](Self::take_publications) takes them.
+    publications: Vec<zakura_header_chain::EngineSnapshot>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -236,6 +240,7 @@ impl HeaderStorage {
             id,
             attributions: FaultAttributions::default(),
             runs: Vec::new(),
+            publications: Vec::new(),
         }
     }
 
@@ -721,6 +726,8 @@ impl ActionSource for HeaderStorage {
         // Only this observation's runs are kept, so a run no tap takes is
         // dropped at the next one.
         self.runs.clear();
+        // Taken every observation, so a run no tap reads keeps none.
+        self.publications = self.port.engine().take_publications();
         let actual = self.port.owner_state();
         // A model failure is returned only once the facts are logged and the
         // checkpoint names this step, so the run's evidence check passes and
@@ -780,6 +787,12 @@ impl HeaderStorage {
     /// fact that carried it, or 0 for a harness commit's.
     pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
         std::mem::take(&mut self.runs)
+    }
+
+    /// Each snapshot the port's engine sent on its selected-chain watch in
+    /// the last observation's window, in order: since the observation before.
+    pub(crate) fn take_publications(&mut self) -> Vec<zakura_header_chain::EngineSnapshot> {
+        std::mem::take(&mut self.publications)
     }
 }
 

@@ -8,9 +8,10 @@
 //! drain, which bounds how far a run got, and, once the run ends, whether it
 //! settled.
 //!
-//! [`AdoptionEvidence::generation`], [`AdoptionEvidence::status`] and
-//! [`AdoptionEvidence::tip`] check hdr-4's adopted-state rules over the
-//! facts. A rule whose deadline the run didn't reach is
+//! [`AdoptionEvidence::generation`] and [`AdoptionEvidence::status`]
+//! check hdr-4's adopted-state rules over the facts. Its tip rule is
+//! `header-sync/state-publication-consistent`'s
+//! ([`super::publication`]). A rule whose deadline the run didn't reach is
 //! [`Acceptance::Inconclusive`].
 
 use std::{
@@ -535,62 +536,6 @@ impl AdoptionEvidence {
         Acceptance::Holds
     }
 
-    /// The tip rule: every adoption that changes the selected tip publishes
-    /// it on the tip watch before the next adoption, and every publication
-    /// names the latest adopted tip and reaches a receiver. The harness holds
-    /// the watch's receiver for the whole run, so a send with none is a break.
-    /// Virtual time isn't a deadline here, since a harness may hold the
-    /// reactor's task (`Sim::hold_tasks`) while time moves.
-    ///
-    /// The reactor adopts and publishes in one synchronous call, but the
-    /// watch send is a preemption point between them. A tip still owed when
-    /// a settled run ends (see [`AdoptionEvidence::end`]) is therefore a
-    /// break, since no task is left partway through that call. A tip still
-    /// owed at any other end, or before the run has ended, is inconclusive.
-    pub fn tip(&self) -> Acceptance {
-        let store = self.store();
-        let mut adopted: Option<Frontier> = None;
-        let mut owed: Option<(Frontier, Duration)> = None;
-        for stamped in &store.facts {
-            match &stamped.fact {
-                AdoptionFact::Adopted(adoption) => {
-                    if let Some((tip, at)) = owed {
-                        return unpublished(tip, at);
-                    }
-                    if adopted != Some(adoption.header_best) {
-                        owed = Some((adoption.header_best, stamped.at));
-                    }
-                    adopted = Some(adoption.header_best);
-                }
-                AdoptionFact::TipPublished { tip, delivered } => {
-                    if !delivered {
-                        return Acceptance::Violated(format!(
-                            "TipLost: {tip:?} was published with no live receiver"
-                        ));
-                    }
-                    if adopted.is_some_and(|adopted| adopted != *tip) {
-                        return Acceptance::Violated(format!(
-                            "StaleTip: {tip:?} was published while the adopted tip is {adopted:?}"
-                        ));
-                    }
-                    owed = None;
-                }
-                _ => {}
-            }
-        }
-        match (owed, store.settled) {
-            (None, _) => Acceptance::Holds,
-            (Some((tip, at)), Some(true)) => unpublished(tip, at),
-            (Some((tip, at)), Some(false)) => Acceptance::Inconclusive(format!(
-                "the run stopped with {tip:?}, adopted at {at:?}, not yet published, \
-                 while a task could be partway through publishing it"
-            )),
-            (Some((tip, at)), None) => {
-                Acceptance::Inconclusive(format!("{tip:?}, adopted at {at:?}, isn't published yet"))
-            }
-        }
-    }
-
     /// The status rule. Every queued `Status` advertises the latest adoption.
     /// Each session in `sessions` is owed, while it lasts:
     ///
@@ -720,13 +665,6 @@ fn overdue(owed: &BTreeMap<u64, Owed>, now: Duration) -> Option<(u64, Duration)>
     })
 }
 
-/// The tip rule's break for `tip`, adopted at `at` and never published.
-fn unpublished(tip: Frontier, at: Duration) -> Acceptance {
-    Acceptance::Violated(format!(
-        "UnpublishedTip: the reactor adopted {tip:?} at {at:?} and published no tip for it"
-    ))
-}
-
 /// The status rule's break for `session`, owed a status fact by `due`.
 fn unsent(session: u64, due: Duration) -> Acceptance {
     Acceptance::Violated(format!(
@@ -815,14 +753,6 @@ mod tests {
         AdoptionFact::StatusDeferred {
             peer: peer(),
             session_id: 1,
-        }
-    }
-
-    /// `tip` published to a live receiver.
-    fn published(tip: Frontier) -> AdoptionFact {
-        AdoptionFact::TipPublished {
-            tip,
-            delivered: true,
         }
     }
 
@@ -1013,111 +943,6 @@ mod tests {
             );
             assert!(violates(&broken.generation(), "StaleGeneration"));
         }
-    }
-
-    /// A changed tip is owed before the next adoption, or by the end of a
-    /// settled run: published by then it holds, and otherwise it breaks. Owed
-    /// while the run goes on, or when it stops unsettled, is inconclusive, and
-    /// a publication after the end doesn't count. A stale or lost publication
-    /// breaks.
-    #[test]
-    fn a_changed_tip_is_owed_before_the_next_adoption() {
-        let (first, second) = (adoption(1, 1), adoption(2, 2));
-        let held = evidence(
-            vec![
-                (0, adopted(&first)),
-                (0, published(first.header_best)),
-                (5, adopted(&second)),
-                (5, published(second.header_best)),
-            ],
-            9,
-        );
-        assert_eq!(held.tip(), Acceptance::Holds);
-        // The same tip at a later version owes nothing.
-        let same = Adoption {
-            state_version: StateVersion::new(9),
-            ..first.clone()
-        };
-        let unchanged = evidence(
-            vec![
-                (0, adopted(&first)),
-                (0, published(first.header_best)),
-                (5, adopted(&same)),
-            ],
-            9,
-        );
-        assert_eq!(unchanged.tip(), Acceptance::Holds);
-
-        // Time alone owes nothing: only the next adoption or a settled end
-        // does.
-        let cut = evidence(vec![(0, adopted(&first))], 60_000);
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
-        let run_end = |outcome, drain| RunEnd {
-            outcome,
-            steps: 100,
-            violation: None,
-            drain,
-            harness: None,
-        };
-        let drained = |exhausted| {
-            Some(Drain {
-                steps: 10,
-                exhausted,
-            })
-        };
-        for settled in [
-            run_end(Outcome::Budget, drained(false)),
-            run_end(
-                Outcome::Idle {
-                    status: IdleStatus::Quiescent,
-                },
-                None,
-            ),
-        ] {
-            cut.end(&settled);
-            assert!(violates(&cut.tip(), "UnpublishedTip"), "{settled:?}");
-        }
-        // A drain cut off at its bound can leave the reactor partway through
-        // the call that adopts and publishes.
-        cut.end(&run_end(Outcome::Budget, drained(true)));
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
-        cut.end(&run_end(
-            Outcome::Idle {
-                status: IdleStatus::Deadlock,
-            },
-            None,
-        ));
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
-        held.end(&run_end(Outcome::Budget, drained(false)));
-        assert_eq!(held.tip(), Acceptance::Holds);
-        // Cleanup can finish the publication after the end, which changes
-        // nothing.
-        let frozen = evidence(vec![(0, adopted(&first))], 0);
-        frozen.end(&run_end(Outcome::Budget, drained(true)));
-        frozen.freeze();
-        frozen.record(Duration::ZERO, published(first.header_best));
-        assert!(matches!(frozen.tip(), Acceptance::Inconclusive(_)));
-        let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);
-        assert!(violates(&skipped.tip(), "UnpublishedTip"));
-        let stale = evidence(
-            vec![(0, adopted(&second)), (0, published(first.header_best))],
-            0,
-        );
-        assert!(violates(&stale.tip(), "StaleTip"));
-        let lost = evidence(
-            vec![
-                (0, adopted(&first)),
-                (
-                    0,
-                    AdoptionFact::TipPublished {
-                        tip: first.header_best,
-                        delivered: false,
-                    },
-                ),
-            ],
-            0,
-        );
-        assert!(violates(&lost.tip(), "TipLost"));
     }
 
     /// A session is owed its first status and each new one within their

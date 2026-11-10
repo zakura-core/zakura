@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 3df7185a65..6b985a2a72 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2625,6 +2625,16 @@ impl HeaderSyncReactor {
+         if self.committed_snapshot.as_ref() == Some(&snapshot) {
+             return;
+         }
++        // Mutation: a new generation is adopted with the previous tip.
++        let mut snapshot = snapshot;
++        if let Some(old) = self
++            .committed_snapshot
++            .as_ref()
++            .filter(|old| old.header_generation != snapshot.header_generation)
++        {
++            snapshot.frontiers.header_best = old.frontiers.header_best;
++            snapshot.header_best_score = old.header_best_score;
++        }
+         observe!(self, ReactorEvent::adopted(&snapshot));
+ 
+         self.state.bump_scheduling_revision();

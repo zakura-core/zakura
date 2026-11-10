@@ -71,8 +71,6 @@ const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 const HOLD: &str = "header-sync/hold-release-wakes";
 /// `header-sync/peer-retirement-progress`.
 const RETIREMENT: &str = "header-sync/peer-retirement-progress";
-/// `header-sync/expected-chain-selected`.
-const SELECTED: &str = "header-sync/expected-chain-selected";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
 /// `header-sync/bounded-adversary-progress`.
@@ -92,7 +90,7 @@ const HONEST: &str = "session/honest-never-punished";
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
-const STORAGE_REGISTERS: [&str; 13] = [
+const STORAGE_REGISTERS: [&str; 12] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -104,7 +102,6 @@ const STORAGE_REGISTERS: [&str; 13] = [
     CHAIN,
     COMMIT,
     RETIREMENT,
-    SELECTED,
     OUTSTANDING,
 ];
 
@@ -316,22 +313,10 @@ const CHAIN_CASES: [&str; 4] = [
     "reset-inside-status-floor ",
 ];
 /// Each authority witness's name, as its witness test prefixes its executions.
-const AUTHORITY_CASES: [&str; 4] = [
+const AUTHORITY_CASES: [&str; 3] = [
     "forks-sharing-a-header ",
     "multi-page-sync ",
     "relinked-mid-round ",
-    "harness-commit ",
-];
-/// Each fork-choice witness's name, as its witness test prefixes its
-/// executions.
-const SELECTED_CASES: [&str; 7] = [
-    "stronger-first ",
-    "stronger-last ",
-    "three-forks ",
-    "equal-work ",
-    "heavier-offered-to-longer ",
-    "invalidated-then-reconsidered ",
-    "harness-commit ",
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
@@ -378,17 +363,6 @@ const AUTHORITY_WITNESSES: HistoryRef = HistoryRef {
         "every_witness_holds_and_applies",
     ),
     case: "forks-sharing-a-header plan 0 of inputs(8, 256)",
-};
-
-/// The fork-choice witnesses, each holding and applying
-/// `expected-chain-selected`.
-const SELECTED_WITNESSES: HistoryRef = HistoryRef {
-    harness: STORAGE,
-    witness: sim_test(
-        "tests/header_chain_selected.rs",
-        "every_witness_holds_and_applies",
-    ),
-    case: "stronger-first plan 0 of inputs(8, 256)",
 };
 
 /// The committed outstanding-work witnesses, each holding and applying
@@ -768,7 +742,6 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         (&RESET_CASES[..], RESET_WITNESSES, RESET),
         (&CHAIN_CASES[..], CHAIN_WITNESSES, CHAIN),
         (&AUTHORITY_CASES[..], AUTHORITY_WITNESSES, COMMIT),
-        (&SELECTED_CASES[..], SELECTED_WITNESSES, SELECTED),
     ] {
         for prefix in cases {
             for case in plan_cases(prefix, "inputs(8, 256)", 8) {
@@ -923,7 +896,6 @@ pub fn witness_tests() -> Vec<TestRef> {
         OUTSTANDING_WITNESSES.witness,
         HOLD_WITNESSES.witness,
         RETIRE_WITNESSES.witness,
-        SELECTED_WITNESSES.witness,
         RECOVERY_WITNESS.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
@@ -1294,12 +1266,6 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
-            "insertion-bump-skipped-by-commit",
-            STORAGE,
-            &[RESET] as &'static [&'static str],
-            Found::AtStep,
-        ),
-        (
             "insertion-bump-skipped-held",
             STORAGE,
             &[RESET] as &'static [&'static str],
@@ -1474,12 +1440,6 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "corrupted-best-score",
-            STORAGE,
-            &[COMMIT] as &'static [&'static str],
-            Found::AtStep,
-        ),
-        (
-            "corrupted-best-score-by-commit",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1974,47 +1934,6 @@ fn hand_written_rows() -> Vec<Row> {
         &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS],
         retirement,
     ));
-
-    let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
-    for (index, (name, harness, set, found)) in [
-        (
-            "offer-by-height",
-            STORAGE,
-            &[SELECTED] as &'static [&'static str],
-            Found::AtStep,
-        ),
-        (
-            "score-corrupted",
-            STORAGE,
-            &[SELECTED] as &'static [&'static str],
-            Found::AtStep,
-        ),
-        (
-            "score-corrupted-by-commit",
-            STORAGE,
-            &[SELECTED] as &'static [&'static str],
-            Found::AtStep,
-        ),
-        (
-            "selector-prefers-length",
-            STORAGE,
-            &[SELECTED] as &'static [&'static str],
-            Found::AtStep,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        selected.extend(caught(
-            harness,
-            case(SELECTED, name),
-            set,
-            found,
-            G2,
-            index == 0,
-        ));
-    }
-    rows.push(sim_row(SELECTED, storage_harnesses, selected));
 
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);

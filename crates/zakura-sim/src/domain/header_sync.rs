@@ -17,6 +17,7 @@ use crate::{
         fork_choice::ForkChoiceEvidence,
         hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
+        publication::PublicationEvidence,
         retirement::{HandoffFact, RetirementEvidence},
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
@@ -750,6 +751,112 @@ where
 /// [`COMMIT_ONLY_AUTHORIZED`]'s trigger history: the check applied.
 fn authority_applied<V: AuthorityView>(view: &V, _: &ObservationLog) -> bool {
     view.authority().any()
+}
+
+/// The node's port publishes every committed engine state as it was, the
+/// reactor adopts only engine records, faithfully, and every `Status` and tip
+/// it publishes names its latest adoption.
+pub const STATE_PUBLICATION_CONSISTENT: &str = "header-sync/state-publication-consistent";
+
+/// What the publication check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait PublicationView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the node's publication check first applied, and the tip it
+    /// still owes.
+    fn publication(&self) -> &PublicationEvidence;
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`], as a harness whose view is a
+/// [`PublicationView`] registers it.
+pub fn state_publication_consistent<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: PublicationView,
+{
+    Property {
+        id: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
+        claim: "the node's port publishes every committed engine state on its selected-chain \
+                watch as committed, in the step that commits it; the reactor adopts only \
+                states some engine record holds, equal to that record; and every Status it \
+                queues and tip it publishes names its latest adoption",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_state_publication::<S>,
+        witness: Some(TriggerHistory::View(publication_applied::<S::View>)),
+    }
+}
+
+/// Checks [`STATE_PUBLICATION_CONSISTENT`] at the boundary after a step.
+///
+/// The tap's publication check
+/// ([`crate::harness::header_node::publication`]) judges each engine run's
+/// publication, each adoption against the engine's records, and each queued
+/// `Status` and tip publication against the latest adoption. A break the
+/// step's drain found violates at once. A tip still owed at a settled end
+/// is the harness's end violation ([`publication_end_violations`]), and
+/// one owed at any other end is inconclusive. It applies once a drain
+/// judged an adoption or a commit's publication, until a drain found a run
+/// corrupt, which is `commit-only-authorized`'s.
+fn check_state_publication<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: PublicationView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected =
+        "committed states are published and adopted as recorded, and advertised as adopted";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::StatePublicationConsistent])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    let publication = view.publication();
+    if publication.tainted_by(step) || !publication.applicable_by(step) {
+        return Verdict::NotApplicable;
+    }
+    // The adoption and its tip's publication are one synchronous call with
+    // a preemption point between, so a run cut off there hasn't shown it.
+    if publication.owed().is_some() {
+        cx.unsettled(Inconclusive::ObligationOpen);
+    }
+    Verdict::Holds
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`]'s trigger history: the check judged an
+/// adoption or a commit's publication.
+fn publication_applied<V: PublicationView>(view: &V, _: &ObservationLog) -> bool {
+    view.publication().any()
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`]'s end violation: a settled run ended
+/// with an adopted tip never published on the reactor's tip watch, though
+/// no task was left partway through publishing it (hdr-4's
+/// `UnpublishedTip`). A harness whose view is a [`PublicationView`] reports
+/// it from [`HasView::end_violations`], after it handed the run's end to
+/// [`PublicationEvidence::end`].
+pub fn publication_end_violations(publication: &PublicationEvidence) -> Vec<EndViolation> {
+    publication
+        .unpublished_at_settled_end()
+        .map(|tip| EndViolation {
+            property: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
+            expected: "every adopted tip is published before the run comes to rest".to_owned(),
+            actual: format!(
+                "UnpublishedTip: the run came to rest with {tip:?} adopted and never published"
+            ),
+        })
+        .into_iter()
+        .collect()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer

@@ -1,0 +1,33 @@
+diff --git a/crates/zakura-storage/src/header/adapter/full_state.rs b/crates/zakura-storage/src/header/adapter/full_state.rs
+index 203b713b5a..ea4a3b87cc 100644
+--- a/crates/zakura-storage/src/header/adapter/full_state.rs
++++ b/crates/zakura-storage/src/header/adapter/full_state.rs
+@@ -217,14 +217,26 @@ impl EnginePort {
+         let mut authority = PreparedAuthority::for_event(&request.event)?;
+         authority.retention_references = tips.clone();
+         authority.verified_tip = Some(verified);
+-        self.apply_locked(
++        // Mutation: an operator event installs its state and skips the
++        // selected-chain watch's publication.
++        let selected = self
++            .selected
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++        let applied = self.apply_locked(
+             &mut engine,
+             request,
+             &authority,
+             &tips,
+             Some(verified),
+             || {},
+-        )
++        );
++        *self
++            .selected
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = selected;
++        applied
+     }
+ 
+     /// Whether an operator invalidation of `target` is in force. See

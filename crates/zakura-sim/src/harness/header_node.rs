@@ -29,6 +29,7 @@ pub mod hold_wake;
 pub mod outstanding;
 mod pair;
 pub mod policy;
+pub mod publication;
 pub mod recovery;
 pub mod reservation;
 pub mod retirement;
@@ -483,7 +484,8 @@ impl ActionSource for PolicySource {
                         }),
                     &runs,
                 );
-                tap.engine_runs(&runs);
+                let publications = self.storage.take_publications();
+                tap.engine_runs(&runs, &publications);
                 tapped_effects = tap.take_effects();
                 queued = tap.take_queued();
                 tap.observe(log)

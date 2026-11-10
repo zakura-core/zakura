@@ -115,6 +115,7 @@ use super::{
     outstanding::{HeldHeaders, Outstanding, OutstandingEvidence},
     pair::{PairError, Pairer},
     policy::LinkEffect,
+    publication::{Publication, PublicationEvidence},
     reservation::ReservationEvidence,
     retirement::{Retirement, RetirementEvidence},
     round_life::{RoundLife, RoundLifeEvidence},
@@ -224,6 +225,9 @@ struct TapState {
     /// Checks that the engine selects a max-work eligible tip of what it
     /// holds. None until [`ReactorTap::watch_fork_choice`].
     fork_choice: Mutex<Option<ForkChoice>>,
+    /// Checks that committed states are published and adopted as they were.
+    /// None until [`ReactorTap::watch_publication`].
+    publication: Mutex<Option<Publication>>,
     /// Checks rounds' owner binding and pages' paths. None until
     /// [`ReactorTap::watch_authority`].
     authority: Mutex<Option<Authority>>,
@@ -474,6 +478,20 @@ impl TapState {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::ExpectedChainSelected,
+                detail,
+            });
+        }
+        let published = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|publication| publication.drain(step))
+            .unwrap_or_default();
+        for detail in published {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::StatePublicationConsistent,
                 detail,
             });
         }
@@ -910,6 +928,14 @@ impl TapState {
             {
                 authority.observe(&event, on_reactor, stale_handler);
             }
+            if let Some(publication) = state
+                .publication
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                publication.observe(&event, on_reactor);
+            }
             if let Some(selection) = state
                 .fork_choice
                 .lock()
@@ -1254,6 +1280,7 @@ impl ReactorTap {
                 chain_effect: Mutex::default(),
                 outstanding: Mutex::default(),
                 fork_choice: Mutex::default(),
+                publication: Mutex::default(),
                 authority: Mutex::default(),
                 retirement: Mutex::default(),
             }))
@@ -1305,14 +1332,17 @@ impl ReactorTap {
         (observer, tap)
     }
 
-    /// Hands the authority and fork-choice checks each apply's, reset's and
-    /// harness commit's engine run that the header storage source just
-    /// logged, in order. A run the authority check's commit-contents rules
-    /// find corrupt taints fork choice from then on
-    /// ([`super::fork_choice`]).
+    /// Hands the authority, fork-choice and publication checks each apply's,
+    /// reset's and harness commit's engine run that the header storage
+    /// source just logged, in order, and the publication check the port's
+    /// `publications` on its selected-chain watch in the same observation.
+    /// A run the authority check's commit-contents rules find corrupt
+    /// taints fork choice and publication from then on
+    /// ([`super::fork_choice`], [`super::publication`]).
     pub(crate) fn engine_runs(
         &self,
         runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
+        publications: &[zakura_header_chain::EngineSnapshot],
     ) {
         let mut authority = self
             .state
@@ -1324,6 +1354,11 @@ impl ReactorTap {
             .fork_choice
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let mut publication = self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         for (_, run) in runs {
             let corrupt = authority
                 .as_mut()
@@ -1331,6 +1366,12 @@ impl ReactorTap {
             if let Some(selection) = selection.as_mut() {
                 selection.run(run, corrupt);
             }
+            if let Some(publication) = publication.as_mut() {
+                publication.run(run, corrupt);
+            }
+        }
+        if let Some(publication) = publication.as_mut() {
+            publication.publications(publications);
         }
     }
 
@@ -1560,6 +1601,29 @@ impl ReactorTap {
             .fork_choice
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(check);
+    }
+
+    /// Checks from now on that the node's port publishes each committed
+    /// engine state as it was and the reactor adopts and advertises only
+    /// engine records, as [`super::publication`] describes, keeping when the
+    /// check applied in `evidence`. Its first record is the engine as it is
+    /// now, before the reactor starts, and what the port published before
+    /// now is dropped. Call it before the run starts. A harness that calls
+    /// it must hand the tap the node's engine runs and publications.
+    pub fn watch_publication(&self, evidence: PublicationEvidence) {
+        let port = self
+            .state
+            .port
+            .upgrade()
+            .expect("the tap's port outlives its harness's setup");
+        let engine = port.engine();
+        engine.take_publications();
+        *self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Publication::new(evidence, engine.snapshot()));
     }
 
     /// Checks from now on that each round's owner is bound to its `Open`

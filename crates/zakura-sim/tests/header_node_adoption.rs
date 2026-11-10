@@ -15,6 +15,8 @@ use std::{cell::RefCell, process::Command, rc::Rc};
 
 use support::inputs;
 use zakura_sim::{
+    check::PropertyOutcome,
+    domain::header_sync::STATE_PUBLICATION_CONSISTENT,
     harness::{
         header_node::{
             adoption::{Acceptance, AdoptionEvidence, AdoptionFact},
@@ -141,6 +143,26 @@ impl Run {
     /// The node's adoption evidence.
     fn adoption(&self) -> &AdoptionEvidence {
         &self.view.adoption
+    }
+
+    /// hdr-4's tip rule, which `header-sync/state-publication-consistent`
+    /// owns now, as its outcome in the run's report: held, broken, or, with
+    /// nothing judged, inconclusive.
+    fn tip(&self) -> Acceptance {
+        let outcome = &self
+            .report
+            .properties
+            .iter()
+            .find(|reported| reported.property == STATE_PUBLICATION_CONSISTENT)
+            .expect("the storage harness registers the property")
+            .outcome;
+        match outcome {
+            PropertyOutcome::Held { .. } => Acceptance::Holds,
+            PropertyOutcome::Violated { .. } => {
+                Acceptance::Violated(format!("{:?}", self.report.end.violation))
+            }
+            other => Acceptance::Inconclusive(format!("{other:?}")),
+        }
     }
 
     /// The status rule over the node's sessions.
@@ -409,7 +431,7 @@ fn every_live_session_gets_the_adopted_status() {
 /// are published, and every publication reaches the node's handle.
 #[test]
 fn every_adopted_tip_is_published() {
-    sweep("tip", |run| run.adoption().tip());
+    sweep("tip", |run| run.tip());
 }
 
 /// One tip change, with nothing after it: the node at A3 syncs A5 from
@@ -442,7 +464,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
             "{:?}",
             run.report.end
         );
-        assert_eq!(run.adoption().tip(), Acceptance::Holds);
+        assert_eq!(run.tip(), Acceptance::Holds);
     }
 }
 
@@ -455,11 +477,7 @@ fn a_run_that_ends_early_breaks_no_rule() {
     for budget in [1, 20, 60, 120, 240, 480] {
         for input in inputs(4, 256) {
             let run = run_for(&scenario, Some(budget), input);
-            for outcome in [
-                run.adoption().generation(),
-                run.adoption().tip(),
-                run.status(),
-            ] {
+            for outcome in [run.adoption().generation(), run.tip(), run.status()] {
                 assert!(
                     !matches!(outcome, Acceptance::Violated(_)),
                     "budget {budget}: {outcome:?}"
@@ -489,7 +507,7 @@ fn a_cut_off_run_keeps_the_evidence_it_ended_with() {
                 &run.adoption().facts()[run.seen..]
             );
             assert!(
-                !matches!(run.adoption().tip(), Acceptance::Violated(_)),
+                !matches!(run.tip(), Acceptance::Violated(_)),
                 "budget {budget}"
             );
         }

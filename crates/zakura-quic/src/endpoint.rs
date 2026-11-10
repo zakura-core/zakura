@@ -687,11 +687,14 @@ impl QuicEndpoint {
         &self.inner.shared
     }
 
-    /// Counts the address attempts a dial to `addr` would claim live slots
-    /// for (ADM-12): its canonical, deduplicated addresses in families this
-    /// endpoint has a socket for (DIAL-2).
+    /// Counts the address attempts [`Self::connect`] to `addr` would claim
+    /// live slots for (ADM-12): its canonical, deduplicated addresses in
+    /// families this endpoint has a socket for (DIAL-2), up to the whole
+    /// table.
     pub fn dial_attempt_count(&self, addr: &NodeAddr) -> usize {
-        self.dial_targets(&addr.direct).len()
+        self.dial_targets(&addr.direct)
+            .len()
+            .min(self.inner.shared.connections.idle_limit(DialCeiling::Whole))
     }
 
     /// Returns the addresses of `direct` to dial with their sockets (DIAL-2):

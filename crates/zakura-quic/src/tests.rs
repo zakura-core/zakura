@@ -479,6 +479,22 @@ async fn dial_attempts_count_only_addresses_the_dial_would_try() {
         ],
     );
     assert_eq!(client.dial_attempt_count(&peer), 2);
+
+    // A dial can't claim more slots than the whole table holds.
+    let two_slots = QuicEndpoint::bind(
+        NodeSecretKey::generate(),
+        &QuicBindConfig {
+            max_connections: 2,
+            ..loopback()
+        },
+        &test_config(),
+    )
+    .unwrap();
+    let wide = NodeAddr::with_addrs(
+        peer.id,
+        (8233..8236).map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+    );
+    assert_eq!(two_slots.dial_attempt_count(&wide), 2);
 }
 
 #[tokio::test]

@@ -43,6 +43,13 @@ pub enum Claim {
     /// A stale prepare or apply's handler had an effect on other work
     /// ([`super::stale`]).
     StaleCompletionEffect,
+    /// The reactor's work outlived a reset it adopted, ran under an older
+    /// generation, or started from the wrong locator read, or a reset
+    /// didn't advance the generation ([`super::round_life`]).
+    ResetInvalidatesWork,
+    /// A round a new snapshot made obsolete retired while the queue still
+    /// held it.
+    UnreleasedObsoleteRound,
 }
 
 impl Claim {
@@ -54,6 +61,7 @@ impl Claim {
             ClaimRule::LeakedLease => Claim::LeakedLease,
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
             ClaimRule::OpenReservation => Claim::OpenReservation,
+            ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
         }
     }
 }

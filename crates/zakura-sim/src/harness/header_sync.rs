@@ -46,6 +46,7 @@ use super::{
         preload,
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
+        round_life::RoundLifeEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
         stamp::Stamps,
@@ -62,8 +63,9 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, AdoptionView, BudgetView, StaleView, TeardownView, WakeView,
+            chunk_budget_bound, reset_invalidates_work, stale_completion_inert,
+            teardown_end_violations, teardown_returns_baseline, AdoptionView, BudgetView,
+            ResetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -570,6 +572,9 @@ pub struct Ports {
     /// the harness and the node's tap record during the run. It holds the
     /// node's stamps.
     pub ends: EndEvidence,
+    /// When the node's reset check first applied, which its tap finds
+    /// during the run.
+    pub round_life: RoundLifeEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
 }
@@ -596,6 +601,8 @@ pub struct Storage {
     ends: EndEvidence,
     /// The node's stamps, from its tap.
     stamps: Stamps,
+    /// When the node's reset check first applied, from its tap.
+    round_life: RoundLifeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -645,6 +652,20 @@ pub struct StorageView {
     pub ends: EndEvidence,
     /// The node's stamps, which every view-side fact above takes.
     pub stamps: Stamps,
+    /// When the node's reset check first applied.
+    pub round_life: RoundLifeEvidence,
+}
+
+impl ResetView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::round_life`].
+    fn round_life(&self) -> &RoundLifeEvidence {
+        &self.round_life
+    }
 }
 
 impl BudgetView for StorageView {
@@ -724,6 +745,7 @@ impl HasView for Storage {
             wake: self.wake.clone(),
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
+            round_life: self.round_life.clone(),
             recovery: self.recovery.clone(),
         }
     }
@@ -858,6 +880,7 @@ impl Subsystem for Storage {
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
             ends: EndEvidence::default(),
+            round_life: RoundLifeEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -894,6 +917,7 @@ impl Subsystem for Storage {
         let claims = tap.claims();
         let ends = tap.ends();
         let stamps = tap.stamps();
+        tap.watch_rounds(ports.round_life.clone());
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -979,6 +1003,7 @@ impl Subsystem for Storage {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            round_life: ports.round_life,
             ends,
             stamps,
             faults,
@@ -1155,6 +1180,9 @@ pub struct WirePorts {
     /// The node's end facts, which its tap records during the run. It holds
     /// the node's stamps.
     pub ends: EndEvidence,
+    /// When the node's reset check first applied, which its tap finds
+    /// during the run.
+    pub round_life: RoundLifeEvidence,
 }
 
 impl WirePorts {
@@ -1198,6 +1226,8 @@ pub struct HeaderWire {
     ends: EndEvidence,
     /// The node's stamps, from its tap.
     stamps: Stamps,
+    /// When the node's reset check first applied, from its tap.
+    round_life: RoundLifeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1231,6 +1261,7 @@ impl HasView for HeaderWire {
             wake: self.wake.clone(),
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
+            round_life: self.round_life.clone(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -1338,6 +1369,7 @@ impl Subsystem for HeaderWire {
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
             ends: EndEvidence::default(),
+            round_life: RoundLifeEvidence::default(),
         }
     }
 
@@ -1381,6 +1413,7 @@ impl Subsystem for HeaderWire {
         let claims = tap.claims();
         let ends = tap.ends();
         let stamps = tap.stamps();
+        tap.watch_rounds(ports.round_life.clone());
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -1462,6 +1495,7 @@ impl Subsystem for HeaderWire {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            round_life: ports.round_life,
             ends,
             stamps,
             faults,
@@ -1658,13 +1692,14 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 
 /// The storage harness's properties, [`OPERATION_IDS`],
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
-/// [`TEARDOWN_RETURNS_BASELINE`] and [`STALE_COMPLETION_INERT`], all
-/// active. A test harness that wraps [`Storage`] with its view registers
+/// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`] and
+/// [`RESET_INVALIDATES_WORK`], all active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
 /// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
+/// [`RESET_INVALIDATES_WORK`]: crate::domain::header_sync::RESET_INVALIDATES_WORK
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1691,6 +1726,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         chunk_budget_bound(),
         teardown_returns_baseline(),
         stale_completion_inert(),
+        reset_invalidates_work(),
     ]
 }
 
@@ -2105,6 +2141,7 @@ mod tests {
                 wake: WakeEvidence::default(),
                 ends: EndEvidence::default(),
                 stamps: Stamps::default(),
+                round_life: RoundLifeEvidence::default(),
                 recovery: RecoveryEvidence::default(),
             }
         }

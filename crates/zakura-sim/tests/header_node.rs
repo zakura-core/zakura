@@ -304,6 +304,7 @@ impl HasView for Planted {
             wake: Default::default(),
             ends: Default::default(),
             stamps: Default::default(),
+            round_life: Default::default(),
             recovery: Default::default(),
         }
     }

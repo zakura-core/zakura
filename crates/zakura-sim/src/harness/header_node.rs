@@ -26,6 +26,7 @@ mod pair;
 pub mod policy;
 pub mod recovery;
 pub mod reservation;
+pub mod round_life;
 pub mod session;
 pub mod stale;
 pub mod stamp;

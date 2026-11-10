@@ -11,6 +11,7 @@ use crate::{
         adoption::{AdoptionEvidence, WatchRead},
         capacity::{BoundaryRead, CapacityEvidence},
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
     },
@@ -305,6 +306,83 @@ where
     } else {
         Verdict::NotApplicable
     }
+}
+
+/// A reset the reactor adopts invalidates its work: no round started under
+/// the old generation outlives the unit of work that adopts the new one,
+/// every live round's dispatch carries the adopted generation, every reset
+/// advances the generation, and every round starts from a locator read of
+/// its own generation.
+pub const RESET_INVALIDATES_WORK: &str = "header-sync/reset-invalidates-work";
+
+/// What the reset check reads: one reactor's claim breaks and when the
+/// check first applied.
+pub trait ResetView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's reset check first applied.
+    fn round_life(&self) -> &RoundLifeEvidence;
+}
+
+/// [`RESET_INVALIDATES_WORK`], as a harness whose view is a [`ResetView`]
+/// registers it.
+pub fn reset_invalidates_work<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ResetView,
+{
+    Property {
+        id: PropertyId::new(RESET_INVALIDATES_WORK),
+        claim: "a header round started under the adopted generation is retired by the end of                 the unit of work that adopts a newer one, a live round's prepare or apply                 carries the adopted generation, every reset advances the header generation,                 and every round starts from a locator read of its own generation",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_reset_invalidates_work::<S>,
+        witness: Some(TriggerHistory::View(reset_applied::<S::View>)),
+    }
+}
+
+/// Checks [`RESET_INVALIDATES_WORK`] at the boundary after a step.
+///
+/// The tap's reset check ([`crate::harness::header_node::round_life`])
+/// judges the reactor's facts and the node's storage facts as they arrive,
+/// and the ownership ledger reports an obsolete round retired before the
+/// queue released it. A break the step's drain found violates at once. It
+/// applies once a drain found an adoption that changed the generation under
+/// a live round, an ordinary start, or a reset.
+fn check_reset_invalidates_work<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ResetView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the reactor's work follows every reset it adopts";
+    let mut breaks = view
+        .claims()
+        .at(
+            step,
+            &[Claim::ResetInvalidatesWork, Claim::UnreleasedObsoleteRound],
+        )
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.round_life().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`RESET_INVALIDATES_WORK`]'s trigger history: the check applied.
+fn reset_applied<V: ResetView>(view: &V, _: &ObservationLog) -> bool {
+    view.round_life().any()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer

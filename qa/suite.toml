@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
+test = "regenerate_reset_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -396,12 +402,6 @@ plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15
 
 [[pending]]
 id = "header-sync/stale-chain-effect-inert"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/reset-invalidates-work"
 kind = "property"
 owner = "H1"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"

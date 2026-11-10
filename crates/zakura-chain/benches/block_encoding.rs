@@ -18,7 +18,7 @@ use std::{hint::black_box, io::Cursor, sync::Arc};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use zakura_chain::{
-    block::{merkle, Block, Header, MAX_BLOCK_BYTES},
+    block::{merkle, Block, BlockEncoding, Header, MAX_BLOCK_BYTES},
     parameters::NetworkUpgrade,
     serialization::{sha256d, ZcashDeserialize, ZcashSerialize},
     transaction::{Transaction, UnminedTx},
@@ -132,6 +132,36 @@ fn block_encoding(c: &mut Criterion) {
             BenchmarkId::new("deserialize_unbounded", &label),
             &bytes,
             |b, bytes| b.iter(|| black_box(decode_unbounded(bytes))),
+        );
+        let shared_bytes: Arc<[u8]> = Arc::from(bytes.as_slice());
+        if bytes.len() <= MAX_BLOCK_BYTES as usize {
+            group.bench_with_input(
+                BenchmarkId::new("decode_keeping_encoding", &label),
+                &shared_bytes,
+                |b, bytes| {
+                    b.iter(|| black_box(BlockEncoding::decode(bytes.clone(), 0).expect("valid")))
+                },
+            );
+        }
+        let encoding = BlockEncoding::for_block(&block, shared_bytes.clone(), 0..bytes.len())
+            .expect("the block re-encodes to its bytes");
+        group.bench_with_input(
+            BenchmarkId::new("encoding_check", &label),
+            &shared_bytes,
+            |b, bytes| {
+                b.iter(|| {
+                    black_box(BlockEncoding::for_block(
+                        &block,
+                        bytes.clone(),
+                        0..bytes.len(),
+                    ))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("transaction_hashes_from_encoding", &label),
+            &block,
+            |b, block| b.iter(|| black_box(encoding.transaction_hashes(block))),
         );
         group.bench_with_input(BenchmarkId::new("serialize", &label), &block, |b, block| {
             b.iter(|| black_box(block.zcash_serialize_to_vec().expect("vec writes succeed")))

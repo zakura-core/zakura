@@ -3,6 +3,8 @@
 #![allow(clippy::unwrap_in_result)]
 
 // TODO: generate should be rewritten as strategies
+#[cfg(test)]
+mod encoding;
 #[cfg(any(test, feature = "bench", feature = "proptest-impl"))]
 pub mod generate;
 #[cfg(test)]

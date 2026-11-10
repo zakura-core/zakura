@@ -31,6 +31,7 @@ use crate::{
 const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
 
 mod commitment;
+mod encoding;
 mod error;
 mod hash;
 mod header;
@@ -49,6 +50,7 @@ pub use commitment::{
     ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Commitment, CommitmentError,
     CHAIN_HISTORY_ACTIVATION_RESERVED,
 };
+pub use encoding::BlockEncoding;
 pub use hash::Hash;
 pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
 pub use height::{Height, HeightDiff, TryIntoHeight};

@@ -142,7 +142,15 @@ proptest! {
             let bytes2 = other_block
                 .zcash_serialize_to_vec()
                 .expect("vec serialization is infallible");
-            prop_assert_eq![bytes, bytes2, "bytes must be equal if structs are equal"];
+            prop_assert_eq![&bytes, &bytes2, "bytes must be equal if structs are equal"];
+
+            // A decoded block keeps exactly the bytes it was decoded from.
+            let (encoded_block, encoding) =
+                crate::block::BlockEncoding::decode(bytes.clone().into(), 0)?;
+            let encoding = encoding.expect("a decoded block re-encodes to its bytes");
+            prop_assert_eq![&encoded_block, &block];
+            prop_assert_eq![encoding.as_bytes(), &bytes[..]];
+            prop_assert_eq![encoding.transaction_hashes(&encoded_block), block.transaction_hashes()];
         } else {
             let serialization_err = bytes.zcash_deserialize_into::<Block>()
                 .expect_err("blocks larger than the maximum size should fail");

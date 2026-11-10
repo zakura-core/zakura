@@ -361,6 +361,13 @@ impl Conn {
         *self.inner.shared.load.borrow()
     }
 
+    /// A probe that reads [`Self::load`]'s snapshot without holding the
+    /// connection open, for the simulator's transport taps.
+    #[cfg(zakura_sim)]
+    pub fn load_probe(&self) -> crate::LoadProbe {
+        crate::LoadProbe::of(&self.inner.shared)
+    }
+
     /// Changes this connection's runtime limits (API-9). Returns the close
     /// reason if the connection has closed.
     pub fn set_limits(&self, limits: ConnLimits) -> Result<(), ConnectionError> {

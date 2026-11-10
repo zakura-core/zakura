@@ -215,7 +215,7 @@ where
 /// settle. Today no committed input can stop the node, so every planted
 /// round-level case relies on that. A step with a released round a claim
 /// tainted isn't judged, so it never counts as holding.
-fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+pub(crate) fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: TeardownView,

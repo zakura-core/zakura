@@ -1,0 +1,10 @@
+# Leaves a committed view unadopted while a needed-block query is pending,
+# if the view keeps the body-work epoch. The input holds the node's first
+# query in storage while the mirrors' chain grows and the node's header
+# sync applies the new headers, so the engine publishes a view with a newer
+# header generation that the reactor never adopts. Once no task can run,
+# the reactor's authority differs from the engine's newest view's.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-retired-query.bin"
+# Besides reactor.rs, which the patch changes, header sync's apply and the
+# rest of block sync decide when the view and the reply arrive.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

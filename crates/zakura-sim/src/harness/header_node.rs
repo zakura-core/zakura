@@ -1719,3 +1719,16 @@ impl ActionSource for Control {
             .expect("the channel holds the whole script, and the task outlives the run");
     }
 }
+
+impl HeaderNode {
+    /// The service its links join, for a harness that builds its own
+    /// links, such as `sync/storage`'s.
+    pub(crate) fn service(&self) -> &HeaderSyncService {
+        &self.service
+    }
+
+    /// Cancels the reactor, as zakurad's shutdown ends header sync.
+    pub(crate) fn cancel(&self) {
+        self.shutdown.cancel();
+    }
+}

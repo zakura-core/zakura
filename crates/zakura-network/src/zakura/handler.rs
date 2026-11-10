@@ -3370,6 +3370,10 @@ impl ZakuraProtocolHandler {
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
         self.resources.report_usage(limits_owner_bound);
+        #[cfg(zakura_sim)]
+        if let Some(observer) = &self.transport_observer {
+            observer.connection(conn_id, connection_resources.probe(connection.load_probe()));
+        }
         // Set once, for the kinds this connection negotiated (zakura-quic
         // API-9). The handshake window stays inside it for the control stream.
         let _ = connection.set_limits(

@@ -36,6 +36,11 @@ use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 pub trait TransportObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: TransportEvent);
+
+    /// Receives a probe of connection `conn_id`'s transport resources, once
+    /// its gates exist, right after its registration. The default drops it.
+    #[cfg(zakura_sim)]
+    fn connection(&self, _conn_id: ZakuraConnId, _probe: super::ConnectionProbe) {}
 }
 
 /// One transport event.

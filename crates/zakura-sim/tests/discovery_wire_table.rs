@@ -12,7 +12,7 @@ use zakura_sim::{
     },
     peer::discovery::discovery_stream,
     property::{Source, Status},
-    table::{sender_properties, table_properties},
+    table::{sender_owed_properties, sender_properties, table_properties},
 };
 
 /// The properties name discovery's stream as the service declares it: its
@@ -33,9 +33,10 @@ fn the_registered_stream_is_the_services() {
 }
 
 /// The harness registers discovery's 31 generated receiver IDs, then its
-/// 7 sender IDs, then `discovery/late-response-admitted`, and no other
-/// property. The 16 stateless `<label>-closes` IDs and the 21 IDs whose
-/// guard is discovery's own have planted cases, are `Active` and check
+/// 7 sender IDs, then the 2 `sender-within-owed` IDs, then
+/// `discovery/late-response-admitted`, and no other property. The 16
+/// stateless `<label>-closes` IDs and the 22 IDs whose guard is discovery's
+/// own have planted cases, are `Active` and check
 /// their cases' trigger histories. The [`SCRIPTED`] ID no scenario reaches
 /// is `Active` with a scripted bypass, and the rest
 /// of the generated IDs are `Draft`s. The late-response ID is hand-written,
@@ -60,10 +61,23 @@ fn the_harness_registers_the_generated_discovery_ids() {
     // Each row's: hello's cadence, a request row's limit and cadence, and
     // a response row's single ending.
     assert_eq!(sender.len(), 7, "{sender:?}");
+    let owed: Vec<String> = sender_owed_properties::<DiscoveryWire>(FAMILY, &STREAMS)
+        .into_iter()
+        .map(|property| property.id.to_string())
+        .collect();
+    // A request-answering response row's: peers' and services'.
+    assert_eq!(
+        owed,
+        [
+            "discovery/s4v2/peers/sender-within-owed",
+            "discovery/s4v2/services/sender-within-owed"
+        ]
+    );
     let late = LATE_RESPONSE_ADMITTED.to_owned();
     let expected: Vec<String> = receiver
         .iter()
         .chain(&sender)
+        .chain(&owed)
         .chain([&late])
         .cloned()
         .collect();
@@ -77,9 +91,10 @@ fn the_harness_registers_the_generated_discovery_ids() {
     // The stateless reader IDs: one per stream, `undeclared-type-closes`,
     // then three per row. Discovery's own guards: over-margin on 2 request
     // rows, unsolicited on 2 response rows, over-owed on peers, bad content
-    // on 5 rows, cadence on 3 rows, conformant-never-closes, and the 7
-    // sender IDs.
-    assert_eq!(planted, 16 + 21, "{ids:?}");
+    // on 5 rows, cadence on 3 rows, conformant-never-closes, the 7 sender
+    // IDs, and services' sender-within-owed. Peers' sender-within-owed has
+    // no case yet (#2267).
+    assert_eq!(planted, 16 + 22, "{ids:?}");
     // Another family's ID with the same template and row has no case here.
     assert!(!has_planted_case("header-sync/s5v9/undeclared-type-closes"));
     assert!(!has_planted_case("discovery/s5v9/undeclared-type-closes"));
@@ -103,7 +118,9 @@ fn the_harness_registers_the_generated_discovery_ids() {
         );
         let needs: &[Source] = if property.id.to_string() == late {
             &[Source::Schedule, Source::Frames, Source::Closes]
-        } else if sender.contains(&property.id.to_string()) {
+        } else if sender.contains(&property.id.to_string())
+            || owed.contains(&property.id.to_string())
+        {
             &[Source::Frames]
         } else {
             &[Source::Frames, Source::Closes]

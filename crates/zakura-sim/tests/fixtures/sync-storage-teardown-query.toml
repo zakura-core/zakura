@@ -1,0 +1,17 @@
+# The committed fuzz input `sync-storage-teardown-query.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `teardown-query` scenario, and
+# `sync-storage-teardown-query.end.json` is its pinned end record.
+harness = "sync/storage"
+generator = 2
+sha256 = "6778dddffa21c0818da7eb4d0086b8a6a3a7f5efc27155c10edfaae60704cce5"
+scenario_sha256 = "62db6fe7f651ef26f1f92070f9102282ef9324a58c41a5acb879d38b807093ed"
+source = "crates/zakura-sim/tests/sync_harness.rs"
+
+[[witness]]
+property = "block-sync/teardown-returns-baseline"
+expect = "holds"
+
+[[witness]]
+property = "sync/teardown-returns-baseline"
+expect = "holds"

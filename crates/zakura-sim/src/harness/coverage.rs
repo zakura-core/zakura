@@ -1019,6 +1019,98 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("no-room-check"),
     },
     Coverage {
+        property: crate::domain::session::REPLACEMENT_PRESERVES_AUTHORIZATION,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_replaced_connection_reopens_every_service_under_fresh_ids",
+        ),
+        bypass: Bypass::Planted("stream-scoped-session-ids"),
+    },
+    Coverage {
+        property: crate::domain::cross::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "teardown_across_held_work_returns_baseline",
+        ),
+        bypass: Bypass::Planted("leaked-reservation-entry"),
+    },
+    Coverage {
+        property: crate::domain::session::STALLED_SERVICE_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_stalled_block_session_starves_no_other_service",
+        ),
+        bypass: Bypass::Planted("close-on-block-stall"),
+    },
+    Coverage {
+        property: crate::domain::connection::CREDIT_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("handshake-window-only"),
+    },
+    Coverage {
+        property: crate::domain::connection::SEND_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Pending(
+            "raising block sync's send priority keeps the bound: QUIC buffers one send window \
+             per stream and each worker writes one frame at a time, so no single production \
+             site blocks other streams across several frames",
+        ),
+    },
+    Coverage {
+        property: crate::domain::connection::CONNECTION_SHARES_BOUND,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("one-raw-gate"),
+    },
+    Coverage {
+        property: crate::domain::cross::TIPS_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_replaced_selection_starts_a_new_body_work_epoch",
+        ),
+        bypass: Bypass::Planted("keep-epoch-on-replaced-selection"),
+    },
+    Coverage {
+        property: crate::domain::cross::BLOCK_REQUESTS_FOLLOW_HEADERS,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
+        ),
+        bypass: Bypass::Planted("keep-work-queue-authority"),
+    },
+    Coverage {
+        property: crate::domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
+        ),
+        bypass: Bypass::Planted("accept-stale-scope-bodies"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::QUERY_WORK_AUTHORIZED,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reply_under_a_retired_authority_installs_nothing",
+        ),
+        bypass: Bypass::Planted("accept-retired-authority"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::FRONTIER_WORK_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "an_epoch_change_retires_the_old_epochs_work",
+        ),
+        bypass: Bypass::Planted("omit-work-reset"),
+    },
+    Coverage {
         property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
         passing: passes(
             "tests/block_semantic_properties.rs",

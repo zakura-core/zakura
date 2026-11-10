@@ -107,6 +107,13 @@ The waiver applies to the node release level only; changed library crates still
 receive their independently required SemVer bumps. It cannot waive
 `Deprecated`, `Removed`, or Mainnet network-upgrade entries.
 
+For the stable v1.8.6 release from v1.8.5 only, the release owner approved a
+node patch exception that includes the documented removal of historical
+treestate commands from default builds and unused Sprout library types.
+The commands remain available with `debug-commands`. This exception does not
+apply to other release versions, lower library SemVer requirements, or waive
+the Mainnet network-upgrade major-version floor.
+
 ## Library crates
 
 The repository does not maintain per-crate changelogs. Version bumps for

@@ -147,6 +147,13 @@ impl OutputByteBudget {
         self.capacity
     }
 
+    /// The semaphore that counts this budget's free bytes, for a transport
+    /// probe's peeks.
+    #[cfg(zakura_sim)]
+    pub(crate) fn semaphore(&self) -> &Arc<Semaphore> {
+        &self.bytes
+    }
+
     /// Bytes currently granted.
     pub(crate) fn granted(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.

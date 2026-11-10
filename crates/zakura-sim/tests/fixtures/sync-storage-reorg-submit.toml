@@ -1,0 +1,17 @@
+# The committed fuzz input `sync-storage-reorg-submit.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `reorg-submit` scenario, and
+# `sync-storage-reorg-submit.end.json` is its pinned end record.
+harness = "sync/storage"
+generator = 2
+sha256 = "df500aa0186b39af626d1d9c9cd10bd41d59e6e792a88336df6a20f6a530f81f"
+scenario_sha256 = "4190146dc962822c6061fc46ce496590287aac0d543282b834b1d54539cf8aaf"
+source = "crates/zakura-sim/tests/sync_harness.rs"
+
+[[witness]]
+property = "sync/block-requests-follow-headers"
+expect = "holds"
+
+[[witness]]
+property = "sync/header-reorg-retires-block-work"
+expect = "holds"

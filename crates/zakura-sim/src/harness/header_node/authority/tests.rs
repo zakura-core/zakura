@@ -505,6 +505,65 @@ fn accepted(through: Frontier) -> ReactorEvent {
     }
 }
 
+/// `round`'s apply as call `call`, then `events` in that call's completion,
+/// as the reactor handles an apply's result.
+fn in_apply(round: &RequestRef, call: u64, events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    use zakura_network::zakura::observe::{PortCall, ReactorCause};
+
+    let mut handled = vec![
+        ReactorEvent::Dispatched {
+            call,
+            op: PortCall::Apply {
+                peer: mirror(),
+                source: zakura_header_chain::SourceId::from_digest([2; 32]),
+                owner: round.owner,
+                target_tip_hash: round.target_tip_hash,
+            },
+        },
+        ReactorEvent::CauseSet {
+            cause: ReactorCause::Completion { call },
+        },
+    ];
+    handled.extend(events);
+    handled.push(ReactorEvent::CauseSet {
+        cause: ReactorCause::Idle,
+    });
+    handled
+}
+
+/// Storage's apply operation `id` for `round`'s apply call `call`, as
+/// [`in_apply`] dispatches it, completing with `result`.
+fn completed(
+    round: &RequestRef,
+    id: u64,
+    call: u64,
+    result: crate::observe::StorageResult,
+) -> [StorageFact; 2] {
+    let source = zakura_header_chain::SourceId::from_digest([2; 32]);
+    [
+        StorageFact::Submitted {
+            id,
+            request: crate::observe::StorageRequest::ApplyHeaderTarget {
+                owner: crate::storage::work_owner(round.owner),
+                source: crate::storage::hex(&source.digest()),
+                parent: None,
+                target: crate::storage::hash(round.target_tip_hash),
+                hashes: None,
+            },
+            digest: String::new(),
+            call: Some(call),
+        },
+        StorageFact::Completed {
+            id,
+            outcome: "engine".to_owned(),
+            result,
+            delivered: true,
+            generation: 0,
+            state: String::new(),
+        },
+    ]
+}
+
 /// The subscriber's claim of a plain page of subscription 1 with `headers`
 /// headers ending at `through`, as [`cursor`] counts it.
 fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
@@ -576,16 +635,17 @@ fn updates_carry_their_subscriptions_state() {
     let genesis = HeaderFixture::regtest().anchor();
     let round = request(1, chain[3].hash, genesis.hash);
     let base = || {
-        vec![
+        let mut events = vec![
             reserved(1, 10),
             adopted(),
             open(chain[3], &[genesis.hash]),
             started(round.clone(), &[genesis.hash]),
             claimed(chain[1], 2),
             page(&round, genesis, &[chain[0].hash, chain[1].hash]),
-            accepted(chain[1]),
-            reserved(2, 2),
-        ]
+        ];
+        events.extend(in_apply(&round, 9, vec![accepted(chain[1])]));
+        events.push(reserved(2, 2));
+        events
     };
     let with = |update: ReactorEvent| {
         let mut events = base();
@@ -654,11 +714,16 @@ fn updates_carry_their_subscriptions_state() {
     );
 }
 
-/// Acceptance through a staged page's last header holds. Through a cursor
-/// no page staged, as a dropped late page's, or below an earlier
-/// acceptance, it breaks.
+/// Acceptance through the last page a round staged before its apply, in
+/// that apply's completion, holds once the apply's storage operation
+/// completed `Applied`. Through a cursor no page staged, as a dropped late
+/// page's, through an earlier page of the round, outside an apply's
+/// completion, in another subscription's apply, after a failed apply, or
+/// below an earlier acceptance, it breaks.
 #[test]
-fn acceptance_reaches_only_staged_pages() {
+fn acceptance_reaches_only_the_applied_rounds_last_page() {
+    use crate::observe::StorageResult;
+
     let chain = main_chain(4);
     let genesis = HeaderFixture::regtest().anchor();
     let round = request(1, chain[3].hash, genesis.hash);
@@ -674,22 +739,104 @@ fn acceptance_reaches_only_staged_pages() {
             page(&round, chain[1], &[chain[2].hash]),
         ]
     };
-    let with = |through: &[Frontier]| {
-        let mut events = base();
-        events.extend(through.iter().map(|through| accepted(*through)));
-        credit_breaks(&events)
+    // The credit half's breaks for `events`, then storage's `result` for
+    // apply call 9. Whether the apply reached storage faithfully is the
+    // submission half's.
+    let judged = |events: Vec<ReactorEvent>, result: Option<StorageResult>| {
+        let mut credit = credit::Credit::default();
+        let events = honest(&events);
+        for event in &events {
+            if let ReactorEvent::CreditIssued {
+                kind: CreditKind::Open,
+                update,
+                ..
+            } = event
+            {
+                if let Some(first) = update.locator_hashes.first() {
+                    credit.note_read(*first, update.acknowledged.height);
+                }
+            }
+            credit.observe(event, true, false);
+        }
+        if let Some(result) = result {
+            for fact in &completed(&round, 4, 9, result) {
+                credit.storage(fact);
+            }
+        }
+        credit.take_breaks()
     };
-    assert_eq!(with(&[chain[1], chain[2]]), Vec::<String>::new());
-    // A late page the subscriber claimed and the reactor dropped unstaged.
-    let mut events = base();
-    events.extend([claimed(chain[3], 1), accepted(chain[3])]);
-    let late = credit_breaks(&events);
+    let applied = |through: Frontier| {
+        let mut events = base();
+        events.extend(in_apply(&round, 9, vec![accepted(through)]));
+        events
+    };
+    assert_eq!(
+        judged(applied(chain[2]), Some(StorageResult::Applied)),
+        Vec::<String>::new()
+    );
+    // Until storage's result reaches the check, nothing breaks.
+    assert_eq!(judged(applied(chain[2]), None), Vec::<String>::new());
+    let failed = judged(
+        applied(chain[2]),
+        Some(StorageResult::ApplyFailed {
+            category: "invalid_header".to_owned(),
+        }),
+    );
     assert!(
-        matches!(&late[..], [only] if only.contains("no staged page ends at")),
+        matches!(&failed[..], [only] if only.contains("whose apply didn't succeed")),
+        "{failed:?}"
+    );
+    let earlier = judged(applied(chain[1]), Some(StorageResult::Applied));
+    assert!(
+        matches!(&earlier[..], [only] if only.contains("not its round's last page")),
+        "{earlier:?}"
+    );
+    let mut outside = base();
+    outside.push(accepted(chain[2]));
+    let outside = judged(outside, None);
+    assert!(
+        matches!(&outside[..], [only] if only.contains("outside an apply call's completion")),
+        "{outside:?}"
+    );
+    let other = RequestRef {
+        session_id: 8,
+        owner: HeaderSyncWorkOwner::Header(
+            round
+                .owner
+                .header_authority()
+                .bind(8, NonZeroU64::new(1).expect("nonzero")),
+        ),
+        ..round.clone()
+    };
+    let mut elsewhere = base();
+    elsewhere.extend(in_apply(&other, 9, vec![accepted(chain[2])]));
+    let elsewhere = judged(elsewhere, Some(StorageResult::Applied));
+    assert!(
+        matches!(&elsewhere[..], [only] if only.contains("an apply for")),
+        "{elsewhere:?}"
+    );
+    // A late page the subscriber claimed after the apply's dispatch and
+    // the reactor dropped unstaged.
+    let mut late = base();
+    let mut handled = in_apply(&round, 9, vec![accepted(chain[3])]);
+    handled.insert(1, claimed(chain[3], 1));
+    late.extend(handled);
+    let late = judged(late, Some(StorageResult::Applied));
+    assert!(
+        late.iter()
+            .any(|found| found.contains("no staged page ends at")),
         "{late:?}"
     );
-    let backwards = with(&[chain[2], chain[1]]);
-    assert!(backwards[0].contains("below its earlier"), "{backwards:?}");
+    let mut backwards = base();
+    backwards.extend(in_apply(&round, 9, vec![accepted(chain[2])]));
+    backwards.extend(in_apply(&round, 10, vec![accepted(chain[1])]));
+    let backwards = judged(backwards, Some(StorageResult::Applied));
+    assert!(
+        backwards
+            .iter()
+            .any(|found| found.contains("below its earlier")),
+        "{backwards:?}"
+    );
 }
 
 /// The model's plain page sizes are encoded pages' payloads, of one header

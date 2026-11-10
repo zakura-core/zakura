@@ -34,6 +34,15 @@
 //!   asked it to accept. Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
+//!   It comes in the handler of an apply call's completion, under
+//!   `CauseSet { Completion { call } }`, for an apply its reactor
+//!   dispatched for that subscription's session and request, and names the
+//!   last page that subscription staged before the apply's dispatch, as
+//!   production accepts only the round's last staged cursor and only once
+//!   its apply succeeded. That apply's storage operation, found by its
+//!   `Submitted { call }`, must have completed `Applied`. Storage's facts
+//!   reach this check at its drains, so an acceptance whose apply result
+//!   isn't known yet is judged once it is.
 //! - **Operations.** An `Open`'s and a `Grant`'s credit comes in an update
 //!   of that operation, and a built `Close` is a `Close` that adds no
 //!   credit.
@@ -51,7 +60,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    observe::{CreditKind, CreditTotals, ReactorEvent, SubscribeHeaders},
+    observe::{CreditKind, CreditTotals, PortCall, ReactorCause, ReactorEvent, SubscribeHeaders},
     v9::Operation,
     AuxSchema, ZakuraPeerId, TREE_AUX_SCHEMA_V1_BYTES,
 };
@@ -102,6 +111,16 @@ struct Live {
     claimed: HashSet<Acknowledged>,
     /// The headers and bytes every built update granted.
     granted: (u64, u64),
+    /// The last page staged on the subscription, by its last header.
+    last_staged: Option<Frontier>,
+}
+
+/// An apply call the reactor dispatched: the subscription its owner names,
+/// and the last page that subscription staged before the dispatch.
+#[derive(Debug)]
+struct Apply {
+    subscription: Subscription,
+    last_staged: Option<Frontier>,
 }
 
 /// A cursor's header and the header and byte credit consumed through it.
@@ -116,6 +135,20 @@ pub(super) struct Credit {
     live: HashMap<Subscription, Live>,
     /// The height of each locator read's first entry, by hash.
     read_heights: HashMap<block::Hash, block::Height>,
+    /// The storage call whose completion the reactor is handling, from its
+    /// latest `CauseSet`.
+    completion: Option<u64>,
+    /// Each apply call the reactor dispatched, by call number.
+    applies: HashMap<u64, Apply>,
+    /// The reactor call each storage operation was submitted for, by
+    /// operation ID.
+    operations: HashMap<u64, u64>,
+    /// Whether each apply call's storage operation completed `Applied`, by
+    /// call number.
+    applied: HashMap<u64, bool>,
+    /// Acceptances under an apply call whose storage result isn't known
+    /// yet, with the call.
+    awaiting: Vec<(Subscription, u64, Frontier)>,
     breaks: Vec<String>,
 }
 
@@ -170,6 +203,31 @@ impl Credit {
                 true
             }
             _ if !on_reactor => false,
+            ReactorEvent::CauseSet { cause } => {
+                self.completion = match cause {
+                    ReactorCause::Completion { call } => Some(*call),
+                    _ => None,
+                };
+                false
+            }
+            ReactorEvent::Dispatched {
+                call,
+                op: PortCall::Apply { peer, owner, .. },
+            } => {
+                let subscription = (peer.clone(), owner.session_id(), owner.request_id().get());
+                let last_staged = self
+                    .live
+                    .get(&subscription)
+                    .and_then(|live| live.last_staged);
+                self.applies.insert(
+                    *call,
+                    Apply {
+                        subscription,
+                        last_staged,
+                    },
+                );
+                false
+            }
             ReactorEvent::CreditIssued {
                 kind,
                 peer,
@@ -222,6 +280,7 @@ impl Credit {
                                 consumed: (0, 0),
                                 claimed: HashSet::new(),
                                 granted: (0, 0),
+                                last_staged: None,
                             },
                         );
                     }
@@ -274,10 +333,12 @@ impl Credit {
                 if let (Some(live), Some(last)) = (self.live.get_mut(&key), hashes.last()) {
                     // A page holds at most a few thousand headers.
                     let count = u32::try_from(hashes.len()).expect("a page's count fits u32");
-                    live.staged.insert(Frontier::new(
+                    let page_last = Frontier::new(
                         block::Height(ancestor.height.0.saturating_add(count)),
                         *last,
-                    ));
+                    );
+                    live.staged.insert(page_last);
+                    live.last_staged = Some(page_last);
                 }
                 false
             }
@@ -316,9 +377,33 @@ impl Credit {
         }
     }
 
-    /// The breaks found since the last call.
+    /// The breaks found since the last call, judging first each awaited
+    /// acceptance whose apply result is known by now.
     pub(super) fn take_breaks(&mut self) -> Vec<String> {
+        self.judge_awaited();
         std::mem::take(&mut self.breaks)
+    }
+
+    /// Breaks for each awaited acceptance whose apply call's storage
+    /// operation completed other than `Applied`, and forgets every one
+    /// whose result is known.
+    fn judge_awaited(&mut self) {
+        let mut waiting = Vec::new();
+        for (key, call, through) in std::mem::take(&mut self.awaiting) {
+            match self.applied.get(&call) {
+                None => waiting.push((key, call, through)),
+                Some(true) => {}
+                Some(false) => {
+                    let (_, session, subscription) = key;
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session} subscription {subscription} \
+                         accepted through {through:?} in apply call {call}'s completion, \
+                         whose apply didn't succeed"
+                    ));
+                }
+            }
+        }
+        self.awaiting = waiting;
     }
 
     /// Judges the credit `update` adds to `key`'s subscription against its
@@ -449,6 +534,24 @@ impl Credit {
     /// Notes storage's `fact`: a locator read gives its first entry's
     /// height, and a resolved VCT repair context its locator's.
     pub(super) fn storage(&mut self, fact: &StorageFact) {
+        match fact {
+            StorageFact::Submitted {
+                id,
+                call: Some(call),
+                ..
+            } => {
+                self.operations.insert(*id, *call);
+            }
+            StorageFact::Completed { id, result, .. } => {
+                if let Some(call) = self.operations.get(id) {
+                    if self.applies.contains_key(call) {
+                        self.applied
+                            .insert(*call, matches!(result, StorageResult::Applied));
+                    }
+                }
+            }
+            _ => {}
+        }
         let entry = match fact {
             StorageFact::Completed {
                 result: StorageResult::Locator { tip, .. },
@@ -556,6 +659,36 @@ impl Credit {
         }
         live.accepted = Some(through);
         live.acknowledged = cursor;
+        let last_staged = live.last_staged;
+        // Production accepts only in an apply's completion, through the
+        // round's last staged cursor, once that apply succeeded.
+        let apply = self.completion.and_then(|call| {
+            self.applies
+                .get(&call)
+                .map(|apply| (call, &apply.subscription, apply.last_staged))
+        });
+        let Some((call, applied, before)) = apply else {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} outside an apply call's completion"
+            ));
+            return;
+        };
+        if applied != key {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} in apply call {call}'s completion, an apply for {applied:?}"
+            ));
+            return;
+        }
+        if before != Some(through) {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} in apply call {call}'s completion, not its round's last \
+                 page staged before that apply, {before:?} (now {last_staged:?})"
+            ));
+        }
+        self.awaiting.push((key.clone(), call, through));
     }
 }
 

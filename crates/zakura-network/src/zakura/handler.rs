@@ -373,6 +373,8 @@ pub struct ZakuraConfig {
     /// the production trace schema and the legacy sync pipeline writes `legacy_sync.jsonl` into
     /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
+    /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
+    /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,

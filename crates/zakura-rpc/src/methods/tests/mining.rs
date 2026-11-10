@@ -416,7 +416,7 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
             vec![],
             Some(false),
         ));
-        let Poll::Ready(Ok(template)) = futures::poll!(&mut template) else {
+        let Poll::Ready(Ok((template, _))) = futures::poll!(&mut template) else {
             panic!("a precomputed coinbase must not wait behind proof construction");
         };
         assert_eq!(template.coinbase_txn.data, expected_coinbase);
@@ -1229,7 +1229,7 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             let (_, info) = watch::channel(chain.clone());
             let (rpc, tip, mut verifier) = mining_rpc(info);
             let params = rpc.gbt.miner_params().unwrap();
-            let template = bounded(rpc.build_mining_template(
+            let (template, _) = bounded(rpc.build_mining_template(
                 None,
                 params,
                 &chain,
@@ -1304,7 +1304,7 @@ fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
         let (info_tx, info) = watch::channel(chain.clone());
         let (rpc, _tip, mut verifier) = mining_rpc(info);
         let params = rpc.gbt.miner_params().unwrap();
-        let template = bounded(rpc.build_mining_template(
+        let (template, _) = bounded(rpc.build_mining_template(
             None,
             params,
             &chain,
@@ -1402,7 +1402,7 @@ async fn shielded_template_rewards() {
     let chain = chain_info(2, 1, 400_000_000);
     let id =
         LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
-    let template = tokio::time::timeout(
+    let (template, _) = tokio::time::timeout(
         Duration::from_secs(300),
         rpc.build_mining_template(None, &params, &chain, id, vec![], None),
     )

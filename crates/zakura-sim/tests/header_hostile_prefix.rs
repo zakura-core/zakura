@@ -286,8 +286,8 @@ fn the_surviving_peer_completes_a_departed_target() {
 /// tip, and the harness closes the source right after the `recovered`
 /// pick, a close only a typed scenario can take. That ends
 /// `StableMembership` and `HonestPeer` with the obligation open, so the
-/// property ends `Inconclusive` with `assumption-lost`, not violated, under
-/// 8 plans.
+/// property ends `Inconclusive` with `assumption-lost`, not violated, and
+/// the registry reports `Lifecycle::AssumptionLost` once, under 8 plans.
 #[test]
 fn closing_the_source_after_recovered_loses_the_assumptions() {
     let mut scenario = storage_witnesses::grown_source();
@@ -323,6 +323,25 @@ fn closing_the_source_after_recovered_loses_the_assumptions() {
             .iter()
             .any(|(step, _, tip)| *step <= close.step && objective.met_by(tip));
         assert!(!met_by_close, "the obligation was open at the close");
+        // The registry reports the loss once, at the step whose facts
+        // carried the close, after the obligation it ended.
+        let lost: Vec<u64> = run
+            .points
+            .iter()
+            .filter(|(_, point)| *point == Lifecycle::AssumptionLost)
+            .map(|(step, _)| *step)
+            .collect();
+        let [lost] = lost[..] else {
+            panic!("one loss: {:?}", run.points);
+        };
+        assert!(lost >= close.step, "{:?}", run.points);
+        assert!(
+            run.points
+                .iter()
+                .any(|(step, point)| *point == Lifecycle::Obliged && *step < lost),
+            "{:?}",
+            run.points
+        );
     }
 }
 
@@ -387,6 +406,13 @@ fn closing_a_departed_peer_after_recovered_loses_nothing() {
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
             &PropertyOutcome::Held { applicable: 1 }
+        );
+        assert!(
+            !run.points
+                .iter()
+                .any(|(_, point)| *point == Lifecycle::AssumptionLost),
+            "{:?}",
+            run.points
         );
     }
 }
@@ -671,69 +697,6 @@ fn an_unfair_plan_starves_the_recovery_the_fair_policy_completes() {
     );
 }
 
-/// Recovery ends within its stated window. Every class witness reaches its
-/// `recovered` pick within `recovery_window` of its `Recover` pick, at the
-/// node's default readmission cooldown, under 8 plans. (A node that never
-/// lets its source back in ends unreached within it, which the planted
-/// `pause-outlasts-cooldown` case shows.)
-#[test]
-fn every_recovery_ends_within_its_window() {
-    let window = recovery_window(
-        zakura_network::zakura::ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
-    );
-    for (class, scenario) in witnesses() {
-        for input in inputs(8, 256) {
-            let run = run(class, &scenario, input);
-            let started = run.recovery.started().expect("the recover is picked");
-            let record = run.recovery.record().expect("the pick wrote its record");
-            let took = record.at.saturating_duration_since(started);
-            assert!(took <= window, "{class}: {took:?} past {window:?}");
-        }
-    }
-}
-
-/// A source's own cooldown of the node, after a prefix that held the
-/// node's serving storage, isn't the node refusing its source. The node is
-/// at A8 and the source behind at A2. Every read lease the node takes to
-/// serve it is held, so the source times out three requests and drops the
-/// node, and the recover comes at that drop. Recovery's first relink is
-/// refused, and it waits a cooldown before the next, which is admitted, so
-/// it never ends unreached, under 8 plans. Nothing is owed, since the node
-/// holds the heaviest chain.
-#[test]
-fn a_source_cooling_down_on_the_node_isnt_unreached() {
-    let mut scenario = StorageScenario {
-        node: Chain::main(8),
-        ..storage_witnesses::recovering(vec![storage_witnesses::recover(Some(Trigger::Closed(
-            storage_witnesses::SOURCE.to_owned(),
-        )))])
-    };
-    scenario.mirrors[0].chain = Chain::main(2);
-    scenario.policy.holds.push(storage_witnesses::hold(
-        Select {
-            kind: Some(OpKind::Acquire),
-            ..Select::default()
-        },
-        Trigger::Released,
-        Allow::Engine,
-    ));
-    for input in inputs(8, 256) {
-        let run = run("cooldown", &scenario, input);
-        let relinks = run
-            .report
-            .picks
-            .iter()
-            .filter(|pick| pick.identity.ends_with(":recovery-relink"))
-            .count();
-        assert!(!run.recovery.unreached(), "recovery reaches its source");
-        assert!(relinks >= 2, "the first relink is refused: {relinks}");
-        assert_eq!(
-            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
-            &PropertyOutcome::NotApplicable
-        );
-    }
-}
-
 /// The departure recovery fixture arms `peer-retirement-progress`'s
 /// hand-off, with mirror A as the owner and B as the taker, so the close
 /// class's completion runs beside it. Under 8 plans the hand-off opens for
@@ -799,6 +762,69 @@ fn the_departure_recovery_hands_the_target_to_the_survivor() {
         assert!(
             stopped.is_none_or(|stopped| read < stopped),
             "the read comes before the stop"
+        );
+    }
+}
+
+/// Recovery ends within its stated window. Every class witness reaches its
+/// `recovered` pick within `recovery_window` of its `Recover` pick, at the
+/// node's default readmission cooldown, under 8 plans. (A node that never
+/// lets its source back in ends unreached within it, which the planted
+/// `pause-outlasts-cooldown` case shows.)
+#[test]
+fn every_recovery_ends_within_its_window() {
+    let window = recovery_window(
+        zakura_network::zakura::ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
+    );
+    for (class, scenario) in witnesses() {
+        for input in inputs(8, 256) {
+            let run = run(class, &scenario, input);
+            let started = run.recovery.started().expect("the recover is picked");
+            let record = run.recovery.record().expect("the pick wrote its record");
+            let took = record.at.saturating_duration_since(started);
+            assert!(took <= window, "{class}: {took:?} past {window:?}");
+        }
+    }
+}
+
+/// A source's own cooldown of the node, after a prefix that held the
+/// node's serving storage, isn't the node refusing its source. The node is
+/// at A8 and the source behind at A2. Every read lease the node takes to
+/// serve it is held, so the source times out three requests and drops the
+/// node, and the recover comes at that drop. Recovery's first relink is
+/// refused, and it waits a cooldown before the next, which is admitted, so
+/// it never ends unreached, under 8 plans. Nothing is owed, since the node
+/// holds the heaviest chain.
+#[test]
+fn a_source_cooling_down_on_the_node_isnt_unreached() {
+    let mut scenario = StorageScenario {
+        node: Chain::main(8),
+        ..storage_witnesses::recovering(vec![storage_witnesses::recover(Some(Trigger::Closed(
+            storage_witnesses::SOURCE.to_owned(),
+        )))])
+    };
+    scenario.mirrors[0].chain = Chain::main(2);
+    scenario.policy.holds.push(storage_witnesses::hold(
+        Select {
+            kind: Some(OpKind::Acquire),
+            ..Select::default()
+        },
+        Trigger::Released,
+        Allow::Engine,
+    ));
+    for input in inputs(8, 256) {
+        let run = run("cooldown", &scenario, input);
+        let relinks = run
+            .report
+            .picks
+            .iter()
+            .filter(|pick| pick.identity.ends_with(":recovery-relink"))
+            .count();
+        assert!(!run.recovery.unreached(), "recovery reaches its source");
+        assert!(relinks >= 2, "the first relink is refused: {relinks}");
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::NotApplicable
         );
     }
 }

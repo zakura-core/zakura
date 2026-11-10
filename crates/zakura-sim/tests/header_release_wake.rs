@@ -463,6 +463,7 @@ impl Checker for Measured {
                     assert!(self.open > 0, "an obligation concludes only once it's open");
                     self.open -= 1;
                 }
+                Lifecycle::AssumptionLost => self.open = 0,
                 Lifecycle::Applicable => continue,
             }
             self.lifecycle.push((cx.step, to));

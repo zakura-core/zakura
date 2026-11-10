@@ -51,6 +51,9 @@ pub enum Lifecycle {
     Discharged,
     /// One of its obligations expired undischarged.
     Expired,
+    /// One of its assumptions stopped holding while obligations were open,
+    /// which ended them all, `Inconclusive` with `assumption-lost`.
+    AssumptionLost,
 }
 
 /// Two checkers run as one pipeline: `.0` sees each step first, and its
@@ -270,8 +273,9 @@ impl Sources {
 /// declares, in registry order:
 ///
 /// 1. It updates `holds_since` from the property's assumptions. When one
-///    stops holding, the property's open obligations end, and the property
-///    is `Inconclusive` with `assumption-lost`.
+///    stops holding, the property's open obligations end, the property
+///    is `Inconclusive` with `assumption-lost`, and it emits
+///    `Lifecycle::AssumptionLost`.
 /// 2. While the assumptions hold, it runs the check and keeps the
 ///    obligations the check opens. Each `Holds` counts as applicable, and
 ///    the first `Holds` or `Violated` emits `Lifecycle::Applicable`.
@@ -684,6 +688,7 @@ fn step_property<S: HasView>(
                     state
                         .inconclusive
                         .get_or_insert(Inconclusive::AssumptionLost);
+                    events.push(event(Lifecycle::AssumptionLost));
                 }
             }
             _ => {}

@@ -3033,8 +3033,15 @@ struct Scan<'a> {
     /// Set while visiting a statement that follows a `missing_evidence`
     /// call in its block.
     after_missing: bool,
+    /// The inline modules enclosing the item being visited.
+    modules: Vec<String>,
     found: Vec<Construction>,
     errors: Vec<String>,
+    /// Every function's text, by its qualified name, with the module it
+    /// sits in.
+    functions: Vec<(String, String, String)>,
+    /// Every module-scope `use` item's text, by its module.
+    uses: Vec<(String, String)>,
 }
 
 impl Scan<'_> {
@@ -3075,8 +3082,11 @@ impl Scan<'_> {
         end: proc_macro2::LineColumn,
         visit: impl FnOnce(&mut Self),
     ) {
-        let print = fingerprint(&self.source(start, end));
+        let text = self.source(start, end);
+        let print = fingerprint(&text);
         self.scope.push(name);
+        self.functions
+            .push((self.scope.join("::"), self.modules.join("::"), text));
         self.prints.push(print);
         visit(self);
         self.prints.pop();
@@ -3389,7 +3399,9 @@ impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
         });
         if !test {
             self.scope.push(item.ident.to_string());
+            self.modules.push(item.ident.to_string());
             syn::visit::visit_item_mod(self, item);
+            self.modules.pop();
             self.scope.pop();
         }
     }
@@ -3455,6 +3467,12 @@ impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
             self.errors
                 .push(format!("{}: a use item renames a verdict type", self.file));
         }
+        if self.prints.is_empty() {
+            use syn::spanned::Spanned;
+            let span = item.span();
+            let text = self.source(span.start(), span.end());
+            self.uses.push((self.modules.join("::"), text));
+        }
         syn::visit::visit_item_use(self, item);
     }
 
@@ -3494,16 +3512,32 @@ impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
     }
 }
 
-/// Every construction under `src/` and every error the scan hit, from the
-/// files in `sources` as `(path relative to the crate, text)`.
+/// What [`scan`] read from the crate's sources.
+struct Scanned {
+    /// Every construction.
+    found: Vec<Construction>,
+    /// Every error the scan hit.
+    errors: Vec<String>,
+    /// Every function's text, by `(file, qualified function)`, with the
+    /// module it sits in.
+    functions: BTreeMap<(String, String), (String, String)>,
+    /// Every module-scope `use` item's text, by `(file, module)`.
+    uses: BTreeMap<(String, String), Vec<String>>,
+}
+
+/// Every construction under `src/` and every error the scan hit, with
+/// each function's text and each module's `use` items, from the files in
+/// `sources` as `(path relative to the crate, text)`.
 ///
 /// It also checks the verdict types' pin: the [`fingerprint`] of the
 /// [`VERDICT_TYPES`]' definitions and every `impl` block for them, in file
 /// and line order, must be [`reasons::VERDICT_FINGERPRINT`].
-fn scan(sources: &[(String, String)]) -> (Vec<Construction>, Vec<String>) {
+fn scan(sources: &[(String, String)]) -> Scanned {
     let mut found = Vec::new();
     let mut errors = Vec::new();
     let mut verdict = Vec::new();
+    let mut functions = BTreeMap::new();
+    let mut uses: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     let files: BTreeSet<String> = sources.iter().map(|(file, _)| file.clone()).collect();
     for (file, text) in sources {
         let parsed = match syn::parse_file(text) {
@@ -3521,12 +3555,21 @@ fn scan(sources: &[(String, String)]) -> (Vec<Construction>, Vec<String>) {
             prints: Vec::new(),
             verdict: Vec::new(),
             after_missing: false,
+            modules: Vec::new(),
             found: Vec::new(),
             errors: Vec::new(),
+            functions: Vec::new(),
+            uses: Vec::new(),
         };
         syn::visit::Visit::visit_file(&mut scan, &parsed);
         found.extend(scan.found);
         errors.extend(scan.errors);
+        for (function, module, text) in scan.functions {
+            functions.insert((file.clone(), function), (module, text));
+        }
+        for (module, text) in scan.uses {
+            uses.entry((file.clone(), module)).or_default().push(text);
+        }
         verdict.extend(
             scan.verdict
                 .into_iter()
@@ -3543,11 +3586,16 @@ fn scan(sources: &[(String, String)]) -> (Vec<Construction>, Vec<String>) {
     );
     if pinned != reasons::VERDICT_FINGERPRINT {
         errors.push(format!(
-            "the verdict types' definitions and impls fingerprint {pinned}, and VERDICT_FINGERPRINT pins {}",
+            "the verdict types' definitions or impls changed: reread every NotApplicable meaning in reasons.rs, then update VERDICT_FINGERPRINT from {} to {pinned}",
             reasons::VERDICT_FINGERPRINT
         ));
     }
-    (found, errors)
+    Scanned {
+        found,
+        errors,
+        functions,
+        uses,
+    }
 }
 
 /// The types whose `NotApplicable` is a reason: their definitions and
@@ -3720,6 +3768,49 @@ fn path_target(file: &str, item: &syn::ItemMod) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// The path identifiers of all header-side text ([`reasons::Basis::NotNamedByHeader`]),
+/// each by where it is: every file under [`reasons::HEADER_SIDE`], whole,
+/// and for each [`NA_REASONS`] producer elsewhere, its own text and its
+/// module scope's `use` items.
+fn header_side_idents(
+    sources: &[(String, String)],
+    functions: &BTreeMap<(String, String), (String, String)>,
+    uses: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<(String, BTreeMap<String, Vec<String>>)> {
+    let header_file = |file: &str| {
+        reasons::HEADER_SIDE
+            .iter()
+            .any(|prefix| file.starts_with(prefix))
+    };
+    let mut side: Vec<(String, BTreeMap<String, Vec<String>>)> = sources
+        .iter()
+        .filter(|(file, _)| header_file(file))
+        .map(|(file, text)| (file.clone(), idents(text)))
+        .collect();
+    for producer in NA_REASONS.iter().filter(|p| !header_file(p.file)) {
+        let at = (producer.file.to_owned(), producer.function.to_owned());
+        // A listed producer the scan doesn't find is its own error.
+        let Some((module, text)) = functions.get(&at) else {
+            continue;
+        };
+        side.push((
+            format!("{} {}", producer.file, producer.function),
+            idents(text),
+        ));
+        for item in uses
+            .get(&(producer.file.to_owned(), module.clone()))
+            .into_iter()
+            .flatten()
+        {
+            side.push((
+                format!("{}'s module-scope use items", producer.file),
+                idents(item),
+            ));
+        }
+    }
+    side
+}
+
 /// Constructions by `(file, function)`, each as `(line, fingerprint,
 /// after_missing)` in source order.
 type Producers = BTreeMap<(String, String), Vec<(String, String, bool)>>;
@@ -3727,9 +3818,16 @@ type Producers = BTreeMap<(String, String), Vec<(String, String, bool)>>;
 /// Every difference between a scan of `sources` and the inventory, with
 /// the scan's own errors: a construction in a header-reachable file that
 /// no entry lists at its function and position, a listed one the scan
-/// doesn't find there, and a [`NOT_HEADER`] file the inventory also lists.
+/// doesn't find there, a producer whose text changed since its meanings
+/// were read, a [`NOT_HEADER`] file the inventory also lists, and one whose
+/// [`reasons::Basis`] doesn't hold.
 fn scan_errors(sources: &[(String, String)]) -> Vec<String> {
-    let (found, mut errors) = scan(sources);
+    let Scanned {
+        found,
+        mut errors,
+        functions,
+        uses,
+    } = scan(sources);
     let not_header: BTreeSet<&str> = NOT_HEADER.iter().map(|n| n.file).collect();
     let mut by_function: Producers = BTreeMap::new();
     for found in found
@@ -3760,35 +3858,20 @@ fn scan_errors(sources: &[(String, String)]) -> Vec<String> {
             )
         })
         .collect();
-    // Each excluded file is excluded on a basis the scan checks: its
-    // module is named by exactly the files it lists, or it names no
-    // `Verdict` or `PropertyOutcome`.
-    let idents: BTreeMap<&str, BTreeMap<String, Vec<String>>> = sources
-        .iter()
-        .map(|(file, text)| (file.as_str(), idents(text)))
-        .collect();
+    // Each excluded file is excluded on a basis the scan checks: no
+    // header-side text names its module, or it names no `Verdict` or
+    // `PropertyOutcome`.
+    let header_side = header_side_idents(sources, &functions, &uses);
     for excluded in NOT_HEADER {
         match excluded.basis {
-            reasons::Basis::NamedOnlyBy(listed) => {
-                let mut naming: Vec<(&str, &str)> = idents
-                    .iter()
-                    .filter(|(file, _)| **file != excluded.file)
-                    .flat_map(|(file, idents)| {
-                        idents
-                            .get(excluded.module)
-                            .into_iter()
-                            .flatten()
-                            .map(move |line| (*file, line.as_str()))
-                    })
-                    .collect();
-                naming.sort_unstable();
-                let mut listed = listed.to_vec();
-                listed.sort_unstable();
-                if naming != listed {
-                    errors.push(format!(
-                        "{} is named by {naming:?}, NOT_HEADER lists {listed:?}",
-                        excluded.module
-                    ));
+            reasons::Basis::NotNamedByHeader => {
+                for (place, idents) in &header_side {
+                    for line in idents.get(excluded.module).into_iter().flatten() {
+                        errors.push(format!(
+                            "{place} names {}, which NOT_HEADER excludes: {line}",
+                            excluded.module
+                        ));
+                    }
                 }
             }
             reasons::Basis::NamesNoVerdict => {
@@ -3812,9 +3895,24 @@ fn scan_errors(sources: &[(String, String)]) -> Vec<String> {
     if listed.len() != NA_REASONS.len() {
         errors.push("a producer is listed twice".into());
     }
+    // A producer's constructions without their fingerprints, to tell a
+    // changed text from a changed construction.
+    let shape = |lines: &[(String, String, bool)]| -> Vec<(String, bool)> {
+        lines
+            .iter()
+            .map(|(line, _, missing)| (line.clone(), *missing))
+            .collect()
+    };
     for (at, lines) in &by_function {
         match listed.get(at) {
             Some(listed) if listed == lines => {}
+            Some(listed) if shape(listed) == shape(lines) => errors.push(format!(
+                "{} {} changed: reread the meanings of its NotApplicable constructions in reasons.rs, then update its fingerprint from {} to {}",
+                at.0,
+                at.1,
+                listed.first().map_or("", |(_, print, _)| print.as_str()),
+                lines.first().map_or("", |(_, print, _)| print.as_str()),
+            )),
             Some(listed) => errors.push(format!("{at:?}: found {lines:?}, listed {listed:?}")),
             None => errors.push(format!("{at:?}: found {lines:?}, unlisted")),
         }
@@ -3839,6 +3937,14 @@ fn the_not_applicable_inventory_equals_a_source_scan() {
             sources.iter().any(|(f, _)| f == excluded.file),
             "{} doesn't exist",
             excluded.file
+        );
+    }
+    // A prefix that matches nothing, after a rename, would leave header
+    // files outside the header-side text.
+    for prefix in reasons::HEADER_SIDE {
+        assert!(
+            sources.iter().any(|(f, _)| f.starts_with(prefix)),
+            "no file is under HEADER_SIDE's {prefix}"
         );
     }
 }
@@ -3973,16 +4079,44 @@ fn the_source_scan_refuses_an_unlisted_producer() {
             "fn check_reach() {\n    let _ = crate::domain::shared::bounds::bound;\n}\n",
             "a header file naming an excluded module",
         ),
+        (
+            "use crate::domain::discovery as found;\n",
+            "a header file aliasing an excluded module",
+        ),
+        (
+            "fn check_rows() {\n    let _ = crate::domain::block_sync::BUDGET_LEDGERS_AGREE;\n}\n",
+            "a header file naming block sync's checks",
+        ),
     ] {
         refused(edited(&sources, header, &|t| format!("{t}\n{extra}")), what);
     }
-    // A helper outside header code that starts naming an excluded module,
-    // which a header check could then call.
-    refused(
-        edited(&sources, "src/table.rs", &|t| {
-            format!("{t}\nfn helper() {{\n    let _ = crate::domain::block_sync::BlockSync;\n}}\n")
+    // A shared producer's own text naming an excluded module, and an
+    // import in its module scope redirected to one, its text unchanged,
+    // each refused as naming it, not only by a changed fingerprint.
+    let names_excluded = |changed: Vec<(String, String)>, what: &str| {
+        let errors = scan_errors(&changed);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("which NOT_HEADER excludes")),
+            "{what}: {errors:?}"
+        );
+    };
+    names_excluded(
+        edited(&sources, "src/harness/mod.rs", &|t| {
+            t.replacen(
+                "        Phase::Drain => Verdict::NotApplicable,\n",
+                "        Phase::Drain => {\n            let _ = block_sync::Storage::NAME;\n            Verdict::NotApplicable\n        }\n",
+                1,
+            )
         }),
-        "a new helper naming an excluded module",
+        "a shared producer naming an excluded module",
+    );
+    names_excluded(
+        edited(&sources, "src/table.rs", &|t| {
+            format!("{t}\nuse crate::domain::block_sync::check_ledgers as judged;\n")
+        }),
+        "a shared producer's module-scope import of an excluded module",
     );
     // The evaluator starting to name a verdict type.
     refused(
@@ -4050,20 +4184,13 @@ fn the_source_scan_refuses_an_unlisted_producer() {
         }),
         "a match on another value",
     );
-    // A file already allowed to name an excluded module gaining another
-    // reference: a call from a header-reachable function, or a re-export a
-    // header check could call.
-    refused(
-        edited(&sources, "src/harness/mod.rs", &|t| {
-            format!("{t}\nfn reach() {{\n    let _ = crate::domain::discovery::wait_complete_wakes::<()>;\n}}\n")
-        }),
-        "a call added in an already-listed importer",
-    );
-    refused(
+    // A re-export in a shared producer's module scope, which its producer
+    // could call.
+    names_excluded(
         edited(&sources, "src/harness/mod.rs", &|t| {
             format!("{t}\npub use block_sync::Storage as ReexportedStorage;\n")
         }),
-        "a re-export added in an already-listed importer",
+        "a re-export in a shared producer's module scope",
     );
     // One of two identical returns given another trigger.
     refused(
@@ -4222,6 +4349,19 @@ fn the_source_scan_refuses_an_unlisted_producer() {
         let errors = scan_errors(&changed);
         assert!(!errors.is_empty(), "{what}");
     }
+    // A producer whose text changed but whose constructions didn't says
+    // what to reread.
+    let errors = scan_errors(&replaced(
+        "src/property/registry.rs",
+        "None if state.applicable > 0 =>",
+        "None if state.applicable > 1 =>",
+    ));
+    assert!(
+        errors.iter().any(|e| e.starts_with(
+            "src/property/registry.rs outcome changed: reread the meanings of its NotApplicable constructions in reasons.rs"
+        )),
+        "{errors:?}"
+    );
     // A comment or whitespace in a producer isn't an edit.
     assert_eq!(
         scan_errors(&replaced(
@@ -4234,7 +4374,7 @@ fn the_source_scan_refuses_an_unlisted_producer() {
 
     // The reachable sender helper's entry removed from the inventory is
     // refused too, since downstream.rs isn't a file NOT_HEADER names.
-    let (found, _) = scan(&sources);
+    let found = scan(&sources).found;
     assert!(found
         .iter()
         .any(|f| f.file == "src/downstream.rs" && f.function == "check_with"));
@@ -4260,6 +4400,45 @@ fn the_source_scan_refuses_an_unlisted_producer() {
                 format!("{t}\n// Verdict::NotApplicable\n")
             }),
             "a comment",
+        ),
+        // Other teams naming their own modules (Evan's examples) don't touch
+        // the scan: an unrelated same-named module, a new coverage row, and
+        // a reference in a shared producer's file outside the producer and
+        // its imports.
+        (
+            edited(&sources, "src/peer/discovery/content.rs", &|t| {
+                format!("{t}\nfn unix_now_again() {{\n    let _ = crate::peer::discovery::unix_now;\n}}\n")
+            }),
+            "an unrelated module of an excluded module's name",
+        ),
+        (
+            edited(&sources, "src/harness/coverage.rs", &|t| {
+                format!("{t}\nfn another_row() {{\n    let _ = crate::domain::block_sync::BUDGET_LEDGERS_AGREE;\n}}\n")
+            }),
+            "a new coverage reference to block sync",
+        ),
+        (
+            edited(&sources, "src/harness/mod.rs", &|t| {
+                format!("{t}\nfn other_entry() {{\n    let _ = block_sync::Storage::NAME;\n}}\n")
+            }),
+            "a reference outside a shared file's producer",
+        ),
+        // The accepted gap (Rule 23): a helper in a shared file, which a
+        // producer could later call, isn't followed until the producer's
+        // own text changes.
+        (
+            edited(&sources, "src/table.rs", &|t| {
+                format!(
+                    "{t}\nfn helper() {{\n    let _ = crate::domain::block_sync::BlockSync;\n}}\n"
+                )
+            }),
+            "a new helper in a shared file",
+        ),
+        (
+            edited(&sources, "src/harness/mod.rs", &|t| {
+                format!("{t}\nfn reach() {{\n    let _ = crate::domain::discovery::wait_complete_wakes::<()>;\n}}\n")
+            }),
+            "a call added in a shared file outside its producer",
         ),
     ] {
         assert_eq!(scan_errors(&changed), Vec::<String>::new(), "{what}");

@@ -1052,11 +1052,17 @@ fn held(kind: OpKind) -> StorageScenario {
 /// relink of [`OWNER`] with the clock past it, and a timeout fixture's the
 /// clock past its horizon ([`LivenessScenario::horizon`]), and a recovery
 /// fixture's `header-sync/bounded-adversary-progress` concluding or the
-/// clock passing its deadline ([`RecoveryEvidence::progress`]). A departure
-/// fixture whose departure never came, and a recovery fixture still
-/// establishing, also end at the horizon. A `BeforeQuiescence` obligation concludes
+/// clock passing its deadline ([`RecoveryEvidence::progress`]). A hold
+/// fixture whose held reply never reached the reactor, a departure fixture
+/// whose departure never came, and a recovery fixture whose recover never
+/// came also end at the horizon, so a node that never gets that far, such
+/// as a planted one that never prepares, still ends idle. So does a fixture
+/// whose own `Shutdown` step was never offered. A recovery that started
+/// always ends recovered or unreached, so the horizon never cuts its
+/// relinks short. A `BeforeQuiescence` obligation concludes
 /// by the first quiescence after its trigger, and the clock moves only then.
-/// The fixture's own `Shutdown` step, if it has one, must be picked first.
+/// The fixture's own `Shutdown` step, if it has one, must be picked first,
+/// unless the horizon has passed.
 /// Its pick begins the node under test's stop, as a `Shutdown` step's does,
 /// and its task then stops every node ([`Topology::finish`]). It offers no
 /// time boundary of its own, so it never changes when the clock moves before
@@ -1087,7 +1093,10 @@ impl Finish {
     /// Whether the run's obligations have concluded at `now`, as
     /// [`Finish`] says.
     fn due(&self, now: SimInstant) -> bool {
-        if self.done || (self.waits_for_shutdown && !self.topology.shutdown_picked()) {
+        let horizon = now > SimInstant::from_start(self.horizon);
+        // A planted defect can keep the fixture's own shutdown from ever
+        // being offered, so the horizon still ends it.
+        if self.done || (self.waits_for_shutdown && !self.topology.shutdown_picked() && !horizon) {
             return false;
         }
         match self.kind {
@@ -1117,14 +1126,15 @@ impl Finish {
             })
         };
         let replies_concluded = opened.iter().all(|(op, at)| now > *at || answered(*op));
-        let horizon = now > SimInstant::from_start(self.horizon);
         let key_event = match self.kind {
-            FixtureKind::Hold => !opened.is_empty(),
+            FixtureKind::Hold => !opened.is_empty() || horizon,
             FixtureKind::Serving => !opened.is_empty() || horizon,
             FixtureKind::Departure => self.departed_at.is_some_and(|at| now > at) || horizon,
             FixtureKind::Timeout => horizon,
             FixtureKind::Recovery => match self.recovery.progress(&self.ends) {
-                RecoveryProgress::Pending => horizon,
+                // A started recovery always ends recovered or unreached,
+                // so only one whose recover never came ends at the horizon.
+                RecoveryProgress::Pending => horizon && self.recovery.recovery.started().is_none(),
                 RecoveryProgress::Concluded => true,
                 RecoveryProgress::Owed { since } => now > recovery_deadline(since),
             },

@@ -2346,14 +2346,25 @@ fn hand_written_rows() -> Vec<Row> {
 
     let recovery = RECOVERY_ID;
     let mut recovering = holds(recovery, NONE, RECOVERY_WITNESS);
-    recovering.extend(caught(
-        LIVENESS,
-        case(recovery, "skipped-apply"),
-        &[RECOVERY_ID],
-        Found::AtStep,
-        NONE,
-        false,
-    ));
+    // hdr-11's control bypass, then hdr-13's: each violates only this ID
+    // on its committed fixture (a case's `also_violates` covers only its
+    // campaign's departure inputs).
+    for name in [
+        "skipped-apply",
+        "stalled-successor",
+        "faulted-target-remembered",
+        "refusal-never-lifts",
+        "pause-outlasts-cooldown",
+    ] {
+        recovering.extend(caught(
+            LIVENESS,
+            case(recovery, name),
+            &[RECOVERY_ID],
+            Found::AtStep,
+            NONE,
+            false,
+        ));
+    }
     rows.push(Row {
         property: recovery,
         tier: Tier::Sim,

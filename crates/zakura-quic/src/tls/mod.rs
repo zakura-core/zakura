@@ -225,7 +225,7 @@ pub(crate) const SHARED_ID_LEN: usize = 16;
 
 /// The exporter label of [`shared_id`].
 #[cfg(any(test, zakura_sim, feature = "test-support"))]
-const SHARED_ID_LABEL: &[u8] = b"EXPORTER-zakura-quic-shared-id";
+const SHARED_ID_LABEL: &[u8] = b"EXPERIMENTAL-zakura-quic-shared-id";
 
 /// The ID both ends of a completed handshake derive from it: the keying
 /// material `session` exports under [`SHARED_ID_LABEL`] (RFC 8446 §7.5).

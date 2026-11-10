@@ -995,6 +995,34 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("close-on-block-stall"),
     },
     Coverage {
+        property: crate::domain::connection::CREDIT_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("handshake-window-only"),
+    },
+    Coverage {
+        property: crate::domain::connection::SEND_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Pending(
+            "raising block sync's send priority keeps the bound: QUIC buffers one send window \
+             per stream and each worker writes one frame at a time, so no single production \
+             site blocks other streams across several frames",
+        ),
+    },
+    Coverage {
+        property: crate::domain::connection::CONNECTION_SHARES_BOUND,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("one-raw-gate"),
+    },
+    Coverage {
         property: crate::domain::cross::TIPS_CONSISTENT,
         passing: passes(
             "tests/sync_properties.rs",

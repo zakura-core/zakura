@@ -166,6 +166,14 @@ impl<T> Sender<T> {
         Ref::new(self.tx().borrow())
     }
 
+    /// Runs `f` on the value for a [`boundary_read`](crate::sim::boundary_read).
+    /// Unlike [`Sender::borrow`], it takes no preemption point, so it never
+    /// changes a schedule. A boundary read runs while no task does, so no
+    /// writer holds tokio's lock.
+    pub fn peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.tx().borrow())
+    }
+
     /// A new receiver that has seen the current value.
     #[track_caller]
     pub fn subscribe(&self) -> Receiver<T> {

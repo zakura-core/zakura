@@ -603,6 +603,15 @@ fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
         .collect()
 }
 
+/// True if the node judged a frame on `connection` in `entries` whose label
+/// isn't `Conformant`, which justifies a punishment after it, or the first
+/// judged frame's missing evidence.
+pub(crate) fn judged_nonconformant(entries: &[Entry], connection: u64) -> Result<bool, String> {
+    Ok(judged(entries, connection)?
+        .iter()
+        .any(|frame| frame.label != Label::Conformant))
+}
+
 /// True if `entries` hold a close of `connection`, with any cause.
 fn closed(entries: &[Entry], connection: u64) -> bool {
     entries.iter().any(|entry| {

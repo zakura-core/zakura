@@ -297,6 +297,7 @@ fn recorded_witness_judges_its_own_trace() {
         &dir.path().join("holds"),
         WAIT_COMPLETE_WAKES,
         Expect::Holds,
+        &[],
     )
     .expect("the trace is written");
     assert_eq!(result, Ok(()));
@@ -308,6 +309,7 @@ fn recorded_witness_judges_its_own_trace() {
         &dir.path().join("violated"),
         WAIT_COMPLETE_WAKES,
         Expect::Violated,
+        &[],
     )
     .expect("a failed witness test still writes its trace");
     assert_eq!(
@@ -324,6 +326,7 @@ fn recorded_witness_judges_its_own_trace() {
         &dir.path().join("unregistered"),
         "discovery/no-such-property",
         Expect::Holds,
+        &[],
     )
     .expect_err("an unregistered property has no witness test");
     assert!(

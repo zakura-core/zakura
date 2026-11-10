@@ -163,6 +163,7 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
         plan(input),
         CAPACITY_RELEASE_WAKES,
         Expect::Holds,
+        &[],
         &mut MemorySink::default(),
     );
     assert_eq!(result, Ok(()));

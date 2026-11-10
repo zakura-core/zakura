@@ -35,10 +35,10 @@
 //!
 //! Each witness process runs under `systemd-run --scope -p MemoryMax=<cap>`.
 //! The cap is the host's memory divided by the slots, unless
-//! `--memory-max` sets it. A case the cap killed reruns alone, with the
-//! host's memory as its cap. A mutant's deadline is five times its
-//! baseline's time, and at least 60 s. A timeout is a harness failure,
-//! never a kill or a survivor.
+//! `--memory-max` sets it. A baseline witness or a case the cap killed
+//! reruns alone, with the host's memory as its cap. A mutant's deadline is
+//! five times its baseline's time, and at least 60 s. A timeout is a
+//! harness failure, never a kill or a survivor.
 //!
 //! `--changed-since <rev>` keeps only the cases a change since `rev` can
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
@@ -79,7 +79,7 @@ mod classify;
 #[cfg(test)]
 mod tests;
 
-use classify::{Class, Classified, Ended, Observed, Reason};
+use classify::{Class, Classified, Ended, Observed, Reason, Trigger};
 
 /// The loop's retained cases, relative to the repository root.
 const CASES: &str = "qa/native-mutations/cases.json";
@@ -196,6 +196,10 @@ pub(super) struct CaseReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) also_violates: Vec<String>,
     pub(super) result: Classified,
+    /// Whether the run that decided the result reached the named ID's
+    /// trigger history ([`classify::trigger`]), if the witness ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) trigger: Option<Trigger>,
     pub(super) baseline: BaselineReport,
     /// How long the mutant's witness ran, if it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,6 +223,10 @@ pub(super) struct BaselineReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) detail: Option<String>,
     pub(super) millis: u64,
+    /// True if the memory cap killed the first run, and this result is the
+    /// rerun alone with the host's memory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) rerun_alone: bool,
 }
 
 /// The build every case ran on, unpatched.
@@ -725,10 +733,14 @@ impl Runner {
                 patch: cases[index].patch.clone(),
                 cases: vec![index],
             };
-            let cap = host_memory().ok();
-            for (index, mut report) in
-                self.mutant(&slots[0], &mutant, cases, &runnables, &baselines, cap)?
-            {
+            for (index, mut report) in self.mutant(
+                &slots[0],
+                &mutant,
+                cases,
+                &runnables,
+                &baselines,
+                self.alone_cap(),
+            )? {
                 report.rerun_alone = true;
                 results.insert(index, report);
             }
@@ -736,8 +748,15 @@ impl Runner {
         Ok((source, results.into_values().collect()))
     }
 
+    /// The memory cap of a run alone: the host's memory, or none if the
+    /// loop runs without a cap.
+    fn alone_cap(&self) -> Option<u64> {
+        self.memory_max.and_then(|_| host_memory().ok())
+    }
+
     /// Runs each distinct witness once on the unpatched `built`, and judges
-    /// it for each case's property.
+    /// it for each case's property. A witness the memory cap killed reruns
+    /// alone with [`Runner::alone_cap`].
     fn baselines(
         &self,
         cases: &[LoopCase],
@@ -789,7 +808,28 @@ impl Runner {
                 })
                 .collect::<Result<Vec<()>, String>>()
         })?;
-        let ran = ran.into_inner().expect("every worker joined");
+        let mut ran = ran.into_inner().expect("every worker joined");
+        let killed: BTreeSet<usize> = ran
+            .iter()
+            .filter(|(_, ran)| classify::cap_killed(&ran.observed))
+            .map(|(index, _)| *index)
+            .collect();
+        for index in &killed {
+            let dir = self
+                .out
+                .join("baseline")
+                .join(format!("witness-{index}-alone"));
+            let rerun = self.witness(
+                slot,
+                built,
+                &runnables[*index],
+                &dir,
+                source,
+                BASELINE_DEADLINE,
+                self.alone_cap(),
+            )?;
+            ran.insert(*index, rerun);
+        }
         Ok((0..cases.len())
             .map(|index| {
                 let first = *distinct
@@ -808,6 +848,7 @@ impl Runner {
                     passed: detail.is_none(),
                     detail,
                     millis: ran.millis,
+                    rerun_alone: killed.contains(&first),
                 }
             })
             .collect())
@@ -843,6 +884,7 @@ impl Runner {
                 witness: case.witness.clone(),
                 also_violates: case.also_violates.clone(),
                 result,
+                trigger: ran.map(|ran| classify::trigger(&case.property, &ran.observed)),
                 baseline: baselines[index].clone(),
                 millis: ran.map(|ran| ran.millis),
                 peak_rss_kib: ran.and_then(|ran| ran.peak_rss_kib),

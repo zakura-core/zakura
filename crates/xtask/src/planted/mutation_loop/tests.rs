@@ -7,9 +7,9 @@ use serde_json::json;
 
 use super::{
     build_failure,
-    classify::{self, read_record, Class, Ended, Observed, Reason, Record},
-    parse_flags, run_measured, summarize, test_executables, BaselineReport, BuildIdentity,
-    CaseReport, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
+    parse_flags, run_measured, summarize, test_executables, BaselineReport, BuildIdentity, Built,
+    CaseReport, LoopCase, Mutant, Report, Runnable, Runner, Slot, WitnessSpec,
 };
 
 const NAMED: &str = "block-sync/retained-byte-bound";
@@ -38,12 +38,12 @@ fn end_on(thread: &str, stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]
     }
 }
 
-fn judged(error: Option<&str>, trigger: &str) -> Record {
+fn judged(error: Option<&str>, trigger: Trigger) -> Record {
     Record::Witness {
         thread: "t1".to_owned(),
         property: NAMED.to_owned(),
         error: error.map(str::to_owned),
-        trigger_history: trigger.to_owned(),
+        trigger_history: trigger,
     }
 }
 
@@ -67,7 +67,7 @@ fn the_named_id_violated_kills_by_the_named_rule() {
         Ended::Exited(1),
         vec![
             end(Some(NAMED), &[(NAMED, "violated", 0)]),
-            judged(Some("violated"), "reached"),
+            judged(Some("violated"), Trigger::Reached),
         ],
     );
     assert_eq!(classified(&run), (Class::KilledByNamedRule, None));
@@ -128,7 +128,7 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
         Ended::Exited(1),
         vec![
             end(None, &[(NAMED, "not-applicable", 0)]),
-            judged(Some("not-applicable"), "lost"),
+            judged(Some("not-applicable"), Trigger::Lost),
         ],
     );
     assert_eq!(
@@ -139,7 +139,7 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
         Ended::Exited(1),
         vec![
             end(None, &[(NAMED, "held", 2)]),
-            judged(Some("lost-trigger-history"), "lost"),
+            judged(Some("lost-trigger-history"), Trigger::Lost),
         ],
     );
     assert_eq!(
@@ -151,7 +151,7 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
         Ended::Exited(1),
         vec![
             end(Some(NAMED), &[(NAMED, "violated", 0)]),
-            judged(Some("violated"), "lost"),
+            judged(Some("violated"), Trigger::Lost),
         ],
     );
     assert_eq!(
@@ -167,11 +167,140 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
                 thread: "t2".to_owned(),
                 property: NAMED.to_owned(),
                 error: Some("lost-trigger-history".to_owned()),
-                trigger_history: "lost".to_owned(),
+                trigger_history: Trigger::Lost,
             },
         ],
     );
     assert_eq!(classified(&elsewhere), (Class::KilledByNamedRule, None));
+}
+
+#[test]
+fn the_trigger_comes_from_the_judgement_after_the_deciding_run() {
+    // A kill whose run a judgement follows carries that judgement's trigger.
+    let judged_kill = observed(
+        Ended::Exited(1),
+        vec![
+            end(Some(NAMED), &[(NAMED, "violated", 0)]),
+            judged(Some("violated"), Trigger::Reached),
+        ],
+    );
+    assert_eq!(classify::trigger(NAMED, &judged_kill), Trigger::Reached);
+    // A test witness that runs no judgement still kills, and its trigger is
+    // unjudged.
+    let unjudged_kill = observed(
+        Ended::Exited(101),
+        vec![end(Some(NAMED), &[(NAMED, "violated", 0)])],
+    );
+    assert_eq!(classified(&unjudged_kill), (Class::KilledByNamedRule, None));
+    assert_eq!(classify::trigger(NAMED, &unjudged_kill), Trigger::Unjudged);
+    // A judgement after another thread's run doesn't speak for this one.
+    let elsewhere = observed(
+        Ended::Exited(1),
+        vec![
+            end(Some(NAMED), &[(NAMED, "violated", 0)]),
+            end_on("t2", None, &[(NAMED, "held", 1)]),
+            Record::Witness {
+                thread: "t2".to_owned(),
+                property: NAMED.to_owned(),
+                error: None,
+                trigger_history: Trigger::Reached,
+            },
+        ],
+    );
+    assert_eq!(classify::trigger(NAMED, &elsewhere), Trigger::Unjudged);
+    // A survivor carries the last judgement's trigger.
+    let survivor = observed(
+        Ended::Exited(1),
+        vec![
+            end(None, &[(NAMED, "held", 2)]),
+            judged(Some("no-view"), Trigger::NoView),
+        ],
+    );
+    assert_eq!(classify::trigger(NAMED, &survivor), Trigger::NoView);
+}
+
+#[test]
+fn a_violation_that_stopped_no_run_decides_nothing() {
+    const DRAFT: &str = "block-sync/reactor-query-lifecycle";
+    let records = || vec![end(None, &[(NAMED, "held", 3), (DRAFT, "violated", 0)])];
+    // The witness passes, so the named ID survives `held`, and the detail
+    // names the other violation.
+    let passed = classify::mutant(NAMED, &[], &observed(Ended::Exited(0), records()));
+    assert_eq!(
+        (passed.class, passed.reason),
+        (Class::Survived, Some(Reason::Held))
+    );
+    assert_eq!(passed.other, None);
+    assert!(passed.detail.contains(DRAFT), "{}", passed.detail);
+    // A judgement that failed only at that violation survives `held` too.
+    let mut unrelated = records();
+    unrelated.push(judged(Some("unrelated"), Trigger::Reached));
+    assert_eq!(
+        classified(&observed(Ended::Exited(1), unrelated)),
+        (Class::Survived, Some(Reason::Held))
+    );
+    // A failed witness with no judgement isn't a kill.
+    assert_eq!(
+        classified(&observed(Ended::Exited(101), records())),
+        (Class::HarnessFailure, Some(Reason::Panic))
+    );
+    // The named ID's own violation decides, though it stopped no run.
+    let own = observed(
+        Ended::Exited(101),
+        vec![end(None, &[(NAMED, "violated", 0), (DRAFT, "violated", 0)])],
+    );
+    assert_eq!(classified(&own), (Class::KilledByNamedRule, None));
+    // Another ID's violation that stopped its run still decides.
+    let stopped = observed(
+        Ended::Exited(101),
+        vec![end(
+            Some(OTHER),
+            &[(OTHER, "violated", 0), (DRAFT, "violated", 0)],
+        )],
+    );
+    let result = classify::mutant(NAMED, &[], &stopped);
+    assert_eq!(result.class, Class::KilledByOtherRule);
+    assert_eq!(result.other.as_deref(), Some(OTHER));
+}
+
+#[test]
+fn an_inconclusive_named_id_survives_inconclusive_not_held() {
+    let inconclusive = observed(
+        Ended::Exited(0),
+        vec![end(None, &[(NAMED, "inconclusive", 0)])],
+    );
+    assert_eq!(
+        classified(&inconclusive),
+        (Class::Survived, Some(Reason::Inconclusive))
+    );
+    // A failed judgement of an inconclusive outcome gives the same reason.
+    let judged_inconclusive = observed(
+        Ended::Exited(1),
+        vec![
+            end(None, &[(NAMED, "inconclusive", 0)]),
+            judged(Some("inconclusive"), Trigger::None),
+        ],
+    );
+    assert_eq!(
+        classified(&judged_inconclusive),
+        (Class::Survived, Some(Reason::Inconclusive))
+    );
+    // Some run that held the named ID with nonzero applicability is `held`,
+    // as a baseline requires.
+    let one_held = observed(
+        Ended::Exited(0),
+        vec![
+            end(None, &[(NAMED, "inconclusive", 0)]),
+            end(None, &[(NAMED, "held", 3)]),
+        ],
+    );
+    assert_eq!(classified(&one_held), (Class::Survived, Some(Reason::Held)));
+    // Held with zero applicability never applied.
+    let never = observed(Ended::Exited(0), vec![end(None, &[(NAMED, "held", 0)])]);
+    assert_eq!(
+        classified(&never),
+        (Class::Survived, Some(Reason::NotApplicable))
+    );
 }
 
 #[test]
@@ -247,6 +376,52 @@ fn a_baseline_must_hold_the_property_cleanly() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_baseline_the_memory_cap_killed_reruns_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tree.path().join("crates/zakura-sim")).unwrap();
+    let (runner, slot, case, _) = one_case(tree.path(), out.path(), &out.path().join("p"), true);
+    // A test binary that SIGKILLs itself on its first run, as the memory cap
+    // does, and holds the named ID on its second.
+    let marker = out.path().join("killed-once");
+    let end_file = json!({
+        "seq": 0, "thread": "t1", "source": "abc",
+        "end": {"properties": [{"property": NAMED, "outcome": {"held": {"applicable": 2}}}]},
+    });
+    let binary = out.path().join("block_table");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --list ]; then echo 't: test'; exit 0; fi\n\
+             if [ ! -e '{marker}' ]; then : > '{marker}'; kill -9 $$; fi\n\
+             printf '%s' '{end_file}' > \"$ZAKURA_SIM_END_RECORDS/1-0000000000.json\"\n",
+            marker = marker.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let built = Built {
+        sim: None,
+        tests: [("block_table".to_owned(), binary)].into_iter().collect(),
+    };
+    let runnables = [Runnable::Test {
+        target: "block_table".to_owned(),
+        test: "t".to_owned(),
+    }];
+    let baselines = runner
+        .baselines(&[case], &runnables, &slot, &built, "abc")
+        .unwrap();
+    assert!(marker.exists(), "the first run was killed");
+    assert_eq!(baselines[0].detail, None);
+    assert!(baselines[0].passed);
+    assert!(baselines[0].rerun_alone);
+}
+
 #[test]
 fn records_are_read_from_the_hooks_files_and_paired_by_source() {
     let end_file = json!({
@@ -293,10 +468,15 @@ fn records_are_read_from_the_hooks_files_and_paired_by_source() {
             thread: "ThreadId(2)".to_owned(),
             property: NAMED.to_owned(),
             error: Some("violated".to_owned()),
-            trigger_history: "reached".to_owned(),
+            trigger_history: Trigger::Reached,
         })
     );
     assert!(read_record(r#"{"source":"abc"}"#, "abc").is_err());
+    for trigger in [json!("unjudged"), json!("maybe"), json!(null)] {
+        let mut file = witness_file.clone();
+        file["witness"]["trigger_history"] = trigger;
+        assert!(read_record(&file.to_string(), "abc").is_err(), "{file}");
+    }
 }
 
 #[test]
@@ -410,6 +590,7 @@ fn one_case(
         passed,
         detail: (!passed).then(|| "a run violates sim/no-task-panic".to_owned()),
         millis: 10,
+        rerun_alone: false,
     };
     (runner, slot, case, baseline)
 }
@@ -450,12 +631,14 @@ fn a_rejected_patch_does_not_apply_and_a_failing_baseline_runs_no_mutant() {
         passed: false,
         detail: Some("a run violates sim/no-task-panic".to_owned()),
         millis: 10,
+        rerun_alone: false,
     };
     let reports = runner
         .mutant(&slot, &mutant, &cases, &runnables, &[failing], None)
         .unwrap();
     assert_eq!(reports[0].1.result.class, Class::BaselineFails);
     assert_eq!(reports[0].1.millis, None);
+    assert_eq!(reports[0].1.trigger, None);
     assert!(!out.path().join("target").exists(), "nothing was built");
 }
 
@@ -475,10 +658,16 @@ fn the_report_round_trips_and_counts_by_property() {
             other: (class == Class::KilledByOtherRule).then(|| OTHER.to_owned()),
             ..classify::Classified::new(class, reason, "why")
         },
+        trigger: match class {
+            Class::KilledByNamedRule => Some(Trigger::Unjudged),
+            Class::Survived => Some(Trigger::Lost),
+            _ => None,
+        },
         baseline: BaselineReport {
             passed: class != Class::BaselineFails,
             detail: None,
             millis: 1200,
+            rerun_alone: class == Class::BaselineFails,
         },
         millis: Some(3400),
         peak_rss_kib: Some(51_200),
@@ -490,6 +679,7 @@ fn the_report_round_trips_and_counts_by_property() {
         case(Class::KilledByOtherRule, None, NAMED),
         case(Class::Survived, Some(Reason::Held), NAMED),
         case(Class::Survived, Some(Reason::TriggerLost), NAMED),
+        case(Class::Survived, Some(Reason::Inconclusive), NAMED),
         case(Class::DidNotCompile, None, OTHER),
         case(Class::PatchDoesNotApply, None, OTHER),
         case(Class::BaselineFails, None, OTHER),
@@ -534,6 +724,7 @@ fn the_report_round_trips_and_counts_by_property() {
         "table",
         "witness",
         "result",
+        "trigger",
         "baseline",
         "millis",
         "peak_rss_kib",
@@ -543,10 +734,16 @@ fn the_report_round_trips_and_counts_by_property() {
     }
     assert_eq!(first["result"]["class"], "killed-by-named-rule");
     assert_eq!(value["cases"][1]["result"]["other"], OTHER);
+    assert_eq!(first["trigger"], "unjudged");
+    assert!(value["cases"][1].get("trigger").is_none());
     assert_eq!(value["cases"][3]["result"]["reason"], "trigger-lost");
+    assert_eq!(value["cases"][3]["trigger"], "lost");
+    assert_eq!(value["cases"][4]["result"]["reason"], "inconclusive");
+    assert_eq!(value["cases"][7]["baseline"]["rerun_alone"], true);
+    assert!(first["baseline"].get("rerun_alone").is_none());
     assert_eq!(
         value["summary"][NAMED]["results"],
-        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1})
+        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1, "survived/inconclusive": 1})
     );
     assert_eq!(
         value["summary"][OTHER]["run_failures"],

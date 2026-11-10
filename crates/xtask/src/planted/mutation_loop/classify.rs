@@ -56,6 +56,9 @@ pub(in crate::planted) enum Reason {
     NotApplicable,
     /// Survived: the run didn't reach the named ID's trigger history.
     TriggerLost,
+    /// Survived: the named ID ended inconclusive, and no run held it with
+    /// nonzero applicability.
+    Inconclusive,
     /// Harness failure: the run passed its deadline.
     Timeout,
     /// Harness failure: the memory cap killed the run.
@@ -119,6 +122,23 @@ pub(in crate::planted) fn name<T: Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a run reached the named ID's trigger history, as a witness
+/// judgement found it. The first four are `zakura-sim`'s `TriggerState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(in crate::planted) enum Trigger {
+    /// The run reached it.
+    Reached,
+    /// The run didn't reach it.
+    Lost,
+    /// The trigger history reads the view, and no view shows the run's end.
+    NoView,
+    /// The property has no trigger-history check.
+    None,
+    /// No witness judgement of the named ID speaks for the run.
+    Unjudged,
+}
+
 /// One file the end-record hook wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::planted) enum Record {
@@ -141,8 +161,8 @@ pub(in crate::planted) enum Record {
         property: String,
         /// The judgement's error kind, or `None` if it passed.
         error: Option<String>,
-        /// `reached`, `lost`, `no-view` or `none`.
-        trigger_history: String,
+        /// Never [`Trigger::Unjudged`].
+        trigger_history: Trigger,
     },
 }
 
@@ -199,11 +219,17 @@ pub(in crate::planted) fn read_record(text: &str, source: &str) -> Result<Option
         }));
     }
     if let Some(witness) = value.get("witness") {
+        let trigger_history = witness
+            .get("trigger_history")
+            .cloned()
+            .and_then(|trigger| serde_json::from_value(trigger).ok())
+            .filter(|trigger| *trigger != Trigger::Unjudged)
+            .ok_or("a witness record has no known `trigger_history`")?;
         return Ok(Some(Record::Witness {
             thread,
             property: text_at(witness, "property").unwrap_or_default(),
             error: text_at(witness, "error"),
-            trigger_history: text_at(witness, "trigger_history").unwrap_or_default(),
+            trigger_history,
         }));
     }
     Err("a record holds neither `end` nor `witness`".to_owned())
@@ -235,16 +261,21 @@ pub(in crate::planted) struct Observed {
 /// The memory cap's kill: the kernel's OOM killer sends SIGKILL.
 const SIGKILL: i32 = 9;
 
+/// True if the memory cap killed the witness process.
+pub(in crate::planted) fn cap_killed(observed: &Observed) -> bool {
+    observed.ended == Ended::Signaled(SIGKILL)
+}
+
 /// The run failure, if any, that keeps `observed` from giving a result.
 fn run_failure(observed: &Observed) -> Option<Classified> {
     let harness =
         |reason, detail: String| Some(Classified::new(Class::HarnessFailure, Some(reason), detail));
+    if cap_killed(observed) {
+        return harness(Reason::Oom, "the memory cap killed the run".to_owned());
+    }
     match observed.ended {
         Ended::TimedOut => {
             return harness(Reason::Timeout, "the run passed its deadline".to_owned())
-        }
-        Ended::Signaled(SIGKILL) => {
-            return harness(Reason::Oom, "the memory cap killed the run".to_owned())
         }
         Ended::Signaled(signal) => {
             return harness(Reason::Panic, format!("signal {signal} killed the run"))
@@ -304,19 +335,67 @@ pub(in crate::planted) fn baseline(property: &str, observed: &Observed) -> Optio
     (!applied).then(|| format!("no run holds {property} with nonzero applicability"))
 }
 
+/// The ID whose violation decides a kill on the run that ended at `record`:
+/// the ID that stopped the run, or else `property` if the run violated it.
+/// Another ID's violation that didn't stop its run, such as a `Draft`
+/// property's, decides nothing.
+fn deciding<'a>(property: &str, record: &'a Record) -> Option<&'a str> {
+    let Record::End {
+        stopped_by,
+        violated,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    stopped_by.as_deref().or_else(|| {
+        violated
+            .iter()
+            .map(String::as_str)
+            .find(|id| *id == property)
+    })
+}
+
+/// Each ID other than `property` that a run violated without stopping, once,
+/// in the order the records name them.
+fn unstopped<'a>(property: &str, records: &'a [Record]) -> Vec<&'a str> {
+    let mut ids: Vec<&str> = Vec::new();
+    for record in records {
+        if let Record::End {
+            stopped_by,
+            violated,
+            ..
+        } = record
+        {
+            for id in violated {
+                if id != property && stopped_by.as_ref() != Some(id) && !ids.contains(&id.as_str())
+                {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// The class of a mutant's witness run for `property`, allowing
 /// `also_violates` beside it.
 ///
-/// The first run with a violation decides a kill: the ID that stopped it,
-/// or its first violated report. That run kills by the named rule if that
-/// ID is `property`, or is in `also_violates` while `property` is violated
-/// too, and if the witness judgement after it on its thread didn't lose the
-/// trigger history. Any other first ID kills by another rule. A run that
-/// ended at a harness failure before any violation is a harness failure.
-/// Without a violation, the mutant survived: `held` if the witness passed
-/// and some run applied `property`, else `not-applicable` or
-/// `trigger-lost` as the witness judgement or the last end record says. A
-/// witness that failed with none of these failed outside the harness run.
+/// The first run with a deciding violation ([`deciding`]) decides a kill.
+/// That run kills by the named rule if the deciding ID is `property`, or is
+/// in `also_violates` while `property` is violated too, and if the witness
+/// judgement after it on its thread didn't lose the trigger history. Any
+/// other deciding ID kills by another rule. A run that ended at a harness
+/// failure before any deciding violation is a harness failure.
+///
+/// Without a deciding violation, the mutant survived. If the witness passed,
+/// or its judgement failed only at a violation that stopped no run, the end
+/// records' outcomes give the reason ([`by_outcomes`]). Otherwise the
+/// witness judgement or the last end record gives `trigger-lost`,
+/// `not-applicable` or `inconclusive`. A witness that failed with none of
+/// these failed outside the harness run.
+///
+/// The detail names each other ID that a run violated without stopping.
 pub(in crate::planted) fn mutant(
     property: &str,
     also_violates: &[String],
@@ -325,11 +404,29 @@ pub(in crate::planted) fn mutant(
     if let Some(failed) = run_failure(observed) {
         return failed;
     }
+    let unstopped = unstopped(property, &observed.records);
+    let mut classified = decide(property, also_violates, observed, &unstopped);
+    if !unstopped.is_empty() {
+        classified.detail += &format!(
+            "; {} violated without stopping its run",
+            unstopped.join(", ")
+        );
+    }
+    classified
+}
+
+/// [`mutant`]'s class, for a run with no run failure, where `unstopped`
+/// lists the violations that stopped no run.
+fn decide(
+    property: &str,
+    also_violates: &[String],
+    observed: &Observed,
+    unstopped: &[&str],
+) -> Classified {
     let survived = |reason, detail: String| Classified::new(Class::Survived, Some(reason), detail);
     for (at, record) in observed.records.iter().enumerate() {
         let Record::End {
             thread,
-            stopped_by,
             violated,
             harness,
             ..
@@ -337,7 +434,7 @@ pub(in crate::planted) fn mutant(
         else {
             continue;
         };
-        let Some(first) = stopped_by.iter().chain(violated).next() else {
+        let Some(first) = deciding(property, record) else {
             if let Some(failure) = harness {
                 return Classified::new(
                     Class::HarnessFailure,
@@ -348,10 +445,11 @@ pub(in crate::planted) fn mutant(
             continue;
         };
         let named = first == property
-            || (also_violates.contains(first) && violated.iter().any(|id| id == property));
+            || (also_violates.iter().any(|id| id == first)
+                && violated.iter().any(|id| id == property));
         if !named {
             return Classified {
-                other: Some(first.clone()),
+                other: Some(first.to_owned()),
                 ..Classified::new(
                     Class::KilledByOtherRule,
                     None,
@@ -360,7 +458,7 @@ pub(in crate::planted) fn mutant(
             };
         }
         if judgement_after(&observed.records[at + 1..], thread, property)
-            .is_some_and(|(_, trigger)| trigger == "lost")
+            .is_some_and(|(_, trigger)| trigger == Trigger::Lost)
         {
             return survived(
                 Reason::TriggerLost,
@@ -373,56 +471,38 @@ pub(in crate::planted) fn mutant(
             format!("a run violates {property}"),
         );
     }
+    let error = last_judgement(property, &observed.records).and_then(|(error, _)| error);
+    if observed.ended == Ended::Exited(0) || (error == Some("unrelated") && !unstopped.is_empty()) {
+        return by_outcomes(property, observed);
+    }
     let last_outcome = observed
         .records
         .iter()
         .rev()
         .find_map(|record| match record {
-            Record::End { outcomes, .. } => outcomes.get(property).cloned(),
+            Record::End { outcomes, .. } => outcomes.get(property).map(|(name, _)| name.as_str()),
             Record::Witness { .. } => None,
         });
-    let judged = observed
-        .records
-        .iter()
-        .rev()
-        .find_map(|record| match record {
-            Record::Witness {
-                property: judged,
-                error,
-                trigger_history,
-                ..
-            } if judged == property => Some((error.clone(), trigger_history.clone())),
-            _ => None,
-        });
-    if observed.ended == Ended::Exited(0) {
-        let applied = observed.records.iter().any(|record| {
-            matches!(record, Record::End { outcomes, .. }
-                if matches!(outcomes.get(property), Some((name, n)) if name != "not-applicable" && !(name == "held" && *n == 0)))
-        });
-        return match (applied, last_outcome) {
-            (true, _) => survived(Reason::Held, format!("{property} held on every run")),
-            (false, Some(_)) => {
-                survived(Reason::NotApplicable, format!("{property} never applied"))
-            }
-            (false, None) => Classified::new(
-                Class::HarnessFailure,
-                Some(Reason::NoEndRecord),
-                format!("no end record reports {property}"),
-            ),
-        };
-    }
-    match judged {
-        Some((Some(error), _)) if error == "lost-trigger-history" => survived(
+    match (error, last_outcome) {
+        (Some("lost-trigger-history"), _) => survived(
             Reason::TriggerLost,
             format!("the witness lost {property}'s trigger history"),
         ),
-        Some((Some(error), _)) if error == "not-applicable" => survived(
+        (Some("not-applicable"), _) => survived(
             Reason::NotApplicable,
             format!("the witness found {property} not applicable"),
         ),
-        _ if matches!(&last_outcome, Some((name, _)) if name == "not-applicable") => survived(
+        (Some("inconclusive"), _) => survived(
+            Reason::Inconclusive,
+            format!("the witness found {property} inconclusive"),
+        ),
+        (_, Some("not-applicable")) => survived(
             Reason::NotApplicable,
             format!("the witness failed with {property} not applicable on its last run"),
+        ),
+        (_, Some("inconclusive")) => survived(
+            Reason::Inconclusive,
+            format!("the witness failed with {property} inconclusive on its last run"),
         ),
         _ => Classified::new(
             Class::HarnessFailure,
@@ -432,13 +512,83 @@ pub(in crate::planted) fn mutant(
     }
 }
 
+/// A survivor's reason from the end records' outcomes of `property`:
+/// `held` if some run held it with nonzero applicability, as a baseline
+/// requires, else `inconclusive` if some run ended it inconclusive, else
+/// `not-applicable`. A harness failure if no end record reports `property`.
+fn by_outcomes(property: &str, observed: &Observed) -> Classified {
+    let outcomes: Vec<&(String, u64)> = observed
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::End { outcomes, .. } => outcomes.get(property),
+            Record::Witness { .. } => None,
+        })
+        .collect();
+    let survived = |reason, detail: String| Classified::new(Class::Survived, Some(reason), detail);
+    if outcomes.iter().any(|(name, n)| name == "held" && *n > 0) {
+        survived(
+            Reason::Held,
+            format!("{property} held with nonzero applicability"),
+        )
+    } else if outcomes.iter().any(|(name, _)| name == "inconclusive") {
+        survived(
+            Reason::Inconclusive,
+            format!("{property} ended inconclusive, and no run held it with nonzero applicability"),
+        )
+    } else if !outcomes.is_empty() {
+        survived(Reason::NotApplicable, format!("{property} never applied"))
+    } else {
+        Classified::new(
+            Class::HarnessFailure,
+            Some(Reason::NoEndRecord),
+            format!("no end record reports {property}"),
+        )
+    }
+}
+
+/// Whether the run that decided `observed`'s class reached `property`'s
+/// trigger history. For a run with a deciding violation ([`deciding`]) or a
+/// harness failure, it is the witness judgement after that run on its
+/// thread. Otherwise it is the last judgement of `property`.
+/// [`Trigger::Unjudged`] if no such judgement exists.
+pub(in crate::planted) fn trigger(property: &str, observed: &Observed) -> Trigger {
+    let records = &observed.records;
+    for (at, record) in records.iter().enumerate() {
+        if let Record::End {
+            thread, harness, ..
+        } = record
+        {
+            if deciding(property, record).is_some() || harness.is_some() {
+                return judgement_after(&records[at + 1..], thread, property)
+                    .map_or(Trigger::Unjudged, |(_, trigger)| trigger);
+            }
+        }
+    }
+    last_judgement(property, records).map_or(Trigger::Unjudged, |(_, trigger)| trigger)
+}
+
+/// The last witness judgement of `property` in `records`: its error and
+/// trigger history.
+fn last_judgement<'a>(property: &str, records: &'a [Record]) -> Option<(Option<&'a str>, Trigger)> {
+    records.iter().rev().find_map(|record| match record {
+        Record::Witness {
+            property: judged,
+            error,
+            trigger_history,
+            ..
+        } if judged == property => Some((error.as_deref(), *trigger_history)),
+        _ => None,
+    })
+}
+
 /// The first witness judgement of `property` on `thread` in `records`,
 /// before that thread's next end record: its error and trigger history.
-fn judgement_after(
-    records: &[Record],
+fn judgement_after<'a>(
+    records: &'a [Record],
     thread: &str,
     property: &str,
-) -> Option<(Option<String>, String)> {
+) -> Option<(Option<&'a str>, Trigger)> {
     for record in records {
         match record {
             Record::End { thread: other, .. } if other == thread => return None,
@@ -448,7 +598,7 @@ fn judgement_after(
                 error,
                 trigger_history,
             } if other == thread && judged == property => {
-                return Some((error.clone(), trigger_history.clone()))
+                return Some((error.as_deref(), *trigger_history))
             }
             _ => {}
         }

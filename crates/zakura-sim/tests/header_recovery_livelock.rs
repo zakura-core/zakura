@@ -26,14 +26,16 @@ use zakura_sim::{
     MemorySink, Observation, ObservationLog, Outcome, RunConfig, RunEnd, Sim,
 };
 
-/// Every storage recovery witness hdr-13 runs: fuzz-12's five classes, and
-/// hdr-13's owed reply hold and departure.
+/// Every storage recovery witness hdr-13 runs: fuzz-12's five classes,
+/// hdr-13's owed reply hold and departure, and the declared stall.
 fn witnesses() -> Vec<(String, StorageScenario)> {
-    storage_witnesses::recovery_witnesses()
+    let mut all: Vec<(String, StorageScenario)> = storage_witnesses::recovery_witnesses()
         .into_iter()
         .chain(storage_witnesses::owed_recovery_witnesses())
         .map(|(class, scenario)| (class.to_owned(), scenario))
-        .collect()
+        .collect();
+    all.push(("stall".to_owned(), storage_witnesses::grown_source()));
+    all
 }
 
 /// The storage harness's declaration for `scenario`, for a harness that

@@ -371,3 +371,41 @@ fn closing_a_departed_peer_after_recovered_loses_nothing() {
         );
     }
 }
+
+/// Progress after the conditions point, moved from fuzz-12.4b. fuzz-12's
+/// barrier opens only once no task is ready, so a node with a live source
+/// has synced from it by the `recovered` pick. The declared stall leaves
+/// the source's grown tip behind its one-second status floor instead. At
+/// the pick the node isn't at the source's recorded tip, it reaches it
+/// later within the bound, and the property holds, under 8 plans. It
+/// prints the virtual time from the pick to that apply.
+#[test]
+#[allow(clippy::print_stdout)]
+fn the_node_reaches_the_source_tip_after_the_conditions_point() {
+    let scenario = storage_witnesses::grown_source();
+    for input in inputs(8, 256) {
+        let run = run("stall", &scenario, input);
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::Held { applicable: 1 }
+        );
+        let record = run.recovery.record().expect("the pick wrote its record");
+        let source_tip = record.source_tip.0;
+        assert_eq!(source_tip.height.0, 10, "the grown tip is recorded");
+        assert_ne!(record.node_tip.0, source_tip, "not there at the pick");
+        let (_, reached, _) = run
+            .tips
+            .iter()
+            .find(|(step, _, tip)| *step > record.step && *tip == source_tip)
+            .expect("the node reaches the source's recorded tip");
+        let waited = reached.saturating_duration_since(record.at);
+        assert!(
+            Duration::ZERO < waited && waited < RECOVERY_PROGRESS_BOUND,
+            "{waited:?}"
+        );
+        println!(
+            "stall: recovered at {:?}, at the source's tip {waited:?} later",
+            record.at
+        );
+    }
+}

@@ -17,6 +17,7 @@
 //! check and the open.
 
 pub mod confirm;
+pub mod end_records;
 pub mod explain;
 pub mod failure;
 pub mod meta;

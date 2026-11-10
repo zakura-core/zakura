@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/admission.rs b/crates/zakura-network/src/zakura/block_sync/admission.rs
+index d95a5eb2e4..e936827ab1 100644
+--- a/crates/zakura-network/src/zakura/block_sync/admission.rs
++++ b/crates/zakura-network/src/zakura/block_sync/admission.rs
+@@ -108,7 +108,9 @@ pub(super) fn request_priority(
+     start_height: block::Height,
+ ) -> RequestPriority {
+     // The next height above the floor can still unblock the current floor.
+-    if start_height <= floor_rescue_high(download_floor) {
++    // Mutation: the floor lane also covers the three heights after the next.
++    let rescue_high = block::Height(floor_rescue_high(download_floor).0.saturating_add(3));
++    if start_height <= rescue_high {
+         RequestPriority::Floor
+     } else {
+         RequestPriority::AboveFloor

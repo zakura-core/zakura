@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index c60b86a718..e32523e525 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -389,8 +389,8 @@ pub struct GetServices {
+ impl GetServices {
+     /// Whether this query asks for `service`. An empty wanted list asks for
+     /// every service.
+-    pub(crate) fn wants(&self, service: &ZakuraServiceId) -> bool {
+-        self.wanted_services.is_empty() || self.wanted_services.contains(service)
++    pub(crate) fn wants(&self, _service: &ZakuraServiceId) -> bool {
++        true
+     }
+ }
+ 

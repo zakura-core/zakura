@@ -366,8 +366,9 @@ async fn admit_dial_round(
     admitted
 }
 
-/// Returns the addresses of `candidate` to dial and the canonical IPs they
-/// reserve: the addresses `state` allows whose IPs the supervisor accepts.
+/// Returns the addresses of `candidate` to dial and their canonical IPs, whose
+/// admission hosts the attempt reserves: the addresses `state` allows whose
+/// hosts the supervisor accepts.
 fn discovery_node_addr_with_reserved_ip_capacity(
     supervisor: &ZakuraSupervisorHandle,
     state: &CandidateDialerState,

@@ -15,6 +15,26 @@ pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Returns the address group that connection admission charges as one host.
+///
+/// That's `ip` after [`canonical_ip`] folding, with a global unicast IPv6
+/// address (2000::/3) cut to its /64. RFC 4291 interface IDs are 64 bits, so a
+/// host that holds a /64 can pick any of its 2^64 addresses per connection, and
+/// an exact-address cap would never bind it. Other IPv6 addresses, such as
+/// unique local, link-local and loopback, stay exact, so containers or hosts
+/// sharing one local subnet keep their own limits. Every per-IP admission
+/// count and discovery's per-IP dial reservation key peers through this.
+pub(crate) fn admission_host(ip: IpAddr) -> IpAddr {
+    match canonical_ip(ip) {
+        IpAddr::V6(ipv6) if ipv6.segments()[0] & 0xe000 == 0x2000 => {
+            let mut octets = ipv6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+        ip => ip,
+    }
+}
+
 fn ipv4_embedded_in_ipv6(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let octets = ip.octets();
 
@@ -72,6 +92,39 @@ mod tests {
         ] {
             let encoded = encoded.parse().expect("IPv6 test address parses");
             assert_eq!(canonical_ip(encoded), ipv4, "failed to decode {encoded}");
+        }
+    }
+
+    #[test]
+    fn admission_host_groups_global_ipv6_by_64() {
+        let host = |ip: &str| admission_host(ip.parse().expect("test address parses"));
+        let ip = |ip: &str| -> IpAddr { ip.parse().expect("test address parses") };
+
+        // Global unicast IPv6 groups by /64, so every interface ID is one host.
+        assert_eq!(host("2001:db8:1:2::1"), ip("2001:db8:1:2::"));
+        assert_eq!(
+            host("2001:db8:1:2:ffff:ffff:ffff:ffff"),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(host("3fff:ffff:ffff:ffff::9"), ip("3fff:ffff:ffff:ffff::"));
+        assert_ne!(host("2001:db8:1:2::1"), host("2001:db8:1:3::1"));
+
+        // Transition encodings fold to their IPv4 host before any masking.
+        assert_eq!(host("2002:5db8:d822::1"), ip("93.184.216.34"));
+        assert_eq!(host("2001:0:c000:22d::a247:27dd"), ip("93.184.216.34"));
+        assert_eq!(host("::ffff:93.184.216.34"), ip("93.184.216.34"));
+        assert_eq!(host("93.184.216.34"), ip("93.184.216.34"));
+
+        // Non-global IPv6 stays exact.
+        for exact in [
+            "::1",
+            "::",
+            "fe80::1:2",
+            "fd00:1:2:3::4",
+            "ff02::1",
+            "64:ff9b:1::5db8:d822",
+        ] {
+            assert_eq!(host(exact), ip(exact), "{exact}");
         }
     }
 

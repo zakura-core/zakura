@@ -102,6 +102,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
+    chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
@@ -202,6 +203,9 @@ struct TapState {
     /// Checks that the reactor's work follows the resets it adopts. None
     /// until [`ReactorTap::watch_rounds`].
     round_life: Mutex<Option<RoundLife>>,
+    /// Checks that no stale apply changes the engine and adoption never
+    /// moves back. None until [`ReactorTap::watch_chain`].
+    chain_effect: Mutex<Option<ChainEffect>>,
 }
 
 /// The resource probe a tap was handed.
@@ -307,6 +311,22 @@ impl TapState {
                 detail,
             });
         }
+        let chain = match self
+            .chain_effect
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(chain) => chain.drain(step)?,
+            None => Vec::new(),
+        };
+        for detail in chain {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::StaleChainEffect,
+                detail,
+            });
+        }
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         self.rounds.record(Settlement {
             step,
@@ -348,6 +368,17 @@ impl TapState {
         self.port
             .upgrade()
             .map_or(0, |port| port.engine().snapshot().header_generation.get())
+    }
+
+    /// The node's engine now, or `None` once its port is gone.
+    fn engine_at(&self) -> Option<EngineAt> {
+        let port = self.port.upgrade()?;
+        let snapshot = port.engine().snapshot();
+        Some(EngineAt {
+            generation: snapshot.header_generation.get(),
+            anchor: hash(snapshot.frontiers.finalized.hash),
+            state: hex(&port.engine().state_digest()),
+        })
     }
 
     /// The reactor's task, as the probe it handed over names it.
@@ -586,6 +617,14 @@ impl TapState {
                 .as_mut()
             {
                 rounds.observe(&event, on_reactor);
+            }
+            if let Some(chain) = state
+                .chain_effect
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                chain.observe(&event, on_reactor);
             }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
@@ -876,6 +915,7 @@ impl ReactorTap {
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
                 wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
                 round_life: Mutex::default(),
+                chain_effect: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -949,6 +989,17 @@ impl ReactorTap {
                 self.state.engine_generation(),
             );
         }
+        if let Some(chain) = self
+            .state
+            .chain_effect
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            if let Some(engine) = self.state.engine_at() {
+                chain.storage(facts.iter().map(|(_, fact)| *fact), engine);
+            }
+        }
         self.pairer.facts(facts);
     }
 
@@ -976,6 +1027,23 @@ impl ReactorTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) =
             Some(RoundLife::new(evidence, self.state.engine_generation()));
+    }
+
+    /// Checks from now on that no stale apply changes the node's engine and
+    /// the reactor's adoption never moves back, as [`super::chain_effect`]
+    /// describes, keeping when the check applied in `evidence`. Call it
+    /// before the run starts. A harness that calls it must hand the tap the
+    /// node's storage facts.
+    pub fn watch_chain(&self, evidence: ChainEffectEvidence) {
+        let engine = self
+            .state
+            .engine_at()
+            .expect("the tap's port outlives its harness's setup");
+        *self
+            .state
+            .chain_effect
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(ChainEffect::new(evidence, engine));
     }
 
     /// The node's stamps, which every fact the tap and the harness keep

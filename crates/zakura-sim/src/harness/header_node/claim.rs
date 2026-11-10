@@ -50,6 +50,9 @@ pub enum Claim {
     /// A round a new snapshot made obsolete retired while the queue still
     /// held it.
     UnreleasedObsoleteRound,
+    /// An apply changed the engine under an older generation or anchor, or
+    /// the reactor's adoption moved back ([`super::chain_effect`]).
+    StaleChainEffect,
 }
 
 impl Claim {

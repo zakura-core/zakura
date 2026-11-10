@@ -34,7 +34,8 @@
 //!   asked it to accept. Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
-//!   It comes in the handler of an apply call's completion, under
+//!   It comes on the reactor's task, in the handler of an apply call's
+//!   completion, under
 //!   `CauseSet { Completion { call } }`, for an apply its reactor
 //!   dispatched for that subscription's session and request, and names the
 //!   last page that subscription staged before the apply's dispatch, as
@@ -203,6 +204,21 @@ impl Credit {
                 let page = (*page_last, *page_headers, *page_bytes);
                 self.claim(&key, (*through, *headers, *bytes), page);
                 self.totals("claim", &key, *totals);
+                true
+            }
+            // Only the reactor's task holds an apply call's completion, so
+            // an acceptance from any other task is outside one.
+            ReactorEvent::CursorsAccepted {
+                session_id,
+                subscription,
+                through,
+                ..
+            } if !on_reactor => {
+                self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session_id} subscription {subscription} \
+                     accepted through {through:?} off the reactor's task, outside an apply \
+                     call's completion"
+                ));
                 true
             }
             _ if !on_reactor => false,

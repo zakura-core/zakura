@@ -752,8 +752,9 @@ fn updates_carry_their_subscriptions_state() {
 /// that apply's completion, holds once the apply's storage operation
 /// completed `Applied`. Through a cursor no page staged, as a dropped late
 /// page's, through an earlier page of the round, outside an apply's
-/// completion, in another subscription's apply, after a failed apply, or
-/// below an earlier acceptance, it breaks.
+/// completion, off the reactor's task, in another subscription's apply,
+/// after a failed apply, or below an earlier acceptance, it breaks. A
+/// subscription resumed in a later round accepts that round's last page.
 #[test]
 fn acceptance_reaches_only_the_applied_rounds_last_page() {
     use crate::observe::StorageResult;
@@ -773,10 +774,11 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
             page(&round, chain[1], &[chain[2].hash]),
         ]
     };
-    // The credit half's breaks for `events`, then storage's `result` for
-    // apply call 9. Whether the apply reached storage faithfully is the
+    // The credit half's breaks for `events`, with acceptances reported on
+    // the reactor's task if `on_reactor`, then storage's `result` for apply
+    // calls 9 and 10. Whether the apply reached storage faithfully is the
     // submission half's.
-    let judged = |events: Vec<ReactorEvent>, result: Option<StorageResult>| {
+    let judge = |events: Vec<ReactorEvent>, result: Option<StorageResult>, on_reactor: bool| {
         let mut credit = credit::Credit::default();
         let events = honest(&events);
         for event in &events {
@@ -790,15 +792,20 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
                     credit.note_read(*first, update.acknowledged.height);
                 }
             }
-            credit.observe(event, true, false);
+            let reactor = on_reactor || !matches!(event, ReactorEvent::CursorsAccepted { .. });
+            credit.observe(event, reactor, false);
         }
         if let Some(result) = result {
-            for fact in &completed(&round, 4, 9, result) {
-                credit.storage(fact);
+            for (id, call) in [(4, 9), (5, 10)] {
+                for fact in &completed(&round, id, call, result.clone()) {
+                    credit.storage(fact);
+                }
             }
         }
         credit.take_breaks()
     };
+    let judged =
+        |events: Vec<ReactorEvent>, result: Option<StorageResult>| judge(events, result, true);
     let applied = |through: Frontier| {
         let mut events = base();
         events.extend(in_apply(&round, 9, vec![accepted(through)]));
@@ -829,6 +836,36 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
     assert!(
         matches!(&earlier[..], [only] if only.contains("not its round's last page")),
         "{earlier:?}"
+    );
+    // Another task's acceptance doesn't borrow the reactor's completion.
+    let off = judge(applied(chain[2]), None, false);
+    assert!(
+        matches!(&off[..], [only] if only.contains("off the reactor's task")),
+        "{off:?}"
+    );
+    // A subscription resumed in a later round accepts that round's last
+    // page, not the earlier round's.
+    let resumed = |through: Frontier| {
+        let mut events = base();
+        events.truncate(events.len() - 2);
+        events.extend(in_apply(&round, 9, vec![accepted(chain[1])]));
+        events.push(reserved(2, 2));
+        events.push(grant(2, 0, 1, chain[1], chain[3].hash));
+        events.push(claimed(chain[2], 1));
+        events.push(page(&round, chain[1], &[chain[2].hash]));
+        events.extend(in_apply(&round, 10, vec![accepted(through)]));
+        events
+    };
+    assert_eq!(
+        judged(resumed(chain[2]), Some(StorageResult::Applied)),
+        Vec::<String>::new()
+    );
+    let stale = judged(resumed(chain[1]), Some(StorageResult::Applied));
+    assert!(
+        stale
+            .iter()
+            .any(|found| found.contains("not its round's last page")),
+        "{stale:?}"
     );
     let mut outside = base();
     outside.push(accepted(chain[2]));

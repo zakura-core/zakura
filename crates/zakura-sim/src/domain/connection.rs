@@ -80,7 +80,9 @@ impl WireState {
     }
 }
 
-/// The properties a wire harness with sampling taps reaches.
+/// The properties a wire harness with sampling taps reaches:
+/// [`CREDIT_ISOLATED`] and [`CONNECTION_SHARES_BOUND`], both active, and
+/// [`SEND_ISOLATED`], a draft until a planted bypass fails it.
 pub fn wire_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -113,7 +115,12 @@ where
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
             needs: &[Source::View, Source::Datagrams],
-            status: Status::Active,
+            // A draft until a planted bypass fails it. QUIC buffers at most
+            // a send window per stream, and each service's worker hands it
+            // one frame at a time, so raising block sync's send priority
+            // keeps the bound: the saturated scenario's header frames wait
+            // behind one body at most.
+            status: Status::Draft,
             check: check_send_isolated::<S>,
             witness: Some(TriggerHistory::View(written_under_saturation::<S>)),
         },
@@ -128,7 +135,7 @@ where
             needs: &[Source::View, Source::Datagrams],
             status: Status::Active,
             check: check_connection_shares_bound::<S>,
-            witness: Some(TriggerHistory::View(credit_held_past_handshake_share::<S>)),
+            witness: Some(TriggerHistory::View(held_past_another_share::<S>)),
         },
     ]
 }
@@ -204,6 +211,9 @@ struct ConnectionFold {
     /// Whether a frame of one service was read while another held more
     /// than the handshake share on its connection.
     held_past_handshake: bool,
+    /// Whether a service held more received frame bytes than another
+    /// service's receive share on its connection.
+    held_past_another_share: bool,
     /// Whether a write that started under saturation reached the node
     /// after other services' frames.
     written_under_saturation: bool,
@@ -360,8 +370,8 @@ impl ConnectionFold {
         }
     }
 
-    /// [`CONNECTION_SHARES_BOUND`] on one load's kinds, and the held kind
-    /// [`CREDIT_ISOLATED`]'s trigger history reads.
+    /// [`CONNECTION_SHARES_BOUND`] on one load's kinds, and what the
+    /// trigger histories of it and [`CREDIT_ISOLATED`] read.
     fn shares(&mut self, bounds: &WireBounds, connection: u64, kinds: &[crate::observe::KindLoad]) {
         let shares = bounds.node.reactor_shares();
         let handshake = u64::from(bounds.node.quic.receive_window_bytes);
@@ -370,6 +380,9 @@ impl ConnectionFold {
         for load in kinds {
             let share = shares.share(load.kind);
             self.held.insert((connection, load.kind), load.raw_held);
+            self.held_past_another_share |= kinds.iter().any(|other| {
+                other.kind != load.kind && load.raw_held > shares.share(other.kind).receive
+            });
             if load.raw_held > handshake {
                 self.holding.insert(connection, load.kind);
             }
@@ -573,8 +586,7 @@ where
     }
 }
 
-/// The trigger history of [`CREDIT_ISOLATED`] and
-/// [`CONNECTION_SHARES_BOUND`]: the node read a frame of one service while
+/// [`CREDIT_ISOLATED`]'s trigger history: the node read a frame of one service while
 /// another service on the connection held more received frame bytes than
 /// the handshake share, so without that service's own share the held
 /// frames would have taken the whole window.
@@ -587,6 +599,22 @@ where
         let mut fold = wire.fold.borrow_mut();
         fold.advance(&wire.bounds, log);
         fold.held_past_handshake
+    })
+}
+
+/// [`CONNECTION_SHARES_BOUND`]'s trigger history: a service on a
+/// connection held more received frame bytes than another service's
+/// receive share there, so a gate the two shared would have let one take
+/// the other's share.
+fn held_past_another_share<S>(view: &S::View, log: &ObservationLog) -> bool
+where
+    S: HasView,
+    S::View: WireView,
+{
+    view.wire().is_some_and(|wire| {
+        let mut fold = wire.fold.borrow_mut();
+        fold.advance(&wire.bounds, log);
+        fold.held_past_another_share
     })
 }
 

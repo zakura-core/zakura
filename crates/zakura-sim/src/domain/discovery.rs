@@ -130,21 +130,38 @@ pub fn wait_complete_wakes<S: HasView>() -> Property<S> {
     }
 }
 
-/// [`WAIT_COMPLETE_WAKES`]'s trigger history: the sink's final mark ran
-/// between the source's failed check and its `notified()`, the two
-/// operations the fix reorders. With the bug, the check comes first, and
-/// the mark lands before the `Notified` exists to catch it. With the fix,
-/// the `Notified` comes first, and the mark lands while the check is still
-/// reading the state. A run where the final mark lands before the source has
-/// done either, or after it has done both, never reaches the bug.
+/// [`WAIT_COMPLETE_WAKES`]'s trigger history: the final mark raced the
+/// source's wait, in one of two windows.
+///
+/// The source's window: the sink's final notify ran between the source's
+/// failed check and its `notified()`, the two operations the fix reorders.
+/// With the bug, the check comes first, and the notify lands before the
+/// `Notified` exists to catch it. With the fix, the `Notified` comes first,
+/// and the notify lands while the check is still reading the state.
+///
+/// The sink's window: the source's check ran while the final mark was half
+/// done, between its record and its notify. With the sink's order, record
+/// then notify, that check passes. With the reverse order, it fails after
+/// the last notify, and nothing wakes the source.
+///
+/// A run where the final mark lands before the source has done either, or
+/// after it has done both, never reaches the bug.
 fn final_mark_raced_the_wait(log: &ObservationLog) -> bool {
     let mut state = WaitState::new();
     for step in WaitState::steps(log.entries()) {
         let raced = state.created_notified != state.check_failed;
         let marked = state.all_marked();
+        let half_done = marked != state.all_recorded();
+        let last_lock = state.last_lock;
         state.apply(step);
-        if !marked && state.all_marked() {
-            return raced;
+        if half_done && state.last_lock != last_lock {
+            return true;
+        }
+        if !marked && state.all_marked() && raced {
+            return true;
+        }
+        if state.all_marked() && state.all_recorded() {
+            return false;
         }
     }
     false
@@ -185,12 +202,17 @@ pub struct WaitState {
     next: BTreeMap<String, (String, Option<u32>)>,
     /// The step that ran each mark's notify.
     marked: Vec<Option<u64>>,
+    /// The step that ran each mark's record.
+    recorded: Vec<Option<u64>>,
     /// The source's last check and `notified` steps in the waiting code.
     last_check: Option<u64>,
     last_notified: Option<u64>,
-    /// True once the source has created its `Notified` in the waiting code
-    /// and hasn't checked for completion since, so it can only go on when
-    /// woken.
+    /// The step at which the source's last check took the lock, and whether
+    /// it passed: every record had landed by then.
+    last_lock: Option<(u64, bool)>,
+    /// True once the source has created its `Notified` or failed a check in
+    /// the waiting code, and has neither passed a check nor stopped outside
+    /// its wait since, so it can only go on when woken.
     in_wait: bool,
     /// True if the source's last stop was a poll that returned pending, so
     /// it runs again only once woken.
@@ -199,7 +221,7 @@ pub struct WaitState {
     /// through the waiting code.
     created_notified: bool,
     /// True once the source's check has failed in the current pass through
-    /// the waiting code: it took the state's lock before the final mark. A
+    /// the waiting code: it took the state's lock before the final record. A
     /// pass ends when the source parks, leaves the waiting code, or runs its
     /// `notified` or check again.
     check_failed: bool,
@@ -222,8 +244,10 @@ impl WaitState {
         WaitState {
             next: BTreeMap::new(),
             marked: vec![None; sites().marks.len()],
+            recorded: vec![None; sites().records.len()],
             last_check: None,
             last_notified: None,
+            last_lock: None,
             in_wait: false,
             source_parked: false,
             created_notified: false,
@@ -248,21 +272,29 @@ impl WaitState {
             source_ran && !self.source_parked && self.source_waits_at(|at| at.starts_with(kind))
         };
         let (created, checked) = (from("notified"), from("lock"));
-        // A check that takes the lock before the final mark finds the exchange
-        // incomplete. The sink records its last answer before its notify, so a
-        // check between the two passes and leaves the waiting code next.
-        let failed = checked && !self.all_marked();
+        // A check reads the records, not the notifies: one that takes the lock
+        // before the final record finds the exchange incomplete.
+        let failed = checked && !self.all_recorded();
         if let Some(task) = task {
             self.ran(sites, task, step[0].step);
         }
         for entry in step {
             match &entry.obs {
                 Observation::TaskReached { task, at, site, .. } => {
+                    let line = sites.line(site);
                     if is_source(task) {
                         self.source_parked = false;
+                        // A stop outside the waiting code, other than the
+                        // sleep's first poll in the same `select!`, means the
+                        // source left its wait.
+                        let waits = line.is_some_and(|line| {
+                            sites.waiting.contains(&line) || line == sites.initial_sleep
+                        });
+                        if !waits {
+                            self.in_wait = false;
+                        }
                     }
-                    self.next
-                        .insert(task.clone(), (at.clone(), sites.line(site)));
+                    self.next.insert(task.clone(), (at.clone(), line));
                 }
                 Observation::TaskWaiting { task } | Observation::TaskParked { task }
                     if is_source(task) =>
@@ -282,6 +314,9 @@ impl WaitState {
             }
             self.created_notified |= created;
             self.check_failed |= failed;
+            if checked {
+                self.last_lock = Some((step[0].step, !failed));
+            }
             if self.source_parked || !self.source_waits_at(|_| true) {
                 self.created_notified = false;
                 self.check_failed = false;
@@ -304,10 +339,23 @@ impl WaitState {
         if let Some(i) = open {
             self.marked[i] = Some(step);
         }
+        // The record lands when the task runs from the lock, not from the
+        // release on the same line.
+        let open = sites
+            .records
+            .iter()
+            .zip(&self.recorded)
+            .position(|(record, recorded)| record == line && recorded.is_none());
+        if let Some(i) = open.filter(|_| at.starts_with("lock")) {
+            self.recorded[i] = Some(step);
+        }
         if is_source(task) && sites.waiting.contains(line) {
             if at.starts_with("release") {
                 self.last_check = Some(step);
-                self.in_wait = false;
+                // A failed check leaves the source waiting: on the
+                // `Notified` it created before the check, or on the one it
+                // creates next.
+                self.in_wait = self.last_lock.is_some_and(|(_, passed)| !passed);
             } else if at.starts_with("notified") {
                 self.last_notified = Some(step);
                 self.in_wait = true;
@@ -328,6 +376,11 @@ impl WaitState {
     /// True if every mark's notify has run.
     pub fn all_marked(&self) -> bool {
         self.final_notify().is_some()
+    }
+
+    /// True if every mark's record has landed.
+    pub fn all_recorded(&self) -> bool {
+        self.recorded.iter().all(Option::is_some)
     }
 
     /// True if the source's next point is its `notified` in the waiting
@@ -361,8 +414,8 @@ pub fn is_source(task: &str) -> bool {
 }
 
 /// Where `SharedPeerState` lives, the lines of its `wait_complete` body and
-/// of the `Hello` and answer notifies, and the line of `wait_initial`'s
-/// sleep.
+/// of the `Hello` and answer records and notifies, and the line of
+/// `wait_initial`'s sleep.
 #[derive(Debug, PartialEq, Eq)]
 struct Sites {
     file: &'static str,
@@ -371,6 +424,9 @@ struct Sites {
     waiting: RangeInclusive<u32>,
     /// The `Hello` notify, then the answer notify once per answer.
     marks: Vec<u32>,
+    /// The `Hello` record's lock, then the answer record's lock once per
+    /// answer.
+    records: Vec<u32>,
     /// The sleep in `wait_initial`, the initial wait's timeout arm.
     initial_sleep: u32,
 }
@@ -406,15 +462,21 @@ impl Sites {
                 .iter()
                 .position(|l| *l == "    }")
                 .expect("wait_complete's body closes");
-        let marks = ["fn record_hello", "fn record_answer", "fn record_answer"]
-            .iter()
-            .map(|mark| line(find(find(progress, mark), "notify_waiters()")))
-            .collect();
+        let recorders = ["fn record_hello", "fn record_answer", "fn record_answer"];
+        let in_recorders = |needle: &str| -> Vec<u32> {
+            recorders
+                .iter()
+                .map(|recorder| line(find(find(progress, recorder), needle)))
+                .collect()
+        };
+        let marks = in_recorders("notify_waiters()");
+        let records = in_recorders("self.lock()");
         let initial_sleep = line(find(find(0, "async fn wait_initial("), "time::sleep("));
         Sites {
             file,
             waiting: line(wait_complete)..=line(end),
             marks,
+            records,
             initial_sleep,
         }
     }
@@ -706,6 +768,7 @@ mod tests {
         assert_eq!(*built, Sites::parse(PEER_RS));
         assert!(built.waiting.start() < built.waiting.end());
         assert_eq!(built.marks.len(), 3);
+        assert_eq!(built.records.len(), 3);
         assert_eq!(
             built.initial_sleep,
             line_of("zakura_rt::time::sleep(timeout)")
@@ -720,6 +783,14 @@ mod tests {
             shifted.marks,
             built
                 .marks
+                .iter()
+                .map(|line| line + 100)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            shifted.records,
+            built
+                .records
                 .iter()
                 .map(|line| line + 100)
                 .collect::<Vec<_>>()
@@ -892,6 +963,55 @@ mod tests {
         fix.run(SOURCE, notified()).run(SOURCE, check());
         fix.mark(0).mark(2);
         assert!(fix.raced());
+    }
+
+    /// The point after `wait_complete` returns, outside the waiting code.
+    fn returned() -> Option<(&'static str, u32)> {
+        Some((
+            "lock#2",
+            line_of("step = self.state.lock().on_input(input)"),
+        ))
+    }
+
+    /// The source's check lands between the final record and the final
+    /// notify. It passes, and the source leaves before the notify, so only
+    /// the sink's window counts it.
+    #[test]
+    fn a_check_inside_the_final_mark_races_it() {
+        let mut fix = History::new();
+        fix.run(SOURCE, notified()).run(SOURCE, check());
+        fix.mark(0).mark(1);
+        let notify = sites().marks[2];
+        fix.run(SINK, Some(("lock#1", notify - 1)))
+            .run(SINK, Some(("notify#1", notify)))
+            .run(SOURCE, checked())
+            .run(SOURCE, returned())
+            .run(SINK, Some(("send#1", 1)));
+        assert!(fix.raced());
+        assert!(!WaitState::of(fix.log.entries()).in_wait);
+    }
+
+    /// The sink notifies before it records. The source's check runs after
+    /// the final notify and before the final record, so it fails, and the
+    /// source parks on a `Notified` that no notify wakes.
+    #[test]
+    fn a_check_before_the_final_record_strands_the_source() {
+        let mut fix = History::new();
+        fix.run(SOURCE, notified()).run(SOURCE, check());
+        fix.mark(0).mark(1);
+        let notify = sites().marks[2];
+        fix.run(SINK, Some(("notify#1", notify)))
+            .run(SINK, Some(("lock#1", notify - 1)))
+            .run(SOURCE, checked())
+            .run(SOURCE, notified())
+            .run(SOURCE, check())
+            .run(SOURCE, checked())
+            .run(SINK, Some(("release#1", notify - 1)))
+            .run(SOURCE, None);
+        assert!(fix.raced());
+        let state = WaitState::of(fix.log.entries());
+        assert!(state.all_marked() && state.all_recorded());
+        assert!(state.in_wait);
     }
 
     /// Both answers run one notify, and each run fills the next open mark.

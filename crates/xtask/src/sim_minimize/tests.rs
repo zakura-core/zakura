@@ -164,6 +164,7 @@ impl Fake {
             harness: "fixtures/all".to_owned(),
             input,
             property: "race/lost-update".to_owned(),
+            also_violates: Vec::new(),
             out: dir.path().join("out"),
             budget: Budget {
                 runs: 1,

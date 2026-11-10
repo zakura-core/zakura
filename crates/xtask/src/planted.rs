@@ -22,14 +22,15 @@
 //! 2. applies the patch, which must not change, delete or rename the
 //!    case's witness files (its input and sidecar, or its scenario and
 //!    Plan bytes), so both runs read the same committed witness. It then
-//!    rebuilds and records the input again, which must violate exactly the
-//!    case's property and pass its witness test expecting `violated`;
+//!    rebuilds and records the input again, which must violate the case's
+//!    property and no property outside the case's `also_violates`, and pass
+//!    its witness test expecting `violated` beside those;
 //! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
 //!    pass the witness test. A case file's `also_violates` names properties
-//!    the patch's bug breaks too, and a campaign run may violate one of
-//!    them instead;
+//!    the patch's bug breaks too. Any run may violate them beside the case's
+//!    property, and a campaign run may violate one of them instead;
 //! 4. for a typed case, replays the patched trace in a fresh `zakura-sim
 //!    replay`, which must match Exact, since no fuzz target can confirm it;
 //! 5. resets the worktree to `HEAD`, so the next patched build recompiles
@@ -50,7 +51,7 @@
 //! on a run that fails, ends at a harness failure, violates another
 //! property not in `also_violates`, doesn't report the case's property, or
 //! violates it without its trigger history, so the gate stays the committed
-//! input, which must violate exactly the case's property.
+//! input, which must violate the case's property.
 //!
 //! `--targets` runs only the cases whose committed fuzz input runs on a harness
 //! that a simulator fuzz target runs, as the fuzz package's
@@ -206,8 +207,8 @@ struct Case {
     /// Other paths whose change can break the catch, relative to the
     /// repository root.
     checks: Vec<PathBuf>,
-    /// Other properties the patch's bug breaks, which a campaign run may
-    /// violate instead of the case's property.
+    /// Other properties the patch's bug breaks, which any run may violate
+    /// beside the case's property, and a campaign run instead of it.
     also_violates: Vec<String>,
     /// The simulator fuzz target that runs the input's harness, with
     /// `--targets`.
@@ -303,10 +304,10 @@ struct CaseFile {
     /// [`SHARED`], such as the rest of the patched module.
     #[serde(default)]
     checks: Vec<PathBuf>,
-    /// Other properties the patched bug breaks, by ID. A campaign input's
-    /// run may violate one of them instead of the case's property, as when
-    /// a leaked charge also takes the byte budget past its bound. The
-    /// committed input must still violate exactly the case's property.
+    /// Other properties the patched bug breaks, by ID, as when a leaked
+    /// charge also takes the byte budget past its bound. Any run may violate
+    /// them beside the case's property, and a campaign input's run instead
+    /// of it. The committed input must still violate the case's property.
     #[serde(default)]
     also_violates: Vec<String>,
 }
@@ -334,9 +335,9 @@ enum Run {
     Ended {
         /// The violation that stopped the run, if one did.
         violation: Option<String>,
-        /// The first property other than the case's whose report is
-        /// `violated`, for a run no violation stopped.
-        other_violated: Option<String>,
+        /// Every property other than the case's whose report is
+        /// `violated`, in report order.
+        others_violated: Vec<String>,
         /// The case's property's outcome, such as `held`, or `None` if the
         /// run doesn't report it.
         outcome: Option<String>,
@@ -830,7 +831,7 @@ fn check_case(
         &harness,
         &input,
         &case.property,
-        "holds",
+        Expect::Holds,
         &scratch.join("baseline"),
         None,
     )?;
@@ -909,11 +910,11 @@ fn judge_patched(
         harness,
         input,
         &case.property,
-        "violated",
+        Expect::Violated(&case.also_violates),
         &trace,
         None,
     )?;
-    let verdict = match classify(&case.property, &patched) {
+    let verdict = match classify(&case.property, &case.also_violates, &patched) {
         Verdict::Caught(None) => campaign(zakura_sim, harness, case, &scratch.join("campaign"))?,
         verdict => return Ok(verdict),
     };
@@ -933,8 +934,9 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
 /// Confirms `case`'s committed input in the patched `worktree` through the
 /// fuzz target `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
-/// property alone and name `harness`, `zakura-sim confirm` must find the
-/// property's trigger history, and a fresh replay must match Exact. Builds
+/// property, beside no other violation but the case's `also_violates`, and
+/// name `harness`, `zakura-sim confirm` must find the property's trigger
+/// history, and a fresh replay must match Exact. Builds
 /// under `builds`, which outlives the worktree, and writes under `scratch`.
 ///
 /// The builds are reused, so both pinned binaries must also name the
@@ -961,6 +963,7 @@ fn through_target(
         harness: harness.to_owned(),
         input: path::absolute(worktree.join(input))?,
         property: case.property.clone(),
+        also_violates: case.also_violates.clone(),
         out: out.clone(),
         budget: sim_minimize::Budget {
             runs: 1,
@@ -1045,16 +1048,13 @@ fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
             harness,
             &Located::Input(input.clone()),
             &case.property,
-            "violated",
+            Expect::Violated(&case.also_violates),
             &dir.join(format!("run-{index}")),
             None,
         )?;
-        match classify(&case.property, &run) {
+        match classify(&case.property, &case.also_violates, &run) {
             Verdict::Caught(_) => caught += 1,
             Verdict::NotCaught(outcome) => *missed.entry(outcome).or_default() += 1,
-            Verdict::Unrelated(violated) if case.also_violates.contains(&violated) => {
-                *missed.entry(format!("violated {violated}")).or_default() += 1;
-            }
             verdict => {
                 return Ok(Verdict::CampaignFails {
                     input,
@@ -1163,6 +1163,33 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     command
 }
 
+/// What a witness test that [`record`] runs expects of the case's property.
+#[derive(Clone, Copy, Debug)]
+enum Expect<'a> {
+    /// The property applies and holds, and no property is violated.
+    Holds,
+    /// The property is violated, and no other property is, except the
+    /// listed ones, the case's `also_violates`.
+    Violated(&'a [String]),
+}
+
+impl Expect<'_> {
+    /// `zakura-sim record`'s `--expect` flag and value, then its
+    /// `--also-violates` flag and value if the list isn't empty.
+    fn args(self) -> Vec<String> {
+        match self {
+            Expect::Holds => vec!["--expect".to_owned(), "holds".to_owned()],
+            Expect::Violated(also_violates) => {
+                let mut args = vec!["--expect".to_owned(), "violated".to_owned()];
+                if !also_violates.is_empty() {
+                    args.extend(["--also-violates".to_owned(), also_violates.join(",")]);
+                }
+                args
+            }
+        }
+    }
+}
+
 /// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
 /// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
 /// `property` that expects `expect`, writing the trace to `out`, and reads
@@ -1177,7 +1204,7 @@ fn record(
     harness: &str,
     input: &Located,
     property: &str,
-    expect: &str,
+    expect: Expect<'_>,
     out: &Path,
     deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
@@ -1189,7 +1216,8 @@ fn record(
         .args(input_args(input)?)
         .arg("--out")
         .arg(out)
-        .args(["--witness", property, "--expect", expect]);
+        .args(["--witness", property])
+        .args(expect.args());
     let ended = match deadline {
         None => format!("exited with {}", zakura_sim.status()?),
         Some((deadline, interrupt)) => {
@@ -1309,11 +1337,12 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
     let id = |report: &Value| text(report.get("property")).unwrap_or_default();
     Ok(Run::Ended {
         violation: text(end.get("violation").and_then(|v| v.get("property"))),
-        other_violated: properties
+        others_violated: properties
             .iter()
             .filter(|report| id(report) != property)
-            .find(|report| outcome_name(report).as_deref() == Some("violated"))
-            .map(id),
+            .filter(|report| outcome_name(report).as_deref() == Some("violated"))
+            .map(id)
+            .collect(),
         outcome: properties
             .iter()
             .find(|report| id(report) == property)
@@ -1334,11 +1363,10 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
         Run::Ended {
             violation: Some(violated),
             ..
-        }
-        | Run::Ended {
-            other_violated: Some(violated),
-            ..
         } => Some(format!("{violated} is violated")),
+        Run::Ended {
+            others_violated, ..
+        } if !others_violated.is_empty() => Some(format!("{} is violated", others_violated[0])),
         Run::Ended { outcome, .. } if outcome.as_deref() != Some("held") => Some(format!(
             "{property} is {}",
             outcome.as_deref().unwrap_or("not reported")
@@ -1350,36 +1378,42 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
     }
 }
 
-/// What the patched run shows about `property`.
-fn classify(property: &str, patched: &Run) -> Verdict {
-    match patched {
-        Run::Failed(why) | Run::Killed(why) => Verdict::Failed(why.clone()),
+/// What the patched run shows about `property`. A violation of a property
+/// in `also_violates`, which the patched bug breaks too, is expected beside
+/// `property`'s: it neither counts as the catch nor fails the case. Any
+/// other violated property makes the verdict [`Verdict::Unrelated`]. The
+/// committed input and every campaign input are judged by this one rule.
+fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict {
+    let (violation, others_violated, outcome, witness) = match patched {
+        Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
-        } => Verdict::Harness(failure.clone()),
+        } => return Verdict::Harness(failure.clone()),
         Run::Ended {
-            violation: Some(violated),
+            violation,
+            others_violated,
+            outcome,
+            witness,
             ..
-        } if violated != property => Verdict::Unrelated(violated.clone()),
-        Run::Ended {
-            other_violated: Some(violated),
-            ..
-        } => Verdict::Unrelated(violated.clone()),
-        Run::Ended {
-            violation: None,
-            outcome: None,
-            ..
-        } => Verdict::Unreported,
-        Run::Ended {
-            violation: None,
-            outcome: Some(outcome),
-            ..
-        } if outcome != "violated" => Verdict::NotCaught(outcome.clone()),
-        Run::Ended {
-            witness: Some(why), ..
-        } => Verdict::WitnessFails(why.clone()),
-        Run::Ended { .. } => Verdict::Caught(None),
+        } => (violation, others_violated, outcome, witness),
+    };
+    let violated = || violation.iter().chain(others_violated);
+    if let Some(unrelated) = violated().find(|id| *id != property && !also_violates.contains(id)) {
+        return Verdict::Unrelated(unrelated.clone());
+    }
+    if violation.as_deref() != Some(property) && outcome.as_deref() != Some("violated") {
+        // A listed property's violation alone misses the patch.
+        return match violated().find(|id| *id != property) {
+            Some(listed) => Verdict::NotCaught(format!("violated {listed}")),
+            None => outcome
+                .clone()
+                .map_or(Verdict::Unreported, Verdict::NotCaught),
+        };
+    }
+    match witness {
+        Some(why) => Verdict::WitnessFails(why.clone()),
+        None => Verdict::Caught(None),
     }
 }
 
@@ -1440,17 +1474,18 @@ mod tests {
     #[test]
     fn planted_passes_only_on_its_own_id() {
         assert_eq!(
-            classify(ID, &run(Some(ID), &[(ID, VIOLATED)])),
+            classify(ID, &[], &run(Some(ID), &[(ID, VIOLATED)])),
             Verdict::Caught(None)
         );
         // A violation that didn't stop the run, as for a Known property.
         assert_eq!(
-            classify(ID, &run(None, &[(ID, VIOLATED)])),
+            classify(ID, &[], &run(None, &[(ID, VIOLATED)])),
             Verdict::Caught(None)
         );
         assert_eq!(
             classify(
                 ID,
+                &[],
                 &run(
                     Some("sim/no-task-panic"),
                     &[(ID, HELD), ("sim/no-task-panic", VIOLATED)]
@@ -1459,17 +1494,103 @@ mod tests {
             Verdict::Unrelated("sim/no-task-panic".to_owned())
         );
         assert_eq!(
-            classify(ID, &run(None, &[(ID, VIOLATED), ("other/draft", VIOLATED)])),
+            classify(
+                ID,
+                &[],
+                &run(None, &[(ID, VIOLATED), ("other/draft", VIOLATED)])
+            ),
             Verdict::Unrelated("other/draft".to_owned())
         );
         assert_eq!(
-            classify(ID, &run(None, &[(ID, HELD)])),
+            classify(ID, &[], &run(None, &[(ID, HELD)])),
             Verdict::NotCaught("held".to_owned())
         );
-        assert_eq!(classify(ID, &run(None, &[])), Verdict::Unreported);
+        assert_eq!(classify(ID, &[], &run(None, &[])), Verdict::Unreported);
         assert_eq!(
-            classify(ID, &Run::Failed("build".to_owned())),
+            classify(ID, &[], &Run::Failed("build".to_owned())),
             Verdict::Failed("build".to_owned())
+        );
+    }
+
+    /// The witness test's flags carry the case's `also_violates` only for a
+    /// violated expectation, and only when the list isn't empty.
+    #[test]
+    fn witness_flags_carry_the_co_violations() {
+        let also = ["a/one".to_owned(), "b/two".to_owned()];
+        assert_eq!(Expect::Holds.args(), ["--expect", "holds"]);
+        assert_eq!(Expect::Violated(&[]).args(), ["--expect", "violated"]);
+        assert_eq!(
+            Expect::Violated(&also).args(),
+            ["--expect", "violated", "--also-violates", "a/one,b/two"]
+        );
+    }
+
+    /// A property in the case's `also_violates` may be violated beside the
+    /// case's own, on the committed input as on a campaign input. Only the
+    /// case's own violation catches the patch, and an unlisted violation
+    /// still fails it.
+    #[test]
+    fn listed_co_violations_are_expected() {
+        let also = ["other/conformant".to_owned()];
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(None, &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Caught(None)
+        );
+        // The case's own violation stopped the run, as for an `Active` one.
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(Some(ID), &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Caught(None)
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(
+                    None,
+                    &[
+                        (ID, VIOLATED),
+                        ("other/conformant", VIOLATED),
+                        ("other/draft", VIOLATED)
+                    ]
+                )
+            ),
+            Verdict::Unrelated("other/draft".to_owned())
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(None, &[(ID, HELD), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::NotCaught("violated other/conformant".to_owned())
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(
+                    Some("other/conformant"),
+                    &[(ID, HELD), ("other/conformant", VIOLATED)]
+                )
+            ),
+            Verdict::NotCaught("violated other/conformant".to_owned())
+        );
+        // Without the listing, the co-violation is unrelated.
+        assert_eq!(
+            classify(
+                ID,
+                &[],
+                &run(None, &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Unrelated("other/conformant".to_owned())
         );
     }
 
@@ -1479,13 +1600,13 @@ mod tests {
         match run {
             Run::Ended {
                 violation,
-                other_violated,
+                others_violated,
                 outcome,
                 harness,
                 ..
             } => Run::Ended {
                 violation,
-                other_violated,
+                others_violated,
                 outcome,
                 harness,
                 witness: Some(why.to_owned()),
@@ -1500,7 +1621,7 @@ mod tests {
     fn planted_requires_the_trigger_history() {
         let lost = "witness test lost its trigger history";
         assert_eq!(
-            classify(ID, &judged(run(Some(ID), &[(ID, VIOLATED)]), lost)),
+            classify(ID, &[], &judged(run(Some(ID), &[(ID, VIOLATED)]), lost)),
             Verdict::WitnessFails(lost.to_owned())
         );
         assert_eq!(
@@ -1509,7 +1630,7 @@ mod tests {
         );
         // The end record's own failures still name themselves first.
         assert_eq!(
-            classify(ID, &judged(run(None, &[(ID, HELD)]), lost)),
+            classify(ID, &[], &judged(run(None, &[(ID, HELD)]), lost)),
             Verdict::NotCaught("held".to_owned())
         );
     }
@@ -1587,7 +1708,11 @@ mod tests {
     fn campaign_failures_name_their_input() {
         let verdict = Verdict::CampaignFails {
             input: PathBuf::from("campaign/input-3.bin"),
-            verdict: Box::new(classify(ID, &run(Some("sim/no-task-panic"), &[(ID, HELD)]))),
+            verdict: Box::new(classify(
+                ID,
+                &[],
+                &run(Some("sim/no-task-panic"), &[(ID, HELD)]),
+            )),
         };
         assert_eq!(
             verdict.to_string(),
@@ -1595,7 +1720,7 @@ mod tests {
         );
         let verdict = Verdict::CampaignFails {
             input: PathBuf::from("campaign/input-4.bin"),
-            verdict: Box::new(classify(ID, &run(None, &[]))),
+            verdict: Box::new(classify(ID, &[], &run(None, &[]))),
         };
         assert_eq!(
             verdict.to_string(),

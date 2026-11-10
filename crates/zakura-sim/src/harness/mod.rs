@@ -432,9 +432,9 @@ pub struct HarnessEntry {
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
-/// property, the expectation and the sink.
+/// property, the expectation, the expected co-violations and the sink.
 pub type WitnessFn =
-    fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
+    fn(&Value, PlanInput, &str, Expect, &[String], &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
@@ -569,11 +569,12 @@ fn witness_value<S: Subsystem>(
     input: PlanInput,
     property: &str,
     expect: Expect,
+    also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
     let scenario = scenario::<S>(value)
         .map_err(|error| WitnessError::UnsupportedScenario(error.to_string()))?;
-    witness_into::<S>(&scenario, input, property, expect, sink)
+    witness_into::<S>(&scenario, input, property, expect, also_violates, sink)
 }
 
 /// [`HarnessEntry::draw`] for `S`.

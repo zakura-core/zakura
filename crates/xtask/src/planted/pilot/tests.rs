@@ -34,13 +34,13 @@ fn witness_failed(run: Run, why: &str) -> Run {
     match run {
         Run::Ended {
             violation,
-            other_violated,
+            others_violated,
             outcome,
             harness,
             ..
         } => Run::Ended {
             violation,
-            other_violated,
+            others_violated,
             outcome,
             harness,
             witness: Some(why.to_owned()),

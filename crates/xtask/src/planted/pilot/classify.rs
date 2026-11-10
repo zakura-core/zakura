@@ -225,7 +225,7 @@ pub(super) fn sensitivity(property: &str, run: &SensitivityRun) -> Classified {
             return harness(format!("the mutant run leaked state: {}", leaks.join(", ")));
         }
     }
-    match planted_verdict(property, &mutant.run) {
+    match planted_verdict(property, &[], &mutant.run) {
         Verdict::Caught(_) => match &run.confirmation {
             None => harness("no fresh process confirmed the violation".to_owned()),
             Some(Err(why)) => harness(why.clone()),

@@ -856,6 +856,7 @@ impl Shrinker<'_> {
                 PlanInput::Skip(SkipScript::new(init, steps)),
                 &property,
                 Expect::Violated,
+                &[],
                 &mut sink,
             );
             let clean = sink
@@ -998,7 +999,8 @@ fn rerecord(
             plan: &plan,
             derived_from: Some(&derivation),
         };
-        let recorded = harness::record_witness(harness, what, &out, &property, Expect::Violated);
+        let recorded =
+            harness::record_witness(harness, what, &out, &property, Expect::Violated, &[]);
         let clean = matches!(&recorded, Ok((trace, _))
             if trace.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
         (recorded, clean)

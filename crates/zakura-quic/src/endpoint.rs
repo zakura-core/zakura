@@ -70,7 +70,8 @@ pub struct IncomingInfo {
     pub validated: bool,
     /// QUIC handshakes in progress on this endpoint (ADM-7).
     pub pending_total: usize,
-    /// QUIC handshakes in progress from `remote`'s IP (ADM-7).
+    /// QUIC handshakes in progress from `remote`'s IP, counted per
+    /// [`Acceptor::pending_group`] (ADM-7).
     pub pending_from_ip: usize,
 }
 
@@ -90,6 +91,14 @@ pub trait Acceptor: Send + Sync + 'static {
     /// closes (PATH-3).
     fn is_banned(&self, _ip: IpAddr) -> bool {
         false
+    }
+
+    /// The group that `ip`'s pending handshakes count under (ADM-7), so an
+    /// acceptor can treat many addresses as one source, such as every
+    /// address in an IPv6 /64. Runs on the endpoint task and must not block
+    /// (ADM-4). Each address is its own group by default.
+    fn pending_group(&self, ip: IpAddr) -> IpAddr {
+        ip
     }
 }
 

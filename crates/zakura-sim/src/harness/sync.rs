@@ -933,9 +933,16 @@ impl HasView for SyncStorage {
 
     /// Drops the node's block-sync handle from its block storage's
     /// replies. The handle reaches the storage again through the reactor's
-    /// range source, so the cycle would outlive the run.
-    fn ended(&self, _: &crate::RunEnd) {
+    /// range source, so the cycle would outlive the run. Records the run's
+    /// end in header sync's round evidence, for the teardown rule.
+    fn ended(&self, end: &crate::RunEnd) {
         let _ = self.replies.clear();
+        self.view.rounds().end(end);
+    }
+
+    /// [`cross::teardown_end_violations`].
+    fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+        cross::teardown_end_violations(self.view.rounds())
     }
 
     /// The node's block-sync view and the cross model, shared rather than

@@ -361,18 +361,20 @@ fn replaced_or_superseded_wrote(log: &ObservationLog) -> bool {
         })
 }
 
-/// One block-sync request's wait: the connection its routine runs on and
-/// when it was published, in nanoseconds of virtual time.
+/// One block-sync request's wait: the connection its routine runs on, the
+/// peer it waits on, and when it was published, in nanoseconds of virtual
+/// time.
 struct Wait {
     connection: Option<u64>,
+    peer: Option<String>,
     since_ns: u64,
 }
 
 /// The block-sync requests that wait on their peers, folded from the log.
 #[derive(Default)]
 struct Waits {
-    /// Each routine generation's connection, from its admission.
-    connections: BTreeMap<u64, u64>,
+    /// Each routine generation's connection and peer, from its admission.
+    routines: BTreeMap<u64, (u64, String)>,
     /// Each waiting request, by its owner's generation and request ID.
     waiting: BTreeMap<(u64, u64), Wait>,
     /// The virtual time of the last `TimeAdvanced` row.
@@ -394,16 +396,20 @@ impl Waits {
         };
         let ended = match fact {
             BlockSyncFact::SessionAdmitted {
+                peer,
                 connection,
                 generation,
                 ..
             } => {
-                self.connections.insert(*generation, *connection);
+                self.routines
+                    .insert(*generation, (*connection, peer.clone()));
                 return false;
             }
             BlockSyncFact::Request { owner, step, .. } if step == "published" => {
+                let routine = self.routines.get(&owner.session_id);
                 let wait = Wait {
-                    connection: self.connections.get(&owner.session_id).copied(),
+                    connection: routine.map(|(connection, _)| *connection),
+                    peer: routine.map(|(_, peer)| peer.clone()),
                     since_ns: self.now_ns,
                 };
                 self.waiting
@@ -415,7 +421,20 @@ impl Waits {
             {
                 owner
             }
-            BlockSyncFact::HandoffStarted { owner, .. } => owner,
+            // Only a body from the peer the request waits on ends its wait,
+            // so a late body from another mirror leaves a stalled mirror's
+            // request waiting.
+            BlockSyncFact::HandoffStarted { peer, owner, .. } => {
+                let key = (owner.session_id, owner.request_id);
+                let from_its_peer = self
+                    .waiting
+                    .get(&key)
+                    .is_some_and(|wait| wait.peer.as_ref() == Some(peer));
+                if !from_its_peer {
+                    return false;
+                }
+                owner
+            }
             _ => return false,
         };
         let Some(wait) = self.waiting.remove(&(ended.session_id, ended.request_id)) else {

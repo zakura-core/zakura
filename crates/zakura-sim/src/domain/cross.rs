@@ -21,10 +21,11 @@ use crate::{
         block_sync::{self, OwnerView},
         header_sync::{self, TeardownView},
     },
-    harness::block_node::view::BlockSyncView,
+    harness::{block_node::view::BlockSyncView, header_node::claim::SettlementEvidence},
     observe::{BlockSyncFact, BlockSyncHolder, StorageFact, StorageRequest, WorkOwner},
     property::{
-        CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
+        CheckCtx, EndViolation, HasView, Kind, Property, PropertyId, Source, Status,
+        TriggerHistory, Verdict,
     },
     record::machine::{BodyAuthority, ReactorAction},
     storage::{hash, BLOCK_SERVICE, HEADER_SERVICE},
@@ -836,9 +837,65 @@ where
     }
 }
 
+/// [`TEARDOWN_RETURNS_BASELINE`]'s violations at the run's end: header
+/// sync's half, a released round stuck when the run came to rest, as
+/// [`header_sync::teardown_end_violations`] finds it on the header
+/// harnesses. A harness reports these from [`HasView::end_violations`],
+/// after it handed the run's end to [`SettlementEvidence::end`].
+pub fn teardown_end_violations(rounds: &SettlementEvidence) -> Vec<EndViolation> {
+    header_sync::teardown_end_violations(rounds)
+        .into_iter()
+        .map(|violation| EndViolation {
+            property: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
+            ..violation
+        })
+        .collect()
+}
+
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history, as header sync's:
 /// header sync's queue released a round, or the harness stopped the node
 /// and header sync's tap saw it settle.
 fn header_settlement_reached<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
     view.rounds().any_released() || view.rounds().settled()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{harness::header_node::claim::Settlement, IdleStatus, Outcome, RunEnd};
+
+    /// A released round stuck when the run comes to rest violates
+    /// `sync/teardown-returns-baseline` at the run's end, under its own ID
+    /// rather than header sync's.
+    #[test]
+    fn a_stuck_round_at_rest_violates_the_sync_teardown_rule() {
+        let rounds = SettlementEvidence::default();
+        rounds.record(Settlement {
+            step: 7,
+            released: 2,
+            unsettled: 1,
+            stuck: 1,
+            shutdown: true,
+            settled: false,
+        });
+        assert!(
+            teardown_end_violations(&rounds).is_empty(),
+            "not at rest yet"
+        );
+        rounds.end(&RunEnd {
+            outcome: Outcome::Idle {
+                status: IdleStatus::Quiescent,
+            },
+            steps: 7,
+            violation: None,
+            drain: None,
+            harness: None,
+        });
+        let found = teardown_end_violations(&rounds);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].property,
+            PropertyId::new(TEARDOWN_RETURNS_BASELINE)
+        );
+    }
 }

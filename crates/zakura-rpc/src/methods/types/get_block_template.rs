@@ -1186,6 +1186,27 @@ where
     Ok(chain_info)
 }
 
+/// Returns `true` if the coinbase of a block at `height` pays the miner to a shielded address,
+/// so building it needs a proof.
+///
+/// `issuance_deficit` is the parent's NSM value balance once ZIP 234 is active, and `None`
+/// before that.
+pub(crate) fn coinbase_needs_proof(
+    network: &Network,
+    height: block::Height,
+    miner_params: &MinerParams,
+    issuance_deficit: Option<Amount<NonNegative>>,
+) -> Result<bool, TransactionError> {
+    let coinbase = TransactionTemplate::coinbase_resource_usage(
+        network,
+        height,
+        miner_params,
+        issuance_deficit,
+    )?;
+
+    Ok(coinbase.shielded_action_counts.cost() > 0)
+}
+
 /// Returns the transactions that are currently in `mempool`, or None if the
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///

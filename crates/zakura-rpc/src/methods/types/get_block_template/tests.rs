@@ -522,6 +522,39 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A coinbase needs a proof only when it pays the miner to a shielded receiver: a unified
+/// address is paid at its transparent receiver before Ironwood activates, and at its shielded
+/// one from then on.
+#[test]
+fn coinbase_needs_proof_only_for_a_shielded_payout() -> anyhow::Result<()> {
+    let net = shielded_coinbase_testnet();
+    let ironwood_height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+    let last_transparent_height = ironwood_height.previous()?;
+    let params = MinerParams::from(
+        MinerAddress::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded unified miner address is valid"),
+    );
+
+    assert!(!super::coinbase_needs_proof(
+        &net,
+        last_transparent_height,
+        &params,
+        None
+    )?);
+    assert!(super::coinbase_needs_proof(
+        &net,
+        ironwood_height,
+        &params,
+        None
+    )?);
+    Ok(())
+}
+
 fn shielded_coinbase_testnet() -> Network {
     testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {

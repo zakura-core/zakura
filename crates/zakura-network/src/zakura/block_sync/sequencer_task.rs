@@ -878,7 +878,22 @@ impl SequencerIO {
     /// whether the input needs the reactor's query and scheduling reaction.
     async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
         let wall_now = self.retry_clock.now();
+        #[cfg(any(test, zakura_sim))]
+        let applied = match &input {
+            SequencerControlInput::BodyWorkEpochChanged {
+                authority,
+                frontiers,
+            } => Some(super::block_sync_observe::BlockEvent::EpochApplied {
+                epoch: authority.body_work_epoch,
+                verified_tip: frontiers.verified_block_tip,
+            }),
+            _ => None,
+        };
         let outputs = self.state.on_control_input(input, wall_now);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(event) = applied {
+            observe!(self.observer, event);
+        }
         self.apply_control_outputs(outputs).await
     }
 

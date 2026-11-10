@@ -1435,6 +1435,14 @@ pub enum BlockSyncFact {
         /// body, or `None` before it had one.
         scope_epoch: Option<u64>,
     },
+    /// The sequencer took a new body-work epoch, before it reset the work
+    /// queue above the verified tip and reauthorized its queued work.
+    EpochApplied {
+        /// The new epoch.
+        epoch: u64,
+        /// The verified tip it resets body work above.
+        verified_tip: u32,
+    },
     /// A serving response took its execution lease, or released it.
     ServingLease {
         /// The requesting peer.

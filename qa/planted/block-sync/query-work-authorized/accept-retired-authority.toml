@@ -12,3 +12,7 @@ checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/
 # dispatches no query for the new authority, so the bug also breaks
 # `reactor-query-lifecycle`, which the patched run violates first.
 also_violates = ["block-sync/reactor-query-lifecycle"]
+# The adoption clears the reactor's queries, so in this input every old
+# reply is `Stale` before the `StaleAuthority` guard can judge it. A patch
+# that removes only that guard survives the input; this patch also keeps the
+# query across the adoption to reach it.

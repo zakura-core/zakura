@@ -153,6 +153,11 @@ impl TapTeardown {
     pub(crate) fn begin(&self) {
         self.0.teardown.store(true, Ordering::Relaxed);
     }
+
+    /// Whether the teardown began.
+    pub(crate) fn begun(&self) -> bool {
+        self.0.teardown.load(Ordering::Relaxed)
+    }
 }
 
 /// Hands a tap its node's session slots probe.
@@ -510,6 +515,13 @@ impl BlockTap {
             } => BlockSyncFact::StaleScope {
                 body: body(held),
                 scope_epoch: scope_epoch.map(|epoch| epoch.get()),
+            },
+            BlockEvent::EpochApplied {
+                epoch,
+                verified_tip,
+            } => BlockSyncFact::EpochApplied {
+                epoch: epoch.get(),
+                verified_tip: verified_tip.0,
             },
             BlockEvent::ServingLease {
                 peer: requesting,

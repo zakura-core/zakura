@@ -68,6 +68,16 @@ pub struct AuthorityModel {
     reported: Option<u64>,
     /// Findings for `QUERY_WORK_AUTHORIZED`, not yet reported.
     pub(super) query_findings: Vec<Finding>,
+    /// The body-work authority of the engine's newest committed view, as
+    /// a harness that runs the engine reads it, independently of the
+    /// reactor. `None` where no harness reads it, or once the node stops.
+    engine: Option<BodyAuthority>,
+    /// The engine authority the adoption check last found unadopted, so one
+    /// lapse is reported once.
+    unadopted: Option<BodyAuthority>,
+    /// Replies classified, and adoptions judged, since the query check last
+    /// reported.
+    pub(super) judged: u64,
 
     /// Accepted replies judged.
     pub accepted: u64,
@@ -173,6 +183,7 @@ impl AuthorityModel {
                 scope,
                 outcome,
             } => {
+                self.judged += 1;
                 if self.adopted.as_ref() == Some(scope) {
                     if *outcome == ReactorReply::Accepted {
                         self.accepted += 1;
@@ -193,6 +204,35 @@ impl AuthorityModel {
             }
             _ => {}
         }
+    }
+
+    /// Records the body-work authority of the engine's newest committed
+    /// view, or `None` once the node stops and no reactor follows the
+    /// engine.
+    pub fn engine_view(&mut self, authority: Option<BodyAuthority>) {
+        self.engine = authority;
+    }
+
+    /// `QUERY_WORK_AUTHORIZED`'s adoption obligation at `step`, where no
+    /// task can run: every committed view the engine published has reached
+    /// the reactor, so the authority it adopted is the engine's newest
+    /// view's. A reactor that ignores a view would otherwise judge replies
+    /// against an authority the engine already retired.
+    pub(super) fn judge_adoption(&mut self, step: u64) -> Option<Finding> {
+        let engine = self.engine.as_ref()?;
+        self.judged += 1;
+        if self.adopted.as_ref() == Some(engine) || self.unadopted.as_ref() == Some(engine) {
+            return None;
+        }
+        self.unadopted = Some(engine.clone());
+        Some(Finding {
+            step,
+            expected: format!(
+                "once no task can run, the reactor has adopted the engine's newest view's \
+                 authority {engine:?}"
+            ),
+            actual: format!("the reactor's adopted authority is {:?}", self.adopted),
+        })
     }
 
     /// Every hold above the verified tip whose owner names a body-work

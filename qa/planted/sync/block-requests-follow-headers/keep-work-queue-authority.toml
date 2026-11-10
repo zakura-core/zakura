@@ -1,0 +1,9 @@
+# Applies a new body-work epoch in the sequencer without resetting or
+# reauthorizing the work queue, so its queue keeps the old epoch's
+# authority and work. The input forks the mirrors' chain while storage holds
+# the node's sixth queued submission, and after the sequencer applies the
+# new epoch a routine publishes a request under the old one.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-reorg-submit.bin"
+# Besides sequencer_task/state.rs, which the patch changes, header sync's
+# apply and the rest of block sync decide what work is queued at the fork.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

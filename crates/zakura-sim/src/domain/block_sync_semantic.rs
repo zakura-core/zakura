@@ -39,7 +39,8 @@ use crate::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
         Status, Subject, TriggerHistory, Unit, Verdict,
     },
-    storage::BLOCK_SERVICE,
+    record::machine::ReactorAction,
+    storage::{BLOCK_SERVICE, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -189,7 +190,9 @@ where
             claim: "a needed-block reply installs work only under the body-work authority the \
                     reactor adopted last: its header generation, branch anchor and target \
                     hashes, verified generation and body-work epoch; a reply under a retired \
-                    authority installs nothing",
+                    authority installs nothing; and where the harness runs the engine, once no \
+                    task can run, the authority the reactor adopted is the engine's newest \
+                    committed view's",
             kind: Kind::Safety,
             assumes: &[],
             needs: REACTOR_NEEDS,
@@ -1345,7 +1348,9 @@ where
     })
 }
 
-/// Checks [`QUERY_WORK_AUTHORIZED`] at each reply the step classified.
+/// Checks [`QUERY_WORK_AUTHORIZED`] at each reply the step classified, and,
+/// where the harness reads the engine, the reactor's adoption of the
+/// engine's newest view whenever no task can run.
 fn check_query_work_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1355,10 +1360,11 @@ where
     let (findings, applicable) = {
         let mut model = model.borrow_mut();
         let authority = &mut model.authority;
-        (
-            std::mem::take(&mut authority.query_findings),
-            authority.accepted > 0 || authority.saw_retired_reply,
-        )
+        let mut findings = std::mem::take(&mut authority.query_findings);
+        if cx.status != zakura_scheduler::Status::Running {
+            findings.extend(authority.judge_adoption(cx.step));
+        }
+        (findings, std::mem::take(&mut authority.judged) > 0)
     };
     report(cx, findings).unwrap_or(if applicable {
         Verdict::Holds
@@ -1390,9 +1396,45 @@ where
 }
 
 /// [`QUERY_WORK_AUTHORIZED`]'s trigger history: a needed-block reply reached
-/// the reactor under an authority other than the one it adopted last.
+/// the reactor under an authority other than the one it adopted last, or,
+/// where the node's header storage runs on the same engine, a header write
+/// left the engine at a newer header generation than an accepted query's
+/// while the query had no reply yet. The second reads only the query's own
+/// authority and header storage's facts, so a reactor that never adopts the
+/// newer view reaches it too.
 fn reply_under_retired_authority(log: &ObservationLog) -> bool {
-    SemanticModel::of(log).authority.saw_retired_reply
+    SemanticModel::of(log).authority.saw_retired_reply || query_outlived_its_generation(log)
+}
+
+/// Whether a header write left the engine at a newer header generation than
+/// an accepted needed-block query's, as header storage's completions report
+/// the engine's, before the query's reply reached the reactor.
+fn query_outlived_its_generation(log: &ObservationLog) -> bool {
+    let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
+    log.entries().iter().any(|entry| match &entry.obs {
+        Observation::Storage {
+            service,
+            fact: StorageFact::Completed { generation, .. },
+            ..
+        } if service == HEADER_SERVICE => pending.values().any(|own| generation > own),
+        Observation::BlockSync {
+            event: BlockSyncFact::Reactor { transition, .. },
+            ..
+        } => {
+            match transition {
+                ReactorAction::QueryAccepted { query } => {
+                    pending.insert(query.query_id, query.scope.header.header_generation);
+                }
+                ReactorAction::QueryReply { query_id, .. }
+                | ReactorAction::QueryFailed { query_id, .. } => {
+                    pending.remove(query_id);
+                }
+                _ => {}
+            }
+            false
+        }
+        _ => false,
+    })
 }
 
 /// [`FRONTIER_WORK_CONSISTENT`]'s trigger history: the reactor adopted a new

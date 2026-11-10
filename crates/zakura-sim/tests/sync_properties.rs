@@ -102,13 +102,19 @@ fn an_epoch_change_retires_the_old_epochs_work() {
 
 /// `sync/tips-consistent`'s witness: the mirrors' fork reaches the engine
 /// through the node's header sync, which prepares a branch forking below
-/// its earlier target, and the engine publishes a view whose selected path
-/// replaced the last one's under a new body-work epoch.
+/// its earlier target. The fixture DAG shows that a sampled view's selected
+/// path replaced the last one's, and the engine published it under a new
+/// body-work epoch.
 #[test]
 fn a_replaced_selection_starts_a_new_body_work_epoch() {
     let committed = Plan::from_fuzz(&[]);
     for input in std::iter::once(committed).chain(inputs(4, 256)) {
-        let report = run(SavedSync::Reorg, input);
+        let (report, ports) = run_with_ports(SavedSync::Reorg, input);
+        assert!(
+            ports.cross.borrow().saw_replaced_selection,
+            "{:?}",
+            report.end
+        );
         assert!(
             EpochHistory::of(&report.log).epoch_changed,
             "{:?}",
@@ -118,23 +124,51 @@ fn a_replaced_selection_starts_a_new_body_work_epoch() {
     }
 }
 
-/// The Draft `sync/block-requests-follow-headers` and
-/// `sync/header-reorg-retires-block-work` apply and hold once the fork
-/// reaches block sync: the node requests and submits the fork's bodies
-/// under the new body-work epoch, each the fork's block at its height.
+/// `sync/block-requests-follow-headers`' and
+/// `sync/header-reorg-retires-block-work`'s witness at every pipeline stage
+/// the harness can hold: the mirrors' fork reaches the node while storage
+/// holds its first needed-block query (query), while a mirror holds a
+/// published request's range read (request, and receive once the body
+/// arrives after the reset), while storage holds a queued submission
+/// (submit), and while storage holds an admitted apply (verdict). After the
+/// sequencer applies the new body-work epoch, the node publishes and
+/// submits only the new epoch's work, and both properties hold.
 #[test]
-fn work_after_a_reorg_follows_the_new_branch() {
+fn a_reorg_at_each_pipeline_stage_retires_old_epoch_work() {
     let committed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(committed).chain(inputs(4, 256)) {
-        let report = run(SavedSync::Reorg, input);
-        let history = EpochHistory::of(&report.log);
-        assert!(
-            history.request_after && history.submission_after,
-            "{history:?}: {:?}",
-            report.end
-        );
-        applicable_and_held(&report, BLOCK_REQUESTS_FOLLOW_HEADERS);
-        applicable_and_held(&report, HEADER_REORG_RETIRES_BLOCK_WORK);
+    for saved in [
+        SavedSync::Reorg,
+        SavedSync::ReorgQuery,
+        SavedSync::ReorgRequest,
+        SavedSync::ReorgSubmit,
+        SavedSync::ReorgVerdict,
+    ] {
+        for input in std::iter::once(committed.clone()).chain(inputs(2, 256)) {
+            let (report, ports) = run_with_ports(saved, input);
+            let history = EpochHistory::of(&report.log);
+            let cross = ports.cross.borrow();
+            match saved {
+                SavedSync::ReorgQuery => assert!(
+                    SemanticModel::of(&report.log).authority.saw_retired_reply,
+                    "{}: the held query's reply arrives under a retired authority",
+                    saved.name()
+                ),
+                SavedSync::ReorgSubmit | SavedSync::ReorgVerdict => assert!(
+                    cross.saw_detached_submission,
+                    "{}: the held submission outlives the epoch change detached",
+                    saved.name()
+                ),
+                _ => {}
+            }
+            assert!(
+                history.applied && history.request_after && history.submission_after,
+                "{}: {history:?}: {:?}",
+                saved.name(),
+                report.end
+            );
+            applicable_and_held(&report, BLOCK_REQUESTS_FOLLOW_HEADERS);
+            applicable_and_held(&report, HEADER_REORG_RETIRES_BLOCK_WORK);
+        }
     }
 }
 

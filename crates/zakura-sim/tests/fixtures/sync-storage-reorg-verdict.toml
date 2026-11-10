@@ -1,0 +1,17 @@
+# The committed fuzz input `sync-storage-reorg-verdict.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `reorg-verdict` scenario, and
+# `sync-storage-reorg-verdict.end.json` is its pinned end record.
+harness = "sync/storage"
+generator = 1
+sha256 = "5e10b5efe02d45985a5e30afadb08591cd08dd91cc7e664f04858dd14ddbe2cf"
+scenario_sha256 = "078600068283ac3c5ae60d96e3af7fdf28c9c3e9d0e618fa9c1d02b1bf616eb1"
+source = "crates/zakura-sim/tests/sync_harness.rs"
+
+[[witness]]
+property = "sync/block-requests-follow-headers"
+expect = "holds"
+
+[[witness]]
+property = "sync/header-reorg-retires-block-work"
+expect = "holds"

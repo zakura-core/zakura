@@ -7,14 +7,18 @@
 //! So a node that confuses two branches can't make its own check agree with
 //! it.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use zakura_header_chain::Frontier;
 use zakura_storage::block::fixture::FixtureBlock;
 
 use crate::{
     harness::block_node::view::BlockSyncView,
-    observe::{BlockSyncFact, StorageFact, StorageRequest, WorkOwner},
+    observe::{BlockSyncFact, BlockSyncHolder, StorageFact, StorageRequest, WorkOwner},
     property::{
         CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
     },
@@ -117,6 +121,20 @@ pub struct CrossModel {
     /// Each adopted target, in order, for the heights a reorganization
     /// replaced.
     targets: Vec<String>,
+    /// The newest body-work epoch the sequencer applied. Its transition
+    /// reset the work queue and the sequencer's bodies, so no later request
+    /// or submission may carry an older epoch.
+    applied: Option<u64>,
+    /// The submission tokens the sequencer's holder changes announced. The
+    /// sequencer announces a submission before it handles its next control
+    /// input, so a token announced by the time it applied an epoch was sent
+    /// before then.
+    announced: BTreeSet<u64>,
+    /// The owner of the last body the sequencer took from its input queue at
+    /// each height, as the request it answered named it, until the sequencer
+    /// refuses it. A body enters the reorder buffer or `applying` at the
+    /// boundary that releases it from the queue.
+    dequeued: BTreeMap<u32, WorkOwner>,
     /// Findings for [`TIPS_CONSISTENT`], not yet reported.
     tip_findings: Vec<Finding>,
     /// Findings for [`BLOCK_REQUESTS_FOLLOW_HEADERS`], not yet reported.
@@ -141,6 +159,16 @@ pub struct CrossModel {
     /// Whether storage took a submission at a height whose block an adopted
     /// reorganization replaced.
     pub saw_submission_on_replaced_height: bool,
+    /// Whether the node published a request under an epoch older than the
+    /// reactor's adopted one before the sequencer applied the newer epoch:
+    /// the window a routine may still publish old work in.
+    pub saw_request_before_apply: bool,
+    /// Whether the sequencer refused an older epoch's body after it applied
+    /// a newer one.
+    pub saw_stale_body_refused: bool,
+    /// Whether a submission of an older epoch's body outlived the
+    /// sequencer's apply of a newer epoch, detached from `applying`.
+    pub saw_detached_submission: bool,
 }
 
 /// One of the cross checks.
@@ -171,6 +199,9 @@ impl CrossModel {
             folded: 0,
             adopted: None,
             targets: Vec::new(),
+            applied: None,
+            announced: BTreeSet::new(),
+            dequeued: BTreeMap::new(),
             tip_findings: Vec::new(),
             request_findings: Vec::new(),
             submit_findings: Vec::new(),
@@ -181,6 +212,9 @@ impl CrossModel {
             saw_replaced_selection: false,
             saw_request_on_replaced_height: false,
             saw_submission_on_replaced_height: false,
+            saw_request_before_apply: false,
+            saw_stale_body_refused: false,
+            saw_detached_submission: false,
         }
     }
 
@@ -266,6 +300,7 @@ impl CrossModel {
                             request:
                                 StorageRequest::SubmitBlock {
                                     owner,
+                                    token,
                                     height: Some(height),
                                     hash,
                                     ..
@@ -273,7 +308,7 @@ impl CrossModel {
                             ..
                         },
                     ..
-                } if service == BLOCK_SERVICE => self.submission(owner, *height, hash),
+                } if service == BLOCK_SERVICE => self.submission(owner, *token, *height, hash),
                 _ => {}
             }
             self.folded += 1;
@@ -300,8 +335,52 @@ impl CrossModel {
                 step,
                 ..
             } if step == "published" => self.request(owner, heights),
+            BlockSyncFact::EpochApplied { epoch, .. } => {
+                self.applied = self.applied.max(Some(*epoch));
+            }
+            BlockSyncFact::Holder {
+                body,
+                holder: BlockSyncHolder::Submitted { token },
+                change,
+            } if change == "retained" => {
+                if self.announced.insert(*token) {
+                    self.sent(&body.owner, body.height, *token);
+                }
+            }
+            BlockSyncFact::Holder {
+                body,
+                holder: BlockSyncHolder::Queued { .. },
+                change,
+            } if change == "released" => {
+                self.dequeued.insert(body.height, body.owner.clone());
+            }
+            BlockSyncFact::Holder {
+                body,
+                holder: BlockSyncHolder::Reorder { .. } | BlockSyncHolder::Applying { .. },
+                change,
+            } if change == "retained" => self.buffered(&body.owner, body.height),
+            BlockSyncFact::Holder {
+                body,
+                holder: BlockSyncHolder::Detached { .. },
+                change,
+            } if change == "retained" => {
+                self.saw_detached_submission |= self.retired(&body.owner);
+            }
+            BlockSyncFact::StaleScope { body, .. } => {
+                self.dequeued.remove(&body.height);
+                self.saw_stale_body_refused |= self.retired(&body.owner);
+            }
             _ => {}
         }
+    }
+
+    /// Whether `owner` names a body-work epoch older than the newest one the
+    /// sequencer applied.
+    fn retired(&self, owner: &WorkOwner) -> bool {
+        owner
+            .body_work_epoch
+            .zip(self.applied)
+            .is_some_and(|(own, applied)| own < applied)
     }
 
     /// Adopts `authority`'s target.
@@ -335,6 +414,25 @@ impl CrossModel {
     /// Judges a published request.
     fn request(&mut self, owner: &WorkOwner, heights: &[u32]) {
         self.requests += 1;
+        if self.retired(owner) {
+            self.request_findings.push(Finding {
+                expected: format!(
+                    "once the sequencer applies body-work epoch {:?}, no request under an older \
+                     epoch is published",
+                    self.applied
+                ),
+                actual: format!(
+                    "request {} on session {} for heights {heights:?} carries epoch {:?}",
+                    owner.request_id, owner.session_id, owner.body_work_epoch
+                ),
+            });
+        } else if self
+            .adopted
+            .as_ref()
+            .is_some_and(|(_, adopted)| owner.body_work_epoch.is_some_and(|own| own < *adopted))
+        {
+            self.saw_request_before_apply = true;
+        }
         let branch = &owner.scope.branch;
         let anchor = self.dag.height(&branch.anchor);
         for &height in heights {
@@ -358,8 +456,60 @@ impl CrossModel {
         }
     }
 
-    /// Judges a submission storage took.
-    fn submission(&mut self, owner: &WorkOwner, height: u32, block: &str) {
+    /// Judges a body the sequencer took into its reorder buffer or
+    /// `applying`: the request it answered, as it arrived, and the owner the
+    /// sequencer holds it under must both be of the epoch the sequencer
+    /// applied last.
+    fn buffered(&mut self, owner: &WorkOwner, height: u32) {
+        self.submissions += 1;
+        let arrived = self.dequeued.get(&height).unwrap_or(owner);
+        if self.retired(arrived) || self.retired(owner) {
+            self.submit_findings.push(Finding {
+                expected: format!(
+                    "once the sequencer applies body-work epoch {:?}, it takes no older epoch's \
+                     body into its reorder buffer or applying",
+                    self.applied
+                ),
+                actual: format!(
+                    "the body at {height} answered request {} on session {} under epoch {:?}, \
+                     and the sequencer holds it under epoch {:?}",
+                    arrived.request_id,
+                    arrived.session_id,
+                    arrived.body_work_epoch,
+                    owner.body_work_epoch
+                ),
+            });
+        }
+    }
+
+    /// Judges a submission the sequencer sent to storage, as its holder
+    /// change, or storage's taking it before that, reports it: the
+    /// sequencer submits only bodies of the epoch it applied last.
+    fn sent(&mut self, owner: &WorkOwner, height: u32, token: u64) {
+        self.submissions += 1;
+        if self.retired(owner) {
+            self.submit_findings.push(Finding {
+                expected: format!(
+                    "once the sequencer applies body-work epoch {:?}, it submits no body under \
+                     an older epoch; a submission sent before then may finish detached",
+                    self.applied
+                ),
+                actual: format!(
+                    "submission {token} of request {} on session {} at {height} carries epoch \
+                     {:?}",
+                    owner.request_id, owner.session_id, owner.body_work_epoch
+                ),
+            });
+        }
+    }
+
+    /// Judges a submission storage took. Storage can take a submission
+    /// before the sequencer's holder change announces it, so an unannounced
+    /// one is judged as sent now.
+    fn submission(&mut self, owner: &WorkOwner, token: u64, height: u32, block: &str) {
+        if self.announced.insert(token) {
+            self.sent(owner, height, token);
+        }
         self.submissions += 1;
         self.saw_submission_on_replaced_height |= self.replaced(height);
         let own = self.dag.ancestor(&owner.scope.branch.target, height);
@@ -388,17 +538,22 @@ pub trait CrossView {
     fn block(&self) -> Rc<RefCell<BlockSyncView>>;
 }
 
-/// The engine's views agree with the fixture DAG: every tip is a block the
-/// run made, and a view whose selected or verified path replaced the last
-/// one's starts a new body-work epoch.
+/// The engine's views, as the harness samples them after each step, agree
+/// with the fixture DAG: every tip is a block the run made, and a view whose
+/// selected or verified path replaced the last sampled one's starts a new
+/// body-work epoch. A view the engine replaces within one step goes
+/// unjudged.
 pub const TIPS_CONSISTENT: &str = "sync/tips-consistent";
 
 /// Every block request the node publishes names heights on its owner's
-/// branch, and under the adopted epoch the adopted target's blocks.
+/// branch, under the adopted epoch the adopted target's blocks, and never
+/// an epoch older than the one the sequencer applied.
 pub const BLOCK_REQUESTS_FOLLOW_HEADERS: &str = "sync/block-requests-follow-headers";
 
-/// Every body block sync submits is its owner's branch's block, and under
-/// the adopted epoch the adopted target's.
+/// Every body block sync submits is its owner's branch's block, under the
+/// adopted epoch the adopted target's, and never of an epoch older than the
+/// one the sequencer applied; nor does the sequencer take such a body into
+/// current work.
 pub const HEADER_REORG_RETIRES_BLOCK_WORK: &str = "sync/header-reorg-retires-block-work";
 
 /// What every cross property reads: storage's and block sync's facts, and
@@ -414,10 +569,11 @@ where
     vec![
         Property {
             id: PropertyId::new(TIPS_CONSISTENT),
-            claim: "every committed view's header tip and verified tip are blocks the run \
-                    made, and a view whose selected path or verified path doesn't extend the \
-                    last one's, or whose verified tip moved off its selected chain, starts a \
-                    new body-work epoch",
+            claim: "each committed view the harness samples after a step has a header tip \
+                    and a verified tip that are blocks the run made, and a sampled view whose \
+                    selected path or verified path doesn't extend the last sampled one's, or \
+                    whose verified tip moved off its selected chain, starts a new body-work \
+                    epoch",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,
@@ -428,24 +584,29 @@ where
         Property {
             id: PropertyId::new(BLOCK_REQUESTS_FOLLOW_HEADERS),
             claim: "every height a published block request names lies above its owner's \
-                    anchor on its owner's branch, and a request under the adopted body-work \
-                    epoch names the adopted target's block at each height",
+                    anchor on its owner's branch; a request under the reactor's adopted \
+                    body-work epoch names the adopted target's block at each height; and once \
+                    the sequencer applies a body-work epoch, no request under an older epoch \
+                    is published",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,
-            status: Status::Draft,
+            status: Status::Active,
             check: check_block_requests_follow_headers::<S>,
             witness: Some(TriggerHistory::Log(request_after_epoch_change)),
         },
         Property {
             id: PropertyId::new(HEADER_REORG_RETIRES_BLOCK_WORK),
-            claim: "every body block sync submits is its owner's branch's block at its height, \
-                    and a submission under the adopted body-work epoch is the adopted \
-                    target's block",
+            claim: "every body storage takes is its owner's branch's block at its height, and \
+                    under the reactor's adopted body-work epoch the adopted target's block; \
+                    and once the sequencer applies a body-work epoch, it takes no older \
+                    epoch's body into its reorder buffer or applying and submits no body \
+                    under an older epoch, though a submission sent before then may finish \
+                    detached",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,
-            status: Status::Draft,
+            status: Status::Active,
             check: check_header_reorg_retires_block_work::<S>,
             witness: Some(TriggerHistory::Log(submission_after_epoch_change)),
         },
@@ -526,16 +687,17 @@ where
 /// the log alone shows it.
 #[derive(Debug, Default)]
 pub struct EpochHistory {
-    /// The epoch of the reactor's latest `AuthorityChanged` that changed
-    /// it.
-    epoch: Option<u64>,
     /// Whether the reactor adopted a new body-work epoch: the engine
     /// published a view whose selected or verified path replaced the last
     /// one's.
     pub epoch_changed: bool,
-    /// Whether the node published a request under the new epoch.
+    /// Whether the sequencer applied a new body-work epoch.
+    pub applied: bool,
+    /// Whether the node published a request after the sequencer applied a
+    /// new epoch.
     pub request_after: bool,
-    /// Whether storage took a submission under the new epoch.
+    /// Whether the sequencer took a body from its input, or sent a
+    /// submission to storage, after it applied a new epoch.
     pub submission_after: bool,
 }
 
@@ -544,48 +706,36 @@ impl EpochHistory {
     pub fn of(log: &ObservationLog) -> Self {
         let mut history = EpochHistory::default();
         for entry in log.entries() {
-            match &entry.obs {
-                Observation::BlockSync {
-                    event:
-                        BlockSyncFact::Reactor {
-                            transition:
-                                ReactorAction::AuthorityChanged {
-                                    authority,
-                                    epoch_changed: true,
-                                },
+            let Observation::BlockSync { event, .. } = &entry.obs else {
+                continue;
+            };
+            match event {
+                BlockSyncFact::Reactor {
+                    transition:
+                        ReactorAction::AuthorityChanged {
+                            epoch_changed: true,
                             ..
                         },
                     ..
-                } => {
-                    history.epoch = Some(authority.body_work_epoch);
-                    history.epoch_changed = true;
+                } => history.epoch_changed = true,
+                BlockSyncFact::EpochApplied { .. } => history.applied = true,
+                BlockSyncFact::Request { step, .. } if step == "published" => {
+                    history.request_after |= history.applied;
                 }
-                Observation::BlockSync {
-                    event: BlockSyncFact::Request { owner, step, .. },
+                BlockSyncFact::Holder {
+                    holder: BlockSyncHolder::Submitted { .. },
+                    change,
                     ..
-                } if step == "published" => {
-                    history.request_after |= history.current(owner);
-                }
-                Observation::Storage {
-                    service,
-                    fact:
-                        StorageFact::BlockSubmitted {
-                            request: StorageRequest::SubmitBlock { owner, .. },
-                            ..
-                        },
+                } if change == "retained" => history.submission_after |= history.applied,
+                BlockSyncFact::Holder {
+                    holder: BlockSyncHolder::Queued { .. },
+                    change,
                     ..
-                } if service == BLOCK_SERVICE => {
-                    history.submission_after |= history.current(owner);
-                }
+                } if change == "released" => history.submission_after |= history.applied,
                 _ => {}
             }
         }
         history
-    }
-
-    /// Whether `owner` works under the latest new epoch.
-    fn current(&self, owner: &WorkOwner) -> bool {
-        self.epoch.is_some() && owner.body_work_epoch == self.epoch
     }
 }
 
@@ -620,13 +770,14 @@ fn fork_prepared(log: &ObservationLog) -> bool {
 }
 
 /// [`BLOCK_REQUESTS_FOLLOW_HEADERS`]'s trigger history: the node published a
-/// request under a new body-work epoch.
+/// request after the sequencer applied a new body-work epoch.
 fn request_after_epoch_change(log: &ObservationLog) -> bool {
     EpochHistory::of(log).request_after
 }
 
-/// [`HEADER_REORG_RETIRES_BLOCK_WORK`]'s trigger history: storage took a
-/// submission under a new body-work epoch.
+/// [`HEADER_REORG_RETIRES_BLOCK_WORK`]'s trigger history: the sequencer took
+/// a body from its input, or sent a submission, after it applied a new
+/// body-work epoch.
 fn submission_after_epoch_change(log: &ObservationLog) -> bool {
     EpochHistory::of(log).submission_after
 }

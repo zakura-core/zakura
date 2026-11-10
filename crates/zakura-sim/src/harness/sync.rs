@@ -38,7 +38,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
-use zakura_header_chain::Frontier;
+use zakura_header_chain::{BodyWorkAuthority, Frontier};
 use zakura_network::zakura::{
     block_sync_serving_limit, framed_channel, CloseCauseReader, FramedRecv, FramedSend, Peer,
     Service, ServicePeerDirection, SessionOrigin, StreamReader, ZakuraBlockSyncConfig,
@@ -785,15 +785,20 @@ impl ActionSource for Control {
 }
 
 /// Watches the node's engine at each observation: hands the cross model the
-/// engine's committed view, and records a reorganization of its selected
-/// header chain as the node's `Reset` chain effect, for the block policy's
-/// triggers.
+/// engine's committed view and the block-sync semantic model its body-work
+/// authority, and records a reorganization of its selected header chain as
+/// the node's `Reset` chain effect, for the block policy's triggers.
 /// It's added before the block policy's source, so a step's effect counts
 /// in the same step.
 struct EngineWatch {
     engine: Arc<EnginePort>,
     effects: block_node::Effects,
     cross: Rc<RefCell<CrossModel>>,
+    /// The node's block-sync semantic model, whose query check expects the
+    /// reactor to adopt the engine's newest view.
+    semantic: Rc<RefCell<SemanticModel>>,
+    /// Once the node's teardown begins, no reactor follows the engine.
+    teardown: TapTeardown,
     /// The header tip at the last observation.
     header_best: Frontier,
 }
@@ -809,6 +814,8 @@ impl ActionSource for EngineWatch {
 
     fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
         let view = self.engine.view();
+        let authority = (!self.teardown.begun()).then(|| BodyWorkAuthority::for_view(&view).into());
+        self.semantic.borrow_mut().authority.engine_view(authority);
         self.cross.borrow_mut().sample(ViewSample {
             state_version: view.state_version.get(),
             epoch: view.body_work_epoch.get(),
@@ -1077,12 +1084,6 @@ pub(crate) fn spawn_actors(
     let header_shutdown = header_tap.shutdown();
     sim.add_source(Box::new(header_storage.with_tap(header_tap)));
     // The block side.
-    sim.add_source(Box::new(EngineWatch {
-        engine: ports.engine.clone(),
-        effects: ports.effects.clone(),
-        cross: ports.cross.clone(),
-        header_best: anchor,
-    }));
     let block_storage = block_node::PolicySource::new(
         sim,
         ports.service.clone(),
@@ -1110,6 +1111,14 @@ pub(crate) fn spawn_actors(
     let wire = Wire::new(block_sync_serving_limit(&config));
     block_tap.label_with(wire.clone());
     let block_teardown = block_tap.teardown();
+    sim.add_source(Box::new(EngineWatch {
+        engine: ports.engine.clone(),
+        effects: ports.effects.clone(),
+        cross: ports.cross.clone(),
+        semantic: view.borrow().semantic.clone(),
+        teardown: block_teardown.clone(),
+        header_best: anchor,
+    }));
     let sessions = block_tap.sessions();
     let block_storage = block_storage.with_tap(block_tap);
     let predicates = block_storage.predicates();
@@ -1245,6 +1254,23 @@ pub enum SavedSync {
     /// The node shuts down while storage holds its second body's apply,
     /// which completes [`TEARDOWN_HOLD_MS`] after its submission.
     TeardownSubmission,
+    /// The `reorg` fork reaches the node while storage holds its first
+    /// needed-block query for [`REORG_HOLD_MS`]: the query stage.
+    ReorgQuery,
+    /// The `reorg` fork reaches the node while a mirror holds its
+    /// [`REORG_READ_NTH`]th range read for [`REORG_HOLD_MS`], so a request
+    /// the node published under the old epoch is outstanding when the
+    /// sequencer applies the new one, and its body arrives after the reset:
+    /// the request and receive stages.
+    ReorgRequest,
+    /// The `reorg` fork reaches the node while storage holds its
+    /// [`REORG_NTH`]th queued submission for [`REORG_HOLD_MS`] before
+    /// admitting it: the submit stage.
+    ReorgSubmit,
+    /// The `reorg` fork reaches the node while storage holds its
+    /// [`REORG_NTH`]th admitted apply for [`REORG_HOLD_MS`] before committing
+    /// it: the verdict stage.
+    ReorgVerdict,
 }
 
 /// How long the teardown scenarios hold their operation past the node's
@@ -1255,17 +1281,34 @@ const TEARDOWN_HOLD_MS: u64 = 2_000;
 /// milliseconds of virtual time.
 const RETIRED_QUERY_HOLD_MS: u64 = 2_000;
 
+/// How long the reorg stage scenarios hold their operation, at least, in
+/// milliseconds of virtual time.
+const REORG_HOLD_MS: u64 = 2_000;
+
+/// Which of its kind's operations a reorg stage scenario holds: one above
+/// the fork point at height 4.
+const REORG_NTH: u32 = 6;
+
+/// Which mirror range read [`SavedSync::ReorgRequest`] holds: an early one,
+/// at a height every branch shares, whose request the epoch change still
+/// retires because it lies above the verified tip.
+const REORG_READ_NTH: u32 = 2;
+
 /// The first byte of every saved scenario's tag.
 const TAG: u8 = 0xFD;
 
 impl SavedSync {
     /// Every saved scenario.
-    pub const ALL: [SavedSync; 5] = [
+    pub const ALL: [SavedSync; 9] = [
         SavedSync::Honest,
         SavedSync::Reorg,
         SavedSync::RetiredQuery,
         SavedSync::TeardownQuery,
         SavedSync::TeardownSubmission,
+        SavedSync::ReorgQuery,
+        SavedSync::ReorgRequest,
+        SavedSync::ReorgSubmit,
+        SavedSync::ReorgVerdict,
     ];
 
     /// The fixture's name, `sync-storage-<name>.bin`.
@@ -1276,6 +1319,10 @@ impl SavedSync {
             SavedSync::RetiredQuery => "retired-query",
             SavedSync::TeardownQuery => "teardown-query",
             SavedSync::TeardownSubmission => "teardown-submission",
+            SavedSync::ReorgQuery => "reorg-query",
+            SavedSync::ReorgRequest => "reorg-request",
+            SavedSync::ReorgSubmit => "reorg-submit",
+            SavedSync::ReorgVerdict => "reorg-verdict",
         }
     }
 
@@ -1299,6 +1346,15 @@ impl SavedSync {
             SavedSync::Reorg => &[
                 (FRONTIER_WORK_CONSISTENT, "holds"),
                 (cross::TIPS_CONSISTENT, "holds"),
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
+            ],
+            SavedSync::ReorgQuery
+            | SavedSync::ReorgRequest
+            | SavedSync::ReorgSubmit
+            | SavedSync::ReorgVerdict => &[
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
             ],
             SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, "holds")],
             SavedSync::TeardownQuery | SavedSync::TeardownSubmission => {
@@ -1369,7 +1425,60 @@ impl SavedSync {
                 two_mirrors,
                 block_policy::Select::nth(block_policy::BlockKind::Apply, 2),
             ),
+            SavedSync::ReorgQuery => reorg_holding(
+                two_mirrors,
+                fork,
+                block_policy::Select::nth(block_policy::BlockKind::Query, 1),
+                vec![block_policy::BlockAllow::Answer],
+            ),
+            SavedSync::ReorgRequest => reorg_holding(
+                two_mirrors,
+                fork,
+                block_policy::Select::nth(block_policy::BlockKind::MirrorRead, REORG_READ_NTH),
+                vec![block_policy::BlockAllow::Serve],
+            ),
+            SavedSync::ReorgSubmit => reorg_holding(
+                two_mirrors,
+                fork,
+                block_policy::Select::nth(block_policy::BlockKind::Admit, REORG_NTH),
+                vec![
+                    block_policy::BlockAllow::Admit,
+                    block_policy::BlockAllow::Committed,
+                ],
+            ),
+            SavedSync::ReorgVerdict => reorg_holding(
+                two_mirrors,
+                fork,
+                block_policy::Select::nth(block_policy::BlockKind::Apply, REORG_NTH),
+                vec![block_policy::BlockAllow::Committed],
+            ),
         }
+    }
+}
+
+/// `scenario`, with the operation `held` selects held for
+/// [`REORG_HOLD_MS`] and then offered only `then`, and the mirrors switching
+/// to `fork` once storage or a mirror takes it.
+fn reorg_holding(
+    scenario: SyncScenario,
+    fork: SyncAction,
+    held: block_policy::Select,
+    then: Vec<block_policy::BlockAllow>,
+) -> SyncScenario {
+    let mut block_policy = block_node::Policy::converging();
+    block_policy.holds.push(block_policy::Hold {
+        select: held.clone(),
+        until: Trigger::VirtualTime(REORG_HOLD_MS),
+        then,
+        deadline_ms: None,
+    });
+    SyncScenario {
+        block_policy,
+        control: vec![SyncStep {
+            action: fork,
+            when: Some(Trigger::Submitted(held)),
+        }],
+        ..scenario
     }
 }
 

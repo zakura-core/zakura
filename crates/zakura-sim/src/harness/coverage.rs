@@ -990,23 +990,17 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::cross::BLOCK_REQUESTS_FOLLOW_HEADERS,
         passing: passes(
             "tests/sync_properties.rs",
-            "work_after_a_reorg_follows_the_new_branch",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
         ),
-        bypass: Bypass::Pending(
-            "the check passes an old-epoch request by its own branch: a routine may publish \
-             one before the epoch's reset reaches it, and the check doesn't bound that window",
-        ),
+        bypass: Bypass::Planted("keep-work-queue-authority"),
     },
     Coverage {
         property: crate::domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
         passing: passes(
             "tests/sync_properties.rs",
-            "work_after_a_reorg_follows_the_new_branch",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
         ),
-        bypass: Bypass::Pending(
-            "storage logs a submission when it takes it, not when the sequencer sends it, so \
-             the check can't tell a stale old-epoch submission from a detached one",
-        ),
+        bypass: Bypass::Planted("accept-stale-scope-bodies"),
     },
     Coverage {
         property: crate::domain::block_sync_semantic::QUERY_WORK_AUTHORIZED,

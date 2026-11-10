@@ -3,8 +3,8 @@
 //! Block sync's tasks report what they do to an installed
 //! [`BlockSyncObserver`]: session admission, judged frames, request write
 //! steps, byte-budget changes, the body handoff to the sequencer, sequencer
-//! holder changes, serving leases and frames, and each owning task's snapshot
-//! after an input. This module exists only in test and `zakura_sim` builds.
+//! holder changes and epoch changes, serving leases and frames, and each
+//! owning task's snapshot after an input. This module exists only in test and `zakura_sim` builds.
 //! Production builds compile none of it, and every hook that reports to it is
 //! behind the same `cfg`.
 //!
@@ -153,6 +153,16 @@ pub enum BlockEvent {
         /// The body work epoch the sequencer applied when it judged the
         /// body, or `None` before it had one.
         scope_epoch: Option<BodyWorkEpoch>,
+    },
+    /// The sequencer took a new body-work epoch. It reports this before it
+    /// runs the transition's operations, which reset the work queue above
+    /// `verified_tip` and reauthorize its queued work without yielding, so
+    /// every request or submission reported after this one follows them.
+    EpochApplied {
+        /// The new epoch.
+        epoch: BodyWorkEpoch,
+        /// The verified tip the transition resets body work above.
+        verified_tip: block::Height,
     },
     /// A serving read received its execution lease, or dropped it.
     ServingLease {

@@ -15,3 +15,11 @@ expect = "holds"
 [[witness]]
 property = "sync/tips-consistent"
 expect = "holds"
+
+[[witness]]
+property = "sync/block-requests-follow-headers"
+expect = "holds"
+
+[[witness]]
+property = "sync/header-reorg-retires-block-work"
+expect = "holds"

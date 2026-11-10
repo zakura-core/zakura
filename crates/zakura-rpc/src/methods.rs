@@ -1650,7 +1650,7 @@ where
     async fn populated_mempool_on_new_tip(
         &self,
         tip_hash: block::Hash,
-    ) -> Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)> {
+    ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
         let mempool_fetch =
             types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
 
@@ -2923,7 +2923,7 @@ where
 
         match response {
             mempool::Response::FullTransactions {
-                mut transactions,
+                transactions,
                 transaction_dependencies,
                 last_seen_tip_hash: _,
             } => {
@@ -2951,6 +2951,7 @@ where
                     // hash in serialized byte order as a tie-breaker. Note that
                     // this is only done in not verbose because in verbose mode
                     // a dictionary is returned, where order does not matter.
+                    let mut transactions = Arc::unwrap_or_clone(transactions);
                     transactions.sort_by_cached_key(|tx| {
                         // zcashd uses modified fee here but Zebra doesn't currently
                         // support prioritizing transactions
@@ -3958,7 +3959,7 @@ where
                 } else {
                     None
                 },
-                mempool_txs,
+                mempool_txs.iter().cloned(),
                 mempool_tx_deps,
             )
             .map_misc_error()?;

@@ -1312,8 +1312,7 @@ impl Service<Request> for Mempool {
                 Request::FullTransactions => {
                     trace!(?req, "got mempool request");
 
-                    let transactions: Vec<_> = storage.transactions().values().cloned().collect();
-                    let transaction_dependencies = storage.transaction_dependencies().clone();
+                    let (transactions, transaction_dependencies) = storage.mining_snapshot();
 
                     trace!(?req, transactions_count = ?transactions.len(), "answered mempool request");
 

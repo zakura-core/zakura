@@ -276,8 +276,8 @@ proptest! {
 
                     let mempool_query = mempool.expect_request(mempool::Request::FullTransactions)
                         .map_ok(|r| r.respond(mempool::Response::FullTransactions {
-                            transactions,
-                            transaction_dependencies,
+                            transactions: transactions.into(),
+                            transaction_dependencies: transaction_dependencies.into(),
                             last_seen_tip_hash: [0; 32].into(),
                         }));
 

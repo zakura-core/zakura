@@ -253,7 +253,7 @@ fn mining_rpc(
         let hash = mempool_info.borrow().tip_hash;
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: hash,
             })
@@ -314,7 +314,7 @@ fn counting_mining_rpc(
                 tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL)).await;
             }
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: hash,
             })
@@ -665,7 +665,7 @@ async fn template_rebuild_limit_returns_parent_changed_error() {
         mempool_tip_sender.send_best_tip_hash(next.tip_hash);
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: current_tip,
             })
@@ -1048,7 +1048,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         });
         let mempool = tower::service_fn(move |_| async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: original.tip_hash,
             })

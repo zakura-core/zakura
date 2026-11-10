@@ -1233,7 +1233,7 @@ pub(crate) fn coinbase_needs_proof(
 pub async fn fetch_mempool_transactions<Mempool>(
     mempool: Mempool,
     chain_tip_hash: block::Hash,
-) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
+) -> RpcResult<Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)>>
 where
     Mempool: Service<
             mempool::Request,

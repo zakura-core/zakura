@@ -3186,7 +3186,13 @@ where
         address_book_updater_guard,
     ) = AddressBookUpdater::spawn(&config, unused_v4, PeerServices::NODE_NETWORK);
 
-    let add_fut = add_initial_peers(config, outbound_connector, peerset_tx, address_book_updater);
+    let add_fut = add_initial_peers(
+        config,
+        outbound_connector,
+        peerset_tx,
+        address_book_updater,
+        Default::default(),
+    );
     let add_task_handle = tokio::spawn(add_fut);
 
     (add_task_handle, peerset_rx, address_book_updater_guard)

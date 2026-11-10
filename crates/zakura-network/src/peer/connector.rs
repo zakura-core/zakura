@@ -88,6 +88,7 @@ where
         }: OutboundConnectorRequest = req;
 
         let hs = self.handshaker.clone();
+        let trace = hs.restart_trace();
         let connected_addr = ConnectedAddr::new_outbound_direct(addr);
         let addr_label = hs.addr_label(&connected_addr);
         let connector_span = info_span!(
@@ -101,7 +102,15 @@ where
         // `zakura_network::init()` implements a connection timeout on this future.
         // Any code outside this future does not have a timeout.
         async move {
-            let tcp_stream = TcpStream::connect(*addr).await?;
+            let mut attempt = trace.dial(addr);
+            let tcp_stream = match TcpStream::connect(*addr).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    attempt.outcome = "tcp_error";
+                    return Err(error.into());
+                }
+            };
+            attempt.phase = "handshake";
             disable_nagle(&tcp_stream);
             let client = hs
                 .oneshot(HandshakeRequest::<TcpStream> {
@@ -109,8 +118,17 @@ where
                     connected_addr,
                     connection_tracker,
                 })
-                .await?;
-            Ok((addr, client))
+                .await;
+            match client {
+                Ok(client) => {
+                    attempt.outcome = "connected";
+                    Ok((addr, client))
+                }
+                Err(error) => {
+                    attempt.outcome = "handshake_error";
+                    Err(error)
+                }
+            }
         }
         .instrument(connector_span)
         .boxed()

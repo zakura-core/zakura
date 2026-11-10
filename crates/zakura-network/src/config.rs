@@ -507,6 +507,14 @@ impl Config {
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> HashSet<PeerSocketAddr> {
+        self.initial_peers_with_trace(&crate::legacy_trace::LegacyPeerTrace::default())
+            .await
+    }
+
+    pub(crate) async fn initial_peers_with_trace(
+        &self,
+        trace: &crate::legacy_trace::LegacyPeerTrace,
+    ) -> HashSet<PeerSocketAddr> {
         // TODO: do DNS and disk in parallel if startup speed becomes important
         let dns_peers = Config::resolve_peers(
             &self.initial_peer_hostnames().iter().cloned().collect(),
@@ -514,6 +522,13 @@ impl Config {
         )
         .await;
 
+        for addr in &dns_peers {
+            trace.event(
+                "startup_candidate",
+                Some(*addr),
+                || serde_json::json!({"source": "seed"}),
+            );
+        }
         if self.network.is_regtest() {
             // Only return local peer addresses and skip loading the peer cache on Regtest.
             dns_peers
@@ -522,7 +537,16 @@ impl Config {
                 .collect()
         } else {
             // Ignore disk errors because the cache is optional and the method already logs them.
-            let disk_peers = self.load_peer_cache().await.unwrap_or_default();
+            let loaded = self.load_peer_cache().await;
+            trace.event("cache_load", None, || serde_json::json!({"success": loaded.is_ok(), "count": loaded.as_ref().map_or(0, |peers| peers.len())}));
+            let disk_peers = loaded.unwrap_or_default();
+            for addr in &disk_peers {
+                trace.event(
+                    "startup_candidate",
+                    Some(*addr),
+                    || serde_json::json!({"source": "cache"}),
+                );
+            }
 
             dns_peers.into_iter().chain(disk_peers).collect()
         }

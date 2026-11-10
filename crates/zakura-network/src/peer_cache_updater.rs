@@ -19,6 +19,7 @@ use crate::{
 pub async fn peer_cache_updater(
     config: Config,
     address_book: Arc<Mutex<AddressBook>>,
+    trace: crate::legacy_trace::LegacyPeerTrace,
 ) -> Result<(), BoxError> {
     // Wait until we've queried DNS and (hopefully) sent peers to the address book.
     // Ideally we'd wait for at least one peer crawl, but that makes tests very slow.
@@ -32,13 +33,44 @@ pub async fn peer_cache_updater(
     loop {
         // Ignore errors because updating the cache is optional.
         // Errors are already logged by the functions we're calling.
-        wrote_cache |= update_peer_cache_once(&config, &address_book)
-            .await
-            .unwrap_or(false);
+        if trace.enabled() {
+            let eligible = cacheable_peers(&address_book);
+            trace.event(
+                "cache_eligible",
+                None,
+                || serde_json::json!({"count": eligible.len()}),
+            );
+            for peer in eligible {
+                trace.event("cache_candidate", Some(peer.addr), || {
+                    serde_json::json!({
+                        "rtt_seconds": peer.rtt().map(|rtt| rtt.as_secs_f64()),
+                    })
+                });
+            }
+        }
+        let result = update_peer_cache_once(&config, &address_book).await;
+        trace.event("cache_update", None, || {
+            serde_json::json!({
+                "success": result.is_ok(), "updated": result.as_ref().copied().unwrap_or(false),
+            })
+        });
+        wrote_cache |= result.unwrap_or(false);
 
         // Right after a cold start, the address book can still be empty at the first attempt,
         // and the cache is only written once there are cacheable peers. Retry soon until the
         // first write, so the cache exists shortly after the node finds its first peers.
+        if trace.enabled() {
+            if let Ok(peers) = config.load_peer_cache().await {
+                trace.event(
+                    "cache_snapshot",
+                    None,
+                    || serde_json::json!({"count": peers.len()}),
+                );
+                for peer in peers {
+                    trace.event("cache_entry", Some(peer), || serde_json::json!({}));
+                }
+            }
+        }
         let interval = if wrote_cache {
             PEER_DISK_CACHE_UPDATE_INTERVAL
         } else {

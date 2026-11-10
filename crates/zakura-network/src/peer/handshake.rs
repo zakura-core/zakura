@@ -161,6 +161,14 @@ where
     S::Future: Send,
     C: ChainTip + Clone + Send + 'static,
 {
+    /// Returns the shared opt-in diagnostic writer for legacy connections.
+    pub(crate) fn restart_trace(&self) -> crate::legacy_trace::LegacyPeerTrace {
+        self.peer_registry
+            .as_ref()
+            .map(|registry| registry.trace.clone())
+            .unwrap_or_default()
+    }
+
     /// Returns a connection address label using this handshake's configured privacy policy.
     pub(crate) fn addr_label(&self, connected_addr: &ConnectedAddr) -> String {
         connected_addr.addr_label(self.config.expose_peer_addresses)
@@ -1716,6 +1724,10 @@ where
                     .await;
             }
 
+            let restart_trace = peer_registry
+                .as_ref()
+                .map(|registry| registry.trace.clone())
+                .unwrap_or_default();
             let (peer_registry_guard, peer_registry_updater) = peer_registry
                 .as_ref()
                 .and_then(|registry| {
@@ -1828,6 +1840,14 @@ where
                     .instrument(span)
                 })
                 .then(move |msg| {
+                    if let (Ok(Message::Inv(items)), Some(addr)) = (&msg, connected_addr.diagnostic_remote_addr()) {
+                        if let [InventoryHash::Block(hash)] = items.as_slice() {
+                            restart_trace.event("block_announcement", Some(addr), || serde_json::json!({
+                                "hash": hash.to_string(), "inbound": connected_addr.is_inbound(),
+                            }));
+                            metrics::counter!("peer.restart.block_announcements", "direction" => if connected_addr.is_inbound() { "inbound" } else { "outbound" }).increment(1);
+                        }
+                    }
                     let inbound_inv_collector = inbound_inv_collector.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
                     register_inventory_status(msg, connected_addr, inbound_inv_collector)

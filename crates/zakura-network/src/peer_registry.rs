@@ -53,6 +53,7 @@ impl ConnectedPeer {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PeerRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    pub(crate) trace: crate::legacy_trace::LegacyPeerTrace,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +71,13 @@ enum ConnectionKey {
 }
 
 impl PeerRegistry {
+    pub(crate) fn with_trace(trace: crate::legacy_trace::LegacyPeerTrace) -> Self {
+        Self {
+            trace,
+            ..Self::default()
+        }
+    }
+
     /// Return a point-in-time snapshot of active connections.
     pub(crate) fn connected_peers(&self) -> Vec<ConnectedPeer> {
         let mut connected_peers: Vec<_> = self
@@ -105,6 +113,14 @@ impl PeerRegistry {
             .checked_add(1)
             .expect("legacy connection generation cannot overflow in one process");
         let key = ConnectionKey::Legacy(generation);
+        self.trace
+            .event("connected", Some(connected_peer.addr), || {
+                serde_json::json!({
+                    "connection": generation, "inbound": connected_peer.is_inbound,
+                    "advertised_height": connected_peer.start_height.0,
+                })
+            });
+        metrics::counter!("peer.restart.connected", "direction" => if connected_peer.is_inbound { "inbound" } else { "outbound" }).increment(1);
         state.active_connections.insert(key.clone(), connected_peer);
         drop(state);
 
@@ -112,6 +128,7 @@ impl PeerRegistry {
             PeerRegistryGuard {
                 registry: self.clone(),
                 key: key.clone(),
+                started: Instant::now(),
             },
             PeerRegistryUpdater {
                 registry: self.clone(),
@@ -246,6 +263,10 @@ impl PeerRegistryUpdater {
     pub(crate) fn record_response(&self, rtt: Duration) {
         self.registry
             .update_connection(&self.key, |connected_peer| {
+                self.registry.trace.event("rtt", Some(connected_peer.addr), || serde_json::json!({
+                    "inbound": connected_peer.is_inbound, "rtt_seconds": rtt.as_secs_f64(),
+                }));
+                metrics::histogram!("peer.restart.rtt_seconds", "direction" => if connected_peer.is_inbound { "inbound" } else { "outbound" }).record(rtt.as_secs_f64());
                 connected_peer.rtt = Some(rtt);
                 connected_peer.ping_sent_at = None;
             });
@@ -257,10 +278,18 @@ impl PeerRegistryUpdater {
 pub(crate) struct PeerRegistryGuard {
     registry: PeerRegistry,
     key: ConnectionKey,
+    started: Instant,
 }
 
 impl Drop for PeerRegistryGuard {
     fn drop(&mut self) {
+        self.registry.update_connection(&self.key, |peer| {
+            self.registry.trace.event("disconnected", Some(peer.addr), || serde_json::json!({
+                "inbound": peer.is_inbound, "age_seconds": self.started.elapsed().as_secs_f64(),
+                "reason": "connection_task_ended",
+            }));
+            metrics::counter!("peer.restart.disconnected", "direction" => if peer.is_inbound { "inbound" } else { "outbound" }).increment(1);
+        });
         self.registry.remove_connection(&self.key);
     }
 }

@@ -261,7 +261,8 @@ where
     // TCP and compatibility ingress reach the backend through clones of this one
     // service, so its load-shedding buffer is their shared admission.
     let inbound_for_zakura_sink = inbound_service.clone();
-    let peer_registry = PeerRegistry::default();
+    let restart_trace = crate::legacy_trace::LegacyPeerTrace::new(&config);
+    let peer_registry = PeerRegistry::with_trace(restart_trace.clone());
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
         &config,
         move |supervisor, trace| {
@@ -399,7 +400,8 @@ where
     let (peer_set, block_advertiser) = super::driver::spawn(peer_set, shutdown);
 
     // Start the peer disk cache updater
-    let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
+    let peer_cache_updater_fut =
+        peer_cache_updater(config.clone(), address_book.clone(), restart_trace.clone());
     let peer_cache_updater_guard = tokio::spawn(erased(peer_cache_updater_fut.in_current_span()));
 
     // Abort startup tasks if this initialization future is dropped before handoff.
@@ -431,6 +433,7 @@ where
             outbound_connector.clone(),
             peerset_tx.clone(),
             address_book_updater.clone(),
+            restart_trace.clone(),
         );
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
@@ -582,6 +585,7 @@ async fn add_initial_peers<S>(
     outbound_connector: S,
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    restart_trace: crate::legacy_trace::LegacyPeerTrace,
 ) -> Result<ActiveConnectionCounter, BoxError>
 where
     S: Service<
@@ -593,7 +597,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+    let initial_peers = limit_initial_peers(&config, address_book_updater, &restart_trace).await;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -633,6 +637,7 @@ where
                 connection_tracker,
             };
             let outbound_connector = outbound_connector.clone();
+            let restart_trace = restart_trace.clone();
 
             // Spawn a new task to make the outbound connection.
             tokio::spawn(erased(
@@ -647,6 +652,11 @@ where
 
                     // As soon as we create the connector future,
                     // the handshake starts running as a spawned task.
+                    restart_trace.event(
+                        "startup_dial",
+                        Some(addr),
+                        || serde_json::json!({"position": i}),
+                    );
                     outbound_connector
                         .oneshot(req)
                         .map_err(move |e| (addr, e))
@@ -734,8 +744,9 @@ where
 async fn limit_initial_peers(
     config: &Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    restart_trace: &crate::legacy_trace::LegacyPeerTrace,
 ) -> HashSet<PeerSocketAddr> {
-    let all_peers: HashSet<PeerSocketAddr> = config.initial_peers().await;
+    let all_peers: HashSet<PeerSocketAddr> = config.initial_peers_with_trace(restart_trace).await;
     let mut preferred_peers: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
 
     let all_peers_count = all_peers.len();

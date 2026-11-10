@@ -162,6 +162,7 @@ mod address_book_updater;
 mod inbound_resources;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
+mod legacy_trace;
 mod meta_addr;
 mod peer;
 mod peer_cache_updater;

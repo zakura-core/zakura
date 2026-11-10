@@ -307,7 +307,6 @@
   {
     "patch": "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch",
     "entry": "block-sync-table",
-    "table": "block-sync/s6v3",
     "property": "block-sync/s6v3/block/receiver-work-authorized",
     "witness": {
       "test": "the_stale_request_body_input_holds_receiver_work_authorized",
@@ -318,7 +317,6 @@
   {
     "patch": "submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch",
     "entry": "block-sync-table",
-    "table": "block-sync/s6v3",
     "property": "block-sync/s6v3/block/receiver-work-authorized",
     "witness": {
       "test": "old_chain_bodies_after_a_reset_hold_receiver_work_authorized",
@@ -678,5 +676,25 @@
       "test_target": "discovery_wire_witness"
     },
     "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "discovery-table/wants-every-service/wants-every-service.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/services/sender-within-owed",
+    "witness": {
+      "test": "answers_within_their_requests_hold_sender_within_owed",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "discovery-table/wants-unnamed-services/wants-unnamed-services.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/services/sender-within-owed",
+    "witness": {
+      "test": "answers_within_their_requests_hold_sender_within_owed",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
   }
 ]

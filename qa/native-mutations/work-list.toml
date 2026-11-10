@@ -282,6 +282,7 @@ witnesses = [
     { test = "get_services_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
     { test = "services_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
     { test = "conformant_controls_hold_conformant_never_closes", test_target = "discovery_wire_witness" },
+    { test = "answers_within_their_requests_hold_sender_within_owed", test_target = "discovery_wire_witness" },
 ]
 
 # discovery/late-response-admitted is the discovery table's entry's too

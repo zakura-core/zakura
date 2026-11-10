@@ -195,3 +195,58 @@ fn the_work_list_covers_every_active_id_once() {
         }
     }
 }
+
+/// The loop's retained cases, relative to the repository root.
+const CASES: &str = "qa/native-mutations/cases.json";
+
+/// Panics unless `witness`, a work-list or `cases.json` witness, names
+/// something that exists: a `test` names a function in its
+/// `crates/zakura-sim/tests/<test_target>.rs`, and a `planted` or `input`
+/// names a file.
+fn check_witness(owner: &str, witness: &serde_json::Value) {
+    let field = |name: &str| witness.get(name).and_then(serde_json::Value::as_str);
+    if let Some(test) = field("test") {
+        let target = field("test_target")
+            .unwrap_or_else(|| panic!("{owner}: test {test} names no test_target"));
+        let file = root().join(format!("crates/zakura-sim/tests/{target}.rs"));
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{owner}: {}: {error}", file.display()));
+        assert!(
+            source.contains(&format!("fn {test}(")),
+            "{owner}: {} has no test {test}",
+            file.display()
+        );
+    } else {
+        let path = field("planted")
+            .or_else(|| field("input"))
+            .unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
+        assert!(root().join(path).is_file(), "{owner}: {path} doesn't exist");
+    }
+}
+
+/// Every witness the work list and `cases.json` name exists, so a renamed
+/// test or moved input fails here and not as a remote run's
+/// `baseline-fails`.
+#[test]
+fn every_named_witness_exists() {
+    let as_json = |value: &toml::Value| serde_json::to_value(value).unwrap();
+    for entry in work_list().entry {
+        let witnesses = entry
+            .instance
+            .iter()
+            .map(|instance| &instance.witness)
+            .chain(entry.tables.iter().map(|table| &table.witness))
+            .chain(&entry.witnesses);
+        for witness in witnesses {
+            check_witness(&entry.id, &as_json(witness));
+        }
+    }
+    let text = fs::read_to_string(root().join(CASES)).unwrap();
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("{CASES}: {error}"));
+    for case in &cases {
+        if let Some(witness) = case.get("witness") {
+            check_witness(case["patch"].as_str().unwrap_or(CASES), witness);
+        }
+    }
+}

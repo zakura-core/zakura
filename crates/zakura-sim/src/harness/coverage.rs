@@ -857,7 +857,11 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/sender-within-owed",
         OWED_ANSWERS,
-        Bypass::Planted("ignore-peers-limit"),
+        Bypass::Pending(
+            "every simulated peer binds an RFC 1918 address, which `is_sample_eligible` refuses, \
+             so the node answers every GetPeers with no records and no limit bug can reach this \
+             check yet",
+        ),
     ),
     discovery(
         "discovery/s4v2/services/sender-within-owed",

@@ -503,27 +503,10 @@ pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
     }
 }
 
-/// The peers of `peers/sender-within-owed`'s scenario: the one that asks for
-/// one record, and two the node dials, so the node's book holds more records
-/// than that request asks for.
-pub const OWED_PEERS: usize = 3;
-
-/// The honest exchange with `peers` peers. The first dials the node and
-/// also sends `request` once. The node holds each other peer as a static
-/// candidate and dials it, which confirms that peer's record, so its book
-/// can sample the record for another peer's `GetPeers`.
-///
-/// # Panics
-///
-/// If `peers` is zero.
-pub fn asking_scenario(request: Request, peers: usize) -> WireScenario {
-    assert!(peers > 0, "a peer sends the request");
+/// The honest exchange, with the peer sending `request` once.
+pub fn asking_scenario(request: Request) -> WireScenario {
     let mut scenario = WireScenario::default();
-    scenario.node.static_candidates = (1..peers).collect();
     scenario.peers[0].script.push(PeerAction::Ask { request });
-    scenario
-        .peers
-        .extend((1..peers).map(|_| discovering(PeerSpec::listening(), DiscoveryScript::default())));
     scenario
 }
 
@@ -641,10 +624,15 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
             }
         }
         Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
-        Template::SenderWithinLimit
-        | Template::SenderEndsOnce
-        | Template::SenderWithinOwed
-        | Template::SenderCadence => SENT_TRIGGERS.get(row()?).copied(),
+        Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
+            SENT_TRIGGERS.get(row()?).copied()
+        }
+        // Every simulated peer binds an RFC 1918 address, which the book's
+        // sampler refuses, so the node's `Peers` answers carry no records,
+        // and `peers/sender-within-owed` stays a `Draft`.
+        Template::SenderWithinOwed if id.row == Some(DiscoveryRow::Services.name()) => {
+            SENT_TRIGGERS.get(row()?).copied()
+        }
         _ => None,
     }
 }

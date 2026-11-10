@@ -19,7 +19,6 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, has_planted_case, DiscoveryWire, WireScenario, FAMILY,
-            OWED_PEERS,
         },
         Subsystem,
     },
@@ -44,9 +43,9 @@ enum Scenario {
     /// The honest exchange, with the peer holding `answer` past the node's
     /// exchange wait.
     Held(Answer),
-    /// The honest exchange with this many peers, the first sending
-    /// `request` once ([`asking_scenario`]).
-    Asks(Request, usize),
+    /// The honest exchange, with the peer sending `request` once
+    /// ([`asking_scenario`]).
+    Asks(Request),
 }
 
 impl Scenario {
@@ -68,7 +67,7 @@ impl Scenario {
                     });
                 scenario
             }
-            Scenario::Asks(request, peers) => asking_scenario(request, peers),
+            Scenario::Asks(request) => asking_scenario(request),
         }
     }
 }
@@ -159,7 +158,7 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
         (
             "peers/sender-ends-once",
             "answer-peers-twice",
-            Scenario::Asks(Request::GetPeers, 1),
+            Scenario::Asks(Request::GetPeers),
         ),
         (
             "get-services/sender-within-limit",
@@ -174,17 +173,12 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
         (
             "services/sender-ends-once",
             "answer-services-twice",
-            Scenario::Asks(Request::GetServices, 1),
-        ),
-        (
-            "peers/sender-within-owed",
-            "ignore-peers-limit",
-            Scenario::Asks(Request::GetOnePeer, OWED_PEERS),
+            Scenario::Asks(Request::GetServices),
         ),
         (
             "services/sender-within-owed",
             "ignore-wanted-services",
-            Scenario::Asks(Request::GetHeaderSyncService, 1),
+            Scenario::Asks(Request::GetHeaderSyncService),
         ),
     ]
 }

@@ -1,0 +1,9 @@
+# The committed fuzz input `sync-wire-stalled-blocks.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `stalled-blocks` scenario, and
+# `sync-wire-stalled-blocks.end.json` is its pinned end record.
+harness = "sync/wire"
+generator = 1
+sha256 = "c2ce72fcaccf106e961feedac534ff8e74f196b818a0a02d608b5b781c3750d5"
+scenario_sha256 = "8c5b080183a005a2a3734fa3e4c42cc8f422d1396074a0c1cbd70323fd5ff508"
+source = "crates/zakura-sim/tests/sync_wire.rs"

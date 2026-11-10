@@ -25,10 +25,11 @@ use zakura_sim::{
     domain::session::REPLACEMENT_PRESERVES_AUTHORIZATION,
     harness::{
         run_prepared,
-        sync::SyncPorts,
+        sync::{self, SyncPorts},
         sync_wire::{SavedWire, SyncWire},
         HarnessError, Subsystem,
     },
+    observe::{StorageFact, StorageRequest},
     seed, MemorySink, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -147,6 +148,52 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
             "{:?}",
             outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION)
         );
+    }
+}
+
+/// #2094's first case on the shared connection: every mirror's block-sync
+/// range read stalls for [`STALL_MS`](zakura_sim::harness::sync_wire::STALL_MS),
+/// so block sync's sessions hold requests outstanding, while header sync's
+/// and discovery's sessions share their connections. Header sync still
+/// applies the mirrors' tip before storage takes the node's first body, no
+/// connection closes, and both tips reach the mirrors' tip once the reads
+/// complete.
+#[test]
+fn a_stalled_block_session_starves_no_other_service() {
+    let committed = Plan::from_fuzz(&[]);
+    for input in std::iter::once(committed).chain(inputs(2, 256)) {
+        let (report, _, ports) = run(SavedWire::StalledBlocks, input);
+        let tip = ports.mirror_tip();
+        assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
+        let tip_hash = sync::hashes(&ports.chain)[&tip.height.0].clone();
+        let mut tip_applied = None;
+        let mut first_body = None;
+        for entry in report.log.entries() {
+            let Observation::Storage { fact, .. } = &entry.obs else {
+                continue;
+            };
+            match fact {
+                StorageFact::Submitted {
+                    request: StorageRequest::ApplyHeaderTarget { target, .. },
+                    ..
+                } if *target == tip_hash => {
+                    tip_applied.get_or_insert(entry.step);
+                }
+                StorageFact::BlockSubmitted { .. } => {
+                    first_body.get_or_insert(entry.step);
+                }
+                _ => {}
+            }
+        }
+        let (Some(tip_applied), Some(first_body)) = (tip_applied, first_body) else {
+            panic!("{tip_applied:?}, {first_body:?}: {:?}", report.end);
+        };
+        assert!(tip_applied < first_body, "{tip_applied} {first_body}");
+        let sessions = sessions(&report.log);
+        for (peer, connections) in &sessions {
+            assert_eq!(connections.len(), 1, "{peer}: {connections:?}");
+            assert_eq!(connections[0].1, every_service(), "{peer}");
+        }
     }
 }
 

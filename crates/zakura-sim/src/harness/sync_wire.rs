@@ -30,7 +30,10 @@ use zakura_quic::{sim::SeededInputs, NodeAddr};
 use zakura_rt::sync::watch;
 
 use super::{
-    block_node::LateHandle,
+    block_node::{
+        policy::{self as block_policy, Trigger},
+        LateHandle,
+    },
     header_sync::Dialer,
     sync::{
         spawn_actors, sync_config, sync_properties, Control, QuicLinks, SyncAction, SyncMirror,
@@ -376,20 +379,35 @@ pub enum SavedWire {
     /// open a session on the replacement while the other mirror's
     /// connection stays up.
     Replace,
+    /// [`SavedWire::Honest`], with every mirror's block-sync range read
+    /// held for [`STALL_MS`]. Block sync's sessions stall with requests
+    /// outstanding, while header sync and discovery share their
+    /// connections.
+    StalledBlocks,
 }
+
+/// How long [`SavedWire::StalledBlocks`] holds each mirror read, in
+/// milliseconds of virtual time: under block sync's 8-second request
+/// timeout, so the stalled requests complete rather than time out.
+pub const STALL_MS: u64 = 5_000;
 
 /// The first byte of a saved scenario's tag.
 const TAG: u8 = 0xFC;
 
 impl SavedWire {
     /// Every saved scenario, in tag order.
-    pub const ALL: [SavedWire; 2] = [SavedWire::Honest, SavedWire::Replace];
+    pub const ALL: [SavedWire; 3] = [
+        SavedWire::Honest,
+        SavedWire::Replace,
+        SavedWire::StalledBlocks,
+    ];
 
     /// The fixture's name, `sync-wire-<name>.bin`.
     pub fn name(self) -> &'static str {
         match self {
             SavedWire::Honest => "honest",
             SavedWire::Replace => "replace",
+            SavedWire::StalledBlocks => "stalled-blocks",
         }
     }
 
@@ -416,7 +434,7 @@ impl SavedWire {
     /// `[[witness]]` entries.
     pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            SavedWire::Honest => &[],
+            SavedWire::Honest | SavedWire::StalledBlocks => &[],
             SavedWire::Replace => &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")],
         }
     }
@@ -450,6 +468,22 @@ impl SavedWire {
                 }],
                 ..sync
             },
+            SavedWire::StalledBlocks => {
+                let mut block_policy = sync.block_policy.clone();
+                block_policy.holds.push(block_policy::Hold {
+                    select: block_policy::Select {
+                        kind: Some(block_policy::BlockKind::MirrorRead),
+                        ..block_policy::Select::default()
+                    },
+                    until: Trigger::VirtualTime(STALL_MS),
+                    then: vec![block_policy::BlockAllow::Serve],
+                    deadline_ms: None,
+                });
+                SyncScenario {
+                    block_policy,
+                    ..sync
+                }
+            }
         };
         SyncWireScenario {
             net: NetScenario::default(),

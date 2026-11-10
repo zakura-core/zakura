@@ -35,9 +35,9 @@ use super::{
         ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
-    rows::{NativeClass, HEADER_HARNESSES},
+    rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
-    NARROWING, NATIVE_MUTATIONS, REQUIRED_CONTRACTS,
+    NARROWING, REQUIRED_CONTRACTS,
 };
 use crate::harness::coverage::{Bypass, COVERAGE};
 
@@ -1224,15 +1224,7 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
     let registered = super::registered();
     let needs = super::needs();
     let planted = planted_cases(repo);
-    let retired: BTreeSet<&str> = NATIVE_MUTATIONS
-        .iter()
-        .filter(|m| matches!(m.class, NativeClass::Retired { .. }))
-        .map(|m| m.patch)
-        .collect();
-    let native: Vec<String> = native_dirs(repo)
-        .into_iter()
-        .filter(|dir| !retired.contains(dir.as_str()))
-        .collect();
+    let native = native_dirs(repo);
     let coverage = coverage_tests();
     let planted_harnesses: BTreeMap<(String, String), String> = planted
         .iter()

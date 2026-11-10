@@ -44,8 +44,8 @@ pub struct Inventories<'a> {
     /// ([`planted_harness`](super::planted_harness)) apart from the rows.
     /// A case with no readable harness counts as a node case.
     pub planted_harnesses: &'a BTreeMap<(String, String), String>,
-    /// Every directory under `qa/native-mutations/header-sync/`, less the
-    /// retired ones.
+    /// Every directory under `qa/native-mutations/header-sync/`, retired
+    /// ones included.
     pub native: &'a [String],
     /// Every `(file, test, property)` `COVERAGE` names for a header row,
     /// all in the `zakura-sim` package.

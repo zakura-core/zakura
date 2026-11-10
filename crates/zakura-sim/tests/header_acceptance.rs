@@ -363,15 +363,7 @@ fn committed_required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
     let registered = header_acceptance::registered();
     let needs = header_acceptance::needs();
     let planted = planted_cases();
-    let retired: BTreeSet<&str> = NATIVE_MUTATIONS
-        .iter()
-        .filter(|m| matches!(m.class, NativeClass::Retired { .. }))
-        .map(|m| m.patch)
-        .collect();
-    let native: Vec<String> = native_dirs()
-        .into_iter()
-        .filter(|dir| !retired.contains(dir.as_str()))
-        .collect();
+    let native = native_dirs();
     let coverage = coverage_triples();
     let contracts = header_acceptance::contract_table();
     let planted_harnesses: BTreeMap<(String, String), String> = planted
@@ -851,6 +843,28 @@ fn every_required_key_is_covered_once_with_its_gates() {
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
             *until = Some("hdr-14.6");
         }
+    });
+    // The retired mutation's Open with another reason, or a ToMove's Open,
+    // isn't its own.
+    refused(&|m| {
+        let at = covering(
+            m,
+            &Key::Native {
+                patch: "readmission-unchecked".into(),
+            },
+        );
+        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
+            *reason = "covered by a zakura-network unit test";
+        }
+    });
+    refused(&|m| {
+        let at = covering(
+            m,
+            &Key::Native {
+                patch: "readmission-unchecked".into(),
+            },
+        );
+        m.expected[at].expected = rows::native_open("hdr-14.7b");
     });
 }
 
@@ -1817,10 +1831,25 @@ fn every_native_mutation_is_classified() {
             match (class, &result.expected) {
                 (NativeClass::Integrity { .. }, Expected::IntegrityCaught { .. })
                 | (NativeClass::ToMove { .. }, Expected::Open { until: Some(_), .. }) => {}
+                (
+                    NativeClass::Retired { .. },
+                    Expected::Open {
+                        until: Some("hdr-14.7b"),
+                        ..
+                    },
+                ) => {}
                 (class, expected) => panic!("{patch}: {class:?} as {:?}", expected.kind()),
             }
         }
     }
+    // A retired mutation stays a required key, blocked by its transitional
+    // Open until its witness runs.
+    assert_eq!(
+        committed_required(&manifest).get(&Key::Native {
+            patch: "readmission-unchecked".into(),
+        }),
+        Some(&BTreeSet::from([Gate::G6]))
+    );
     // A mutation whose directory and classification are both removed is
     // refused, since the inventory still names it.
     let dropped: Vec<rows::NativeMutation> = NATIVE_MUTATIONS

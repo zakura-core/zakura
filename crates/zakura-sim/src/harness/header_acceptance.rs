@@ -754,8 +754,15 @@ impl Key {
             (Key::Native { patch }, Expected::Open { .. }) => {
                 NATIVE_MUTATIONS.iter().any(|mutation| {
                     mutation.patch == patch
-                        && matches!(mutation.class, NativeClass::ToMove { until, .. }
-                        if same_open(expected, &rows::native_open(until)))
+                        && match mutation.class {
+                            NativeClass::ToMove { until, .. } => {
+                                same_open(expected, &rows::native_open(until))
+                            }
+                            NativeClass::Retired { .. } => {
+                                same_open(expected, &rows::retired_open())
+                            }
+                            _ => false,
+                        }
                 })
             }
             (Key::NarrowingTest { entry }, Expected::Open { .. }) => {

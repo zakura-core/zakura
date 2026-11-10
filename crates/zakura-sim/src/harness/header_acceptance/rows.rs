@@ -640,6 +640,19 @@ pub fn native_open(until: &'static str) -> Expected {
     )
 }
 
+/// A retired native mutation's transitional `Open`: its witness is a test
+/// outside the simulator, which the runner doesn't run yet, so its key
+/// blocks until hdr-14.7b runs it unpatched, patched (with the required
+/// failure its README names) and restored.
+pub fn retired_open() -> Expected {
+    transitional(
+        "a retired native mutation's witness runs outside the simulator, which the runner can't \
+         run yet",
+        "the acceptance runner",
+        "hdr-14.7b",
+    )
+}
+
 /// `key`'s expected result with the gates `gates`: the transitional `Open`
 /// [`owed_open`] writes for it.
 fn owed(key: Key, gates: &[Gate]) -> ExpectedResult {
@@ -1673,7 +1686,8 @@ pub fn native_results() -> Vec<ExpectedResult> {
                     diagnostic,
                     not_applicable,
                 },
-                NativeClass::Retired { .. } | NativeClass::Moved { .. } => return None,
+                NativeClass::Retired { .. } => retired_open(),
+                NativeClass::Moved { .. } => return None,
             };
             Some(result(key, &[Gate::G6], expected))
         })

@@ -654,6 +654,7 @@ fn serving_and_lifecycle_follow_the_admitted_header_peers() {
         // (inbound, outbound, admitted connections, header peers)
         (256, 256, 16, 16),
         (256, 256, 200, 200),
+        (256, 256, 512, 512),
         (6, 6, 92, 12),
     ];
     for (inbound, outbound, connections, peers) in cases {

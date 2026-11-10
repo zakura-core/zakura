@@ -99,6 +99,7 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         Some(anchor),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     );
     startup.header_chain_port = Arc::new(InertHeaderChainPort);
     startup.shutdown = shutdown;

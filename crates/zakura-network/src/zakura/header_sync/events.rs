@@ -51,8 +51,7 @@ pub struct HeaderSyncStartup {
     pub max_frame_bytes: u32,
     /// The most connections the node admits at once, which caps how many
     /// header-sync peers it can hold. It sizes header serving, the lifecycle
-    /// queue and the per-identity state that outlives a session. Defaults to
-    /// [`DEFAULT_ZAKURA_MAX_CONNECTIONS`](crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS).
+    /// queue and the per-identity state that outlives a session.
     pub max_connections: usize,
     /// Per-request timeout.
     pub request_timeout: Duration,
@@ -70,7 +69,9 @@ pub struct HeaderSyncStartup {
 }
 
 impl HeaderSyncStartup {
-    /// Build startup configuration from durable state facts.
+    /// Build startup configuration from durable state facts, for a node that
+    /// admits `max_connections` at once. Pass the same count `config` was
+    /// derived for with [`ZakuraHeaderSyncConfig::for_node_connections`].
     pub fn new(
         network: Network,
         anchor: (block::Height, block::Hash),
@@ -78,6 +79,7 @@ impl HeaderSyncStartup {
         best_header_tip: Option<(block::Height, block::Hash)>,
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
+        max_connections: usize,
     ) -> Self {
         let status_refresh_interval = config.effective_status_refresh_interval();
         Self {
@@ -97,7 +99,7 @@ impl HeaderSyncStartup {
             port_dispatch: PortDispatch::External,
             config,
             max_frame_bytes,
-            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            max_connections,
             request_timeout: Duration::from_secs(30),
             status_refresh_interval,
             trace: ZakuraTrace::noop(),

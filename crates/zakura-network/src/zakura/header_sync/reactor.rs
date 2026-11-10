@@ -657,7 +657,11 @@ impl HeaderSyncReactor {
     }
 
     /// Handles the storage completions that are ready now, then reads both
-    /// watches, so a deadline checked afterward can't win over a ready result.
+    /// watches, so a deadline checked afterward can't win over a result that
+    /// was ready when the turn started. Of the inputs that become ready while
+    /// the turn handles its events, only the VCT local operation and the
+    /// repair watch are checked again before deadlines, by
+    /// [`Self::run_due_maintenance`]. The rest wait for the next turn.
     ///
     /// The VCT local operation, whose deadline is fatal, is polled directly,
     /// so its result never waits on the shared ready queue. See

@@ -30,7 +30,7 @@ use zakura_chain::{
 use zakura_consensus::transaction as tx;
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
-use zakura_test::mock_service::{MockService, PanicAssertion};
+use zakura_test::mock_service::{MockService, PanicAssertion, ResponseSender};
 
 use crate::components::{
     mempool::{self, *},
@@ -2806,6 +2806,198 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
+
+    Ok(())
+}
+
+/// Checks that a chain tip reset re-verifies every stored transaction, including those beyond
+/// the inbound download cap, and stores only the transactions that pass against the new tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reset_reverifies_every_stored_transaction() -> Result<(), Report> {
+    use crate::components::mempool::downloads::MAX_INBOUND_CONCURRENCY;
+
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _changes,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
+    )
+    .await?;
+    mempool.dummy_call().await;
+
+    // Fill the mempool past the inbound download cap, with one parent/child pair.
+    let independent_count = u64::try_from(MAX_INBOUND_CONCURRENCY)? + 100;
+    for index in 0..independent_count {
+        mempool.storage().insert(
+            expiry_fixture_transaction(index, Height(100), None),
+            Vec::new(),
+            Some(Height(1)),
+        )?;
+    }
+    let parent = expiry_fixture_transaction(independent_count, Height(100), None);
+    let parent_id = parent.transaction.id();
+    let parent_outpoint = OutPoint::from_usize(parent_id.mined_id(), 0);
+    let child = expiry_fixture_transaction(0, Height(100), Some(parent_outpoint));
+    let child_id = child.transaction.id();
+    mempool
+        .storage()
+        .insert(parent, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(child, vec![parent_outpoint], Some(Height(1)))?;
+
+    // The verifier rejects this transaction, as if the new chain spent its input.
+    let conflicting_id = expiry_fixture_transaction(1, Height(100), None)
+        .transaction
+        .id();
+    let mut expected_ids: HashSet<_> = mempool.storage().tx_ids().collect();
+    expected_ids.remove(&conflicting_id);
+
+    // Commit two blocks before the mempool polls, so it sees skipped blocks and resets.
+    for block in [
+        &zakura_test::vectors::BLOCK_MAINNET_2_BYTES,
+        &zakura_test::vectors::BLOCK_MAINNET_3_BYTES,
+    ] {
+        timeout(
+            CHAIN_TIP_UPDATE_WAIT_LIMIT,
+            commit_block_and_wait_for_tip_change(
+                &mut state_service,
+                &mut chain_tip_change,
+                block.zcash_deserialize_into()?,
+            ),
+        )
+        .await?;
+    }
+    mempool.dummy_call().await;
+
+    assert_eq!(mempool.storage().transaction_count(), 0);
+    assert_eq!(
+        mempool.tx_downloads().in_flight(),
+        MAX_INBOUND_CONCURRENCY,
+        "reset retries fill the inbound cap and wait for free slots"
+    );
+
+    // Verify every retry. Like the real verifier's `AwaitOutput`, the child's verification
+    // finishes only after its parent is stored.
+    let respond = |responder: ResponseSender<tx::Request, tx::Response, TransactionError>,
+                   spent_mempool_outpoints| {
+        let transaction = responder
+            .request()
+            .mempool_transaction()
+            .expect("the mempool only sends mempool requests");
+        let transaction =
+            VerifiedUnminedTx::new(transaction, Amount::new(10_000), 0, 0, Arc::new(Vec::new()))
+                .expect("fixture fee covers its conventional fee");
+        responder.respond(transaction::Response::Mempool {
+            transaction,
+            spent_mempool_outpoints,
+        });
+    };
+    let mut child_verification = None;
+    timeout(Duration::from_secs(60), async {
+        while mempool.storage().transaction_count() < expected_ids.len() {
+            let Some(responder) = tx_verifier.try_next_request().await else {
+                // Handle the finished verifications, which frees slots for waiting retries.
+                mempool.dummy_call().await;
+                if mempool
+                    .storage()
+                    .contains_transaction_exact(&parent_id.mined_id())
+                {
+                    if let Some(responder) = child_verification.take() {
+                        respond(responder, vec![parent_outpoint]);
+                    }
+                }
+                continue;
+            };
+            let tx_id = responder.request().tx_id();
+            if tx_id == conflicting_id {
+                responder.respond_error(TransactionError::TransparentInputNotFound);
+            } else if tx_id == child_id {
+                child_verification = Some(responder);
+            } else {
+                respond(responder, Vec::new());
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(
+        mempool.storage().tx_ids().collect::<HashSet<_>>(),
+        expected_ids
+    );
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
+
+    Ok(())
+}
+
+/// Checks that reset retries list each stored transaction after the stored transactions it
+/// spends outputs from.
+#[tokio::test]
+async fn mempool_reset_retries_parents_before_children() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _changes,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    // Insert many three-generation chains, so a hash-ordered list would misplace some.
+    const CHAINS: u64 = 20;
+    let mut chains = Vec::new();
+    for chain in 0..CHAINS {
+        let mut generations = Vec::new();
+        let mut input = None;
+        for generation in 0..3 {
+            let tx = expiry_fixture_transaction(chain * 3 + generation, Height(100), input);
+            let tx_id = tx.transaction.id();
+            mempool
+                .storage()
+                .insert(tx, input.into_iter().collect(), Some(Height(0)))?;
+            generations.push(tx_id);
+            input = Some(OutPoint::from_usize(tx_id.mined_id(), 0));
+        }
+        chains.push(generations);
+    }
+
+    let retry_ids: Vec<_> = mempool
+        .active_state
+        .transaction_retry_requests()
+        .into_iter()
+        .map(|(tx, _source)| tx.id())
+        .collect();
+    assert_eq!(retry_ids.len(), chains.len() * 3);
+    for generations in chains {
+        let positions: Vec<_> = generations
+            .iter()
+            .map(|tx_id| {
+                retry_ids
+                    .iter()
+                    .position(|retry_id| retry_id == tx_id)
+                    .expect("every stored transaction is retried")
+            })
+            .collect();
+        assert!(
+            positions.is_sorted(),
+            "parents must come before children: {positions:?}"
+        );
+    }
 
     Ok(())
 }

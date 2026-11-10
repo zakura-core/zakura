@@ -33,7 +33,7 @@
 //! [`Mempool`]: super::Mempool
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -281,6 +281,15 @@ where
     /// has it as the third tuple element. Enforces
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`]. See `GHSA-4fc2-h7jh-287c`.
     pending_per_peer: HashMap<QueueSource, usize>,
+
+    /// Transactions waiting for a slot to be verified again after a chain tip reset,
+    /// in the order the mempool queued them.
+    ///
+    /// They take each freed slot before new downloads, so verification stays under
+    /// [`MAX_INBOUND_CONCURRENCY`] and no new transaction is queued while they wait.
+    /// A later reset re-queues the same transactions, so the mempool's storage limits
+    /// and [`MAX_INBOUND_CONCURRENCY`] bound this queue.
+    reset_retries: VecDeque<(Gossip, Option<QueueSource>)>,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -308,7 +317,11 @@ where
         (UnminedTxId, tokio::time::error::Elapsed),
     >;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // Fill the slots that earlier results freed. The caller handles each result
+        // before it polls again, so it can re-queue that transaction in the freed slot.
+        self.start_reset_retries();
+
         let mut this = self.project();
 
         // Results arrive on their own channel; the handles only propagate panics.
@@ -425,6 +438,7 @@ where
             in_flight: 0,
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
+            reset_retries: VecDeque::new(),
         }
     }
 
@@ -444,17 +458,32 @@ where
         self.queue(gossiped_tx, source, rsp_tx, false)
     }
 
-    /// Queue a transaction that was pending before a chain tip reset for
-    /// download (if needed) and verification.
+    /// Queue transactions that were stored or pending before a chain tip reset for
+    /// download (if needed) and verification, in order.
     ///
-    /// A failure can still ban `source`, but it does not start a cooldown,
+    /// Each one starts when a slot is free, before any new download can take that slot.
+    ///
+    /// A failure can still ban a source, but it does not start a cooldown,
     /// because the peer relayed the transaction before the reset.
     pub fn retry_after_tip_reset(
         &mut self,
-        gossiped_tx: Gossip,
-        source: Option<QueueSource>,
-    ) -> Result<(), MempoolError> {
-        self.queue(gossiped_tx, source, None, true)
+        retries: impl IntoIterator<Item = (Gossip, Option<QueueSource>)>,
+    ) {
+        self.reset_retries.extend(retries);
+        self.start_reset_retries();
+    }
+
+    /// Starts queued reset retries until every slot is busy or none are left.
+    fn start_reset_retries(&mut self) {
+        while self.in_flight < MAX_INBOUND_CONCURRENCY {
+            let Some((gossiped_tx, source)) = self.reset_retries.pop_front() else {
+                break;
+            };
+
+            // The slot is free, so an error means the transaction is already queued,
+            // or its source peer is at its own cap.
+            let _result = self.queue(gossiped_tx, source, None, true);
+        }
     }
 
     #[instrument(
@@ -789,6 +818,7 @@ where
             let _ = cancel_tx.send(CancelDownloadAndVerify);
         }
         self.pending_per_peer.clear();
+        self.reset_retries.clear();
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
         metrics::gauge!("mempool.currently.queued.transactions",).set(self.in_flight as f64);
@@ -811,11 +841,13 @@ where
         self.in_flight
     }
 
-    /// Get a list of the currently pending transaction requests.
+    /// Get a list of the currently pending transaction requests, including reset retries
+    /// that are waiting for a slot.
     pub fn transaction_requests(&self) -> impl Iterator<Item = (&Gossip, &Option<QueueSource>)> {
         self.cancel_handles
             .iter()
             .map(|(_tx_id, (_handle, tx, source))| (tx, source))
+            .chain(self.reset_retries.iter().map(|(tx, source)| (tx, source)))
     }
 
     /// Reject transactions that exceed the configured serialized size limit.
@@ -968,6 +1000,30 @@ mod tests {
             .transaction_requests()
             .any(|(tx, retry_source)| tx.id() == transaction.id()
                 && retry_source.as_ref() == Some(&source)));
+    }
+
+    /// Reset retries beyond the inbound cap wait for a slot instead of being dropped, and
+    /// they stay retryable while they wait.
+    #[tokio::test]
+    async fn reset_retries_wait_for_a_slot() {
+        let mut downloads = pending_downloads();
+        let retries = MAX_INBOUND_CONCURRENCY + 10;
+        downloads.retry_after_tip_reset((0..retries).map(|index| {
+            (
+                Gossip::Id(tx_id(u64::try_from(index).expect("test index fits u64"))),
+                None,
+            )
+        }));
+
+        assert_eq!(downloads.in_flight(), MAX_INBOUND_CONCURRENCY);
+        assert_eq!(downloads.transaction_requests().count(), retries);
+        assert!(matches!(
+            downloads.download_if_needed_and_verify(Gossip::Id(tx_id(u64::MAX)), None, None),
+            Err(MempoolError::FullQueue)
+        ));
+
+        downloads.cancel_all();
+        assert_eq!(downloads.transaction_requests().count(), 0);
     }
 
     #[tokio::test]
@@ -1531,11 +1587,13 @@ mod tests {
             peer_addr.remove_socket_addr_privacy(),
         ));
         if retried {
-            downloads.retry_after_tip_reset(gossip, source)
+            downloads.retry_after_tip_reset([(gossip, source)]);
         } else {
-            downloads.download_if_needed_and_verify(gossip, source, None)
+            downloads
+                .download_if_needed_and_verify(gossip, source, None)
+                .expect("download is queued");
         }
-        .expect("download is queued");
+        assert_eq!(downloads.in_flight(), 1, "download is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
             .await

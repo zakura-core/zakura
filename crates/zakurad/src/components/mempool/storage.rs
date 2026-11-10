@@ -818,6 +818,29 @@ impl Storage {
         self.verified.transaction_dependencies()
     }
 
+    /// Returns the verified transactions, each after the mempool transactions it spends
+    /// outputs from.
+    pub fn transactions_parents_first(&self) -> Vec<&VerifiedUnminedTx> {
+        /// Returns the number of generations of mempool parents above `tx_id`.
+        ///
+        /// The package limit keeps this at most [`MAX_MEMPOOL_ANCESTORS`], and dependencies
+        /// are acyclic, so the recursion is shallow.
+        fn depth(dependencies: &HashMap<Hash, HashSet<Hash>>, tx_id: &Hash) -> usize {
+            dependencies.get(tx_id).map_or(0, |parents| {
+                1 + parents
+                    .iter()
+                    .map(|parent| depth(dependencies, parent))
+                    .max()
+                    .unwrap_or(0)
+            })
+        }
+
+        let dependencies = self.transaction_dependencies().dependencies();
+        let mut transactions: Vec<_> = self.transactions().values().collect();
+        transactions.sort_by_cached_key(|tx| depth(dependencies, &tx.transaction.id().mined_id()));
+        transactions
+    }
+
     /// Returns a [`transparent::Output`] created by a mempool transaction for the provided
     /// [`transparent::OutPoint`] if one exists, or None otherwise.
     pub fn created_output(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Output> {

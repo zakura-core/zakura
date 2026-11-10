@@ -543,6 +543,9 @@ impl ActiveState {
     }
 
     /// Returns a list of requests that will retry every stored and pending transaction.
+    ///
+    /// Stored transactions come first, each after the stored transactions it spends outputs
+    /// from, so no child holds a verification slot while its parent waits for one.
     fn transaction_retry_requests(&self) -> Vec<(Gossip, Option<QueueSource>)> {
         match self {
             ActiveState::Disabled => Vec::new(),
@@ -554,8 +557,8 @@ impl ActiveState {
                 let mut transactions = Vec::new();
 
                 let storage = storage
-                    .transactions()
-                    .values()
+                    .transactions_parents_first()
+                    .into_iter()
                     .map(|tx| (tx.transaction.clone().into(), None));
                 transactions.extend(storage);
 
@@ -913,11 +916,7 @@ impl Service<Request> for Mempool {
                     "re-verifying mempool transactions after a chain fork"
                 );
 
-                for (tx, source) in tx_retries {
-                    // This is just an efficiency optimisation, so we don't care if queueing
-                    // transaction requests fails.
-                    let _result = tx_downloads.retry_after_tip_reset(tx, source);
-                }
+                tx_downloads.retry_after_tip_reset(tx_retries);
             }
 
             return Poll::Ready(Ok(()));

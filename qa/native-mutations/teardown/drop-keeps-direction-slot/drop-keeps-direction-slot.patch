@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/session_capacity.rs b/crates/zakura-network/src/zakura/regulation/session_capacity.rs
+index 9f7633ad0c..7f64feea1b 100644
+--- a/crates/zakura-network/src/zakura/regulation/session_capacity.rs
++++ b/crates/zakura-network/src/zakura/regulation/session_capacity.rs
+@@ -226,7 +226,8 @@ impl Drop for SessionReservation {
+         {
+             self.setting_up.decrement(1.0);
+         }
+-        self.session.take();
++        // Mutation: the last owner's drop keeps the direction slot.
++        std::mem::forget(self.session.take());
+         self.reserved.decrement(1.0);
+         self.changed.send_replace(());
+     }

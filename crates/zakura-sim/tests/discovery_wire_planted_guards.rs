@@ -17,13 +17,12 @@ use std::{
 
 use zakura_sim::{
     harness::{
-        discovery_service::{act_scenario, has_planted_case, DiscoveryWire, WireScenario, FAMILY},
+        discovery_service::{
+            act_scenario, asking_scenario, has_planted_case, DiscoveryWire, WireScenario, FAMILY,
+        },
         Subsystem,
     },
-    peer::{
-        discovery::{Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, Hold, Request},
-        PeerAction,
-    },
+    peer::discovery::{Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, Hold, Request},
 };
 
 /// The harness every case runs on.
@@ -44,7 +43,8 @@ enum Scenario {
     /// The honest exchange, with the peer holding `answer` past the node's
     /// exchange wait.
     Held(Answer),
-    /// The honest exchange, with the peer sending `request` once.
+    /// The honest exchange, with the peer sending `request` once
+    /// ([`asking_scenario`]).
     Asks(Request),
 }
 
@@ -67,11 +67,7 @@ impl Scenario {
                     });
                 scenario
             }
-            Scenario::Asks(request) => {
-                let mut scenario = WireScenario::default();
-                scenario.peers[0].script.push(PeerAction::Ask { request });
-                scenario
-            }
+            Scenario::Asks(request) => asking_scenario(request),
         }
     }
 }
@@ -178,6 +174,11 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             "services/sender-ends-once",
             "answer-services-twice",
             Scenario::Asks(Request::GetServices),
+        ),
+        (
+            "services/sender-within-owed",
+            "ignore-wanted-services",
+            Scenario::Asks(Request::GetHeaderSyncService),
         ),
     ]
 }

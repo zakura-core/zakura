@@ -53,7 +53,9 @@ use crate::{
     model::Label,
     observe::StreamId,
     peer::{
-        discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
+        discovery::{
+            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold, Request,
+        },
         key_index,
         limit::ADVERSARY_RATE,
         peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
@@ -63,7 +65,7 @@ use crate::{
         Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status,
         TriggerHistory,
     },
-    table::{sender_properties, table_properties, GeneratedId, Template},
+    table::{sender_owed_properties, sender_properties, table_properties, GeneratedId, Template},
     Observation, ObservationLog, RunConfig, Sim,
 };
 
@@ -501,6 +503,13 @@ pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
     }
 }
 
+/// The honest exchange, with the peer sending `request` once.
+pub fn asking_scenario(request: Request) -> WireScenario {
+    let mut scenario = WireScenario::default();
+    scenario.peers[0].script.push(PeerAction::Ask { request });
+    scenario
+}
+
 /// The family discovery's generated property IDs name.
 pub const FAMILY: &str = "discovery";
 
@@ -515,7 +524,9 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, then its sender properties, 7 IDs. An ID is a
+/// properties, 31 IDs, then its sender properties, 7 IDs, then the
+/// `sender-within-owed` IDs of `peers` and `services`
+/// ([`sender_owed_properties`]). An ID is a
 /// `Draft` until its planted case lands. An ID with a planted case checks
 /// that case's trigger history ([`planted_trigger`]). An ID no planted case
 /// violates alone, one of [`SCRIPTED`], is `Active` with the scripted
@@ -541,6 +552,7 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         });
     receiver
         .chain(sender_properties(FAMILY, &STREAMS))
+        .chain(sender_owed_properties(FAMILY, &STREAMS))
         .map(|property| match planted_trigger(property.id.as_str()) {
             Some(trigger) => Property {
                 witness: Some(TriggerHistory::Log(trigger)),
@@ -613,6 +625,12 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
         }
         Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
         Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
+            SENT_TRIGGERS.get(row()?).copied()
+        }
+        // Every simulated peer binds an RFC 1918 address, which the book's
+        // sampler refuses, so the node's `Peers` answers carry no records,
+        // and `peers/sender-within-owed` stays a `Draft`.
+        Template::SenderWithinOwed if id.row == Some(DiscoveryRow::Services.name()) => {
             SENT_TRIGGERS.get(row()?).copied()
         }
         _ => None,

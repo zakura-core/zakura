@@ -1,0 +1,18 @@
+# The committed fuzz input `block-sync-floor-lane-race.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its two
+# first bytes, `ff 03`, pick the paused-handoffs scenario. The rest is Plan
+# bytes from a seeded random search on the remote host (mut-7.4), the first
+# whose run violated `block-sync/reserved-byte-bound` with
+# `qa/native-mutations/bounds/wide-floor-lane` applied: a routine probes the
+# floor's next height, another routine takes it first, and the first
+# routine's floor take starts above it. The unpatched node refuses that take
+# for capacity, and the property holds.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "876f40c8b9848f9613966885b8dc06df3f41230eecd9ec4ac0450930b9a1693b"
+scenario_sha256 = "8abd7a09c01523ab203ddbe8afc41b79dc6ecda28a47194f288ad4b4e524a682"
+source = "crates/zakura-sim/tests/block_resource_properties.rs"
+
+[[witness]]
+property = "block-sync/reserved-byte-bound"
+expect = "holds"

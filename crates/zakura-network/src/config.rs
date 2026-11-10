@@ -35,11 +35,12 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        DEFAULT_ADVERT_WINDOW_FULL_BLOCK, DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
-        DEFAULT_ADVERT_WINDOW_SMALL_BLOCK, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
-        DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
-        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        DEFAULT_ADVERT_DELAY, DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES, DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        DEFAULT_MAX_CONNS_PER_IP, DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT,
+        INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR,
+        OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
@@ -413,28 +414,23 @@ pub struct Config {
     /// Experimental.
     pub advert_window_full_size_bytes: u64,
 
-    /// The delay before announcing small blocks to peers outside the initial group.
+    /// The delay before announcing a block to peers outside the initial group.
     ///
-    /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
-    /// Each broadcast measures this delay once from its start, independently of peer requests
-    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
+    /// The block size sets the initial group's size, not this delay. Each broadcast measures the
+    /// delay once from its start, independently of peer requests and uploads. Zero announces to
+    /// every peer immediately. Defaults to 500 ms.
     ///
-    /// Experimental.
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    pub advert_delay_min: Duration,
-
-    /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
-    ///
-    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
-    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
-    /// concurrent body writes.
-    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
-    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// Delaying inventory can reduce redundant requests but does not bound concurrent body
+    /// writes. The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget
+    /// with peer discovery and delivery tracking. A delay that exhausts that budget can prevent
     /// announcements to the remaining peers.
     ///
+    /// The previous name `advert_delay_max` still loads, and applies only when `advert_delay`
+    /// is unset. The previous `advert_delay_min` is ignored.
+    ///
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    pub advert_delay_max: Duration,
+    pub advert_delay: Duration,
 }
 
 impl Config {
@@ -1047,8 +1043,7 @@ impl Default for Config {
             advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
-            advert_delay_min: Duration::ZERO,
-            advert_delay_max: Duration::ZERO,
+            advert_delay: DEFAULT_ADVERT_DELAY,
         }
     }
 }
@@ -1257,10 +1252,25 @@ struct DConfig {
     advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    advert_delay_min: Duration,
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    advert_delay_max: Duration,
+    /// `None` if the config does not set it, so the delay falls back to `advert_delay_max`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
+    )]
+    advert_delay: Option<Duration>,
+    /// The previous name of `advert_delay`, used only when `advert_delay` is unset.
+    ///
+    /// Not a serde alias: the node loader merges sources by key name, so an old file key plus
+    /// an `advert_delay` environment override would otherwise fail as a duplicate field.
+    #[serde(
+        skip_serializing,
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
+    )]
+    advert_delay_max: Option<Duration>,
+    /// Ignored. Versions before the single `advert_delay` interpolated the delay from this value
+    /// for small blocks.
+    #[serde(skip_serializing)]
+    advert_delay_min: Option<de::IgnoredAny>,
 }
 
 impl Default for DConfig {
@@ -1289,8 +1299,9 @@ impl Default for DConfig {
             advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
-            advert_delay_min: config.advert_delay_min,
-            advert_delay_max: config.advert_delay_max,
+            advert_delay: None,
+            advert_delay_max: None,
+            advert_delay_min: None,
         }
     }
 }
@@ -1365,8 +1376,7 @@ impl From<Config> for DConfig {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
-            advert_delay_max,
+            advert_delay,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1413,8 +1423,9 @@ impl From<Config> for DConfig {
             advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
-            advert_delay_max,
+            advert_delay: Some(advert_delay),
+            advert_delay_max: None,
+            advert_delay_min: None,
         }
     }
 }
@@ -1447,11 +1458,15 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
+            advert_delay,
             advert_delay_max,
+            advert_delay_min: _,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let advert_delay = advert_delay
+            .or(advert_delay_max)
+            .unwrap_or(DEFAULT_ADVERT_DELAY);
         let (advert_window_full_block, advert_window_small_block) =
             resolve_advert_windows(advert_window_full_block, advert_window_small_block);
         validate_advert_fanout(
@@ -1459,8 +1474,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
-            advert_delay_max,
+            advert_delay,
         )
         .map_err(de::Error::custom)?;
 
@@ -1609,8 +1623,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
-            advert_delay_max,
+            advert_delay,
         })
     }
 }
@@ -1640,8 +1653,7 @@ fn validate_advert_fanout(
     advert_window_small_block: usize,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
-    advert_delay_min: Duration,
-    advert_delay_max: Duration,
+    advert_delay: Duration,
 ) -> Result<(), String> {
     if advert_window_full_block == 0 || advert_window_full_block > advert_window_small_block {
         return Err(format!(
@@ -1656,14 +1668,11 @@ fn validate_advert_fanout(
              got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
         ));
     }
-    if advert_delay_min > advert_delay_max {
-        return Err("advert_delay_min must not exceed advert_delay_max".to_owned());
-    }
     if std::time::Instant::now()
-        .checked_add(advert_delay_max)
+        .checked_add(advert_delay)
         .is_none()
     {
-        return Err("advert_delay_max exceeds the monotonic clock range".to_owned());
+        return Err("advert_delay exceeds the monotonic clock range".to_owned());
     }
     Ok(())
 }

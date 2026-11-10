@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/serving.rs b/crates/zakura-network/src/zakura/discovery/serving.rs
+index f4b8a0a77d..7ebd71cc57 100644
+--- a/crates/zakura-network/src/zakura/discovery/serving.rs
++++ b/crates/zakura-network/src/zakura/discovery/serving.rs
+@@ -269,7 +269,9 @@ impl ServiceReporter {
+             }
+         }
+ 
+-        if query.wants(&ZakuraServiceId::discovery()) {
++        // Planted bypass: discovery reports its summary whatever the query
++        // wants.
++        if true {
+             let summary = self.handle.local_discovery_summary().await;
+             summaries.push(ServiceSummaryEnvelope::discovery(&summary)?);
+         }

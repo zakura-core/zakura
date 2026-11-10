@@ -55,6 +55,7 @@ fn broken_by(template: Template) -> Option<Label> {
     match template {
         Template::SenderWithinLimit => Some(Label::OverMargin),
         Template::SenderAnswersOpen | Template::SenderEndsOnce => Some(Label::Unsolicited),
+        Template::SenderWithinOwed => Some(Label::OverOwed),
         Template::SenderWithinLive => Some(Label::OverLive),
         Template::SenderWithinCredit => Some(Label::OverCredit),
         _ => None,

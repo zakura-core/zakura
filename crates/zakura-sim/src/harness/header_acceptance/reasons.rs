@@ -296,7 +296,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/table.rs",
         function: "check_never_closes",
-        fingerprint: "41f4c3cfb98aafa4",
+        fingerprint: "595a51c68b4af91b",
         constructions: &[
             step(
                 "no frame of the ID's stream that it applies to was judged at this step",

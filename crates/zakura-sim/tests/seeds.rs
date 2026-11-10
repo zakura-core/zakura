@@ -162,10 +162,14 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         }),
         "block-sync-handoff" => value(BlockScenario::default()),
         "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),
-        "block-sync-paused-handoffs" => value(BlockScenario::paused_handoffs()),
+        "block-sync-paused-handoffs" | "block-sync-floor-lane-race" => {
+            value(BlockScenario::paused_handoffs())
+        }
         "block-sync-above-window" => value(BlockScenario::above_window()),
         "block-sync-peers-leave" => value(BlockScenario::peers_leave()),
-        "block-sync-reset-mid-flight" => value(BlockScenario::reset_mid_flight()),
+        "block-sync-reset-mid-flight" | "block-sync-stale-request-body" => {
+            value(BlockScenario::reset_mid_flight())
+        }
         "block-sync-stale-beside-current" => value(BlockScenario::stale_beside_current()),
         "block-sync-stalled-reset" => value(BlockScenario::stalled_reset()),
         "block-sync-decoded-input-stall" => value(BlockScenario::decoded_input_stall()),

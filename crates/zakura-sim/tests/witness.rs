@@ -43,6 +43,27 @@ fn discovery_wait_complete_lost_wakeup() {
     );
 }
 
+/// The byte of [`INPUT`] that picks the sink's first step of the final
+/// mark. Each later byte picks between the sink and the source, and 1 picks
+/// the source.
+const FINAL_MARK_STARTS: usize = 147;
+
+/// S4.7's sink side: [`INPUT`] up to the sink's first step of the final
+/// mark, then four picks of the source. The source's check lands while the
+/// final mark is half done. The sink records before it notifies, so the
+/// check passes. A sink that notifies first strands the source: its check
+/// fails, and its next `Notified` comes after the last notify.
+#[test]
+fn discovery_wait_complete_check_inside_final_mark() {
+    let mut input = INPUT[..=FINAL_MARK_STARTS].to_vec();
+    input.extend([1; 4]);
+    check_witness(
+        lost_wakeup(Plan::from_fuzz(&input)),
+        WAIT_COMPLETE_WAKES,
+        Expect::Holds,
+    );
+}
+
 /// The fixed code holds, so a test that expects the violation fails.
 #[test]
 fn violated_witness_fails_while_fixed() {

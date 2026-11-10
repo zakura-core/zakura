@@ -210,6 +210,11 @@ pub enum Request {
     GetPeers,
     /// `GetServices` for every service.
     GetServices,
+    /// `GetPeers` for one record.
+    GetOnePeer,
+    /// `GetServices` for header sync alone, which a node without header
+    /// sync answers with no summary.
+    GetHeaderSyncService,
 }
 
 impl Request {
@@ -218,6 +223,8 @@ impl Request {
         match self {
             Request::GetPeers => "get-peers",
             Request::GetServices => "get-services",
+            Request::GetOnePeer => "get-one-peer",
+            Request::GetHeaderSyncService => "get-header-sync-service",
         }
     }
 }
@@ -283,6 +290,55 @@ impl DiscoveryFrame {
 fn peers_cap(peers: &zakura_network::zakura::MessageRule, limit: u16) -> u64 {
     let bytes = peers.payload.min() + usize::from(limit) * MAX_NODE_RECORD_BYTES;
     u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// What a peer's discovery request asked for, which bounds the node's
+/// answer: a `GetPeers` at most its limit's records, and a `GetServices`
+/// only summaries of the services it names, or of any service when it names
+/// none (the discovery specification's `GetPeers` and `GetServices`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// A `GetPeers` with this limit.
+    Peers {
+        /// The most records the answer may carry.
+        limit: u16,
+    },
+    /// A `GetServices` naming these services.
+    Services {
+        /// The services whose summaries the answer may carry. Empty asks
+        /// for every service.
+        wanted: Vec<ZakuraServiceId>,
+    },
+}
+
+impl Asked {
+    /// What `message` asks for, if it's a request.
+    pub(crate) fn of(message: &DiscoveryMessage) -> Option<Self> {
+        match message {
+            DiscoveryMessage::GetPeers(query) => Some(Asked::Peers { limit: query.limit }),
+            DiscoveryMessage::GetServices(query) => Some(Asked::Services {
+                wanted: query.wanted_services.clone(),
+            }),
+            DiscoveryMessage::Hello { .. }
+            | DiscoveryMessage::Peers { .. }
+            | DiscoveryMessage::Services(_) => None,
+        }
+    }
+
+    /// Whether `answer` carries only what was asked. An answer of another
+    /// row breaks another rule, so it passes here.
+    pub(crate) fn admits(&self, answer: &DiscoveryMessage) -> bool {
+        match (self, answer) {
+            (Asked::Peers { limit }, DiscoveryMessage::Peers { records }) => {
+                records.len() <= usize::from(*limit)
+            }
+            (Asked::Services { wanted }, DiscoveryMessage::Services(services)) => services
+                .summaries
+                .iter()
+                .all(|summary| wanted.is_empty() || wanted.contains(&summary.service_id)),
+            _ => true,
+        }
+    }
 }
 
 /// One discovery stream's role models and the answers it holds.
@@ -664,6 +720,7 @@ impl DiscoveryPeer {
                 // A frame's payload is under its stream's frame cap.
                 payload: header.payload_len as u64,
                 prepares: None,
+                asks: own_row.then(|| Asked::of(&frame.message)).flatten(),
             }],
         }
     }
@@ -680,27 +737,32 @@ fn answer_of(message: &DiscoveryMessage) -> Option<Answer> {
 }
 
 impl Request {
-    /// The request's message: `GetPeers` for the most records a response
-    /// may carry, or `GetServices` for every service.
+    /// The request's message, as each variant names it.
     fn message(self) -> DiscoveryMessage {
-        match self {
-            Request::GetPeers => DiscoveryMessage::GetPeers(GetPeers {
-                limit: u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
-                    .expect("the wire limit fits u16"),
+        let get_peers = |limit| {
+            DiscoveryMessage::GetPeers(GetPeers {
+                limit,
                 wanted_services: Vec::new(),
                 exclude_node_ids: Vec::new(),
-            }),
-            Request::GetServices => DiscoveryMessage::GetServices(GetServices {
-                wanted_services: Vec::new(),
-            }),
+            })
+        };
+        let get_services =
+            |wanted_services| DiscoveryMessage::GetServices(GetServices { wanted_services });
+        match self {
+            Request::GetPeers => get_peers(
+                u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE).expect("the wire limit fits u16"),
+            ),
+            Request::GetOnePeer => get_peers(1),
+            Request::GetServices => get_services(Vec::new()),
+            Request::GetHeaderSyncService => get_services(vec![ZakuraServiceId::header_sync()]),
         }
     }
 
     /// The request's message type.
     fn message_type(self) -> u16 {
         u16::from(match self {
-            Request::GetPeers => MSG_DISCOVERY_GET_PEERS,
-            Request::GetServices => MSG_DISCOVERY_GET_SERVICES,
+            Request::GetPeers | Request::GetOnePeer => MSG_DISCOVERY_GET_PEERS,
+            Request::GetServices | Request::GetHeaderSyncService => MSG_DISCOVERY_GET_SERVICES,
         })
     }
 }

@@ -32,6 +32,15 @@
 //! through the contract it needs. The record's three lists, verified,
 //! excluded and blocked, are by obligation key.
 //!
+//! # Trust
+//!
+//! Run acceptance only on a reviewed commit, on a dedicated host. The
+//! subject's build and tests run with the runner's full user access, as
+//! `cargo build` and `cargo test` do. The runner is not a sandbox for
+//! untrusted code: it catches honest defects and honest tools, and a
+//! subject, host toolchain or environment hostile to the run is out of
+//! model.
+//!
 //! # The record invariant
 //!
 //! `<out>/record.json` exists only if the last run to start fully

@@ -142,7 +142,7 @@ def minimum_release(
 ) -> tuple[str, CoreVersion, list[str]]:
     categories = sorted(entries)
     combined = "\n".join(body for bodies in entries.values() for body in bodies)
-    patch_waiver = patch_waiver_reason(entries)
+    patch_waiver = release_patch_waiver(base, target, entries)
 
     # Later candidates and the stable release keep the core chosen by the
     # first candidate. New entries during the candidate cycle are folded into
@@ -180,6 +180,19 @@ def minimum_release(
     return level, minimum, categories
 
 
+def release_patch_waiver(
+    base: Version, target: Version, entries: dict[str, list[str]]
+) -> str | None:
+    """Apply the approved node-only exception for the stable v1.8.6 release."""
+    if base == parse_version("1.8.5") and target == parse_version("1.8.6"):
+        return (
+            "The release owner approved v1.8.6 as a patch, including the documented "
+            "removal of historical treestate commands from default builds and unused "
+            "Sprout library types. Library crates retain independent SemVer bumps."
+        )
+    return patch_waiver_reason(entries)
+
+
 def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict[str, object]:
     if not release_tag.startswith("v"):
         raise ReadinessError("release tag must start with 'v'")
@@ -193,7 +206,7 @@ def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict
         "minimum_level": level,
         "minimum_version": str(minimum),
         "categories": categories,
-        "patch_waiver_reason": patch_waiver_reason(entries),
+        "patch_waiver_reason": release_patch_waiver(base, target, entries),
         "changelog": context,
     }
 
@@ -255,6 +268,30 @@ def height_report(
 
 
 class SelfTests(unittest.TestCase):
+    def test_approved_stable_patch_allows_documented_removals(self) -> None:
+        level, minimum, _ = minimum_release(
+            parse_version("1.8.5"),
+            parse_version("1.8.6"),
+            {"Removed": ["- Removed debug commands from default builds."]},
+        )
+        self.assertEqual((level, str(minimum)), ("patch", "1.8.6"))
+
+    def test_patch_exception_does_not_apply_to_other_releases(self) -> None:
+        for base, target in (("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"), ("1.8.6", "1.8.7")):
+            with self.subTest(base=base, target=target):
+                with self.assertRaisesRegex(ReadinessError, "minor floor"):
+                    minimum_release(
+                        parse_version(base), parse_version(target),
+                        {"Removed": ["- Removed a command."]},
+                    )
+
+    def test_patch_exception_preserves_network_upgrade_floor(self) -> None:
+        with self.assertRaisesRegex(ReadinessError, "major floor"):
+            minimum_release(
+                parse_version("1.8.5"), parse_version("1.8.6"),
+                {"Added": ["- Added the Mainnet Network Upgrade."]},
+            )
+
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

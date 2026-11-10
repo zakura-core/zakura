@@ -232,6 +232,8 @@ fn calls_parsed_as_sent_match_their_conversion() {
         Some("-1"),
         Some("1.5"),
         Some("1e2"),
+        Some("1e400"),
+        Some("-1e400"),
         Some(r#""x""#),
         Some(r#""\u0041""#),
         Some(r#""""#),
@@ -320,6 +322,29 @@ fn calls_parsed_as_sent_match_their_conversion() {
         "Bitcoind notification",
     ] {
         assert!(parsed.contains_key(expected), "no {expected}: {parsed:?}");
+    }
+}
+
+/// Legacy requests with unrepresentable numeric IDs retain their parse-error responses.
+#[test]
+fn legacy_overflow_ids_keep_parse_errors() {
+    for version in ["", r#""jsonrpc":"1.0","#] {
+        for id in ["1e400", "-1e400"] {
+            for params in ["[]", r#"["00ff",{"workid":"ab"}]"#] {
+                let request =
+                    format!(r#"{{{version}"method":"submitblock","id":{id},"params":{params}}}"#);
+                let (version, body) = converted(&request);
+                assert_eq!(version, JsonRpcVersion::Unknown, "{request}");
+                let Body::Error(response) = Body::parse(&body, true, 1) else {
+                    panic!("{request} must return an error, not become a notification");
+                };
+                assert_eq!(
+                    response_from_json_rpc_2(version, response.into_json()),
+                    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#,
+                    "{request}",
+                );
+            }
+        }
     }
 }
 

@@ -367,6 +367,15 @@ fn parse_call_as_sent(body: &[u8]) -> Option<(JsonRpcVersion, Body<'_>)> {
             method: call.method,
             params,
         }),
+        Some(Err(_))
+            if call.id.is_some_and(|id| {
+                serde_json::from_str::<serde_json::Number>(id.get()).is_err()
+            }) =>
+        {
+            // Conversion rejects unrepresentable numbers. Preserve that error path without
+            // parsing ordinary call IDs twice.
+            return None;
+        }
         None | Some(Err(_)) => Body::Notification(Notification {
             jsonrpc: TwoPointZero,
             method: call.method,

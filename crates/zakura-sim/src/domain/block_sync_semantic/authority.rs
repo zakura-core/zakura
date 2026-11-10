@@ -53,9 +53,9 @@ pub struct AuthorityModel {
     /// The authority of the reactor's latest `AuthorityChanged`, or its
     /// startup's.
     adopted: Option<BodyAuthority>,
-    /// Whether the reactor reported a transition yet. Before its first one,
-    /// its startup's authority is unobserved, so no adoption is judged.
-    reported_state: bool,
+    /// The authority of the committed view the reactor read at spawn, where
+    /// the harness hands it over.
+    startup: Option<BodyAuthority>,
     /// The verified tip the reactor's latest transition reported.
     verified_tip: u32,
     /// The work queue's taken items, by its latest snapshot.
@@ -89,6 +89,9 @@ pub struct AuthorityModel {
     /// Whether a reply reached the reactor under an authority other than
     /// the adopted one.
     pub saw_retired_reply: bool,
+    /// Whether the engine's newest view's authority differed from the
+    /// reactor's startup authority, so the reactor had a view to adopt.
+    pub saw_engine_move: bool,
     /// Whether the reactor adopted a new body-work epoch while an owner held
     /// body work from an older one.
     pub saw_epoch_change_with_work: bool,
@@ -102,12 +105,12 @@ impl AuthorityModel {
                 self.verified_tip = state.verified_tip;
                 // A node started on a committed view adopts its authority at
                 // startup, with no `AuthorityChanged`. No transition but
-                // `AuthorityChanged` changes the authority, so the first
-                // state reports the startup's.
+                // `AuthorityChanged` changes the authority, so where the
+                // harness didn't hand over the startup authority, the first
+                // state reports it.
                 if self.adopted.is_none() {
                     self.adopted.clone_from(&state.scope);
                 }
-                self.reported_state = true;
                 self.transition(step, transition);
             }
             BlockSyncFact::WorkQueue { items } => {
@@ -210,10 +213,23 @@ impl AuthorityModel {
         }
     }
 
+    /// Records the body-work authority of the committed view the reactor
+    /// read at spawn, `BodyWorkAuthority::for_view` of the engine's view
+    /// then, as the reactor's adopted authority. The reactor adopts it with
+    /// no transition, so a reactor that never reports one, as when it drops
+    /// every committed view, is still judged against it.
+    pub fn startup(&mut self, authority: BodyAuthority) {
+        self.adopted = Some(authority.clone());
+        self.startup = Some(authority);
+    }
+
     /// Records the body-work authority of the engine's newest committed
     /// view, or `None` once the node stops and no reactor follows the
     /// engine.
     pub fn engine_view(&mut self, authority: Option<BodyAuthority>) {
+        if self.startup.is_some() && authority.is_some() && authority != self.startup {
+            self.saw_engine_move = true;
+        }
         self.engine = authority;
     }
 
@@ -221,14 +237,8 @@ impl AuthorityModel {
     /// task can run: every committed view the engine published has reached
     /// the reactor, so the authority it adopted is the engine's newest
     /// view's. A reactor that ignores a view would otherwise judge replies
-    /// against an authority the engine already retired. Before the
-    /// reactor's first transition, which reports its startup's authority,
-    /// nothing is judged: a slow link can leave every task waiting before
-    /// any transition.
+    /// against an authority the engine already retired.
     pub(super) fn judge_adoption(&mut self, step: u64) -> Option<Finding> {
-        if !self.reported_state {
-            return None;
-        }
         let engine = self.engine.as_ref()?;
         self.judged += 1;
         if self.adopted.as_ref() == Some(engine) || self.unadopted.as_ref() == Some(engine) {

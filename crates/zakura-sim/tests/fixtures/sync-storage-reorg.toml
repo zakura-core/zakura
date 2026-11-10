@@ -3,7 +3,7 @@
 # first two bytes pick the saved `reorg` scenario, and
 # `sync-storage-reorg.end.json` is its pinned end record.
 harness = "sync/storage"
-generator = 1
+generator = 2
 sha256 = "8fe7e9e07960bc5c4eb4a7332ef3e81f4baf5bb23754e881776d2b76ec5fe2ba"
 scenario_sha256 = "1e0c39c5352f2d8048d7eafbd745cd88c100008f80125e405adaa9f0d8cfda20"
 source = "crates/zakura-sim/tests/sync_harness.rs"

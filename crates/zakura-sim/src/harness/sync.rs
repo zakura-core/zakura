@@ -978,7 +978,7 @@ pub fn sync_config(scenario: &SyncScenario) -> RunConfig {
 
 impl Subsystem for SyncStorage {
     const NAME: &'static str = "sync/storage";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncScenario;
     type Prepared = SyncPorts;
@@ -1196,6 +1196,13 @@ pub(crate) fn spawn_actors(
     )));
     let header_fixture = ports.fixture.headers();
     let dispatch = DispatchFlag::default();
+    // The node's reactor adopts the authority of the engine's view it reads
+    // at spawn, below, with no transition. No task runs before it.
+    view.borrow()
+        .semantic
+        .borrow_mut()
+        .authority
+        .startup(BodyWorkAuthority::for_view(&ports.engine.view()).into());
     let node = SyncNode {
         name: "node".to_owned(),
         header: HeaderNode::spawn(

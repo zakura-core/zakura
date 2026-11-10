@@ -198,7 +198,9 @@ where
             needs: REACTOR_NEEDS,
             status: Status::Active,
             check: check_query_work_authorized::<S>,
-            witness: Some(TriggerHistory::Log(reply_under_retired_authority)),
+            witness: Some(TriggerHistory::View(
+                retired_reply_or_engine_moved::<S::View>,
+            )),
         },
         Property {
             id: PropertyId::new(FRONTIER_WORK_CONSISTENT),
@@ -1404,6 +1406,15 @@ where
 /// newer view reaches it too.
 fn reply_under_retired_authority(log: &ObservationLog) -> bool {
     SemanticModel::of(log).authority.saw_retired_reply || query_outlived_its_generation(log)
+}
+
+/// [`QUERY_WORK_AUTHORIZED`]'s trigger history for either half: a reply
+/// under a retired authority ([`reply_under_retired_authority`]), or, where
+/// the harness runs the engine, an engine view whose authority differs from
+/// the reactor's startup authority. The second reads only the harness's
+/// engine samples, so a reactor that drops every committed view reaches it.
+fn retired_reply_or_engine_moved<V: SemanticView>(view: &V, log: &ObservationLog) -> bool {
+    reply_under_retired_authority(log) || view.semantic().borrow().authority.saw_engine_move
 }
 
 /// Whether a header write left the engine at a newer header generation than

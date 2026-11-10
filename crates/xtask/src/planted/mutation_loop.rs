@@ -53,7 +53,7 @@ use std::{
     process::{Command, Stdio},
     sync::{atomic::Ordering, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -663,6 +663,14 @@ impl Runner {
                     .arg(&slots[0].target)
                     .arg(&slot.target),
             )?;
+            // The copied build-script output watches slot 0's tree, whose
+            // files reset to the pin, so a patch here wouldn't rerun the
+            // script, and the binary would carry the unpatched source digest.
+            // A newer `build.rs` reruns it once against this slot's tree.
+            fs::File::options()
+                .write(true)
+                .open(slot.tree.join("crates/zakura-sim/build.rs"))?
+                .set_modified(SystemTime::now())?;
         }
         let baselines = self.baselines(cases, &runnables, &slots[0], &built, &source)?;
         let mut mutants: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();

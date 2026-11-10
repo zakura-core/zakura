@@ -227,8 +227,9 @@ pub struct Config {
     ///
     /// The peer cache is a list of the addresses of some recently useful peers.
     ///
-    /// Line order preserves RTT preference. For privacy, individual RTT measurements
-    /// and connection timestamps are not stored.
+    /// Line order preserves measured RTT preference; unmeasured peers are shuffled.
+    /// Individual RTT measurements and connection timestamps are not stored, but
+    /// cooperating endpoints can observe their relative startup dial order.
     ///
     /// Deleting or modifying the peer cache can impact your node's:
     /// - reliability: if DNS or the Zcash DNS seeders are unavailable or broken

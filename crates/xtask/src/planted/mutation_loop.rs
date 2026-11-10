@@ -4,8 +4,9 @@
 //! It reads the loop's cases: the entries of
 //! `qa/native-mutations/cases.json` that name a `property`, the cases of a
 //! generated directory's own `cases.json` with `--cases <dir>`, or, with
-//! `--planted <prefix>`, the retained `qa/planted/` cases whose property
-//! starts with the prefix. Each case names a patch, the property the patch
+//! `--planted <prefix>`, the retained `qa/planted/` cases whose path under
+//! `qa/planted/` starts with the prefix. A property ID prefix selects its
+//! cases, and a case's path without `.patch` selects that case alone. Each case names a patch, the property the patch
 //! must violate, and one witness: a planted case's committed input or
 //! typed scenario, a committed fuzz input, or one `zakura-sim` test.
 //!
@@ -447,13 +448,20 @@ fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>,
     }
     let root = repo_root.join(PLANTED_DIR);
     let mut cases = Vec::new();
+    let mut matched = BTreeSet::new();
     for patch in planted_layout::files(&root, "patch")? {
         let Some(property) = planted_layout::property_id(&root, &patch) else {
             continue;
         };
-        if !prefixes.iter().any(|prefix| property.starts_with(prefix)) {
+        let path = relative_label(&root, &patch);
+        if !prefixes.iter().any(|prefix| path.starts_with(prefix)) {
             continue;
         }
+        matched.extend(
+            prefixes
+                .iter()
+                .filter(|prefix| path.starts_with(prefix.as_str())),
+        );
         let case_file = patch.with_extension("toml");
         let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
@@ -469,6 +477,9 @@ fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>,
             table: None,
             also_violates,
         });
+    }
+    if let Some(unmatched) = prefixes.iter().find(|prefix| !matched.contains(prefix)) {
+        return Err(format!("--planted {unmatched} matches no case under {PLANTED_DIR}").into());
     }
     Ok(cases)
 }

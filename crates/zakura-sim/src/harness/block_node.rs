@@ -55,9 +55,9 @@ use zakura_network::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
         BlockRangeRead, BlockRangeReadResult, BlockRangeSource, BlockSyncAction,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, CloseCauseReader,
-        FramedSend, Peer, Service, ServicePeerDirection, StreamReader, ZakuraBlockSyncConfig,
-        ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-        ZAKURA_STREAM_BLOCK_SYNC,
+        FramedSend, Peer, Service, ServicePeerDirection, SessionFull, SessionSlotsProbe,
+        StreamReader, ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
 };
@@ -932,6 +932,17 @@ impl Link {
     }
 }
 
+impl BlockNode {
+    /// A probe of the session slots its service reserves, until a teardown
+    /// drops the service.
+    pub fn session_slots(&self) -> Option<SessionSlotsProbe> {
+        self.live
+            .borrow()
+            .as_ref()
+            .map(|live| live.service.session_slots())
+    }
+}
+
 /// The fixture chain every actor follows, which `Control` steps grow and
 /// fork. Cloning shares it, so a test can read it after a run.
 #[derive(Clone)]
@@ -997,6 +1008,9 @@ pub struct Topology {
     wire: Option<relay::Wire>,
     /// The node under test's tap, told of its teardown.
     tap: Option<TapTeardown>,
+    /// Whether the node under test's links reserve its service's session
+    /// slots, as the transport does.
+    sessions: bool,
 }
 
 impl Topology {
@@ -1011,6 +1025,18 @@ impl Topology {
             last_id: Cell::new(0),
             wire: None,
             tap: None,
+            sessions: false,
+        }
+    }
+
+    /// This topology, reserving a session slot on the node under test's
+    /// service for each of its links, as the transport does. The node's
+    /// sender holds the reservation, so the slot returns once the node lets
+    /// go of every clone of it.
+    pub fn reserving_sessions(self) -> Self {
+        Topology {
+            sessions: true,
+            ..self
         }
     }
 
@@ -1067,7 +1093,12 @@ impl Topology {
 
     /// Admits `local`'s side of connection `id` to its service, from
     /// `remote`, with `streams`, whose receiving end `reader` reads if it
-    /// has one, and returns why it closes.
+    /// has one, and returns why it closes. If the topology reserves
+    /// sessions and `local` is the node under test, its service reserves
+    /// the session first, and the session's one stream is ready at once. If
+    /// the service's slots for `direction` are full, as a leaked slot can
+    /// leave them, it records a failure and admits the peer without a
+    /// reservation, since the failure ends the run.
     #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
@@ -1079,6 +1110,26 @@ impl Topology {
         reader: Option<StreamReader>,
         token: &CancellationToken,
     ) -> CloseCauseReader {
+        let live = self.nodes[local].live.borrow();
+        let service = &live
+            .as_ref()
+            .expect("only setup and a relink add links, and a relink refuses a torn-down node")
+            .service;
+        let (recv, mut send) = streams;
+        if self.sessions && local == 0 {
+            match service.reserve_session(direction) {
+                Ok(reservation) => {
+                    let reservation =
+                        reservation.expect("a service with routines reserves its sessions");
+                    reservation.admitted();
+                    send = send.holding_session(reservation);
+                }
+                Err(SessionFull) => self.fail(&format!(
+                    "the node's {direction:?} session slots are full, so it takes no link"
+                )),
+            }
+        }
+        let streams = (recv, send);
         let peer = Peer::new_versioned(
             id,
             remote,
@@ -1094,13 +1145,7 @@ impl Topology {
         if let Some(reader) = &reader {
             peer.read_through(reader);
         }
-        self.nodes[local]
-            .live
-            .borrow()
-            .as_ref()
-            .expect("only setup and a relink add links, and a relink refuses a torn-down node")
-            .service
-            .add_peer(peer);
+        service.add_peer(peer);
         cause
     }
 

@@ -951,7 +951,10 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState<S::View>) -
             witness: violation.witness.clone(),
         };
     }
-    if !state.declared || state.excluded.is_some() {
+    if !state.declared {
+        return PropertyOutcome::NotApplicable;
+    }
+    if state.excluded.is_some() {
         return PropertyOutcome::NotApplicable;
     }
     let reason = if !property.assumes.is_empty() && !state.ever_held {

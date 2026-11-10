@@ -1438,8 +1438,8 @@ Changed:
 
 - **ADM-3.** Inbound connections and inbound handshakes each get Zakura's
   cap less a quarter, rounded down but at least one slot once the cap is 2
-  or more. That reserve stays for dials. Bitcoin Core, geth, reth and Zebra all bound inbound below the total
-  in the same way.
+  or more. That reserve stays for dials. Bitcoin Core, geth, reth and Zebra
+  all bound inbound below the total in the same way.
 - **§16.** Adds the inbound share test.
 
 ## 17q. Changes in version 0.19

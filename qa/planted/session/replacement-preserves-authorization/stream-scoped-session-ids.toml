@@ -1,0 +1,10 @@
+# Names a peer-opened service session by its QUIC stream ID, which each
+# connection numbers from zero, instead of the handler's run-wide counter.
+# The input closes the node's connection to the mirror it dials once the
+# node has asked storage to admit four bodies. The node redials, the mirror
+# opens its block-sync stream on the replacement under the same QUIC stream
+# ID, and the session gets the replaced session's ID.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-replace.bin"
+# Besides handler.rs, which the patch changes, the handler's session setup
+# decides which ID a session carries.
+checks = ["crates/zakura-network/src/zakura/handler"]

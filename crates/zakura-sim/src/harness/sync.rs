@@ -42,9 +42,9 @@ use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
     block_sync_serving_limit, framed_channel, CloseCauseReader, FramedRecv, FramedSend, Peer,
     Service, ServicePeerDirection, SessionOrigin, StreamReader, ZakuraBlockSyncConfig,
-    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-    ZAKURA_STREAM_HEADER_SYNC,
+    ZakuraPeerId, ZakuraSupervisorHandle, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_rt::sync::{mpsc, CancellationToken};
@@ -259,7 +259,7 @@ pub struct SyncPorts {
     pub port: Arc<ControlledPort>,
     /// The node's block service over [`SyncPorts::engine`].
     pub service: Arc<ControlledBlockService>,
-    replies: Arc<LateHandle>,
+    pub(crate) replies: Arc<LateHandle>,
     /// Each mirror's engine, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
     /// The mirrors' range reads.
@@ -336,9 +336,91 @@ pub struct SyncTopology {
     /// The node's taps, told of its teardown.
     header_tap: TapShutdown,
     block_tap: TapTeardown,
+    /// What carries the links.
+    transport: Transport,
+}
+
+/// What carries a run's links.
+pub(crate) enum Transport {
+    /// In-memory channels, the block side through the labelling relay
+    /// (`sync/storage`).
+    Memory,
+    /// Real QUIC connections, which their dialers redial (`sync/wire`).
+    Quic(QuicLinks),
+}
+
+/// The node's handle on its QUIC connections.
+pub(crate) struct QuicLinks {
+    /// The node's supervisor, once its endpoint serves.
+    pub(crate) supervisor: Arc<std::sync::Mutex<Option<ZakuraSupervisorHandle>>>,
+    /// Set once the node shuts down, so no dialer redials.
+    pub(crate) stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Each mirror's peer ID on QUIC, its endpoint key's, by name.
+    pub(crate) peers: BTreeMap<String, ZakuraPeerId>,
 }
 
 impl SyncTopology {
+    /// The topology of `actors`, with no link yet.
+    pub(crate) fn new(
+        actors: Actors,
+        scenario: &SyncScenario,
+        ports: &SyncPorts,
+        transport: Transport,
+    ) -> Self {
+        SyncTopology {
+            nodes: actors.nodes,
+            links: RefCell::default(),
+            effects: ports.effects.clone(),
+            last_id: Cell::new(0),
+            fixture: ports.fixture.clone(),
+            spec: scenario.body_spec(),
+            chain: RefCell::new(ports.chain.clone()),
+            cross: ports.cross.clone(),
+            wire: actors.wire,
+            header_tap: actors.header_tap,
+            block_tap: actors.block_tap,
+            transport,
+        }
+    }
+
+    /// The node's supervisor, if its links are QUIC connections and its
+    /// endpoint serves.
+    fn supervisor(&self) -> Option<ZakuraSupervisorHandle> {
+        match &self.transport {
+            Transport::Memory => None,
+            Transport::Quic(quic) => quic
+                .supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+
+    /// Closes the node's newest connection to the mirror named `peer`. A
+    /// QUIC connection's dialer redials it.
+    async fn close(&self, peer: &str) {
+        if let Transport::Memory = self.transport {
+            match self.link_to(peer) {
+                Some(link) => link.close(),
+                None => self.fail(format!("the scenario never links `{peer}`")),
+            }
+            return;
+        }
+        let Transport::Quic(quic) = &self.transport else {
+            unreachable!("a memory link returned above");
+        };
+        let Some(id) = quic.peers.get(peer) else {
+            self.fail(format!("the scenario has no mirror `{peer}`"));
+            return;
+        };
+        let Some(supervisor) = self.supervisor() else {
+            self.fail("the node's endpoint doesn't serve yet".to_owned());
+            return;
+        };
+        if !supervisor.disconnect_peer(id).await {
+            self.fail(format!("the node has no connection to `{peer}`"));
+        }
+    }
     /// The next connection and session ID.
     fn next_id(&self) -> u64 {
         let id = self.last_id.get() + 1;
@@ -474,7 +556,14 @@ impl SyncTopology {
     }
 
     /// Links the mirror named `peer` again, in its newest link's direction.
+    /// A QUIC connection's dialer redials it by itself.
     fn relink(&self, peer: &str) {
+        if let Transport::Quic(_) = self.transport {
+            self.fail(format!(
+                "`{peer}`'s dialer redials it; a wire run never relinks"
+            ));
+            return;
+        }
         let Some(link) = self.link_to(peer) else {
             self.fail(format!("the scenario never links `{peer}`"));
             return;
@@ -486,10 +575,19 @@ impl SyncTopology {
     /// Stops the node under test, as zakurad's shutdown does: tells both
     /// taps, closes every link, cancels header sync's reactor and tears
     /// block sync down.
-    fn teardown(&self) {
+    async fn teardown(&self) {
         let node = &self.nodes[0];
         self.header_tap.begin();
         self.block_tap.begin();
+        if let Transport::Quic(quic) = &self.transport {
+            quic.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(supervisor) = self.supervisor() {
+                for id in quic.peers.values() {
+                    supervisor.disconnect_peer(id).await;
+                }
+            }
+        }
         // Cancelling can be a scheduling point, so the links are copied
         // first.
         let links = self.links.borrow().clone();
@@ -581,7 +679,7 @@ impl SyncTopology {
 /// Offers a scenario's scripted actions in order, each once, as
 /// `peer:<actor>:<action>`. Closes, relinks and teardowns run on the link
 /// task, and chain changes on the chain task.
-struct Control {
+pub(crate) struct Control {
     script: Vec<SyncStep>,
     topology: Rc<SyncTopology>,
     predicates: Rc<RefCell<Predicates>>,
@@ -593,7 +691,7 @@ struct Control {
 impl Control {
     /// A source for `script` on `topology`, gated by `predicates`, with its
     /// tasks spawned on `sim`.
-    fn new(
+    pub(crate) fn new(
         sim: &mut Sim,
         topology: Rc<SyncTopology>,
         script: Vec<SyncStep>,
@@ -607,12 +705,9 @@ impl Control {
         sim.scheduler().spawn_root("control", async move {
             while let Some(action) = links.recv().await {
                 match action {
-                    SyncAction::Close { peer } => match task_topology.link_to(&peer) {
-                        Some(link) => link.close(),
-                        None => task_topology.fail(format!("the scenario never links `{peer}`")),
-                    },
+                    SyncAction::Close { peer } => task_topology.close(&peer).await,
                     SyncAction::Relink { peer } => task_topology.relink(&peer),
-                    SyncAction::Teardown => task_topology.teardown(),
+                    SyncAction::Teardown => task_topology.teardown().await,
                     action => unreachable!("the link task gets only links, not {action:?}"),
                 }
             }
@@ -743,6 +838,8 @@ impl ActionSource for EngineWatch {
 /// one engine, and mirror peers. See the module doc.
 pub struct SyncStorage {
     view: SyncView,
+    /// The node's block storage's replies, cleared once the run ends.
+    replies: Arc<LateHandle>,
     /// The actors and links. They live until the run ends, so no reactor
     /// sees its inputs close unless a `Teardown` step stops the node.
     _topology: Rc<SyncTopology>,
@@ -781,6 +878,13 @@ impl CrossView for SyncView {
 
 impl HasView for SyncStorage {
     type View = SyncView;
+
+    /// Drops the node's block-sync handle from its block storage's
+    /// replies. The handle reaches the storage again through the reactor's
+    /// range source, so the cycle would outlive the run.
+    fn ended(&self, _: &crate::RunEnd) {
+        let _ = self.replies.clear();
+    }
 
     /// The node's block-sync view and the cross model, shared rather than
     /// copied.
@@ -891,140 +995,17 @@ impl Subsystem for SyncStorage {
         }
     }
 
-    /// Spawns the node's two services on its storages, each under its
-    /// policy and tapped, then each mirror's, links each mirror to the node
-    /// once, and adds the `Control` source.
+    /// Spawns the node's actors ([`spawn_actors`]), links each mirror to
+    /// the node once, and adds the `Control` source.
     fn build(sim: &mut Sim, scenario: &SyncScenario, ports: SyncPorts) -> Self {
-        let anchor = ports.fixture.anchor();
-        // The header side.
-        let header_storage = header_node::PolicySource::new(
-            sim,
-            ports.port.clone(),
-            scenario.header_policy.clone(),
-            header_node::Effects::default(),
-        );
-        let (header_observer, header_tap) = ReactorTap::new(sim, &ports.port, "node");
-        let header_shutdown = header_tap.shutdown();
-        sim.add_source(Box::new(header_storage.with_tap(header_tap)));
-        // The block side.
-        sim.add_source(Box::new(EngineWatch {
-            engine: ports.engine.clone(),
-            effects: ports.effects.clone(),
-            cross: ports.cross.clone(),
-            header_best: anchor,
-        }));
-        let block_storage = block_node::PolicySource::new(
-            sim,
-            ports.service.clone(),
-            scenario.block_policy.clone(),
-            ports.effects.clone(),
-        );
-        let config = ZakuraBlockSyncConfig::default();
-        let largest_body = ports
-            .chain
-            .iter()
-            .map(FixtureBlock::size)
-            .chain([scenario.body_bytes])
-            .max()
-            .map_or(0, u64::from);
-        let workers = sync_config(scenario).scheduler.workers;
-        let limits = Limits::of(&config, workers, largest_body);
-        assert_eq!(
-            limits.per_request, 1,
-            "block-sync properties are checked only at one body per request"
-        );
-        ports.view.borrow_mut().owners = OwnerModel::new(limits, 0);
-        let view = ports.view.clone();
-        view.borrow().semantic.borrow_mut().set_limit(&config);
-        let (block_observer, mut block_tap) =
-            BlockTap::new(sim, &ports.service, "node", view.clone());
-        let wire = Wire::new(block_sync_serving_limit(&config));
-        block_tap.label_with(wire.clone());
-        let block_teardown = block_tap.teardown();
-        let sessions = block_tap.sessions();
-        let block_storage = block_storage.with_tap(block_tap);
-        let predicates = block_storage.predicates();
-        sim.add_source(Box::new(block_storage));
-        sim.add_source(Box::new(MirrorReadSource::new(
-            ports.reads.clone(),
-            predicates.clone(),
-        )));
-        let header_fixture = ports.fixture.headers();
-        let dispatch = DispatchFlag::default();
-        let node = SyncNode {
-            name: "node".to_owned(),
-            header: HeaderNode::spawn(
-                sim,
-                "node",
-                1,
-                ports.port.clone() as Arc<dyn Port>,
-                header_fixture,
-                anchor,
-                dispatch.clone(),
-                Some(header_observer),
-            ),
-            block: BlockNode::spawn(
-                sim,
-                "node",
-                1,
-                &ports.engine,
-                NodeStorage::Controlled {
-                    service: ports.service.clone(),
-                    replies: ports.replies.clone(),
-                },
-                config,
-                Some(block_observer),
-            ),
-        };
-        sessions.watch(
-            node.block
-                .session_slots()
-                .expect("a node just spawned holds its service"),
-        );
-        let tip = ports.chain.last().map_or(anchor, FixtureBlock::frontier);
-        let mut nodes = vec![node];
-        for ((index, engine), seed) in ports.mirrors.iter().enumerate().zip(2..) {
-            let name = format!("mirror-{index}");
-            nodes.push(SyncNode {
-                header: HeaderNode::spawn(
-                    sim,
-                    &name,
-                    seed,
-                    engine.clone() as Arc<dyn Port>,
-                    header_fixture,
-                    tip,
-                    dispatch.clone(),
-                    None,
-                ),
-                block: BlockNode::spawn(
-                    sim,
-                    &name,
-                    seed,
-                    engine,
-                    NodeStorage::Mirror(MirrorStorage::new(
-                        &name,
-                        engine.clone(),
-                        ports.reads.clone(),
-                    )),
-                    ZakuraBlockSyncConfig::default(),
-                    None,
-                ),
-                name,
-            });
-        }
-        let topology = Rc::new(SyncTopology {
-            nodes,
-            links: RefCell::default(),
-            effects: ports.effects.clone(),
-            last_id: Cell::new(0),
-            fixture: ports.fixture.clone(),
-            spec: scenario.body_spec(),
-            chain: RefCell::new(ports.chain.clone()),
-            cross: ports.cross.clone(),
-            wire,
-            header_tap: header_shutdown,
-            block_tap: block_teardown,
-        });
+        let (actors, predicates) = spawn_actors(sim, scenario, &ports);
+        let view = actors.view.clone();
+        let topology = Rc::new(SyncTopology::new(
+            actors,
+            scenario,
+            &ports,
+            Transport::Memory,
+        ));
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
@@ -1038,6 +1019,7 @@ impl Subsystem for SyncStorage {
                 block: view,
                 cross: ports.cross,
             },
+            replies: ports.replies,
             _topology: topology,
         }
     }
@@ -1046,23 +1028,7 @@ impl Subsystem for SyncStorage {
     /// generated, resource and semantic properties, then the cross
     /// properties.
     fn properties() -> Vec<Property<Self>> {
-        let mut properties = vec![Property {
-            id: PropertyId::new(HEADER_OPERATION_IDS),
-            claim: "the node's storage operations get rising IDs, and each completes at most \
-                    once, after its submission",
-            kind: Kind::Safety,
-            assumes: &[],
-            needs: &[Source::Storage],
-            status: Status::Active,
-            check: check_header_operation_ids,
-            witness: None,
-        }];
-        properties.extend(block_storage_properties());
-        properties.extend(table_wiring_properties());
-        properties.extend(resource_properties());
-        properties.extend(semantic_properties());
-        properties.extend(cross::storage_properties());
-        properties
+        sync_properties()
     }
 
     /// Block sync's: the node's storage facts, its block-sync relays'
@@ -1079,9 +1045,180 @@ impl Subsystem for SyncStorage {
     }
 }
 
+/// The run's actors, before any link: the node under test first, then
+/// each mirror, and the node's taps and frame relays.
+pub(crate) struct Actors {
+    pub(crate) nodes: Vec<SyncNode>,
+    /// The node's block-sync view, as its tap folds it.
+    pub(crate) view: Rc<RefCell<BlockSyncView>>,
+    wire: Wire,
+    header_tap: TapShutdown,
+    block_tap: TapTeardown,
+}
+
+/// Spawns the node's two services on its storages, each under its policy
+/// and tapped, and the engine watch, then each mirror's services. Returns
+/// the actors and the block policy's predicates, which control steps wait
+/// on.
+pub(crate) fn spawn_actors(
+    sim: &mut Sim,
+    scenario: &SyncScenario,
+    ports: &SyncPorts,
+) -> (Actors, Rc<RefCell<Predicates>>) {
+    let anchor = ports.fixture.anchor();
+    // The header side.
+    let header_storage = header_node::PolicySource::new(
+        sim,
+        ports.port.clone(),
+        scenario.header_policy.clone(),
+        header_node::Effects::default(),
+    );
+    let (header_observer, header_tap) = ReactorTap::new(sim, &ports.port, "node");
+    let header_shutdown = header_tap.shutdown();
+    sim.add_source(Box::new(header_storage.with_tap(header_tap)));
+    // The block side.
+    sim.add_source(Box::new(EngineWatch {
+        engine: ports.engine.clone(),
+        effects: ports.effects.clone(),
+        cross: ports.cross.clone(),
+        header_best: anchor,
+    }));
+    let block_storage = block_node::PolicySource::new(
+        sim,
+        ports.service.clone(),
+        scenario.block_policy.clone(),
+        ports.effects.clone(),
+    );
+    let config = ZakuraBlockSyncConfig::default();
+    let largest_body = ports
+        .chain
+        .iter()
+        .map(FixtureBlock::size)
+        .chain([scenario.body_bytes])
+        .max()
+        .map_or(0, u64::from);
+    let workers = sync_config(scenario).scheduler.workers;
+    let limits = Limits::of(&config, workers, largest_body);
+    assert_eq!(
+        limits.per_request, 1,
+        "block-sync properties are checked only at one body per request"
+    );
+    ports.view.borrow_mut().owners = OwnerModel::new(limits, 0);
+    let view = ports.view.clone();
+    view.borrow().semantic.borrow_mut().set_limit(&config);
+    let (block_observer, mut block_tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
+    let wire = Wire::new(block_sync_serving_limit(&config));
+    block_tap.label_with(wire.clone());
+    let block_teardown = block_tap.teardown();
+    let sessions = block_tap.sessions();
+    let block_storage = block_storage.with_tap(block_tap);
+    let predicates = block_storage.predicates();
+    sim.add_source(Box::new(block_storage));
+    sim.add_source(Box::new(MirrorReadSource::new(
+        ports.reads.clone(),
+        predicates.clone(),
+    )));
+    let header_fixture = ports.fixture.headers();
+    let dispatch = DispatchFlag::default();
+    let node = SyncNode {
+        name: "node".to_owned(),
+        header: HeaderNode::spawn(
+            sim,
+            "node",
+            1,
+            ports.port.clone() as Arc<dyn Port>,
+            header_fixture,
+            anchor,
+            dispatch.clone(),
+            Some(header_observer),
+        ),
+        block: BlockNode::spawn(
+            sim,
+            "node",
+            1,
+            &ports.engine,
+            NodeStorage::Controlled {
+                service: ports.service.clone(),
+                replies: ports.replies.clone(),
+            },
+            config,
+            Some(block_observer),
+        ),
+    };
+    sessions.watch(
+        node.block
+            .session_slots()
+            .expect("a node just spawned holds its service"),
+    );
+    let tip = ports.chain.last().map_or(anchor, FixtureBlock::frontier);
+    let mut nodes = vec![node];
+    for ((index, engine), seed) in ports.mirrors.iter().enumerate().zip(2..) {
+        let name = format!("mirror-{index}");
+        nodes.push(SyncNode {
+            header: HeaderNode::spawn(
+                sim,
+                &name,
+                seed,
+                engine.clone() as Arc<dyn Port>,
+                header_fixture,
+                tip,
+                dispatch.clone(),
+                None,
+            ),
+            block: BlockNode::spawn(
+                sim,
+                &name,
+                seed,
+                engine,
+                NodeStorage::Mirror(MirrorStorage::new(
+                    &name,
+                    engine.clone(),
+                    ports.reads.clone(),
+                )),
+                ZakuraBlockSyncConfig::default(),
+                None,
+            ),
+            name,
+        });
+    }
+    (
+        Actors {
+            nodes,
+            view,
+            wire,
+            header_tap: header_shutdown,
+            block_tap: block_teardown,
+        },
+        predicates,
+    )
+}
+
 /// Checks [`HEADER_OPERATION_IDS`] on the node's header storage.
-fn check_header_operation_ids(cx: &mut CheckCtx<'_, SyncStorage>) -> crate::property::Verdict {
+fn check_header_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> crate::property::Verdict {
     check_service_operation_ids(HEADER_SERVICE, cx)
+}
+
+/// Both storages' operation ID properties, block sync's stream-6
+/// generated, resource and semantic properties, then the cross properties,
+/// for a harness whose view is a [`SyncView`].
+pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
+    let mut properties = vec![Property {
+        id: PropertyId::new(HEADER_OPERATION_IDS),
+        claim: "the node's storage operations get rising IDs, and each completes at most \
+                once, after its submission",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Storage],
+        status: Status::Active,
+        check: check_header_operation_ids::<S>,
+        witness: None,
+    }];
+    properties.extend(block_storage_properties());
+    properties.extend(table_wiring_properties());
+    properties.extend(resource_properties());
+    properties.extend(semantic_properties());
+    properties.extend(cross::storage_properties());
+    properties
 }
 
 /// A saved scenario of `sync/storage`. Each has a committed input under

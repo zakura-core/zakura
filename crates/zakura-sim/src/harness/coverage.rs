@@ -971,6 +971,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("no-room-check"),
     },
     Coverage {
+        property: crate::domain::session::REPLACEMENT_PRESERVES_AUTHORIZATION,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_replaced_connection_reopens_every_service_under_fresh_ids",
+        ),
+        bypass: Bypass::Planted("stream-scoped-session-ids"),
+    },
+    Coverage {
         property: crate::domain::cross::TIPS_CONSISTENT,
         passing: passes(
             "tests/sync_properties.rs",

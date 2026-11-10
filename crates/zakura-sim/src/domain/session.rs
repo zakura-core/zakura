@@ -1,13 +1,19 @@
 //! Cross-family session properties (properties.md, Cross-family).
 
-use std::net::SocketAddr;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+};
 
 use crate::{
     model::is_fault_cause,
     observe::Entry,
     peer::peer_of,
-    property::{Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    Observation,
+    property::{
+        Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory,
+        Verdict,
+    },
+    Observation, ObservationLog,
 };
 
 /// A peer the scenario marks `HonestPeer` is never punished.
@@ -121,4 +127,133 @@ fn remote_of(entries: &[Entry], connection: u64) -> Option<&str> {
         } if *c == connection => Some(remote.as_str()),
         _ => None,
     })
+}
+
+/// A service session the node admits on a connection that replaces an
+/// earlier connection to the same peer carries a session ID no earlier
+/// connection's session carried.
+pub const REPLACEMENT_PRESERVES_AUTHORIZATION: &str = "session/replacement-preserves-authorization";
+
+/// The session properties a wire harness with several services on one
+/// connection reaches: [`REPLACEMENT_PRESERVES_AUTHORIZATION`].
+pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
+    vec![Property {
+        id: PropertyId::new(REPLACEMENT_PRESERVES_AUTHORIZATION),
+        claim: "every service session the node admits on a connection that replaces an \
+                earlier connection to the same peer carries a session ID that no session on \
+                an earlier connection carried, so no frame, credit or completion keyed by a \
+                replaced session names its replacement or another service's session",
+        kind: Kind::Safety,
+        assumes: &[],
+        // The transport tap's session rows, which only a harness on the
+        // simulated network logs.
+        needs: &[Source::Datagrams],
+        status: Status::Active,
+        check: check_replacement_preserves_authorization::<S>,
+        witness: Some(TriggerHistory::Log(replacement_admitted)),
+    }]
+}
+
+/// One session row: its connection, its peer and its session ID.
+type SessionRow<'a> = (u64, &'a str, u64);
+
+/// `obs` as a session row, if it is one.
+fn session_row(obs: &Observation) -> Option<SessionRow<'_>> {
+    match obs {
+        Observation::Session {
+            connection,
+            peer,
+            session_id,
+            ..
+        } => Some((*connection, peer.as_str(), *session_id)),
+        _ => None,
+    }
+}
+
+/// Each peer's connections, in the order their first session arrived, and
+/// each connection's session IDs.
+#[derive(Default)]
+struct Sessions {
+    connections: BTreeMap<String, Vec<u64>>,
+    ids: BTreeMap<u64, BTreeSet<u64>>,
+}
+
+impl Sessions {
+    /// Folds `row`. Returns the session IDs of every earlier connection to
+    /// the row's peer if the row's connection replaces one, or `None`.
+    fn fold(&mut self, (connection, peer, session_id): SessionRow<'_>) -> Option<BTreeSet<u64>> {
+        let connections = self.connections.entry(peer.to_owned()).or_default();
+        if !connections.contains(&connection) {
+            connections.push(connection);
+        }
+        let earlier: BTreeSet<u64> = connections
+            .iter()
+            .take_while(|earlier| **earlier != connection)
+            .flat_map(|earlier| self.ids.get(earlier).into_iter().flatten().copied())
+            .collect();
+        let replaces = connections.first() != Some(&connection);
+        self.ids.entry(connection).or_default().insert(session_id);
+        replaces.then_some(earlier)
+    }
+}
+
+/// Checks [`REPLACEMENT_PRESERVES_AUTHORIZATION`] at each step with a
+/// session row. It applies to a row on a connection that replaces an
+/// earlier one to the same peer. It folds the log's earlier rows each time,
+/// since a run admits only a few dozen sessions.
+fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let step = cx.step;
+    if cx.observations().all(|obs| session_row(obs).is_none()) {
+        return Verdict::NotApplicable;
+    }
+    let mut sessions = Sessions::default();
+    let mut judged = false;
+    let mut findings = Vec::new();
+    for entry in cx.log.entries() {
+        let Some(row) = session_row(&entry.obs) else {
+            continue;
+        };
+        let earlier = sessions.fold(row);
+        if entry.step != step {
+            continue;
+        }
+        let Some(earlier) = earlier else {
+            continue;
+        };
+        judged = true;
+        let (connection, peer, session_id) = row;
+        if earlier.contains(&session_id) {
+            findings.push((
+                "a replacement connection's session carries an ID no earlier connection's \
+                 session carried"
+                    .to_owned(),
+                format!(
+                    "connection {connection} to {peer} admitted session {session_id}, which an \
+                     earlier connection to {peer} carried"
+                ),
+            ));
+        }
+    }
+    let mut findings = findings.into_iter();
+    match findings.next() {
+        Some((expected, actual)) => {
+            for (expected, actual) in findings {
+                cx.record_violation(expected, actual);
+            }
+            cx.violated(expected, actual)
+        }
+        None if judged => Verdict::Holds,
+        None => Verdict::NotApplicable,
+    }
+}
+
+/// [`REPLACEMENT_PRESERVES_AUTHORIZATION`]'s trigger history: the node
+/// admitted a session on a connection that replaces an earlier one to the
+/// same peer.
+fn replacement_admitted(log: &ObservationLog) -> bool {
+    let mut sessions = Sessions::default();
+    log.entries()
+        .iter()
+        .filter_map(|entry| session_row(&entry.obs))
+        .any(|row| sessions.fold(row).is_some())
 }

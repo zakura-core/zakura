@@ -72,7 +72,7 @@ fn config(network: &Network) -> Config {
 }
 
 /// The node's endpoint and the limits it dials with, once it's bound.
-type Bound = Option<(ZakuraEndpoint, ZakuraLocalLimits)>;
+pub(crate) type Bound = Option<(ZakuraEndpoint, ZakuraLocalLimits)>;
 
 /// The node under test on real QUIC.
 pub struct WireNode {
@@ -122,8 +122,8 @@ pub struct WireEndpoint {
     seed: [u8; 32],
     /// Set once the node serves.
     endpoint: watch::Receiver<Bound>,
-    /// Where its failed dials go.
-    dials: DialReporter,
+    /// Where its failed dials go, if a tap reports them.
+    dials: Option<DialReporter>,
 }
 
 impl WireEndpoint {
@@ -154,16 +154,55 @@ impl WireEndpoint {
         F: Future<Output = K> + Send,
         K: Send,
     {
+        WireEndpoint::spawn_at(
+            sim,
+            network,
+            net,
+            seed,
+            None,
+            observer,
+            Some(dials),
+            services,
+            started,
+        )
+    }
+
+    /// [`WireEndpoint::spawn`], binding the node at `index`: [`NODE_ADDR`]
+    /// with key 0 for `None`, or peer `i`'s first address,
+    /// [`peer_addr`]`(i, 0)`, with its key for `Some(i)`. A peer's failed
+    /// dials go to `dials` if given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_at<T, F, K>(
+        sim: &mut Sim,
+        network: &Network,
+        net: SimNet,
+        seed: [u8; 32],
+        index: Option<usize>,
+        observer: Arc<dyn TransportObserver>,
+        dials: Option<DialReporter>,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
+        let (addr, key) = index.map_or((NODE_ADDR, 0), |index| {
+            (peer_addr(index, 0), key_index(index))
+        });
         let (bound, endpoint) = watch::channel(None);
         let config = config(network);
         sim.scheduler().spawn_root("wire-node", async move {
             let limits = ZakuraLocalLimits::from_config(&config);
             let quic = QuicEndpoint::bind_with(
-                SeededInputs::node_key(seed, 0),
-                &limits.quic_bind_config(vec![NODE_ADDR]),
+                SeededInputs::node_key(seed, key),
+                &limits.quic_bind_config(vec![addr]),
                 &limits.quic,
                 net,
-                SeededInputs::new(seed, 0).endpoint_inputs(),
+                SeededInputs::new(seed, key).endpoint_inputs(),
             )
             .expect("the node binds its address");
             let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
@@ -194,6 +233,11 @@ impl WireEndpoint {
         }
     }
 
+    /// The endpoint and its limits, once it serves.
+    pub(crate) fn bound(&self) -> watch::Receiver<Bound> {
+        self.endpoint.clone()
+    }
+
     /// Spawns a task that dials peer `index` once the node serves and
     /// `listening` says the peer does too, and serves the connection until
     /// it ends. A dial that fails is reported as `dial-failed` on the
@@ -217,7 +261,9 @@ impl WireEndpoint {
             let (endpoint, limits) = bound.expect("the wait returns a bound node");
             // A connection's own events show how it went once it registers.
             if let Err(error) = endpoint.dial(target, &limits).await {
-                dials.report(remote, error.to_string());
+                if let Some(dials) = dials {
+                    dials.report(remote, error.to_string());
+                }
             }
         });
     }

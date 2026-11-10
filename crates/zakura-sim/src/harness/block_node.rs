@@ -457,7 +457,7 @@ impl LateHandle {
 
     /// Takes the handle out, so every later reply fails as a closed
     /// handle's does. The caller drops it outside the lock.
-    fn clear(&self) -> Option<BlockSyncHandle> {
+    pub(crate) fn clear(&self) -> Option<BlockSyncHandle> {
         self.slot().take()
     }
 }
@@ -808,7 +808,7 @@ struct Live {
     /// The reactor's handle.
     handle: BlockSyncHandle,
     /// The service its links join.
-    service: BlockSyncService,
+    service: Arc<BlockSyncService>,
 }
 
 impl BlockNode {
@@ -878,7 +878,7 @@ impl BlockNode {
             engine: engine.clone(),
             shutdown,
             live: RefCell::new(Some(Live {
-                service: BlockSyncService::new_with_handle(handle.clone()),
+                service: Arc::new(BlockSyncService::new_with_handle(handle.clone())),
                 handle,
             })),
             controlled,
@@ -1673,6 +1673,13 @@ impl BlockNode {
             }
             None => false,
         }
+    }
+
+    /// The service its links join, for a harness that registers it with a
+    /// transport handler, such as `sync/wire`'s. `None` once a teardown
+    /// dropped it.
+    pub(crate) fn wire_service(&self) -> Option<Arc<BlockSyncService>> {
+        self.live.borrow().as_ref().map(|live| live.service.clone())
     }
 
     /// Tears the node's block sync down as [`Topology::teardown`] does, but

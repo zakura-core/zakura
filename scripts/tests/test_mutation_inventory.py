@@ -265,6 +265,45 @@ class LoopTests(unittest.TestCase):
         self.assertEqual([row["errors"] for row in report["cases"]], [[]])
         self.assertEqual(report["cases"][0]["apply"], "passed")
 
+    def generated(self, cases):
+        generated = tempfile.TemporaryDirectory()
+        self.addCleanup(generated.cleanup)
+        out = Path(generated.name)
+        (out / "bounds/raise").mkdir(parents=True)
+        (out / "bounds/raise/raise.patch").write_text(PATCH)
+        (out / "bounds/raise/README.md").write_text("Required failure: the run ends at `fixture/bound`.\n")
+        (out / "cases.json").write_text(json.dumps(cases))
+        return out
+
+    def test_a_generated_patch_without_a_loop_mapping_fails(self):
+        out = self.generated([])
+        report = inventory.inventory(self.root, cases_dir=out)
+        self.assertEqual(report["errors"], [f"patch has no loop mapping: {(out / 'bounds/raise/raise.patch').as_posix()}"])
+        unmapped = {key: value for key, value in self.case.items() if key != "property"}
+        out = self.generated([unmapped])
+        report = inventory.inventory(self.root, cases_dir=out)
+        patch = (out / "bounds/raise/raise.patch").as_posix()
+        self.assertEqual(report["errors"], [
+            f"patch has no loop mapping: {patch}", f"mapping names no property: {patch}",
+        ])
+
+    def test_a_simulator_only_module_of_a_production_crate_is_refused(self):
+        self.write("crates/prod/src/lib.rs", "pub fn limit() -> u32 { 1 }\n\n#[cfg(zakura_sim)]\nmod sim_reader;\n#[cfg(not(zakura_sim))]\nmod real;\n")
+        self.write("crates/prod/src/sim_reader.rs", "pub fn limit() -> u32 { 1 }\n")
+        self.write("crates/prod/src/real.rs", "pub fn limit() -> u32 { 1 }\n")
+        self.assertEqual(inventory.production_errors(self.root, [
+            "crates/prod/src/lib.rs", "crates/prod/src/real.rs", "crates/prod/src/sim_reader.rs",
+        ]), ["changes a non-production file: crates/prod/src/sim_reader.rs"])
+
+    def test_release_cfg_evaluates_a_release_build(self):
+        for predicate, holds in [
+            ("test", False), ("zakura_sim", False), ("unix", True), ("not(zakura_sim)", True),
+            ('any(test, feature = "proptest-impl")', False), ('feature = "indexer"', True),
+            ('all(test, unix)', False), ('any(test, zakura_sim, feature = "zakura-testkit")', False),
+            ('not(feature = "test-support")', True),
+        ]:
+            self.assertEqual(inventory.release_cfg(predicate), holds, predicate)
+
 
 if __name__ == "__main__":
     unittest.main()

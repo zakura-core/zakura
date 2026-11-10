@@ -159,18 +159,113 @@ def native_binding(root, case):
     }
 
 
-def production_errors(paths):
+# The cfg atoms a release build leaves unset: the test, simulator, fuzzing
+# and doc builds. A release build also leaves unset each feature whose name
+# matches NON_RELEASE_FEATURE, such as `proptest-impl` or `zakura-testkit`.
+# Every other atom and feature counts as set.
+NON_RELEASE_CFG = {"test", "zakura_sim", "fuzzing", "doc"}
+NON_RELEASE_FEATURE = re.compile(r"test|fuzz|bench|proptest|mock|sim")
+
+CFG_TOKEN = re.compile(r'\s*(?:([A-Za-z_][A-Za-z0-9_]*)|("[^"]*")|(\S))')
+
+# An out-of-line module declaration, `mod name;`, at the start of a line.
+MOD_DECL = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
+CFG_ATTRIBUTE = re.compile(r"^\s*#\[\s*cfg\s*\((.*)\)\s*\]\s*$")
+PATH_ATTRIBUTE = re.compile(r'^\s*#\[\s*path\s*=\s*"([^"]*)"\s*\]\s*$')
+
+
+def release_cfg(predicate):
+    """Whether the `cfg` predicate `predicate` holds in a release build."""
+    tokens = [next(group for group in match.groups() if group) for match in CFG_TOKEN.finditer(predicate)]
+
+    def parse(at):
+        name = tokens[at]
+        if tokens[at + 1:at + 2] == ["("]:
+            values, at = [], at + 2
+            while tokens[at] != ")":
+                value, at = parse(at)
+                values.append(value)
+                if tokens[at] == ",":
+                    at += 1
+            combine = {"all": all, "any": any, "not": lambda values: not values[0]}[name]
+            return combine(values), at + 1
+        if tokens[at + 1:at + 2] == ["="]:
+            value = tokens[at + 2].strip('"')
+            return not (name == "feature" and NON_RELEASE_FEATURE.search(value)), at + 3
+        return name not in NON_RELEASE_CFG, at + 1
+
+    holds, at = parse(0)
+    if at != len(tokens):
+        raise ValueError(f"unparsed cfg predicate: {predicate}")
+    return holds
+
+
+def declared_modules(source):
+    """The files `source` declares as modules that a release build compiles:
+    each `mod name;` whose `cfg` attributes hold in a release build
+    ([`release_cfg`]), at its `path` attribute's file or its default one."""
+    text = source.read_text()
+    lines = text.splitlines()
+    owns_directory = source.name in ("lib.rs", "main.rs", "mod.rs")
+    directory = source.parent if owns_directory else source.parent / source.stem
+    files = []
+    for match in MOD_DECL.finditer(text):
+        line = text.count("\n", 0, match.start())
+        holds, path = True, None
+        # The declaration's attributes and doc comments sit directly above it.
+        while line > 0 and lines[line - 1].lstrip().startswith(("#[", "//")):
+            line -= 1
+            if cfg := CFG_ATTRIBUTE.match(lines[line]):
+                holds = holds and release_cfg(cfg.group(1))
+            elif attribute := PATH_ATTRIBUTE.match(lines[line]):
+                path = attribute.group(1)
+        if not holds:
+            continue
+        name = match.group(1)
+        if path is not None:
+            files.append(source.parent / path)
+        else:
+            files.extend(
+                candidate for candidate in (directory / f"{name}.rs", directory / name / "mod.rs")
+                if candidate.is_file()
+            )
+    return files
+
+
+def release_files(crate):
+    """The source files of `crate` a release build compiles: those its
+    library and binary roots reach through `mod` declarations whose `cfg`
+    holds in a release build. Simulator-only modules such as
+    `transport/sim_reader.rs`, and test-only ones, are not among them. A
+    module declared inside an inline module or a macro is not either."""
+    roots = [crate / "src/lib.rs", crate / "src/main.rs", *(crate / "src/bin").glob("*.rs")]
+    pending = [root for root in roots if root.is_file()]
+    reached = set()
+    while pending:
+        source = pending.pop().resolve()
+        if source in reached or not source.is_file():
+            continue
+        reached.add(source)
+        pending.extend(declared_modules(source))
+    return reached
+
+
+def production_errors(root, paths):
     """Name each path a loop patch may not change: anything but a Rust
-    source file of a production crate, outside its tests."""
+    source file a release build of a production crate compiles
+    ([`release_files`]), so not a simulator crate, a test, or a module only
+    the simulator or tests compile."""
     errors = []
+    crates = {}
     for path in paths:
         parts = Path(path).parts
-        name = parts[-1]
-        if (
-            len(parts) < 3 or parts[0] != "crates" or parts[1] in SIMULATOR_CRATES
-            or not name.endswith(".rs") or name == "tests.rs" or name.endswith("_tests.rs")
-            or any(part in ("tests", "benches", "fuzz", "testkit") for part in parts[2:-1])
-        ):
+        if len(parts) < 3 or parts[0] != "crates" or parts[1] in SIMULATOR_CRATES:
+            errors.append(f"changes a non-production file: {path}")
+            continue
+        crate = root / "crates" / parts[1]
+        if crate not in crates:
+            crates[crate] = release_files(crate)
+        if (root / path).resolve() not in crates[crate]:
             errors.append(f"changes a non-production file: {path}")
     return errors
 
@@ -229,7 +324,7 @@ def loop_binding(root, patch, cases, work_list):
     changed = [line.split("\t", 2)[2] for line in numstat.stdout.splitlines() if line.count("\t") >= 2]
     if not changed:
         errors.append("the patch changes no file")
-    errors.extend(production_errors(changed))
+    errors.extend(production_errors(root, changed))
     readme = patch.parent / "README.md"
     required = []
     if readme.is_file():
@@ -288,9 +383,10 @@ def witness_errors(root):
 def inventory(root, loop_only=False, cases_dir=None):
     """Return one row per retained patch and every static validation failure.
     With `loop_only`, only the mutation loop's patches: those whose
-    `cases.json` entries name a property. With `cases_dir`, the loop patches
-    of that directory's own `cases.json`, such as a generator's output before
-    triage, whose patch paths are relative to it."""
+    `cases.json` entries name a property. With `cases_dir`, every patch of
+    that directory, such as a generator's output before triage, against the
+    directory's own `cases.json`, whose patch paths are relative to it; each
+    patch must have a loop mapping."""
     native_dir = Path(cases_dir) if cases_dir is not None else root / "qa/native-mutations"
     native = json.loads((native_dir / "cases.json").read_text())
     work_list = (
@@ -323,7 +419,14 @@ def inventory(root, loop_only=False, cases_dir=None):
         *(root / "qa/native-mutations").rglob("*.patch"),
     ])
     if cases_dir is not None:
+        # Every generated patch is a loop case: one with no loop mapping, or
+        # whose entry names no property, fails rather than going unchecked.
         patches = sorted(Path(cases_dir).resolve().rglob("*.patch"))
+        errors.extend(
+            f"patch has no loop mapping: {patch_path(patch)}"
+            for patch in patches if patch_path(patch) not in loops
+        )
+        errors.extend(f"mapping names no property: {path}" for path in sorted(mappings))
     if loop_only or cases_dir is not None:
         patches = [patch for patch in patches if patch_path(patch) in loops]
         mappings = {}

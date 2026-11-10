@@ -541,8 +541,8 @@ fn select(
 
 /// Every path whose change can change `case`'s result, relative to
 /// `repo_root`: the patch, the file that lists the case, the witness's
-/// files, the files the patch changes, a planted witness's checks, and the
-/// shared machinery.
+/// files, the files the patch changes, a planted witness's checks, the
+/// shared machinery, and its work-list entry's paths ([`entry_paths`]).
 fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
     let mut watched: Vec<PathBuf> = [&case.patch, &case.listed_in]
         .into_iter()
@@ -550,6 +550,7 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
         .collect();
     watched.extend(SHARED.iter().map(PathBuf::from));
     watched.extend(patched_files(repo_root, &case.patch)?);
+    watched.extend(entry_paths(repo_root, case)?);
     match &case.witness {
         WitnessSpec::Planted { planted } => {
             watched.push(planted.clone());
@@ -574,6 +575,64 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
         }
     }
     Ok(watched)
+}
+
+/// The mutation loop's work list, relative to the repository root.
+const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
+
+/// The parts of [`WORK_LIST`] that [`entry_paths`] reads.
+#[derive(Deserialize)]
+struct WorkList {
+    entry: Vec<WorkEntry>,
+}
+
+#[derive(Deserialize)]
+struct WorkEntry {
+    id: String,
+    #[serde(default)]
+    check: Vec<PathBuf>,
+    #[serde(default)]
+    shared: Vec<PathBuf>,
+    #[serde(default)]
+    code: Vec<PathBuf>,
+    #[serde(default)]
+    instance: Vec<WorkInstance>,
+}
+
+#[derive(Deserialize)]
+struct WorkInstance {
+    property: String,
+    #[serde(default)]
+    code: Vec<PathBuf>,
+}
+
+/// The work-list paths that bear on `case`'s result: the work list itself,
+/// and its entry's checks, shared code and code, with the code of the
+/// entry's instance of `case`'s property. A change to an instance's code can
+/// change whether a patch to the entry's shared code survives. Empty for a
+/// case that names no entry.
+fn entry_paths(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
+    let Some(id) = &case.entry else {
+        return Ok(Vec::new());
+    };
+    let list: WorkList = toml::from_str(&fs::read_to_string(repo_root.join(WORK_LIST))?)?;
+    let entry = list
+        .entry
+        .into_iter()
+        .find(|entry| &entry.id == id)
+        .ok_or_else(|| format!("{} names entry {id}, which {WORK_LIST} lacks", case.label))?;
+    let mut paths = vec![PathBuf::from(WORK_LIST)];
+    paths.extend(entry.check);
+    paths.extend(entry.shared);
+    paths.extend(entry.code);
+    paths.extend(
+        entry
+            .instance
+            .into_iter()
+            .filter(|instance| instance.property == case.property)
+            .flat_map(|instance| instance.code),
+    );
+    Ok(paths)
 }
 
 /// The host's memory, from `/proc/meminfo`.

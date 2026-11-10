@@ -354,6 +354,28 @@ fn run_failures_are_harness_failures_with_their_reasons() {
     }
 }
 
+/// A run that ended at a harness failure with the named ID violated but
+/// nothing stopping it is a harness failure, not a kill. A violation that
+/// stopped the run before the failure still kills.
+#[test]
+fn a_harness_failure_outranks_an_unstopped_named_violation() {
+    let failed = |stopped_by: Option<&str>| {
+        let mut record = end(stopped_by, &[(NAMED, "violated", 1)]);
+        if let Record::End { harness, .. } = &mut record {
+            *harness = Some("deadlock".to_owned());
+        }
+        record
+    };
+    assert_eq!(
+        classified(&observed(Ended::Exited(1), vec![failed(None)])),
+        (Class::HarnessFailure, Some(Reason::HarnessEnd))
+    );
+    assert_eq!(
+        classified(&observed(Ended::Exited(1), vec![failed(Some(NAMED))])).0,
+        Class::KilledByNamedRule
+    );
+}
+
 #[test]
 fn a_baseline_must_hold_the_property_cleanly() {
     let held = observed(Ended::Exited(0), vec![end(None, &[(NAMED, "held", 2)])]);
@@ -834,5 +856,37 @@ fn planted_prefixes_end_at_a_component() {
     assert!(selects(
         "block",
         "block/work-funding/lost-reservation-release.patch"
+    ));
+}
+
+/// A case watches its work-list entry's paths beside its patch's own: a
+/// change to `admission.rs`, the reserved-byte instance's code, reruns
+/// `budget-ignores-charges`, whose patch changes only the shared
+/// `guard.rs`.
+#[test]
+fn a_case_watches_its_work_list_entrys_paths() {
+    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+    let cases = super::native_cases(&repo_root, &repo_root.join("qa/native-mutations"))
+        .expect("the committed cases parse");
+    let case = cases
+        .iter()
+        .find(|case| case.label.ends_with("budget-ignores-charges.patch"))
+        .expect("the bounds entry keeps budget-ignores-charges");
+    let watched = super::watched(&repo_root, case).expect("the work list parses");
+    for path in [
+        "crates/zakura-network/src/zakura/block_sync/admission.rs",
+        "crates/zakura-network/src/zakura/transport/guard.rs",
+        "crates/zakura-sim/src/domain/shared/bounds.rs",
+        "qa/native-mutations/work-list.toml",
+    ] {
+        assert!(
+            crate::planted::is_affected(&watched, &[path.into()]),
+            "{path}"
+        );
+    }
+    // Another instance's code doesn't affect it.
+    assert!(!crate::planted::is_affected(
+        &watched,
+        &["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs".into()]
     ));
 }

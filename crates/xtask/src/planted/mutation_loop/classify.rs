@@ -336,24 +336,31 @@ pub(in crate::planted) fn baseline(property: &str, observed: &Observed) -> Optio
 }
 
 /// The ID whose violation decides a kill on the run that ended at `record`:
-/// the ID that stopped the run, or else `property` if the run violated it.
-/// Another ID's violation that didn't stop its run, such as a `Draft`
-/// property's, decides nothing.
+/// the ID that stopped the run, or else `property` if the run violated it
+/// and ended without a harness failure. Another ID's violation that didn't
+/// stop its run, such as a `Draft` property's, decides nothing. A run that
+/// ended at a harness failure stopped before its end-of-run outcomes were
+/// final, so only a violation that stopped it decides.
 fn deciding<'a>(property: &str, record: &'a Record) -> Option<&'a str> {
     let Record::End {
         stopped_by,
         violated,
+        harness,
         ..
     } = record
     else {
         return None;
     };
-    stopped_by.as_deref().or_else(|| {
-        violated
-            .iter()
-            .map(String::as_str)
-            .find(|id| *id == property)
-    })
+    if let Some(id) = stopped_by {
+        return Some(id);
+    }
+    if harness.is_some() {
+        return None;
+    }
+    violated
+        .iter()
+        .map(String::as_str)
+        .find(|id| *id == property)
 }
 
 /// Each ID other than `property` that a run violated without stopping, once,

@@ -848,6 +848,22 @@ impl Storage {
         self.verified.transaction_count()
     }
 
+    /// Returns how much work it is to remove the mined, conflicting and expired transactions
+    /// of a block with `block_transactions` from the mempool.
+    ///
+    /// The work is counted in the parts of a transaction the mempool looks up or removes one
+    /// by one: the transparent outputs it creates and spends, and the nullifiers it reveals.
+    /// It is the number of those parts in `block_transactions` plus the number in the
+    /// mempool's own transactions.
+    pub fn tip_work(&self, block_transactions: &[impl AsRef<Transaction>]) -> usize {
+        let block_parts: usize = block_transactions
+            .iter()
+            .map(|transaction| verified_set::tracked_parts(transaction.as_ref()))
+            .sum();
+
+        block_parts + self.verified.tracked_parts()
+    }
+
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.
     #[allow(dead_code)]
     pub fn total_cost(&self) -> u64 {

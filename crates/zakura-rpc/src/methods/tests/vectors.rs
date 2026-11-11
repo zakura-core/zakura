@@ -4075,6 +4075,165 @@ async fn first_answer_on_new_tip_waits_for_the_mempool_to_process_the_block() {
     );
 }
 
+/// A long poll that reaches a new tip does not wait for a mempool that reports more work on
+/// that block than it is expected to finish within the bounded wait: it answers coinbase-only
+/// at once, whether the mempool reported before or after the long poll asked.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
+    let _init_guard = zakura_test::init();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_OLD_TIP,
+        vec![fake_verified_mempool_tx()],
+    )));
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+
+    // The mempool has not started on the new tip: the long poll waits for it.
+    let started = tokio::time::Instant::now();
+    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    tokio::pin!(populated_mempool);
+    assert!(
+        tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
+            .await
+            .is_err(),
+        "a mempool that has reported nothing on the new tip is waited for"
+    );
+
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    assert_eq!(
+        populated_mempool.await.unwrap_err(),
+        EmptyReason::MempoolWorkHeavy
+    );
+    assert_eq!(
+        started.elapsed(),
+        NEW_TIP_MEMPOOL_WAIT / 2,
+        "the wait ends when the mempool reports the work"
+    );
+
+    // The mempool already reported the work when the next long poll asks.
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+            .await
+            .unwrap_err(),
+        EmptyReason::MempoolWorkHeavy
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+/// A long poll that reaches a new tip does not wait for a mempool that held no transactions
+/// when the block arrived: a block only removes transactions, so there are none to wait for.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_that_held_nothing() {
+    let _init_guard = zakura_test::init();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 0, 1);
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+            .await
+            .unwrap_err(),
+        EmptyReason::MempoolEmpty
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+/// A long poll that reaches a new tip waits for a mempool that reports light work on that
+/// block, and gets its transactions once the mempool publishes them. The work limit itself
+/// is still light.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_waits_for_a_mempool_with_light_work() {
+    let _init_guard = zakura_test::init();
+    let mempool_tx = fake_verified_mempool_tx();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_OLD_TIP,
+        vec![mempool_tx.clone()],
+    )));
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK);
+
+    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    tokio::pin!(populated_mempool);
+    assert!(
+        tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
+            .await
+            .is_err(),
+        "light work is waited for"
+    );
+
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_NEW_TIP,
+        vec![mempool_tx.clone()],
+    )));
+    mempool_snapshots.finish_tip(LONG_POLL_NEW_TIP);
+    let (transactions, _dependencies) = populated_mempool
+        .await
+        .expect("the mempool published the new tip within the wait");
+    assert_eq!(
+        transactions[0].transaction.id(),
+        mempool_tx.transaction.id()
+    );
+}
+
+/// Transactions the mempool has already published for the new tip are used whatever work it
+/// reported for that block.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_uses_published_transactions_despite_heavy_work() {
+    let _init_guard = zakura_test::init();
+    let mempool_tx = fake_verified_mempool_tx();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_NEW_TIP,
+        vec![mempool_tx.clone()],
+    )));
+
+    let (transactions, _dependencies) = rpc
+        .populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+        .await
+        .expect("the transactions for the new tip are published");
+    assert_eq!(
+        transactions[0].transaction.id(),
+        mempool_tx.transaction.id()
+    );
+}
+
+/// Heavy work the mempool reported on another block, or a block it has finished, does not
+/// end the wait early: only the bounded wait does.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_waits_out_heavy_work_on_another_block_and_a_finished_block() {
+    let _init_guard = zakura_test::init();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+
+    mempool_snapshots.start_tip(LONG_POLL_OLD_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+            .await
+            .unwrap_err(),
+        EmptyReason::MempoolWaitElapsed
+    );
+    assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
+
+    // The mempool finished the new tip and then withdrew its transactions: it no longer has
+    // that work to do, so its request, which this mempool never answers, is waited for.
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.finish_tip(LONG_POLL_NEW_TIP);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+            .await
+            .unwrap_err(),
+        EmptyReason::MempoolWaitElapsed
+    );
+    assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
+}
+
 /// A long poll that reaches a new tip stops waiting for a mempool that neither answers nor
 /// publishes the new block when the bounded wait ends, and not before.
 #[tokio::test(start_paused = true)]
@@ -4088,10 +4247,12 @@ async fn first_answer_on_new_tip_stops_waiting_for_the_mempool_after_the_bounded
     let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
 
     let started = tokio::time::Instant::now();
-    assert!(rpc
-        .populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
-        .await
-        .is_none());
+    assert_eq!(
+        rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+            .await
+            .unwrap_err(),
+        EmptyReason::MempoolWaitElapsed
+    );
     assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
 }
 
@@ -4280,6 +4441,7 @@ async fn check_template_trace_on_new_tip(populated: bool) {
             assert_eq!(template.transactions.len(), 1);
         } else {
             assert_eq!(returned["event"], "gbt_empty_returned");
+            assert_eq!(returned["reason"], "mempool_empty");
             assert!(template.transactions.is_empty());
         }
     }

@@ -29,7 +29,7 @@ use zakura_chain::{
 };
 use zakura_consensus::transaction as tx;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
-use zakura_node_services::mempool::QueueSource;
+use zakura_node_services::mempool::{MempoolTipStage, QueueSource};
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -2236,6 +2236,26 @@ async fn queue_checker_has_the_mempool_publish_a_new_block_to_snapshot_readers(
         "the snapshot for block 2 holds only the transaction that block did not expire"
     );
 
+    // The snapshot is published before the block is reported finished, so wait for the report.
+    let progress = timeout(Duration::from_secs(2), async {
+        loop {
+            let progress = snapshots
+                .progress_on_tip(block2.hash())
+                .await
+                .expect("the mempool is still running");
+            if progress.stage == MempoolTipStage::Reconciled {
+                break progress;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        progress.tip_hash,
+        block2.hash(),
+        "the mempool reports block 2 as finished once its snapshot is published"
+    );
+
     Ok(())
 }
 
@@ -3047,7 +3067,26 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
             serde_json::from_slice(&written.line).expect("each trace row is JSON");
         rows.push(row);
     }
-    for (block, action, requeued) in [(&reset_block, "reset", 1), (&grow_block, "grow", 0)] {
+    // The mempool holds no verified transactions here, so the work it reports for the block
+    // that grows the tip is that block's own: the transparent outputs its transactions spend
+    // and create, and the nullifiers they reveal. A reset is reported as no work.
+    let grow_work: usize = grow_block
+        .transactions
+        .iter()
+        .map(|tx| {
+            tx.inputs().len()
+                + tx.outputs().len()
+                + tx.sprout_nullifiers().count()
+                + tx.sapling_nullifiers().count()
+                + tx.orchard_nullifiers().count()
+                + tx.ironwood_nullifiers().count()
+        })
+        .sum();
+    assert!(grow_work > 0, "the block has a coinbase transaction");
+    for (block, action, requeued, work) in [
+        (&reset_block, "reset", 1, 0),
+        (&grow_block, "grow", 0, grow_work),
+    ] {
         let row = rows
             .iter()
             .find(|row| row["tip_hash"] == block.hash().to_string())
@@ -3058,8 +3097,10 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
             row["tip_height"],
             block.coinbase_height().expect("the block has a height").0
         );
+        assert_eq!(row["tx_count_before"], 0);
         assert_eq!(row["tx_count_after"], 0);
         assert_eq!(row["requeued"], requeued);
+        assert_eq!(row["work"], work);
         assert!(row["process_us"].is_u64(), "{row}");
     }
 

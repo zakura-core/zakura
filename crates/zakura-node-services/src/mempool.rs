@@ -23,7 +23,10 @@ pub use self::{
     gossip::Gossip,
     mempool_change::{MempoolChange, MempoolChangeKind, MempoolTxSubscriber},
     service_trait::MempoolService,
-    snapshot::{MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender},
+    snapshot::{
+        MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTipProgress,
+        MempoolTipStage,
+    },
     transaction_dependencies::TransactionDependencies,
 };
 

@@ -4,6 +4,10 @@
 //! New tips and explicit transaction-list requests publish a snapshot. Other mutations
 //! withdraw it until the next list request, avoiding full-mempool copies during admission.
 //! A reader uses a published snapshot or requests the current lists from the service.
+//!
+//! The mempool also publishes its progress on the newest block: that it has started removing
+//! the block's transactions and how much work that is, and that it has finished. A reader
+//! that cannot wait long for the block's snapshot uses it to decide whether to wait at all.
 
 use std::sync::Arc;
 
@@ -42,14 +46,85 @@ impl MempoolSnapshot {
     }
 }
 
+/// The mempool's progress on the newest block it has started to process.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MempoolTipProgress {
+    /// The hash of that block.
+    pub tip_hash: block::Hash,
+
+    /// How far the mempool is with it.
+    pub stage: MempoolTipStage,
+}
+
+/// How far the mempool is with a block.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MempoolTipStage {
+    /// The mempool is removing the block's mined, conflicting and expired transactions.
+    /// Its transactions for this block are not available until it finishes.
+    Reconciling {
+        /// The number of verified transactions the mempool held when the block arrived.
+        /// The block can only remove some of them, so zero means it has none for this block.
+        mempool_transactions: usize,
+
+        /// How much there is to do, counted in the parts of a transaction the mempool looks
+        /// up or removes one by one: the transparent outputs it spends and creates, and the
+        /// nullifiers it reveals. This is the number of those parts in the block's
+        /// transactions plus the number in the mempool's.
+        work: usize,
+    },
+
+    /// The mempool has finished the block. Its transactions for the block are published, or
+    /// it answers a request for them without further work on the block.
+    Reconciled,
+}
+
 /// The mempool's end of the snapshot channel.
 #[derive(Debug)]
-pub struct MempoolSnapshotSender(watch::Sender<Option<MempoolSnapshot>>);
+pub struct MempoolSnapshotSender {
+    /// The published snapshot.
+    snapshots: watch::Sender<Option<MempoolSnapshot>>,
+
+    /// The mempool's progress on the newest block, or `None` before its first block.
+    tip_progress: watch::Sender<Option<MempoolTipProgress>>,
+}
 
 impl MempoolSnapshotSender {
-    /// Creates a channel on which no snapshot has been published yet.
+    /// Creates a channel on which no snapshot or progress has been published yet.
     pub fn new() -> Self {
-        Self(watch::Sender::new(None))
+        Self {
+            snapshots: watch::Sender::new(None),
+            tip_progress: watch::Sender::new(None),
+        }
+    }
+
+    /// Publishes that the mempool has started on the block `tip_hash`, before it does any of
+    /// the work. See [`MempoolTipStage::Reconciling`] for `mempool_transactions` and `work`.
+    pub fn start_tip(&self, tip_hash: block::Hash, mempool_transactions: usize, work: usize) {
+        self.publish_tip_progress(MempoolTipProgress {
+            tip_hash,
+            stage: MempoolTipStage::Reconciling {
+                mempool_transactions,
+                work,
+            },
+        });
+    }
+
+    /// Publishes that the mempool has finished the block `tip_hash`.
+    pub fn finish_tip(&self, tip_hash: block::Hash) {
+        self.publish_tip_progress(MempoolTipProgress {
+            tip_hash,
+            stage: MempoolTipStage::Reconciled,
+        });
+    }
+
+    /// Publishes `progress`, waking readers only when it differs from the progress published
+    /// last.
+    fn publish_tip_progress(&self, progress: MempoolTipProgress) {
+        self.tip_progress.send_if_modified(|published| {
+            let is_changed = *published != Some(progress);
+            *published = Some(progress);
+            is_changed
+        });
     }
 
     /// Publishes `snapshot`, or `None` when the mempool is inactive or its lists changed.
@@ -57,7 +132,7 @@ impl MempoolSnapshotSender {
     /// Readers are woken only when it differs from the snapshot published last.
     pub fn publish(&self, snapshot: Option<MempoolSnapshot>) {
         let mut replaced = None;
-        self.0.send_if_modified(|published| {
+        self.snapshots.send_if_modified(|published| {
             let is_unchanged = match (&*published, &snapshot) {
                 (None, None) => true,
                 (Some(published), Some(snapshot)) => snapshot.is_unchanged_from(published),
@@ -75,9 +150,12 @@ impl MempoolSnapshotSender {
         drop(replaced);
     }
 
-    /// Returns a reader of the snapshots published on this channel.
+    /// Returns a reader of the snapshots and progress published on this channel.
     pub fn subscribe(&self) -> MempoolSnapshotReceiver {
-        MempoolSnapshotReceiver(self.0.subscribe())
+        MempoolSnapshotReceiver {
+            snapshots: self.snapshots.subscribe(),
+            tip_progress: self.tip_progress.subscribe(),
+        }
     }
 }
 
@@ -87,14 +165,38 @@ impl Default for MempoolSnapshotSender {
     }
 }
 
-/// A reader of the mempool's published snapshots.
+/// A reader of the mempool's published snapshots and of its progress on the newest block.
 #[derive(Clone, Debug)]
-pub struct MempoolSnapshotReceiver(watch::Receiver<Option<MempoolSnapshot>>);
+pub struct MempoolSnapshotReceiver {
+    /// The published snapshot.
+    snapshots: watch::Receiver<Option<MempoolSnapshot>>,
+
+    /// The mempool's progress on the newest block.
+    tip_progress: watch::Receiver<Option<MempoolTipProgress>>,
+}
 
 impl MempoolSnapshotReceiver {
     /// Returns the latest snapshot, or `None` when no current list has been published.
     pub fn latest(&self) -> Option<MempoolSnapshot> {
-        self.0.borrow().clone()
+        self.snapshots.borrow().clone()
+    }
+
+    /// Returns the mempool's progress on the block `tip_hash`, waiting until the mempool has
+    /// started on that block. Returns at once if it already has.
+    ///
+    /// The progress returned is the one published when this is called or first published
+    /// afterwards, so a block the mempool is still working on is reported as
+    /// [`MempoolTipStage::Reconciling`] and one it finished earlier as
+    /// [`MempoolTipStage::Reconciled`].
+    ///
+    /// Returns `None` if the mempool shut down first. The wait has no bound of its own: a
+    /// mempool that is not active, or that never sees `tip_hash`, never ends it.
+    pub async fn progress_on_tip(&mut self, tip_hash: block::Hash) -> Option<MempoolTipProgress> {
+        self.tip_progress
+            .wait_for(|progress| progress.is_some_and(|progress| progress.tip_hash == tip_hash))
+            .await
+            .ok()
+            .and_then(|progress| *progress)
     }
 
     /// Returns the snapshot the mempool checked against the block `tip_hash`, waiting until
@@ -107,7 +209,7 @@ impl MempoolSnapshotReceiver {
     /// the full list publishes it again, so a reader that must not wait for that also asks the
     /// mempool.
     pub async fn on_tip(&mut self, tip_hash: block::Hash) -> Option<MempoolSnapshot> {
-        self.0
+        self.snapshots
             .wait_for(|snapshot| {
                 snapshot
                     .as_ref()
@@ -191,7 +293,10 @@ mod tests {
         let sender = MempoolSnapshotSender::new();
         let receiver = sender.subscribe();
         let has_news = |receiver: &MempoolSnapshotReceiver| {
-            receiver.0.has_changed().expect("the sender is still alive")
+            receiver
+                .snapshots
+                .has_changed()
+                .expect("the sender is still alive")
         };
         let mut seen = receiver.clone();
 
@@ -201,7 +306,7 @@ mod tests {
         let first = snapshot(tip);
         sender.publish(Some(first.clone()));
         assert!(has_news(&seen));
-        seen.0.mark_unchanged();
+        seen.snapshots.mark_unchanged();
 
         sender.publish(Some(first.clone()));
         assert!(!has_news(&seen), "same block and the same shared lists");
@@ -209,12 +314,83 @@ mod tests {
         // Same block and equal contents, but new lists: the mempool's transactions changed.
         sender.publish(Some(snapshot(tip)));
         assert!(has_news(&seen));
-        seen.0.mark_unchanged();
+        seen.snapshots.mark_unchanged();
 
         sender.publish(Some(MempoolSnapshot {
             last_seen_tip_hash: block::Hash([2; 32]),
             ..receiver.latest().expect("a snapshot was published")
         }));
         assert!(has_news(&seen), "same lists on a new block");
+    }
+
+    /// A reader gets the mempool's progress on the block it asks about, whether the mempool
+    /// started on that block before or after it asked, and not its progress on another block.
+    #[tokio::test]
+    async fn reader_gets_the_progress_on_its_block() {
+        let older_tip = block::Hash([1; 32]);
+        let newer_tip = block::Hash([2; 32]);
+        let sender = MempoolSnapshotSender::new();
+        let mut receiver = sender.subscribe();
+
+        sender.start_tip(older_tip, 3, 40);
+        assert_eq!(
+            receiver.progress_on_tip(older_tip).await,
+            Some(MempoolTipProgress {
+                tip_hash: older_tip,
+                stage: MempoolTipStage::Reconciling {
+                    mempool_transactions: 3,
+                    work: 40,
+                },
+            }),
+            "the mempool had already started on the block"
+        );
+
+        let mut waiting = receiver.clone();
+        let waiting = tokio::spawn(async move { waiting.progress_on_tip(newer_tip).await });
+        tokio::task::yield_now().await;
+        sender.finish_tip(older_tip);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "progress on an older block is not progress on the block asked about"
+        );
+
+        sender.start_tip(newer_tip, 2, 7);
+        let started_after = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the mempool starting on the block wakes the reader")
+            .expect("the reader task does not panic");
+        assert_eq!(
+            started_after,
+            Some(MempoolTipProgress {
+                tip_hash: newer_tip,
+                stage: MempoolTipStage::Reconciling {
+                    mempool_transactions: 2,
+                    work: 7,
+                },
+            })
+        );
+    }
+
+    /// A reader that asks about a block the mempool has finished is told so, and one that
+    /// asks about a block the mempool never starts stops waiting when the mempool shuts down.
+    #[tokio::test]
+    async fn reader_learns_that_a_block_is_finished_or_that_the_mempool_stopped() {
+        let tip = block::Hash([1; 32]);
+        let sender = MempoolSnapshotSender::new();
+        let mut receiver = sender.subscribe();
+
+        sender.start_tip(tip, 3, 40);
+        sender.finish_tip(tip);
+        assert_eq!(
+            receiver.progress_on_tip(tip).await,
+            Some(MempoolTipProgress {
+                tip_hash: tip,
+                stage: MempoolTipStage::Reconciled,
+            })
+        );
+
+        drop(sender);
+        assert_eq!(receiver.progress_on_tip(block::Hash([2; 32])).await, None);
     }
 }

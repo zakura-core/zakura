@@ -25,6 +25,25 @@ pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 /// The mempool's part of that was at most 0.3 ms.
 pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The most work the mempool may report for a new block for a long poll answered on that tip
+/// to wait for the mempool's transactions. Above it, the long poll answers with the
+/// coinbase-only template at once.
+///
+/// The mempool reports the work when it starts on a block: the number of transparent outputs
+/// spent and created and of nullifiers revealed, by the block's transactions and by its own
+/// (see `MempoolTipStage::Reconciling`). It looks up or removes these one by one, so their
+/// number predicts how long it takes to have its transactions for the block ready.
+///
+/// The limit is set so that the wait is only started when the mempool is expected to finish
+/// within [`NEW_TIP_MEMPOOL_WAIT`]: at 100 to 200 ns for each part, this much work takes 5 to
+/// 10 ms. A long poll that waits and then answers coinbase-only delays work on the new tip
+/// for nothing: on blocks the mempool needed 63 to 100 ms for, every waiting long poll spent
+/// the whole wait and still answered coinbase-only.
+///
+/// Provisional: the mempool trace records the work and the time taken for each block, and
+/// measurements of both set this value.
+pub const NEW_TIP_MEMPOOL_LIGHT_WORK: usize = 50_000;
+
 /// How many long polls answered on a new tip may build a full template at the same time.
 ///
 /// Each one may ask the mempool, selects from its transactions and queues a template build.

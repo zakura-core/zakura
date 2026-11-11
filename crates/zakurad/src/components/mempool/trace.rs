@@ -23,14 +23,26 @@ pub(super) enum TipProcessing {
     Reset,
 }
 
+/// What the mempool held when a new tip arrived, and how much work the tip's block is.
+#[derive(Copy, Clone, Debug, Default)]
+pub(super) struct TipWork {
+    /// The number of verified transactions the mempool held before it applied the change.
+    pub(super) transactions_before: usize,
+    /// The work the mempool published for the block (see `Storage::tip_work`), or zero for a
+    /// reset, which empties the mempool whatever the block holds.
+    pub(super) work: usize,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "event", rename = "mempool_tip_processed")]
 struct MempoolTipProcessed<'a> {
     tip_height: u32,
     tip_hash: JsonlDisplay<'a, block::Hash>,
     action: TipProcessing,
+    tx_count_before: u64,
     tx_count_after: u64,
     requeued: u64,
+    work: u64,
     process_us: u64,
 }
 
@@ -43,6 +55,8 @@ pub(super) struct MempoolTrace(pub(super) JsonlEventEmitter);
 impl MempoolTrace {
     /// Records that the mempool applied the tip `tip` with `action`.
     ///
+    /// `work` is the number of verified transactions the mempool held before the change and
+    /// the amount of work it published for the block before applying it (zero for a reset).
     /// `tx_count_after` is the number of verified transactions left in the mempool.
     /// `requeued` is the number of transactions queued for re-verification.
     /// `process` is the time the mempool spent applying the change.
@@ -50,6 +64,7 @@ impl MempoolTrace {
         &self,
         action: TipProcessing,
         tip: (block::Hash, block::Height),
+        work: TipWork,
         tx_count_after: usize,
         requeued: usize,
         process: Duration,
@@ -59,8 +74,10 @@ impl MempoolTrace {
             tip_height: tip_height.0,
             tip_hash: JsonlDisplay(&tip_hash),
             action,
+            tx_count_before: saturating_count(work.transactions_before),
             tx_count_after: saturating_count(tx_count_after),
             requeued: saturating_count(requeued),
+            work: saturating_count(work.work),
             process_us: saturating_micros(process),
         });
     }

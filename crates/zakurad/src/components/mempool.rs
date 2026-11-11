@@ -58,7 +58,7 @@ use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
 
 use crate::components::sync::SyncStatus;
-use trace::{MempoolTrace, TipProcessing};
+use trace::{MempoolTrace, TipProcessing, TipWork};
 
 pub mod config;
 mod crawler;
@@ -729,10 +729,11 @@ impl Mempool {
     /// that no current snapshot is available.
     ///
     /// Rebuild only after processing a new tip. Otherwise keep a current cached list or
-    /// withdraw an invalidated one without copying transactions during admission.
+    /// withdraw an invalidated one without copying transactions during admission. A rebuild
+    /// also publishes that the mempool has finished that tip's block.
     fn publish_snapshot(&mut self, rebuild: bool) {
-        let snapshot = match &mut self.active_state {
-            ActiveState::Disabled => None,
+        let (snapshot, finished_tip) = match &mut self.active_state {
+            ActiveState::Disabled => (None, None),
             ActiveState::Enabled {
                 storage,
                 last_seen_tip_hash,
@@ -743,15 +744,56 @@ impl Mempool {
                 } else {
                     storage.cached_mining_snapshot()
                 };
-                lists.map(|(transactions, transaction_dependencies)| MempoolSnapshot {
-                    last_seen_tip_hash: *last_seen_tip_hash,
-                    transactions,
-                    transaction_dependencies,
-                })
+                let snapshot =
+                    lists.map(|(transactions, transaction_dependencies)| MempoolSnapshot {
+                        last_seen_tip_hash: *last_seen_tip_hash,
+                        transactions,
+                        transaction_dependencies,
+                    });
+                (snapshot, rebuild.then_some(*last_seen_tip_hash))
             }
         };
 
         self.snapshot_sender.publish(snapshot);
+        // Published after the lists, so a reader told that the block is finished finds them.
+        if let Some(finished_tip) = finished_tip {
+            self.snapshot_sender.finish_tip(finished_tip);
+        }
+    }
+
+    /// Publishes that the mempool has started on the block of `tip_action`, and how much work
+    /// that block is, before doing any of the work.
+    ///
+    /// A reader that cannot wait long for the block's transactions uses this to decide
+    /// whether to wait at all. A reset is published as holding nothing: it empties the
+    /// mempool whatever the block holds.
+    ///
+    /// Returns what was held and that work, for the trace. A disabled mempool holds nothing
+    /// and publishes nothing.
+    fn publish_tip_started(&self, tip_action: &TipAction) -> TipWork {
+        let ActiveState::Enabled { storage, .. } = &self.active_state else {
+            return TipWork::default();
+        };
+        let transactions_before = storage.transaction_count();
+        let (tip_hash, _height) = tip_action.best_tip_hash_and_height();
+
+        let work = match tip_action {
+            TipAction::Grow { block } => {
+                let work = storage.tip_work(&block.transactions);
+                self.snapshot_sender
+                    .start_tip(tip_hash, transactions_before, work);
+                work
+            }
+            TipAction::Reset { .. } => {
+                self.snapshot_sender.start_tip(tip_hash, 0, 0);
+                0
+            }
+        };
+
+        TipWork {
+            transactions_before,
+            work,
+        }
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -935,6 +977,13 @@ impl Service<Request> for Mempool {
             return Poll::Ready(Ok(()));
         }
 
+        // Say how much work the new block is before doing any of it: a mining long poll
+        // answers without the mempool's transactions rather than wait out a long removal.
+        let tip_work = tip_action
+            .as_ref()
+            .map(|tip_action| self.publish_tip_started(tip_action))
+            .unwrap_or_default();
+
         // Clear the mempool and cancel downloads if there has been a chain tip reset.
         //
         // But if the mempool was just freshly enabled,
@@ -988,6 +1037,7 @@ impl Service<Request> for Mempool {
                 self.trace.tip_processed(
                     TipProcessing::Reset,
                     tip_action.best_tip_hash_and_height(),
+                    tip_work,
                     storage.transaction_count(),
                     requeued,
                     reset_started.elapsed(),
@@ -1201,6 +1251,7 @@ impl Service<Request> for Mempool {
                 self.trace.tip_processed(
                     TipProcessing::Grow,
                     tip,
+                    tip_work,
                     storage.transaction_count(),
                     0,
                     grow_started.elapsed(),

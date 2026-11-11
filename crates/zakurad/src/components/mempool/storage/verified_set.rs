@@ -11,7 +11,7 @@ use std::{
 use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
-    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
@@ -46,6 +46,18 @@ pub(super) mod benchmarks;
 // Imports for doc links
 #[allow(unused_imports)]
 use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
+
+/// Returns the number of parts of `transaction` that the mempool looks up or removes one by
+/// one when a block arrives: the transparent outputs it creates and spends, and the
+/// nullifiers it reveals.
+pub(super) fn tracked_parts(transaction: &Transaction) -> usize {
+    transaction.outputs().len()
+        + transaction.inputs().len()
+        + transaction.sprout_nullifiers().count()
+        + transaction.sapling_nullifiers().count()
+        + transaction.orchard_nullifiers().count()
+        + transaction.ironwood_nullifiers().count()
+}
 
 /// The set of verified transactions stored in the mempool.
 ///
@@ -157,6 +169,19 @@ impl VerifiedSet {
     /// Returns the number of verified transactions in the set.
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    /// Returns the number of parts of its transactions that the set tracks one by one: the
+    /// transparent outputs they create and spend, and the nullifiers they reveal.
+    ///
+    /// Counts the same parts as [`tracked_parts`] does for one transaction.
+    pub fn tracked_parts(&self) -> usize {
+        self.created_outputs.len()
+            + self.spent_outpoints.len()
+            + self.sprout_nullifiers.len()
+            + self.sapling_nullifiers.len()
+            + self.orchard_nullifiers.len()
+            + self.ironwood_nullifiers.len()
     }
 
     /// Returns the total cost of the verified transactions in the set.
@@ -930,6 +955,35 @@ mod tests {
         let after_rejection = verified.mining_snapshot();
         assert!(Arc::ptr_eq(&populated.0, &after_rejection.0));
         assert!(Arc::ptr_eq(&populated.1, &after_rejection.1));
+    }
+
+    /// The set's count of tracked parts is the sum of its transactions' parts, as
+    /// transactions are added and removed.
+    #[test]
+    fn tracked_parts_count_the_parts_of_the_transactions_held() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        assert_eq!(verified.tracked_parts(), 0);
+
+        let first = factory.tx(10_000);
+        let second = factory.tx(10_000);
+        let first_id = first.transaction.id().mined_id();
+        let first_parts = tracked_parts(first.transaction.transaction());
+        let second_parts = tracked_parts(second.transaction.transaction());
+        assert!(
+            first_parts > 0 && second_parts > 0,
+            "every transaction spends or reveals something"
+        );
+
+        verified.insert(first, vec![], &mut pending, None).unwrap();
+        verified.insert(second, vec![], &mut pending, None).unwrap();
+        assert_eq!(verified.tracked_parts(), first_parts + second_parts);
+
+        assert_eq!(verified.remove_all([first_id]).len(), 1);
+        assert_eq!(verified.tracked_parts(), second_parts);
     }
 
     #[test]

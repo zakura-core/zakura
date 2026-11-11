@@ -67,10 +67,10 @@
 //!   At most 2 of those, tombstones, unwritten terminal outcomes and
 //!   publication slots, since each holds a slot, and each subscription's
 //!   sent-cursor ring within 4,096. At a pass, at most 2 kept waits, every
-//!   one a subscription is stalled on. No fixture reaches `CapacityBusy`
-//!   to keep a wait, so zakura-network's
-//!   `the_owner_holds_a_capacity_signal_only_while_a_stall_waits` is what
-//!   catches a pass that skips the pruning (Open coverage). At most 8 node
+//!   one a subscription is stalled on. The capacity-waits witness registers
+//!   one: a replaced session's acquire finds its peer's lease still live,
+//!   and a selected-chain change, before or after the subscription stalls
+//!   on it, leaves no stall referencing it. At most 8 node
 //!   and 2 peer execution slots, and at most 64 MiB of a peer's output.
 //!   The node output bytes
 //!   and the response slots are listed, not checked: their limits follow

@@ -1302,6 +1302,7 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "header-outstanding-churn",
                 "header-outstanding-serving-churn",
                 "header-outstanding-serving-replaced",
+                "header-outstanding-capacity-waits",
             ]),
         ),
         (

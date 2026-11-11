@@ -320,7 +320,7 @@ const AUTHORITY_CASES: [&str; 3] = [
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
-const OUTSTANDING_CASES: [&str; 9] = [
+const OUTSTANDING_CASES: [&str; 10] = [
     "header-authority-forks-sharing-a-header",
     "header-authority-relinked-mid-round",
     "header-reset-held-apply",
@@ -330,6 +330,7 @@ const OUTSTANDING_CASES: [&str; 9] = [
     "header-outstanding-churn",
     "header-outstanding-serving-churn",
     "header-outstanding-serving-replaced",
+    "header-outstanding-capacity-waits",
 ];
 
 /// The committed reset witnesses, each holding and applying
@@ -1907,6 +1908,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "unknown-as-known",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "waits-kept",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,

@@ -269,7 +269,7 @@ fn assert_dial_under_load(report: &zakura_sim::RunReport, pending: usize, connec
             } if *seq < dial_seq => Some((*inbound, *inbound_connections)),
             _ => None,
         })
-        .last();
+        .next_back();
     assert_eq!(
         held,
         Some((pending, connections)),
@@ -352,8 +352,10 @@ fn capability_flip_covers_inflight_handshake() {
         CapabilityFlip::AfterRegistration,
         CapabilityFlip::TwiceBeforeRegistration,
     ] {
-        let mut scenario = Scenario::default();
-        scenario.capability_flip = Some(order);
+        let mut scenario = Scenario {
+            capability_flip: Some(order),
+            ..Scenario::default()
+        };
         scenario.peers[0].handshake = Some(HandshakeSpec {
             dial_delay_ms: 1,
             ..HandshakeSpec::default()
@@ -476,12 +478,12 @@ fn malformed_prelude_resets_the_stream() {
 #[test]
 fn prelude_guards_apply_each_declared_consequence() {
     use zakura_sim::harness::handshake_wire::PRELUDE_FAULTS;
-    for index in 1..PRELUDE_FAULTS.len() {
+    for (index, fault) in PRELUDE_FAULTS.iter().enumerate().skip(1) {
         let mut input = [0; Wire::SCENARIO_BYTES];
         input[0] = 2;
         input[1] = u8::try_from(index).unwrap();
         let report = run(Wire::draw(&input));
-        let label = PRELUDE_FAULTS[index].label();
+        let label = fault.label();
         let effect = zakura_sim::table::handshake::PRELUDE
             .iter()
             .find(|(name, _)| *name == label)
@@ -496,22 +498,24 @@ fn installed_services_follow_each_peers_negotiation() {
     use zakura_network::zakura::{ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC};
     use zakura_sim::peer::PeerSpec;
     for node_dials in [false, true] {
-        let mut scenario = Scenario::default();
-        scenario.peers = [
-            ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC | (1 << 60) | (1 << 61),
-        ]
-        .into_iter()
-        .map(|capabilities| PeerSpec {
-            capabilities,
-            ..if node_dials {
-                PeerSpec::listening()
-            } else {
-                PeerSpec::dialing()
-            }
-        })
-        .collect();
+        let scenario = Scenario {
+            peers: [
+                ZAKURA_CAP_HEADER_SYNC,
+                ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
+                ZAKURA_CAP_HEADER_SYNC | (1 << 60) | (1 << 61),
+            ]
+            .into_iter()
+            .map(|capabilities| PeerSpec {
+                capabilities,
+                ..if node_dials {
+                    PeerSpec::listening()
+                } else {
+                    PeerSpec::dialing()
+                }
+            })
+            .collect(),
+            ..Scenario::default()
+        };
         let report = run(scenario);
         assert_held(&report, "session/installed-services-authorized");
         if node_dials {

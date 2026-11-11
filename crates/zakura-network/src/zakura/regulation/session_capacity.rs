@@ -178,7 +178,11 @@ impl SessionCapacity {
         });
         #[cfg(zakura_sim)]
         {
-            let mut owners = self.owners.reservations.lock().unwrap();
+            let mut owners = self
+                .owners
+                .reservations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             owners.retain(|owner| owner.strong_count() > 0);
             owners.push(Arc::downgrade(&reservation));
         }
@@ -360,7 +364,13 @@ impl SessionSlotsProbe {
             setup: 0,
             inbound_setup: 0,
         };
-        for owner in self.owners.reservations.lock().unwrap().iter() {
+        for owner in self
+            .owners
+            .reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
             let Some(owner) = owner.upgrade() else {
                 continue;
             };

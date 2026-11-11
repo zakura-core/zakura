@@ -55,7 +55,7 @@ fn honest_control_handshake_holds() {
 
 #[test]
 fn every_family_draws_a_conformant_control_exchange() {
-    for family in 0..6 {
+    for family in 0..7 {
         let mut input = [0; Wire::SCENARIO_BYTES];
         input[0] = family;
         let report = run(Wire::draw(&input));
@@ -138,6 +138,63 @@ fn slow_control_steps_exceed_the_overall_deadline() {
             .any(|violation| violation.actual.ends_with("Some(18000) ms")),
         "{deadline:?}"
     );
+}
+
+#[test]
+fn capability_flip_covers_inflight_handshake() {
+    use zakura_sim::harness::handshake_wire::CapabilityFlip;
+    for order in [
+        CapabilityFlip::BeforeRegistration,
+        CapabilityFlip::AfterRegistration,
+        CapabilityFlip::TwiceBeforeRegistration,
+    ] {
+        let mut scenario = Scenario::default();
+        scenario.capability_flip = Some(order);
+        scenario.peers[0].handshake = Some(HandshakeSpec {
+            dial_delay_ms: 1,
+            ..HandshakeSpec::default()
+        });
+        let report = run(scenario);
+        use zakura_sim::{observe::TransportFact, Observation};
+        let expected = if order == CapabilityFlip::AfterRegistration {
+            zakura_sim::witness::Expect::Holds
+        } else {
+            zakura_sim::witness::Expect::Violated
+        };
+        zakura_sim::witness::judge_report::<Wire>(
+            &report,
+            "session/renegotiation-covers-inflight-handshakes",
+            expected,
+        )
+        .unwrap();
+        let entries = report.log.entries();
+        let registered = entries.iter().position(|entry| matches!(&entry.obs,
+            Observation::Transport { event: TransportFact::Handshake { stage, .. }, .. } if stage == "registered"
+        )).unwrap();
+        let changes: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match &entry.obs {
+                Observation::Transport {
+                    event: TransportFact::CapabilitiesChanged { supported },
+                    ..
+                } if supported & zakura_network::zakura::ZAKURA_CAP_HEADER_SYNC != 0 => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            if order == CapabilityFlip::TwiceBeforeRegistration {
+                2
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            registered < changes[0],
+            order == CapabilityFlip::AfterRegistration
+        );
+    }
 }
 
 #[test]

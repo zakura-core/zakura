@@ -108,12 +108,13 @@ impl WireNode {
             dials,
             vec![NODE_ADDR],
             |_, _| Vec::new(),
+            |_| async {},
         )
     }
 
     /// Builds the same wire node with additional production services in its registry.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_with_services(
+    pub(crate) fn spawn_with_services<F: Future<Output = ()> + Send + 'static>(
         sim: &mut Sim,
         header: HeaderNode,
         network: &Network,
@@ -125,6 +126,7 @@ impl WireNode {
         additional: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> Vec<Arc<dyn Service>>
             + Send
             + 'static,
+        started: impl FnOnce(ZakuraEndpoint) -> F + Send + 'static,
     ) -> Self {
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
         let endpoint = WireEndpoint::spawn_configured(
@@ -141,7 +143,7 @@ impl WireNode {
                 services.extend(additional(supervisor, limits));
                 (services, ())
             },
-            |_, _, ()| async {},
+            |endpoint, _, ()| started(endpoint),
         );
         WireNode { header, endpoint }
     }
@@ -801,6 +803,23 @@ impl TransportTap {
             }
         };
         Ok(match event {
+            TransportEvent::HandshakeCapabilities {
+                remote,
+                shared_id,
+                supported,
+            } => (
+                None,
+                remote,
+                TransportFact::HandshakeCapabilities {
+                    shared_id: shared_id.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    supported,
+                },
+            ),
+            TransportEvent::CapabilitiesChanged { supported } => (
+                None,
+                NODE_ADDR,
+                TransportFact::CapabilitiesChanged { supported },
+            ),
             TransportEvent::PreludeJudged {
                 conn_id,
                 quic_stream,

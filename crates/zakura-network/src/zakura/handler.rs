@@ -1005,6 +1005,22 @@ pub struct ZakuraHeaderSyncDriverStartup {
 }
 
 impl ZakuraEndpoint {
+    /// Applies the production initial capability gate for a simulator witness.
+    #[cfg(zakura_sim)]
+    pub fn disable_header_sync_for_sim(&self) {
+        self.handler.set_header_sync_enabled(false);
+    }
+
+    /// Runs production capability enablement and its registered-peer reconnect pass.
+    #[cfg(zakura_sim)]
+    pub async fn enable_header_sync_for_sim(&self, epoch: u64) -> usize {
+        enable_header_sync_and_renegotiate(
+            &self.handler,
+            &self.supervisor,
+            zakura_node_services::sync_lifecycle::LifecycleEpoch::new(epoch),
+        )
+        .await
+    }
     /// Returns the local node identity used to authenticate native connections.
     pub(crate) fn local_node_id(&self) -> NodeId {
         self.quic.local_id()
@@ -3121,12 +3137,31 @@ impl ZakuraProtocolHandler {
     }
 
     fn set_header_sync_enabled(&self, enabled: bool) {
-        if enabled {
+        let _supported = if enabled {
             self.supported_capabilities
-                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed)
+                | ZAKURA_CAP_HEADER_SYNC
         } else {
             self.supported_capabilities
-                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed)
+                & !ZAKURA_CAP_HEADER_SYNC
+        };
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::CapabilitiesChanged {
+                supported: _supported,
+            }
+        );
+    }
+
+    #[cfg(zakura_sim)]
+    async fn pause_handshake(&self, phase: super::HandshakePhase) {
+        if let Some(pause) = self
+            .transport_observer
+            .as_ref()
+            .and_then(|observer| observer.handshake_pause())
+        {
+            pause.at(phase).await;
         }
     }
 
@@ -3357,6 +3392,16 @@ impl ZakuraProtocolHandler {
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
         let handshake_config = self.current_handshake_config();
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::HandshakeCapabilities {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                supported: handshake_config.supported_capabilities,
+            }
+        );
+        #[cfg(zakura_sim)]
+        self.pause_handshake(super::HandshakePhase::Snapshot).await;
         conn.trace_handshake(
             "control.started",
             "responder",
@@ -4563,6 +4608,11 @@ impl ZakuraProtocolHandler {
                 }
             );
         }
+        #[cfg(zakura_sim)]
+        if matches!(&registration, ZakuraRegistration::Registered { .. }) {
+            self.pause_handshake(super::HandshakePhase::Registered)
+                .await;
+        }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
         if let Some(report) = context.registration_report {
@@ -5569,6 +5619,19 @@ pub(crate) async fn serve_reported_native_dial_connection(
             .owners()
             .enter(OwnerPhase::Handshake);
         let handshake_config = endpoint.handler.current_handshake_config();
+        transport_observe!(
+            endpoint.handler.transport_observer,
+            super::TransportEvent::HandshakeCapabilities {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                supported: handshake_config.supported_capabilities,
+            }
+        );
+        #[cfg(zakura_sim)]
+        endpoint
+            .handler
+            .pause_handshake(super::HandshakePhase::Snapshot)
+            .await;
         let result = run_native_initiator_handshake(
             &connection,
             limits,

@@ -64,6 +64,8 @@ pub use message_rule::{
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
+#[cfg(zakura_sim)]
+pub use observe::{HandshakePause, HandshakePhase};
 #[cfg(any(test, zakura_sim))]
 pub use observe::{HeaderCheck, Transition, TransportEvent, TransportObserver};
 #[cfg(feature = "internal-bench")]

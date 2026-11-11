@@ -96,6 +96,13 @@ pub const ACK: &[&str] = &[
 /// Generates the control rows through the table property's usual registry and obligations.
 pub fn properties<S: HasView>() -> Vec<Property<S>> {
     let mut properties = Vec::new();
+    properties.push(Property {
+        id: PropertyId::new("session/renegotiation-covers-inflight-handshakes"),
+        claim: "Capability enablement closes every connection whose handshake captured the old capability mask.",
+        kind: Kind::Liveness { bound: LivenessBound::BeforeQuiescence },
+        assumes: &[], needs: &[Source::Closes], status: Status::Known { issue: 2334 },
+        check: check_epoch::<S>, witness: Some(TriggerHistory::Log(capability_flip_reached)),
+    });
     for (id, claim) in [
         (
             "handshake/pending-bounded",
@@ -191,6 +198,79 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         });
     }
     properties
+}
+
+fn epoch_closed(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::PeerConnectionClosed { shared_id, .. }
+        if key.subject == Subject::Session(shared_id.clone()))
+}
+
+fn check_epoch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    use zakura_network::zakura::ZAKURA_CAP_HEADER_SYNC;
+    let mut pending = Vec::new();
+    let mut applies = false;
+    for (at, obs) in cx.observations().enumerate() {
+        let Observation::Transport {
+            event: TransportFact::CapabilitiesChanged { supported },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        if supported & ZAKURA_CAP_HEADER_SYNC == 0 {
+            continue;
+        }
+        for entry in cx.log.entries() {
+            let Observation::Transport {
+                event: TransportFact::HandshakeCapabilities { shared_id, .. },
+                ..
+            } = &entry.obs
+            else {
+                continue;
+            };
+            if entry.step > cx.step {
+                continue;
+            }
+            applies = true;
+            let obligation =
+                cx.obligation(Some(at), Subject::Session(shared_id.clone()), epoch_closed);
+            if !cx
+                .log
+                .entries()
+                .iter()
+                .any(|entry| epoch_closed(&obligation.key, &entry.obs))
+            {
+                pending.push(obligation);
+            }
+        }
+    }
+    for obligation in pending {
+        cx.oblige(obligation);
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn capability_flip_reached(log: &crate::ObservationLog) -> bool {
+    use zakura_network::zakura::ZAKURA_CAP_HEADER_SYNC;
+    let mut snapshot = false;
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::Transport {
+                event: TransportFact::HandshakeCapabilities { supported, .. },
+                ..
+            } if supported & ZAKURA_CAP_HEADER_SYNC == 0 => snapshot = true,
+            Observation::Transport {
+                event: TransportFact::CapabilitiesChanged { supported },
+                ..
+            } if snapshot && supported & ZAKURA_CAP_HEADER_SYNC != 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {

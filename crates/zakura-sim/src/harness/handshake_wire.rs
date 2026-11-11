@@ -35,6 +35,21 @@ pub struct Scenario {
     pub net: NetScenario,
     /// Concurrent endpoints, which may share addresses or identities.
     pub peers: Vec<PeerSpec>,
+    /// A runtime capability change ordered against the control handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_flip: Option<CapabilityFlip>,
+}
+
+/// The reconnect snapshot's order relative to an in-flight handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityFlip {
+    /// Enable header sync after the handshake snapshot but before registration.
+    BeforeRegistration,
+    /// Enable header sync after registration enters the reconnect snapshot.
+    AfterRegistration,
+    /// Enable, disable, and enable again before registration.
+    TwiceBeforeRegistration,
 }
 
 impl Default for Scenario {
@@ -42,6 +57,7 @@ impl Default for Scenario {
         Self {
             net: NetScenario::default(),
             peers: vec![PeerSpec::dialing()],
+            capability_flip: None,
         }
     }
 }
@@ -103,6 +119,23 @@ impl Subsystem for Wire {
             .map(|i| format!("peer-{i}"))
             .collect();
         let (observer, tap) = TransportTap::sampling(sim, "node", net.clone(), names.clone());
+        let (observer, capability_control) = if let Some(order) = scenario.capability_flip {
+            use zakura_network::zakura::{HandshakePause, HandshakePhase};
+            let (reached, observed) = zakura_rt::sync::watch::channel(HandshakePhase::Waiting);
+            let (resume, released) = zakura_rt::sync::watch::channel(HandshakePhase::Waiting);
+            (
+                Arc::new(CapabilityObserver {
+                    inner: observer,
+                    pause: HandshakePause {
+                        reached,
+                        resume: released,
+                    },
+                }) as Arc<dyn zakura_network::zakura::TransportObserver>,
+                Some((order, observed, resume)),
+            )
+        } else {
+            (observer, None)
+        };
         let dials = tap.dials();
         let shared_ids = tap.shared_ids();
         sim.add_source(Box::new(tap.with_handshake_counts()));
@@ -145,6 +178,36 @@ impl Subsystem for Wire {
                     )) as Arc<dyn Service>,
                     Arc::new(PreludeLayouts),
                 ]
+            },
+            move |endpoint| async move {
+                use zakura_network::zakura::HandshakePhase;
+                let Some((order, mut reached, resume)) = capability_control else {
+                    return;
+                };
+                endpoint.disable_header_sync_for_sim();
+                if reached
+                    .wait_for(|phase| *phase == HandshakePhase::Snapshot)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if order == CapabilityFlip::AfterRegistration {
+                    resume.send_replace(HandshakePhase::Snapshot);
+                    if reached
+                        .wait_for(|phase| *phase == HandshakePhase::Registered)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                endpoint.enable_header_sync_for_sim(1).await;
+                if order == CapabilityFlip::TwiceBeforeRegistration {
+                    endpoint.disable_header_sync_for_sim();
+                    endpoint.enable_header_sync_for_sim(2).await;
+                }
+                resume.send_replace(HandshakePhase::Registered);
             },
         );
         let failure = PeerFailure::default();
@@ -202,7 +265,7 @@ impl Subsystem for Wire {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
         let mut scenario = Scenario::default();
         let mut script = HandshakeSpec::default();
-        match byte(0) % 6 {
+        match byte(0) % 7 {
             0 => script.control = HELLO_FAULTS[usize::from(byte(1)) % HELLO_FAULTS.len()],
             1 => {
                 scenario.peers[0] = PeerSpec::listening();
@@ -250,7 +313,16 @@ impl Subsystem for Wire {
                 script.retries = byte(1) % 32;
                 script.retry_delay_ms = u64::from(byte(2));
             }
-            _ => unreachable!("six families"),
+            6 => {
+                scenario.capability_flip = match byte(1) % 4 {
+                    0 => None,
+                    1 => Some(CapabilityFlip::BeforeRegistration),
+                    2 => Some(CapabilityFlip::AfterRegistration),
+                    _ => Some(CapabilityFlip::TwiceBeforeRegistration),
+                };
+                script.dial_delay_ms = 1;
+            }
+            _ => unreachable!("seven families"),
         }
         for peer in &mut scenario.peers {
             peer.handshake = Some(script.clone());
@@ -316,7 +388,7 @@ mod tests {
 
     #[test]
     fn draws_round_trip_millisecond_timing_and_address_families() {
-        for family in 0..6 {
+        for family in 0..7 {
             let mut bytes = [179; Wire::SCENARIO_BYTES];
             bytes[0] = family;
             let scenario = Wire::draw(&bytes);
@@ -330,6 +402,30 @@ mod tests {
 /// Production's built-in services currently declare only their newest persistent layout.
 #[derive(Debug)]
 struct PreludeLayouts;
+
+#[derive(Debug)]
+struct CapabilityObserver {
+    inner: Arc<dyn zakura_network::zakura::TransportObserver>,
+    pause: zakura_network::zakura::HandshakePause,
+}
+
+impl zakura_network::zakura::TransportObserver for CapabilityObserver {
+    fn observe(&self, event: zakura_network::zakura::TransportEvent) {
+        self.inner.observe(event);
+    }
+    fn handshakes(&self, probe: zakura_network::zakura::HandshakeProbe) {
+        self.inner.handshakes(probe);
+    }
+    fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
+        self.inner.quic_admission(probe);
+    }
+    fn connection(&self, id: ZakuraConnId, probe: zakura_network::zakura::ConnectionProbe) {
+        self.inner.connection(id, probe);
+    }
+    fn handshake_pause(&self) -> Option<zakura_network::zakura::HandshakePause> {
+        Some(self.pause.clone())
+    }
+}
 
 impl Service for PreludeLayouts {
     fn name(&self) -> &'static str {

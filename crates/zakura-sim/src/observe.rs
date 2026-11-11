@@ -1971,6 +1971,18 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// The control exchange captured the node's capability mask.
+    HandshakeCapabilities {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The captured capability mask.
+        supported: u64,
+    },
+    /// Runtime service demand changed the node's enabled capabilities.
+    CapabilitiesChanged {
+        /// The enabled mask after the change.
+        supported: u64,
+    },
     /// Admission machine charges and independently read semaphore usage.
     HandshakeCounts {
         /// The configured registered-connection limit per address.

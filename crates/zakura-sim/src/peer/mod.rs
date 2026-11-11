@@ -1358,6 +1358,9 @@ impl PeerTask {
     /// Dials the node, from a fresh address each time, until a connection
     /// ends without a [`PeerAction::Redial`] after it.
     async fn dial(&mut self, local: &Local, scripts: &mut Scripts) {
+        if let Some(script) = &self.spec.handshake {
+            handshake::options::delay(script.dial_delay_ms).await;
+        }
         let mut dial = 0;
         loop {
             let quic = self.bind(dial);

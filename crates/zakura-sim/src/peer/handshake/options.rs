@@ -205,6 +205,8 @@ impl PreludeFault {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandshakeSpec {
+    /// Delay before the peer begins dialing.
+    pub dial_delay_ms: u64,
     /// Field corruption on the hello or ack, according to the peer's role.
     pub control: ControlFault,
     /// Field corruption on each prelude the peer opens.

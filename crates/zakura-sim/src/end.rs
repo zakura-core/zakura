@@ -35,7 +35,9 @@ pub enum HarnessFailure {
     /// steps. That code is harness code, so it must not consume the plan.
     DrawOutsideStep,
     /// Nothing is enabled, yet the scheduler says the run can go on, as when a
-    /// source's deadline blocks time while it offers no action.
+    /// source's deadline blocks time while it offers no action, or when a
+    /// task is ready with no worker for it while a check is still open,
+    /// which the end can't conclude against the node.
     StuckWithoutAction {
         /// The scheduler's status.
         status: &'static str,

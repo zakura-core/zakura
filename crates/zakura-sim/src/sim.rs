@@ -646,6 +646,13 @@ impl Sim {
                     return st.end_harness(failure);
                 }
                 let rest = self.sched().status();
+                // A task ready with no worker would still run with more, so
+                // the end can't conclude what's open against the node.
+                if rest == Status::WorkerStarved && !checker.unfinished().is_empty() {
+                    return st.end_harness(HarnessFailure::StuckWithoutAction {
+                        status: "worker-starved",
+                    });
+                }
                 return match phase {
                     Phase::Drain => st.end_budget(drained, rest),
                     Phase::Live => match idle_status(rest) {
@@ -759,9 +766,10 @@ impl Sim {
             let after = self.sched().now();
             let next_offers = self.offers(phase, after, ready.is_empty());
             let status = self.sched().status();
-            // In the drain, a recovery boundary ahead is work the clock can
-            // still reach, such as a delivery whose window hasn't opened.
-            let quiescent = status != Status::Running
+            // A worker-starved scheduler still has a task ready. In the
+            // drain, a recovery boundary ahead is work the clock can still
+            // reach, such as a delivery whose window hasn't opened.
+            let quiescent = !matches!(status, Status::Running | Status::WorkerStarved)
                 && next_offers.iter().all(|offer| {
                     offer.actions.is_empty()
                         && (phase == Phase::Live

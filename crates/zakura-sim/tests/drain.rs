@@ -1405,3 +1405,46 @@ fn a_recovery_boundary_ahead_keeps_the_drain_from_quiescence() {
         outcome(&report, &SERVED)
     );
 }
+
+/// Terra 1, round 3: a step with a task ready but no worker for it isn't
+/// quiescent, so it expires no `BeforeQuiescence` obligation, and a run
+/// that ends dry that way with an obligation open fails as stuck rather
+/// than conclude it against the node, since more workers would let it go
+/// on.
+#[test]
+fn a_worker_starved_end_fails_rather_than_conclude() {
+    let report = checked(
+        config(1, 0),
+        world(),
+        vec![served_within(LivenessBound::BeforeQuiescence)],
+        Assumptions::none(),
+        |sim| {
+            sim.scheduler().spawn_root("request-p1", async {});
+            // The holder yields holding the lock, the waiter takes the only
+            // worker and parks on it, and the holder is ready with no worker.
+            let lock = Arc::new(zakura_rt::sync::Mutex::new(()));
+            let held = lock.clone();
+            sim.scheduler().spawn_root("holder", async move {
+                #[allow(clippy::await_holding_lock)]
+                {
+                    let _guard = held.lock().unwrap();
+                    task::yield_now().await;
+                }
+            });
+            sim.scheduler().spawn_root("waiter", async move {
+                drop(lock.lock().unwrap());
+            });
+        },
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert_eq!(
+        report.end.harness,
+        Some(HarnessFailure::StuckWithoutAction {
+            status: "worker-starved"
+        })
+    );
+    assert_eq!(
+        outcome(&report, &SERVED),
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
+    );
+}

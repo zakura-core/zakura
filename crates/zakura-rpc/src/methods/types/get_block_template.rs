@@ -499,7 +499,7 @@ pub struct BlockTemplateResponse {
     pub(crate) submit_old: Option<bool>,
 
     /// The JSON of this template's answer, when the template was taken from the store that
-    /// long polls share, so that the answer is encoded once for all of them.
+    /// requests share, so that the answer is encoded once for all of them.
     ///
     /// It describes the template as it was taken, with this `submit_old`. It is set as the
     /// template is returned to its caller, and the template is not changed after that.
@@ -531,6 +531,16 @@ impl PartialEq for SharedJson {
 impl Eq for SharedJson {}
 
 impl BlockTemplateResponse {
+    /// Whether this template carries the times and difficulty that a template built from
+    /// `chain_info` would: it was built on the same chain state, in the same second of the
+    /// node's clock.
+    pub(crate) fn has_times_of(&self, chain_info: &GetBlockTemplateChainInfo) -> bool {
+        self.cur_time == chain_info.cur_time
+            && self.min_time == chain_info.min_time
+            && self.max_time == chain_info.max_time
+            && self.bits == chain_info.expected_difficulty
+    }
+
     /// Returns this template's answer as finished JSON, if it shares one and is being written
     /// into an RPC response.
     fn shared_response_json(&self) -> Option<&RawValue> {

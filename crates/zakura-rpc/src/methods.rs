@@ -1103,6 +1103,10 @@ where
 /// the point past which a parent's templates cost more than they are worth.
 const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the task that builds templates ahead of requests waits for the state to describe a
+/// new tip, before it gives up on that tip. No miner waits on it.
+const BUILD_AHEAD_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The outcome of validating one server mining template.
 enum Preparation {
     /// The template passed proposal validation.
@@ -1670,6 +1674,224 @@ where
                 .best_tip_hash()
                 .is_some_and(|tip| tip != parent)
             || (!state.needs_fallback() && state.revision != revision)
+    }
+
+    /// Chooses the template's transactions from the mempool's `mempool_txs` and builds the
+    /// template named `long_poll_id` on `chain_info`.
+    ///
+    /// Apart from the random weighted choice of transactions, the template depends only on the
+    /// arguments. Returns it without a `submit_old`, with how long choosing took and the build's
+    /// times. Fails only if the coinbase transaction cannot be built or no build slot comes free.
+    async fn select_and_build_template(
+        &self,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: &[VerifiedUnminedTx],
+        mempool_tx_deps: &TransactionDependencies,
+    ) -> Result<(BlockTemplateResponse, Duration, BuildTimes)> {
+        use types::get_block_template::zip317::select_mempool_transactions;
+
+        tracing::debug!(
+            mempool_tx_hashes = ?mempool_txs
+                .iter()
+                .map(|tx| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>(),
+            "selecting transactions for the template from the mempool"
+        );
+
+        let height = chain_info.tip_height.next().map_misc_error()?;
+
+        // Randomly select some mempool transactions.
+        let selection_started = std::time::Instant::now();
+        let mempool_txs = select_mempool_transactions(
+            &self.network,
+            height,
+            miner_params,
+            if is_zip234_active(&self.network, height) {
+                Some(
+                    parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                        .map_misc_error()?,
+                )
+            } else {
+                None
+            },
+            mempool_txs.iter().cloned(),
+            mempool_tx_deps,
+        )
+        .map_misc_error()?;
+        let selection = selection_started.elapsed();
+
+        tracing::debug!(
+            selected_mempool_tx_hashes = ?mempool_txs
+                .iter()
+                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>(),
+            "selected transactions for the template from the mempool"
+        );
+
+        let (template, build_times) = self
+            .build_mining_template(
+                None,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                mempool_txs,
+                None,
+            )
+            .await?;
+        Ok((template, selection, build_times))
+    }
+
+    /// Builds the template for each new tip without waiting for a request, and stores it for the
+    /// requests that arrive after that block.
+    ///
+    /// A request that arrives once the template is stored is answered from it instead of
+    /// choosing transactions, building and encoding. A long poll that is already waiting when the
+    /// block arrives gains nothing: it starts on the same tip change as this task, and whichever
+    /// of the two claims the build first does it for both.
+    ///
+    /// Requests never wait for this task to get to a template. It claims the build only once it
+    /// holds everything the build needs, so until then a request finds nothing in progress and
+    /// answers on the new tip itself.
+    ///
+    /// Returns when the node has no miner address, the chain tip channel closes, or the node is
+    /// shutting down.
+    pub(crate) async fn run_template_builder(self) {
+        let Some(miner_params) = self.gbt.miner_params() else {
+            return;
+        };
+        let mut tip = self.latest_chain_tip.clone();
+        let mut rejections = self.gbt.template_rejections.subscribe();
+
+        while !zakura_chain::shutdown::is_shutting_down() {
+            // Tip changes from here on end this tip's build and start the next one.
+            tip.mark_best_tip_seen();
+            tokio::select! {
+                biased;
+
+                changed = tip.best_tip_changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                built = self.build_template_ahead(miner_params, &mut rejections) => {
+                    if let Err(error) = built {
+                        tracing::debug!(
+                            ?error,
+                            "could not build a mining template ahead of requests on this tip"
+                        );
+                    }
+                }
+            }
+            if tip.best_tip_changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Builds and stores the template for the current tip, and encodes the answers that requests
+    /// arriving after a new block ask for.
+    ///
+    /// Does nothing while the node is not synced, when the miner's reward needs a proof, while
+    /// this tip's templates are being recovered after a rejection, and when other work on this
+    /// tip is being built. A proof takes seconds and holds the only build slot, so those
+    /// templates are left to the requests that need them.
+    ///
+    /// Waits for the mempool to process the tip's block for as long as that takes. The caller
+    /// drops this future when the tip changes.
+    async fn build_template_ahead(
+        &self,
+        miner_params: &types::get_block_template::MinerParams,
+        rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
+    ) -> Result<()> {
+        use types::get_block_template::{check_synced_to_tip, fetch_chain_info};
+
+        if check_synced_to_tip(&self.network, self.latest_chain_tip.clone()).is_err() {
+            return Ok(());
+        }
+        let chain_info = tokio::time::timeout(
+            BUILD_AHEAD_STATE_TIMEOUT,
+            fetch_chain_info(self.read_state.clone()),
+        )
+        .await
+        .map_misc_error()??;
+        let tip_hash = chain_info.tip_hash;
+        let height = chain_info.tip_height.next().map_misc_error()?;
+        if matches!(
+            TemplateBuildWork::for_coinbase(&self.network, height, miner_params),
+            TemplateBuildWork::Proof
+        ) {
+            return Ok(());
+        }
+
+        let mut mempool_snapshots = self.mempool_snapshots.clone();
+        let Some(mempool) = mempool_snapshots.on_tip(tip_hash).await else {
+            return Ok(());
+        };
+
+        // Read after the wait for the mempool, so the template is named for the rejection state
+        // a request arriving now would read.
+        let Some(rejection_state) = self.track_template_parent(tip_hash, rejections) else {
+            return Ok(());
+        };
+        if rejection_state.needs_fallback() {
+            return Ok(());
+        }
+        let mut long_poll_id = LongPollInput::new(
+            chain_info.tip_height,
+            tip_hash,
+            chain_info.max_time,
+            mempool.transactions.iter().map(|tx| tx.transaction.id()),
+        )
+        .generate_id();
+        long_poll_id.revision = rejection_state.revision;
+
+        let store = &self.gbt.shared_template;
+        let shared = match store.wait_for(tip_hash, &long_poll_id).await {
+            // A request built this template first.
+            Some(shared) => shared,
+            None => {
+                let Some(build) = store.claim(tip_hash, long_poll_id) else {
+                    return Ok(());
+                };
+                let (template, _selection, _build_times) = self
+                    .select_and_build_template(
+                        miner_params,
+                        &chain_info,
+                        long_poll_id,
+                        &mempool.transactions,
+                        &mempool.transaction_dependencies,
+                    )
+                    .await?;
+                let Some(shared) = build.publish(template) else {
+                    return Ok(());
+                };
+
+                // Validate the template in the background, as a request's build does.
+                let state = self.gbt.template_rejections.borrow().clone();
+                if !state.needs_fallback()
+                    && !self.template_superseded(&state, tip_hash, long_poll_id.revision)
+                {
+                    self.prepare_template_in_background(&shared.template);
+                }
+                shared
+            }
+        };
+
+        // On a new tip, a long poll that still names the old tip is told to drop its old work,
+        // and a request without a long poll ID has no `submit_old`. The template is already
+        // stored, so nobody waits for these encodings.
+        tokio::task::spawn_blocking(move || {
+            for submit_old in [Some(false), None] {
+                let mut answer = BlockTemplateResponse::clone(&shared.template);
+                answer.submit_old = submit_old;
+                shared.json.get_or_encode(&answer);
+            }
+        })
+        .await
+        .map_misc_error()
     }
 
     /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
@@ -3672,7 +3894,7 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal,
         };
         use types::transaction::coinbase_needs_proof;
 
@@ -4060,39 +4282,50 @@ where
                 }
             };
 
-            // - Sharing one template between long polls
+            // - Sharing one template between requests
             //
-            // Long polls that ask for the same work share one template: the first of them builds
-            // it and the rest take it. A long poll waits only for a build of its own long poll ID,
-            // never for other work on the same tip. A caller without a long poll ID asks for a
-            // template now, and a template past its time range must be rebuilt, so neither shares.
-            let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
-                if let Some(template) = self
-                    .gbt
+            // Requests that ask for the same work share one template: the first long poll to ask
+            // builds it, or the node builds it ahead of them on a new tip, and the rest take it.
+            //
+            // A long poll waits only for a build of its own long poll ID, never for other work on
+            // the same tip. A request without a long poll ID asks for a template now: it never
+            // waits, and it takes a stored template only when that is the template it would build,
+            // down to the current time. A template past its time range must be rebuilt.
+            let shared = if max_time_reached {
+                None
+            } else if client_long_poll_id.is_some() {
+                self.gbt
                     .shared_template
                     .wait_for(chain_info.tip_hash, &server_long_poll_id)
                     .await
-                {
-                    if let Some(response) = self.reuse_shared_template(template, submit_old).await?
-                    {
-                        drop(full_first_answer);
-                        if let GetBlockTemplateResponse::TemplateMode(template) = &response {
-                            // Nothing was chosen or built for this answer.
-                            self.gbt.trace.full_returned(
-                                request_id,
-                                template,
-                                wait_reason,
-                                Duration::ZERO,
-                                BuildTimes {
-                                    wait: Duration::ZERO,
-                                    run: Duration::ZERO,
-                                },
-                                request_started.elapsed(),
-                            );
-                        }
-                        return Ok(response);
+            } else {
+                self.gbt
+                    .shared_template
+                    .ready(&server_long_poll_id)
+                    .filter(|shared| shared.template.has_times_of(&chain_info))
+            };
+            if let Some(shared) = shared {
+                if let Some(response) = self.reuse_shared_template(shared, submit_old).await? {
+                    drop(full_first_answer);
+                    if let GetBlockTemplateResponse::TemplateMode(template) = &response {
+                        // Nothing was chosen or built for this answer.
+                        self.gbt.trace.full_returned(
+                            request_id,
+                            template,
+                            wait_reason,
+                            Duration::ZERO,
+                            BuildTimes {
+                                wait: Duration::ZERO,
+                                run: Duration::ZERO,
+                            },
+                            request_started.elapsed(),
+                        );
                     }
+                    return Ok(response);
                 }
+            }
+            // Only a long poll stores the template it builds.
+            let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
                 self.gbt
                     .shared_template
                     .claim(chain_info.tip_hash, server_long_poll_id)
@@ -4100,60 +4333,15 @@ where
                 None
             };
 
-            // - Processing fetched data to create a transaction template
-            //
-            // Apart from random weighted transaction selection,
-            // the template only depends on the previously fetched data.
-            // This processing fails only if the coinbase transaction cannot be built.
-
-            tracing::debug!(
-                mempool_tx_hashes = ?mempool_txs
-                    .iter()
-                    .map(|tx| tx.transaction.id().mined_id())
-                    .collect::<Vec<_>>(),
-                "selecting transactions for the template from the mempool"
-            );
-
-            let height = chain_info.tip_height.next().map_misc_error()?;
-
-            // Randomly select some mempool transactions.
-            let selection_started = std::time::Instant::now();
-            let mempool_txs = select_mempool_transactions(
-                &self.network,
-                height,
-                miner_params,
-                if is_zip234_active(&self.network, height) {
-                    Some(
-                        parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
-                            .map_misc_error()?,
-                    )
-                } else {
-                    None
-                },
-                mempool_txs.iter().cloned(),
-                mempool_tx_deps,
-            )
-            .map_misc_error()?;
-            let selection = selection_started.elapsed();
-
-            tracing::debug!(
-                selected_mempool_tx_hashes = ?mempool_txs
-                    .iter()
-                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
-                    .collect::<Vec<_>>(),
-                "selected transactions for the template from the mempool"
-            );
-
             // - After this point, the template only depends on the previously fetched data.
 
-            let (mut template, build_times) = self
-                .build_mining_template(
-                    None,
+            let (mut template, selection, build_times) = self
+                .select_and_build_template(
                     miner_params,
                     &chain_info,
                     server_long_poll_id,
-                    mempool_txs,
-                    None,
+                    &mempool_txs,
+                    &mempool_tx_deps,
                 )
                 .await?;
             drop(full_first_answer);

@@ -1669,26 +1669,269 @@ fn shared_template_answer_is_the_bytes_of_a_fresh_encoding() {
     });
 }
 
-/// A request without a long poll ID asks for a template now, so it builds its own.
+/// A request without a long poll ID asks for a template now. It takes a stored template only
+/// when that is the template it would build, and it never stores the one it builds.
 #[test]
-fn request_without_a_long_poll_id_does_not_take_a_shared_template() {
+fn request_without_a_long_poll_id_takes_only_the_template_it_would_build() {
     mining_runtime(async {
-        let next = chain_info(3, 2, 400_000_000);
-        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
-        let shared = bounded(long_poll(&rpc, old_tip_id))
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
             .await
             .unwrap()
             .try_into_template()
             .unwrap();
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let plain = || async {
+            bounded(rpc.get_block_template(None))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap()
+        };
 
-        let own = bounded(rpc.get_block_template(None))
+        // Nothing is stored yet, and this request's own build is not stored either.
+        let own = plain().await;
+        let shared = bounded(long_poll(&rpc, initial.long_poll_id))
             .await
             .unwrap()
             .try_into_template()
             .unwrap();
         assert_eq!(own.long_poll_id, shared.long_poll_id);
-        assert_eq!(own.submit_old, None);
         assert_ne!(own.work_id(), shared.work_id());
+
+        // The stored template is what a request in the same second would build.
+        let taken = plain().await;
+        assert_eq!(taken.work_id(), shared.work_id());
+        assert_eq!(taken.submit_old, None);
+
+        // A second later the same work has a newer time, so the request builds it.
+        info_tx.send_modify(|info| info.cur_time = 1654008618.into());
+        let later = plain().await;
+        assert_eq!(later.long_poll_id, shared.long_poll_id);
+        assert_eq!(later.cur_time, 1654008618.into());
+        assert_ne!(later.work_id(), shared.work_id());
+    });
+}
+
+/// The ID of the template on the tip `info` names, for the one transaction that
+/// [`populated_mining_rpc`]'s mempool holds.
+fn populated_template_id(info: &GetBlockTemplateChainInfo) -> types::long_poll::LongPollId {
+    types::long_poll::LongPollInput::new(
+        info.tip_height,
+        info.tip_hash,
+        info.max_time,
+        [fake_verified_mempool_tx().transaction.id()],
+    )
+    .generate_id()
+}
+
+/// Returns the template stored for the tip `info` names, once the task that builds templates
+/// ahead of requests has stored it and encoded its answers.
+async fn template_built_ahead(
+    rpc: &TestRpcImpl,
+    info: &GetBlockTemplateChainInfo,
+) -> BlockTemplateResponse {
+    let id = populated_template_id(info);
+    let stored = bounded(async {
+        loop {
+            if let Some(stored) = rpc.gbt.shared_template.ready(&id) {
+                break stored;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // The task encodes on the one blocking thread, so this job runs after its encoding.
+    bounded(tokio::task::spawn_blocking(|| ())).await.unwrap();
+    BlockTemplateResponse::clone(&stored.template)
+}
+
+/// Lets the tasks that are ready to run do so, for a test that then checks nothing happened.
+async fn let_other_tasks_run() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// On each new tip the node builds the template without being asked. Requests that arrive
+/// after it, with or without a long poll ID, are answered from that template: they complete
+/// while the build slot is held, so they did not build.
+#[test]
+fn requests_after_a_new_tip_take_the_template_built_ahead() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        tokio::spawn(rpc.clone().run_template_builder());
+
+        let mut old_tip_id = initial.long_poll_id;
+        for next in [chain_info(3, 2, 400_000_000), chain_info(4, 3, 400_000_000)] {
+            move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+            let built_ahead = template_built_ahead(&rpc, &next).await;
+            assert_eq!(built_ahead.previous_block_hash, next.tip_hash);
+            assert_eq!(built_ahead.transactions.len(), 1);
+
+            let gate = TemplateBuildGate::new(&rpc).await;
+            let plain = bounded(rpc.get_block_template(None))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            let polled = bounded(long_poll(&rpc, old_tip_id))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            gate.release().await;
+
+            assert_eq!(plain.work_id(), built_ahead.work_id());
+            assert_eq!(plain.submit_old, None);
+            assert_eq!(polled.work_id(), built_ahead.work_id());
+            assert_eq!(polled.submit_old, Some(false));
+            old_tip_id = polled.long_poll_id;
+        }
+    });
+}
+
+/// A long poll that is waiting when the tip changes and the task that builds ahead start on the
+/// same change. One of them builds the template and the other takes it.
+#[test]
+fn waiting_long_poll_and_the_build_ahead_share_one_build() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        tokio::spawn(rpc.clone().run_template_builder());
+        let mut waiting = long_poll(&rpc, initial.long_poll_id);
+        assert!(futures::poll!(&mut waiting).is_pending());
+
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let answered = bounded(waiting).await.unwrap().try_into_template().unwrap();
+        let stored = template_built_ahead(&rpc, &next).await;
+
+        assert_eq!(answered.previous_block_hash, next.tip_hash);
+        assert_eq!(answered.transactions.len(), 1);
+        assert_eq!(answered.work_id(), stored.work_id());
+    });
+}
+
+/// The task that builds ahead waits for the mempool to process the new block for as long as
+/// that takes. A long poll that arrives meanwhile is not held for it: it is answered on the new
+/// tip by its own build.
+#[test]
+fn long_poll_is_not_held_while_the_build_ahead_waits_for_the_mempool() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        tokio::spawn(rpc.clone().run_template_builder());
+
+        // A block lands, and the mempool has not published its list for it.
+        let next = chain_info(3, 2, 400_000_000);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_height(next.tip_height);
+        tip.send_best_tip_hash(next.tip_hash);
+        let_other_tasks_run().await;
+        let id = populated_template_id(&next);
+        assert!(rpc.gbt.shared_template.ready(&id).is_none());
+
+        let answered = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(answered.previous_block_hash, next.tip_hash);
+        assert_eq!(answered.submit_old, Some(false));
+
+        // Once the mempool publishes its list, the stored template is the long poll's.
+        mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
+            last_seen_tip_hash: next.tip_hash,
+            transactions: vec![fake_verified_mempool_tx()].into(),
+            transaction_dependencies: Default::default(),
+        }));
+        let stored = template_built_ahead(&rpc, &next).await;
+        assert_eq!(stored.work_id(), answered.work_id());
+    });
+}
+
+/// Nothing is built ahead on a tip whose templates are being recovered after a rejection: only
+/// validated fallback work may be handed out there.
+#[test]
+fn nothing_is_built_ahead_while_a_tip_recovers_from_a_rejection() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        tokio::spawn(rpc.clone().run_template_builder());
+
+        let next = chain_info(3, 2, 400_000_000);
+        rpc.gbt.template_rejections.send_modify(|state| {
+            state.set_parent(next.tip_hash);
+            state.reject(next.tip_hash, "rejected-work");
+        });
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let_other_tasks_run().await;
+
+        let mut id = populated_template_id(&next);
+        id.revision = rpc.gbt.template_rejections.borrow().revision;
+        assert!(rpc.gbt.shared_template.ready(&id).is_none());
+    });
+}
+
+/// The answers encoded ahead of requests are the bytes that encoding the template afresh gives,
+/// for a request without a long poll ID and for a long poll from the old tip.
+#[test]
+fn answers_encoded_ahead_are_the_bytes_of_a_fresh_encoding() {
+    use crate::server::jsonrpc::{Id, MethodResponse};
+
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        tokio::spawn(rpc.clone().run_template_builder());
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let built_ahead = template_built_ahead(&rpc, &next).await;
+
+        let answers = [
+            bounded(rpc.get_block_template(None)).await.unwrap(),
+            bounded(long_poll(&rpc, initial.long_poll_id))
+                .await
+                .unwrap(),
+        ];
+        for (answer, submit_old) in answers.into_iter().zip([None, Some(false)]) {
+            let mut afresh = answer.clone().try_into_template().unwrap();
+            assert_eq!(afresh.work_id(), built_ahead.work_id());
+            assert_eq!(afresh.submit_old, submit_old);
+            afresh.shared_json = Default::default();
+            let afresh = GetBlockTemplateResponse::from(afresh);
+
+            let response = |template: &GetBlockTemplateResponse| {
+                MethodResponse::response(Id::Number(1), &Ok(template), usize::MAX)
+            };
+            assert_eq!(
+                response(&answer).as_json().get(),
+                response(&afresh).as_json().get()
+            );
+        }
     });
 }
 

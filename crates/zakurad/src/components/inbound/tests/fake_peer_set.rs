@@ -1723,7 +1723,8 @@ async fn setup_with_misbehavior_receiver(
             sync_status.clone(),
             latest_chain_tip.clone(),
             block_announcements,
-            peer_set.clone(),
+            Some(peer_set.clone()),
+            None,
             read_only_state_service,
             Some(submitblock_channel.receiver()),
         )

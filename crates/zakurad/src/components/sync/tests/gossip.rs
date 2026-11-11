@@ -3,17 +3,19 @@
 #![allow(clippy::unwrap_in_result)]
 
 use crate::components::sync::{self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipError, SyncStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     task::JoinHandle,
     time::{timeout, Instant},
 };
-use tower::{util::BoxCloneService, ServiceExt};
+use tower::{util::BoxCloneService, Service, ServiceExt};
 use zakura_chain::{
     block::{Block, Height},
     parameters::Network::Mainnet,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
+use zakura_network::NoEligibleBlockPeers;
 use zakura_network::{AdvertisedBlock, Request, Response};
 use zakura_rpc::{
     EarlyMinedBlock, EarlyMinedBlockChannel, MinedBlockSubmission, PendingBlockSignal,
@@ -87,7 +89,8 @@ fn start(
         sync_status,
         latest_tip,
         announcements,
-        peer_set.clone(),
+        Some(peer_set.clone()),
+        None,
         read_state,
         Some(early.receiver()),
     ));
@@ -157,18 +160,15 @@ async fn relayed_tip_change_is_gossiped_without_waiting() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn ordinary_updates_coalesce_but_local_commits_are_all_broadcast() {
+async fn newer_local_commit_replaces_an_older_waiting_block() {
     let (mut sender, mut gossip) = setup().await;
     local_commit(&mut sender, block(2));
     local_commit(&mut sender, block(3));
-    // Both publications happen before gossip runs. No ordinary relay is queued for either.
-    for n in [2, 3] {
-        gossip
-            .peer_set
-            .expect_request(Request::AdvertiseMinedBlock(with_size(&block(n))))
-            .await
-            .respond(Response::Nil);
-    }
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block(3))))
+        .await
+        .respond(Response::Nil);
     gossip.peer_set.expect_no_requests().await;
 }
 
@@ -254,7 +254,10 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .unwrap();
     gossip
         .peer_set
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .expect_request(Request::AdvertiseMinedBlock(AdvertisedBlock::submitted(
+            local.hash(),
+            local.zcash_serialized_size(),
+        )))
         .await
         .respond(Response::Nil);
     local_commit(&mut sender, local.clone());
@@ -406,4 +409,230 @@ async fn ordinary_relay_pauses_when_sync_falls_behind_and_local_commits_continue
         .expect_request(Request::AdvertiseBlock(without_size(&block(2)), None))
         .await
         .respond(Response::Nil);
+}
+
+/// A block advertisement service whose connected peers the test controls, standing in for a
+/// protocol that has nobody to advertise to.
+struct GatedPeers {
+    /// Receives the advertisements that reach a peer.
+    inner: MockService<Request, Response, PanicAssertion>,
+
+    /// Set while a peer can receive an advertisement.
+    has_peers: tokio::sync::watch::Receiver<bool>,
+
+    /// How many dispatches report that every peer disappeared before the advertisement was sent.
+    vanishing: Arc<AtomicUsize>,
+
+    /// The wait for a peer, while one is in progress.
+    waiting: Option<futures::future::BoxFuture<'static, ()>>,
+}
+
+impl Clone for GatedPeers {
+    /// Clones the handle without its wait, like the node's block advertiser.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            has_peers: self.has_peers.clone(),
+            vanishing: self.vanishing.clone(),
+            waiting: None,
+        }
+    }
+}
+
+impl Service<Request> for GatedPeers {
+    type Response = Response;
+    type Error = crate::BoxError;
+    type Future = futures::future::BoxFuture<'static, Result<Response, crate::BoxError>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        if self.waiting.is_none() {
+            let mut has_peers = self.has_peers.clone();
+            self.waiting = Some(Box::pin(async move {
+                while !*has_peers.borrow_and_update() {
+                    has_peers.changed().await.expect("the test owns the sender");
+                }
+            }));
+        }
+        let waiting = self.waiting.as_mut().expect("a wait was just installed");
+        std::task::ready!(futures::FutureExt::poll_unpin(waiting, cx));
+        self.waiting = None;
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        // These tests are single threaded, so a load and a store report each vanishing dispatch
+        // exactly once.
+        if self.vanishing.load(Ordering::SeqCst) > 0 {
+            self.vanishing.fetch_sub(1, Ordering::SeqCst);
+            return Box::pin(std::future::ready(Err(
+                Box::new(NoEligibleBlockPeers) as crate::BoxError
+            )));
+        }
+        Box::pin(self.inner.clone().oneshot(request))
+    }
+}
+
+/// Starts both protocols through the production state publication API, with legacy readiness gated.
+struct GatedSetup {
+    sender: ChainTipSender,
+    gossip: GossipTestSetup,
+    peers: tokio::sync::watch::Sender<bool>,
+    native: MockService<Request, Response, PanicAssertion>,
+    vanishing: Arc<AtomicUsize>,
+}
+
+fn gated() -> GatedSetup {
+    let _init = zakura_test::init();
+    let (sender, latest, _) = ChainTipSender::new(None, &Mainnet);
+    let (sender, announcements) = sender.with_block_announcements();
+    let (peers, has_peers) = tokio::sync::watch::channel(false);
+    let vanishing = Arc::new(AtomicUsize::new(0));
+    let legacy = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let native = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let service = BoxCloneService::new(GatedPeers {
+        inner: legacy.clone(),
+        has_peers,
+        vanishing: vanishing.clone(),
+        waiting: None,
+    });
+    let (status, mut recent_syncs) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    let early = EarlyMinedBlockChannel::new();
+    let early_sender = early.sender();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        latest,
+        announcements,
+        Some(service),
+        Some(BoxCloneService::new(native.clone())),
+        read_state_without_sizes(),
+        Some(early.receiver()),
+    ));
+    GatedSetup {
+        sender,
+        gossip: GossipTestSetup {
+            peer_set: legacy,
+            early_sender,
+            task,
+            recent_syncs,
+        },
+        peers,
+        native,
+        vanishing,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_protocol_without_peers_does_not_delay_the_other_and_gets_only_current_work() {
+    let GatedSetup {
+        mut sender,
+        mut gossip,
+        peers,
+        mut native,
+        ..
+    } = gated();
+    for n in [1, 2, 3] {
+        local_commit(&mut sender, block(n));
+        native
+            .expect_request(Request::AdvertiseMinedBlock(with_size(&block(n))))
+            .await
+            .respond(Response::Nil);
+    }
+    peers.send_replace(true);
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block(3))))
+        .await
+        .respond(Response::Nil);
+    gossip.peer_set.expect_no_requests().await;
+    native.expect_no_requests().await;
+    gossip.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejected_early_work_waiting_for_a_peer_is_discarded() {
+    let GatedSetup {
+        sender: _sender,
+        mut gossip,
+        peers,
+        mut native,
+        ..
+    } = gated();
+    let local = block(2);
+    let (pending, failure) = PendingBlockSignal::waiting_for_tests();
+    gossip
+        .early_sender
+        .send(EarlyMinedBlock {
+            admission: zakura_state::BlockAdmission::pending(),
+            hash: local.hash(),
+            height: Height(2),
+            size: local.zcash_serialized_size(),
+            submitted_at: std::time::Instant::now(),
+            submission: MinedBlockSubmission::FullBlock,
+            pending,
+        })
+        .unwrap();
+    native
+        .expect_request(Request::AdvertiseMinedBlock(AdvertisedBlock::submitted(
+            local.hash(),
+            local.zcash_serialized_size(),
+        )))
+        .await
+        .respond(Response::Nil);
+    failure.fail();
+    peers.send_replace(true);
+    gossip.peer_set.expect_no_requests().await;
+    gossip.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_peer_at_dispatch_restores_the_committed_announcement() {
+    let GatedSetup {
+        mut sender,
+        mut gossip,
+        peers,
+        mut native,
+        vanishing,
+    } = gated();
+    local_commit(&mut sender, block(2));
+    native
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block(2))))
+        .await
+        .respond(Response::Nil);
+    vanishing.store(1, Ordering::SeqCst);
+    peers.send_replace(true);
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block(2))))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(vanishing.load(Ordering::SeqCst), 0);
+    gossip.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_work_expires_before_a_peer_connects() {
+    let GatedSetup {
+        mut sender,
+        mut gossip,
+        peers,
+        mut native,
+        ..
+    } = gated();
+    local_commit(&mut sender, block(2));
+    native
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block(2))))
+        .await
+        .respond(Response::Nil);
+    tokio::time::sleep(BLOCK_GOSSIP_TIMEOUT + Duration::from_secs(1)).await;
+    peers.send_replace(true);
+    gossip.peer_set.expect_no_requests().await;
+    gossip.task.abort();
 }

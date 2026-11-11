@@ -154,6 +154,10 @@ pub(crate) struct SocketSlot {
     pub(crate) stopped: AtomicBool,
 }
 
+/// The simulator's callback for each admitted QUIC attempt's remote address.
+#[cfg(zakura_sim)]
+type AdmissionObserver = Arc<dyn Fn(SocketAddr) + Send + Sync>;
+
 /// State the handles and every endpoint task share. It holds no command
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
@@ -163,7 +167,7 @@ pub(crate) struct Shared {
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
     #[cfg(zakura_sim)]
-    admission_observer: std::sync::Mutex<Option<Arc<dyn Fn(SocketAddr) + Send + Sync>>>,
+    pub(crate) admission_observer: std::sync::Mutex<Option<AdmissionObserver>>,
     pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,

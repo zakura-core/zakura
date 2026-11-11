@@ -694,6 +694,8 @@ mod tests {
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
+            #[cfg(zakura_sim)]
+            admission_observer: std::sync::Mutex::new(None),
             connections: ConnectionSlots::new(16, 0, None, 16),
             hooks: Arc::default(),
             shutdown: watch::Sender::new(false),

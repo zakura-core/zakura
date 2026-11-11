@@ -441,30 +441,43 @@ where
         violation
     }
 
-    /// Calls `end`. Each report takes the violations `after` found for its
-    /// property ahead of its own, as step findings, whatever it says about
-    /// the end, so a harness failure keeps them
-    /// ([`PropertyReport::after_harness_failure`]). One the report already
-    /// holds as a step finding isn't added again, and one it holds only as
-    /// an end finding moves to the step findings. A report left with any
-    /// violation is `Violated` with the first one's witness.
+    /// Calls `end`, then merges in the violations `after` found as step
+    /// findings, so a harness failure keeps them
+    /// ([`PropertyReport::after_harness_failure`]). Each report's step
+    /// findings are its own and `after`'s together, once each, in the order
+    /// they were found, and its end findings are what's left of its own. A
+    /// property `after` found violated that `end` didn't report gets a
+    /// report of its own. A report left with any violation is `Violated`
+    /// with the first one's witness.
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         let mut reports = (self.end)(end, log);
+        for step in &self.found {
+            if !reports
+                .iter()
+                .any(|report| report.property == step.property)
+            {
+                reports.push(PropertyReport::new(
+                    step.property.clone(),
+                    PropertyOutcome::Violated {
+                        witness: step.witness.clone(),
+                    },
+                ));
+            }
+        }
         for report in &mut reports {
             let first_end = report.violations.len().saturating_sub(report.end_found);
             let mut end_findings = report.violations.split_off(first_end);
-            let mut found = Vec::new();
+            let mut steps = std::mem::take(&mut report.violations);
             for step in self.found.iter().filter(|v| v.property == report.property) {
-                if report.violations.contains(step) || found.contains(step) {
-                    continue;
+                end_findings.retain(|v| v != step);
+                if !steps.contains(step) {
+                    steps.push(step.clone());
                 }
-                if let Some(at) = end_findings.iter().position(|v| v == step) {
-                    end_findings.remove(at);
-                }
-                found.push(step.clone());
             }
+            // A stable sort keeps each step's findings in the order found.
+            steps.sort_by_key(|v| v.step);
             report.end_found = end_findings.len();
-            report.violations.splice(0..0, found);
+            report.violations = steps;
             report.violations.append(&mut end_findings);
             // The first retained violation is the outcome's, as for any
             // report ([`PropertyReport::violations`]).

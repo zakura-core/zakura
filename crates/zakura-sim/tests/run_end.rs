@@ -327,6 +327,53 @@ fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
     }
 }
 
+/// Terra, round 9: a step violation survives a late harness failure even
+/// when the end closure reports nothing for its property, and the merged
+/// step findings keep the order they were found in, so an earlier step
+/// finding the end closure carries stays first and gives the witness.
+#[test]
+fn a_closure_merge_keeps_every_step_finding_in_order() {
+    let step = |at: u64, witness: Vec<u64>| Violation {
+        property: "test/stop".into(),
+        step: at,
+        witness,
+        expected: "fewer steps".into(),
+        actual: format!("step {at}"),
+    };
+    let late = || PropertyReport {
+        holds_since: Some(1_000),
+        ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
+    };
+    let earlier = PropertyReport {
+        violations: vec![step(2, vec![2])],
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![2] })
+    };
+    for (reports, witness) in [(vec![late()], vec![2, 5]), (vec![earlier, late()], vec![2])] {
+        let mut checker = FnChecker::new(
+            move |cx: &check::StepCtx<'_>| (cx.step == 5).then(|| step(5, vec![2, 5])),
+            move |_: &RunEnd, _: &ObservationLog| reports.clone(),
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        let stop = report
+            .properties
+            .iter()
+            .find(|p| p.property == "test/stop")
+            .expect("the step violation keeps a report");
+        assert_eq!(stop.outcome, PropertyOutcome::Violated { witness });
+        let steps: Vec<u64> = stop.violations.iter().map(|v| v.step).collect();
+        assert!(steps.windows(2).all(|w| w[0] <= w[1]), "{steps:?}");
+        assert_eq!(stop.end_found, 0);
+    }
+}
+
 /// Sol 2, round 2: a report's end finding that names a step outside the
 /// run is dropped as a harness failure, and the step finding before it
 /// stays, so the trim's count of end findings follows what's left.

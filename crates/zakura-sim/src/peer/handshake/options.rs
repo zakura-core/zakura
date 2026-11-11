@@ -124,7 +124,9 @@ impl ControlFault {
             Self::UnofferedCapability => {
                 ack.accepted_capabilities |= 1 << (!offered).trailing_zeros()
             }
-            Self::LimitsAboveRequest => ack.accepted_limits.max_open_streams += 1,
+            // The request's idle limit is below the local hard ceiling. Exceed only
+            // the request, so the earlier hard-limit validator still accepts it.
+            Self::LimitsAboveRequest => ack.accepted_limits.idle_timeout_millis += 1,
             Self::FrameLimit => ack.accepted_limits.max_frame_bytes = 0,
             Self::MessageLimit => ack.accepted_limits.max_message_bytes = 0,
             Self::StreamLimit => ack.accepted_limits.max_open_streams = 0,

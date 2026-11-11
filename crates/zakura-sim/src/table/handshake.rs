@@ -1035,6 +1035,15 @@ fn check_prelude<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             continue;
         }
         applies = true;
+        if cx.log.entries().iter().any(|entry| {
+            matches!(&entry.obs,
+                Observation::Transport { event: TransportFact::PreludeJudged {
+                    shared_id: judged_id, quic_stream: judged_stream, rejection: None,
+                }, .. } if judged_id == shared_id && judged_stream == quic_stream
+            )
+        }) {
+            return cx.violated("a prelude requiring rejection is never accepted", label);
+        }
         let obligation = cx.obligation(
             Some(at),
             Subject::Session(format!("{shared_id}/{quic_stream}")),
@@ -1050,6 +1059,23 @@ fn check_prelude<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
     }
     for (at, obs) in cx.observations().enumerate() {
+        if let Observation::Transport {
+            event:
+                TransportFact::PreludeJudged {
+                    shared_id,
+                    quic_stream,
+                    rejection: None,
+                },
+            ..
+        } = obs
+        {
+            if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::PeerHandshake { shared_id: sent_id, quic_stream: sent_stream, row, label: sent_label, .. }
+                    if sent_id == shared_id && sent_stream == quic_stream && row == "prelude" && sent_label == label
+            )) {
+                return cx.violated("a prelude requiring rejection is never accepted", label);
+            }
+        }
         if let Observation::Transport {
             connection: Some(connection),
             event:

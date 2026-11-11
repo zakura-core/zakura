@@ -19,6 +19,23 @@ from `PROMPT.md`. Their `cases.json` entries name a property and its witness
 instead of a native test. `cargo xtask planted loop` runs them on the remote
 host. `python3 scripts/mutation_inventory.py --loop` checks them.
 
+With `--generate-runs <n>`, the loop also gives each case generator lanes:
+`zakura-sim generate` searches `n` inputs drawn from each seed of
+`--generate-seeds` for a violation of the case's property, skipping every
+committed input here and under `qa/planted`. `--generate-harness` picks the
+harness, `auto` by default. `--generate-mode libfuzzer` runs one campaign
+per seed for `--generate-seconds` instead. A kill must confirm in a fresh
+process, and the loop shrinks its trace. One search per harness and seed
+runs on the unpatched build first. A search that stops there is a property
+finding in the report, and that lane is `baseline-fails`. A property that no
+generator harness reaches has a `[[no-generator]]` record in
+`work-list.toml` with the reason.
+
+`python3 scripts/mutation_joint_run.py run --previous <report.json> --out
+<dir>` runs the loop with generator lanes on the cases changed since the
+previous report's pin, and lists new survivors, new baseline failures and
+new property findings. `diff <old> <new>` lists them for two reports.
+
 Run `python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"`
 from the repository root to check patch application and binding metadata.
 The command does not apply patches or compile tests. A matching source symbol

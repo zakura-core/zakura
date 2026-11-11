@@ -92,7 +92,7 @@ use crate::{
         NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
+        Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Kind, Pending,
         Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
@@ -139,7 +139,7 @@ impl Subsystem for Smoke {
                 ..SchedulerConfig::default()
             },
             budget: 2_000,
-            drain_bound: 1_000,
+            drain_bound: 5_000,
             ..RunConfig::default()
         }
     }
@@ -1065,6 +1065,11 @@ impl HasView for Storage {
         found
     }
 
+    /// Whether a `Shutdown` step was picked, which begins the node's stop.
+    fn stopping(&self) -> bool {
+        self.topology.shutdown_picked()
+    }
+
     /// The node's stamps after `after` ([`Stamps::after`]), from every
     /// view-side store its tap and harness keep.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
@@ -1903,7 +1908,13 @@ impl Subsystem for HeaderWire {
             dials,
         );
         let failure = PeerFailure::default();
-        let mut control = PeerControl::new(failure.clone(), ports.records.clone(), shared_ids);
+        let mut control = PeerControl::new(
+            sim,
+            "node",
+            failure.clone(),
+            ports.records.clone(),
+            shared_ids,
+        );
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =
                 control.add(&name, spec.script.clone(), spec.adversary.is_some());
@@ -2103,7 +2114,10 @@ pub fn wire_config() -> RunConfig {
     RunConfig {
         scheduler: SchedulerConfig::default(),
         budget: 30_000,
-        drain_bound: 2_000,
+        // The longest drain measured on the saved Plans, which runs the QUIC
+        // timers to the harness timer cap, is about 4,700 steps, and more
+        // peers take more.
+        drain_bound: 50_000,
         ..RunConfig::default()
     }
 }
@@ -2142,6 +2156,29 @@ impl ActionSource for RecoveryDeadline {
     /// Never called: it offers no action.
     fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
         unreachable!("the recovery deadline source offers no action")
+    }
+
+    /// The same boundary, so the drain's clock reaches an owed recovery's
+    /// deadline too, and nothing else.
+    fn recovery(&self, now: SimInstant, out: &mut crate::RecoveryOffer) {
+        let mut boundaries = Vec::new();
+        self.boundaries(now, &mut boundaries);
+        out.boundaries.extend(
+            boundaries
+                .into_iter()
+                .filter_map(|boundary| match boundary {
+                    Boundary::Opens(at) => Some(at),
+                    Boundary::Deadline(_) => None,
+                }),
+        );
+    }
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -2266,6 +2303,20 @@ impl ActionSource for RecoveryFinish {
         }
         Ok(())
     }
+
+    /// Nothing: the finish begins the node's stop, new scenario work as a
+    /// `Shutdown` step is, so the drain doesn't offer it. An owed recovery
+    /// the drain reaches still expires at its deadline
+    /// ([`RecoveryDeadline`]).
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: a picked finish is carried out by a task the drain runs.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The storage run's config: 2 workers, the default stack, which engine
@@ -2277,7 +2328,12 @@ pub fn storage_config() -> RunConfig {
             ..SchedulerConfig::default()
         },
         budget: 4_000,
-        drain_bound: 1_000,
+        // A drain took about 3,600 steps on the committed inputs, and over
+        // 10,000 with 17 mirrors, so the bound leaves room for many more.
+        drain_bound: 50_000,
+        // No harness tail here waits on a timer, so the default zero cap
+        // holds: controls run as queued, churn relinks by steps, and
+        // `Settle` and a recovery's cooldown offer recovery boundaries.
         ..RunConfig::default()
     }
 }
@@ -2523,12 +2579,12 @@ const FAULT_PENALIZED_EXPECTED: &str = "each header-peer fault the reactor took 
 
 /// Checks [`HEADER_FAULT_PENALIZED`] after each step, from the node's fault
 /// evidence ([`FaultEvidence::check`]). Each break the step's entries show
-/// is its own violation at this step. Something still open is unsettled,
-/// beside a break too: a penalty whose call is still being handled, or a
-/// failed reply the reactor hasn't taken yet. A failure whose reply never
+/// is its own violation at this step. Something still open is pending
+/// ([`Pending::FaultOpen`]), beside a break too: a penalty whose call is
+/// still being handled, or a failed reply the reactor hasn't taken yet. A failure whose reply never
 /// reached the reactor opens nothing. What's still open when a settled run
 /// ends breaks the rule through [`fault_end_violations`], and at any other
-/// end it's inconclusive.
+/// end it's unsettled.
 fn check_header_fault_penalized<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {
@@ -2536,12 +2592,12 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
         FaultCheck::Nothing => Verdict::NotApplicable,
         FaultCheck::Holds => Verdict::Holds,
         FaultCheck::Open(_) => {
-            cx.unsettled(Inconclusive::ObligationOpen);
+            cx.pending(Pending::FaultOpen);
             Verdict::Holds
         }
         FaultCheck::Broken { breaks, open } => {
             if open.is_some() {
-                cx.unsettled(Inconclusive::ObligationOpen);
+                cx.pending(Pending::FaultOpen);
             }
             let mut breaks = breaks.into_iter();
             let first = breaks
@@ -2557,12 +2613,26 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
 
 /// [`HEADER_FAULT_PENALIZED`]'s breaks at the run's end, one each, from
 /// [`FaultEvidence::penalized`] over `log`, such as two failed replies the
-/// reactor never took by the time a settled run ended.
+/// reactor never took by the time a settled run ended. The end replay reads
+/// the whole run again, so it finds every break the step check already
+/// reported too. Each of those is left out once, by its words, which name
+/// its operation ([`FaultEvidence::reported`]), so each break is reported
+/// once (C12).
 fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<EndViolation> {
+    let mut reported = faults.reported();
     faults
         .penalized(log.entries())
         .violated
         .into_iter()
+        .filter(
+            |actual| match reported.iter().position(|at_step| at_step == actual) {
+                Some(at) => {
+                    reported.swap_remove(at);
+                    false
+                }
+                None => true,
+            },
+        )
         .map(|actual| EndViolation {
             property: PropertyId::new(HEADER_FAULT_PENALIZED),
             expected: FAULT_PENALIZED_EXPECTED.to_owned(),
@@ -2834,6 +2904,7 @@ mod tests {
             violation: None,
             drain: None,
             harness: None,
+            rest: Some(zakura_scheduler::Status::Quiescent),
         });
         faults
     }
@@ -2932,6 +3003,7 @@ mod tests {
                 budget: 10,
                 now,
                 status: SchedulerStatus::Quiescent,
+                quiescent: false,
                 log: &log,
             };
             let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
@@ -2984,8 +3056,9 @@ mod tests {
 
     /// Two penalties broken in one step are two violations at that step,
     /// and an untaken reply beside them leaves the property unsettled. A
-    /// later check reports neither again, and the settled end reports both
-    /// breaks and the untaken reply.
+    /// later check reports neither again. The settled end's replay finds
+    /// both breaks again, in the same words, and the untaken reply, and
+    /// reports only the untaken reply, since the step reported the breaks.
     #[test]
     fn the_fault_check_reports_every_break_at_a_step() {
         use crate::check::{Phase, StepCtx};
@@ -3010,6 +3083,7 @@ mod tests {
                 budget: u64::MAX,
                 now: SimInstant::ZERO,
                 status: SchedulerStatus::Quiescent,
+                quiescent: true,
                 log: &log,
             };
             let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
@@ -3020,33 +3094,37 @@ mod tests {
                 _ => Vec::new(),
             };
             actual.extend(parts.recorded.into_iter().map(|violation| violation.actual));
-            (actual, parts.unsettled)
+            (actual, parts.pending)
         };
-        let (actual, unsettled) = check(0);
+        let (stepped, pending) = check(0);
         starts_with_each(
-            &actual,
+            &stepped,
             &[
                 "UnpenalizedFault: prepare operation 1 ",
                 "UnpenalizedFault: prepare operation 2 ",
             ],
         );
-        assert_eq!(unsettled, Some(Inconclusive::ObligationOpen));
-        let (actual, unsettled) = check(1);
+        assert_eq!(pending, [Pending::FaultOpen].into());
+        let (actual, pending) = check(1);
         assert!(actual.is_empty(), "{actual:?}");
-        assert_eq!(unsettled, Some(Inconclusive::ObligationOpen));
+        assert_eq!(pending, [Pending::FaultOpen].into());
 
-        let ended: Vec<String> = fault_end_violations(&harness.0, &log)
-            .into_iter()
-            .map(|found| found.actual)
-            .collect();
+        let replayed = harness.0.penalized(log.entries()).violated;
         starts_with_each(
-            &ended,
+            &replayed,
             &[
                 "UnpenalizedFault: prepare operation 1 ",
                 "UnpenalizedFault: prepare operation 2 ",
                 "UntakenFault: operation 3 ",
             ],
         );
+        assert_eq!(replayed[..2], stepped[..]);
+        assert_eq!(harness.0.reported(), stepped);
+        let ended: Vec<String> = fault_end_violations(&harness.0, &log)
+            .into_iter()
+            .map(|found| found.actual)
+            .collect();
+        starts_with_each(&ended, &["UntakenFault: operation 3 "]);
     }
 
     /// A harness with no view, for checks that read only the log.
@@ -3093,6 +3171,17 @@ mod tests {
                 });
             }
             Ok(())
+        }
+
+        /// Nothing: it finishes no submitted work.
+        fn recovery(&self, _now: zakura_scheduler::SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+        /// Nothing: it has no holds.
+        fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+        /// None: it holds no submitted work.
+        fn holds_work(&self) -> Option<String> {
+            None
         }
     }
 

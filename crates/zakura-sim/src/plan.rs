@@ -104,7 +104,9 @@ impl fmt::Display for PlanChoice {
 pub enum PlanInput {
     /// Fuzz bytes, decoded one choice at a time.
     Bytes(Vec<u8>),
-    /// A scripted plan that follows picks by identity. Test scaffolding only.
+    /// A scripted plan that follows picks by identity, as a steered test
+    /// writes it. `zakura-sim record --script` records one, and its trace
+    /// names it in `meta.plan`.
     Script(Plan),
     /// A recorded trace's every pick and draw, which the run must make again
     /// exactly (traces.md, Replay). Only [`crate::trace::replay`] builds one.

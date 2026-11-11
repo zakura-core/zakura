@@ -71,7 +71,7 @@ use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
     adapter::EnginePort,
-    controlled::{ControlledPort, ResetRequest},
+    controlled::{ControlledPort, OpId, ResetRequest},
     fixture::HeaderFixture,
     Outcome,
 };
@@ -90,8 +90,9 @@ use self::{
 };
 use crate::{
     observe::StorageFact,
+    sim::Generators,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
 /// Frames each direction of a link buffers, enough for a page and control
@@ -225,9 +226,7 @@ impl Base {
     pub fn offers(self, legal: &[Outcome], outcome: Outcome) -> bool {
         match self {
             Base::Any => true,
-            Base::SuccessOnly => {
-                outcome == Outcome::Engine || legal == [Outcome::Rejected].as_slice()
-            }
+            Base::SuccessOnly => crate::storage::succeeds(legal, outcome),
         }
     }
 }
@@ -295,6 +294,9 @@ pub struct Effects {
     pub reset: Rc<RefCell<Vec<String>>>,
     /// Each hold a `Release` step opened, by its index, in order.
     pub released: Rc<RefCell<Vec<usize>>>,
+    /// The holds whose release the scenario itself plans, by index, which
+    /// the drain doesn't retire ([`Topology::own`]).
+    pub owned: Rc<RefCell<BTreeSet<usize>>>,
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
@@ -334,6 +336,8 @@ pub struct PolicySource {
     released: usize,
     /// The run's recovery, which retires every hold once it starts.
     recovery: RecoveryEvidence,
+    /// Set at drain entry, which retires every hold but the owned ones.
+    drained: bool,
 }
 
 impl PolicySource {
@@ -357,6 +361,7 @@ impl PolicySource {
             reset: 0,
             released: 0,
             recovery: RecoveryEvidence::default(),
+            drained: false,
         }
     }
 
@@ -411,6 +416,14 @@ impl PolicySource {
     /// Whom each failed prepare and apply of the node's storage blamed.
     pub fn attributions(&self) -> FaultAttributions {
         self.storage.attributions()
+    }
+
+    /// Whether operation `id`'s hold is one the scenario owns
+    /// ([`Topology::own`]).
+    fn owned(&self, predicates: &Predicates, id: OpId) -> bool {
+        predicates
+            .hold_of(id.0)
+            .is_some_and(|hold| self.effects.owned.borrow().contains(&hold))
     }
 }
 
@@ -489,7 +502,8 @@ impl ActionSource for PolicySource {
         }
         match crate::storage::decode(local) {
             StorageAction::Complete(id, Outcome::Engine)
-                if self.recovery.started().is_none()
+                if !self.drained
+                    && self.recovery.started().is_none()
                     && self.predicates.borrow().holds_reply(id) =>
             {
                 self.port
@@ -498,6 +512,71 @@ impl ActionSource for PolicySource {
             }
             _ => self.storage.execute(local, log),
         }
+    }
+
+    /// The storage's recovery set, which holds don't filter, as in the
+    /// `Recover` mode `enabled` follows: the same success rule
+    /// ([`crate::storage::succeeds`]) and every held reply's delivery.
+    ///
+    /// The exception is an owned hold ([`Topology::own`]), such as the
+    /// release-wake fixture's. Its operation keeps the live rule: nothing
+    /// until its planned release, a `Release` step or `Settle`, and then
+    /// only the hold's own outcomes. So the fixture's first prepare still
+    /// fails with its planned local fault, and never before the waiting
+    /// offer its release step waits for.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        let pending = self.port.pending();
+        let predicates = self.predicates.borrow();
+        let mut free = RecoveryOffer::default();
+        self.storage.recovery(now, &mut free);
+        out.actions.extend(free.actions.into_iter().filter(
+            |(_, local)| match crate::storage::decode(*local) {
+                StorageAction::Complete(id, _) => !self.owned(&predicates, id),
+                StorageAction::Deliver(_) => true,
+            },
+        ));
+        out.quiet.extend(free.quiet);
+        out.boundaries.extend(free.boundaries);
+        let mut live = Vec::new();
+        self.storage.enabled(now, &mut live);
+        out.actions.extend(live.into_iter().filter(|(_, local)| {
+            match crate::storage::decode(*local) {
+                StorageAction::Complete(id, outcome) => {
+                    self.owned(&predicates, id)
+                        && pending
+                            .iter()
+                            .find(|op| op.id == id)
+                            .is_some_and(|op| predicates.offers(self.base, op, outcome))
+                }
+                StorageAction::Deliver(_) => false,
+            }
+        }));
+        for op in pending.iter().filter(|op| self.owned(&predicates, op.id)) {
+            let mut boundaries = Vec::new();
+            predicates.boundaries(None, op, now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) if at > now => Some(at),
+                        Boundary::Opens(_) | Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+    }
+
+    /// Retires every hold but the owned ones: from now on an engine
+    /// completion of a reply-held apply completes it instead of holding
+    /// its reply.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.drained = true;
+        self.storage.enter_drain(log);
+    }
+
+    /// The storage's stranded work. An owned hold that can never release
+    /// is its owner's to report, as `Settle` does.
+    fn holds_work(&self) -> Option<String> {
+        self.storage.holds_work()
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
@@ -903,7 +982,8 @@ async fn delay_first_page(
 }
 
 /// The far end of a flooding link: the dialer's streams and its connection
-/// token, held by a harness task instead of a service.
+/// token, held by a harness task instead of a service. [`Topology::flood`]
+/// swaps the token for its generator's own child of it.
 struct FarEnd {
     from_node: FramedRecv,
     to_node: FramedSend,
@@ -912,11 +992,14 @@ struct FarEnd {
 
 /// Floods the node under test over `far`. It waits for the node's first
 /// `Status` on the session, then sends that frame back as fast as the node
-/// takes it, reading whatever the node sends meanwhile, until the link
-/// closes or either stream ends. The node's receiver awaits room in its
+/// takes it, reading whatever the node sends meanwhile, until `far`'s token
+/// is cancelled, by `link`'s close or the generator's retirement, or
+/// either stream ends. The node's receiver awaits room in its
 /// events queue for each `Status` it forwards, so the session stays open
-/// while the queue is full.
-async fn flood(far: FarEnd) {
+/// while the queue is full. A retirement only stops the sending: the flood
+/// then [`keep`]s its streams until the link closes, so the node's session
+/// outlives it.
+async fn flood(far: FarEnd, link: CancellationToken) {
     let FarEnd {
         mut from_node,
         to_node,
@@ -925,7 +1008,7 @@ async fn flood(far: FarEnd) {
     let status = loop {
         let frame = zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => frame,
         };
         let Some(frame) = frame else {
@@ -941,11 +1024,29 @@ async fn flood(far: FarEnd) {
     loop {
         zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => if frame.is_none() {
                 return;
             },
             sent = to_node.send(status.clone()) => if sent.is_err() {
+                return;
+            },
+        }
+    }
+}
+
+/// Keeps a retired flood's session open, as a quiet peer would: holds the
+/// stream to the node and reads and drops what the node sends, until
+/// `link` closes or the node ends the stream. Dropping the streams instead
+/// would end the session with an EOF that no harness close records, which
+/// the session view would blame on the node.
+async fn keep(mut from_node: FramedRecv, to_node: FramedSend, link: &CancellationToken) {
+    let _to_node = to_node;
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = link.cancelled() => return,
+            frame = from_node.recv() => if frame.is_none() {
                 return;
             },
         }
@@ -1018,6 +1119,19 @@ impl Topology {
     /// says. Opening an open hold does nothing.
     pub(crate) fn release(&self, hold: usize) {
         self.effects.released.borrow_mut().push(hold);
+    }
+
+    /// Marks the policy's hold number `hold` as one whose release the
+    /// scenario itself plans, through a `Release` step or a source of its
+    /// own. The drain doesn't retire it: the hold stays until that release
+    /// runs, then offers only its own outcomes. Call it at setup.
+    pub(crate) fn own(&self, hold: usize) {
+        self.effects.owned.borrow_mut().insert(hold);
+    }
+
+    /// Whether [`Topology::own`] marked hold `hold`.
+    fn owns(&self, hold: usize) -> bool {
+        self.effects.owned.borrow().contains(&hold)
     }
 
     /// This topology, telling `tap` before it stops the node under test.
@@ -1295,11 +1409,23 @@ impl Topology {
 
     /// Links the mirror named `peer` to the node under test again, as its
     /// dialer, with a flooding task at the mirror's end in place of its
-    /// service ([`flood`]). The node replaces the mirror's earlier session.
-    fn flood(&self, peer: &str) {
+    /// service ([`flood`]), registered with `generators`. The node replaces
+    /// the mirror's earlier session.
+    ///
+    /// The task's token is a child of the far end's connection token: the
+    /// connection's close still stops it, and its retirement cancels only
+    /// the child, so the connection stays open. One token keeps the loop's
+    /// preemption points as they were.
+    fn flood(&self, peer: &str, generators: &Generators) {
         let (_, far) = self.open(self.index(peer), 0, true);
         let far = far.expect("an open with a far end hands it back");
-        zakura_rt::task::spawn_named("flood", flood(far));
+        let link = far.cancel.clone();
+        let stop = link.child_token();
+        let far = FarEnd {
+            cancel: stop.clone(),
+            ..far
+        };
+        generators.spawn("flood", stop, flood(far, link));
     }
 
     /// Whether the node under test's shutdown has begun: a `Shutdown` step
@@ -1599,6 +1725,7 @@ impl Control {
             })
             .collect();
         let task_fixture = fixture.clone();
+        let generators = sim.generators();
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
             let topology = task_topology;
@@ -1616,7 +1743,7 @@ impl Control {
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => topology.flood(&step.peer),
+                    ControlAction::Flood => topology.flood(&step.peer, &generators),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
@@ -1852,16 +1979,17 @@ pub(crate) fn harness_commit(
     Ok(())
 }
 
-impl ActionSource for Control {
-    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+impl Control {
+    /// The next step and its action, if it may be picked at `now`: before
+    /// any `Recover` pick, or from its `recovered` pick on, once
+    /// [`Control::ready`] and its trigger hold.
+    fn next_offer(&self, now: SimInstant) -> Option<(&ControlStep, (Identity, u64))> {
         // From the `Recover` pick the script stops, until the `recovered`
         // pick lets a typed test's closes after it go on.
         if self.recovering() && !self.resumed() {
-            return;
+            return None;
         }
-        let Some(index) = self.next_step() else {
-            return;
-        };
+        let index = self.next_step()?;
         let step = &self.script[index];
         // A full prefix has ended, so its `Recover` comes at once: its
         // trigger can wait on a step the cutoff skipped.
@@ -1871,10 +1999,19 @@ impl ActionSource for Control {
                     .when
                     .as_ref()
                     .is_none_or(|when| self.predicates.borrow().control_holds(when, now)));
-        if open {
-            // A script is far shorter than u64.
-            out.push((Identity::peer(&step.peer, step.action.name()), index as u64));
-        }
+        // A script is far shorter than u64.
+        open.then(|| {
+            (
+                step,
+                (Identity::peer(&step.peer, step.action.name()), index as u64),
+            )
+        })
+    }
+}
+
+impl ActionSource for Control {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        out.extend(self.next_offer(now).map(|(_, action)| action));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
@@ -1912,6 +2049,87 @@ impl ActionSource for Control {
                 .recovery
                 .as_ref()
                 .is_some_and(|driver| driver.evidence.disrupts(Disruption::Unfair))
+    }
+
+    /// While a `Recover` establishes, its quiet `recovered` pick, under the
+    /// same condition as [`ActionSource::quiet`], but no relink or give-up,
+    /// and the end of the source's cooldown as a boundary.
+    /// Otherwise the next step, if it's the planned `Release` of an owned
+    /// hold ([`Topology::own`]) and may be picked as it would be live, with
+    /// its trigger's openings. No other script step runs in the drain.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        if let Some(driver) = self.recovery.as_ref().filter(|_| self.queued.get() == 0) {
+            let mut quiet = Vec::new();
+            driver.quiet(now, &mut quiet);
+            out.quiet
+                .extend(quiet.into_iter().filter(|(_, local)| *local == RECOVERED));
+            // The end of the source's cooldown, which `recovered` waits for.
+            let mut boundaries = Vec::new();
+            driver.boundaries(now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) if at > now => Some(at),
+                        Boundary::Opens(_) | Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+        let owned_release = |step: &ControlStep| match step.action {
+            ControlAction::Release { hold } => self.topology.owns(hold),
+            _ => false,
+        };
+        if let Some((_, action)) = self.next_offer(now).filter(|(step, _)| owned_release(step)) {
+            out.actions.push(action);
+        } else if let Some(when) = self
+            .script
+            .get(self.next)
+            .filter(|step| !self.recovering() && owned_release(step))
+            .and_then(|step| step.when.as_ref())
+        {
+            let mut boundaries = Vec::new();
+            self.predicates
+                .borrow()
+                .control_boundaries(when, now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) => Some(at),
+                        Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+    }
+
+    /// Nothing: a queued step still runs on the control task, and the
+    /// script holds nothing else.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// A planned `Release` of an owned hold ([`Topology::own`]) that's still
+    /// to come behind a step the drain never offers, such as a peer's
+    /// growth, so the hold's operation can never finish. A release that's
+    /// next waits only on its own trigger, which node work can still meet,
+    /// and once a `Recover` is picked every hold retires.
+    fn holds_work(&self) -> Option<String> {
+        if self.recovering() {
+            return None;
+        }
+        let owned_release = |step: &ControlStep| match step.action {
+            ControlAction::Release { hold } => self.topology.owns(hold).then_some(hold),
+            _ => None,
+        };
+        let next = self.script.get(self.next)?;
+        if owned_release(next).is_some() {
+            return None;
+        }
+        let hold = self.script[self.next..].iter().find_map(owned_release)?;
+        Some(format!(
+            "the planned release of owned hold {hold} waits behind the {} step of {}, which \
+             the drain doesn't run",
+            next.action.name(),
+            next.peer
+        ))
     }
 
     /// Checks the next step and queues it for the control task, or carries

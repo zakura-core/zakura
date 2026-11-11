@@ -23,6 +23,7 @@ use std::{
 
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL, CAPACITY_RELEASE_WAKES},
     explore::{classify, ExploreOutcome},
@@ -215,10 +216,9 @@ fn the_wake_fixtures_hold_under_every_plan() {
 ///
 /// An empty list means the fixture holds nothing at the end, not that the
 /// node is idle. Its status refreshes keep starting rounds, so work younger
-/// than the bound can still be in flight when the budget runs out, and the
-/// drain offers no storage completions to finish it. No hold picks that
-/// work, so a drain that completes storage operations, as #1840 proposes,
-/// can finish it.
+/// than the bound can still be in flight when a run ends. No hold picks
+/// that work, and the drain offers each pending operation's completion
+/// (#1840 rule 1), so work the live phase started finishes there.
 fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
     let storage = scenario.storage();
     let bound = Duration::from_millis(
@@ -353,6 +353,11 @@ impl HasView for Unsettled {
     /// The storage harness's end violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.0.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
     }
 
     /// The storage harness's wake facts' stamps.
@@ -492,6 +497,11 @@ impl Checker for Measured {
                 _ => None,
             }));
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// `scenario`'s run through harness `S` under `input`, measured.
@@ -527,8 +537,9 @@ where
 /// without the release ([`Unsettled`]), step for step: the same picks
 /// from the same enabled sets, the same observations, and the same
 /// obligations opened and concluded at the same steps. The release is
-/// picked once, and the run then ends settled ([`stuck`]), where the
-/// fixture without it ends with `mirror-1`'s prepare still held.
+/// picked once, and the run then ends settled ([`stuck`]). The fixture
+/// without it keeps `mirror-1`'s prepare held through the live phase, and
+/// only its drain, which retires the hold the fixture doesn't own, runs it.
 #[test]
 fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
     let committed = [
@@ -621,15 +632,22 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
         );
         let held = stuck(scenario, &settled);
         assert!(held.is_empty(), "{scenario:?}: {held:?}");
+        let drained = unsettled
+            .picks
+            .iter()
+            .filter(|pick| pick.phase == zakura_sim::check::Phase::Drain)
+            .any(|pick| pick.identity.starts_with("storage:"));
         assert!(
-            !stuck(scenario, &unsettled).is_empty(),
-            "{scenario:?}: without the release, mirror-1's prepare stays held"
+            drained,
+            "{scenario:?}: without the release, only the drain completes the held prepare"
         );
     }
 }
 
 /// A fixture run without the wake declared opens no wake, so the property
-/// is not applicable there.
+/// is not applicable there. Nothing then releases `mirror-1`'s held
+/// prepare, and the run still ends without a harness failure: a wake that
+/// never opens is the node's to answer.
 #[test]
 fn an_undeclared_fixture_opens_no_wake() {
     let scenario = WakeScenario::Release;
@@ -653,8 +671,283 @@ fn an_undeclared_fixture_opens_no_wake() {
         .find(|property| property.property == CAPACITY_RELEASE_WAKES)
         .map(|property| property.outcome.clone());
     assert!(
-        matches!(outcome, Some(PropertyOutcome::NotApplicable)),
+        matches!(
+            outcome,
+            Some(PropertyOutcome::NotApplicable {
+                reason: NaReason::NeverApplied
+            })
+        ),
         "{outcome:?}"
+    );
+}
+
+/// `header-sync/release-wake` with its live budget cut at the scenario's
+/// step count instead of the fixture's, so a test can end the live phase at
+/// a chosen point of the fixture and leave the rest to the drain.
+struct CutWake(ReleaseWake);
+
+impl HasView for CutWake {
+    type View = StorageView;
+
+    /// The fixture's view.
+    fn view(&self) -> StorageView {
+        self.0.view()
+    }
+
+    /// The fixture's end.
+    fn ended(&self, end: &RunEnd) {
+        self.0.ended(end);
+    }
+
+    /// The fixture's end violations.
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        self.0.end_violations(log)
+    }
+
+    /// The fixture's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
+    /// The fixture's wake facts' stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        self.0.stamps_after(after)
+    }
+}
+
+impl Subsystem for CutWake {
+    const NAME: &'static str = "test/release-wake-cut";
+    const GENERATOR: u32 = ReleaseWake::GENERATOR;
+    const SCENARIO_BYTES: usize = ReleaseWake::SCENARIO_BYTES;
+    /// The fixture, and the live steps before the drain.
+    type Scenario = (WakeScenario, u64);
+    type Prepared = Ports;
+
+    /// [`ReleaseWake`]'s, with the scenario's budget.
+    fn config((scenario, budget): &(WakeScenario, u64)) -> RunConfig {
+        RunConfig {
+            budget: *budget,
+            ..ReleaseWake::config(scenario)
+        }
+    }
+
+    /// [`ReleaseWake`]'s.
+    fn prepare((scenario, _): &(WakeScenario, u64)) -> Ports {
+        ReleaseWake::prepare(scenario)
+    }
+
+    /// [`ReleaseWake`]'s fixture, with its settle source.
+    fn build(sim: &mut Sim, (scenario, _): &(WakeScenario, u64), ports: Ports) -> Self {
+        CutWake(ReleaseWake::build(sim, scenario, ports))
+    }
+
+    /// [`ReleaseWake`]'s, in its order.
+    fn properties() -> Vec<Property<Self>> {
+        let mut properties = storage_properties();
+        properties.push(capacity_release_wakes());
+        properties
+    }
+
+    /// [`ReleaseWake`]'s.
+    fn sources() -> Sources {
+        storage_sources()
+    }
+
+    /// The fixture's scenario, at its own budget.
+    fn draw(prefix: &[u8]) -> (WakeScenario, u64) {
+        let scenario = ReleaseWake::draw(prefix);
+        (scenario, ReleaseWake::config(&scenario).budget)
+    }
+}
+
+/// `scenario` cut after `budget` live steps, under `input`, measured.
+fn cut(scenario: WakeScenario, budget: u64, input: PlanInput) -> (RunReport, Measured) {
+    let ports = CutWake::prepare(&(scenario, budget));
+    let mut measured = Measured {
+        wake: ports.wake.clone(),
+        open: 0,
+        pending: Vec::new(),
+        lifecycle: Vec::new(),
+        enabled: Vec::new(),
+        offered: None,
+        settles: Vec::new(),
+    };
+    let report = run_prepared::<CutWake>(
+        &(scenario, budget),
+        ports,
+        input,
+        &mut MemorySink::default(),
+        Some(&mut measured),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    (report, measured)
+}
+
+/// The step at which `measured`'s run opened its first wake after step
+/// `after`.
+fn wake_after(measured: &Measured, after: u64) -> u64 {
+    measured
+        .lifecycle
+        .iter()
+        .find(|(step, to)| *to == Lifecycle::Obliged && *step > after)
+        .map(|(step, _)| *step)
+        .expect("the fixture opens a wake")
+}
+
+/// The step at which `report`'s run picked `identity`.
+fn picked(report: &RunReport, identity: &str) -> u64 {
+    report
+        .picks
+        .iter()
+        .find(|pick| pick.identity == identity)
+        .map(|pick| pick.step)
+        .unwrap_or_else(|| panic!("the run picks {identity}"))
+}
+
+/// The completion outcome of the run's first prepare, the one the fixture's
+/// first hold plans to fail with a local fault.
+fn first_prepare_outcome(report: &RunReport) -> Option<String> {
+    let id = report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::PrepareHeaderTarget { .. },
+                        ..
+                    },
+                ..
+            } => Some(*id),
+            _ => None,
+        })?;
+    report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Completed {
+                        id: done, outcome, ..
+                    },
+                ..
+            } if *done == id => Some(outcome.clone()),
+            _ => None,
+        })
+}
+
+/// C1's history: the live budget ends after the release's wake opens and
+/// before its cached-pass refill. The drain finishes the round: the wake concludes
+/// and holds, and only then, past the wake's deadline, does `mirror-1`'s
+/// held prepare run, so the run ends with nothing held.
+#[test]
+fn a_budget_cut_between_a_wake_and_its_refill_holds_the_wake() {
+    for (scenario, input) in [
+        (WakeScenario::Release, RELEASE_INPUT),
+        (WakeScenario::Deferred, DEFERRED_INPUT),
+    ] {
+        let (report, full) = measured::<ReleaseWake>(scenario, plan(input));
+        let opened = wake_after(&full, picked(&report, "peer:node:release"));
+        let (report, measured) = cut(scenario, opened, plan(input));
+        assert_eq!(
+            report.end.outcome,
+            Outcome::Budget,
+            "{scenario:?}: {:?}",
+            report.end
+        );
+        let outcome = report
+            .properties
+            .iter()
+            .find(|property| property.property == CAPACITY_RELEASE_WAKES)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(outcome, Some(PropertyOutcome::Held { .. })),
+            "{scenario:?}: {outcome:?}"
+        );
+        let [(settle, settle_at)] = measured.settles[..] else {
+            panic!("{scenario:?}: one settle: {:?}", measured.settles);
+        };
+        assert!(settle > opened, "{scenario:?}: settled in the drain");
+        let concluded = measured
+            .lifecycle
+            .iter()
+            .find(|(step, to)| {
+                *step >= opened && matches!(to, Lifecycle::Discharged | Lifecycle::Expired)
+            })
+            .map(|(step, _)| *step)
+            .expect("the release's wake concluded");
+        assert!(
+            concluded > opened && concluded < settle,
+            "{scenario:?}: the wake concluded in the drain, before the settle"
+        );
+        let wake_opened = measured
+            .wake
+            .facts()
+            .iter()
+            .find_map(|(_, fact)| match fact {
+                WakeFact::Opened { at, .. } => Some(at.since_start()),
+                _ => None,
+            })
+            .expect("a wake opened");
+        assert!(
+            settle_at > wake_opened + CACHED_PASS_REFILL,
+            "{scenario:?}: settled at {settle_at:?}, past the deadline"
+        );
+        let held = stuck(scenario, &report);
+        assert!(held.is_empty(), "{scenario:?}: {held:?}");
+    }
+}
+
+/// The fixture's first prepare is planned to fail with a local fault after
+/// its `Release` step. A cut just before that step, at it, or after it
+/// keeps both the fault and the order: the drain runs the planned release,
+/// then the fault, as the full run does. A cut before `mirror-2`'s growth,
+/// which the drain never runs, strands the release behind it, which fails
+/// the run as source evidence rather than leave the prepare held.
+#[test]
+fn the_planned_prepare_keeps_its_local_fault_whatever_the_cut() {
+    let (full, _) = measured::<ReleaseWake>(WakeScenario::Release, plan(RELEASE_INPUT));
+    assert_eq!(
+        first_prepare_outcome(&full).as_deref(),
+        Some("local-resource")
+    );
+    let release = picked(&full, "peer:node:release");
+    for budget in [release - 1, release, release + 1] {
+        let (report, _) = cut(WakeScenario::Release, budget, plan(RELEASE_INPUT));
+        assert_eq!(
+            report.end.harness, None,
+            "cut at {budget}: {:?}",
+            report.end
+        );
+        assert_eq!(
+            first_prepare_outcome(&report).as_deref(),
+            Some("local-resource"),
+            "cut at {budget}"
+        );
+    }
+    let grow = picked(&full, "peer:mirror-2:grow");
+    let scenario = (WakeScenario::Release, grow - 1);
+    let error = run_prepared::<CutWake>(
+        &scenario,
+        CutWake::prepare(&scenario),
+        plan(RELEASE_INPUT),
+        &mut MemorySink::default(),
+        None,
+    )
+    .expect_err("the cut strands the release");
+    let HarnessError::Run { failure, .. } = error else {
+        panic!("{error}");
+    };
+    assert!(
+        matches!(
+            &failure,
+            zakura_sim::HarnessFailure::SourceEvidence { detail, .. }
+                if detail.starts_with("the planned release of owned hold 0")
+        ),
+        "{failure}"
     );
 }
 

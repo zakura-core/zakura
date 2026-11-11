@@ -47,7 +47,7 @@
 //!   its generation's `generation-exited`, or its connection's `torn-down`.
 //!   [`SessionEvidence::end_check`] judges it once the run ends. A run that
 //!   ends idle with one open never will retire it, which is a leak. A run
-//!   that stopped first, at its budget included, is inconclusive. That rule
+//!   that stopped first, at its budget included, stays open. That rule
 //!   never breaks the run itself.
 //!
 //! The view freezes with the run's log, before the scheduler's shutdown
@@ -69,8 +69,9 @@ use zakura_network::zakura::{
     ZakuraPeerId, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_rt::sim::RunId;
+use zakura_scheduler::Status as SchedulerStatus;
 
-use crate::{peer::peer_of, property::EndedBy, IdleStatus, Outcome, RunEnd};
+use crate::{peer::peer_of, property::EndedBy, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -161,7 +162,7 @@ pub enum EndCheck {
     Unretired(Vec<(String, u64)>),
     /// The run stopped, or hasn't ended, before own-9 retired these
     /// sessions.
-    Inconclusive(Vec<(String, u64)>),
+    Open(Vec<(String, u64)>),
 }
 
 /// A run's session view, shared by the node's tap and the topology's links.
@@ -344,23 +345,20 @@ impl SessionEvidence {
         }
     }
 
-    /// Records whether the run ended idle: with every task finished or
-    /// waiting outside the scheduler, and nothing enabled. Nothing can
-    /// retire a session after that. A drain after the budget runs only
-    /// ready tasks and fires no timer, so a session whose retirement waits
-    /// on one could still retire, and that end doesn't count.
+    /// Records whether the run ran dry idle: at rest
+    /// ([`RunEnd::at_rest`]) with no timer pending, live or after a drain. Nothing can retire a
+    /// session after that. A drain fires a timer alone only within the
+    /// harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so a dry
+    /// drain can leave a later timer pending, and a session whose
+    /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
-        self.ledger().idle = Some(matches!(
-            end.outcome,
-            Outcome::Idle {
-                status: IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-            }
-        ));
+        self.ledger().idle =
+            Some(end.at_rest() && end.rest != Some(SchedulerStatus::WaitingOnTime));
     }
 
     /// Whether own-9 retired every session that left the reactor's view:
     /// [`EndCheck::Unretired`] if the run ended idle with one open, and
-    /// [`EndCheck::Inconclusive`] if it stopped first or hasn't ended.
+    /// [`EndCheck::Open`] if it stopped first or hasn't ended.
     pub fn end_check(&self) -> EndCheck {
         let ledger = self.ledger();
         let open: Vec<(String, u64)> = ledger
@@ -374,7 +372,7 @@ impl SessionEvidence {
         } else if ledger.idle == Some(true) {
             EndCheck::Unretired(open)
         } else {
-            EndCheck::Inconclusive(open)
+            EndCheck::Open(open)
         }
     }
 

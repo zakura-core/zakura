@@ -1253,6 +1253,17 @@ impl ActionSource for Finish {
         }
         Ok(())
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Which kind of liveness fixture a run is, for [`Finish`].
@@ -1339,6 +1350,17 @@ impl ActionSource for Deadlines {
     fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
         unreachable!("the deadline source offers no action")
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Commits one fixture header into the node under test's engine at each of
@@ -1385,6 +1407,18 @@ impl ActionSource for Ticker {
             self.topology.fail(why);
         }
     }
+
+    /// Nothing: a tick is new scenario work, as a `Commit` step is, so the
+    /// drain makes no more of them.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: each commit completes in its own step.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What every liveness fixture declares: `BoundedAdversary`, with no
@@ -1422,6 +1456,11 @@ impl HasView for Liveness {
     /// The storage harness's end violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.0.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
     }
 
     /// The storage harness's stamps.

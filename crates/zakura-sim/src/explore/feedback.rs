@@ -273,6 +273,11 @@ impl Checker for Collecting {
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.collect.observe_events(events, self.map);
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> crate::Unfinished {
+        crate::Unfinished::default()
+    }
 }
 
 /// [`Probe`]'s scenario: its task sleeps `delay_ms` + 1 ms.

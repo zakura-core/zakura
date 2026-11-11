@@ -23,6 +23,7 @@ use tempfile::TempDir;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::after_step,
+    check::Phase,
     harness::{
         header_node::{
             policy::Trigger,
@@ -33,13 +34,16 @@ use zakura_sim::{
             session::{SessionEvidence, SessionFact},
             Chain, ControlAction, ControlStep, Policy,
         },
-        header_sync::{grammar, Dialer, MirrorSpec, Storage, StorageScenario, Weights},
+        header_sync::{
+            grammar, storage_config, storage_properties, storage_sources, Dialer, MirrorSpec,
+            Storage, StorageScenario, Weights,
+        },
         run_prepared, Subsystem,
     },
     observe::StorageFact,
-    property::Assume,
+    property::{Assume, Assumptions, Registry, RegistryChecker},
     record::{Record, StepRecord},
-    By, MemorySink, Observation, PlanInput, RunReport,
+    By, MemorySink, Observation, PlanInput, RunReport, Sim,
 };
 use zakura_storage::header::controlled::ControlledPort;
 
@@ -365,6 +369,53 @@ fn each_witness_recovers_from_its_class() {
                 .node_tip
         );
     }
+}
+
+/// A budget that ends right after the `Recover` pick, before `recovered`,
+/// leaves the recovery to the drain. The drain offers its quiet
+/// `recovered` once no task is ready, and the run ends dry, with neither
+/// a violation nor a harness failure. The holds witness keeps its source's
+/// session live, since the drain doesn't relink a closed one.
+#[test]
+fn a_budget_cut_after_recover_still_reaches_recovered() {
+    let (_, scenario) = witnesses()
+        .into_iter()
+        .find(|(class, _)| *class == "holds")
+        .expect("a holds witness");
+    let input = || inputs(1, 256).remove(0);
+    let full = run(&scenario, input());
+    let started = full
+        .picked(&format!("peer:{SOURCE}:recover"))
+        .expect("the recover is picked")
+        .step;
+    let config = zakura_sim::RunConfig {
+        budget: started,
+        ..storage_config()
+    };
+    let mut sim = Sim::new(config, input());
+    let storage = Rc::new(Storage::build(
+        &mut sim,
+        &scenario,
+        Storage::prepare(&scenario),
+    ));
+    let registry = Registry::new(storage_properties()).expect("the storage IDs are unique");
+    let mut checker = RegistryChecker::new(
+        registry,
+        Rc::clone(&storage),
+        Assumptions::none(),
+        &storage_sources(),
+    );
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    drop((checker, storage));
+    let end = &report.end;
+    assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+    let recovered = report
+        .picks
+        .iter()
+        .find(|pick| pick.identity == "peer:node:recovered")
+        .expect("the drain offers recovered");
+    assert_eq!(recovered.phase, Phase::Drain);
+    assert!(recovered.step > started);
 }
 
 /// The recover waits for the control task to carry out every earlier step.

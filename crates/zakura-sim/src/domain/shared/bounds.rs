@@ -180,6 +180,7 @@ mod tests {
             budget: u64::MAX,
             now: SimInstant::ZERO,
             status: SchedulerStatus::Quiescent,
+            quiescent: true,
             log: &log,
         };
         let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);

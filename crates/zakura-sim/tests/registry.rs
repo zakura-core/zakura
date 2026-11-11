@@ -23,11 +23,11 @@ use zakura_sim::{
     observe::Exit,
     property::{
         Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent,
-        EndViolation, HasView, Inconclusive, Kind, Lifecycle, LivenessBound, Obligation,
-        ObligationKey, Property, PropertyId, Registry, RegistryChecker, RegistryError, Source,
-        Sources, Status, Subject, Tee, Verdict,
+        EndViolation, HasView, Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Pending,
+        Property, PropertyId, Registry, RegistryChecker, RegistryError, Source, Sources, Status,
+        Subject, Tee, Verdict,
     },
-    ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, Observation,
+    ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, NaReason, Observation,
     ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
     StepCtx, Violation,
 };
@@ -212,11 +212,9 @@ fn outcome(report: &RunReport, id: &PropertyId) -> PropertyOutcome {
         .unwrap_or_else(|| panic!("{id} has a report"))
 }
 
-/// An `Inconclusive` outcome with `reason`.
-fn inconclusive(reason: &str) -> PropertyOutcome {
-    PropertyOutcome::Inconclusive {
-        reason: reason.to_owned(),
-    }
+/// A `NotApplicable` outcome with `reason`.
+fn not_applicable(reason: NaReason) -> PropertyOutcome {
+    PropertyOutcome::not_applicable(reason)
 }
 
 /// The step at which `task` exited in `log`.
@@ -268,7 +266,7 @@ impl Checker for Recorder {
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         vec![PropertyReport::new(
             "test/recorder",
-            PropertyOutcome::NotApplicable,
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
         )]
     }
 
@@ -276,12 +274,17 @@ impl Checker for Recorder {
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.events.extend_from_slice(events);
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 const TWO_SECONDS: LivenessBound = LivenessBound::VirtualTime(Duration::from_secs(2));
 
-/// P1.1: a discharged, an expired, and an open obligation give `Held`,
-/// `Violated`, and `Inconclusive`.
+/// P1.1: a discharged obligation gives `Held`, and an expired one
+/// `Violated`, live or after the drain moves the clock to its deadline.
 #[test]
 fn obligations_discharge_expire_and_stay_open() {
     let served_after = |serve: Option<Duration>| {
@@ -329,9 +332,21 @@ fn obligations_discharge_expire_and_stay_open() {
         }
     );
 
-    // The run goes idle at 0 s with the 2 s deadline still ahead.
+    // The live phase goes idle at 0 s with the 2 s deadline still ahead,
+    // and no source offers a boundary. The open check sends the run into
+    // the drain, whose clock moves just past the deadline and convicts it.
     let open = served_after(None);
-    assert_eq!(outcome(&open, &SERVED), inconclusive("obligation-open"));
+    assert_eq!(open.end.outcome, Outcome::Violation, "{:?}", open.end);
+    let violation = open.end.violation.as_ref().expect("it violated");
+    assert_eq!(violation.property, SERVED.as_str());
+    let last = picks(&open);
+    assert_eq!(last.last().copied(), Some("advance-time:2000000001"));
+    assert_eq!(
+        open.picks.last().map(|pick| pick.phase),
+        Some(zakura_sim::check::Phase::Drain)
+    );
+    let request = exit_step(&open.log, "request-p1.1");
+    assert_eq!(violation.witness, vec![request, violation.step]);
 }
 
 /// P1.1, review P-03: two owners' obligations and one completion. The
@@ -461,9 +476,9 @@ fn handler(sim: &mut Sim, ops: usize) {
 /// P1.1, review P-01: the first completion wakes the handler. The enabled set
 /// at that step didn't have the handler in it, but the scheduler's status
 /// after the step is `Running`, so the obligation stays open until the
-/// handler exits. A handler that waits again instead leaves no task able to
-/// run, and the property fails at that step, before the second completion
-/// can repair it.
+/// handler exits. A handler that waits again isn't quiescent either while
+/// the second completion is still enabled ([`StepCtx::quiescent`]): that
+/// completion wakes it, and its exit discharges the obligation.
 #[test]
 fn before_quiescence_reads_post_step_status() {
     let woken = report(
@@ -483,24 +498,16 @@ fn before_quiescence_reads_post_step_status() {
         Assumptions::none(),
         |sim| handler(sim, 2),
     );
-    assert_eq!(parked.end.outcome, Outcome::Violation);
-    let violation = parked.end.violation.as_ref().expect("it violated");
+    assert_eq!(
+        outcome(&parked, &HANDLED),
+        PropertyOutcome::Held { applicable: 1 }
+    );
     let picks = picks(&parked);
-    let step = usize::try_from(violation.step).expect("a small step");
     assert!(
-        picks[step - 1].starts_with("task:handler.1:"),
-        "the violation is at the handler's step: {picks:?}"
-    );
-    assert!(
-        picks[step - 2].starts_with("storage:store:1:"),
-        "right after the completion that woke it: {picks:?}"
-    );
-    assert_eq!(picks.len(), step, "the run ended at that step");
-    assert!(
-        !picks
+        picks
             .iter()
             .any(|pick| pick.starts_with("storage:store:2:")),
-        "the second completion never ran: {picks:?}"
+        "the second completion ran: {picks:?}"
     );
 }
 
@@ -521,7 +528,10 @@ fn undeclared_assumption_not_applicable() {
             handler(sim, 1);
         },
     );
-    assert_eq!(outcome(&report, &SERVED), PropertyOutcome::NotApplicable);
+    assert_eq!(
+        outcome(&report, &SERVED),
+        not_applicable(NaReason::Undeclared)
+    );
     assert_eq!(
         outcome(&report, &HANDLED),
         PropertyOutcome::Held { applicable: 1 },
@@ -530,9 +540,9 @@ fn undeclared_assumption_not_applicable() {
 }
 
 /// P1.2: a property whose declared assumptions never hold is
-/// `Inconclusive`.
+/// `NotApplicable` with `assumptions-never-held`.
 #[test]
-fn assumptions_never_held_inconclusive() {
+fn assumptions_never_held_not_applicable() {
     let world = Rc::new(World::default());
     let report = report(
         world,
@@ -549,7 +559,7 @@ fn assumptions_never_held_inconclusive() {
     );
     assert_eq!(
         outcome(&report, &SERVED),
-        inconclusive("assumptions-never-held")
+        not_applicable(NaReason::AssumptionsNeverHeld)
     );
 }
 
@@ -579,10 +589,12 @@ fn deadline_starts_at_trigger() {
     );
 }
 
-/// P1.2, review P-03: an assumption that breaks and returns ends the open
-/// obligation `Inconclusive`, and `holds_since` restarts when it returns.
+/// P1.2, review P-03: an assumption that breaks and returns withdraws the
+/// open obligation, and `holds_since` restarts when it returns. The
+/// request's evaluation applied, so the lost assumption isn't a reason
+/// (#1840 rule 4), and the property holds.
 #[test]
-fn lost_assumption_inconclusive() {
+fn a_lost_assumption_withdraws_its_obligation() {
     let world = honest();
     let fault = world.clone();
     let (report, checker, _) = run_with(
@@ -605,7 +617,10 @@ fn lost_assumption_inconclusive() {
             });
         },
     );
-    assert_eq!(outcome(&report, &SERVED), inconclusive("assumption-lost"));
+    assert_eq!(
+        outcome(&report, &SERVED),
+        PropertyOutcome::Held { applicable: 1 }
+    );
     assert_eq!(
         checker.holds_since(&SERVED),
         Some(exit_step(&report.log, "fault.1")),
@@ -683,23 +698,16 @@ fn known_violation_does_not_stop_the_run() {
 }
 
 /// A violation the view reports only at the run's end counts against its
-/// property, at the run's last step. A property already violated keeps its
-/// first violation, and an ID nothing registered is ignored.
+/// property, at the run's last step, and an ID nothing registered is
+/// ignored. A property already violated at a step keeps that violation
+/// first, and the end finding beside it (C12).
 #[test]
-fn an_end_violation_counts_unless_the_property_already_broke() {
+fn an_end_violation_counts_beside_earlier_violations() {
     let bumps = |twice: bool| {
         let world = honest();
         world.end.borrow_mut().extend([
-            EndViolation {
-                property: LEVEL,
-                expected: "settled".to_owned(),
-                actual: "still open".to_owned(),
-            },
-            EndViolation {
-                property: PropertyId::new("test/unregistered"),
-                expected: String::new(),
-                actual: String::new(),
-            },
+            end_finding(LEVEL, "settled", "still open"),
+            end_finding(PropertyId::new("test/unregistered"), "", ""),
         ]);
         let task_world = world.clone();
         let known = level(Status::Known { issue: 1523 });
@@ -727,11 +735,206 @@ fn an_end_violation_counts_unless_the_property_already_broke() {
         .all(|p| p.property != "test/unregistered"));
 
     let broke = bumps(true);
+    let bump_step = exit_step(&broke.log, "bump.1");
     assert_eq!(
         outcome(&broke, &LEVEL),
         PropertyOutcome::Violated {
-            witness: vec![exit_step(&broke.log, "bump.1")]
+            witness: vec![bump_step]
         }
+    );
+    let kept: Vec<(u64, &str)> = property_report(&broke, &LEVEL)
+        .violations
+        .iter()
+        .map(|v| (v.step, v.actual.as_str()))
+        .collect();
+    assert_eq!(
+        kept,
+        [(bump_step, "level 2"), (broke.end.steps, "still open")]
+    );
+}
+
+/// An end finding `expected` and `actual` of `property`.
+fn end_finding(property: PropertyId, expected: &str, actual: &str) -> EndViolation {
+    EndViolation {
+        property,
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
+}
+
+/// C12: the registry keeps every end finding beside the violations the
+/// steps found: a step finding and an end finding of one ID, two end
+/// findings of one ID, even in the same words, since distinct breaks can
+/// share them, and an `Active` and a `Known` property's end findings at one
+/// boundary. A harness whose end replay finds a step's break again leaves it
+/// out itself, where it knows the break's identity.
+#[test]
+fn every_end_finding_is_kept() {
+    const ACTIVE: PropertyId = PropertyId::new("test/active-end");
+    let world = honest();
+    world.end.borrow_mut().extend([
+        end_finding(LEVEL, "settled", "first still open"),
+        end_finding(LEVEL, "settled", "second still open"),
+        end_finding(LEVEL, "settled", "second still open"),
+        end_finding(ACTIVE, "settled", "active still open"),
+    ]);
+    let task_world = world.clone();
+    let active = Property {
+        id: ACTIVE,
+        check: |_| Verdict::Holds,
+        ..level(Status::Active)
+    };
+    let known = level(Status::Known { issue: 1523 });
+    let report = report(
+        world,
+        vec![known, active],
+        Assumptions::none(),
+        move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
+            });
+        },
+    );
+    let bump_step = exit_step(&report.log, "bump.1");
+    let kept = |id: &PropertyId| -> Vec<(u64, String)> {
+        property_report(&report, id)
+            .violations
+            .iter()
+            .map(|v| (v.step, v.actual.clone()))
+            .collect()
+    };
+    let last = report.end.steps;
+    assert_eq!(
+        kept(&LEVEL),
+        [
+            (bump_step, "level 2".to_owned()),
+            (last, "first still open".to_owned()),
+            (last, "second still open".to_owned()),
+            (last, "second still open".to_owned()),
+        ]
+    );
+    assert_eq!(kept(&ACTIVE), [(last, "active still open".to_owned())]);
+    // The end findings come last, and the report says how many there are.
+    assert_eq!(property_report(&report, &LEVEL).end_found, 3);
+    assert_eq!(property_report(&report, &ACTIVE).end_found, 1);
+    assert_eq!(
+        outcome(&report, &ACTIVE),
+        PropertyOutcome::Violated {
+            witness: vec![last]
+        }
+    );
+}
+
+const MISSING: PropertyId = PropertyId::new("test/missing-evidence");
+
+/// Finds evidence missing once the counter reaches `FROM`, which fails the
+/// run as a harness failure after that step.
+fn missing_from<const FROM: u32>(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    if cx.view() >= FROM {
+        cx.missing_evidence(format!("level {}", cx.view()));
+    }
+    Verdict::NotApplicable
+}
+
+/// A property that fails the run once the counter reaches `FROM`.
+fn missing_property<const FROM: u32>() -> Property<World> {
+    Property {
+        id: MISSING,
+        claim: "the counter's evidence is complete",
+        check: missing_from::<FROM>,
+        ..level(Status::Active)
+    }
+}
+
+/// The trim: a run that ends at a harness failure drops every report's end
+/// findings and recomputes its outcome. A report whose only violation was
+/// an end finding is `HarnessFailed`, one with a step violation stays
+/// `Violated` with only that one, and `Undeclared` and `Excluded` survive.
+#[test]
+fn a_harness_end_trims_every_end_finding() {
+    let run = |bumps: u32, properties: Vec<Property<World>>, end: &[PropertyId]| {
+        let world = honest();
+        world.end.borrow_mut().extend(
+            end.iter()
+                .map(|id| end_finding(id.clone(), "settled", "still open")),
+        );
+        let task_world = world.clone();
+        report(world, properties, Assumptions::none(), move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                for _ in 0..bumps {
+                    bump(&task_world);
+                    task::yield_now().await;
+                }
+            });
+        })
+    };
+
+    // An end finding alone, then a harness end.
+    let ended = run(
+        1,
+        vec![level(Status::Active), missing_property::<1>()],
+        &[LEVEL],
+    );
+    assert_eq!(ended.end.outcome, Outcome::Harness, "{:?}", ended.end);
+    assert_eq!(
+        outcome(&ended, &LEVEL),
+        not_applicable(NaReason::HarnessFailed)
+    );
+    let trimmed = property_report(&ended, &LEVEL);
+    assert_eq!((trimmed.violations.len(), trimmed.end_found), (0, 0));
+
+    // A step violation and an end finding, then a harness end at the same
+    // step.
+    let broke = run(
+        2,
+        vec![
+            level(Status::Known { issue: 1523 }),
+            missing_property::<2>(),
+        ],
+        &[LEVEL],
+    );
+    assert_eq!(broke.end.outcome, Outcome::Harness, "{:?}", broke.end);
+    let kept = property_report(&broke, &LEVEL);
+    assert_eq!(kept.end_found, 0);
+    assert_eq!(
+        kept.violations
+            .iter()
+            .map(|v| (v.step, v.actual.as_str()))
+            .collect::<Vec<_>>(),
+        [(broke.end.steps, "level 2")]
+    );
+    assert_eq!(
+        outcome(&broke, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: vec![broke.end.steps]
+        }
+    );
+
+    // An undeclared and an excluded property keep their reasons, even with
+    // an end finding each.
+    let unrun = run(
+        1,
+        vec![
+            request_served(TWO_SECONDS, Status::Active, &[Assume::HonestPeer]),
+            frames_property(),
+            missing_property::<1>(),
+        ],
+        &[SERVED, NO_BAD_FRAMES],
+    );
+    assert_eq!(unrun.end.outcome, Outcome::Harness, "{:?}", unrun.end);
+    assert_eq!(
+        outcome(&unrun, &SERVED),
+        not_applicable(NaReason::Undeclared)
+    );
+    assert_eq!(
+        outcome(&unrun, &NO_BAD_FRAMES),
+        not_applicable(NaReason::Excluded)
+    );
+    assert_eq!(
+        outcome(&unrun, &MISSING),
+        not_applicable(NaReason::HarnessFailed)
     );
 }
 
@@ -743,17 +946,18 @@ fn settled_at_two(cx: &mut CheckCtx<'_, World>) -> Verdict {
     match cx.view() {
         0 => Verdict::NotApplicable,
         1 => {
-            cx.unsettled(Inconclusive::TeardownOpen);
+            cx.pending(Pending::TeardownOpen);
             Verdict::NotApplicable
         }
         _ => Verdict::Holds,
     }
 }
 
-/// A run whose latest evaluation was unsettled is `Inconclusive` with the
-/// check's reason. A later evaluation that judges the property clears it.
+/// A run whose latest evaluation left a pending mark is `NotApplicable`,
+/// unsettled at the mark's site. A later evaluation that judges the
+/// property clears it.
 #[test]
-fn an_unsettled_last_evaluation_is_inconclusive() {
+fn a_pending_last_evaluation_is_unsettled() {
     let bumps = |count| {
         let world = honest();
         let task_world = world.clone();
@@ -776,12 +980,20 @@ fn an_unsettled_last_evaluation_is_inconclusive() {
             });
         })
     };
-    assert_eq!(outcome(&bumps(1), &SETTLED), inconclusive("teardown-open"));
+    assert_eq!(
+        outcome(&bumps(1), &SETTLED),
+        not_applicable(NaReason::Unsettled {
+            site: Pending::TeardownOpen
+        })
+    );
     assert!(
         matches!(outcome(&bumps(2), &SETTLED), PropertyOutcome::Held { .. }),
         "the second bump settles it"
     );
-    assert_eq!(outcome(&bumps(0), &SETTLED), PropertyOutcome::NotApplicable);
+    assert_eq!(
+        outcome(&bumps(0), &SETTLED),
+        not_applicable(NaReason::NeverApplied)
+    );
 }
 
 /// An `Ops` bound counts the named task's points of one operation after
@@ -1172,7 +1384,7 @@ fn excluded_source_not_applicable() {
     );
     assert_eq!(
         outcome(&report, &NO_BAD_FRAMES),
-        PropertyOutcome::NotApplicable
+        not_applicable(NaReason::Excluded)
     );
     assert_eq!(recorder.points(), []);
     assert_eq!(
@@ -1408,6 +1620,17 @@ impl ActionSource for Wire {
                 event: (*event).to_owned(),
             });
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

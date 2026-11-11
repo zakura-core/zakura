@@ -418,14 +418,13 @@ fn evidence_text(evidence: &Evidence) -> String {
     text += &format!("features: {distinct} distinct ({})\n", families.join(", "));
     for (id, counts) in &totals.properties {
         text += &format!(
-            "property {id} [{}]: held {} ({} evaluations), not applicable {}, inconclusive {} \
-             ({}), assumption losses {}, violated {}\n",
+            "property {id} [{}]: held {} ({} evaluations), not applicable {} ({}), \
+             assumption losses {}, violated {}\n",
             property_status(counts.status),
             counts.held,
             counts.evaluations,
-            counts.not_applicable,
-            counts.inconclusive.values().sum::<u64>(),
-            pairs(&counts.inconclusive),
+            counts.not_applicable_runs(),
+            pairs(&counts.not_applicable),
             counts.assumption_losses(),
             counts.violated
         );

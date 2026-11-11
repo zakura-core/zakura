@@ -1672,6 +1672,7 @@ pub(crate) mod tests {
             budget: u64::MAX,
             now: at(2_000),
             status: zakura_scheduler::Status::Quiescent,
+            quiescent: false,
             log: &log,
         };
         let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), Some(&[]));

@@ -15,6 +15,7 @@ use zakura_network::zakura::{
     testkit::regulation::{production_tables, TEST_FAMILY},
     MessageRole, MessageRule, Stream,
 };
+use zakura_sim::NaReason;
 use zakura_sim::{
     model::{consequence, is_fault_cause, Consequence, Label},
     observe::StreamId,
@@ -247,7 +248,7 @@ fn close_cause_recorded_before_quiescence() {
     assert!(held(outcome(&report, "feed/s64v1/watch/over-live-closes")));
     assert_eq!(
         *outcome(&report, "feed/s64v1/item/unsolicited-closes"),
-        PropertyOutcome::NotApplicable
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
 }
 
@@ -450,7 +451,7 @@ fn a_rate_limit_close_after_an_exhausting_frame_breaks_cadence() {
     assert_eq!(unexhausted.end.violation, None);
     assert_eq!(
         *outcome(&unexhausted, "test/s65v2/status/cadence-never-closes"),
-        PropertyOutcome::NotApplicable
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
 }
 

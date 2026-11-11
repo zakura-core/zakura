@@ -371,10 +371,11 @@ fn every_witness_holds_and_applies() {
                 STALE_COMPLETION_INERT,
             ] {
                 assert!(
-                    matches!(
-                        outcome(&ran.report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-                    ),
+                    match outcome(&ran.report, control) {
+                        PropertyOutcome::Held { .. } => true,
+                        PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                        PropertyOutcome::Violated { .. } => false,
+                    },
                     "{name}: {control}: {:?}",
                     outcome(&ran.report, control)
                 );

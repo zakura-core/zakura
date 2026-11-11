@@ -686,6 +686,12 @@ impl<F: Family> Predicates<F> {
         ))
     }
 
+    /// The index of the hold that picked operation `key`'s current stage at
+    /// its submission, if one did.
+    pub(crate) fn hold_of(&self, key: F::Key) -> Option<usize> {
+        self.ops.get(&key)?.last()?.hold
+    }
+
     /// Whether a hold picked operation `key`'s current stage at its
     /// submission, so it completes only once that hold opens.
     pub(crate) fn held(&self, key: F::Key) -> bool {

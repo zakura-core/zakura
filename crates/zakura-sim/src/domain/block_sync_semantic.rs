@@ -1261,8 +1261,8 @@ fn waiting_body_moved(key: &ObligationKey, obs: &Observation) -> bool {
 /// Checks [`DETACHED_SUBMISSION_BOUNDED`]: the shared count limit, the
 /// shared decoded-byte target over the bodies storage holds, which only a
 /// lone body may pass, a holder for every submission storage held across a
-/// reset, and, once no task can run, no holder left on a submission whose
-/// verdict reached block sync.
+/// reset, and, once the scheduler is at rest ([`crate::at_rest`]), no
+/// holder left on a submission whose verdict reached block sync.
 fn check_detached_submission_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1272,7 +1272,7 @@ where
     let (findings, applicable) = {
         let mut model = model.borrow_mut();
         let mut findings = std::mem::take(&mut model.detached_findings);
-        if cx.status != zakura_scheduler::Status::Running && !model.closed {
+        if crate::at_rest(cx.status) && !model.closed {
             let unreleased = std::mem::take(&mut model.completed_held);
             if !unreleased.is_empty() {
                 findings.push(Finding {
@@ -1326,8 +1326,8 @@ where
 }
 
 /// Checks [`REACTOR_QUERY_LIFECYCLE`] after each reactor transition and
-/// storage query. Once no task can run, a query storage took that the channel
-/// never accepted is a finding too.
+/// storage query. Once the scheduler is at rest ([`crate::at_rest`]), a
+/// query storage took that the channel never accepted is a finding too.
 fn check_reactor_query_lifecycle<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1338,7 +1338,7 @@ where
         let mut model = model.borrow_mut();
         let queries = &mut model.reactor_queries;
         let mut findings = std::mem::take(&mut queries.findings);
-        if cx.status != zakura_scheduler::Status::Running {
+        if crate::at_rest(cx.status) {
             findings.extend(queries.take_unaccepted(cx.step));
         }
         (findings, queries.saw_proposal)
@@ -1352,7 +1352,8 @@ where
 
 /// Checks [`QUERY_WORK_AUTHORIZED`] at each reply the step classified, and,
 /// where the harness reads the engine, the reactor's adoption of the
-/// engine's newest view whenever no task can run.
+/// engine's newest view whenever the scheduler is at rest
+/// ([`crate::at_rest`]).
 fn check_query_work_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1363,7 +1364,7 @@ where
         let mut model = model.borrow_mut();
         let authority = &mut model.authority;
         let mut findings = std::mem::take(&mut authority.query_findings);
-        if cx.status != zakura_scheduler::Status::Running {
+        if crate::at_rest(cx.status) {
             findings.extend(authority.judge_adoption(cx.step));
         }
         (findings, std::mem::take(&mut authority.judged) > 0)
@@ -1375,13 +1376,14 @@ where
     })
 }
 
-/// Checks [`FRONTIER_WORK_CONSISTENT`] whenever no task can run.
+/// Checks [`FRONTIER_WORK_CONSISTENT`] whenever the scheduler is at rest
+/// ([`crate::at_rest`]).
 fn check_frontier_work_consistent<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: SemanticView,
 {
-    if cx.status == zakura_scheduler::Status::Running {
+    if !crate::at_rest(cx.status) {
         return Verdict::NotApplicable;
     }
     let model = caught_up(cx);

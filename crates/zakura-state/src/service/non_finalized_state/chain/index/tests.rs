@@ -1,487 +1,571 @@
-//! Snapshot isolation checks and a release-mode clone microbenchmark.
+//! Per-block transparent address indexes, and finalized entries left in shared chain indexes.
 
-use std::{collections::HashMap, hint::black_box, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use zakura_chain::{
-    amount::NonNegative,
-    block::Height,
-    parameters::{Network, NetworkKind},
-    transaction, transparent,
+    amount::{Amount, NegativeAllowed},
+    block::{Block, Height},
+    parameters::Network,
+    serialization::ZcashDeserializeInto,
+    transaction::{self, LockTime, Transaction},
+    transparent,
     value_balance::ValueBalance,
 };
 
-use super::{
-    super::{Chain, RevertPosition, UpdateWith},
-    CreatedOutputs, CreatedUtxos, TransparentTransfers,
+use crate::{
+    arbitrary::Prepare, service::non_finalized_state::shared_map::PARTITIONS,
+    tests::FakeChainHelper, ContextuallyVerifiedBlock, OutputLocation, TransactionLocation,
 };
 
-#[test]
-fn cloned_chain_keeps_transparent_address_history_isolated() {
-    let address = transparent::Address::PayToPublicKeyHash {
-        network_kind: NetworkKind::Mainnet,
-        pub_key_hash: [1; 20],
-    };
-    let existing = transaction::Hash([2; 32]);
-    let added = transaction::Hash([3; 32]);
-    let mut transfers = TransparentTransfers::default();
-    transfers.tx_ids.insert(existing);
+use super::{
+    super::{Chain, FINALIZED_PARTITIONS_PER_ROOT},
+    AddressKey,
+};
 
-    let mut chain = Chain::new(
-        &Network::Mainnet,
-        Height(0),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        ValueBalance::<NonNegative>::zero(),
-    );
-    *chain
-        .partial_transparent_transfers
-        .get_or_insert_mut(address) = transfers;
-    let original = Arc::new(chain);
-    let mut candidate = Arc::unwrap_or_clone(Arc::clone(&original));
-    let history = |chain: &Chain| {
-        chain
-            .partial_transparent_transfers
-            .get(&address)
-            .expect("the address was inserted above")
-            .clone()
-    };
-
-    assert!(std::ptr::eq(
-        original
-            .partial_transparent_transfers
-            .get(&address)
-            .unwrap(),
-        candidate
-            .partial_transparent_transfers
-            .get(&address)
-            .unwrap(),
-    ));
-
-    candidate
-        .partial_transparent_transfers
-        .get_mut(&address)
-        .expect("the address was inserted above")
-        .tx_ids
-        .insert(added);
-
-    assert!(history(&candidate).tx_ids.contains(&added));
-    assert!(!history(&original).tx_ids.contains(&added));
-    assert!(history(&original).tx_ids.contains(&existing));
-}
-
-/// Records a coinbase output paid to the address at `height`.
-fn receive_coinbase(
-    transfers: &mut TransparentTransfers,
-    height: u32,
-) -> (transparent::OutPoint, transparent::OrderedUtxo) {
-    let mut hash = [0; 32];
-    hash[..4].copy_from_slice(&height.to_le_bytes());
-    let outpoint = transparent::OutPoint {
-        hash: transaction::Hash(hash),
-        index: 0,
-    };
-    let output = transparent::Output::new(
-        zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
-        transparent::Script::new(&[0x51; 25]),
-    );
-    let utxo = transparent::OrderedUtxo::new(output, Height(height), 0);
-    transfers
-        .update_chain_tip_with(&(&outpoint, &utxo))
-        .expect("a new output is accepted");
-    (outpoint, utxo)
-}
-
-fn height_outputs(transfers: &TransparentTransfers, height: u32) -> &Arc<CreatedOutputs> {
-    transfers
-        .created_utxos
-        .heights()
-        .find(|(existing, _)| existing.0 == height)
-        .unwrap()
-        .1
-}
+const VALUE: i64 = 1_000;
 
 #[test]
-fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
-    let mut original = TransparentTransfers::default();
-    for height in 1..=3 {
-        receive_coinbase(&mut original, height);
-    }
-
-    // A snapshot taken before the next block keeps the earlier outputs without copying them.
-    let mut appended = original.clone();
-    let (outpoint, utxo) = receive_coinbase(&mut appended, 4);
-
-    for height in 1..=3 {
-        assert!(Arc::ptr_eq(
-            height_outputs(&original, height),
-            height_outputs(&appended, height),
-        ));
-    }
-    assert_eq!(original.created_utxos().count(), 3);
-    assert_eq!(appended.created_utxos().count(), 4);
-    assert_eq!(appended.received(), 4_000);
-
-    // Outputs are listed in chain order across heights.
-    let heights: Vec<_> = appended
-        .created_utxos()
-        .map(|(location, _)| location.height())
-        .collect();
-    assert_eq!(heights, [Height(1), Height(2), Height(3), Height(4)]);
-
-    // Reverting the block removes its whole height and leaves no empty group behind.
-    appended.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
-    assert_eq!(appended, original);
-    assert!(appended
-        .created_utxos
-        .heights()
-        .all(|(height, _)| *height != Height(4)));
-}
-
-#[test]
-fn retained_address_history_copies_only_changed_height_chunks() {
-    let mut original = TransparentTransfers::default();
-    let outputs: Vec<_> = (0..256)
-        .map(|height| receive_coinbase(&mut original, height))
-        .collect();
-    let mut candidate = original.clone();
-
-    // Cloning 256 heights copies eight chunk pointers, not 256 height entries.
-    let CreatedUtxos::Chunked(original_chunks) = &original.created_utxos else {
-        panic!("256 retained heights must span multiple chunks");
-    };
-    let CreatedUtxos::Chunked(candidate_chunks) = &candidate.created_utxos else {
-        panic!("the clone preserves the chunked representation");
-    };
-    assert_eq!(original_chunks.len(), 8);
-    for (id, chunk) in original_chunks {
-        assert!(Arc::ptr_eq(chunk, &candidate_chunks[id]));
-        assert!(chunk
-            .values()
-            .all(|outputs| Arc::strong_count(outputs) == 1));
-    }
-
-    // Append into a new chunk, then finalize one block from the oldest chunk.
-    let added = receive_coinbase(&mut candidate, 256);
-    candidate.revert_chain_with(&(&outputs[0].0, &outputs[0].1), RevertPosition::Root);
-    let CreatedUtxos::Chunked(candidate_chunks) = &candidate.created_utxos else {
-        panic!("appending a chunk preserves the chunked representation");
-    };
-    for (id, chunk) in original_chunks {
-        assert_eq!(Arc::ptr_eq(chunk, &candidate_chunks[id]), *id != 0);
-        if *id != 0 {
-            assert!(chunk
-                .values()
-                .all(|outputs| Arc::strong_count(outputs) == 1));
+fn duplicate_spends_in_one_block_panic_during_push() {
+    for starts_empty in [false, true] {
+        let (chain, template) = chain_and_template(false);
+        let chain = if starts_empty {
+            empty_chain_at(template.coinbase_height().unwrap())
+        } else {
+            chain
+        };
+        let (mut block, _) = child_with_spends(&template, 0, 2);
+        let transactions = &mut Arc::make_mut(&mut block).transactions;
+        let inputs = transactions[1].inputs().to_vec();
+        match Arc::make_mut(&mut transactions[2]) {
+            Transaction::V4 { inputs: second, .. } => *second = inputs,
+            _ => unreachable!("the fixture creates V4 transactions"),
         }
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            block.prepare(),
+            HashMap::from([finalized_output(0)]),
+        )
+        .expect("each transaction preserves value");
+        assert_push_panics(chain, contextual, "unexpected duplicate spent output");
     }
-    assert_eq!(original.created_utxos().count(), 256);
-    assert_eq!(candidate.created_utxos().count(), 256);
-    assert_eq!(
-        original.created_utxos().next().unwrap().0.height(),
-        Height(0)
-    );
-    assert_eq!(
-        candidate.created_utxos().next().unwrap().0.height(),
-        Height(1)
-    );
-
-    // Reorg across the new chunk boundary, and remove the rest of the oldest chunk.
-    candidate.revert_chain_with(&(&added.0, &added.1), RevertPosition::Tip);
-    assert!(candidate
-        .created_utxos
-        .heights()
-        .all(|(height, _)| height.0 < 256));
-    for (outpoint, utxo) in &outputs[1..32] {
-        candidate.revert_chain_with(&(outpoint, utxo), RevertPosition::Root);
-    }
-    assert!(candidate
-        .created_utxos
-        .heights()
-        .all(|(height, _)| height.0 >= 32));
-    assert_eq!(candidate.created_utxos().count(), 224);
-    assert_eq!(candidate.received(), 224_000);
-    assert_eq!(original.received(), 256_000);
-    assert_eq!(candidate.balance(), 224_000_i64);
-    assert_eq!(original.balance(), 256_000_i64);
-    let mut expected = TransparentTransfers::default();
-    for height in 32..256 {
-        receive_coinbase(&mut expected, height);
-    }
-    assert_eq!(candidate, expected);
 }
 
 #[test]
-fn short_histories_promote_and_collapse_without_changing_snapshots() {
-    // Exercise both tip rollback and removal of the oldest chunk, including sparse heights.
-    for (first, second, position) in [
-        (31, 32, RevertPosition::Tip),
-        (32, 31, RevertPosition::Root),
-        (32, 4096, RevertPosition::Tip),
-    ] {
-        let mut original = TransparentTransfers::default();
-        let first_output = receive_coinbase(&mut original, first);
-        assert!(matches!(original.created_utxos, CreatedUtxos::Single(_)));
-        let mut candidate = original.clone();
-        let added = receive_coinbase(&mut candidate, second);
-        assert!(matches!(candidate.created_utxos, CreatedUtxos::Chunked(_)));
-        assert!(Arc::ptr_eq(
-            height_outputs(&original, first),
-            height_outputs(&candidate, first)
-        ));
-
-        // Keep the promoted snapshot alive while removing a chunk from another snapshot.
-        let promoted = candidate.clone();
-        candidate.revert_chain_with(&(&added.0, &added.1), position);
-        assert_eq!(candidate, original);
-        assert!(matches!(candidate.created_utxos, CreatedUtxos::Single(_)));
-        assert_eq!(promoted.received(), 2_000);
-        assert!(Arc::ptr_eq(
-            height_outputs(&promoted, first),
-            height_outputs(&candidate, first)
-        ));
-
-        candidate.revert_chain_with(&(&first_output.0, &first_output.1), RevertPosition::Tip);
-        assert!(candidate.is_empty());
-        receive_coinbase(&mut candidate, second + 1);
-        assert!(matches!(candidate.created_utxos, CreatedUtxos::Single(_)));
-        assert_eq!(
-            candidate.created_utxos().next().unwrap().0.height(),
-            Height(second + 1)
+fn duplicate_transactions_in_one_block_panic_during_push() {
+    for starts_empty in [false, true] {
+        let (chain, template) = chain_and_template(false);
+        let chain = if starts_empty {
+            empty_chain_at(template.coinbase_height().unwrap())
+        } else {
+            chain
+        };
+        let (mut block, _) = child_with_spends(&template, 0, 1);
+        let transactions = &mut Arc::make_mut(&mut block).transactions;
+        transactions.push(transactions[1].clone());
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            block.prepare(),
+            HashMap::from([finalized_output(0)]),
+        )
+        .expect("each transaction preserves value");
+        assert_push_panics(
+            chain,
+            contextual,
+            "transactions must be unique within a single chain",
         );
-        assert_eq!(original.received(), 1_000);
-        assert_eq!(promoted.received(), 2_000);
+    }
+}
+
+fn assert_push_panics(chain: Chain, block: ContextuallyVerifiedBlock, expected: &str) {
+    let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chain.push(block)))
+    else {
+        panic!("pushing the invalid block must trigger its index invariant");
+    };
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("the invariant panic has a string message");
+    assert!(message.contains(expected), "unexpected panic: {message}");
+}
+
+#[test]
+fn finalized_entries_can_be_replaced_before_they_are_swept() {
+    let (chain, template) = chain_and_template(false);
+    let (root, contextual) = child_with_spends(&template, 0, 300);
+    let chain = push(chain, contextual);
+    let (tip, contextual) = child_with_spends(&root, 1_000, 0);
+    let mut chain = push(chain, contextual);
+    chain.pop_root();
+    chain.pop_root();
+
+    let (seed, transaction) = root
+        .transactions
+        .iter()
+        .skip(1)
+        .enumerate()
+        .find(|(seed, tx)| {
+            let outpoint = finalized_output(u32::try_from(*seed).unwrap()).0;
+            chain.tx_loc_by_hash.get(&tx.hash()).is_some()
+                && chain.spent_utxos.get(&outpoint).is_some()
+        })
+        .expect("most finalized entries are still waiting for a sweep");
+    let mut block = tip.make_fake_child();
+    Arc::make_mut(&mut block)
+        .transactions
+        .push(transaction.clone());
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        block.prepare(),
+        HashMap::from([finalized_output(u32::try_from(seed).unwrap())]),
+    )
+    .expect("the repeated transaction preserves value");
+    let height = contextual.height;
+    // Exercise only the index backstop: full validation would reject spending an
+    // already-finalized output, but finalized index residue must allow replacement.
+    let chain = push(chain, contextual);
+    assert_eq!(
+        chain
+            .transaction_location(&transaction.hash())
+            .unwrap()
+            .height,
+        height
+    );
+    assert!(chain
+        .spent_utxo(&finalized_output(u32::try_from(seed).unwrap()).0)
+        .is_some());
+}
+
+#[test]
+fn utxo_query_resolves_outputs_across_many_transactions() {
+    let (chain, template) = chain_and_template(false);
+    let (mut block, contextual) = child_with_spends(&template, 0, 256);
+    let height = contextual.height;
+    // Include two outputs to the same address in the last transaction.
+    match Arc::make_mut(&mut Arc::make_mut(&mut block).transactions[256]) {
+        Transaction::V4 { outputs, .. } => {
+            outputs.push(transparent::Output::new(Amount::zero(), p2pkh(1_000_255).1))
+        }
+        _ => unreachable!("the fixture creates V4 transactions"),
+    }
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        block.clone().prepare(),
+        contextual.spent_outputs.as_ref().clone(),
+    )
+    .expect("adding a zero-value output preserves the transfer values");
+    let chain = push(chain, contextual);
+
+    for seeds in [(0..256).collect::<Vec<_>>(), vec![0, 31, 127, 255]] {
+        let mut addresses: HashSet<_> =
+            seeds.iter().map(|seed| p2pkh(1_000_000 + seed).0).collect();
+        addresses.insert(p2pkh(9_000_000).0);
+        let mut expected: BTreeMap<_, _> = seeds
+            .iter()
+            .map(|seed| {
+                let transaction_index = usize::try_from(seed + 1).unwrap();
+                (
+                    OutputLocation::from_usize(height, transaction_index, 0),
+                    block.transactions[transaction_index].outputs()[0].clone(),
+                )
+            })
+            .collect();
+        expected.insert(
+            OutputLocation::from_usize(height, 256, 1),
+            block.transactions[256].outputs()[1].clone(),
+        );
+        let (created, spent) = chain.partial_transparent_utxo_changes(&addresses);
+        assert_eq!(created, expected);
+        assert!(spent.is_empty());
+    }
+    let (created, spent) = chain.partial_transparent_utxo_changes(&HashSet::new());
+    assert!(created.is_empty());
+    assert!(spent.is_empty());
+}
+
+#[test]
+fn balance_query_cancels_large_transfers_between_addresses() {
+    for receiver_first in [true, false] {
+        let (chain, template) = chain_and_template(false);
+        let addresses = HashSet::from([p2pkh(7).0, p2pkh(8).0]);
+        // Exercise both visit orders. Visiting the receiver first in the second block
+        // counts the same funds twice before subtracting the spend.
+        let mut order = addresses.iter().copied();
+        let first_address = order.next().unwrap();
+        let second_address = order.next().unwrap();
+        let (receiver, sender) = if receiver_first {
+            (first_address, second_address)
+        } else {
+            (second_address, first_address)
+        };
+        let script_for = |address| {
+            if p2pkh(7).0 == address {
+                p2pkh(7).1
+            } else {
+                p2pkh(8).1
+            }
+        };
+        let value = 11_000_000 * zakura_chain::amount::COIN;
+        let (funding, mut funding_output) = finalized_output(99);
+        funding_output.utxo.output =
+            transparent::Output::new(Amount::try_from(value).unwrap(), p2pkh(99).1);
+        let transfer = |parent: &Arc<Block>, outpoint, output: transparent::OrderedUtxo, script| {
+            let mut block = parent.make_fake_child();
+            let transactions = &mut Arc::make_mut(&mut block).transactions;
+            transactions.truncate(1);
+            transactions.push(Arc::new(Transaction::V4 {
+                inputs: vec![transparent::Input::PrevOut {
+                    outpoint,
+                    unlock_script: transparent::Script::new(&[]),
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![transparent::Output::new(output.utxo.output.value(), script)],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            }));
+            let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+                &Network::Mainnet,
+                block.clone().prepare(),
+                HashMap::from([(outpoint, output)]),
+            )
+            .expect("the transfer preserves value");
+            (block, contextual)
+        };
+        let (first, contextual) = transfer(&template, funding, funding_output, script_for(sender));
+        let first_height = contextual.height;
+        let outpoint = transparent::OutPoint {
+            hash: first.transactions[1].hash(),
+            index: 0,
+        };
+        let output = contextual.new_outputs[&outpoint].clone();
+        let chain = push(chain, contextual);
+        let (_, contextual) = transfer(&first, outpoint, output, script_for(receiver));
+        let second_height = contextual.height;
+        let chain = push(chain, contextual);
+
+        assert_eq!(
+            chain.partial_transparent_balance_change(&addresses, first_height),
+            (
+                Amount::try_from(value).unwrap(),
+                u64::try_from(2 * value).unwrap()
+            )
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&addresses, second_height),
+            (Amount::zero(), u64::try_from(value).unwrap())
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&HashSet::from([sender]), first_height),
+            (Amount::zero(), u64::try_from(value).unwrap())
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&HashSet::from([receiver]), first_height),
+            (
+                Amount::try_from(value).unwrap(),
+                u64::try_from(value).unwrap()
+            )
+        );
+    }
+}
+
+/// Returns a pay-to-public-key-hash address and its lock script.
+fn p2pkh(seed: u32) -> (transparent::Address, transparent::Script) {
+    let mut hash = [0; 20];
+    hash[..4].copy_from_slice(&seed.to_le_bytes());
+    let mut script = vec![0x76, 0xa9, 0x14];
+    script.extend(hash);
+    script.extend([0x88, 0xac]);
+    let script = transparent::Script::new(&script);
+    let address = transparent::Output::new(Amount::zero(), script.clone())
+        .address(&Network::Mainnet)
+        .expect("a P2PKH script has an address");
+    (address, script)
+}
+
+/// A finalized output the tests treat as sent to `p2pkh(seed)`.
+fn finalized_output(seed: u32) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    let mut hash = [0xee; 32];
+    hash[..4].copy_from_slice(&seed.to_le_bytes());
+    let output = transparent::Output::new(
+        Amount::try_from(VALUE).expect("the value is in range"),
+        p2pkh(seed).1,
+    );
+    (
+        transparent::OutPoint {
+            hash: transaction::Hash(hash),
+            index: 0,
+        },
+        transparent::OrderedUtxo::new(output, Height(1), 0),
+    )
+}
+
+/// Returns a child of `parent` with `spends` transactions. Transaction `i` spends the
+/// finalized output of `p2pkh(first_seed + i)` and pays `p2pkh(first_seed + i + 1_000_000)`.
+fn child_with_spends(
+    parent: &Arc<Block>,
+    first_seed: u32,
+    spends: u32,
+) -> (Arc<Block>, ContextuallyVerifiedBlock) {
+    let mut block = parent.make_fake_child();
+    let mut spent = HashMap::new();
+    let transactions = &mut Arc::make_mut(&mut block).transactions;
+    transactions.truncate(1);
+    for seed in first_seed..first_seed + spends {
+        let (outpoint, utxo) = finalized_output(seed);
+        spent.insert(outpoint, utxo);
+        transactions.push(Arc::new(Transaction::V4 {
+            inputs: vec![transparent::Input::PrevOut {
+                outpoint,
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![transparent::Output::new(
+                Amount::try_from(VALUE).expect("the value is in range"),
+                p2pkh(seed + 1_000_000).1,
+            )],
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            joinsplit_data: None,
+            sapling_shielded_data: None,
+        }));
+    }
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        block.clone().prepare(),
+        spent,
+    )
+    .expect("the spends and outputs balance");
+    (block, contextual)
+}
+
+/// Returns an empty chain, and a coinbase-only copy of a historical block at its first height.
+fn chain_and_template(skip_address_index: bool) -> (Chain, Arc<Block>) {
+    let mut template = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("the historical block vector deserializes");
+    Arc::make_mut(&mut template).transactions.truncate(1);
+    let finalized_tip =
+        (template.coinbase_height().expect("the block has a height") - 1).expect("above genesis");
+    let chain =
+        empty_chain_at(finalized_tip).skipping_transparent_address_index(skip_address_index);
+    let chain = push(
+        chain,
+        template.clone().prepare().test_with_zero_spent_utxos(),
+    );
+    (chain, template)
+}
+
+fn empty_chain_at(finalized_tip: Height) -> Chain {
+    Chain::new(
+        &Network::Mainnet,
+        finalized_tip,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::fake_populated_pool(),
+    )
+}
+
+fn push(chain: Chain, block: ContextuallyVerifiedBlock) -> Chain {
+    chain
+        .push(block)
+        .expect("test blocks are valid chain updates")
+}
+
+#[test]
+fn block_index_records_each_address_transfers() {
+    let (chain, template) = chain_and_template(false);
+    let (block, contextual) = child_with_spends(&template, 7, 1);
+    let height = contextual.height;
+    let spending_hash = block.transactions[1].hash();
+    let chain = push(chain, contextual);
+
+    let (spender, _) = p2pkh(7);
+    let (receiver, _) = p2pkh(1_000_007);
+    let transfers = chain
+        .transparent_transfers_by_height
+        .get(&height)
+        .expect("the block has indexed transfers");
+
+    let spent = transfers
+        .get(&AddressKey::new(spender))
+        .expect("the spender is indexed");
+    assert_eq!(
+        spent.balance(),
+        Amount::<NegativeAllowed>::try_from(-VALUE).unwrap()
+    );
+    assert_eq!(spent.received(), 0);
+    assert!(spent.created_locations().is_empty());
+    let spent_location = OutputLocation::from_usize(Height(1), 0, 0);
+    assert_eq!(spent.spent().collect::<Vec<_>>(), [&spent_location]);
+
+    let received = transfers
+        .get(&AddressKey::new(receiver))
+        .expect("the receiver is indexed");
+    assert_eq!(
+        received.balance(),
+        Amount::<NegativeAllowed>::try_from(VALUE).unwrap()
+    );
+    assert_eq!(received.received(), 1_000);
+    let created_location = OutputLocation::from_usize(height, 1, 0);
+    assert_eq!(received.created_locations(), [created_location]);
+    assert_eq!(received.spent().count(), 0);
+
+    let both = HashSet::from([spender, receiver]);
+    assert_eq!(
+        chain.partial_transparent_balance_change(&both, height),
+        (Amount::zero(), 1_000)
+    );
+    let (created, spent) = chain.partial_transparent_utxo_changes(&both);
+    assert_eq!(
+        created.into_iter().collect::<Vec<_>>(),
+        [(created_location, block.transactions[1].outputs()[0].clone())]
+    );
+    assert_eq!(spent.into_iter().collect::<Vec<_>>(), [spent_location]);
+    assert_eq!(
+        chain.partial_transparent_tx_ids(&HashSet::from([spender]), Height(0)..=Height::MAX),
+        [(TransactionLocation::from_usize(height, 1), spending_hash)].into()
+    );
+}
+
+#[test]
+fn chains_share_block_indexes_and_finalizing_drops_the_root_index() {
+    let (chain, template) = chain_and_template(false);
+    let (first, contextual) = child_with_spends(&template, 0, 2);
+    let first_height = contextual.height;
+    let chain = push(chain, contextual);
+    let (second, contextual) = child_with_spends(&first, 10, 2);
+    let mut best = push(chain, contextual);
+    let mut side = best.clone();
+    best = push(best, child_with_spends(&second, 20, 2).1);
+
+    assert!(Arc::ptr_eq(
+        best.transparent_transfers_by_height
+            .get(&first_height)
+            .unwrap(),
+        side.transparent_transfers_by_height
+            .get(&first_height)
+            .unwrap(),
+    ));
+
+    let first_receiver = HashSet::from([p2pkh(1_000_000).0]);
+    assert_eq!(
+        best.partial_transparent_balance_change(&first_receiver, first_height),
+        (Amount::<NegativeAllowed>::try_from(VALUE).unwrap(), 1_000)
+    );
+    for chain in [&mut best, &mut side] {
+        // The template, then the first spending block.
+        chain.pop_root();
+        chain.pop_root();
+        assert!(chain
+            .transparent_transfers_by_height
+            .get(&first_height)
+            .is_none());
+        assert_eq!(
+            chain.partial_transparent_balance_change(&first_receiver, first_height),
+            (Amount::zero(), 0)
+        );
+        assert!(chain
+            .partial_transparent_utxo_changes(&first_receiver)
+            .0
+            .is_empty());
     }
 }
 
 #[test]
-fn changes_within_a_shared_height_preserve_snapshots_and_transaction_counts() {
-    let mut original = TransparentTransfers::default();
-    let (outpoint, utxo) = receive_coinbase(&mut original, 31);
-    let mut candidate = original.clone();
-    let second = transparent::OutPoint {
-        index: 1,
-        ..outpoint
-    };
-    candidate.update_chain_tip_with(&(&second, &utxo)).unwrap();
-    assert_eq!(original.received(), 1_000);
-    assert_eq!(candidate.received(), 2_000);
-    candidate.revert_chain_with(&(&second, &utxo), RevertPosition::Tip);
-    assert_eq!(candidate, original);
-    assert!(candidate.tx_ids.contains(&outpoint.hash));
-    candidate.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
-    assert!(candidate.is_empty());
-    assert!(candidate.created_utxos.is_empty());
-    assert_eq!(original.received(), 1_000);
+fn finalized_entries_are_hidden_then_swept() {
+    let (chain, template) = chain_and_template(false);
+    let (root, contextual) = child_with_spends(&template, 0, 300);
+    let mut chain = push(chain, contextual);
+    chain.pop_root();
+    let mut parent = root.clone();
+    // Enough blocks to finalize the spending block, then sweep every partition.
+    let sweeps = PARTITIONS.div_ceil(FINALIZED_PARTITIONS_PER_ROOT);
+    for _ in 0..=sweeps {
+        let child = parent.make_fake_child();
+        chain = push(chain, child.clone().prepare().test_with_zero_spent_utxos());
+        parent = child;
+    }
+
+    let spent = finalized_output(0).0;
+    let spending = root.transactions[1].hash();
+    assert!(chain.spent_utxo(&spent).is_some());
+    assert!(chain.contains_transaction(&spending));
+
+    chain.pop_root();
+    assert!(chain.spent_utxo(&spent).is_none());
+    assert!(chain.transaction_location(&spending).is_none());
+    assert!(!chain.contains_transaction(&spending));
+    assert!(chain.transaction(spending).is_none());
+    // Most of the finalized spends wait for a later sweep.
+    assert!(chain.spent_utxos.len() > 200);
+
+    for _ in 1..sweeps {
+        chain.pop_root();
+    }
+    assert_eq!(chain.spent_utxos.len(), 0);
+    assert!(root
+        .transactions
+        .iter()
+        .all(|transaction| chain.tx_loc_by_hash.get(&transaction.hash()).is_none()));
 }
 
 #[test]
-fn changing_outputs_in_a_shared_chunk_preserves_earlier_snapshots() {
-    let mut original = TransparentTransfers::default();
-    let (outpoint, utxo) = receive_coinbase(&mut original, 31);
-    receive_coinbase(&mut original, 32);
-    let mut candidate = original.clone();
-    let second = transparent::OutPoint {
-        index: 1,
-        ..outpoint
-    };
-    candidate.update_chain_tip_with(&(&second, &utxo)).unwrap();
-    assert_eq!(original.received(), 2_000);
-    assert_eq!(candidate.received(), 3_000);
-    assert!(!Arc::ptr_eq(
-        height_outputs(&original, 31),
-        height_outputs(&candidate, 31)
-    ));
-    assert!(Arc::ptr_eq(
-        height_outputs(&original, 32),
-        height_outputs(&candidate, 32)
-    ));
-    let appended = candidate.clone();
-    candidate.revert_chain_with(&(&second, &utxo), RevertPosition::Tip);
-    assert_eq!(candidate, original);
-    assert_eq!(appended.received(), 3_000);
-    assert!(candidate.tx_ids.contains(&outpoint.hash));
+fn finalizing_copies_only_the_swept_partitions_of_a_shared_chain() {
+    let (chain, template) = chain_and_template(false);
+    // Enough spends to put the root's entries in every partition.
+    let (root, contextual) = child_with_spends(&template, 0, 4_000);
+    let mut chain = push(chain, contextual);
+    chain.pop_root();
+    let (_, contextual) = child_with_spends(&root, 10_000, 1);
+    let mut chain = push(chain, contextual);
+
+    let snapshot = chain.clone();
+    assert_eq!(
+        chain.spent_utxos.shared_partitions(&snapshot.spent_utxos),
+        PARTITIONS
+    );
+    chain.pop_root();
+
+    let copied = FINALIZED_PARTITIONS_PER_ROOT;
+    assert_eq!(
+        chain.spent_utxos.shared_partitions(&snapshot.spent_utxos),
+        PARTITIONS - copied
+    );
+    assert_eq!(
+        chain
+            .tx_loc_by_hash
+            .shared_partitions(&snapshot.tx_loc_by_hash),
+        PARTITIONS - copied
+    );
 }
 
 #[test]
 fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
     for skip in [false, true] {
-        let mut chain = Chain::new(
-            &Network::Mainnet,
-            Height(0),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            ValueBalance::<NonNegative>::zero(),
-        )
-        .skipping_transparent_address_index(skip);
-
-        // A pay-to-public-key-hash output, so it has an address to index.
-        let mut lock_script = vec![0x76, 0xa9, 0x14];
-        lock_script.extend([4; 20]);
-        lock_script.extend([0x88, 0xac]);
-        let output = transparent::Output::new(
-            zakura_chain::amount::Amount::try_from(1_000).expect("the amount is in range"),
-            transparent::Script::new(&lock_script),
-        );
-        assert!(output.address(&Network::Mainnet).is_some());
-
-        let creating_tx = transaction::Hash([5; 32]);
-        let outpoint = transparent::OutPoint {
-            hash: creating_tx,
-            index: 0,
-        };
-        let outputs = vec![output.clone()];
-        let created = HashMap::from([(
-            outpoint,
-            transparent::OrderedUtxo::new(output, Height(1), 1),
-        )]);
-
-        let spending_tx = transaction::Hash([6; 32]);
-        let inputs = vec![transparent::Input::PrevOut {
-            outpoint,
-            unlock_script: transparent::Script::new(&[]),
-            sequence: 0,
-        }];
-
-        chain
-            .update_chain_tip_with(&(&outputs, &creating_tx, &created))
-            .expect("a new output is accepted");
-        chain
-            .update_chain_tip_with(&(&inputs, &spending_tx, &created))
-            .expect("spending the new output is accepted");
+        let (chain, template) = chain_and_template(skip);
+        let (_, contextual) = child_with_spends(&template, 0, 1);
+        let height = contextual.height;
+        let mut chain = push(chain, contextual);
 
         // Spending checks remain active even when address indexing is skipped.
-        assert!(chain.spent_utxos.contains_key(&outpoint));
+        let spent = finalized_output(0).0;
+        assert!(chain.spent_utxo(&spent).is_some());
         assert_eq!(
-            chain.partial_transparent_transfers.len(),
-            usize::from(!skip)
+            chain.transparent_transfers_by_height.get(&height).is_some(),
+            !skip
         );
 
-        chain.revert_chain_with(&(&inputs, &spending_tx, &created), RevertPosition::Tip);
-        chain.revert_chain_with(&(&outputs, &creating_tx, &created), RevertPosition::Tip);
-
-        assert!(!chain.spent_utxos.contains_key(&outpoint));
-        assert_eq!(chain.partial_transparent_transfers.len(), 0);
+        chain.pop_tip();
+        assert!(chain.spent_utxo(&spent).is_none());
+        assert!(chain.spent_utxos.get(&spent).is_none());
+        assert!(chain.transparent_transfers_by_height.get(&height).is_none());
     }
-}
-
-#[test]
-#[ignore = "release-mode clone benchmark"]
-#[allow(clippy::print_stdout)]
-fn compare_address_index_clone() {
-    // Isolate the address index; other chain indexes are empty. This does not
-    // reproduce a full block replay or its thread scheduling.
-    const ADDRESSES: usize = 10_000;
-    const TRANSACTIONS_PER_ADDRESS: usize = 16;
-    const SAMPLES: usize = 50;
-
-    let old_index: HashMap<_, _> = (0..ADDRESSES)
-        .map(|address_index| {
-            let mut address_hash = [0; 20];
-            let address_number =
-                u64::try_from(address_index).expect("the benchmark address count fits in u64");
-            address_hash[..8].copy_from_slice(&address_number.to_le_bytes());
-            let address = transparent::Address::PayToPublicKeyHash {
-                network_kind: NetworkKind::Mainnet,
-                pub_key_hash: address_hash,
-            };
-            let mut transfers = TransparentTransfers::default();
-            for transaction_index in 0..TRANSACTIONS_PER_ADDRESS {
-                let unique = address_index * TRANSACTIONS_PER_ADDRESS + transaction_index;
-                let mut hash = [0; 32];
-                let unique =
-                    u64::try_from(unique).expect("the benchmark transaction count fits in u64");
-                hash[..8].copy_from_slice(&unique.to_le_bytes());
-                transfers.tx_ids.insert(transaction::Hash(hash));
-            }
-            (address, transfers)
-        })
-        .collect();
-
-    let mut chain = Chain::new(
-        &Network::Mainnet,
-        Height(0),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        ValueBalance::<NonNegative>::zero(),
-    );
-    for (address, transfers) in &old_index {
-        *chain
-            .partial_transparent_transfers
-            .get_or_insert_mut(*address) = transfers.clone();
-    }
-    let chain = Arc::new(chain);
-
-    let measure = |mut operation: Box<dyn FnMut()>| {
-        let mut times = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
-            let start = Instant::now();
-            operation();
-            times.push(start.elapsed().as_nanos());
-        }
-        times.sort_unstable();
-        times[SAMPLES / 2]
-    };
-
-    let old = measure(Box::new(|| {
-        black_box(black_box(&old_index).clone());
-    }));
-    let shared = measure(Box::new(|| {
-        black_box(black_box(&chain.partial_transparent_transfers).clone());
-    }));
-    let unwrap = measure(Box::new(|| {
-        let candidate = Arc::clone(&chain);
-        black_box(Arc::unwrap_or_clone(candidate));
-    }));
-    let make_mut = measure(Box::new(|| {
-        let mut candidate = Arc::clone(&chain);
-        black_box(Arc::make_mut(&mut candidate));
-    }));
-    let touched = (0..100)
-        .map(|address_index| {
-            let mut address_hash = [0; 20];
-            let address_number =
-                u64::try_from(address_index).expect("the benchmark address count fits in u64");
-            address_hash[..8].copy_from_slice(&address_number.to_le_bytes());
-            transparent::Address::PayToPublicKeyHash {
-                network_kind: NetworkKind::Mainnet,
-                pub_key_hash: address_hash,
-            }
-        })
-        .collect::<Vec<_>>();
-    let added = transaction::Hash([255; 32]);
-    let old_clone_and_update = measure(Box::new(|| {
-        let mut candidate = old_index.clone();
-        for address in &touched {
-            candidate
-                .get_mut(address)
-                .expect("the address was inserted above")
-                .tx_ids
-                .insert(added);
-        }
-        black_box(candidate);
-    }));
-    let shared_clone_and_update = measure(Box::new(|| {
-        let mut candidate = Arc::unwrap_or_clone(Arc::clone(&chain));
-        for address in &touched {
-            candidate
-                .partial_transparent_transfers
-                .get_mut(address)
-                .expect("the address was inserted above")
-                .tx_ids
-                .insert(added);
-        }
-        black_box(candidate);
-    }));
-    println!(
-        "addresses={ADDRESSES} tx_per_address={TRANSACTIONS_PER_ADDRESS} median_ns old_index={old} shared_index={shared} unwrap_or_clone={unwrap} make_mut={make_mut} old_clone_and_update={old_clone_and_update} shared_clone_and_update={shared_clone_and_update}"
-    );
 }

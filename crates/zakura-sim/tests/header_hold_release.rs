@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -24,7 +25,7 @@ use zakura_sim::{
             Policy,
         },
         header_sync::{
-            liveness::{self, HeldKind, LivenessScenario, LIVENESS_BUDGET},
+            liveness::{self, HeldKind, LivenessScenario, RecoveryFixture, LIVENESS_BUDGET},
             storage_config, storage_properties, storage_sources, Liveness, Ports, Storage,
             StorageScenario, StorageView,
         },
@@ -115,7 +116,10 @@ fn assert_holds_and_applies(fixture: LivenessScenario, report: &RunReport) {
         assert!(
             matches!(
                 outcome(report, control),
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                PropertyOutcome::Held { .. }
+                    | PropertyOutcome::NotApplicable {
+                        reason: NaReason::NeverApplied
+                    }
             ),
             "{fixture:?}: {control}: {:?}",
             outcome(report, control)
@@ -405,6 +409,11 @@ impl HasView for Probe {
         self.0.end_violations(log)
     }
 
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
     /// The storage harness's stamps.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
@@ -487,6 +496,11 @@ impl HasView for Limited {
     /// The liveness harness's end violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.0.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
     }
 
     /// The liveness harness's stamps.
@@ -589,7 +603,7 @@ fn a_run_without_a_held_reply_doesnt_apply() {
             assert_eq!(report.end.violation, None, "{:?}", report.end);
             assert_eq!(
                 outcome(&report, HOLD_RELEASE_WAKES),
-                &PropertyOutcome::NotApplicable
+                &PropertyOutcome::not_applicable(NaReason::NeverApplied)
             );
         }
     }
@@ -624,6 +638,11 @@ impl HasView for Spinning {
     /// The storage harness's end violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.0.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
     }
 
     /// The storage harness's stamps.
@@ -776,10 +795,14 @@ fn the_scenario_byte_picks_each_fixture() {
     // generator, which corpus carry checks.
     assert_eq!(
         (Liveness::GENERATOR, all.len()),
-        (3, 39),
+        (4, 42),
         "a new fixture list needs a new generator"
     );
     assert_eq!(Liveness::draw(&[30]), LivenessScenario::QuietReset);
+    assert_eq!(
+        Liveness::draw(&[39]),
+        LivenessScenario::Recovery(RecoveryFixture::Closes)
+    );
 }
 
 /// The serving-read fixture holds the property and applies, with the
@@ -842,7 +865,9 @@ fn the_serving_controls_open_nothing() {
             assert!(
                 matches!(
                     outcome(&report, HOLD_RELEASE_WAKES),
-                    PropertyOutcome::NotApplicable
+                    PropertyOutcome::NotApplicable {
+                        reason: NaReason::NeverApplied
+                    }
                 ),
                 "{fixture:?}: {:?}",
                 outcome(&report, HOLD_RELEASE_WAKES)
@@ -851,7 +876,10 @@ fn the_serving_controls_open_nothing() {
                 assert!(
                     matches!(
                         outcome(&report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        PropertyOutcome::Held { .. }
+                            | PropertyOutcome::NotApplicable {
+                                reason: NaReason::NeverApplied
+                            }
                     ),
                     "{fixture:?}: {control}: {:?}",
                     outcome(&report, control)

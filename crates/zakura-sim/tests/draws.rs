@@ -235,7 +235,9 @@ fn cleanup_draws_rotate_so_a_select_loop_exits() {
     let (outcome, exited, unwound, leaked) = finished
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("shutdown finished the select loop");
-    assert_eq!(outcome, Outcome::Budget);
+    // The loop is still ready at the drain's bound of 0, which fails the
+    // run as `DrainBound`. Shutdown cleans up after it all the same.
+    assert_eq!(outcome, Outcome::Harness);
     // The cleanup point bound would also end a stuck loop, by unwinding it.
     assert!(exited, "the loop took its exit branch during cleanup");
     assert_eq!(
@@ -324,6 +326,17 @@ impl ActionSource for DrawsOnOffer {
 
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         self.runs.set(self.runs.get() + 1);
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

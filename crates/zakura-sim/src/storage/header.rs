@@ -42,7 +42,7 @@ use crate::{
         HeaderStorageState, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StorageRequest, StorageResult, StorageState, WorkOwner,
     },
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
 /// The service name in identities and observations.
@@ -82,6 +82,13 @@ pub(crate) fn decode(local: u64) -> StorageAction {
         // Indices come from `enabled`, so the code is in range.
         code => StorageAction::Complete(id, OUTCOMES[code as usize]),
     }
+}
+
+/// Whether `outcome` is the success of an operation whose legal outcomes
+/// are `legal`: `engine`, or `rejected` where that's the only legal
+/// outcome. Convergence policies and the drain offer only this.
+pub(crate) fn succeeds(legal: &[Outcome], outcome: Outcome) -> bool {
+    outcome == Outcome::Engine || legal == [Outcome::Rejected].as_slice()
 }
 
 /// Header storage driven by the run. Dropping it shuts the port down, which
@@ -717,6 +724,48 @@ impl ActionSource for HeaderStorage {
         }
     }
 
+    /// Each pending operation's success ([`succeeds`]) among the outcomes
+    /// legal now, and each committed reply's delivery.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        let mut offered = Vec::new();
+        self.enabled(now, &mut offered);
+        let pending = self.port.pending();
+        out.actions.extend(offered.into_iter().filter(|(_, local)| {
+            match decode(*local) {
+                StorageAction::Complete(id, outcome) => pending
+                    .iter()
+                    .find(|op| op.id == id)
+                    .is_some_and(|op| succeeds(&op.enabled, outcome)),
+                StorageAction::Deliver(_) => true,
+            }
+        }));
+    }
+
+    /// Nothing: the port has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// The first pending operation with no legal success, which no recovery
+    /// action completes.
+    fn holds_work(&self) -> Option<String> {
+        self.port
+            .pending()
+            .into_iter()
+            .find(|op| {
+                !op.enabled
+                    .iter()
+                    .any(|outcome| succeeds(&op.enabled, *outcome))
+            })
+            .map(|op| {
+                format!(
+                    "{} operation {} ({}) has no legal success: {:?}",
+                    self.label,
+                    op.id.0,
+                    op.op.name(),
+                    op.enabled
+                )
+            })
+    }
+
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -829,5 +878,28 @@ impl Drop for HeaderStorage {
         // Its shutdown facts are never observed, so a run still live fails.
         self.checkpoint.dropped();
         self.port.shut_down();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_storage::header::{Fault, Outcome};
+
+    use super::succeeds;
+
+    /// The drain's success rule: `engine` wherever it's legal, and
+    /// `rejected` for a request whose only legal outcome it is, such as one
+    /// that fails an adapter-side input check, so recovery still ends it.
+    #[test]
+    fn a_rejection_only_request_succeeds_by_its_rejection() {
+        let ordinary = [
+            Outcome::Engine,
+            Outcome::Fault(Fault::Timeout),
+            Outcome::Rejected,
+        ];
+        assert!(succeeds(&ordinary, Outcome::Engine));
+        assert!(!succeeds(&ordinary, Outcome::Fault(Fault::Timeout)));
+        assert!(!succeeds(&ordinary, Outcome::Rejected));
+        assert!(succeeds(&[Outcome::Rejected], Outcome::Rejected));
     }
 }

@@ -32,6 +32,7 @@ use tempfile::TempDir;
 use zakura_chain::block;
 use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{
         COMMIT_ONLY_AUTHORIZED, OUTSTANDING_WORK_BOUNDED, STALE_COMPLETION_INERT,
@@ -229,7 +230,8 @@ fn ended<'a>(facts: &[&'a ReactorFact], call: u64) -> Option<&'a str> {
     })
 }
 
-/// Checks that every property of `run` held or didn't apply, that
+/// Checks that every property of `run` held, didn't apply, or isn't
+/// declared, as `sim/no-livelock` isn't here, that
 /// `stale-completion-inert` applied, that its one stale call was the stale
 /// peer's ordinary prepare, and that the repair prepared and applied once,
 /// retired admitted, and left the node's records constraining the next
@@ -247,7 +249,10 @@ fn repaired(run: &Run) {
         assert!(
             matches!(
                 property.outcome,
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                PropertyOutcome::Held { .. }
+                    | PropertyOutcome::NotApplicable {
+                        reason: NaReason::NeverApplied | NaReason::Undeclared
+                    }
             ),
             "{property:?}"
         );
@@ -381,10 +386,11 @@ fn charged(run: &Run) {
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     for property in &report.properties {
         assert!(
-            matches!(
-                property.outcome,
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-            ),
+            match &property.outcome {
+                PropertyOutcome::Held { .. } => true,
+                PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                PropertyOutcome::Violated { .. } => false,
+            },
             "{property:?}"
         );
     }

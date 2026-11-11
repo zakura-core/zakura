@@ -891,6 +891,7 @@ mod tests {
             violation: None,
             drain: None,
             harness: None,
+            rest: Some(zakura_scheduler::Status::Quiescent),
         });
         let found = teardown_end_violations(&rounds);
         assert_eq!(found.len(), 1);

@@ -5,7 +5,7 @@
 //! header within 30 virtual seconds, against production timers.
 //!
 //! The witness holds on every Plan here, well inside the bound. A peer that
-//! leaves before the apply makes the property inconclusive, not violated,
+//! leaves before the apply withdraws its obligation, so it's not violated,
 //! and outside the fixture the property never applies. The bypass, an
 //! apply the reactor skips, is the planted case
 //! `qa/planted/header-sync/honest-progress/skipped-apply`.
@@ -25,6 +25,7 @@ use std::{
 use serde_json::Value;
 use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::{
         header_sync_progress::{HONEST_PROGRESS, PROGRESS_BOUND},
@@ -238,22 +239,21 @@ fn leaving_scenario() -> WireScenario {
 
 /// The honest peer disconnects after the node's honest session started
 /// and before the successor applies. `StableMembership` stops holding while
-/// the obligation is open, so the property ends `Inconclusive` with
-/// `assumption-lost`, not `Violated`, and no property is violated. The
-/// node's tip stays at 50, so the apply never landed.
+/// the obligation is open, which withdraws it, so the property isn't
+/// `Violated`, and no property is violated. The evaluation that opened it
+/// applied, so the lost assumption isn't a reason (#1840 rule 4), and the
+/// property holds. The node's tip stays at 50, so the apply never landed.
 ///
 /// This fails if a lost membership reads as a violation, or the obligation
 /// outlives the assumption it rests on.
 #[test]
-fn a_peer_that_leaves_before_the_apply_makes_honest_progress_inconclusive() {
+fn a_peer_that_leaves_before_the_apply_withdraws_honest_progress() {
     let scenario = leaving_scenario();
     assert!(progress_fixture(&scenario));
     let (report, ports) = run(&scenario, Plan::from_fuzz(&[]));
     assert_eq!(
         outcome(&report, HONEST_PROGRESS),
-        &PropertyOutcome::Inconclusive {
-            reason: "assumption-lost".to_owned()
-        }
+        &PropertyOutcome::Held { applicable: 1 }
     );
     assert_eq!(violated(&report), Vec::<&str>::new());
     assert_eq!(ports.selected_tip(), Chain::main(50).tip(&ports.fixture));
@@ -334,9 +334,10 @@ fn honest_progress_applies_only_in_its_fixture() {
     let honest = SavedPlan::HonestSync.scenario();
     assert!(!progress_fixture(&honest));
     let (report, _) = run(&honest, Plan::from_fuzz(&[]));
+    // The honest sync doesn't declare the progress fixture's assumptions.
     assert_eq!(
         outcome(&report, HONEST_PROGRESS),
-        &PropertyOutcome::NotApplicable
+        &PropertyOutcome::not_applicable(NaReason::Undeclared)
     );
 }
 
@@ -422,7 +423,8 @@ fn captured() -> String {
 /// Each witness, recorded, then replayed exactly in a fresh process of the
 /// same test binary, gives the view-side evidence and end record its
 /// recorded run gave, and its property outcome there too: the committed
-/// input holds the property, and the leaving peer makes it inconclusive.
+/// input holds the property, and so does the leaving peer, whose lost
+/// assumption withdrew the obligation.
 #[test]
 fn the_progress_witnesses_replay_in_a_fresh_process() {
     let entry = HarnessEntry {
@@ -431,9 +433,7 @@ fn the_progress_witnesses_replay_in_a_fresh_process() {
     };
     let expected = [
         PropertyOutcome::Held { applicable: 1 },
-        PropertyOutcome::Inconclusive {
-            reason: "assumption-lost".to_owned(),
-        },
+        PropertyOutcome::Held { applicable: 1 },
     ];
     if let Some(dir) = std::env::var_os(CHILD) {
         for (index, expected) in expected.iter().enumerate() {

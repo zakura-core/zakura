@@ -34,7 +34,8 @@ use zakura_sim::{
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
-    seed, MemorySink, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome, RunReport,
+    seed, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome,
+    RunReport,
 };
 
 /// Runs `saved` under `input`, and returns the report with its records and
@@ -230,6 +231,47 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
             outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION)
         );
     }
+}
+
+/// Round 8's tail: a budget that ends while `mirror-1`'s dialer sleeps out
+/// its redial settle leaves the redial to the drain. The drain's clock
+/// reaches that timer within the harness timer cap, though nothing is open,
+/// so the replacement connection still opens, in the drain, and the run
+/// ends dry rather than at its bound.
+#[test]
+fn a_redial_asleep_at_the_budget_finishes_in_the_drain() {
+    let (full, _, _) = run(SavedWire::Replace, Plan::from_fuzz(&[]));
+    let first_session = |report: &RunReport, connection: u64| {
+        report
+            .log
+            .entries()
+            .iter()
+            .find(|entry| {
+                matches!(&entry.obs, Observation::Session { connection: c, peer, .. }
+                    if *c == connection && peer == "mirror-1")
+            })
+            .map(|entry| entry.step)
+            .expect("the connection carried a session")
+    };
+    let replacement = sessions(&full.log)["mirror-1"][1].0;
+    let opened = first_session(&full, replacement);
+    // The last clock jump before the replacement is the redial's settle.
+    let settle = full.picks[..usize::try_from(opened).expect("a run's steps fit usize")]
+        .iter()
+        .rev()
+        .find(|pick| pick.identity.starts_with("advance-time:"))
+        .map(|pick| pick.step)
+        .expect("the redial waited out its settle");
+    let mut scenario = SavedWire::Replace.scenario();
+    scenario.sync.steps = Some(settle - 1);
+    let (cut, _, _) = run_scenario(&scenario, Plan::from_fuzz(&[]));
+    assert_eq!(cut.end.outcome, Outcome::Budget, "{:?}", cut.end);
+    let replaced = &sessions(&cut.log)["mirror-1"];
+    assert!(replaced.len() >= 2, "the redial ran: {replaced:?}");
+    assert!(
+        first_session(&cut, replaced[1].0) > settle - 1,
+        "the replacement opened in the drain"
+    );
 }
 
 /// #2094's first case on the shared connection: every mirror's block-sync

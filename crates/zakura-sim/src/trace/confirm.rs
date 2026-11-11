@@ -403,13 +403,18 @@ fn judge(
             WitnessError::LostTriggerHistory
             | WitnessError::ActSkipped { .. }
             | WitnessError::ActNotRun { .. } => ConfirmStatus::WitnessLost,
-            WitnessError::HarnessEnd(_) | WitnessError::NoEnd => ConfirmStatus::IncompleteEvidence,
+            WitnessError::HarnessEnd(_) | WitnessError::NoEnd | WitnessError::Unreported { .. } => {
+                ConfirmStatus::IncompleteEvidence
+            }
             // The first run violated the property alone, so a rerun that
             // finds anything else disagrees with it.
             WitnessError::UnsupportedScenario(_)
             | WitnessError::MissingReport
             | WitnessError::Outcome(_)
             | WitnessError::Unrelated { .. }
+            | WitnessError::UnrelatedIncomplete { .. }
+            | WitnessError::SetMember { .. }
+            | WitnessError::Unjoined { .. }
             | WitnessError::Fixed { .. }
             | WitnessError::ChangedFailure => ConfirmStatus::Nondeterministic,
         };

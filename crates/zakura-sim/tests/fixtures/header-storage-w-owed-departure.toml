@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-owed-departure.bin`, a fuzz-12 item 7 witness whose run
+# shows Owed("departure"). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "4ac0541b0c6b85e3d096870f63ad16d487652a1d1f5cebdd541b40420fc841de"
+scenario_sha256 = "fe36472ad4e4d6d41146d3267bf01cb7d92b6094c3cf63ec854aa6c2f8614a55"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

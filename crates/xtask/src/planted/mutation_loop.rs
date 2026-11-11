@@ -452,8 +452,6 @@ pub(super) fn native_cases(repo_root: &Path, dir: &Path) -> Result<Vec<LoopCase>
     Ok(cases)
 }
 
-/// Every retained planted case whose property starts with one of
-/// `prefixes`, with its own committed witness.
 /// True if `--planted <prefix>` selects the planted case whose patch is at
 /// `path` under `qa/planted/`. The prefix ends at a path component or at the
 /// case's `.patch`, so `block` selects `block/…` and not `block-sync/…`.
@@ -462,7 +460,13 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/') || rest.starts_with('.'))
 }
 
-fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>, BoxError> {
+/// Every retained planted case whose property starts with one of
+/// `prefixes`, with its own committed witness. Fails on a case that names
+/// a nested `set`, which the loop's classes don't judge.
+pub(super) fn planted_cases(
+    repo_root: &Path,
+    prefixes: &[String],
+) -> Result<Vec<LoopCase>, BoxError> {
     if prefixes.is_empty() {
         return Ok(Vec::new());
     }
@@ -479,8 +483,19 @@ fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>,
         }
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
-        let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
+        let CaseFile {
+            also_violates, set, ..
+        } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
+        // The loop's classes judge one property beside `also_violates`, so
+        // a nested case's exact set would be silently ignored.
+        if !set.is_empty() {
+            return Err(format!(
+                "{}: the loop doesn't judge a nested case's `set`; `cargo xtask planted` does",
+                case_file.display()
+            )
+            .into());
+        }
         cases.push(LoopCase {
             label: relative_label(repo_root, &patch),
             listed_in: case_file.clone(),

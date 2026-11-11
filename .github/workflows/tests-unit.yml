@@ -499,7 +499,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: target/sim
     steps:
@@ -551,7 +551,7 @@ jobs:
       contents: read
       issues: write
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -577,7 +577,7 @@ jobs:
       # The step's limit leaves the issue step time to run.
       - name: Check tonight's shard of the planted bypass patches
         id: planted
-        timeout-minutes: 40
+        timeout-minutes: 110
         run: cargo xtask planted --shard "${SHARD}/${SHARDS}"
         env:
           RUSTFLAGS: --cfg zakura_sim

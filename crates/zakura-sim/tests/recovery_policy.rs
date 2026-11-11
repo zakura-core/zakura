@@ -14,15 +14,15 @@ use tempfile::TempDir;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
-    harness::{self, entry, run_harness, HarnessEntry, RecordInput, Subsystem},
+    harness::{self, entry, run_harness, HarnessEntry, HarnessError, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, TriggerHistory, Verdict},
     record::{DrawRecord, Record, StepRecord},
     trace::{
         replay_with, shrink::REDUCED_DIR, shrink_with, Candidate, ReplayOptions, ShrinkBudget,
         Trace, TraceReader,
     },
-    ActionSource, By, Identity, MemorySink, Observation, ObservationLog, Plan, PlanInput,
-    RunConfig, Sim, SkipScript,
+    ActionSource, By, HarnessFailure, Identity, MemorySink, Observation, ObservationLog, Plan,
+    PlanInput, RunConfig, RunReport, Sim, SkipScript,
 };
 
 /// Whether the switch's action starts recovery, and whether an alarm action
@@ -117,6 +117,17 @@ impl ActionSource for Switch {
     /// True once picked, unless this is the control.
     fn recovering(&self) -> bool {
         self.recover && self.picked
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -231,14 +242,32 @@ impl Run {
 
     /// The `sel` task's select draws: (ordinal, value, by).
     fn selects(&self) -> Vec<(u32, u64, By)> {
+        self.selects_through(u64::MAX)
+    }
+
+    /// [`selects`](Self::selects) of the steps through `last`.
+    fn selects_through(&self, last: u64) -> Vec<(u32, u64, By)> {
         self.steps
             .iter()
+            .filter(|step| step.step <= last)
             .flat_map(|step| &step.draws)
             .filter_map(|draw| {
                 let ordinal = draw.draw.strip_prefix("sel.1:select#")?;
                 Some((ordinal.parse().unwrap(), draw.value.0, draw.by))
             })
             .collect()
+    }
+}
+
+/// The report of a run that `error` says ended at its drain's bound, which
+/// every run of [`Recovering`]'s endless spinners does.
+fn drain_bound(error: HarnessError) -> Box<RunReport> {
+    match error {
+        HarnessError::Run {
+            failure: HarnessFailure::DrainBound { .. },
+            report,
+        } => report,
+        error => panic!("{error}"),
     }
 }
 
@@ -249,8 +278,11 @@ fn run(mode: bool, input: PlanInput) -> Run {
         recover: mode,
         alarm: false,
     };
-    run_harness::<Recovering>(&mode, input, &mut sink, None)
-        .unwrap_or_else(|error| panic!("{error}"));
+    // The spinners never stop, so the drain ends at its bound, a harness
+    // failure these tests don't read: they read the picks and draws.
+    if let Err(error) = run_harness::<Recovering>(&mode, input, &mut sink, None) {
+        drain_bound(error);
+    }
     let mut run = Run {
         init: Vec::new(),
         steps: Vec::new(),
@@ -382,12 +414,18 @@ fn every_task_runs_within_a_round() {
 }
 
 /// With the input exhausted, the shared per-kind ordinal gives site A
-/// branch 0 and site B branch 1 every time. After the switch each site
-/// rotates through both branches on its own.
+/// branch 0 and site B branch 1 every time, through the live phase. After
+/// the switch, or the drain's start, each site rotates through both
+/// branches on its own.
 #[test]
 fn draws_rotate_per_call_site_after_the_switch() {
     let control = run(false, Plan::from_fuzz(&[]));
-    for (ordinal, value, by) in control.selects() {
+    let budget = Recovering::config(&Mode {
+        recover: false,
+        alarm: false,
+    })
+    .budget;
+    for (ordinal, value, by) in control.selects_through(budget) {
         assert_eq!(by, By::Default);
         assert_eq!(
             value,
@@ -445,8 +483,10 @@ fn a_recovery_run_replays() {
         recover: true,
         alarm: false,
     };
-    let report =
-        run_harness::<Recovering>(&mode, Plan::from_fuzz(&bytes), &mut sink, None).unwrap();
+    let report = match run_harness::<Recovering>(&mode, Plan::from_fuzz(&bytes), &mut sink, None) {
+        Ok(report) => report,
+        Err(error) => *drain_bound(error),
+    };
     assert_eq!(
         run(true, PlanInput::Script(report.resolved)).history(),
         original.history()

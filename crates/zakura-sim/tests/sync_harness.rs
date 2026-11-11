@@ -152,7 +152,7 @@ fn saved_scenarios_replay_their_end_records() {
         // A node that shuts down early stops short of the tip.
         let torn_down = matches!(
             saved,
-            SavedSync::TeardownQuery | SavedSync::TeardownSubmission
+            SavedSync::TeardownQuery | SavedSync::TeardownSubmission | SavedSync::TeardownHeaders
         );
         let tip = ports.mirror_tip();
         assert!(torn_down || ports.tips() == (tip, tip), "{name}");

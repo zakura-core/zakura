@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index 67fb071acb..ae78af16a5 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -621,9 +621,13 @@ impl HeaderSyncReactor {
+                     target,
+                 )),
+             };
++        // Mutation: a call dropped before it completes, as only the stopped
++        // reactor drops one, never returns the headers it holds.
++        let mut retained = std::mem::ManuallyDrop::new(retained);
+         let operation = AssertUnwindSafe(operation)
+             .catch_unwind()
+             .map(move |result| {
++                let mut retained = retained.take();
+                 #[cfg(any(test, zakura_sim))]
+                 let result = observe::rethrow_observer_panic(result);
+                 match result {

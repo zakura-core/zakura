@@ -641,8 +641,9 @@ pub struct Mempool {
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
 
-    /// Publishes the verified transactions and the block they were last checked against,
-    /// each time the mempool finishes processing.
+    /// Publishes the verified transactions and the block they were last checked against. A new
+    /// block or a request for the full list publishes them; admitting or removing a transaction
+    /// withdraws them until then.
     snapshot_sender: MempoolSnapshotSender,
 
     /// Records how the mempool applies each best tip change.

@@ -1674,12 +1674,14 @@ where
     /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
     /// superseded it.
     ///
-    /// The template's builder already queued its background preparation, so this does not.
-    fn reuse_shared_template(
+    /// Renews the compact-submission registration, restoring its block content if it expired or
+    /// was evicted. Registration grants no verification or relay authority; submissions still
+    /// pass through the consensus verifier. The builder already queued speculative validation.
+    async fn reuse_shared_template(
         &self,
         template: &BlockTemplateResponse,
         submit_old: Option<bool>,
-    ) -> Option<GetBlockTemplateResponse> {
+    ) -> Result<Option<GetBlockTemplateResponse>> {
         {
             let state = self.gbt.template_rejections.borrow();
             if state.needs_fallback()
@@ -1689,12 +1691,47 @@ where
                     template.long_poll_id.revision,
                 )
             {
-                return None;
+                return Ok(None);
+            }
+        }
+
+        let candidates = self.gbt.prepared_candidates();
+        if !candidates.refresh_server_template(template.work_id()) {
+            let retained_template = template.clone();
+            let network = self.network.clone();
+            self.gbt
+                .run_template_build(TemplateBuildWork::RetainedContent, move || {
+                    // Another caller may have restored the same shared work while this job waited.
+                    if !candidates.refresh_server_template(retained_template.work_id()) {
+                        let block =
+                            proposal_block_from_template(&retained_template, None, &network)?;
+                        candidates.insert(
+                            Arc::new(block),
+                            retained_template.work_id(),
+                            zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                            &network,
+                        );
+                    }
+                    Ok::<_, zakura_chain::serialization::SerializationError>(())
+                })
+                .await?
+                .map_misc_error()?;
+
+            // Reconstructing the retained block yielded to other requests and tip updates.
+            let state = self.gbt.template_rejections.borrow();
+            if state.needs_fallback()
+                || self.template_superseded(
+                    &state,
+                    template.previous_block_hash,
+                    template.long_poll_id.revision,
+                )
+            {
+                return Ok(None);
             }
         }
         let mut template = template.clone();
         template.submit_old = submit_old;
-        Some(template.into())
+        Ok(Some(template.into()))
     }
 
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
@@ -4024,7 +4061,9 @@ where
                     .wait_for(chain_info.tip_hash, &server_long_poll_id)
                     .await
                 {
-                    if let Some(response) = self.reuse_shared_template(&template, submit_old) {
+                    if let Some(response) =
+                        self.reuse_shared_template(&template, submit_old).await?
+                    {
                         drop(full_first_answer);
                         if let GetBlockTemplateResponse::TemplateMode(template) = &response {
                             // Nothing was chosen or built for this answer.

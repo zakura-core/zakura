@@ -109,6 +109,10 @@ pub(crate) enum TemplateBuildWork {
     /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
     /// on a blocking thread.
     Proof,
+
+    /// Parses and retains a shared template's block content. Use the same admission bound as
+    /// construction and a blocking thread because the template may contain a full block.
+    RetainedContent,
 }
 
 impl TemplateBuildWork {
@@ -967,13 +971,15 @@ where
                     })
                     .map_misc_error()
             }
-            TemplateBuildWork::Proof => tokio::task::spawn_blocking(move || {
-                // Dropping the RPC future cannot release capacity while this job still owns work.
-                let _permit = permit;
-                build()
-            })
-            .await
-            .map_misc_error(),
+            TemplateBuildWork::Proof | TemplateBuildWork::RetainedContent => {
+                tokio::task::spawn_blocking(move || {
+                    // Dropping the RPC future cannot release capacity while this job still owns work.
+                    let _permit = permit;
+                    build()
+                })
+                .await
+                .map_misc_error()
+            }
         }
     }
 

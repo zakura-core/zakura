@@ -113,6 +113,35 @@ struct WorkIdAlias {
 }
 
 impl PreparedCandidateResolver {
+    /// Renews retained server work when its template is served again.
+    ///
+    /// Returns false if the candidate or its alias has expired or been evicted. The caller must
+    /// restore the block content before returning the shared work ID. This does not validate it.
+    pub(crate) fn refresh_server_template(&self, work_id: &str) -> bool {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let partition = &mut inner.server;
+        let Some(alias) = partition.work_ids.get(work_id) else {
+            return false;
+        };
+        let entry_id = alias.entry_id;
+        if alias.expires_at <= now
+            || !partition
+                .entries
+                .iter()
+                .any(|entry| entry.id == entry_id && entry.expires_at > now)
+        {
+            return false;
+        }
+        partition
+            .work_ids
+            .get_mut(work_id)
+            .expect("the alias exists because this partition is still locked")
+            .expires_at = now + ENTRY_TTL;
+        partition.touch_candidate(entry_id, now);
+        true
+    }
+
     fn lock(&self) -> MutexGuard<'_, CacheInner> {
         self.0
             .lock()
@@ -1065,6 +1094,60 @@ mod tests {
         assert_eq!(inner.server.work_ids["fresh"].expires_at, fresh_expiry);
         assert_eq!(inner.server.work_ids.len(), 1);
         assert_accounting(&inner.server);
+    }
+
+    #[test]
+    fn serving_shared_work_renews_its_candidate_and_alias() {
+        let block = test_block();
+        let cache = PreparedCandidateResolver::default();
+        insert(&cache, &block, "shared", ServerTemplate);
+        let old_expiry = Instant::now() + Duration::from_secs(1);
+        {
+            let mut inner = cache.lock();
+            inner.server.entries[0].expires_at = old_expiry;
+            inner.server.work_ids.get_mut("shared").unwrap().expires_at = old_expiry;
+        }
+
+        assert!(cache.refresh_server_template("shared"));
+        let inner = cache.lock();
+        assert!(inner.server.entries[0].expires_at > old_expiry);
+        assert!(inner.server.work_ids["shared"].expires_at > old_expiry);
+        assert_accounting(&inner.server);
+        drop(inner);
+        assert!(cache.resolve("shared", *block.header).is_ok());
+    }
+
+    #[test]
+    fn expired_shared_work_requires_restoration() {
+        let block = test_block();
+        for expire_candidate in [false, true] {
+            let cache = PreparedCandidateResolver::default();
+            insert(&cache, &block, "shared", ServerTemplate);
+            {
+                let mut inner = cache.lock();
+                if expire_candidate {
+                    inner.server.entries[0].expires_at = Instant::now();
+                } else {
+                    inner.server.work_ids.get_mut("shared").unwrap().expires_at = Instant::now();
+                }
+            }
+            assert!(!cache.refresh_server_template("shared"));
+            assert_eq!(cache.resolve("shared", *block.header), Err(StaleWork));
+            insert(&cache, &block, "shared", ServerTemplate);
+            assert!(cache.refresh_server_template("shared"));
+            assert!(cache.resolve("shared", *block.header).is_ok());
+        }
+    }
+
+    #[test]
+    fn missing_and_client_work_cannot_be_refreshed_as_server_work() {
+        let cache = PreparedCandidateResolver::default();
+        assert!(!cache.refresh_server_template("missing"));
+        let block = test_block();
+        insert(&cache, &block, "proposal", ClientProposal);
+        assert!(!cache.refresh_server_template("proposal"));
+        assert!(cache.resolve("proposal", *block.header).is_ok());
+        assert_accounting(&cache.lock().proposals);
     }
 
     #[test]

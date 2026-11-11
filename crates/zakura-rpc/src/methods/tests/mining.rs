@@ -587,7 +587,13 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
 #[test]
 fn template_build_paths_wait_for_the_build_slot() {
     mining_runtime(async {
-        for path in ["normal", "precompute", "tip change", "recovery"] {
+        for path in [
+            "normal",
+            "precompute",
+            "tip change",
+            "recovery",
+            "shared restoration",
+        ] {
             let old_height = if path == "precompute" { 0 } else { 2 };
             let chain = chain_info(old_height, 1, 0);
             let (info_tx, info) = watch::channel(chain.clone());
@@ -601,6 +607,14 @@ fn template_build_paths_wait_for_the_build_slot() {
 
             let mut request = match path {
                 "normal" => rpc.get_block_template(None).boxed(),
+                "shared restoration" => rpc
+                    .reuse_shared_template(&initial, None)
+                    .map(|result| {
+                        result.map(|template| {
+                            template.expect("shared work is still on the current parent")
+                        })
+                    })
+                    .boxed(),
                 "recovery" => {
                     rpc.gbt.template_rejections.send_modify(|state| {
                         state.reject(chain.tip_hash, "rejected-work");
@@ -1506,6 +1520,57 @@ fn long_polls_asking_for_the_same_work_share_one_build() {
                 "every long poll must receive the one shared build"
             );
         }
+    });
+}
+
+/// Serving shared work restores the block content needed by compact submissions after eviction.
+#[test]
+fn reused_shared_work_restores_evicted_compact_submission_content() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+        let shared = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let block = Arc::new(proposal_block_from_template(&shared, None, &rpc.network).unwrap());
+        let candidates = rpc.gbt.prepared_candidates();
+        candidates.insert(
+            block.clone(),
+            shared.work_id(),
+            zakura_consensus::PreparedCandidateSource::ServerTemplate,
+            &rpc.network,
+        );
+        assert!(candidates.resolve(shared.work_id(), *block.header).is_ok());
+
+        // Fill the real bounded resolver with distinct candidates, evicting the shared answer.
+        for index in 3..=40 {
+            let mut other = (*block).clone();
+            Arc::make_mut(&mut other.header).previous_block_hash = Hash([index; 32]);
+            candidates.insert(
+                Arc::new(other),
+                &format!("other-work-{index}"),
+                zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                &rpc.network,
+            );
+        }
+        assert_eq!(
+            candidates.resolve(shared.work_id(), *block.header),
+            Err(ResolvePreparedCandidateError::StaleWork)
+        );
+
+        let reused = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(reused.work_id(), shared.work_id());
+        let restored = candidates
+            .resolve(reused.work_id(), *block.header)
+            .expect("freshly served shared work must reconstruct a compact submission");
+        assert_eq!(restored.transactions, block.transactions);
+        assert_eq!(restored.header, block.header);
     });
 }
 

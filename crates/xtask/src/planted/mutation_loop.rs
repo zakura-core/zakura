@@ -964,11 +964,31 @@ impl Runner {
                 results.insert(index, report);
             }
         }
+        let cases: Vec<CaseReport> = results.into_values().collect();
+        let mut property_findings = found.findings;
+        for finding in cases
+            .iter()
+            .flat_map(|case| &case.generator)
+            .filter_map(generate::GeneratorReport::finding)
+        {
+            let same = |known: &generate::PropertyFinding| {
+                (&known.property, &known.harness, known.seed, known.mode)
+                    == (
+                        &finding.property,
+                        &finding.harness,
+                        finding.seed,
+                        finding.mode,
+                    )
+            };
+            if !property_findings.iter().any(same) {
+                property_findings.push(finding);
+            }
+        }
         Ok(Outcome {
             source,
-            cases: results.into_values().collect(),
+            cases,
             generate,
-            property_findings: found.findings,
+            property_findings,
             generator_baseline_failures: found.failures,
         })
     }

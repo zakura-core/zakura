@@ -36,6 +36,14 @@
 //!   lane is a harness failure (`unconfirmed`). The loop then shrinks the
 //!   confirmed trace with `zakura-sim shrink` under `ZAKURA_SIM_EXPECT`,
 //!   within [`SHRINK_CANDIDATES`] and [`SHRINK_WALL`].
+//! - **Unpatched check (mut-5).** The loop replays each shrunk kill on the
+//!   unpatched build's `zakura-sim`, with `--allow-build-mismatch`, and
+//!   reads the replay's report ([`judge_unpatched`]). If the unpatched build
+//!   violates the killing ID on that trace too, the kill shows a defect of
+//!   the pinned revision, not of the mutant: the lane is `baseline-fails`,
+//!   and the report lists it under `property_findings`. If the unpatched
+//!   build leaves the trace's picks, it can't judge the trace, so the kill
+//!   stands and the lane records the replay as `undecided`.
 //!
 //! A mutant's search runs once per harness and seed, and the loop
 //! classifies each of the mutant's cases from it. A search, or each
@@ -100,6 +108,11 @@ pub(super) const SEARCH_DIR: &str = "search";
 /// `zakura-sim generate`'s report file, under [`SEARCH_DIR`]. It is
 /// `zakura_sim::explore::generate::REPORT_FILE`.
 pub(super) const REPORT_FILE: &str = "generate.json";
+
+/// Where the loop keeps the unpatched build's `zakura-sim`, under `--out`.
+/// Slot 0 rebuilds mutants in its target directory, so the lanes can't
+/// read that copy once the baselines ran.
+const UNPATCHED_SIM: &str = "baseline/zakura-sim";
 
 /// The most candidates a kill's shrink tries.
 const SHRINK_CANDIDATES: u32 = 500;
@@ -260,9 +273,35 @@ pub(in crate::planted) struct GeneratorReport {
     pub(in crate::planted) confirmation: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) shrunk: Option<FollowUp>,
+    /// The shrunk trace's replay on the unpatched build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) unpatched: Option<UnpatchedCheck>,
     /// The search's evidence, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) log: Option<PathBuf>,
+}
+
+/// What the unpatched build does on a shrunk kill's trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(in crate::planted) enum OnUnpatched {
+    /// The replay ran to its end, and the killing ID isn't violated.
+    Holds,
+    /// The replay violates the killing ID: a property finding.
+    Violated,
+    /// The replay wrote no report that judges the killing ID, such as when
+    /// the unpatched build left the trace's picks.
+    Undecided,
+}
+
+/// A shrunk kill's replay on the unpatched build.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::planted) struct UnpatchedCheck {
+    pub(in crate::planted) outcome: OnUnpatched,
+    /// What showed it, in words.
+    pub(in crate::planted) detail: String,
+    /// The replay's log, relative to `--out`.
+    pub(in crate::planted) log: PathBuf,
 }
 
 impl GeneratorReport {
@@ -285,8 +324,82 @@ impl GeneratorReport {
             family: None,
             confirmation: None,
             shrunk: None,
+            unpatched: None,
             log: None,
         }
+    }
+
+    /// The property finding this lane shows, if the unpatched build
+    /// violates its shrunk kill too.
+    pub(in crate::planted) fn finding(&self) -> Option<PropertyFinding> {
+        let check = self.unpatched.as_ref()?;
+        (check.outcome == OnUnpatched::Violated).then(|| PropertyFinding {
+            harness: self.harness.clone(),
+            seed: self.seed,
+            mode: self.mode,
+            property: self.violated.clone(),
+            detail: check.detail.clone(),
+            runs: self.runs,
+            millis: self.millis.unwrap_or_default(),
+            input: self.input.clone(),
+            family: self.family.clone(),
+            confirmation: self.confirmation.clone(),
+            shrunk: self.shrunk.clone(),
+            log: check.log.clone(),
+        })
+    }
+}
+
+/// How the unpatched build judged `id` on a shrunk trace, from the
+/// replay's `--report` line, `report`, or `None` if it wrote none. `ended`
+/// says how the replay ended, for an undecided judgment.
+pub(in crate::planted) fn judge_unpatched(
+    id: &str,
+    report: Option<&str>,
+    ended: &str,
+) -> (OnUnpatched, String) {
+    let undecided = |why: String| (OnUnpatched::Undecided, why);
+    let Some(report) = report else {
+        return undecided(format!(
+            "the unpatched replay wrote no report; `zakura-sim replay` {ended}"
+        ));
+    };
+    let Ok(report) = serde_json::from_str::<serde_json::Value>(report) else {
+        return undecided("the unpatched replay's report isn't JSON".to_owned());
+    };
+    let entry = report["properties"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["property"] == id);
+    let Some(entry) = entry else {
+        return undecided(format!("the unpatched replay doesn't report {id}"));
+    };
+    let violations = entry["violations"].as_array().map_or(0, Vec::len);
+    if violations > 0 {
+        (
+            OnUnpatched::Violated,
+            format!("the shrunk trace violates {id} on the unpatched build too"),
+        )
+    } else {
+        (
+            OnUnpatched::Holds,
+            format!("{id} isn't violated on the unpatched build's replay of the shrunk trace"),
+        )
+    }
+}
+
+/// A confirmed kill's class once the unpatched build replayed its shrunk
+/// trace: `baseline-fails` if the unpatched build violates the ID too,
+/// else `result`.
+pub(super) fn unpatched_class(result: Classified, check: Option<&UnpatchedCheck>) -> Classified {
+    match check {
+        Some(check) if check.outcome == OnUnpatched::Violated => Classified::new(
+            Class::BaselineFails,
+            None,
+            format!("{}, but {}", result.detail, check.detail),
+        ),
+        _ => result,
     }
 }
 
@@ -374,6 +487,8 @@ pub(super) struct Lanes {
     pub(super) corpus: PathBuf,
     /// Each harness's fuzz target, for `libfuzzer` lanes.
     pub(super) targets: BTreeMap<String, String>,
+    /// The unpatched build's `zakura-sim`, copied out of slot 0's target.
+    pub(super) unpatched_sim: PathBuf,
 }
 
 impl Lanes {
@@ -532,7 +647,11 @@ impl Search {
                     return Unpatched::Violation(id.clone());
                 }
                 match campaign_failure(&facts) {
-                    Some(why) => failed(Reason::CampaignIncomplete, format!("the campaign {why}"), false),
+                    Some(why) => failed(
+                        Reason::CampaignIncomplete,
+                        format!("the campaign {why}"),
+                        false,
+                    ),
                     None => Unpatched::Clean,
                 }
             }
@@ -872,6 +991,9 @@ impl Runner {
         let excluded_inputs = write_exclusions(&slot.tree, &exclude)?;
         let corpus = self.out.join(EMPTY_CORPUS);
         fs::create_dir_all(&corpus)?;
+        let unpatched_sim = self.out.join(UNPATCHED_SIM);
+        fs::create_dir_all(unpatched_sim.parent().expect("the copy lies under --out"))?;
+        fs::copy(sim, &unpatched_sim)?;
         let libfuzzer = flags.mode == GenerateMode::Libfuzzer;
         let targets = if libfuzzer {
             harness_targets(&slot.tree)?
@@ -906,6 +1028,7 @@ impl Runner {
             exclude,
             corpus,
             targets,
+            unpatched_sim,
         };
         let pairs: BTreeSet<(String, u64)> = lanes
             .plans
@@ -1073,6 +1196,39 @@ impl Runner {
             )),
         };
         Ok((confirmation, Some(shrunk)))
+    }
+
+    /// Replays the shrunk `trace` on the unpatched build, under the memory
+    /// `cap`, and judges whether it violates `id` there. Writes under `dir`.
+    fn replay_unpatched(
+        &self,
+        lanes: &Lanes,
+        trace: &Path,
+        id: &str,
+        dir: &Path,
+        cap: Option<u64>,
+    ) -> Result<UnpatchedCheck, BoxError> {
+        let report = dir.join("unpatched-report.json");
+        let log = dir.join("unpatched-replay.log");
+        if report.exists() {
+            fs::remove_file(&report)?;
+        }
+        let mut replay = scoped(cap, &lanes.unpatched_sim);
+        replay
+            .arg("replay")
+            .arg(trace)
+            .arg("--allow-build-mismatch")
+            .arg("--report")
+            .arg(&report);
+        // `--allow-build-mismatch` always exits 1, so only the report counts.
+        let ended = run_lane_child(&mut replay, &log, Some(CONFIRM_CHILD))?;
+        let written = fs::read_to_string(&report).ok();
+        let (outcome, detail) = judge_unpatched(id, written.as_deref(), &ended.to_string());
+        Ok(UnpatchedCheck {
+            outcome,
+            detail,
+            log: self.relative(&log),
+        })
     }
 
     /// `path` relative to `--out`, or whole if it lies outside.
@@ -1290,8 +1446,10 @@ impl Runner {
                     deadline,
                     cap,
                 )?;
-                let mut follow_ups: BTreeMap<String, (FollowUp, Option<FollowUp>)> =
-                    BTreeMap::new();
+                let mut follow_ups: BTreeMap<
+                    String,
+                    (FollowUp, Option<FollowUp>, Option<UnpatchedCheck>),
+                > = BTreeMap::new();
                 for (index, case) in &cases {
                     let (mut result, kill) = search.classify(&case.property, &case.also_violates);
                     let mut lane = GeneratorReport {
@@ -1303,20 +1461,30 @@ impl Runner {
                     if let Some(kill) = kill {
                         if !follow_ups.contains_key(&kill.id) {
                             let also = co_violations(&search.searched, &kill.id);
-                            let done = self.follow_up(
-                                built,
-                                harness,
-                                &kill,
-                                &also,
-                                &search_dir.join(key(&kill.id)),
-                                cap,
-                            )?;
-                            follow_ups.insert(kill.id.clone(), done);
+                            let kill_dir = search_dir.join(key(&kill.id));
+                            let (confirmation, shrunk) =
+                                self.follow_up(built, harness, &kill, &also, &kill_dir, cap)?;
+                            let check = match &shrunk {
+                                Some(FollowUp {
+                                    ok: true,
+                                    trace: Some(trace),
+                                    ..
+                                }) => Some(self.replay_unpatched(
+                                    lanes,
+                                    &self.out.join(trace),
+                                    &kill.id,
+                                    &kill_dir,
+                                    cap,
+                                )?),
+                                _ => None,
+                            };
+                            follow_ups.insert(kill.id.clone(), (confirmation, shrunk, check));
                         }
-                        let (confirmation, shrunk) = &follow_ups[&kill.id];
-                        result = confirmed(result, confirmation);
+                        let (confirmation, shrunk, check) = &follow_ups[&kill.id];
+                        result = unpatched_class(confirmed(result, confirmation), check.as_ref());
                         lane.confirmation = Some(confirmation.clone());
                         lane.shrunk.clone_from(shrunk);
+                        lane.unpatched.clone_from(check);
                         lane.input = kill.input.map(|input| self.relative(&input));
                         lane.family = search.family();
                         lane.violated = Some(kill.id);

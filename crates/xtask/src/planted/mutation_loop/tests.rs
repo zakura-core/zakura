@@ -20,10 +20,10 @@ use super::{
         Reason, Record, Trigger,
     },
     generate::{
-        baseline_lane, campaign_class, co_violations, confirmed, no_generator as no_generator_of,
-        plan, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
-        GeneratorBaselineFailure, GeneratorReport, Kill, Lanes, PropertyFinding, Search, Searched,
-        Unpatched,
+        baseline_lane, campaign_class, co_violations, confirmed, judge_unpatched,
+        no_generator as no_generator_of, plan, unpatched_class, write_exclusions, FollowUp,
+        GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill,
+        Lanes, OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
     parse_flags, planted_cases, selects, summarize, test_executables, BaselineReport,
     BuildIdentity, CaseReport, GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
@@ -1248,6 +1248,60 @@ fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
     assert_eq!(confirmed(result.clone(), &kept), result);
 }
 
+/// The unpatched build's replay of a shrunk kill decides whether the kill
+/// stands (mut-5): a violation there too is a property finding and makes
+/// the lane `baseline-fails`; a hold or a replay that judged nothing
+/// leaves the kill.
+#[test]
+fn a_shrunk_kill_that_fails_unpatched_is_a_property_finding() {
+    let report = |violations: &str| {
+        format!(
+            r#"{{"properties":[{{"property":"{NAMED}","outcome":"held","violations":{violations},"end_found":0}}],"snapshot":null}}"#
+        )
+    };
+    let judged = |line: Option<&str>| judge_unpatched(NAMED, line, "exited 1").0;
+    assert_eq!(judged(Some(&report("[]"))), OnUnpatched::Holds);
+    assert_eq!(
+        judged(Some(&report(r#"[{"step":3}]"#))),
+        OnUnpatched::Violated
+    );
+    assert_eq!(judged(None), OnUnpatched::Undecided);
+    assert_eq!(judged(Some("not json")), OnUnpatched::Undecided);
+    assert_eq!(
+        judge_unpatched(OTHER, Some(&report("[]")), "exited 1").0,
+        OnUnpatched::Undecided,
+        "a report without the ID judges nothing"
+    );
+
+    let killed = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let check = |outcome| UnpatchedCheck {
+        outcome,
+        detail: "the shrunk trace violates it on the unpatched build too".to_owned(),
+        log: "mutants/x/unpatched-replay.log".into(),
+    };
+    for kept in [OnUnpatched::Holds, OnUnpatched::Undecided] {
+        assert_eq!(unpatched_class(killed.clone(), Some(&check(kept))), killed);
+    }
+    assert_eq!(unpatched_class(killed.clone(), None), killed);
+    let failed = unpatched_class(killed.clone(), Some(&check(OnUnpatched::Violated)));
+    assert_eq!((failed.class, failed.reason), (Class::BaselineFails, None));
+    assert!(failed.detail.contains("unpatched build too"));
+
+    let mut lane =
+        GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
+    lane.violated = Some(NAMED.to_owned());
+    assert_eq!(lane.finding(), None, "no replay ran");
+    lane.unpatched = Some(check(OnUnpatched::Holds));
+    assert_eq!(lane.finding(), None);
+    lane.unpatched = Some(check(OnUnpatched::Violated));
+    let finding = lane.finding().unwrap();
+    assert_eq!(finding.property.as_deref(), Some(NAMED));
+    assert_eq!(
+        finding.log,
+        std::path::PathBuf::from("mutants/x/unpatched-replay.log")
+    );
+}
+
 /// A search that ended at a run failure on the unpatched build is a
 /// failure to rerun alone, never a property finding. Only a confirmed
 /// `Active` violation is a finding.
@@ -1352,6 +1406,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
         exclude: out.path().join("exclude.txt"),
         corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
+        unpatched_sim: out.path().join("zakura-sim"),
     };
     let reports = runner
         .generator_lanes(
@@ -1449,7 +1504,11 @@ fn a_campaign_lane_gets_the_same_classes() {
     ] {
         assert_eq!(
             class(&[], &short),
-            (Class::HarnessFailure, Some(Reason::CampaignIncomplete), None),
+            (
+                Class::HarnessFailure,
+                Some(Reason::CampaignIncomplete),
+                None
+            ),
             "{short:?}"
         );
     }
@@ -1600,10 +1659,18 @@ fn each_case_gets_a_generator_harness_or_a_reason() {
         Err("no fuzz target runs block-sync/s6v3".to_owned())
     );
 
-    // The work list's records parse.
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let recorded = no_generator_of(&root).unwrap();
-    assert!(!recorded.is_empty());
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("qa/native-mutations/work-list.toml");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        "[[no-generator]]\nreason = \"refused frames\"\nproperties = [\"x/unreported\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        no_generator_of(root.path()).unwrap(),
+        BTreeMap::from([("x/unreported".to_owned(), "refused frames".to_owned())])
+    );
 }
 
 #[test]

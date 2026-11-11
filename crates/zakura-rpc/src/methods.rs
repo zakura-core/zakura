@@ -126,8 +126,8 @@ use types::{
         proposal::proposal_block_from_template,
         shared_template::ReadyTemplate,
         trace::{
-            next_request_id, AheadOutcome, AheadTimes, BuildTimes, MiningTemplateTrace,
-            NewTipMempool, TemplateSource, WaitReason,
+            next_request_id, AheadOutcome, AheadTimes, BuildTimes, NewTipMempool, TemplateSource,
+            WaitReason,
         },
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
@@ -2512,8 +2512,8 @@ where
 
     /// Writes a `mining_template.jsonl` row to `trace` for each stage of the
     /// `getblocktemplate` path from a new tip to a returned template.
-    pub fn with_template_trace(mut self, trace: JsonlEventEmitter) -> Self {
-        self.gbt.trace = MiningTemplateTrace(trace);
+    pub fn with_template_trace(self, trace: JsonlEventEmitter) -> Self {
+        self.gbt.trace.attach(trace);
         self
     }
 
@@ -4030,6 +4030,8 @@ where
             // The coinbase a waiting long poll built before the tip changed, with the height it
             // was built for. The next pass of the loop answers on the new tip and may use it.
             let mut tip_wake_coinbase = None;
+            // When a tip change last woke this request from its wait, for the trace.
+            let mut tip_woke_at = None;
             // This request's place among the long polls that may build a full first answer on
             // a new tip at once, held from its mempool request until its template is built.
             let mut full_first_answer = None;
@@ -4093,9 +4095,13 @@ where
                                 .same_tip(client_long_poll_id)
                         })
                     {
-                        self.gbt
-                            .trace
-                            .tip_woke(request_id, Some((tip_height, tip_hash)));
+                        self.gbt.trace.tip_woke(
+                            request_id,
+                            Some((tip_height, tip_hash)),
+                            tip_woke_at
+                                .take()
+                                .map(|at: std::time::Instant| at.elapsed()),
+                        );
 
                         // A coinbase built in advance only fits the height it was built for. Discard
                         // it after a multi-block advance, a reorg, or a spurious notification: its
@@ -4350,6 +4356,7 @@ where
 
                     precomputed_coinbase = wait_for_new_tip => {
                         wait_reason = WaitReason::Tip;
+                        tip_woke_at = Some(std::time::Instant::now());
                         // The next pass of the loop sees that this request's long poll ID names
                         // an older tip and answers it there, with this coinbase if it fits.
                         tip_wake_coinbase = precomputed_coinbase?

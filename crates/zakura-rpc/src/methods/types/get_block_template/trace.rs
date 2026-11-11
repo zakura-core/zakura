@@ -9,7 +9,10 @@
 //! works on.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::Duration,
 };
 
@@ -139,6 +142,7 @@ enum MiningTemplateEvent<'a> {
         request_id: u64,
         tip_height: u32,
         tip_hash: JsonlDisplay<'a, block::Hash>,
+        since_wake_us: Option<u64>,
     },
     #[serde(rename = "gbt_new_tip_mempool")]
     NewTipMempool {
@@ -185,19 +189,44 @@ enum MiningTemplateEvent<'a> {
 zakura_jsonl_trace::impl_jsonl_trace_event!(MiningTemplateEvent<'_>, TABLE);
 
 /// Writes `mining_template.jsonl` rows, or nothing when tracing is disabled.
+///
+/// Clones share one emitter. A clone made before the emitter is attached, such as the one the
+/// task that builds templates ahead of requests holds, writes rows once it is.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MiningTemplateTrace(pub(crate) JsonlEventEmitter);
+pub(crate) struct MiningTemplateTrace(Arc<OnceLock<JsonlEventEmitter>>);
 
 impl MiningTemplateTrace {
+    /// Attaches `emitter` to this trace and its clones. Only the first call takes effect.
+    pub(crate) fn attach(&self, emitter: JsonlEventEmitter) {
+        let _ = self.0.set(emitter);
+    }
+
+    /// Returns the attached emitter, or one that writes nothing.
+    fn emitter(&self) -> &JsonlEventEmitter {
+        static DISABLED: OnceLock<JsonlEventEmitter> = OnceLock::new();
+        self.0
+            .get()
+            .unwrap_or_else(|| DISABLED.get_or_init(JsonlEventEmitter::default))
+    }
+
     /// Records that request `request_id` saw the new best tip `tip`.
-    pub(crate) fn tip_woke(&self, request_id: u64, tip: Option<(block::Height, block::Hash)>) {
+    ///
+    /// `since_wake` is the time since the tip change woke the request from its wait, which it
+    /// spent reading the state. It is `None` for a request that was not waiting.
+    pub(crate) fn tip_woke(
+        &self,
+        request_id: u64,
+        tip: Option<(block::Height, block::Hash)>,
+        since_wake: Option<Duration>,
+    ) {
         let Some((tip_height, tip_hash)) = tip else {
             return;
         };
-        self.0.emit_event(|| MiningTemplateEvent::TipWoke {
+        self.emitter().emit_event(|| MiningTemplateEvent::TipWoke {
             request_id,
             tip_height: tip_height.0,
             tip_hash: JsonlDisplay(&tip_hash),
+            since_wake_us: since_wake.map(saturating_micros),
         });
     }
 
@@ -211,13 +240,14 @@ impl MiningTemplateTrace {
         tx_count: usize,
         wait: Duration,
     ) {
-        self.0.emit_event(|| MiningTemplateEvent::NewTipMempool {
-            request_id,
-            tip_hash: JsonlDisplay(&tip_hash),
-            outcome,
-            tx_count: saturating_count(tx_count),
-            wait_us: saturating_micros(wait),
-        });
+        self.emitter()
+            .emit_event(|| MiningTemplateEvent::NewTipMempool {
+                request_id,
+                tip_hash: JsonlDisplay(&tip_hash),
+                outcome,
+                tx_count: saturating_count(tx_count),
+                wait_us: saturating_micros(wait),
+            });
     }
 
     /// Records that request `request_id` returned the coinbase-only `template` for a new tip.
@@ -227,13 +257,14 @@ impl MiningTemplateTrace {
         template: &BlockTemplateResponse,
         build: BuildTimes,
     ) {
-        self.0.emit_event(|| MiningTemplateEvent::EmptyReturned {
-            request_id,
-            tip_hash: JsonlDisplay(&template.previous_block_hash),
-            work_id: &template.work_id,
-            permit_wait_us: saturating_micros(build.wait),
-            build_us: saturating_micros(build.run),
-        });
+        self.emitter()
+            .emit_event(|| MiningTemplateEvent::EmptyReturned {
+                request_id,
+                tip_hash: JsonlDisplay(&template.previous_block_hash),
+                work_id: &template.work_id,
+                permit_wait_us: saturating_micros(build.wait),
+                build_us: saturating_micros(build.run),
+            });
     }
 
     /// Records that request `request_id` returned `template`, built from the mempool.
@@ -253,19 +284,20 @@ impl MiningTemplateTrace {
         build: BuildTimes,
         total: Duration,
     ) {
-        self.0.emit_event(|| MiningTemplateEvent::FullReturned {
-            request_id,
-            tip_hash: JsonlDisplay(&template.previous_block_hash),
-            work_id: &template.work_id,
-            tx_count: saturating_count(template.transactions.len()),
-            long_poll,
-            source,
-            wait_reason,
-            selection_us: saturating_micros(selection),
-            permit_wait_us: saturating_micros(build.wait),
-            build_us: saturating_micros(build.run),
-            total_us: saturating_micros(total),
-        });
+        self.emitter()
+            .emit_event(|| MiningTemplateEvent::FullReturned {
+                request_id,
+                tip_hash: JsonlDisplay(&template.previous_block_hash),
+                work_id: &template.work_id,
+                tx_count: saturating_count(template.transactions.len()),
+                long_poll,
+                source,
+                wait_reason,
+                selection_us: saturating_micros(selection),
+                permit_wait_us: saturating_micros(build.wait),
+                build_us: saturating_micros(build.run),
+                total_us: saturating_micros(total),
+            });
     }
 
     /// Records what the task that builds templates ahead of requests did on the tip `tip_hash`,
@@ -280,7 +312,7 @@ impl MiningTemplateTrace {
         ahead: AheadTimes,
         total: Duration,
     ) {
-        self.0.emit_event(|| MiningTemplateEvent::Ahead {
+        self.emitter().emit_event(|| MiningTemplateEvent::Ahead {
             tip_hash: tip_hash.as_ref().map(JsonlDisplay),
             outcome,
             tx_count: saturating_count(ahead.tx_count),

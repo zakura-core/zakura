@@ -403,6 +403,76 @@ async fn seeds_resolved_during_startup_get_startup_dials() {
     assert!(connections.pending_seed_peers.is_none());
 }
 
+/// A live cached connection must let initialization finish even when the cache is
+/// smaller than the target and every seed lookup keeps retrying.
+#[tokio::test]
+async fn small_healthy_cache_finishes_startup_with_unresolved_seeds() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 3,
+        ..test_defaults()
+    };
+    let cached: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    write_peer_cache_file(&config, &["127.0.0.1:8233"]);
+
+    // Keep the successful connection's reservation alive after its connector returns.
+    let live_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let connector = {
+        let live_connections = live_connections.clone();
+        service_fn(move |request: OutboundConnectorRequest| {
+            live_connections
+                .lock()
+                .unwrap()
+                .push(request.connection_tracker);
+            async move {
+                let (client, _harness) = ClientTestHarness::build().finish();
+                Ok::<DiscoveredPeer, BoxError>((request.addr, client))
+            }
+        })
+    };
+    let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+    let (peerset_tx, mut peerset_rx) = mpsc::channel(10);
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
+        config,
+        async move { seed_rx.await.unwrap() }.boxed(),
+        connector,
+        peerset_tx,
+        book_tx,
+    )));
+    let connected = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, peerset_rx.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(connected.0, cached);
+    // The seed sender stays alive and unresolved, modelling indefinite DNS retries.
+    let mut connections = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
+        .await
+        .expect("a live cached peer must unblock initialization without seed DNS")
+        .unwrap()
+        .unwrap();
+    assert_eq!(connections.active_connections.update_count(), 1);
+    assert!(connections.pending_seed_peers.is_some());
+
+    // The unresolved seeds still reach discovery after the startup handoff.
+    let seed: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let late_seeds = tokio::spawn(send_late_seed_peers(
+        connections.pending_seed_peers.take(),
+        book_tx,
+    )));
+    seed_tx.send(vec![seed]).unwrap();
+    let late_seed = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, book_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(late_seed.addr(), seed);
+    late_seeds.abort();
+    live_connections.lock().unwrap().clear();
+}
+
 /// Empty, missing, unreadable, and invalid caches wait for seeds.
 #[tokio::test]
 async fn unusable_cache_waits_for_seeds() {

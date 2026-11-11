@@ -5,8 +5,11 @@
 //! wrote ([`Record`]), how the witness process ended, and, for a test
 //! witness, how many tests its selector names. The runner never reads the
 //! process's output, so it never reads panic text.
+//!
+//! A generator lane is classified into the same classes ([`generated`]),
+//! from the search's report and the one end record it wrote.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +78,12 @@ pub(in crate::planted) enum Reason {
     /// Harness failure: the build broke without a compile error, such as a
     /// compiler the memory cap killed or a full disk.
     Build,
+    /// Harness failure: a generator's search stopped at its limit of runs
+    /// whose shutdown abandoned tasks.
+    Abandoned,
+    /// Harness failure: a generator's kill didn't confirm, or didn't replay
+    /// Exact, in a fresh process.
+    Unconfirmed,
 }
 
 /// One case's class, and what showed it.
@@ -613,4 +622,208 @@ fn judgement_after<'a>(
         }
     }
     None
+}
+
+/// Why a generator's search stopped, as `zakura-sim generate` writes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(in crate::planted) enum GenerateStop {
+    /// No drawn input stopped it.
+    Clean,
+    /// A run violated an `Active` property.
+    Violation { property: String },
+    /// A run ended at a harness failure.
+    HarnessFailure { reason: String },
+    /// Shutdown abandoned the search's limit of runs.
+    Abandoned { leaked: u64 },
+    /// A run panicked outside any task.
+    Panic { message: String },
+}
+
+/// One property's outcomes over a search's runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::planted) struct Applicability {
+    pub(in crate::planted) held: u64,
+    pub(in crate::planted) violated: u64,
+    pub(in crate::planted) inconclusive: u64,
+    pub(in crate::planted) not_applicable: u64,
+}
+
+/// The parts of `zakura-sim generate`'s report the loop reads.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(in crate::planted) struct GenerateFacts {
+    pub(in crate::planted) stop: GenerateStop,
+    /// The draw index of the input that stopped the search.
+    #[serde(default)]
+    pub(in crate::planted) kill_run: Option<u64>,
+    pub(in crate::planted) executed: u64,
+    pub(in crate::planted) millis: u64,
+    /// The saved input that stopped the search.
+    #[serde(default)]
+    pub(in crate::planted) input: Option<PathBuf>,
+    #[serde(default)]
+    pub(in crate::planted) properties: BTreeMap<String, Applicability>,
+}
+
+impl GenerateFacts {
+    /// Runs the search took: to its kill, or all it ran.
+    pub(in crate::planted) fn runs(&self) -> u64 {
+        self.kill_run.map_or(self.executed, |kill| kill + 1)
+    }
+}
+
+/// The run failure, if any, that keeps a generator process that ended as
+/// `observed` says, with report `facts`, from giving a result.
+fn generator_failure(observed: &Observed, facts: Option<&GenerateFacts>) -> Option<Classified> {
+    let harness =
+        |reason, detail: String| Some(Classified::new(Class::HarnessFailure, Some(reason), detail));
+    if cap_killed(observed) {
+        return harness(Reason::Oom, "the memory cap killed the search".to_owned());
+    }
+    match (observed.ended, facts) {
+        #[cfg(any(unix, test))]
+        (Ended::TimedOut, _) => {
+            harness(Reason::Timeout, "the search passed its deadline".to_owned())
+        }
+        (Ended::Signaled(signal), _) => {
+            harness(Reason::Panic, format!("signal {signal} killed the search"))
+        }
+        (Ended::Exited(0), Some(_)) => None,
+        (ended, _) => harness(
+            Reason::Panic,
+            format!("the generator wrote no report: {ended:?}"),
+        ),
+    }
+}
+
+/// Why a generator's search on the unpatched build isn't clean, or `None`
+/// if it is: it must run every input with no `Active` violation, harness
+/// failure, abandonment limit or panic.
+pub(in crate::planted) fn generator_baseline(
+    observed: &Observed,
+    facts: Option<&GenerateFacts>,
+) -> Option<String> {
+    if let Some(failed) = generator_failure(observed, facts) {
+        return Some(failed.detail);
+    }
+    let facts = facts.expect("a search with no run failure wrote its report");
+    stop_detail(&facts.stop, facts.runs())
+}
+
+/// `stop` in words, after `runs` runs, or `None` for a clean search.
+pub(in crate::planted) fn stop_detail(stop: &GenerateStop, runs: u64) -> Option<String> {
+    match stop {
+        GenerateStop::Clean => None,
+        GenerateStop::Violation { property } => {
+            Some(format!("run {runs} of the search violates {property}"))
+        }
+        GenerateStop::HarnessFailure { reason } => Some(format!(
+            "run {runs} of the search ended at a harness failure: {reason}"
+        )),
+        GenerateStop::Abandoned { leaked } => Some(format!(
+            "run {runs} of the search reached the abandonment limit, leaking {leaked} tasks"
+        )),
+        GenerateStop::Panic { message } => {
+            Some(format!("run {runs} of the search panicked: {message}"))
+        }
+    }
+}
+
+/// The class of a generator's search on a mutant for `property`, allowing
+/// `also_violates` beside it, by the witness lane's rules.
+///
+/// A search that stopped at an `Active` violation kills by the named rule
+/// if the violated ID is `property`, or is in `also_violates` while the
+/// kill's end record shows `property` violated too. Any other ID kills by
+/// another rule. The kill's end record must come from the patched build.
+/// A clean search survived: `held` if some run held `property` with an
+/// applicable evaluation, else `inconclusive` if some run ended it
+/// inconclusive, else `not-applicable`. Any other stop is a harness
+/// failure.
+pub(in crate::planted) fn generated(
+    property: &str,
+    also_violates: &[String],
+    observed: &Observed,
+    facts: Option<&GenerateFacts>,
+) -> Classified {
+    if let Some(failed) = generator_failure(observed, facts) {
+        return failed;
+    }
+    let facts = facts.expect("a search with no run failure wrote its report");
+    let runs = facts.runs();
+    let detail = stop_detail(&facts.stop, runs).unwrap_or_default();
+    let harness = |reason| Classified::new(Class::HarnessFailure, Some(reason), detail.clone());
+    match &facts.stop {
+        GenerateStop::Clean => searched(property, facts),
+        GenerateStop::Violation { property: id } => {
+            let Some(violated) = observed.records.iter().find_map(|record| match record {
+                Record::End {
+                    stopped_by: Some(stopped),
+                    violated,
+                    ..
+                } if stopped == id => Some(violated),
+                _ => None,
+            }) else {
+                return Classified::new(
+                    Class::HarnessFailure,
+                    Some(Reason::NoEndRecord),
+                    format!(
+                        "no end record from this build shows the search's violation of {id}; \
+                         {} records came from another build",
+                        observed.unpaired
+                    ),
+                );
+            };
+            let named = id == property
+                || (also_violates.iter().any(|also| also == id)
+                    && violated.iter().any(|other| other == property));
+            if named {
+                Classified::new(Class::KilledByNamedRule, None, detail)
+            } else {
+                Classified {
+                    other: Some(id.clone()),
+                    ..Classified::new(Class::KilledByOtherRule, None, detail)
+                }
+            }
+        }
+        GenerateStop::HarnessFailure { .. } => harness(Reason::HarnessEnd),
+        GenerateStop::Abandoned { .. } => harness(Reason::Abandoned),
+        GenerateStop::Panic { .. } => harness(Reason::Panic),
+    }
+}
+
+/// A clean search's survivor reason for `property`, from its outcome
+/// counts, as [`by_outcomes`] gives a passing witness's.
+fn searched(property: &str, facts: &GenerateFacts) -> Classified {
+    let survived = |reason, detail: String| Classified::new(Class::Survived, Some(reason), detail);
+    let Some(counts) = facts.properties.get(property) else {
+        return Classified::new(
+            Class::HarnessFailure,
+            Some(Reason::NoEndRecord),
+            format!("no run of the search reports {property}"),
+        );
+    };
+    let runs = facts.executed;
+    if counts.held > 0 {
+        survived(
+            Reason::Held,
+            format!(
+                "{property} held with nonzero applicability in {} of {runs} runs",
+                counts.held
+            ),
+        )
+    } else if counts.inconclusive > 0 {
+        survived(
+            Reason::Inconclusive,
+            format!(
+                "{property} ended inconclusive in {} of {runs} runs and never applied",
+                counts.inconclusive
+            ),
+        )
+    } else {
+        survived(
+            Reason::NotApplicable,
+            format!("{property} never applied in {runs} runs"),
+        )
+    }
 }

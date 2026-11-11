@@ -7,16 +7,26 @@ use std::{collections::BTreeMap, fs, path::Path, process::Command};
 use std::time::Duration;
 
 #[cfg(unix)]
-use super::{run_measured, Built, Runnable};
+use super::run_measured;
+use super::{Built, Runnable};
 
 use serde_json::json;
 
 use super::{
     build_failure,
-    classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
+    classify::{
+        self, read_record, Applicability, Class, Ended, GenerateFacts, GenerateStop, Observed,
+        Reason, Record, Trigger,
+    },
+    generate::{
+        campaign_class, confirmed, no_generator as no_generator_of, plan, write_exclusions,
+        FollowUp, GenBaseline, GenerateConfig, GenerateMode, GeneratorReport, Kill, Lanes,
+        PropertyFinding, Search, Searched,
+    },
     parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
-    LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
+use crate::planted::lane::CampaignFacts;
 
 const NAMED: &str = "block-sync/retained-byte-bound";
 const OTHER: &str = "block-sync/reserved-byte-bound";
@@ -596,6 +606,7 @@ fn one_case(
         pinned: repository(tree),
         memory_max: None,
         build_jobs: 1,
+        generate: GenerateFlags::default(),
     };
     let slot = Slot {
         tree: tree.to_path_buf(),
@@ -645,7 +656,7 @@ fn a_rejected_patch_does_not_apply_and_a_failing_baseline_runs_no_mutant() {
     };
     let cases = [case];
     let reports = runner
-        .mutant(&slot, &mutant, &cases, &runnables, &[baseline], None)
+        .mutant(&slot, &mutant, &cases, &runnables, &[baseline], None, None)
         .unwrap();
     assert_eq!(reports[0].1.result.class, Class::PatchDoesNotApply);
 
@@ -663,7 +674,7 @@ fn a_rejected_patch_does_not_apply_and_a_failing_baseline_runs_no_mutant() {
         rerun_alone: false,
     };
     let reports = runner
-        .mutant(&slot, &mutant, &cases, &runnables, &[failing], None)
+        .mutant(&slot, &mutant, &cases, &runnables, &[failing], None, None)
         .unwrap();
     assert_eq!(reports[0].1.result.class, Class::BaselineFails);
     assert_eq!(reports[0].1.millis, None);
@@ -702,6 +713,8 @@ fn the_report_round_trips_and_counts_by_property() {
         peak_rss_kib: Some(51_200),
         log: Some("mutants/x/witness.log".into()),
         rerun_alone: reason == Some(Reason::Oom),
+        generator: Vec::new(),
+        no_generator: None,
     };
     let cases = vec![
         case(Class::KilledByNamedRule, None, NAMED),
@@ -727,6 +740,8 @@ fn the_report_round_trips_and_counts_by_property() {
         host: "zakura-sim-nov06".to_owned(),
         jobs: 4,
         memory_max: Some(16 << 30),
+        generate: None,
+        property_findings: Vec::new(),
         summary: summarize(&cases),
         cases,
     };
@@ -895,4 +910,637 @@ fn a_case_watches_its_work_list_entrys_paths() {
         &watched,
         &["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs".into()]
     ));
+}
+
+// The generator lane (mut-4.3 and mut-4.4).
+
+/// A search's report that stopped at `stop`, with `NAMED`'s outcome
+/// counts `named`, after 40 runs, the last at draw 41 if it stopped.
+fn search(stop: GenerateStop, named: Option<Applicability>) -> GenerateFacts {
+    let stopped = stop != GenerateStop::Clean;
+    GenerateFacts {
+        stop,
+        kill_run: stopped.then_some(41),
+        executed: 40,
+        millis: 900,
+        input: stopped.then(|| "/out/search/ab.bin".into()),
+        properties: named
+            .map(|counts| BTreeMap::from([(NAMED.to_owned(), counts)]))
+            .unwrap_or_default(),
+    }
+}
+
+fn violation(id: &str) -> GenerateStop {
+    GenerateStop::Violation {
+        property: id.to_owned(),
+    }
+}
+
+fn generated(
+    also: &[&str],
+    observed: &Observed,
+    facts: Option<&GenerateFacts>,
+) -> (Class, Option<Reason>) {
+    let also: Vec<String> = also.iter().map(|id| (*id).to_owned()).collect();
+    let result = classify::generated(NAMED, &also, observed, facts);
+    (result.class, result.reason)
+}
+
+#[test]
+fn a_search_that_stops_at_a_violation_kills_by_its_rule() {
+    let paired = |id| {
+        observed(
+            Ended::Exited(0),
+            vec![end(Some(id), &[(id, "violated", 0)])],
+        )
+    };
+    assert_eq!(
+        generated(&[], &paired(NAMED), Some(&search(violation(NAMED), None))),
+        (Class::KilledByNamedRule, None)
+    );
+    let other = classify::generated(
+        NAMED,
+        &[],
+        &paired(OTHER),
+        Some(&search(violation(OTHER), None)),
+    );
+    assert_eq!(other.class, Class::KilledByOtherRule);
+    assert_eq!(other.other.as_deref(), Some(OTHER));
+    assert!(other.detail.contains("run 42"), "{}", other.detail);
+
+    // An `also_violates` ID kills by the named rule only beside the named
+    // ID's violation in the same run.
+    let both = observed(
+        Ended::Exited(0),
+        vec![end(
+            Some(OTHER),
+            &[(OTHER, "violated", 0), (NAMED, "violated", 0)],
+        )],
+    );
+    let facts = search(violation(OTHER), None);
+    assert_eq!(
+        generated(&[OTHER], &both, Some(&facts)),
+        (Class::KilledByNamedRule, None)
+    );
+    assert_eq!(
+        generated(&[OTHER], &paired(OTHER), Some(&facts)),
+        (Class::KilledByOtherRule, None)
+    );
+
+    // A violation without an end record from this build decides nothing.
+    let unpaired = Observed {
+        unpaired: 1,
+        ..observed(Ended::Exited(0), Vec::new())
+    };
+    assert_eq!(
+        generated(&[], &unpaired, Some(&search(violation(NAMED), None))),
+        (Class::HarnessFailure, Some(Reason::NoEndRecord))
+    );
+}
+
+#[test]
+fn a_clean_search_survives_by_its_outcome_counts() {
+    let clean = observed(Ended::Exited(0), Vec::new());
+    let counts = |held, inconclusive| Applicability {
+        held,
+        violated: 0,
+        inconclusive,
+        not_applicable: 40 - held - inconclusive,
+    };
+    for (named, expected) in [
+        (Some(counts(3, 1)), (Class::Survived, Some(Reason::Held))),
+        (
+            Some(counts(0, 2)),
+            (Class::Survived, Some(Reason::Inconclusive)),
+        ),
+        (
+            Some(counts(0, 0)),
+            (Class::Survived, Some(Reason::NotApplicable)),
+        ),
+        (None, (Class::HarnessFailure, Some(Reason::NoEndRecord))),
+    ] {
+        assert_eq!(
+            generated(&[], &clean, Some(&search(GenerateStop::Clean, named))),
+            expected,
+            "{named:?}"
+        );
+    }
+}
+
+#[test]
+fn a_search_that_cannot_give_a_result_is_a_harness_failure() {
+    let clean = search(GenerateStop::Clean, None);
+    for (ended, facts, reason) in [
+        (Ended::Signaled(9), Some(&clean), Reason::Oom),
+        (Ended::TimedOut, Some(&clean), Reason::Timeout),
+        (Ended::Signaled(6), Some(&clean), Reason::Panic),
+        (Ended::Exited(0), None, Reason::Panic),
+        (Ended::Exited(2), None, Reason::Panic),
+    ] {
+        assert_eq!(
+            generated(&[], &observed(ended, Vec::new()), facts),
+            (Class::HarnessFailure, Some(reason)),
+            "{ended:?} {facts:?}"
+        );
+    }
+    let done = observed(Ended::Exited(0), Vec::new());
+    for (stop, reason) in [
+        (
+            GenerateStop::HarnessFailure {
+                reason: "schedule exhausted".to_owned(),
+            },
+            Reason::HarnessEnd,
+        ),
+        (GenerateStop::Abandoned { leaked: 3 }, Reason::Abandoned),
+        (
+            GenerateStop::Panic {
+                message: "boom".to_owned(),
+            },
+            Reason::Panic,
+        ),
+    ] {
+        assert_eq!(
+            generated(&[], &done, Some(&search(stop.clone(), None))),
+            (Class::HarnessFailure, Some(reason)),
+            "{stop:?}"
+        );
+    }
+}
+
+/// An `inproc` search that ended `ended` with report `facts` and
+/// `records`.
+fn inproc(ended: Ended, records: Vec<Record>, facts: Option<GenerateFacts>) -> Search {
+    Search {
+        searched: Searched::Inproc(super::Ran {
+            observed: observed(ended, records),
+            millis: 900,
+            peak_rss_kib: None,
+            log: "/out/x/witness.log".into(),
+            generated: facts,
+        }),
+        millis: 900,
+        dir: "/out/x".into(),
+    }
+}
+
+#[test]
+fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
+    let killed = inproc(
+        Ended::Exited(0),
+        vec![end(Some(OTHER), &[(OTHER, "violated", 0)])],
+        Some(search(violation(OTHER), None)),
+    );
+    let (result, kill) = killed.classify(NAMED, &[]);
+    assert_eq!(result.class, Class::KilledByOtherRule);
+    assert_eq!(
+        kill,
+        Some(Kill {
+            id: OTHER.to_owned(),
+            input: Some("/out/search/ab.bin".into()),
+        })
+    );
+    let clean = inproc(
+        Ended::Exited(0),
+        Vec::new(),
+        Some(search(GenerateStop::Clean, Some(Applicability::default()))),
+    );
+    assert_eq!(clean.classify(NAMED, &[]).1, None);
+
+    // A kill whose fresh confirmation fails is a harness failure.
+    let unconfirmed = confirmed(
+        result.clone(),
+        &FollowUp::failed("missing witness".to_owned()),
+    );
+    assert_eq!(unconfirmed.class, Class::HarnessFailure);
+    assert_eq!(unconfirmed.reason, Some(Reason::Unconfirmed));
+    assert!(unconfirmed.detail.contains("missing witness"));
+    let kept = FollowUp {
+        ok: true,
+        trace: Some("x/confirmation/confirm/trace".into()),
+        detail: None,
+    };
+    assert_eq!(confirmed(result.clone(), &kept), result);
+}
+
+#[test]
+fn an_unpatched_search_that_stops_is_a_property_finding_and_fails_the_lane() {
+    // The baseline search names the violated ID only for a process that
+    // finished and reported it.
+    let stopped = inproc(
+        Ended::Exited(0),
+        vec![end(Some(NAMED), &[(NAMED, "violated", 0)])],
+        Some(search(violation(NAMED), None)),
+    );
+    let (detail, violated) = stopped.baseline();
+    assert!(detail.unwrap().contains(NAMED));
+    assert_eq!(violated.as_deref(), Some(NAMED));
+    let clean = inproc(
+        Ended::Exited(0),
+        Vec::new(),
+        Some(search(GenerateStop::Clean, None)),
+    );
+    assert_eq!(clean.baseline(), (None, None));
+    let timed_out = inproc(Ended::TimedOut, Vec::new(), None);
+    let (detail, violated) = timed_out.baseline();
+    assert!(detail.is_some());
+    assert_eq!(violated, None);
+
+    // A failed baseline makes that harness and seed's lane `baseline-fails`
+    // for every case on it, with nothing run.
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (runner, slot, case, _) = one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    let lanes = Lanes {
+        flags: GenerateFlags {
+            runs: 50,
+            seeds: vec![7, 8],
+            ..GenerateFlags::default()
+        },
+        plans: vec![Ok("block-sync/storage".to_owned())],
+        baselines: BTreeMap::from([
+            (
+                ("block-sync/storage".to_owned(), 7),
+                GenBaseline {
+                    detail: Some("run 3 of the search violates x".to_owned()),
+                    millis: 10,
+                },
+            ),
+            (
+                ("block-sync/storage".to_owned(), 8),
+                GenBaseline {
+                    detail: Some("the search passed its deadline".to_owned()),
+                    millis: 10,
+                },
+            ),
+        ]),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+    };
+    let reports = runner
+        .generator_lanes(
+            &slot,
+            &Built::default(),
+            &lanes,
+            &[(0, &case)],
+            out.path(),
+            "source",
+            None,
+        )
+        .unwrap();
+    let lanes = &reports[&0];
+    assert_eq!(lanes.len(), 2);
+    assert!(lanes
+        .iter()
+        .all(|lane| lane.result.class == Class::BaselineFails && lane.runs.is_none()));
+    assert_eq!(lanes[1].seed, 8);
+    assert!(!out.path().join("generate").exists(), "nothing ran");
+}
+
+#[test]
+fn a_campaign_lane_gets_the_same_classes() {
+    let facts = |violated: &[&str], applied| CampaignFacts {
+        status: "complete".to_owned(),
+        violated: violated.iter().map(|id| (*id).to_owned()).collect(),
+        applied,
+        runs: 1000,
+        applicable_runs: if applied { 10 } else { 0 },
+        ..CampaignFacts::default()
+    };
+    let class = |also: &[&str], facts: &CampaignFacts| {
+        let also: Vec<String> = also.iter().map(|id| (*id).to_owned()).collect();
+        let result = campaign_class(NAMED, &also, facts);
+        (result.class, result.reason, result.other)
+    };
+    assert_eq!(
+        class(&[], &facts(&[NAMED], true)),
+        (Class::KilledByNamedRule, None, None)
+    );
+    assert_eq!(
+        class(&[OTHER], &facts(&[NAMED, OTHER], true)),
+        (Class::KilledByNamedRule, None, None)
+    );
+    assert_eq!(
+        class(&[], &facts(&[NAMED, OTHER], true)),
+        (Class::KilledByOtherRule, None, Some(OTHER.to_owned()))
+    );
+    assert_eq!(
+        class(&[OTHER], &facts(&[OTHER], true)),
+        (Class::KilledByOtherRule, None, Some(OTHER.to_owned()))
+    );
+    assert_eq!(
+        class(&[], &facts(&[], true)),
+        (Class::Survived, Some(Reason::Held), None)
+    );
+    assert_eq!(
+        class(&[], &facts(&[], false)),
+        (Class::Survived, Some(Reason::NotApplicable), None)
+    );
+    let timed_out = CampaignFacts {
+        killed: vec!["artifacts/timeout-1".to_owned()],
+        ..facts(&[NAMED], true)
+    };
+    assert_eq!(
+        class(&[], &timed_out),
+        (Class::HarnessFailure, Some(Reason::Timeout), None)
+    );
+    let saved = CampaignFacts {
+        failures: vec!["sim/inputs/harness-failure/a.bin".to_owned()],
+        ..facts(&[], true)
+    };
+    assert_eq!(
+        class(&[], &saved),
+        (Class::HarnessFailure, Some(Reason::HarnessEnd), None)
+    );
+}
+
+#[test]
+fn each_case_gets_a_generator_harness_or_a_reason() {
+    let case = |property: &str| LoopCase {
+        label: format!("{property}.patch"),
+        patch: "p".into(),
+        listed_in: "cases.json".into(),
+        property: property.to_owned(),
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "tt".to_owned(),
+        },
+        entry: None,
+        table: None,
+        also_violates: Vec::new(),
+    };
+    let record = |harness: &str| Runnable::Record {
+        harness: harness.to_owned(),
+        args: Vec::new(),
+        property: NAMED.to_owned(),
+    };
+    let cases = [case(NAMED), case(NAMED), case(OTHER), case("x/unreported")];
+    let runnables = [
+        record("block-sync/s6v3"),
+        record("block-sync/planted"),
+        record("block-sync/s6v3"),
+        record("block-sync/s6v3"),
+    ];
+    let map = BTreeMap::from([
+        (
+            NAMED.to_owned(),
+            vec![
+                "block-sync/s6v3".to_owned(),
+                "block-sync/storage".to_owned(),
+            ],
+        ),
+        ("x/unreported".to_owned(), Vec::new()),
+    ]);
+    let no_generator = BTreeMap::from([(OTHER.to_owned(), "refused frames".to_owned())]);
+    let plans = plan(&cases, &runnables, &map, &no_generator, None, None);
+    assert_eq!(
+        plans[0],
+        Ok("block-sync/s6v3".to_owned()),
+        "its own harness"
+    );
+    assert_eq!(plans[1], Ok("block-sync/s6v3".to_owned()), "the first one");
+    assert_eq!(plans[2], Err("no-generator: refused frames".to_owned()));
+    assert!(plans[3].is_err());
+    let forced = plan(&cases, &runnables, &map, &no_generator, Some("h"), None);
+    assert!(forced.iter().all(|plan| plan == &Ok("h".to_owned())));
+    let targets = BTreeMap::from([("block-sync/storage".to_owned(), "storage".to_owned())]);
+    let libfuzzer = plan(
+        &cases,
+        &runnables,
+        &map,
+        &no_generator,
+        None,
+        Some(&targets),
+    );
+    assert_eq!(
+        libfuzzer[0],
+        Err("no fuzz target runs block-sync/s6v3".to_owned())
+    );
+
+    // The work list's records parse.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let recorded = no_generator_of(&root).unwrap();
+    assert!(!recorded.is_empty());
+}
+
+#[test]
+fn exclusions_list_every_committed_input_once() {
+    let tree = tempfile::tempdir().unwrap();
+    for (path, bytes) in [
+        ("qa/planted/a/witness.bin", &b"one"[..]),
+        ("qa/native-mutations/inputs/b.bin", b"two"),
+        ("crates/zakura-sim/tests/fixtures/c.bin", b"one"),
+        ("qa/planted/a/witness.toml", b"not an input"),
+        ("elsewhere/d.bin", b"three"),
+    ] {
+        let path = tree.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let file = tree.path().join("out/exclude.txt");
+    assert_eq!(write_exclusions(tree.path(), &file).unwrap(), 2);
+    let text = fs::read_to_string(&file).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.lines().all(|line| line.len() == 64));
+}
+
+#[test]
+fn generate_flags_parse_and_refuse_bad_values() {
+    let flags = parse_flags(
+        [
+            "--out",
+            "out",
+            "--generate-runs",
+            "2000",
+            "--generate-seeds",
+            "1, 2,3",
+            "--generate-harness",
+            "block-sync/storage",
+            "--generate-mode",
+            "libfuzzer",
+            "--generate-seconds",
+            "30",
+        ]
+        .map(str::to_owned)
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(
+        flags.generate,
+        GenerateFlags {
+            runs: 2000,
+            seeds: vec![1, 2, 3],
+            harness: Some("block-sync/storage".to_owned()),
+            mode: GenerateMode::Libfuzzer,
+            seconds: 30,
+        }
+    );
+    assert!(flags.generate.on());
+    let off = parse_flags(
+        ["--out", "o", "--generate-harness", "auto"]
+            .map(str::to_owned)
+            .into_iter(),
+    )
+    .unwrap();
+    assert!(!off.generate.on());
+    assert_eq!(off.generate.harness, None);
+    assert_eq!(off.generate.mode, GenerateMode::Inproc);
+    for bad in [
+        &["--out", "o", "--generate-runs", "many"][..],
+        &["--out", "o", "--generate-seeds", "1,,2"],
+        &["--out", "o", "--generate-mode", "afl"],
+        &["--out", "o", "--generate-seconds", "0"],
+    ] {
+        assert!(
+            parse_flags(bad.iter().map(|s| (*s).to_owned())).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn the_report_keeps_generator_lanes_and_findings_apart() {
+    let lane = |class, reason| GeneratorReport {
+        violated: (class == Class::KilledByNamedRule).then(|| NAMED.to_owned()),
+        runs: Some(42),
+        millis: Some(900),
+        input: Some("mutants/x/generate/s/search/ab.bin".into()),
+        confirmation: Some(FollowUp {
+            ok: true,
+            trace: Some("mutants/x/confirmation/confirm/trace".into()),
+            detail: None,
+        }),
+        shrunk: Some(FollowUp::failed("`zakura-sim shrink` exited 1".to_owned())),
+        log: Some("mutants/x/generate/s".into()),
+        ..GeneratorReport::unsearched(
+            "block-sync/storage",
+            11,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, reason, "why"),
+        )
+    };
+    let case = |generator: Vec<GeneratorReport>, no_generator: Option<&str>| CaseReport {
+        patch: "bounds/raise/raise.patch".to_owned(),
+        patch_sha256: "00".repeat(32),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result: classify::Classified::new(Class::Survived, Some(Reason::Held), "why"),
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 10,
+            rerun_alone: false,
+        },
+        millis: Some(10),
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator,
+        no_generator: no_generator.map(str::to_owned),
+    };
+    let cases = vec![
+        case(
+            vec![
+                lane(Class::KilledByNamedRule, None),
+                lane(Class::Survived, Some(Reason::NotApplicable)),
+                lane(Class::BaselineFails, None),
+                lane(Class::HarnessFailure, Some(Reason::Unconfirmed)),
+            ],
+            None,
+        ),
+        case(Vec::new(), Some("no-generator: refused frames")),
+    ];
+    let report = Report {
+        schema: 2,
+        pinned: "a".repeat(40),
+        prompt_sha256: "b".repeat(64),
+        build: BuildIdentity {
+            source: "c".repeat(64),
+            rustc: "rustc 1.97.0".to_owned(),
+            profile: "planted".to_owned(),
+            rustflags: "--cfg zakura_sim".to_owned(),
+        },
+        host: "h".to_owned(),
+        jobs: 1,
+        memory_max: None,
+        generate: Some(GenerateConfig {
+            mode: GenerateMode::Inproc,
+            runs: 2000,
+            seeds: vec![11],
+            harness: "auto".to_owned(),
+            seconds: None,
+            excluded_inputs: 120,
+        }),
+        property_findings: vec![PropertyFinding {
+            harness: "discovery/wire".to_owned(),
+            seed: 23,
+            mode: GenerateMode::Inproc,
+            property: Some(OTHER.to_owned()),
+            detail: format!("run 7 of the search violates {OTHER}"),
+            runs: Some(7),
+            millis: 300,
+            input: Some("baseline/generate/d/search/cd.bin".into()),
+            confirmation: Some(FollowUp::failed("missing witness".to_owned())),
+            shrunk: None,
+            log: "baseline/generate/d".into(),
+        }],
+        summary: summarize(&cases),
+        cases,
+    };
+    let text = serde_json::to_string_pretty(&report).unwrap();
+    let back: Report = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, report);
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["generate"]["mode"], "inproc");
+    assert!(value["generate"].get("seconds").is_none());
+    assert_eq!(value["property_findings"][0]["property"], OTHER);
+    let lane = &value["cases"][0]["generator"][0];
+    for key in [
+        "harness",
+        "seed",
+        "mode",
+        "result",
+        "violated",
+        "runs",
+        "millis",
+        "input",
+        "confirmation",
+        "shrunk",
+        "log",
+    ] {
+        assert!(lane.get(key).is_some(), "{key}");
+    }
+    assert_eq!(lane["result"]["class"], "killed-by-named-rule");
+    assert!(value["cases"][1].get("generator").is_none());
+    assert_eq!(
+        value["cases"][1]["no_generator"],
+        "no-generator: refused frames"
+    );
+    let summary = &value["summary"][NAMED];
+    assert_eq!(summary["results"], json!({"survived/held": 2}));
+    assert_eq!(
+        summary["generator_results"],
+        json!({"killed-by-named-rule": 1, "survived/not-applicable": 1})
+    );
+    assert_eq!(
+        summary["generator_run_failures"],
+        json!({"baseline-fails": 1, "harness-failure/unconfirmed": 1, "no-generator": 1})
+    );
+
+    // A report without generator lanes reads back without them.
+    let plain = serde_json::to_value(Report {
+        generate: None,
+        property_findings: Vec::new(),
+        ..report
+    })
+    .unwrap();
+    assert!(plain.get("generate").is_none());
+    assert!(plain.get("property_findings").is_none());
 }

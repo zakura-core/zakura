@@ -27,9 +27,9 @@ pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_
 
 /// How many long polls answered on a new tip may build a full template at the same time.
 ///
-/// Each one selects from the mempool's transactions and queues a template build. Without
-/// a limit, every long poll woken by one tip change would do that at once. A long poll over
-/// the limit answers with the coinbase-only template instead of waiting.
+/// Each one may ask the mempool, selects from its transactions and queues a template build.
+/// Without a limit, every long poll woken by one tip change would do that at once. A long
+/// poll over the limit answers with the coinbase-only template instead of waiting.
 ///
 /// Three covers a pool that keeps a few long polls open on one node. The limit stays small
 /// because templates are built one at a time: a larger one queues more builds, some for a tip

@@ -3697,6 +3697,33 @@ pub(super) fn fake_verified_mempool_tx() -> VerifiedUnminedTx {
     }
 }
 
+/// What the mock mempool does once the new block has landed.
+struct MempoolAfterBlock {
+    /// The snapshot it publishes. `None` is a mempool that is no longer active.
+    published: Option<mempool::MempoolSnapshot>,
+    /// Its answer to a request for its transactions. `None` is a mempool that never answers.
+    answer: Option<mempool::MempoolSnapshot>,
+}
+
+impl MempoolAfterBlock {
+    /// A mempool that publishes `snapshot` and never answers a request, so only the
+    /// published snapshot can supply a long poll's transactions.
+    fn publishes_only(snapshot: mempool::MempoolSnapshot) -> Self {
+        Self {
+            published: Some(snapshot),
+            answer: None,
+        }
+    }
+
+    /// A mempool that publishes `snapshot` and answers requests with the same.
+    fn publishes_and_answers(snapshot: mempool::MempoolSnapshot) -> Self {
+        Self {
+            published: Some(snapshot.clone()),
+            answer: Some(snapshot),
+        }
+    }
+}
+
 /// When a long poll carrying the old tip's ID reaches the node, relative to the new block.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum LongPollSent {
@@ -3713,12 +3740,11 @@ enum LongPollSent {
 /// The miner is paid to a transparent address, so a coinbase built before the block lands is
 /// no reason to hold back the mempool's transactions.
 ///
-/// `mempool_after_block` is the snapshot the mempool publishes once the block has landed.
-/// `None` is a mempool that is no longer active. From then on the mempool service never
-/// answers, so the long poll's answer cannot come from a request to it.
+/// `mempool_after_block` is what the mempool publishes, and answers to a request, once the
+/// block has landed.
 async fn old_tip_long_poll_answer(
     sent: LongPollSent,
-    mempool_after_block: Option<mempool::MempoolSnapshot>,
+    mempool_after_block: MempoolAfterBlock,
 ) -> BlockTemplateResponse {
     let _init_guard = zakura_test::init();
     let old_height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
@@ -3733,20 +3759,21 @@ async fn old_tip_long_poll_answer(
     sync.set_is_close_to_tip(true);
 
     // Before the block lands, the mempool is empty and on the old tip.
+    let before_block = mempool_snapshot(LONG_POLL_OLD_TIP, vec![]);
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
-    mempool_snapshots.publish(Some(mempool_snapshot(LONG_POLL_OLD_TIP, vec![])));
-    let (block_landed, block_landed_rx) = tokio::sync::watch::channel(false);
+    mempool_snapshots.publish(Some(before_block.clone()));
+    let (mempool_answer, mempool_answer_rx) = tokio::sync::watch::channel(Some(before_block));
     let mempool = tower::service_fn(move |_| {
-        let block_landed = *block_landed_rx.borrow();
+        let answer = mempool_answer_rx.borrow().clone();
         async move {
-            if block_landed {
+            let Some(answer) = answer else {
                 return std::future::pending::<std::result::Result<mempool::Response, BoxError>>()
                     .await;
-            }
+            };
             Ok(mempool::Response::FullTransactions {
-                transactions: Default::default(),
-                transaction_dependencies: Default::default(),
-                last_seen_tip_hash: LONG_POLL_OLD_TIP,
+                transactions: answer.transactions,
+                transaction_dependencies: answer.transaction_dependencies,
+                last_seen_tip_hash: answer.last_seen_tip_hash,
             })
         }
     });
@@ -3828,8 +3855,8 @@ async fn old_tip_long_poll_answer(
     }
 
     // A block lands. The mempool, the state and the tip watch move on.
-    block_landed.send_replace(true);
-    mempool_snapshots.publish(mempool_after_block);
+    mempool_answer.send_replace(mempool_after_block.answer);
+    mempool_snapshots.publish(mempool_after_block.published);
     chain_info.send_modify(|info| {
         info.tip_height = new_height;
         info.tip_hash = LONG_POLL_NEW_TIP;
@@ -3839,7 +3866,7 @@ async fn old_tip_long_poll_answer(
 
     let new_template = tokio::time::timeout(Duration::from_secs(2), long_poll)
         .await
-        .expect("a long poll from the old tip answers without sending the mempool a request")
+        .expect("a long poll from the old tip answers without waiting for the mempool")
         .unwrap()
         .try_into_template()
         .unwrap();
@@ -3852,13 +3879,13 @@ async fn old_tip_long_poll_answer(
 }
 
 /// A long poll that starts, or loops back, after the tip moved must answer from the new tip
-/// even if the mempool does not process that block: it gives up on the mempool after its
-/// bounded wait.
+/// without waiting for the mempool to process that block. The old tip's snapshot is not used
+/// for it.
 #[tokio::test]
 async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
     let template = old_tip_long_poll_answer(
         LongPollSent::AfterBlock,
-        Some(mempool_snapshot(
+        MempoolAfterBlock::publishes_and_answers(mempool_snapshot(
             LONG_POLL_OLD_TIP,
             vec![fake_verified_mempool_tx()],
         )),
@@ -3874,11 +3901,14 @@ async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
 /// Checks that the first answer on a new tip carries the mempool's transactions when the
 /// mempool has already processed the new block, so a miner that keeps its first answer does
 /// not mine an empty block while transactions wait.
+///
+/// The transactions come from the mempool's published snapshot: the mempool does not answer
+/// a request here.
 async fn first_answer_on_new_tip_has_mempool_transactions(sent: LongPollSent) {
     let mempool_tx = fake_verified_mempool_tx();
     let template = old_tip_long_poll_answer(
         sent,
-        Some(mempool_snapshot(
+        MempoolAfterBlock::publishes_only(mempool_snapshot(
             LONG_POLL_NEW_TIP,
             vec![mempool_tx.clone()],
         )),
@@ -3912,7 +3942,7 @@ async fn waiting_long_poll_returns_mempool_transactions_on_the_new_tip() {
 async fn waiting_long_poll_does_not_wait_for_mempool() {
     let template = old_tip_long_poll_answer(
         LongPollSent::BeforeBlock,
-        Some(mempool_snapshot(
+        MempoolAfterBlock::publishes_and_answers(mempool_snapshot(
             LONG_POLL_OLD_TIP,
             vec![fake_verified_mempool_tx()],
         )),
@@ -3927,28 +3957,62 @@ async fn waiting_long_poll_does_not_wait_for_mempool() {
 async fn long_poll_from_old_tip_is_coinbase_only_when_the_mempool_is_empty() {
     let template = old_tip_long_poll_answer(
         LongPollSent::AfterBlock,
-        Some(mempool_snapshot(LONG_POLL_NEW_TIP, vec![])),
+        MempoolAfterBlock::publishes_only(mempool_snapshot(LONG_POLL_NEW_TIP, vec![])),
     )
     .await;
 
     assert!(template.transactions.is_empty());
 }
 
-/// A mempool that is not active cannot hold back work on the new tip: the long poll falls
-/// back to the coinbase-only template.
+/// A mempool that neither answers nor publishes the new tip cannot hold back work on it: the
+/// long poll falls back to the coinbase-only template, and does not use the old tip's
+/// snapshot.
 #[tokio::test]
-async fn long_poll_from_old_tip_is_coinbase_only_when_the_mempool_is_not_active() {
-    let template = old_tip_long_poll_answer(LongPollSent::AfterBlock, None).await;
+async fn long_poll_from_old_tip_is_coinbase_only_when_the_mempool_does_not_answer() {
+    let template = old_tip_long_poll_answer(
+        LongPollSent::AfterBlock,
+        MempoolAfterBlock::publishes_only(mempool_snapshot(
+            LONG_POLL_OLD_TIP,
+            vec![fake_verified_mempool_tx()],
+        )),
+    )
+    .await;
 
     assert!(template.transactions.is_empty());
 }
 
-/// Returns an RPC handler that reads `mempool_snapshots`, for tests that call none of its
-/// services.
+/// While the published snapshot is still for the old tip, the long poll asks the mempool, as
+/// it did before snapshots, and uses the answer when that names the new tip.
+#[tokio::test]
+async fn long_poll_from_old_tip_asks_the_mempool_when_its_snapshot_is_behind() {
+    let mempool_tx = fake_verified_mempool_tx();
+    let template = old_tip_long_poll_answer(
+        LongPollSent::AfterBlock,
+        MempoolAfterBlock {
+            published: Some(mempool_snapshot(LONG_POLL_OLD_TIP, vec![])),
+            answer: Some(mempool_snapshot(
+                LONG_POLL_NEW_TIP,
+                vec![mempool_tx.clone()],
+            )),
+        },
+    )
+    .await;
+
+    let template_tx_ids: Vec<_> = template.transactions.iter().map(|tx| tx.hash).collect();
+    assert_eq!(
+        template_tx_ids,
+        vec![mempool_tx.transaction.id().mined_id()]
+    );
+}
+
+/// Returns an RPC handler that reads `mempool_snapshots` and whose mempool never answers a
+/// request, for tests that call none of its other services.
 fn rpc_reading_mempool_snapshots(
     mempool_snapshots: &mempool::MempoolSnapshotSender,
 ) -> TestRpcImpl {
-    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mempool = tower::service_fn(|_: mempool::Request| {
+        std::future::pending::<std::result::Result<mempool::Response, BoxError>>()
+    });
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -3975,7 +4039,8 @@ fn rpc_reading_mempool_snapshots(
 }
 
 /// A long poll that reaches a new tip before the mempool has processed that block gets the
-/// mempool's transactions if the mempool publishes them within the bounded wait.
+/// mempool's transactions if the mempool publishes them within the bounded wait, without
+/// waiting for the answer to its own request.
 #[tokio::test(start_paused = true)]
 async fn first_answer_on_new_tip_waits_for_the_mempool_to_process_the_block() {
     let _init_guard = zakura_test::init();
@@ -4010,8 +4075,8 @@ async fn first_answer_on_new_tip_waits_for_the_mempool_to_process_the_block() {
     );
 }
 
-/// A long poll that reaches a new tip stops waiting for a mempool that stays on the old block
-/// when the bounded wait ends, and not before.
+/// A long poll that reaches a new tip stops waiting for a mempool that neither answers nor
+/// publishes the new block when the bounded wait ends, and not before.
 #[tokio::test(start_paused = true)]
 async fn first_answer_on_new_tip_stops_waiting_for_the_mempool_after_the_bounded_wait() {
     let _init_guard = zakura_test::init();

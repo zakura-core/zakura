@@ -1068,7 +1068,7 @@ where
     mempool: Mempool,
 
     /// The snapshots that mempool publishes: its verified transactions and the block they
-    /// were last checked against. Read without sending the mempool a request.
+    /// were last checked against. Reading one sends the mempool no request.
     mempool_snapshots: MempoolSnapshotReceiver,
 
     /// A handle to the state service.
@@ -1652,39 +1652,63 @@ where
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
     /// the mempool has processed that block and holds any.
     ///
-    /// Reads the snapshot the mempool publishes instead of sending it a request, so the long
-    /// poll does not queue behind the mempool's other callers. Waits at most
-    /// [`NEW_TIP_MEMPOOL_WAIT`] for the snapshot checked against `tip_hash`.
+    /// Takes them from the snapshot the mempool publishes when that snapshot was checked
+    /// against `tip_hash`. The long poll then sends the mempool no request, so it does not
+    /// queue behind the mempool's other callers. A snapshot for any other block is never
+    /// used: while the published one is for another block, this asks the mempool, as it did
+    /// before snapshots, and takes the mempool's answer or a snapshot for `tip_hash`,
+    /// whichever comes first.
     ///
-    /// Returns `None` when the mempool is empty, is not active, has not processed the block
-    /// within that wait, or has shut down. The caller then answers with the coinbase-only
-    /// template, so the mempool never delays work on a new tip by more than that wait.
+    /// Returns `None` when the mempool is empty, answers that it is still on an older tip,
+    /// takes longer than [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the
+    /// coinbase-only template, so the mempool never delays work on a new tip by more than
+    /// that wait.
     async fn populated_mempool_on_new_tip(
         &self,
         tip_hash: block::Hash,
     ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
         let mut mempool_snapshots = self.mempool_snapshots.clone();
-        let snapshot_on_tip = mempool_snapshots.on_tip(tip_hash);
+        let published = mempool_snapshots.on_tip(tip_hash);
+        let requested =
+            types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
 
-        let snapshot = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, snapshot_on_tip).await {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
+        let mempool_on_tip = async {
+            tokio::pin!(published, requested);
+
+            tokio::select! {
+                // The snapshot is checked first, and the request is only sent once it is
+                // polled: a snapshot that already names the tip costs the mempool nothing.
+                biased;
+
+                // A mempool that has shut down publishes nothing more. Its answer to the
+                // request, an error, then decides.
+                Some(snapshot) = &mut published => {
+                    Ok(Some((snapshot.transactions, snapshot.transaction_dependencies)))
+                }
+                answer = &mut requested => answer,
+            }
+        };
+
+        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_on_tip).await {
+            Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
+                Some((transactions, dependencies))
+            }
+            Ok(Ok(_empty_or_on_an_older_tip)) => None,
+            Ok(Err(error)) => {
                 tracing::debug!(
-                    "mempool shut down before processing a new tip; answering with the coinbase-only template"
+                    ?error,
+                    "mempool request failed on a new tip; answering with the coinbase-only template"
                 );
-                return None;
+                None
             }
             Err(_elapsed) => {
                 tracing::debug!(
                     ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not process a new tip in time; answering with the coinbase-only template"
+                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
                 );
-                return None;
+                None
             }
-        };
-
-        (!snapshot.transactions.is_empty())
-            .then_some((snapshot.transactions, snapshot.transaction_dependencies))
+        }
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template

@@ -20,11 +20,38 @@ pub fn validation_label(error: ZakuraValidationError) -> &'static str {
     }
 }
 
+/// Maps every production stream-setup refusal to its table label.
+pub fn prelude_label(rejection: zakura_network::zakura::PreludeRejection) -> &'static str {
+    use zakura_network::zakura::PreludeRejection;
+    match rejection {
+        PreludeRejection::BadPrelude => "bad-magic",
+        PreludeRejection::UnknownKind => "unknown-kind",
+        PreludeRejection::UnnegotiatedCapability => "unnegotiated-capability",
+        PreludeRejection::UnselectedVersion => "unselected-version",
+        PreludeRejection::UnexpectedRequestId => "unexpected-request-id",
+        PreludeRejection::RequestWithoutId => "request-without-id",
+        PreludeRejection::UndersizedFrameCap => "undersized-cap",
+        PreludeRejection::IneligibleOpener => "ineligible-opener",
+    }
+}
+
+/// The prelude row's stream resets and fault closes.
+pub const PRELUDE: &[(&str, &str)] = &[
+    ("bad-magic", "resets"),
+    ("unknown-kind", "resets"),
+    ("unnegotiated-capability", "resets"),
+    ("unselected-version", "resets"),
+    ("undersized-cap", "closes"),
+    ("unexpected-request-id", "closes"),
+    ("request-without-id", "closes"),
+    ("ineligible-opener", "closes"),
+];
+
 use crate::{
     observe::TransportFact,
     property::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
-        Status, Subject, Verdict,
+        Status, Subject, TriggerHistory, Verdict,
     },
     Observation,
 };
@@ -69,6 +96,43 @@ pub const ACK: &[&str] = &[
 /// Generates the control rows through the table property's usual registry and obligations.
 pub fn properties<S: HasView>() -> Vec<Property<S>> {
     let mut properties = Vec::new();
+    for (id, claim) in [
+        (
+            "handshake/pending-bounded",
+            "QUIC and control handshakes stay within total, inbound, and address bounds.",
+        ),
+        (
+            "handshake/connections-per-address-bounded",
+            "Registered connections stay within the configured address cap.",
+        ),
+        (
+            "handshake/counts-match-permits",
+            "Admission machine charges equal the live pending semaphore permits.",
+        ),
+    ] {
+        properties.push(Property {
+            id: PropertyId::new(id),
+            claim,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Closes],
+            status: Status::Active,
+            check: check_counts::<S>,
+            witness: None,
+        });
+    }
+    properties.push(Property {
+        id: PropertyId::new("handshake/finishes-in-time"),
+        claim: "An inbound control handshake releases its claim within ten seconds plus the shutdown drain.",
+        kind: Kind::Liveness {
+            bound: LivenessBound::VirtualTime(std::time::Duration::from_secs(13)),
+        },
+        assumes: &[],
+        needs: &[Source::Closes],
+        status: Status::Known { issue: 2333 },
+        check: check_deadline::<S>,
+        witness: Some(TriggerHistory::Log(paced_control_reached)),
+    });
     for (row, labels) in [("hello", HELLO), ("ack", ACK)] {
         for label in labels {
             properties.push(Property {
@@ -110,10 +174,114 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         check: check_released::<S>,
         witness: None,
     });
+    for &(label, consequence) in PRELUDE {
+        properties.push(Property {
+            id: PropertyId::generated(format!("handshake/prelude/{label}-{consequence}"))
+                .expect("prelude labels follow the ID grammar"),
+            claim:
+                "The node applies the prelude's declared consequence without installing a session.",
+            kind: Kind::Liveness {
+                bound: LivenessBound::BeforeQuiescence,
+            },
+            assumes: &[],
+            needs: &[Source::Closes],
+            status: Status::Active,
+            check: check_prelude::<S>,
+            witness: None,
+        });
+    }
     properties
 }
 
+fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut applies = false;
+    for obs in cx.observations() {
+        let Observation::Transport {
+            event:
+                TransportFact::HandshakeCounts {
+                    pending,
+                    inbound,
+                    pending_permits,
+                    inbound_permits,
+                    cap,
+                    address_cap,
+                    hosts,
+                    quic_hosts,
+                    quic_pending,
+                    quic_handoffs,
+                    ..
+                },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        applies = true;
+        match cx.id().as_str() {
+            "handshake/counts-match-permits"
+                if pending != pending_permits || inbound != inbound_permits =>
+            {
+                return cx.violated(
+                    "machine charges equal pending permits",
+                    format!(
+                        "machine {pending}/{inbound}; permits {pending_permits}/{inbound_permits}"
+                    ),
+                );
+            }
+            "handshake/connections-per-address-bounded" => {
+                for (host, registered, _) in hosts {
+                    if registered > address_cap {
+                        return cx.violated(
+                            format!("at most {address_cap} registrations per address"),
+                            format!("{host}: {registered}"),
+                        );
+                    }
+                }
+            }
+            "handshake/pending-bounded" => {
+                let inbound_cap = cap - if *cap >= 2 { (cap / 4).max(1) } else { 0 };
+                if pending + quic_pending > *cap || inbound + quic_pending > inbound_cap {
+                    return cx.violated(
+                        format!("pending <= {cap}; inbound <= {inbound_cap}"),
+                        format!("control {pending}/{inbound}, QUIC {quic_pending}"),
+                    );
+                }
+                // QUIC and the handler charge the same connection during synchronous transfer.
+                // Judge address sums only after that transfer commits.
+                if *quic_handoffs == 0 {
+                    let mut addresses = std::collections::BTreeMap::new();
+                    for (host, _, handshaking) in hosts {
+                        addresses.insert(host, *handshaking);
+                    }
+                    for (host, pending) in quic_hosts {
+                        *addresses.entry(host).or_default() += pending;
+                    }
+                    let host_cap = (cap / 8).max(1);
+                    for (host, pending) in addresses {
+                        if pending > host_cap {
+                            return cx.violated(
+                                format!("at most {host_cap} pending per address"),
+                                format!("{host}: {pending}"),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
 fn refused(key: &ObligationKey, obs: &Observation) -> bool {
+    if let Subject::Owner(shared_id) = &key.subject {
+        return matches!(obs, Observation::PeerConnectionClosed { shared_id: closed, code: 0 }
+            if closed == shared_id);
+    }
     matches!(obs, Observation::Transport {
         event: TransportFact::Handshake { shared_id, stage, error: Some(_), .. }, ..
     } if key.subject == Subject::Session(shared_id.clone())
@@ -124,6 +292,69 @@ fn released(key: &ObligationKey, obs: &Observation) -> bool {
     matches!(obs, Observation::Transport {
         event: TransportFact::Handshake { shared_id, stage, .. }, ..
     } if stage == "released" && key.subject == Subject::Session(shared_id.clone()))
+}
+
+fn check_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut pending = Vec::new();
+    let mut applies = false;
+    for (at, obs) in cx.observations().enumerate() {
+        let Observation::Transport {
+            event:
+                TransportFact::Handshake {
+                    shared_id,
+                    stage,
+                    elapsed_ms,
+                    ..
+                },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        if stage == "released" {
+            applies = true;
+            if elapsed_ms.is_some_and(|elapsed| elapsed > 13_000) {
+                return cx.violated(
+                    "control claim released within 13000 ms",
+                    format!("{shared_id}: {elapsed_ms:?} ms"),
+                );
+            }
+        }
+        if stage == "started" {
+            applies = true;
+            pending.push(cx.obligation(Some(at), Subject::Session(shared_id.clone()), released));
+        }
+    }
+    for obligation in pending {
+        cx.oblige(obligation);
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn paced_control_reached(log: &crate::ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        let Observation::Transport {
+            event:
+                TransportFact::Handshake {
+                    shared_id,
+                    stage,
+                    elapsed_ms: Some(elapsed),
+                    ..
+                },
+            ..
+        } = &entry.obs
+        else {
+            return false;
+        };
+        stage == "released" && *elapsed >= 9_000 && log.entries().iter().any(|entry| {
+            matches!(&entry.obs, Observation::PeerHandshake { shared_id: sent_id, row, label, .. }
+                if sent_id == shared_id && row == "hello" && label == "paced")
+        })
+    })
 }
 
 fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
@@ -148,6 +379,32 @@ fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             continue;
         }
         applies = true;
+        if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+            Observation::Transport { event: TransportFact::Handshake { shared_id: registered, stage, .. }, .. }
+                if registered == shared_id && stage == "registered")) {
+            return cx.violated("a malformed control exchange never registers", shared_id);
+        }
+        if let Some(code) = cx.log.entries().iter().find_map(|entry| match &entry.obs {
+            Observation::PeerConnectionClosed {
+                shared_id: closed,
+                code,
+            } if closed == shared_id && *code != 0 => Some(code),
+            _ => None,
+        }) {
+            return cx.violated(
+                "a malformed control exchange receives a neutral close",
+                format!("application close code {code}"),
+            );
+        }
+        let close = cx.obligation(Some(at), Subject::Owner(shared_id.clone()), refused);
+        if !cx
+            .log
+            .entries()
+            .iter()
+            .any(|entry| refused(&close.key, &entry.obs))
+        {
+            pending.push(close);
+        }
         let obligation = cx.obligation(Some(at), Subject::Session(shared_id.clone()), refused);
         if !cx
             .log
@@ -250,4 +507,152 @@ fn check_conformant<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     } else {
         Verdict::NotApplicable
     }
+}
+
+fn prelude_judged(key: &ObligationKey, obs: &Observation) -> bool {
+    let Observation::Transport {
+        event:
+            TransportFact::PreludeJudged {
+                shared_id,
+                quic_stream,
+                rejection: Some(rejection),
+            },
+        ..
+    } = obs
+    else {
+        return false;
+    };
+    let subject = Subject::Session(format!("{shared_id}/{quic_stream}"));
+    let claim = key
+        .property
+        .as_str()
+        .strip_prefix("handshake/prelude/")
+        .unwrap();
+    key.subject == subject
+        && PRELUDE
+            .iter()
+            .any(|(label, effect)| *label == rejection && claim == format!("{label}-{effect}"))
+}
+
+fn check_prelude<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let id = cx.id().to_string();
+    let claim = id.strip_prefix("handshake/prelude/").unwrap();
+    let label = PRELUDE
+        .iter()
+        .find(|(label, effect)| claim == format!("{label}-{effect}"))
+        .unwrap()
+        .0;
+    let mut pending = Vec::new();
+    let mut applies = false;
+    for (at, obs) in cx.observations().enumerate() {
+        let Observation::PeerHandshake {
+            shared_id,
+            quic_stream,
+            row,
+            label: sent_label,
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        if row != "prelude" || sent_label != label {
+            continue;
+        }
+        applies = true;
+        let obligation = cx.obligation(
+            Some(at),
+            Subject::Session(format!("{shared_id}/{quic_stream}")),
+            prelude_judged,
+        );
+        if !cx
+            .log
+            .entries()
+            .iter()
+            .any(|entry| prelude_judged(&obligation.key, &entry.obs))
+        {
+            pending.push(obligation);
+        }
+    }
+    for (at, obs) in cx.observations().enumerate() {
+        if let Observation::Transport {
+            connection: Some(connection),
+            event:
+                TransportFact::PreludeJudged {
+                    shared_id,
+                    quic_stream,
+                    rejection: Some(rejection),
+                },
+            ..
+        } = obs
+        {
+            if rejection != label {
+                continue;
+            }
+            applies = true;
+            let subject = if claim.ends_with("-resets") {
+                Subject::Owner(format!("reset/{shared_id}/{quic_stream}"))
+            } else {
+                Subject::Owner(format!("close/{connection}"))
+            };
+            let obligation = cx.obligation(Some(at), subject, prelude_effect);
+            if !cx
+                .log
+                .entries()
+                .iter()
+                .any(|entry| prelude_effect(&obligation.key, &entry.obs))
+            {
+                pending.push(obligation);
+            }
+        }
+        if let Observation::Session {
+            connection,
+            quic_stream,
+            ..
+        } = obs
+        {
+            if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::Transport { connection: Some(judged_connection), event: TransportFact::PreludeJudged { quic_stream: judged_stream, rejection: Some(rejection), .. }, .. }
+                if judged_connection == connection && judged_stream == quic_stream && rejection == label)) {
+                return cx.violated("a refused prelude installs no session", "the refused stream installed a session");
+            }
+        }
+        if let Observation::ConnectionClosed { connection, cause } = obs {
+            if claim.ends_with("-resets") && crate::model::is_fault_cause(cause)
+                && cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+                    Observation::Transport { connection: Some(judged_connection), event: TransportFact::PreludeJudged { rejection: Some(rejection), .. }, .. }
+                    if judged_connection == connection && rejection == label)) {
+                return cx.violated("a reset-only prelude never charges a fault", cause);
+            }
+        }
+    }
+    for obligation in pending {
+        cx.oblige(obligation);
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn prelude_effect(key: &ObligationKey, obs: &Observation) -> bool {
+    let claim = key
+        .property
+        .as_str()
+        .strip_prefix("handshake/prelude/")
+        .unwrap();
+    if claim.ends_with("-resets") {
+        return matches!(obs, Observation::PeerStreamReset { shared_id, quic_stream, code }
+            if key.subject == Subject::Owner(format!("reset/{shared_id}/{quic_stream}"))
+                && *code == if claim == "bad-magic-resets" { 2 } else { 5 });
+    }
+    let expected = match claim {
+        "undersized-cap-closes" => "undersized_frame_cap",
+        "unexpected-request-id-closes" => "unexpected_request_id",
+        "request-without-id-closes" => "request_without_id",
+        "ineligible-opener-closes" => "unexpected_stream",
+        _ => return false,
+    };
+    matches!(obs, Observation::ConnectionClosed { connection, cause }
+        if key.subject == Subject::Owner(format!("close/{connection}")) && cause == expected)
 }

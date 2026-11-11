@@ -73,7 +73,7 @@ pub(crate) use pipe::{
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 #[cfg(zakura_sim)]
-pub use probe::{ConnectionProbe, ConnectionSample, KindSample};
+pub use probe::{ConnectionProbe, ConnectionSample, HandshakeProbe, HandshakeSample, KindSample};
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
 pub(crate) use service::ServiceStream;
 pub use service::{

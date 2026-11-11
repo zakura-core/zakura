@@ -309,6 +309,20 @@ name = "sync_wire"
 smoke-secs = 60
 timeout-secs = 1800
 
+[[target]]
+package = "sim"
+name = "handshake_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "handshake_counts"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
 # cover each fixture's own harness and the fixed variants. Its report must
 # account for each fixture and variant.

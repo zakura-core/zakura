@@ -34,6 +34,13 @@ use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 /// implementation must not block, yield, take a `zakura_rt` lock, or call
 /// into the transport.
 pub trait TransportObserver: Send + Sync + fmt::Debug {
+    /// Receives the admission probe before the handler starts serving connections.
+    #[cfg(zakura_sim)]
+    fn handshakes(&self, _probe: super::HandshakeProbe) {}
+
+    /// Receives the endpoint's independent admission counters.
+    #[cfg(zakura_sim)]
+    fn quic_admission(&self, _probe: zakura_quic::AdmissionProbe) {}
     /// Records one event.
     fn observe(&self, event: TransportEvent);
 
@@ -52,13 +59,22 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TransportEvent {
+    /// The production stream setup path judged a prelude.
+    PreludeJudged {
+        /// The registered connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream, whether or not it becomes a session.
+        quic_stream: u64,
+        /// The refusal, or `None` after every prelude check passed.
+        rejection: Option<crate::zakura::handshake::PreludeRejection>,
+    },
     /// A control-handshake boundary, including connections that never register.
     Handshake {
         /// The address charged by admission.
         remote: SocketAddr,
         /// The TLS-derived connection identity.
         shared_id: [u8; 16],
-        /// Started, hello, ack, or released.
+        /// Started, hello, ack, registered, or released.
         stage: &'static str,
         /// The production validation error, if validation rejected the payload.
         validation: Option<crate::zakura::ZakuraValidationError>,

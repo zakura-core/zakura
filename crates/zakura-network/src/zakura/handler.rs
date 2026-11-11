@@ -3000,6 +3000,14 @@ impl ZakuraProtocolHandler {
     /// before serving or dialing any connection.
     #[cfg(any(test, zakura_sim))]
     pub fn with_transport_observer(mut self, observer: Arc<dyn super::TransportObserver>) -> Self {
+        #[cfg(zakura_sim)]
+        observer.handshakes(super::HandshakeProbe::new(
+            &self.supervisor.ip_slots.0,
+            &self.pending_handshakes,
+            &self.inbound_handshakes,
+            self.limits.max_pending_handshakes,
+            self.supervisor.max_connections_per_ip,
+        ));
         self.transport_observer = Some(observer);
         self
     }
@@ -3197,6 +3205,17 @@ impl ZakuraProtocolHandler {
                 Some("admission"),
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
+            transport_observe!(
+                self.transport_observer,
+                super::TransportEvent::Handshake {
+                    remote: connection.admitted_addr(),
+                    shared_id: connection.shared_id(),
+                    stage: "released",
+                    validation: None,
+                    error: None,
+                    elapsed: None,
+                }
+            );
             return;
         };
 
@@ -4142,6 +4161,12 @@ impl ZakuraProtocolHandler {
             let prelude = match read_stream_prelude(recv, limits.prelude_timeout).await {
                 Ok(prelude) => prelude,
                 Err(error) => {
+                    #[cfg(any(test, zakura_sim))]
+                    report_prelude_judged(
+                        &close_cause,
+                        send,
+                        Some(super::handshake::PreludeRejection::BadPrelude),
+                    );
                     debug!(?error, "rejecting Zakura stream with bad prelude");
                     let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                     metrics::counter!("zakura.p2p.stream.rejected.prelude").increment(1);
@@ -4165,7 +4190,11 @@ impl ZakuraProtocolHandler {
                 .increment(1);
                 conn.trace_stream("rejected.unknown_kind", stream_id, Some(stream_kind));
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unknown_kind");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnknownKind;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             };
 
@@ -4188,7 +4217,11 @@ impl ZakuraProtocolHandler {
                     Some(stream_kind),
                 );
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unnegotiated_capability");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnnegotiatedCapability;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             }
 
@@ -4211,14 +4244,21 @@ impl ZakuraProtocolHandler {
                 .increment(1);
                 conn.trace_stream("rejected.unselected_version", stream_id, Some(stream_kind));
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unselected_version");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnselectedVersion;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             }
 
             if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
                 debug!("rejecting non-request Zakura stream with request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("unexpected_request_id");
+                let rejection = super::handshake::PreludeRejection::UnexpectedRequestId;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.unexpected_request_id").increment(1);
                 conn.trace_stream(
@@ -4232,7 +4272,10 @@ impl ZakuraProtocolHandler {
             if stream.mode == StreamMode::RequestResponse && prelude.request_id.is_none() {
                 debug!("rejecting Zakura request stream without request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("request_without_id");
+                let rejection = super::handshake::PreludeRejection::RequestWithoutId;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.request_without_id").increment(1);
                 conn.trace_stream("rejected.request_without_id", stream_id, Some(stream_kind));
@@ -4247,7 +4290,10 @@ impl ZakuraProtocolHandler {
                     "rejecting Zakura stream whose frame cap cannot carry a payload"
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("undersized_frame_cap");
+                let rejection = super::handshake::PreludeRejection::UndersizedFrameCap;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.undersized_frame_cap").increment(1);
                 conn.trace_stream(
@@ -4267,11 +4313,16 @@ impl ZakuraProtocolHandler {
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("unexpected_stream");
+                let rejection = super::handshake::PreludeRejection::IneligibleOpener;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 return None;
             }
 
+            #[cfg(any(test, zakura_sim))]
+            report_prelude_judged(&close_cause, send, None);
             metrics::counter!(
                 "zakura.p2p.stream.accepted",
                 "stream_kind" => stream_kind,
@@ -4500,6 +4551,17 @@ impl ZakuraProtocolHandler {
         #[cfg(any(test, zakura_sim))]
         if let ZakuraRegistration::Registered { conn_id, .. } = &registration {
             self.observe_registered(*conn_id, &close_cause, &connection);
+            transport_observe!(
+                self.transport_observer,
+                super::TransportEvent::Handshake {
+                    remote: connection.admitted_addr(),
+                    shared_id: connection.shared_id(),
+                    stage: "registered",
+                    validation: None,
+                    error: None,
+                    elapsed: None,
+                }
+            );
         }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
@@ -5353,6 +5415,21 @@ fn native_dial_timeout(config: &QuicConfig, addrs: usize, control_timeout: Durat
 
 /// Report that an incoming stream with `prelude` on `send` was reset for
 /// `reason` while the connection stays open.
+#[cfg(any(test, zakura_sim))]
+fn report_prelude_judged(
+    close_cause: &CloseCause,
+    send: &SendStream,
+    rejection: Option<super::handshake::PreludeRejection>,
+) {
+    if let Some(tap) = close_cause.tap() {
+        tap.emit(super::TransportEvent::PreludeJudged {
+            conn_id: tap.conn_id(),
+            quic_stream: send.id(),
+            rejection,
+        });
+    }
+}
+
 #[cfg(any(test, zakura_sim))]
 fn report_stream_refused(
     close_cause: &CloseCause,

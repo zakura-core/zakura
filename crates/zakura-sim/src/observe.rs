@@ -12,6 +12,22 @@ use crate::model::Label;
 #[serde(tag = "obs", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Observation {
+    /// The peer received the node's application close before or after registration.
+    PeerConnectionClosed {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The application close code received on the wire.
+        code: u64,
+    },
+    /// The peer received a reset on a stream that may never become a session.
+    PeerStreamReset {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The stream reset by the node.
+        quic_stream: u64,
+        /// The wire reset code.
+        code: u64,
+    },
     /// A scripted control payload or prelude, labelled before its write.
     PeerHandshake {
         /// The peer endpoint's address.
@@ -1955,6 +1971,50 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// Admission machine charges and independently read semaphore usage.
+    HandshakeCounts {
+        /// The configured registered-connection limit per address.
+        address_cap: usize,
+        /// Transfers during which QUIC and the handler may both charge one address.
+        quic_handoffs: usize,
+        /// Inbound TLS handshakes still held by QUIC.
+        quic_pending: usize,
+        /// QUIC pending counts by canonical admission address.
+        quic_hosts: Vec<(String, usize)>,
+        /// QUIC live connection slots.
+        quic_live: usize,
+        /// QUIC inbound connection slots.
+        quic_inbound: usize,
+        /// QUIC slots held during shutdown drain.
+        quic_closing: usize,
+        /// QUIC total live-slot capacity.
+        quic_max_live: usize,
+        /// QUIC inbound live-slot capacity.
+        quic_max_inbound: usize,
+        /// The live-slot ceiling for inbound admission.
+        quic_below_reserve: usize,
+        /// Total control handshakes charged by the machine.
+        pending: usize,
+        /// Inbound control handshakes charged by the machine.
+        inbound: usize,
+        /// Total pending semaphore permits held.
+        pending_permits: usize,
+        /// Inbound pending semaphore permits held.
+        inbound_permits: usize,
+        /// Configured total pending limit.
+        cap: usize,
+        /// Canonical address, registered count, and control-handshake count.
+        hosts: Vec<(String, usize, usize)>,
+    },
+    /// A prelude judgement before session installation.
+    PreludeJudged {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The mapped production refusal, or `None` on acceptance.
+        rejection: Option<String>,
+    },
     /// A control-handshake boundary before registration.
     Handshake {
         /// The TLS connection identity.

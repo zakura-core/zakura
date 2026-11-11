@@ -1,6 +1,7 @@
 //! The production wire node against the shared scripted handshake peer.
 
 use std::sync::Arc;
+use zakura_network::zakura::{Peer, Stream, ZakuraConnId, ZakuraPeerId};
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
@@ -101,11 +102,21 @@ impl Subsystem for Wire {
         let names: Vec<_> = (0..scenario.peers.len())
             .map(|i| format!("peer-{i}"))
             .collect();
-        let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
+        let (observer, tap) = TransportTap::sampling(sim, "node", net.clone(), names.clone());
         let dials = tap.dials();
         let shared_ids = tap.shared_ids();
-        sim.add_source(Box::new(tap));
+        sim.add_source(Box::new(tap.with_handshake_counts()));
         let handshake = ZakuraHandshakeConfig::for_network(&network);
+        let node_v6 = "[2001:db8::1]:4000".parse().unwrap();
+        let listen_addrs = if scenario
+            .peers
+            .iter()
+            .any(|peer| peer.address(0, 0).is_ipv6())
+        {
+            vec![NODE_ADDR, node_v6]
+        } else {
+            vec![NODE_ADDR]
+        };
         let node = WireNode::spawn_with_services(
             sim,
             header,
@@ -114,6 +125,7 @@ impl Subsystem for Wire {
             seed,
             observer,
             dials,
+            listen_addrs,
             move |supervisor, limits| {
                 let handle = build_discovery_handle(
                     SeededInputs::node_key(seed, 0),
@@ -126,10 +138,13 @@ impl Subsystem for Wire {
                 )
                 .expect("the Regtest discovery configuration is valid")
                 .with_verification_slots(1);
-                vec![Arc::new(DiscoveryService::with_max_connections(
-                    handle,
-                    limits.max_connections,
-                )) as Arc<dyn Service>]
+                vec![
+                    Arc::new(DiscoveryService::with_max_connections(
+                        handle,
+                        limits.max_connections,
+                    )) as Arc<dyn Service>,
+                    Arc::new(PreludeLayouts),
+                ]
             },
         );
         let failure = PeerFailure::default();
@@ -144,7 +159,14 @@ impl Subsystem for Wire {
                 spec: spec.clone(),
                 seed,
                 net: net.sim(),
-                node: NodeAddr::with_addrs(SeededInputs::node_key(seed, 0).public(), [NODE_ADDR]),
+                node: NodeAddr::with_addrs(
+                    SeededInputs::node_key(seed, 0).public(),
+                    [if spec.address(index, 0).is_ipv6() {
+                        node_v6
+                    } else {
+                        NODE_ADDR
+                    }],
+                ),
                 commands,
                 readiness,
                 failure: failure.clone(),
@@ -186,7 +208,18 @@ impl Subsystem for Wire {
                 scenario.peers[0] = PeerSpec::listening();
                 script.control = ACK_FAULTS[usize::from(byte(1)) % ACK_FAULTS.len()];
             }
-            2 => script.prelude = PRELUDE_FAULTS[usize::from(byte(1)) % PRELUDE_FAULTS.len()],
+            2 => {
+                script.prelude = PRELUDE_FAULTS[usize::from(byte(1)) % PRELUDE_FAULTS.len()];
+                if script.prelude == PreludeFault::IneligibleOpener {
+                    scenario.peers[0] = PeerSpec::listening();
+                }
+                if script.prelude == PreludeFault::Version {
+                    scenario.peers[0].capabilities |= (1 << 60) | (1 << 61);
+                }
+                if script.prelude == PreludeFault::MissingRequestId {
+                    scenario.peers[0].capabilities |= 1 << 62;
+                }
+            }
             3 => {
                 script.open_delay_ms = u64::from(byte(1)) * 40;
                 script.length_delay_ms = u64::from(byte(2)) * 40;
@@ -208,7 +241,11 @@ impl Subsystem for Wire {
                 scenario.peers = vec![PeerSpec::dialing(); usize::from(byte(3) % 32) + 1];
             }
             5 => {
-                script.control = ControlFault::Network;
+                script.control = if byte(3) == 0 {
+                    ControlFault::None
+                } else {
+                    ControlFault::Network
+                };
                 script.bind_ip = Some("192.0.2.1".parse().unwrap());
                 script.retries = byte(1) % 32;
                 script.retry_delay_ms = u64::from(byte(2));
@@ -287,4 +324,42 @@ mod tests {
             assert_eq!(scenario, serde_json::from_str::<Scenario>(&json).unwrap());
         }
     }
+}
+
+/// Custom service declarations expose the transport's version and request-ID guards.
+/// Production's built-in services currently declare only their newest persistent layout.
+#[derive(Debug)]
+struct PreludeLayouts;
+
+impl Service for PreludeLayouts {
+    fn name(&self) -> &'static str {
+        "handshake-layouts"
+    }
+    fn streams(&self) -> &[Stream] {
+        &[
+            Stream {
+                kind: 900,
+                version: 1,
+                frame_cap: 1024,
+                capability: 1 << 60,
+                ..Stream::PERSISTENT
+            },
+            Stream {
+                kind: 900,
+                version: 2,
+                frame_cap: 1024,
+                capability: 1 << 61,
+                ..Stream::PERSISTENT
+            },
+            Stream {
+                kind: 901,
+                version: 1,
+                frame_cap: 1024,
+                capability: 1 << 62,
+                ..Stream::REQUEST_RESPONSE
+            },
+        ]
+    }
+    fn add_peer(&self, _peer: Peer) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
 }

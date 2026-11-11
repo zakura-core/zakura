@@ -177,17 +177,24 @@ impl PreludeFault {
     }
 
     pub(crate) fn apply(self, prelude: &mut StreamPrelude) {
-        use zakura_network::zakura::{ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY};
+        use zakura_network::zakura::{ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY};
         match self {
             Self::None | Self::IneligibleOpener => {}
             Self::Magic => prelude.magic[0] ^= 1,
             Self::Kind => prelude.stream_kind = u16::MAX,
-            Self::Capability => prelude.stream_kind = ZAKURA_STREAM_DISCOVERY,
-            Self::Version => prelude.stream_version = 0,
+            Self::Capability => {
+                prelude.stream_kind = ZAKURA_STREAM_DISCOVERY;
+                prelude.stream_version = ZAKURA_DISCOVERY_STREAM_VERSION;
+            }
+            Self::Version => {
+                prelude.stream_kind = 900;
+                prelude.stream_version = 1;
+            }
             Self::FrameCap => prelude.max_frame_bytes = 1,
             Self::UnexpectedRequestId => prelude.request_id = Some(1),
             Self::MissingRequestId => {
-                prelude.stream_kind = ZAKURA_STREAM_BLOCK_SYNC;
+                prelude.stream_kind = 901;
+                prelude.stream_version = 1;
                 prelude.request_id = None;
             }
         }

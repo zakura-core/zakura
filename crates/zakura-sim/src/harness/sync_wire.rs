@@ -447,6 +447,7 @@ impl Subsystem for SyncWire {
                 net.sim(),
                 seed,
                 peer,
+                None,
                 observer,
                 dials,
                 move |supervisor, limits| {

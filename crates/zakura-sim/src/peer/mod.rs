@@ -202,10 +202,11 @@ pub struct PeerSpec {
 
 impl PeerSpec {
     /// The endpoint address, with a distinct port when peers share an IP.
+    /// Mapped IPv4 aliases bind the IPv4 socket that production dialing selects.
     pub fn address(&self, index: usize, dial: usize) -> SocketAddr {
         match self.handshake.as_ref().and_then(|spec| spec.bind_ip) {
             Some(ip) => SocketAddr::new(
-                ip,
+                ip.to_canonical(),
                 u16::try_from(4001 + index + 256 * dial)
                     .expect("a handshake scenario has bounded peers and retries"),
             ),
@@ -593,6 +594,8 @@ enum Ended {
 
 /// What a stream task tells its peer.
 enum StreamEvent {
+    /// The node reset a stream, including one it refused before session installation.
+    Reset { id: u64, code: u64 },
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
     /// The node opened a discovery stream: the peer's half to write on.
@@ -1124,7 +1127,15 @@ async fn read_frames(
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     loop {
         let mut header = [0; 8];
-        if recv.read_exact(&mut header).await.is_err() {
+        if let Err(error) = recv.read_exact(&mut header).await {
+            if let zakura_quic::ReadExactError::ReadError(zakura_quic::ReadError::Reset(code)) =
+                error
+            {
+                let _ = events.send(StreamEvent::Reset {
+                    id,
+                    code: code.into_inner(),
+                });
+            }
             return;
         }
         let len = usize::try_from(u32::from_le_bytes([
@@ -1365,6 +1376,13 @@ impl PeerTask {
             )
             .await
             else {
+                self.record_connection_close(
+                    &conn,
+                    Remote {
+                        addr: self.address(dial),
+                        shared_id: conn.shared_id(),
+                    },
+                );
                 if let Some(script) = &self.spec.handshake {
                     if dial < usize::from(script.retries) {
                         quic.shutdown().await;
@@ -1437,6 +1455,7 @@ impl PeerTask {
                 Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {
                     conn.closed().await;
+                    self.record_connection_close(&conn, remote);
                     Ended::Closed
                 }
             };
@@ -1454,6 +1473,18 @@ impl PeerTask {
             quic_stream,
             body,
         });
+    }
+
+    fn record_connection_close(&self, conn: &Conn, remote: Remote) {
+        if let Some(zakura_quic::ConnectionError::ApplicationClosed(close)) = conn.close_reason() {
+            self.record(
+                remote,
+                0,
+                RecordBody::ConnectionClosed {
+                    code: close.error_code.into_inner(),
+                },
+            );
+        }
     }
 
     /// Writes `frames` on `stream` in order, recording the `PeerFrame` of
@@ -1514,7 +1545,12 @@ impl PeerTask {
         // Frames read so far on each header stream, the next one's `seq`.
         let mut reads = BTreeMap::new();
         let mut settled = !header_sync;
-        if header_sync && self.spec.dialer == Dialer::Peer {
+        if header_sync
+            && (self.spec.dialer == Dialer::Peer
+                || self.spec.handshake.as_ref().is_some_and(|script| {
+                    script.prelude == handshake::options::PreludeFault::IneligibleOpener
+                }))
+        {
             let Ok((mut send, recv)) = conn.open_bi().await else {
                 return Ended::Closed;
             };
@@ -1640,6 +1676,9 @@ impl PeerTask {
             let mut answers = Vec::new();
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
+                    StreamEvent::Reset { id, code } => {
+                        self.record(remote, id, RecordBody::Reset { code });
+                    }
                     StreamEvent::Header { id, send } => {
                         reads.insert(id, 0);
                         header = Some(HeaderStream { id, send });
@@ -1812,6 +1851,7 @@ impl PeerTask {
                     }
                 }
                 _ = conn.closed() => {
+                    self.record_connection_close(conn, remote);
                     self.readiness.set(false);
                     return Ended::Closed;
                 }

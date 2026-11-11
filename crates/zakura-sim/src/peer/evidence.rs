@@ -138,6 +138,10 @@ pub(crate) struct PeerRecord {
 /// A [`PeerRecord`]'s observation, without its connection.
 #[derive(Clone, Debug)]
 pub(crate) enum RecordBody {
+    /// The peer received an application close.
+    ConnectionClosed { code: u64 },
+    /// The peer received a stream reset, independent of session installation.
+    Reset { code: u64 },
     /// A control payload or prelude, keyed before registration.
     Handshake {
         row: &'static str,
@@ -431,6 +435,19 @@ impl WireEvidence {
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
     fn place(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
+        if let RecordBody::ConnectionClosed { code } = &record.body {
+            return Some(Ok(vec![Observation::PeerConnectionClosed {
+                shared_id: hex(&record.remote.shared_id),
+                code: *code,
+            }]));
+        }
+        if let RecordBody::Reset { code } = &record.body {
+            return Some(Ok(vec![Observation::PeerStreamReset {
+                shared_id: hex(&record.remote.shared_id),
+                quic_stream: record.quic_stream,
+                code: *code,
+            }]));
+        }
         if let RecordBody::Handshake { row, label } = &record.body {
             return Some(Ok(vec![Observation::PeerHandshake {
                 remote: record.remote.addr.to_string(),
@@ -444,7 +461,11 @@ impl WireEvidence {
         let stream = *self.streams.get(&(connection, record.quic_stream))?;
         let quic_stream = record.quic_stream;
         Some(Ok(vec![match record.body.clone() {
-            RecordBody::Handshake { .. } => unreachable!("handshake records need no session"),
+            RecordBody::ConnectionClosed { .. }
+            | RecordBody::Reset { .. }
+            | RecordBody::Handshake { .. } => {
+                unreachable!("handshake records need no session")
+            }
             RecordBody::Frame {
                 seq,
                 row,

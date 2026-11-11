@@ -27,6 +27,22 @@ pub struct HandshakeCounts {
 }
 
 impl HandshakeCounts {
+    /// Reads both address ledgers for a simulator boundary sample.
+    #[cfg(zakura_sim)]
+    pub(crate) fn hosts(&self) -> Vec<(IpAddr, usize, usize)> {
+        let mut hosts: Vec<_> = self
+            .registered
+            .keys()
+            .chain(self.handshaking.keys())
+            .copied()
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts
+            .into_iter()
+            .map(|ip| (ip, self.registered(ip), self.handshaking(ip)))
+            .collect()
+    }
     /// Counts control-handshake permits, including this node's dials.
     pub fn pending(&self) -> usize {
         self.pending

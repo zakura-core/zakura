@@ -13,6 +13,78 @@ use zakura_rt::{sim::in_boundary_read, sync::Semaphore};
 
 use crate::zakura::regulation::OutputByteBudget;
 
+/// A weak read of the admission machine and its independent semaphore permits.
+#[derive(Clone, Debug)]
+pub struct HandshakeProbe {
+    counts: Weak<zakura_rt::sync::Mutex<super::HandshakeCounts>>,
+    pending: Weak<Semaphore>,
+    inbound: Weak<Semaphore>,
+    cap: usize,
+    address_cap: usize,
+}
+
+/// Admission charges and permits sampled at one scheduler boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandshakeSample {
+    /// The configured registered-connection limit per address.
+    pub address_cap: usize,
+    /// The machine's total pending charge.
+    pub pending: usize,
+    /// The machine's inbound pending charge.
+    pub inbound: usize,
+    /// Live total pending permits.
+    pub pending_permits: usize,
+    /// Live inbound pending permits.
+    pub inbound_permits: usize,
+    /// The total pending capacity.
+    pub cap: usize,
+    /// Canonical addresses with registered and control-handshake counts.
+    pub hosts: Vec<(std::net::IpAddr, usize, usize)>,
+}
+
+impl HandshakeProbe {
+    pub(crate) fn new(
+        counts: &Arc<zakura_rt::sync::Mutex<super::HandshakeCounts>>,
+        pending: &Arc<Semaphore>,
+        inbound: &Arc<Semaphore>,
+        cap: usize,
+        address_cap: usize,
+    ) -> Self {
+        Self {
+            counts: Arc::downgrade(counts),
+            pending: Arc::downgrade(pending),
+            inbound: Arc::downgrade(inbound),
+            cap,
+            address_cap,
+        }
+    }
+
+    /// Reads without preemption. A held machine lock means its transition is unfinished.
+    pub fn read(&self) -> Option<HandshakeSample> {
+        assert!(
+            in_boundary_read(),
+            "admission probes require a boundary read"
+        );
+        let counts = self.counts.upgrade()?;
+        let pending = self.pending.upgrade()?;
+        let inbound = self.inbound.upgrade()?;
+        match counts.peek(|counts| HandshakeSample {
+            address_cap: self.address_cap,
+            pending: counts.pending(),
+            inbound: counts.inbound_pending(),
+            pending_permits: self.cap - pending.peek_available(),
+            inbound_permits: super::inbound_share(self.cap) - inbound.peek_available(),
+            cap: self.cap,
+            hosts: counts.hosts(),
+        }) {
+            zakura_rt::sim::Peek::Current(sample) | zakura_rt::sim::Peek::Poisoned(sample) => {
+                Some(sample)
+            }
+            zakura_rt::sim::Peek::Held { .. } => None,
+        }
+    }
+}
+
 /// A read of one connection's transport resources for the simulator's
 /// transport taps, which keep it past the connection.
 #[derive(Clone, Debug)]

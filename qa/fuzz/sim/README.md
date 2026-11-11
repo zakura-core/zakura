@@ -31,6 +31,13 @@ whose target has no harness or no campaign.
 
 ## Targets
 
+- `handshake_wire` runs `handshake/wire` against the production QUIC endpoint
+  and protocol handler. Its 32-byte prefix chooses control corruption,
+  prelude corruption, pacing, shared addresses, or failed retries. Remaining
+  bytes choose the schedule.
+- `handshake_counts` runs `handshake/counts` against production admission
+  decisions. Its three-byte operations choose an action, owner slot, and
+  address. The harness checks charges against independent live owners.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of

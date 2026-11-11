@@ -46,6 +46,8 @@ pub use conn::{
     DriverStats, LOAD_INTERVAL,
 };
 pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
+#[cfg(zakura_sim)]
+pub use endpoint::{AdmissionProbe, AdmissionSample};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };

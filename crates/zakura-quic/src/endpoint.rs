@@ -218,6 +218,11 @@ impl fmt::Debug for QuicEndpoint {
 }
 
 impl QuicEndpoint {
+    /// Reads admission counters without retaining the endpoint or changing its schedule.
+    #[cfg(zakura_sim)]
+    pub fn admission_probe(&self) -> AdmissionProbe {
+        AdmissionProbe(Arc::downgrade(&self.inner.shared))
+    }
     /// Binds one socket per address in `bind` (API-2).
     pub fn bind(
         secret: NodeSecretKey,
@@ -806,6 +811,8 @@ pub(crate) async fn inbound_handshake(
     };
     // `handle` runs before the pending count drops, so an acceptor that moves
     // the connection into its own accounting there leaves no gap (ADM-7).
+    #[cfg(zakura_sim)]
+    let pending = pending.handoff();
     let handled = acceptor.handle(Conn::new(conn, remote_id, remote, alpn));
     drop(pending);
     handled.await;
@@ -933,12 +940,80 @@ async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
 
 /// Handshakes in progress, in total and per source IP (ADM-7).
 #[derive(Clone, Default)]
-pub(crate) struct PendingTable(Arc<Mutex<PendingCounts>>);
+pub(crate) struct PendingTable(
+    Arc<Mutex<PendingCounts>>,
+    #[cfg(zakura_sim)] Arc<counter::AtomicUsize>,
+);
 
 #[derive(Default)]
 struct PendingCounts {
     total: usize,
     by_ip: HashMap<IpAddr, usize>,
+}
+
+/// A weak simulator probe of QUIC admission counters.
+#[cfg(zakura_sim)]
+#[derive(Clone)]
+pub struct AdmissionProbe(std::sync::Weak<Shared>);
+
+/// QUIC admission counters at one scheduler boundary.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionSample {
+    /// Pending charges currently transferring into the handler's accounting.
+    pub handoffs: usize,
+    /// Inbound connections still completing TLS.
+    pub pending: usize,
+    /// Pending TLS connections by admission group.
+    pub hosts: Vec<(IpAddr, usize)>,
+    /// Connections holding live slots, including outbound attempts.
+    pub live: usize,
+    /// Inbound connections holding live slots.
+    pub inbound: usize,
+    /// Connections holding shutdown-drain slots.
+    pub closing: usize,
+    /// The total live-slot capacity.
+    pub max_live: usize,
+    /// The inbound live-slot capacity.
+    pub max_inbound: usize,
+    /// The live-slot ceiling for inbound admission that protects outbound dials.
+    pub below_reserve: usize,
+}
+
+#[cfg(zakura_sim)]
+impl AdmissionProbe {
+    /// Reads through peeks. A held pending lock leaves the transition unsampled.
+    pub fn read(&self) -> Option<AdmissionSample> {
+        use zakura_rt::sim::{in_boundary_read, Peek};
+        assert!(
+            in_boundary_read(),
+            "QUIC admission probes require a boundary read"
+        );
+        let shared = self.0.upgrade()?;
+        match shared.pending.0.peek(|pending| {
+            let held = Held::unpack(shared.connections.counts.held.peek());
+            let mut hosts: Vec<_> = pending
+                .by_ip
+                .iter()
+                .map(|(&ip, &count)| (ip, count))
+                .collect();
+            hosts.sort_unstable();
+            AdmissionSample {
+                handoffs: shared.pending.1.load(Ordering::Relaxed),
+                pending: pending.total,
+                hosts,
+                live: held.live,
+                inbound: held.inbound,
+                closing: shared.connections.counts.closing.peek(),
+                max_live: shared.connections.max,
+                max_inbound: shared.connections.max_inbound,
+                below_reserve: shared.connections.below_reserve,
+            }
+        }) {
+            Peek::Current(sample) | Peek::Poisoned(sample) => Some(sample),
+            Peek::Held { .. } => None,
+        }
+    }
 }
 
 impl PendingTable {
@@ -963,6 +1038,8 @@ impl PendingTable {
         PendingGuard {
             table: self.clone(),
             ip,
+            #[cfg(zakura_sim)]
+            handing_off: false,
         }
     }
 }
@@ -971,6 +1048,17 @@ impl PendingTable {
 pub(crate) struct PendingGuard {
     table: PendingTable,
     ip: IpAddr,
+    #[cfg(zakura_sim)]
+    handing_off: bool,
+}
+
+#[cfg(zakura_sim)]
+impl PendingGuard {
+    fn handoff(mut self) -> Self {
+        self.table.1.fetch_add(1, Ordering::Relaxed);
+        self.handing_off = true;
+        self
+    }
 }
 
 impl Drop for PendingGuard {
@@ -982,6 +1070,10 @@ impl Drop for PendingGuard {
             if *count == 0 {
                 counts.by_ip.remove(&self.ip);
             }
+        }
+        #[cfg(zakura_sim)]
+        if self.handing_off {
+            self.table.1.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

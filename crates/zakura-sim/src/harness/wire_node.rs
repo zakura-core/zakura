@@ -39,7 +39,7 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        ConnectionProbe, ConnectionSample, HeaderCheck, HeaderSyncService, Service,
+        ConnectionProbe, ConnectionSample, HandshakeProbe, HeaderCheck, HeaderSyncService, Service,
         ServiceRegistry, SessionStep, Transition, TransportEvent, TransportObserver, ZakuraConnId,
         ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
         ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
@@ -98,9 +98,17 @@ impl WireNode {
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
     ) -> Self {
-        Self::spawn_with_services(sim, header, network, net, seed, observer, dials, |_, _| {
-            Vec::new()
-        })
+        Self::spawn_with_services(
+            sim,
+            header,
+            network,
+            net,
+            seed,
+            observer,
+            dials,
+            vec![NODE_ADDR],
+            |_, _| Vec::new(),
+        )
     }
 
     /// Builds the same wire node with additional production services in its registry.
@@ -113,18 +121,21 @@ impl WireNode {
         seed: [u8; 32],
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
+        listen_addrs: Vec<SocketAddr>,
         additional: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> Vec<Arc<dyn Service>>
             + Send
             + 'static,
     ) -> Self {
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
-        let endpoint = WireEndpoint::spawn(
+        let endpoint = WireEndpoint::spawn_configured(
             sim,
-            network,
+            config(network),
             net,
             seed,
+            None,
+            Some(listen_addrs),
             observer,
-            dials,
+            Some(dials),
             move |supervisor, limits| {
                 let mut services = vec![service];
                 services.extend(additional(supervisor, limits));
@@ -221,6 +232,7 @@ impl WireEndpoint {
             net,
             seed,
             index,
+            None,
             observer,
             dials,
             services,
@@ -237,6 +249,7 @@ impl WireEndpoint {
         net: SimNet,
         seed: [u8; 32],
         index: Option<usize>,
+        listen_addrs: Option<Vec<SocketAddr>>,
         observer: Arc<dyn TransportObserver>,
         dials: Option<DialReporter>,
         services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
@@ -257,12 +270,13 @@ impl WireEndpoint {
             let limits = ZakuraLocalLimits::from_config(&config);
             let quic = QuicEndpoint::bind_with(
                 SeededInputs::node_key(seed, key),
-                &limits.quic_bind_config(vec![addr]),
+                &limits.quic_bind_config(listen_addrs.unwrap_or_else(|| vec![addr])),
                 &limits.quic,
                 net,
                 SeededInputs::new(seed, key).endpoint_inputs(),
             )
             .expect("the node binds its address");
+            observer.quic_admission(quic.admission_probe());
             let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
             let (services, handed) = services(&supervisor, &limits);
             let registry = ServiceRegistry::new(services).expect("the node's services register");
@@ -356,6 +370,7 @@ pub struct TransportTap {
     peers: Vec<String>,
     /// Each registered connection's remote address.
     remotes: BTreeMap<u64, SocketAddr>,
+    connection_ids: BTreeMap<u64, String>,
     /// Where it hands over the shared ID of each `registered` and
     /// `handshake-refused` event it logs.
     shared_ids: SharedIds,
@@ -363,6 +378,8 @@ pub struct TransportTap {
     role: TapRole,
     /// The last load it logged for each connection it samples.
     loads: BTreeMap<u64, TransportFact>,
+    handshake_load: Option<TransportFact>,
+    handshake_sampling: bool,
 }
 
 /// The end of its connections a [`TransportTap`] reads.
@@ -393,6 +410,8 @@ struct TapState {
     sampling: bool,
     /// Each registered connection's resource probe, in registration order.
     probes: Mutex<Vec<(u64, ConnectionProbe)>>,
+    handshakes: Mutex<Option<HandshakeProbe>>,
+    quic_admission: Mutex<Option<zakura_quic::AdmissionProbe>>,
 }
 
 /// Events reported and not yet drained.
@@ -406,6 +425,8 @@ struct Buffer {
 
 /// One event in the tap's buffer: the transport's, or the wire node's own.
 enum Reported {
+    /// Node-wide admission counts changed.
+    HandshakeLoad(TransportFact),
     /// What the transport reported.
     Event(TransportEvent),
     /// A dial to `remote` failed with `error`.
@@ -497,6 +518,20 @@ impl std::fmt::Debug for TapObserver {
 }
 
 impl TransportObserver for TapObserver {
+    fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
+        *self
+            .0
+            .quic_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
+    fn handshakes(&self, probe: HandshakeProbe) {
+        *self
+            .0
+            .handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
     /// Buffers `event`, as [`TapState::push`] does.
     fn observe(&self, event: TransportEvent) {
         self.0.push(Reported::Event(event));
@@ -595,6 +630,8 @@ impl TransportTap {
                 sessions,
                 sampling,
                 probes: Mutex::default(),
+                handshakes: Mutex::default(),
+                quic_admission: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -623,17 +660,79 @@ impl TransportTap {
             net,
             peers,
             remotes: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
             shared_ids: SharedIds::default(),
             role,
             loads: BTreeMap::new(),
+            handshake_load: None,
+            handshake_sampling: false,
         };
         (observer, tap)
     }
 
-    /// Buffers a `load` row for each probed connection whose resources
-    /// changed since the row last logged for it, read inside a boundary
-    /// read.
+    /// Enables admission samples for the handshake harness.
+    pub(crate) fn with_handshake_counts(mut self) -> Self {
+        self.handshake_sampling = true;
+        self
+    }
+
+    fn sample_handshakes(&mut self) {
+        let quic = self
+            .state
+            .quic_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(quic) = quic.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
+        else {
+            return;
+        };
+        let probe = self
+            .state
+            .handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(sample) = probe.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
+        {
+            let load = TransportFact::HandshakeCounts {
+                address_cap: sample.address_cap,
+                quic_handoffs: quic.handoffs,
+                quic_pending: quic.pending,
+                quic_hosts: quic
+                    .hosts
+                    .into_iter()
+                    .map(|(ip, count)| (ip.to_string(), count))
+                    .collect(),
+                quic_live: quic.live,
+                quic_inbound: quic.inbound,
+                quic_closing: quic.closing,
+                quic_max_live: quic.max_live,
+                quic_max_inbound: quic.max_inbound,
+                quic_below_reserve: quic.below_reserve,
+                pending: sample.pending,
+                inbound: sample.inbound,
+                pending_permits: sample.pending_permits,
+                inbound_permits: sample.inbound_permits,
+                cap: sample.cap,
+                hosts: sample
+                    .hosts
+                    .into_iter()
+                    .map(|(ip, registered, handshaking)| (ip.to_string(), registered, handshaking))
+                    .collect(),
+            };
+            if self.handshake_load.as_ref() != Some(&load) {
+                self.handshake_load = Some(load.clone());
+                self.state.push(Reported::HandshakeLoad(load));
+            }
+        }
+    }
+
+    /// Buffers changed resource samples without taking scheduling points.
     fn sample(&mut self) {
+        if self.handshake_sampling {
+            self.sample_handshakes();
+        }
         let probes = self
             .state
             .probes
@@ -684,6 +783,7 @@ impl TransportTap {
         event: Reported,
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
         let event = match event {
+            Reported::HandshakeLoad(load) => return Ok((None, NODE_ADDR, load)),
             Reported::Event(event) => event,
             Reported::DialFailed { remote, error } => {
                 return Ok((None, remote, TransportFact::DialFailed { error }));
@@ -701,6 +801,24 @@ impl TransportTap {
             }
         };
         Ok(match event {
+            TransportEvent::PreludeJudged {
+                conn_id,
+                quic_stream,
+                rejection,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::PreludeJudged {
+                    shared_id: self
+                        .connection_ids
+                        .get(&conn_id)
+                        .cloned()
+                        .ok_or_else(|| "prelude has no registered TLS identity".to_owned())?,
+                    quic_stream,
+                    rejection: rejection
+                        .map(|rejection| crate::table::handshake::prelude_label(rejection).into()),
+                },
+            ),
             TransportEvent::Handshake {
                 remote,
                 shared_id,
@@ -756,6 +874,8 @@ impl TransportTap {
                     ));
                 }
                 self.shared_ids.borrow_mut().insert(seq, shared_id);
+                self.connection_ids
+                    .insert(conn_id, crate::storage::hex(&shared_id));
                 (Some(conn_id), remote, TransportFact::Registered)
             }
             TransportEvent::Admitted {

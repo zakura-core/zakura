@@ -819,8 +819,8 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The tagged scenarios [`Storage::draw`] picks, the semantic ones
-    /// last.
+    /// The tagged scenarios [`Storage::draw`] picks, then the semantic
+    /// ones, then the hostile ones.
     fn families() -> Vec<ScenarioFamily> {
         let mut families = vec![
             ScenarioFamily::new("stuck-floor", STUCK_FLOOR_TAG),
@@ -829,18 +829,22 @@ impl Subsystem for Storage {
             ScenarioFamily::new("peers-leave", PEERS_LEAVE_TAG),
         ];
         families.extend(BlockScenario::semantic_families());
+        families.extend(BlockScenario::hostile_families());
         families
     }
 
     /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],
     /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`] and [`PEERS_LEAVE_TAG`]
     /// pick theirs, as do the semantic scenarios' tags
-    /// ([`BlockScenario::semantic_drawn`]). All of them start with `ff`, so
+    /// ([`BlockScenario::semantic_drawn`]) and the hostile scenarios' tags
+    /// ([`BlockScenario::hostile_drawn`]). All of them start with `ff`, so
     /// they come before the odd-first-byte arm. Otherwise an odd first byte
     /// picks the short budget, and an even one the default. Each tagged run is long or narrow, so
     /// fuzzing draws each on one prefix in 65,536.
     fn draw(prefix: &[u8]) -> BlockScenario {
-        if let Some(scenario) = BlockScenario::semantic_drawn(prefix) {
+        if let Some(scenario) =
+            BlockScenario::semantic_drawn(prefix).or_else(|| BlockScenario::hostile_drawn(prefix))
+        {
             return scenario;
         }
         match prefix {

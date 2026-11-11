@@ -686,12 +686,36 @@ fn rule_2_a_drain_cut_off_with_an_obligation_open_names_it() {
     );
 }
 
+/// [`requests_unapplied`], marking the world's site pending too.
+fn requests_marked_unapplied(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    marks(cx);
+    requests_unapplied(cx)
+}
+
 /// #1840 rule 4: an assumption lost while an obligation is open withdraws
 /// it, so the dry end has nothing to conclude, and a property that never
-/// applied reports the loss.
+/// applied reports the loss. A pending mark the last evaluation left goes
+/// with it, so it doesn't mask the loss as unsettled (Terra T5).
 #[test]
 fn rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude() {
+    for (check, mark) in [
+        (
+            requests_unapplied as fn(&mut CheckCtx<'_, World>) -> Verdict,
+            None,
+        ),
+        (requests_marked_unapplied, Some(Pending::FaultOpen)),
+    ] {
+        lost_assumption_withdraws(check, mark);
+    }
+}
+
+/// Rule 4's case for `check`, with the world's site `mark`.
+fn lost_assumption_withdraws(
+    check: fn(&mut CheckCtx<'_, World>) -> Verdict,
+    mark: Option<Pending>,
+) {
     let world = world();
+    world.mark.set(mark);
     let assumptions = Assumptions::declare(vec![AssumeRecord {
         assume: Assume::HonestPeer,
         params: serde_json::json!({ "peer": "p1" }),
@@ -702,7 +726,7 @@ fn rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude() {
         Rc::clone(&world),
         vec![Property {
             assumes: &[Assume::HonestPeer],
-            check: requests_unapplied,
+            check,
             ..served_within(LivenessBound::BeforeQuiescence)
         }],
         assumptions,
@@ -720,7 +744,8 @@ fn rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude() {
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert_eq!(
         outcome(&report, &SERVED),
-        PropertyOutcome::not_applicable(NaReason::AssumptionLost)
+        PropertyOutcome::not_applicable(NaReason::AssumptionLost),
+        "{mark:?}"
     );
 }
 

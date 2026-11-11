@@ -366,8 +366,8 @@ struct PropertyState<V> {
     holds_since: Option<(u64, SimInstant)>,
     /// True once the assumptions have all held.
     ever_held: bool,
-    /// True once an assumption stopped holding while an obligation was
-    /// open, which withdrew it.
+    /// True once an assumption stopped holding while an obligation or a
+    /// pending mark was open, which withdrew it.
     assumption_lost: bool,
     /// The sites the latest evaluation marked pending
     /// ([`CheckCtx::pending`]).
@@ -774,10 +774,13 @@ fn step_property<S: HasView>(
                 state.holds_since = Some((cx.step, cx.now));
                 state.ever_held = true;
             }
+            // The loss withdraws what the last evaluation left open, its
+            // pending marks included, since none of it is judged again.
             (false, Some(_)) => {
                 state.holds_since = None;
-                if !state.open.is_empty() {
+                if !(state.open.is_empty() && state.pending.is_empty()) {
                     state.open.clear();
+                    state.pending.clear();
                     state.assumption_lost = true;
                 }
             }

@@ -22,7 +22,7 @@ use zakura_rt::{sync::CancellationToken, task, time};
 use zakura_scheduler::{At, Op, SimInstant, TaskId};
 use zakura_sim::{
     check::Phase,
-    fake::FakeStorage,
+    fake::{FakeNet, FakeStorage},
     observe::Exit,
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, LivenessBound, ObligationKey,
@@ -1320,5 +1320,32 @@ fn a_duplicate_recovery_identity_at_a_live_idle_end_fails_the_run() {
         ),
         "{:?}",
         report.end.harness
+    );
+}
+
+/// Sol S1: a datagram the fake network already holds when the budget runs
+/// out is delivered in the drain, losslessly, once its window opens, so an
+/// obligation waiting on it isn't expired against a correct sender.
+#[test]
+fn the_drain_delivers_a_fake_datagram_in_flight() {
+    let net = FakeNet::new(Duration::from_millis(5), Duration::from_millis(10), 1);
+    let sender = net.clone();
+    let report = run(
+        config(2, 1),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.add_source(Box::new(net.clone()));
+            sim.scheduler().spawn_root("sender", async move {
+                sender.send("node->p1");
+            });
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert_eq!(net.in_flight(), 0, "the drain left the datagram in flight");
+    assert!(
+        drain_picks(&report).contains(&"deliver:node->p1:1"),
+        "{:?}",
+        drain_picks(&report)
     );
 }

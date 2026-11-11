@@ -144,13 +144,24 @@ impl ActionSource for FakeNet {
         event(log, "net", format!("{what} {}:{}", d.link, d.seq));
     }
 
-    /// Nothing: it finishes no submitted work.
-    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+    /// Each datagram in flight's lossless delivery once its window opens,
+    /// at `enabled`'s index, and each window still to open as a boundary.
+    fn recovery(&self, now: SimInstant, out: &mut crate::RecoveryOffer) {
+        for (i, d) in self.0.borrow().in_flight.iter().enumerate() {
+            if d.opens <= now {
+                // usize always fits in u64 on supported targets.
+                out.actions
+                    .push((Identity::deliver(&d.link, d.seq), 2 * i as u64));
+            } else {
+                out.boundaries.push(d.opens);
+            }
+        }
+    }
 
     /// Nothing: it has no holds.
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
-    /// None: it holds no submitted work.
+    /// None: `recovery` delivers every datagram in flight.
     fn holds_work(&self) -> Option<String> {
         None
     }

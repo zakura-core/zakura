@@ -1679,16 +1679,20 @@ impl Control {
             .is_some_and(|driver| driver.evidence.record().is_some())
     }
 
-    /// The index of the script step to offer next: the next one, or once
-    /// the hostile prefix is full ([`Prefix`]), the `Recover` step at or
-    /// after it, skipping the steps between. `None` once the script is done,
-    /// or with the prefix full and no `Recover` step left.
-    fn next_step(&self) -> Option<usize> {
-        let full = self
-            .recovery
+    /// Whether the hostile prefix before the `Recover` pick is full
+    /// ([`Prefix`]).
+    fn prefix_full(&self) -> bool {
+        self.recovery
             .as_ref()
-            .is_some_and(|driver| driver.evidence.in_prefix() && driver.evidence.prefix().full());
-        if !full {
+            .is_some_and(|driver| driver.evidence.in_prefix() && driver.evidence.prefix().full())
+    }
+
+    /// The index of the script step to offer next: the next one, or once
+    /// the hostile prefix is full, the `Recover` step at or after it,
+    /// skipping the steps between. `None` once the script is done, or with
+    /// the prefix full and no `Recover` step left.
+    fn next_step(&self) -> Option<usize> {
+        if !self.prefix_full() {
             return (self.next < self.script.len()).then_some(self.next);
         }
         self.script
@@ -1859,11 +1863,14 @@ impl ActionSource for Control {
             return;
         };
         let step = &self.script[index];
+        // A full prefix has ended, so its `Recover` comes at once: its
+        // trigger can wait on a step the cutoff skipped.
         let open = self.ready(step)
-            && step
-                .when
-                .as_ref()
-                .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
+            && (self.prefix_full()
+                || step
+                    .when
+                    .as_ref()
+                    .is_none_or(|when| self.predicates.borrow().control_holds(when, now)));
         if open {
             // A script is far shorter than u64.
             out.push((Identity::peer(&step.peer, step.action.name()), index as u64));

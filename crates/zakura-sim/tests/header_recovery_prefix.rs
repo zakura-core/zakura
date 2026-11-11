@@ -19,7 +19,7 @@ use zakura_sim::{
         header_node::{
             policy::{Allow, OpKind, ReplyHold, Select, Trigger},
             recovery::{Hostile, HostileEvent, PREFIX_BOUND},
-            Base, Reset,
+            Base, ControlAction, ControlStep, Reset,
         },
         header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
@@ -257,6 +257,42 @@ fn a_decoded_prefix_stops_at_the_bound() {
     assert_eq!(decoded, typed);
     for input in inputs(8, 256) {
         assert_full(&run(&decoded, input));
+    }
+}
+
+/// A `Recover` whose trigger waits on a step the cutoff skips still comes.
+/// Here the two failed prepares (four events) and 28 reconsiders fill the
+/// prefix just before the source's growth, and the recover waits for that
+/// growth. The cutoff skips the growth, and the recover comes at once,
+/// typed and decoded alike.
+#[test]
+fn a_full_prefix_recovers_even_when_its_trigger_was_skipped() {
+    let mut typed = failing(28, false);
+    typed.controls.push(ControlStep {
+        peer: SOURCE.to_owned(),
+        action: ControlAction::Grow { len: 2 },
+        when: None,
+    });
+    typed.controls.push(ControlStep {
+        when: Some(Trigger::Grown(SOURCE.to_owned())),
+        ..recover(None)
+    });
+    let encoded = grammar::encode(&typed).expect("generator 3 encodes it");
+    let decoded = Storage::draw(&encoded);
+    assert_eq!(decoded, typed);
+    for scenario in [&typed, &decoded] {
+        for input in inputs(8, 256) {
+            let prefix = run(scenario, input);
+            assert_full(&prefix);
+            assert!(
+                !prefix
+                    .record
+                    .iter()
+                    .flatten()
+                    .any(|event| event.hostile == Hostile::Step(28)),
+                "the growth was skipped: {prefix:?}"
+            );
+        }
     }
 }
 

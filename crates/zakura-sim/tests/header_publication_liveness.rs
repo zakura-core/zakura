@@ -162,10 +162,11 @@ fn assert_holds_and_applies(fixture: LivenessScenario, report: &RunReport) {
     );
     for control in CONTROLS {
         assert!(
-            matches!(
-                outcome(report, control),
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-            ),
+            match outcome(report, control) {
+                PropertyOutcome::Held { .. } => true,
+                PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                PropertyOutcome::Violated { .. } => false,
+            },
             "{fixture:?}: {control}: {:?}",
             outcome(report, control)
         );

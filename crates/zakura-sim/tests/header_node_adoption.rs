@@ -153,8 +153,7 @@ impl Run {
 
     /// hdr-4's status and tip rules, which
     /// `header-sync/state-publication-consistent` owns now, as its outcome
-    /// in the run's report: held, broken, or, with nothing judged,
-    /// inconclusive.
+    /// in the run's report: held, broken, or, with nothing judged, open.
     fn publication(&self) -> Acceptance {
         let outcome = &self
             .report
@@ -168,7 +167,7 @@ impl Run {
             PropertyOutcome::Violated { .. } => {
                 Acceptance::Violated(format!("{:?}", self.report.end.violation))
             }
-            other => Acceptance::Inconclusive(format!("{other:?}")),
+            other => Acceptance::Open(format!("{other:?}")),
         }
     }
 }

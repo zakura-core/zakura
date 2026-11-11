@@ -1290,6 +1290,18 @@ impl ActionSource for Ticker {
             self.topology.fail(why);
         }
     }
+
+    /// Nothing: a tick is new scenario work, as a `Commit` step is, so the
+    /// drain makes no more of them.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: each commit completes in its own step.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What every liveness fixture declares: `BoundedAdversary`, with no

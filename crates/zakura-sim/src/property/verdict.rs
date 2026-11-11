@@ -214,6 +214,11 @@ pub enum Pending {
     /// `header-sync/peer-retirement-progress`: a departure the slot rule
     /// hasn't judged at a unit boundary yet.
     UnjudgedDeparture,
+    /// `header-sync/state-publication-consistent`: an adopted tip still
+    /// waits for its publication on the tip watch. Adoption and publication
+    /// are one synchronous call with a preemption point between, so only a
+    /// settled end judges it.
+    TipUnpublished,
 }
 
 impl fmt::Display for Pending {
@@ -227,6 +232,7 @@ impl fmt::Display for Pending {
             Pending::WatchOpen => "watch-open",
             Pending::UnreadTrigger => "unread-trigger",
             Pending::UnjudgedDeparture => "unjudged-departure",
+            Pending::TipUnpublished => "tip-unpublished",
         })
     }
 }

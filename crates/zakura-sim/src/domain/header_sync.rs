@@ -30,7 +30,7 @@ use crate::{
     },
     ObservationLog,
 };
-use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
+use zakura_scheduler::SimInstant;
 
 /// The header chunk budget never holds more than its capacity, reserved
 /// and owned together.
@@ -642,12 +642,7 @@ where
     }
     // A settled point needs no task able to run after the step, which only
     // the scheduler's status says.
-    let at_rest = matches!(
-        cx.status,
-        SchedulerStatus::Quiescent
-            | SchedulerStatus::WaitingOnTime
-            | SchedulerStatus::WaitingOnExternal
-    );
+    let at_rest = crate::at_rest(cx.status);
     if let (true, Some(verdict)) = (at_rest, view.fork_choice().settled_at(step)) {
         if let Some(detail) = verdict {
             return cx.violated(
@@ -827,7 +822,8 @@ where
 /// `Status` and tip publication against the latest adoption. A break the
 /// step's drain found violates at once. A tip still owed at a settled end
 /// is the harness's end violation ([`publication_end_violations`]), and
-/// one owed at any other end is inconclusive. It applies once a drain
+/// one owed at any other end leaves the property `Unsettled` at
+/// [`Pending::TipUnpublished`]. It applies once a drain
 /// judged an adoption or a commit's publication, until a drain found a run
 /// corrupt, which is `commit-only-authorized`'s.
 ///
@@ -908,8 +904,9 @@ where
     }
     // The adoption and its tip's publication are one synchronous call with
     // a preemption point between, so a run cut off there hasn't shown it.
+    // A settled end judges it ([`PublicationEvidence::unpublished_at_settled_end`]).
     if publication.owed().is_some() {
-        cx.unsettled(Inconclusive::ObligationOpen);
+        cx.pending(Pending::TipUnpublished);
     }
     Verdict::Holds
 }

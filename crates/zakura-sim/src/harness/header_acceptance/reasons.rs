@@ -87,6 +87,10 @@ pub static NA_REASONS: &[NaEntry] = &[
         Pending::UnjudgedDeparture,
         "a departure the slot rule hadn't judged at a unit boundary yet",
     ),
+    unsettled(
+        Pending::TipUnpublished,
+        "an adopted tip still waited for its publication at an unsettled end",
+    ),
 ];
 
 /// The reasons no header ID can end with, and why.

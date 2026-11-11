@@ -3521,7 +3521,8 @@ fn the_not_applicable_inventory_lists_every_reason() {
                 | Pending::TeardownOpen
                 | Pending::WatchOpen
                 | Pending::UnreadTrigger
-                | Pending::UnjudgedDeparture,
+                | Pending::UnjudgedDeparture
+                | Pending::TipUnpublished,
         } => true,
         // A dry end turns an unread boundary into missing evidence.
         NaReason::Unsettled {

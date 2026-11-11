@@ -2084,6 +2084,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "service-rejects-valid-streams",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
             "offer-by-height",
             STORAGE,
             &[SELECTED] as &'static [&'static str],

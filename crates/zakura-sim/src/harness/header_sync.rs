@@ -1341,17 +1341,22 @@ impl Subsystem for Storage {
             .collect();
         ports.publication.name_peers(names.clone());
         let topology = Rc::new(
-            Topology::new(nodes, effects)
+            Topology::new(nodes, effects.clone())
                 .with_tap(shutdown)
                 .with_sessions(ports.sessions.clone())
                 .with_delayed_page(ports.delayed_page.clone()),
         );
+        let mut mirror_links = Vec::new();
         for (index, spec) in (1..).zip(&scenario.mirrors) {
-            match spec.dialer {
+            let link = match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
                 Dialer::Node => topology.link(0, index),
             };
+            mirror_links.push((link.conn_id, link.peer));
         }
+        ports
+            .fork_choice
+            .watch_link_ends(effects.ended.clone(), mirror_links);
         let control = Control::new(
             sim,
             topology.clone(),

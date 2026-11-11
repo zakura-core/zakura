@@ -58,8 +58,9 @@
 //! reset run with no `Reset` fact is missing evidence, which fails the run.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -95,6 +96,18 @@ struct Store {
     /// The mirrors whose own reactors decided on a session with the node
     /// ([`MirrorDecisions`]).
     mirrors_decided: HashSet<String>,
+    /// Each mirror's links with the node, by connection ID, and when the
+    /// session on each ended, as the topology's cancellation hooks record
+    /// it ([`ForkChoiceEvidence::watch_link_ends`]).
+    link_ends: Option<LinkEnds>,
+}
+
+/// The topology's record of when each link's session ended, by connection
+/// ID, and which mirror each of the node's links joins.
+#[derive(Debug)]
+struct LinkEnds {
+    ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+    mirrors: Vec<(u64, String)>,
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
@@ -156,10 +169,47 @@ impl ForkChoiceEvidence {
         })
     }
 
-    /// How many mirrors' own reactors have admitted or refused a session
-    /// with the node.
-    fn mirrors_decided(&self) -> usize {
-        self.with(|store| store.mirrors_decided.len())
+    /// Counts a mirror whose link `connection` with the node ended, as
+    /// `ended` records it, as one that had its chance to connect, for each
+    /// of `mirrors`' links: a refusal before either reactor holds a session,
+    /// in a service or the transport, ends the link but reports no
+    /// decision.
+    pub fn watch_link_ends(
+        &self,
+        ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+        mirrors: Vec<(u64, String)>,
+    ) {
+        self.with(|store| store.link_ends = Some(LinkEnds { ended, mirrors }));
+    }
+
+    /// How many mirrors have had their chance to connect: their own
+    /// reactors admitted or refused a session with the node, or a link of
+    /// theirs with the node ended.
+    fn mirrors_resolved(&self) -> usize {
+        let link_ends = self.with(|store| {
+            store
+                .link_ends
+                .as_ref()
+                .map(|ends| (ends.ended.clone(), ends.mirrors.clone()))
+        });
+        // The topology's hooks take the ended map's lock inside a `cancel`,
+        // so it's read with the store's lock released.
+        let ended: Vec<String> = link_ends.map_or_else(Vec::new, |(ended, mirrors)| {
+            let ended = ended.lock().unwrap_or_else(PoisonError::into_inner);
+            mirrors
+                .into_iter()
+                .filter(|(connection, _)| ended.contains_key(connection))
+                .map(|(_, mirror)| mirror)
+                .collect()
+        });
+        self.with(|store| {
+            store
+                .mirrors_decided
+                .iter()
+                .chain(&ended)
+                .collect::<HashSet<_>>()
+                .len()
+        })
     }
 }
 
@@ -306,7 +356,7 @@ impl ForkChoice {
         // also run before the run's clock does.
         let verdict = match (&mut self.settled, self.tainted) {
             (Some(settled), false) if step > 0 => {
-                settled.judge(self.selected, outside, self.evidence.mirrors_decided())
+                settled.judge(self.selected, outside, self.evidence.mirrors_resolved())
             }
             _ => None,
         };

@@ -1747,9 +1747,11 @@ where
     /// requests that arrive after that block.
     ///
     /// A request that arrives once the template is stored is answered from it instead of
-    /// choosing transactions, building and encoding. A long poll that is already waiting when the
-    /// block arrives gains nothing: it starts on the same tip change as this task, and whichever
-    /// of the two claims the build first does it for both.
+    /// choosing transactions, building and encoding.
+    ///
+    /// This task stays out of the way of a long poll that is already waiting when the block
+    /// arrives. That long poll is woken by the same tip change and builds and stores the template
+    /// itself, so there is nothing to gain, and working beside it measurably delayed its answer.
     ///
     /// Requests never wait for this task to get to a template. It claims the build only once it
     /// holds everything the build needs, so until then a request finds nothing in progress and
@@ -1794,10 +1796,12 @@ where
     /// Builds and stores the template for the current tip, and encodes the answers that requests
     /// arriving after a new block ask for.
     ///
-    /// Does nothing while the node is not synced, when the miner's reward needs a proof, while
-    /// this tip's templates are being recovered after a rejection, and when other work on this
-    /// tip is being built. A proof takes seconds and holds the only build slot, so those
-    /// templates are left to the requests that need them.
+    /// Does nothing when a long poll that waited for this tip has yet to be answered, or a
+    /// request has already built this template: the request's own build serves it and the
+    /// requests after it. Also does nothing while the node is not synced, when the miner's reward
+    /// needs a proof, while this tip's templates are being recovered after a rejection, and when
+    /// other work on this tip is being built. A proof takes seconds and holds the only build
+    /// slot, so those templates are left to the requests that need them.
     ///
     /// Waits for the mempool to process the tip's block for as long as that takes. The caller
     /// drops this future when the tip changes.
@@ -1808,7 +1812,9 @@ where
     ) -> Result<()> {
         use types::get_block_template::{check_synced_to_tip, fetch_chain_info};
 
-        if check_synced_to_tip(&self.network, self.latest_chain_tip.clone()).is_err() {
+        if self.gbt.has_waiting_long_poll()
+            || check_synced_to_tip(&self.network, self.latest_chain_tip.clone()).is_err()
+        {
             return Ok(());
         }
         let chain_info = tokio::time::timeout(
@@ -1849,36 +1855,32 @@ where
         long_poll_id.revision = rejection_state.revision;
 
         let store = &self.gbt.shared_template;
-        let shared = match store.wait_for(tip_hash, &long_poll_id).await {
-            // A request built this template first.
-            Some(shared) => shared,
-            None => {
-                let Some(build) = store.claim(tip_hash, long_poll_id) else {
-                    return Ok(());
-                };
-                let (template, _selection, _build_times) = self
-                    .select_and_build_template(
-                        miner_params,
-                        &chain_info,
-                        long_poll_id,
-                        &mempool.transactions,
-                        &mempool.transaction_dependencies,
-                    )
-                    .await?;
-                let Some(shared) = build.publish(template) else {
-                    return Ok(());
-                };
-
-                // Validate the template in the background, as a request's build does.
-                let state = self.gbt.template_rejections.borrow().clone();
-                if !state.needs_fallback()
-                    && !self.template_superseded(&state, tip_hash, long_poll_id.revision)
-                {
-                    self.prepare_template_in_background(&shared.template);
-                }
-                shared
-            }
+        if store.ready(&long_poll_id).is_some() {
+            return Ok(());
+        }
+        let Some(build) = store.claim(tip_hash, long_poll_id) else {
+            return Ok(());
         };
+        let (template, _selection, _build_times) = self
+            .select_and_build_template(
+                miner_params,
+                &chain_info,
+                long_poll_id,
+                &mempool.transactions,
+                &mempool.transaction_dependencies,
+            )
+            .await?;
+        let Some(shared) = build.publish(template) else {
+            return Ok(());
+        };
+
+        // Validate the template in the background, as a request's build does.
+        let state = self.gbt.template_rejections.borrow().clone();
+        if !state.needs_fallback()
+            && !self.template_superseded(&state, tip_hash, long_poll_id.revision)
+        {
+            self.prepare_template_in_background(&shared.template);
+        }
 
         // On a new tip, a long poll that still names the old tip is told to drop its old work,
         // and a request without a long poll ID has no `submit_old`. The template is already
@@ -3942,6 +3944,8 @@ where
         // 20 seconds) even though fresh work is one read away, so rebuild from current
         // state instead. The bound guards against pathological tip or rejection churn.
         let mut max_time_reached = false;
+        // Set once this request waits for its work to change, and kept until it returns.
+        let mut waiting_long_poll = None;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
                 metrics::counter!("mining.template.rebuilt").increment(1);
@@ -4134,6 +4138,11 @@ where
 
                 // - Polling wait conditions
                 //
+                // From here until this request returns, the node leaves the template for a new
+                // tip to it instead of building one ahead: this request is woken by the tip
+                // change and builds the template at once.
+                waiting_long_poll.get_or_insert_with(|| self.gbt.long_poll_waiting());
+
                 // TODO: when we're happy with this code, split it into a function.
                 //
                 // Periodically check the mempool for changes.

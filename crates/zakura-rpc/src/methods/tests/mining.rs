@@ -1799,10 +1799,10 @@ fn requests_after_a_new_tip_take_the_template_built_ahead() {
     });
 }
 
-/// A long poll that is waiting when the tip changes and the task that builds ahead start on the
-/// same change. One of them builds the template and the other takes it.
+/// A long poll that is waiting when the tip changes builds the template and stores it. The task
+/// that builds ahead leaves the tip to it, so the stored template is the long poll's.
 #[test]
-fn waiting_long_poll_and_the_build_ahead_share_one_build() {
+fn waiting_long_poll_builds_the_template_for_its_tip() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);

@@ -661,6 +661,9 @@ pub(in crate::planted) struct GenerateFacts {
     /// The saved input that stopped the search.
     #[serde(default)]
     pub(in crate::planted) input: Option<PathBuf>,
+    /// The scenario family whose tag starts that input, or `untagged`.
+    #[serde(default)]
+    pub(in crate::planted) family: Option<String>,
     #[serde(default)]
     pub(in crate::planted) properties: BTreeMap<String, Applicability>,
 }

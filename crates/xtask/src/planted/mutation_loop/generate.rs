@@ -245,6 +245,10 @@ pub(in crate::planted) struct GeneratorReport {
     /// The input that stopped the search, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) input: Option<PathBuf>,
+    /// The scenario family whose tag starts that input, or `untagged`, as
+    /// `zakura-sim generate` reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) confirmation: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +275,7 @@ impl GeneratorReport {
             runs: None,
             millis: None,
             input: None,
+            family: None,
             confirmation: None,
             shrunk: None,
             log: None,
@@ -295,6 +300,9 @@ pub(in crate::planted) struct PropertyFinding {
     /// The input that stopped the search, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) input: Option<PathBuf>,
+    /// The scenario family whose tag starts that input, or `untagged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) confirmation: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -422,6 +430,14 @@ impl Search {
                 .intended_input
                 .map(|input| self.dir.join("store").join(input)),
             Searched::Campaign(Err(_)) => None,
+        }
+    }
+
+    /// The scenario family of the input that stopped an `inproc` search.
+    fn family(&self) -> Option<String> {
+        match &self.searched {
+            Searched::Inproc(ran) => ran.generated.as_ref()?.family.clone(),
+            Searched::Campaign(_) => None,
         }
     }
 
@@ -1088,6 +1104,7 @@ impl Runner {
             runs: search.runs(),
             millis: search.millis,
             input: input.map(|input| self.relative(&input)),
+            family: search.family(),
             confirmation,
             shrunk,
             log: self.relative(&search.dir),
@@ -1179,6 +1196,7 @@ impl Runner {
                         lane.confirmation = Some(confirmation.clone());
                         lane.shrunk.clone_from(shrunk);
                         lane.input = kill.input.map(|input| self.relative(&input));
+                        lane.family = search.family();
                         lane.violated = Some(kill.id);
                     }
                     println!(

@@ -924,6 +924,7 @@ fn search(stop: GenerateStop, named: Option<Applicability>) -> GenerateFacts {
         executed: 40,
         millis: 900,
         input: stopped.then(|| "/out/search/ab.bin".into()),
+        family: stopped.then(|| "stuck-floor".to_owned()),
         properties: named
             .map(|counts| BTreeMap::from([(NAMED.to_owned(), counts)]))
             .unwrap_or_default(),
@@ -1405,6 +1406,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         runs: Some(42),
         millis: Some(900),
         input: Some("mutants/x/generate/s/search/ab.bin".into()),
+        family: Some("stuck-floor".to_owned()),
         confirmation: Some(FollowUp {
             ok: true,
             trace: Some("mutants/x/confirmation/confirm/trace".into()),
@@ -1487,6 +1489,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
             runs: Some(7),
             millis: 300,
             input: Some("baseline/generate/d/search/cd.bin".into()),
+            family: Some("untagged".to_owned()),
             confirmation: Some(FollowUp::failed("missing witness".to_owned())),
             shrunk: None,
             log: "baseline/generate/d".into(),
@@ -1511,6 +1514,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         "runs",
         "millis",
         "input",
+        "family",
         "confirmation",
         "shrunk",
         "log",

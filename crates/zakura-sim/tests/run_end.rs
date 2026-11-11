@@ -71,6 +71,22 @@ fn a_drain_cut_off_while_a_task_spins_is_drain_bound() {
         report.end.harness
     );
 
+    // A closure checker's end-only violation is an end finding, so the
+    // harness failure drops it rather than blame the task it couldn't judge.
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("done", yields(1_000));
+        },
+        &mut finishes(),
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::not_applicable(zakura_sim::NaReason::HarnessFailed)
+    );
+
     // A task that finishes during the drain discharges the claim.
     let report = run(
         config,
@@ -168,6 +184,53 @@ fn violation_stops_at_once() {
     assert_eq!(report.picks.len(), 5);
     assert_eq!(report.end.violation.unwrap().step, 5);
     assert!(report.log.entries().iter().all(|e| e.step <= 5));
+}
+
+/// A closure checker's step violation is a step finding, so a harness
+/// failure found after it, here a report naming a step past the run's end,
+/// keeps it `Violated`.
+#[test]
+fn a_closure_step_violation_survives_a_late_harness_failure() {
+    let mut checker = FnChecker::new(
+        |cx: &check::StepCtx<'_>| {
+            (cx.step == 5).then(|| Violation {
+                property: "test/stop".into(),
+                step: cx.step,
+                witness: vec![2, 5],
+                expected: "fewer steps".into(),
+                actual: "step 5".into(),
+            })
+        },
+        |_: &RunEnd, _: &ObservationLog| {
+            let stop = PropertyOutcome::Violated {
+                witness: vec![2, 5],
+            };
+            let late = PropertyReport {
+                holds_since: Some(1_000),
+                ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
+            };
+            vec![PropertyReport::new("test/stop", stop), late]
+        },
+    );
+    let report = run(
+        config(2, 1_000),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("a", yields(100));
+        },
+        &mut checker,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert!(matches!(
+        report.end.harness,
+        Some(HarnessFailure::HoldsSinceOutsideRun { .. })
+    ));
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Violated {
+            witness: vec![2, 5]
+        }
+    );
 }
 
 #[test]

@@ -208,13 +208,10 @@ impl PropertyReport {
     /// harness end ([`crate::property::leading_outcome`]). A step violation
     /// stays `Violated`, `Undeclared` and `Excluded` stay, and every other
     /// outcome becomes `NotApplicable { HarnessFailed }`.
+    ///
+    /// Only a retained violation proves a step found it, so a `Violated`
+    /// outcome with none behind it is an end finding and is dropped too.
     pub(crate) fn after_harness_failure(mut self) -> Self {
-        // A checker that retains no violations, such as a closure's, says
-        // `Violated` only through the outcome, and has no end findings to
-        // drop, so its violation stands.
-        if self.violations.is_empty() && matches!(self.outcome, PropertyOutcome::Violated { .. }) {
-            return self;
-        }
         let kept = self.violations.len().saturating_sub(self.end_found);
         self.violations.truncate(kept);
         self.end_found = 0;
@@ -400,6 +397,9 @@ impl Checker for NoChecks {
 pub struct FnChecker<A, E> {
     after: A,
     end: E,
+    /// Every violation `after` returned, so the end's reports carry them as
+    /// step findings.
+    found: Vec<Violation>,
 }
 
 impl<A, E> FnChecker<A, E>
@@ -409,7 +409,11 @@ where
 {
     /// A checker that calls `after` after each step and `end` at run end.
     pub fn new(after: A, end: E) -> Self {
-        FnChecker { after, end }
+        FnChecker {
+            after,
+            end,
+            found: Vec::new(),
+        }
     }
 }
 
@@ -428,12 +432,29 @@ where
     A: FnMut(&StepCtx<'_>) -> Option<Violation>,
     E: FnMut(&RunEnd, &ObservationLog) -> Vec<PropertyReport>,
 {
+    /// Calls `after`, keeping what it found.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        (self.after)(cx)
+        let violation = (self.after)(cx);
+        self.found.extend(violation.clone());
+        violation
     }
 
+    /// Calls `end`. A `Violated` report that retains no violations takes the ones
+    /// `after` found for its property, as step findings, so a harness
+    /// failure keeps them ([`PropertyReport::after_harness_failure`]).
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
-        (self.end)(end, log)
+        let mut reports = (self.end)(end, log);
+        let bare = |r: &&mut PropertyReport| {
+            r.violations.is_empty() && matches!(r.outcome, PropertyOutcome::Violated { .. })
+        };
+        for report in reports.iter_mut().filter(bare) {
+            report.violations = (self.found.iter())
+                .filter(|v| v.property == report.property)
+                .cloned()
+                .collect();
+            report.end_found = 0;
+        }
+        reports
     }
 
     /// Nothing, since closures keep no obligations.

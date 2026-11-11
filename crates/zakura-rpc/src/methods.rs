@@ -1107,6 +1107,10 @@ const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// new tip, before it gives up on that tip. No miner waits on it.
 const BUILD_AHEAD_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the task that builds templates ahead of requests looks whether a long poll is
+/// still waiting, while one is and the task therefore sits out.
+const WAITING_LONG_POLL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The outcome of validating one server mining template.
 enum Preparation {
     /// The template passed proposal validation.
@@ -1752,6 +1756,7 @@ where
     /// This task stays out of the way of a long poll that is already waiting when the block
     /// arrives. That long poll is woken by the same tip change and builds and stores the template
     /// itself, so there is nothing to gain, and working beside it measurably delayed its answer.
+    /// While a long poll is waiting, this task does not even listen for tip changes.
     ///
     /// Requests never wait for this task to get to a template. It claims the build only once it
     /// holds everything the build needs, so until then a request finds nothing in progress and
@@ -1767,6 +1772,17 @@ where
         let mut rejections = self.gbt.template_rejections.subscribe();
 
         while !zakura_chain::shutdown::is_shutting_down() {
+            // A waiting long poll answers each new tip itself. Waking this task on the same tip
+            // change delayed that long poll's own wake-up by a measurable amount, so this task
+            // does not listen for tip changes until no long poll is waiting. Looking again on a
+            // timer keeps this off the path of every request.
+            while self.gbt.has_waiting_long_poll() {
+                tokio::time::sleep(WAITING_LONG_POLL_CHECK_INTERVAL).await;
+                if zakura_chain::shutdown::is_shutting_down() {
+                    return;
+                }
+            }
+
             // Tip changes from here on end this tip's build and start the next one.
             tip.mark_best_tip_seen();
             tokio::select! {

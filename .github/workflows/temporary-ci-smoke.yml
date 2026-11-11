@@ -1,0 +1,53 @@
+name: Temporary runner checks
+
+on:
+  pull_request:
+    paths:
+      - deploy/ci/**
+      - .github/actions/setup-zakura-build/**
+      - .github/workflows/temporary-ci-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  first-job:
+    if: vars.TEMPORARY_PR_CI == 'true'
+    runs-on: [self-hosted, zakura-ci-temporary]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: 'true'
+          protoc: 'true'
+      - name: Verify prepared tools and isolation
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          python3 -m pip --version
+          test "$(nproc)" -eq 16
+          test "$(id -u)" -ne 0
+          test ! -r /opt/zakura-ci/registration/.credentials
+          if sudo -n true 2>/dev/null; then
+            echo 'The job account must not have sudo.' >&2
+            exit 1
+          fi
+          if curl --noproxy '*' --max-time 3 -fs -o /dev/null http://169.254.169.254/metadata/v1/; then
+            echo 'The job must not reach cloud metadata.' >&2
+            exit 1
+          fi
+          touch "$HOME/previous-job-marker"
+
+  next-job:
+    needs: first-job
+    runs-on: [self-hosted, zakura-ci-temporary]
+    timeout-minutes: 5
+    steps:
+      - name: Verify that files from the previous job were removed
+        shell: bash
+        run: test ! -e "$HOME/previous-job-marker"

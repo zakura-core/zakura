@@ -1674,9 +1674,11 @@ where
     /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
     /// superseded it.
     ///
-    /// Renews the compact-submission registration, restoring its block content if it expired or
-    /// was evicted. Registration grants no verification or relay authority; submissions still
-    /// pass through the consensus verifier. The builder already queued speculative validation.
+    /// Renews the compact-submission registration of validated work, restoring its block content
+    /// if it expired or was evicted. Work that has not been validated yet gets no registration
+    /// here: the builder's background validation registers it if it passes, as it does for the
+    /// builder's own answer. Registration grants no verification or relay authority; submissions
+    /// still pass through the consensus verifier.
     async fn reuse_shared_template(
         &self,
         template: &BlockTemplateResponse,
@@ -1696,7 +1698,13 @@ where
         }
 
         let candidates = self.gbt.prepared_candidates();
-        if !candidates.refresh_server_template(template.work_id()) {
+        if !candidates.refresh_server_template(template.work_id())
+            && self
+                .gbt
+                .template_rejections
+                .borrow()
+                .is_prepared(template.work_id())
+        {
             let retained_template = template.clone();
             let network = self.network.clone();
             self.gbt

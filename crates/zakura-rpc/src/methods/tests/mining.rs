@@ -607,14 +607,19 @@ fn template_build_paths_wait_for_the_build_slot() {
 
             let mut request = match path {
                 "normal" => rpc.get_block_template(None).boxed(),
-                "shared restoration" => rpc
-                    .reuse_shared_template(&initial, None)
-                    .map(|result| {
-                        result.map(|template| {
-                            template.expect("shared work is still on the current parent")
+                "shared restoration" => {
+                    // Only validated work is restored once its registration is gone.
+                    rpc.gbt.template_rejections.send_modify(|state| {
+                        state.mark_prepared(chain.tip_hash, initial.work_id());
+                    });
+                    rpc.reuse_shared_template(&initial, None)
+                        .map(|result| {
+                            result.map(|template| {
+                                template.expect("shared work is still on the current parent")
+                            })
                         })
-                    })
-                    .boxed(),
+                        .boxed()
+                }
                 "recovery" => {
                     rpc.gbt.template_rejections.send_modify(|state| {
                         state.reject(chain.tip_hash, "rejected-work");
@@ -1542,6 +1547,10 @@ fn reused_shared_work_restores_evicted_compact_submission_content() {
             zakura_consensus::PreparedCandidateSource::ServerTemplate,
             &rpc.network,
         );
+        // Background validation registers passing work and marks it validated.
+        rpc.gbt.template_rejections.send_modify(|state| {
+            state.mark_prepared(next.tip_hash, shared.work_id());
+        });
         assert!(candidates.resolve(shared.work_id(), *block.header).is_ok());
 
         // Fill the real bounded resolver with distinct candidates, evicting the shared answer.
@@ -1571,6 +1580,42 @@ fn reused_shared_work_restores_evicted_compact_submission_content() {
             .expect("freshly served shared work must reconstruct a compact submission");
         assert_eq!(restored.transactions, block.transactions);
         assert_eq!(restored.header, block.header);
+    });
+}
+
+/// Shared work that has not been validated yet is served as it is, like the builder's own answer:
+/// reusing it neither waits for the build slot nor registers it for compact submissions. Its
+/// background validation registers it if it passes.
+#[test]
+fn reused_unvalidated_work_is_served_without_registering_it() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+        let shared = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let header = *proposal_block_from_template(&shared, None, &rpc.network)
+            .unwrap()
+            .header;
+        assert!(!rpc.mining_template_prepared(shared.work_id()));
+
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let reused = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        gate.release().await;
+
+        assert_eq!(reused.work_id(), shared.work_id());
+        assert_eq!(
+            rpc.gbt
+                .prepared_candidates()
+                .resolve(shared.work_id(), header),
+            Err(ResolvePreparedCandidateError::StaleWork)
+        );
     });
 }
 

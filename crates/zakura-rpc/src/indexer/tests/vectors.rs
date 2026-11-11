@@ -8,7 +8,7 @@ use tower::BoxError;
 use zakura_chain::{
     block::{Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    serialization::ZcashDeserializeInto,
+    serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, UnminedTxId},
 };
 use zakura_node_services::mempool::{MempoolChange, MempoolTxSubscriber};
@@ -18,10 +18,9 @@ use zakura_test::{
     prelude::eyre::{eyre, Result},
 };
 
-#[cfg(feature = "indexer")]
-use zakura_chain::serialization::ZcashSerialize;
-
-use crate::indexer::{self, indexer_client::IndexerClient, BlockRangeRequest, BlockRequest, Empty};
+use crate::indexer::{
+    self, indexer_client::IndexerClient, BlockRangeRequest, BlockRequest, Empty, TransactionRequest,
+};
 use crate::{
     config::rpc::IndexerTlsConfig,
     indexer::tests::certs::{
@@ -31,8 +30,15 @@ use crate::{
     sync::{IndexerClientConfig, IndexerClientTlsConfig},
 };
 
+/// A funded serialized transaction for a mocked state response.
+fn raw_transaction(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawTransaction {
+    zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
+        .try_reserve(0)
+        .and_then(|reservation| reservation.retain(bytes))
+        .expect("an unlimited budget has room")
+}
+
 /// A funded serialized block for a mocked state response.
-#[cfg(feature = "indexer")]
 fn raw_block(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawBlock {
     zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
         .try_reserve(0)
@@ -55,6 +61,7 @@ async fn rpc_server_spawn() -> Result<()> {
     test_chain_tip_change(client.clone(), mock_chain_tip_sender).await?;
     test_mempool_change(client.clone(), mempool_transaction_sender).await?;
     test_get_block(client.clone(), mock_read_service.clone()).await?;
+    test_get_transaction(client.clone(), mock_read_service.clone()).await?;
     #[cfg(feature = "indexer")]
     test_get_block_range(client.clone(), mock_read_service).await?;
     #[cfg(not(feature = "indexer"))]
@@ -237,9 +244,37 @@ async fn test_get_block(
     });
 
     mock_read_service
-        .expect_request(ReadRequest::Block(HashOrHeight::Height(height)))
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(height)))
         .await
-        .respond(ReadResponse::Block(Some(block.clone().into())));
+        .respond(ReadResponse::RawBlock(Some(raw_block(
+            block.zcash_serialize_to_vec()?,
+        ))));
+
+    let response = request_task
+        .await?
+        .expect("get_block should succeed")
+        .into_inner();
+    assert_eq!(response.data, block.zcash_serialize_to_vec()?);
+    let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
+    assert_eq!(decoded_hash, expected_hash);
+    assert_eq!(decoded_block.hash(), expected_hash);
+
+    // A block requested by hash returns the requested hash with the stored bytes.
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block(tonic::Request::new(BlockRequest {
+                hash_or_height: expected_hash.bytes_in_display_order().to_vec(),
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Hash(expected_hash)))
+        .await
+        .respond(ReadResponse::RawBlock(Some(raw_block(
+            block.zcash_serialize_to_vec()?,
+        ))));
 
     let response = request_task
         .await?
@@ -248,6 +283,25 @@ async fn test_get_block(
     let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
     assert_eq!(decoded_hash, expected_hash);
     assert_eq!(decoded_block.hash(), expected_hash);
+
+    // A block the state does not have is not found.
+    let request_task = tokio::spawn(async move {
+        client
+            .get_block(tonic::Request::new(BlockRequest {
+                hash_or_height: height.0.to_be_bytes().to_vec(),
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(height)))
+        .await
+        .respond(ReadResponse::RawBlock(None));
+
+    let status = request_task
+        .await?
+        .expect_err("a missing block should not be found");
+    assert_eq!(status.code(), tonic::Code::NotFound);
 
     Ok(())
 }
@@ -339,11 +393,13 @@ async fn test_get_block_range(
         });
 
         mock_read_service
-            .expect_request(ReadRequest::Block(HashOrHeight::Height(Height(
+            .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(Height(
                 expected_height,
             ))))
             .await
-            .respond(ReadResponse::Block(Some(expected_block.clone().into())));
+            .respond(ReadResponse::RawBlock(Some(raw_block(
+                expected_block.zcash_serialize_to_vec()?,
+            ))));
 
         let get_block_response = get_block_task
             .await?
@@ -712,5 +768,66 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
         .await?;
     }
     server.abort();
+    Ok(())
+}
+
+/// Tests that `GetTransaction` returns the stored transaction bytes for a
+/// display-order ID, reports unknown IDs as not found, and rejects IDs that
+/// are not 32 bytes without reading the state.
+async fn test_get_transaction(
+    mut client: IndexerClient<tonic::transport::Channel>,
+    mut mock_read_service: MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
+) -> Result<()> {
+    let status = client
+        .get_transaction(tonic::Request::new(TransactionRequest {
+            txid: vec![0; 31],
+        }))
+        .await
+        .expect_err("a transaction ID that is not 32 bytes should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let transaction = block.transactions[0].clone();
+    let txid = transaction.hash();
+    let transaction_bytes = transaction.zcash_serialize_to_vec()?;
+
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_transaction(tonic::Request::new(TransactionRequest {
+                txid: txid.bytes_in_display_order().to_vec(),
+            }))
+            .await
+    });
+    mock_read_service
+        .expect_request(ReadRequest::AnyChainRawTransaction(txid))
+        .await
+        .respond(ReadResponse::RawTransaction(Some(raw_transaction(
+            transaction_bytes.clone(),
+        ))));
+    let response = request_task
+        .await?
+        .expect("get_transaction should succeed")
+        .into_inner();
+    assert_eq!(response.data, transaction_bytes);
+    let decoded: transaction::Transaction = response.data.zcash_deserialize_into()?;
+    assert_eq!(decoded.hash(), txid);
+
+    let request_task = tokio::spawn(async move {
+        client
+            .get_transaction(tonic::Request::new(TransactionRequest {
+                txid: txid.bytes_in_display_order().to_vec(),
+            }))
+            .await
+    });
+    mock_read_service
+        .expect_request(ReadRequest::AnyChainRawTransaction(txid))
+        .await
+        .respond(ReadResponse::RawTransaction(None));
+    let status = request_task
+        .await?
+        .expect_err("a missing transaction should not be found");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+
     Ok(())
 }

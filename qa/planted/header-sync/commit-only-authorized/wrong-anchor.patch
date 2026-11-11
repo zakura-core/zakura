@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..fd352f0f8d 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2391,7 +2391,9 @@ impl HeaderSyncReactor {
+                     max_header_count,
+                     tree_aux_schema,
+                 );
+-                let owner = target.scope.bind(
++                let mut scope = target.scope;
++                scope.branch.anchor_hash = block::Hash([0x11; 32]);
++                let owner = scope.bind(
+                     session_id,
+                     NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
+                 );

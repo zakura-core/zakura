@@ -1,0 +1,10 @@
+# Any non-empty locator counts its target as already known, so the reactor
+# marks an offered target completed although the node holds no header for
+# it. The reactor decides when the witness's offers meet their locators,
+# so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

@@ -136,6 +136,10 @@ pub struct DiskDb {
     /// applying any format changes that may have been required.
     finished_format_upgrades: Arc<AtomicBool>,
 
+    /// Set by the first instance that runs the shutdown format check.
+    /// Every instance that shuts down the shared database would otherwise run it.
+    shutdown_format_check_claimed: Arc<AtomicBool>,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -833,6 +837,16 @@ impl DiskDb {
             .store(true, atomic::Ordering::SeqCst);
     }
 
+    /// Returns true for the first caller across all clones of this database, and false after.
+    ///
+    /// The shutdown format check calls this so that it runs once per database, not once per
+    /// instance that shuts the database down.
+    pub(crate) fn claim_shutdown_format_check(&self) -> bool {
+        !self
+            .shutdown_format_check_claimed
+            .swap(true, atomic::Ordering::SeqCst)
+    }
+
     /// Returns true if the `finished_format_upgrades` flag has been set to true to
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
@@ -1222,6 +1236,7 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    shutdown_format_check_claimed: Arc::new(AtomicBool::new(false)),
                     cached_size: Arc::new(AtomicU64::new(0)),
                     retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };

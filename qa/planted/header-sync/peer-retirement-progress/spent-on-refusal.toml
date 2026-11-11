@@ -1,0 +1,16 @@
+# An offer refused because another peer owns its target is spent, not kept
+# for the cached pass. The input's `mirror-1` offers the target only while
+# `mirror-0`'s round owns it, then `mirror-0` is closed while its prepare
+# is held. No cached pass offers `mirror-1`'s spent status once
+# `mirror-0`'s slot goes, and its next `Status` comes only at its refresh,
+# after the clock moves, so the hand-off expires at the next quiescence.
+# Besides reactor.rs, which the patch changes, the queue and the offer
+# policy decide when an offer is refused for another owner, and the cached
+# pass's key decides when the pass runs. A change there can move the input
+# off its hand-off.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-preparing-close.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-preparing-close.plan"

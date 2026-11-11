@@ -27,6 +27,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -54,6 +55,7 @@ on:
       - "deploy/**"
       - ".github/scripts/**"
       - ".github/release-review/**"
+      - ".github/release-notes/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -88,7 +90,7 @@ jobs:
       contents: read
       id-token: write
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEMPORARY_PR_CI == 'true' && fromJSON('["self-hosted","zakura-ci-temporary"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 30
 
     steps:
@@ -154,6 +156,7 @@ jobs:
   # `crate-checks` and `features` jobs.
 
   msrv:
+    if: vars.TEMPORARY_PR_CI != 'true'
     name: MSRV
     permissions:
       contents: read
@@ -182,7 +185,7 @@ jobs:
     permissions:
       contents: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEMPORARY_PR_CI == 'true' && fromJSON('["self-hosted","zakura-ci-temporary"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -205,7 +208,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck .github/actions/setup-zakura-build/*.sh scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck deploy/ci/*.sh .github/actions/setup-zakura-build/*.sh scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
       - name: Ubuntu package retry tests
         if: ${{ !cancelled() }}
         run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
@@ -251,6 +254,10 @@ jobs:
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
+
+      - name: Release notes drafter tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_notes*.py'
 
       - name: Deployer tests
         if: ${{ !cancelled() }}
@@ -302,7 +309,7 @@ jobs:
     permissions:
       contents: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEMPORARY_PR_CI == 'true' && fromJSON('["self-hosted","zakura-ci-temporary"]') || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -320,7 +327,7 @@ jobs:
     # cargo-udeps needs a clean from-scratch nightly build and is not a
     # correctness gate (unused deps don't break compilation). Run it nightly /
     # on demand only, keeping it off the PR critical path.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: vars.TEMPORARY_PR_CI != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
       id-token: write
@@ -346,6 +353,7 @@ jobs:
   # `cargo hack check --workspace` pass in `test-crates.yml`.
 
   supply-chain:
+    if: vars.TEMPORARY_PR_CI != 'true'
     name: supply chain
     permissions:
       contents: read
@@ -442,6 +450,7 @@ jobs:
     # See "Cancelled runs" in .github/workflows/README.md.
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
+      - header-conformance
       - rust-checks
       - msrv
       - fast-lints
@@ -453,6 +462,10 @@ jobs:
       # A separate required `zizmor` context would strand pull requests opened
       # before that context existed, because GitHub does not backfill checks on
       # their current head commits.
+      - name: Record reduced lint coverage
+        if: vars.TEMPORARY_PR_CI == 'true'
+        run: echo 'Temporary CI keeps formatting, script checks, Clippy, build checks, and header conformance. MSRV, unused-dependency, and supply-chain checks are paused.' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Detect workflow-audit changes
         id: workflow-audit-changes
         if: github.event_name == 'pull_request'
@@ -501,4 +514,4 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # unused-deps runs only on the nightly schedule / on demand.
-          allowed-skips: unused-deps
+          allowed-skips: ${{ vars.TEMPORARY_PR_CI == 'true' && 'msrv, unused-deps, supply-chain' || 'unused-deps' }}

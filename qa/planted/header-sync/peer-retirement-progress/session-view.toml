@@ -1,0 +1,19 @@
+# A session replacement leaves the old session's work in place: the
+# reactor admits the new session without retiring the old one's round.
+# This is hdr-5's session-view mutation, moved here with the
+# `DepartedSessionWork` rule. The input relinks `mirror-0` while its
+# round receives pages, so the queue still lists that round's slot under
+# the replaced session at the end of the unit that admitted the new one.
+# A held prepare would put a stale completion after the replacement, whose
+# apply dispatch is `header-sync/stale-completion-inert`'s, so the input
+# holds nothing.
+# Besides reactor.rs, which the patch changes, the queue decides when the
+# round starts and which slots it lists, and the session readers decide
+# when the relink's admission lands. A change there can move the input off
+# its replacement while receiving.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-receiving-relink.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-receiving-relink.plan"

@@ -1,0 +1,12 @@
+# Adopting a reset keeps every awaiting target. The witness's first locator
+# read is held across the invalidation, so the peer's awaiting slot still
+# names the old generation when the adopting unit ends.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.plan"

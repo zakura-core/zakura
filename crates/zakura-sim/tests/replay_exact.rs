@@ -1178,6 +1178,7 @@ fn work_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         "block/work-ownership",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1303,6 +1304,7 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
         PlanInput::Bytes(Vec::new()),
         "block/decoded-retention",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1380,6 +1382,7 @@ fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
             PlanInput::Bytes(Vec::new()),
             "block/decoded-retention",
             zakura_sim::witness::Expect::Holds,
+            &[],
             &mut zakura_sim::NullSink,
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
@@ -1411,6 +1414,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
         PlanInput::Bytes(Vec::new()),
         "block/work-funding",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1488,6 +1492,7 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
             PlanInput::Bytes(Vec::new()),
             "block/work-funding",
             zakura_sim::witness::Expect::Holds,
+            &[],
             &mut zakura_sim::NullSink
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
@@ -1548,6 +1553,7 @@ fn reactor_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         "header/reactor-policy",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1593,6 +1599,7 @@ fn publisher_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         name,
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1657,6 +1664,7 @@ fn reactor_machine_records_and_replays_query_identities() {
         PlanInput::Bytes(Vec::new()),
         "block/reactor-policy",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1784,6 +1792,7 @@ fn discovery_book_records_and_replays_signed_samples() {
         PlanInput::Bytes(Vec::new()),
         "discovery/record-book",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1841,6 +1850,7 @@ fn discovery_state_records_and_replays_installations() {
         PlanInput::Bytes(Vec::new()),
         "discovery/session-installation",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();

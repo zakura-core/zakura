@@ -591,15 +591,15 @@ impl AddressBook {
         peers
     }
 
-    /// Get the active addresses in `self`, in preferred caching order,
-    /// excluding our local listener address.
+    /// Get active outbound listener addresses in measured RTT order, followed by
+    /// shuffled addresses without a measurement, excluding our local listener.
     pub fn cacheable(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
         let peers = self.peers.clone();
 
         // Get peers in preferred order, then keep the recently active ones
-        peers
+        let mut eligible: Vec<_> = peers
             .ordered_values()
             // # Security
             //
@@ -612,8 +612,19 @@ impl AddressBook {
             .filter(|addr| addr.is_active_for_gossip(now))
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
+            // Address-only persistence must not forget a known rejection.
+            .filter(|addr| addr.last_known_info_is_valid_for_outbound(&self.network))
             .cloned()
-            .collect()
+            .collect();
+
+        // Keep measured RTT preference and stable measured ties. Unmeasured peers
+        // have no trusted ranking: gossip timestamps and address values must not
+        // decide which ones survive cache truncation.
+        eligible.sort_by_key(|peer| (peer.rtt().is_none(), peer.rtt()));
+        let first_unmeasured = eligible.partition_point(|peer| peer.rtt().is_some());
+        use rand_10::seq::SliceRandom;
+        eligible[first_unmeasured..].shuffle(&mut rand_10::rng());
+        eligible
     }
 
     /// Look up `addr` in the address book, and return its [`MetaAddr`].

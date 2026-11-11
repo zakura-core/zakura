@@ -9,24 +9,43 @@
 
 mod support;
 
-use std::{cell::RefCell, fs, io::Write, path::Path, path::PathBuf, process::Command};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::Write,
+    path::Path,
+    path::PathBuf,
+    process::Command,
+    time::Duration,
+};
 
 use serde_json::Value;
 use tempfile::TempDir;
 use zakura_sim::{
-    domain::header_sync::CAPACITY_RELEASE_WAKES,
+    domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL, CAPACITY_RELEASE_WAKES},
     explore::{classify, ExploreOutcome},
     harness::{
         self,
-        header_node::wake::{WakeEvidence, WakeFact},
-        header_sync::{Ports, ReleaseWake, WakeScenario},
+        header_node::{
+            policy::OpKind,
+            wake::{WakeEvidence, WakeFact},
+        },
+        header_sync::{
+            storage_properties, storage_sources, Ports, ReleaseWake, Storage, StorageView,
+            WakeScenario,
+        },
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
+    observe::{ReactorFact, StorageFact, StorageRequest, StorageState},
+    property::{CheckEvent, EndViolation, HasView, Lifecycle, Property, Sources},
     record::RecordSink,
     seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
-    MemorySink, NullSink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    Checker, MemorySink, NullSink, Observation, ObservationLog, Outcome, Plan, PlanInput,
+    PropertyOutcome, PropertyReport, RunConfig, RunEnd, RunReport, Sim, StepCtx, Violation,
 };
 
 /// The committed release input, `tests/fixtures/header-release-wake.bin`:
@@ -144,6 +163,7 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
         plan(input),
         CAPACITY_RELEASE_WAKES,
         Expect::Holds,
+        &[],
         &mut MemorySink::default(),
     );
     assert_eq!(result, Ok(()));
@@ -169,14 +189,441 @@ fn the_deferred_wake_input_holds_capacity_release_wakes() {
 
 /// Each fixture opens a wake, gets the waiting offer's locator read to
 /// storage and holds the property under every plan, not only the committed
-/// ones. In the deferred fixture a deferral comes between every time.
+/// ones. In the deferred fixture a deferral comes between every time. Each
+/// run then ends settled ([`stuck`]).
 #[test]
 fn the_wake_fixtures_hold_under_every_plan() {
     for input in support::inputs(16, 256) {
         let (report, facts) = run(WakeScenario::Release, input.clone());
         wake_held(&report, &facts);
+        let held = stuck(WakeScenario::Release, &report);
+        assert!(held.is_empty(), "{held:?}");
         let (report, facts) = run(WakeScenario::Deferred, input);
         assert!(deferred(wake_held(&report, &facts)), "{facts:?}");
+        let held = stuck(WakeScenario::Deferred, &report);
+        assert!(held.is_empty(), "{held:?}");
+    }
+}
+
+/// What the fixture still holds at `report`'s end. First, each prepare
+/// one of `scenario`'s holds picked that didn't complete, or whose reactor
+/// call didn't end. Then the work still in flight at the end that has
+/// waited longer than the scenario's policy bound: each of the node's
+/// reactor calls not yet ended, and each operation the node's storage
+/// still holds, with the virtual time it began. An operation no hold
+/// picked completes within the bound, so only held work can wait longer.
+///
+/// An empty list means the fixture holds nothing at the end, not that the
+/// node is idle. Its status refreshes keep starting rounds, so work younger
+/// than the bound can still be in flight when the budget runs out, and the
+/// drain offers no storage completions to finish it. No hold picks that
+/// work, so a drain that completes storage operations, as #1840 proposes,
+/// can finish it.
+fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
+    let storage = scenario.storage();
+    let bound = Duration::from_millis(
+        storage
+            .policy
+            .bound_ms
+            .expect("the fixture bounds unheld operations"),
+    );
+    let picked: Vec<usize> = storage
+        .policy
+        .holds
+        .iter()
+        .map(|hold| {
+            assert_eq!(hold.select.kind, Some(OpKind::Prepare), "{hold:?}");
+            let nth = hold.select.nth.expect("each hold picks one prepare");
+            usize::try_from(nth).expect("a u32 fits usize")
+        })
+        .collect();
+    let mut now = Duration::ZERO;
+    let mut calls = BTreeMap::new();
+    let mut submitted = HashMap::new();
+    let mut prepares = Vec::new();
+    let mut completed = HashSet::new();
+    let mut call_ended = HashSet::new();
+    let mut taps = HashSet::new();
+    let mut storages = HashSet::new();
+    let mut held = Vec::new();
+    for entry in report.log.entries() {
+        match &entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => now = Duration::from_nanos(*to_ns),
+            Observation::Reactor {
+                instance, event, ..
+            } => {
+                taps.insert(*instance);
+                match event {
+                    ReactorFact::Dispatched { call, port } => {
+                        calls.insert(*call, (now, format!("call {call}: {port:?}")));
+                    }
+                    ReactorFact::CallEnded { call, op, .. } => {
+                        calls.remove(call);
+                        call_ended.extend(*op);
+                    }
+                    _ => {}
+                }
+            }
+            Observation::Storage {
+                service,
+                instance,
+                fact,
+                ..
+            } => {
+                storages.insert((service.clone(), *instance));
+                match fact {
+                    StorageFact::Submitted { id, request, .. } => {
+                        submitted.insert(*id, now);
+                        if matches!(request, StorageRequest::PrepareHeaderTarget { .. }) {
+                            prepares.push(*id);
+                        }
+                    }
+                    StorageFact::Completed { id, .. } => {
+                        completed.insert(*id);
+                    }
+                    _ => {}
+                }
+            }
+            Observation::StorageState {
+                service,
+                instance,
+                state,
+                ..
+            } => {
+                storages.insert((service.clone(), *instance));
+                if let StorageState::Header(state) = state {
+                    held = state.operations.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    // A call's ID is its tap's, and an operation's is its storage's, which
+    // `(service, instance)` names. So bare IDs name the node's calls and
+    // operations only while the node's are the one tap and the one storage
+    // the run logs.
+    assert_eq!(taps.len(), 1, "{taps:?}");
+    assert!(
+        storages.len() == 1 && storages.iter().all(|(service, _)| service == "header"),
+        "{storages:?}"
+    );
+    let unsettled_holds = picked
+        .into_iter()
+        .filter_map(|nth| prepares.get(nth - 1))
+        .filter(|id| !(completed.contains(*id) && call_ended.contains(*id)))
+        .map(|id| {
+            format!(
+                "held prepare {id}: completed {}, call ended {}",
+                completed.contains(id),
+                call_ended.contains(id)
+            )
+        });
+    let ops = held.into_iter().map(|op| {
+        let since = *submitted
+            .get(&op.id)
+            .expect("storage logs each operation's submission before its state");
+        (since, format!("operation {}: {op:?}", op.id))
+    });
+    let waited = calls
+        .into_values()
+        .chain(ops)
+        .filter(|(since, _)| now.saturating_sub(*since) > bound)
+        .map(|(since, work)| format!("since {since:?}, at {now:?}: {work}"));
+    unsettled_holds.chain(waited).collect()
+}
+
+/// `header-sync/release-wake` as it was before it let `mirror-1`'s held
+/// prepare run: the same storage scenario, budget, ports, properties and
+/// sources, without the fixture's settle source.
+struct Unsettled(Storage);
+
+impl HasView for Unsettled {
+    type View = StorageView;
+
+    /// The storage harness's view.
+    fn view(&self) -> StorageView {
+        self.0.view()
+    }
+
+    /// The storage harness's end.
+    fn ended(&self, end: &RunEnd) {
+        self.0.ended(end);
+    }
+
+    /// The storage harness's end violations.
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        self.0.end_violations(log)
+    }
+
+    /// The storage harness's wake facts' stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        self.0.stamps_after(after)
+    }
+}
+
+impl Subsystem for Unsettled {
+    const NAME: &'static str = "test/release-wake-unsettled";
+    const GENERATOR: u32 = ReleaseWake::GENERATOR;
+    const SCENARIO_BYTES: usize = ReleaseWake::SCENARIO_BYTES;
+    type Scenario = WakeScenario;
+    type Prepared = Ports;
+
+    /// [`ReleaseWake`]'s.
+    fn config(scenario: &WakeScenario) -> RunConfig {
+        ReleaseWake::config(scenario)
+    }
+
+    /// [`ReleaseWake`]'s.
+    fn prepare(scenario: &WakeScenario) -> Ports {
+        ReleaseWake::prepare(scenario)
+    }
+
+    /// The storage harness on the fixture's scenario, alone.
+    fn build(sim: &mut Sim, scenario: &WakeScenario, ports: Ports) -> Self {
+        Unsettled(Storage::build(sim, &scenario.storage(), ports))
+    }
+
+    /// [`ReleaseWake`]'s, in its order.
+    fn properties() -> Vec<Property<Self>> {
+        let mut properties = storage_properties();
+        properties.push(capacity_release_wakes());
+        properties
+    }
+
+    /// [`ReleaseWake`]'s.
+    fn sources() -> Sources {
+        storage_sources()
+    }
+
+    /// [`ReleaseWake`]'s.
+    fn draw(prefix: &[u8]) -> WakeScenario {
+        ReleaseWake::draw(prefix)
+    }
+}
+
+/// The pick identity of the fixture's release of `mirror-1`'s hold.
+const SETTLE: &str = "peer:node:settle";
+
+/// What a run of the wake fixture showed about its measured boundary and
+/// the release after it. The measured boundary is where
+/// `header-sync/capacity-release-wakes` concludes the obligation each wake
+/// opens, discharged or expired.
+struct Measured {
+    /// The run's wake facts.
+    wake: WakeEvidence,
+    /// The property's obligations open after the last step.
+    open: usize,
+    /// The property's lifecycle events this step, which the registry hands
+    /// over before [`Measured::after_step`] sees the step.
+    pending: Vec<Lifecycle>,
+    /// Each obligation the property opened or concluded, with its step.
+    lifecycle: Vec<(u64, Lifecycle)>,
+    /// Each step's enabled set, as a digest of its identities in order.
+    enabled: Vec<u64>,
+    /// The first step whose enabled set offered [`SETTLE`].
+    offered: Option<Offered>,
+    /// The step and virtual time of each [`SETTLE`] pick.
+    settles: Vec<(u64, Duration)>,
+}
+
+/// The first offer of [`SETTLE`] in a run.
+struct Offered {
+    /// The step whose enabled set held it.
+    step: u64,
+    /// The property's obligations open when that set was built.
+    open: usize,
+    /// The wake facts found by then.
+    facts: Vec<(u64, WakeFact)>,
+}
+
+impl Checker for Measured {
+    /// Notes the first offer of [`SETTLE`] against the obligations the
+    /// last step left open, then the step's own lifecycle events and pick.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        let identities: Vec<String> = cx
+            .enabled
+            .iter()
+            .map(|enabled| enabled.identity.to_string())
+            .collect();
+        let mut digest = DefaultHasher::new();
+        identities.hash(&mut digest);
+        self.enabled.push(digest.finish());
+        let offers = identities.iter().any(|identity| identity == SETTLE);
+        if offers && self.offered.is_none() {
+            self.offered = Some(Offered {
+                step: cx.step,
+                open: self.open,
+                facts: self.wake.facts(),
+            });
+        }
+        for to in std::mem::take(&mut self.pending) {
+            match to {
+                Lifecycle::Obliged => self.open += 1,
+                Lifecycle::Discharged | Lifecycle::Expired => {
+                    assert!(self.open > 0, "an obligation concludes only once it's open");
+                    self.open -= 1;
+                }
+                Lifecycle::Applicable => continue,
+            }
+            self.lifecycle.push((cx.step, to));
+        }
+        if cx.pick.to_string() == SETTLE {
+            self.settles.push((cx.step, cx.now.since_start()));
+        }
+        None
+    }
+
+    /// Reports nothing of its own.
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+
+    /// Keeps the property's lifecycle events for
+    /// [`Measured::after_step`].
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        self.pending
+            .extend(events.iter().filter_map(|event| match event {
+                CheckEvent::Lifecycle { property, to }
+                    if property.as_str() == CAPACITY_RELEASE_WAKES =>
+                {
+                    Some(*to)
+                }
+                _ => None,
+            }));
+    }
+}
+
+/// `scenario`'s run through harness `S` under `input`, measured.
+fn measured<S>(scenario: WakeScenario, input: PlanInput) -> (RunReport, Measured)
+where
+    S: Subsystem<Scenario = WakeScenario, Prepared = Ports>,
+{
+    let ports = S::prepare(&scenario);
+    let mut measured = Measured {
+        wake: ports.wake.clone(),
+        open: 0,
+        pending: Vec::new(),
+        lifecycle: Vec::new(),
+        enabled: Vec::new(),
+        offered: None,
+        settles: Vec::new(),
+    };
+    let report = run_prepared::<S>(
+        &scenario,
+        ports,
+        input,
+        &mut MemorySink::default(),
+        Some(&mut measured),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    (report, measured)
+}
+
+/// hf-5: the fixture releases `mirror-1`'s hold only after its measured
+/// boundary. It first offers the release once the clock is past every
+/// opened wake's deadline, when no wake obligation is open and at least
+/// one has concluded. Before that step each run is the run of the fixture
+/// without the release ([`Unsettled`]), step for step: the same picks
+/// from the same enabled sets, the same observations, and the same
+/// obligations opened and concluded at the same steps. The release is
+/// picked once, and the run then ends settled ([`stuck`]), where the
+/// fixture without it ends with `mirror-1`'s prepare still held.
+#[test]
+fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
+    let committed = [
+        (WakeScenario::Release, plan(RELEASE_INPUT)),
+        (WakeScenario::Deferred, plan(DEFERRED_INPUT)),
+    ];
+    let plans = support::inputs(3, 256).into_iter().flat_map(|input| {
+        [
+            (WakeScenario::Release, input.clone()),
+            (WakeScenario::Deferred, input),
+        ]
+    });
+    for (scenario, input) in committed.into_iter().chain(plans) {
+        let (settled, after) = measured::<ReleaseWake>(scenario, input.clone());
+        let (unsettled, before) = measured::<Unsettled>(scenario, input);
+        let Some(Offered {
+            step: offered,
+            open,
+            facts,
+        }) = &after.offered
+        else {
+            panic!(
+                "{scenario:?}: the release was offered: {:?}",
+                after.lifecycle
+            );
+        };
+        assert_eq!(*open, 0, "{scenario:?}: no wake is open at the offer");
+        let earlier = |measured: &Measured| {
+            measured
+                .lifecycle
+                .iter()
+                .filter(|(step, _)| step < offered)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let concluded = earlier(&after);
+        assert!(
+            concluded
+                .iter()
+                .any(|(_, to)| matches!(to, Lifecycle::Discharged | Lifecycle::Expired)),
+            "{scenario:?}: a wake concluded before the offer: {concluded:?}"
+        );
+        assert_eq!(concluded, earlier(&before), "{scenario:?}");
+        // The wakes themselves, each with its peer, session, time and stamp.
+        let unsettled_facts = before.wake.facts();
+        assert_eq!(
+            unsettled_facts.get(..facts.len()),
+            Some(&facts[..]),
+            "{scenario:?}"
+        );
+        assert!(before.offered.is_none(), "{scenario:?}");
+        let index = usize::try_from(offered - 1).expect("a run's steps fit usize");
+        assert_eq!(
+            settled.picks[..index],
+            unsettled.picks[..index],
+            "{scenario:?}"
+        );
+        assert_eq!(
+            after.enabled[..index],
+            before.enabled[..index],
+            "{scenario:?}"
+        );
+        let prefix = |report: &RunReport| {
+            report
+                .log
+                .entries()
+                .iter()
+                .take_while(|entry| entry.step < *offered)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(prefix(&settled) == prefix(&unsettled), "{scenario:?}");
+
+        let [(settle, settle_at)] = after.settles[..] else {
+            panic!("{scenario:?}: one settle: {:?}", after.settles);
+        };
+        assert_eq!(before.settles, [], "{scenario:?}");
+        assert!(*offered <= settle, "{scenario:?}");
+        let opened = facts
+            .iter()
+            .filter_map(|(_, fact)| match fact {
+                WakeFact::Opened { at, .. } => Some(at.since_start()),
+                _ => None,
+            })
+            .max()
+            .expect("a wake opened before the offer");
+        assert!(
+            settle_at > opened + CACHED_PASS_REFILL,
+            "{scenario:?}: opened at {opened:?}, settled at {settle_at:?}"
+        );
+        let held = stuck(scenario, &settled);
+        assert!(held.is_empty(), "{scenario:?}: {held:?}");
+        assert!(
+            !stuck(scenario, &unsettled).is_empty(),
+            "{scenario:?}: without the release, mirror-1's prepare stays held"
+        );
     }
 }
 

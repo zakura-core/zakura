@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+index f36982fa0e..3baef2c473 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+@@ -261,7 +261,6 @@ impl ReactorState {
+         self.progress.last_reaction_epoch = view.reaction_epoch;
+         if reset {
+             self.progress.last_reset_epoch = view.reset_epoch;
+-            self.queries.clear();
+             self.queries.end_hint_refresh();
+         }
+         ViewReaction::React {

@@ -21,63 +21,62 @@ pub(super) fn render(metrics: &Metrics, now: Instant) -> String {
     let descriptions = read(&metrics.descriptions);
     let mut output = String::new();
 
-    let counters = by_name(
-        read(&metrics.counters)
-            .iter()
-            .map(|(key, counter)| (key, counter.load(Ordering::Acquire))),
-    );
-    for (name, series) in counters {
-        write_header(&mut output, &name, "counter", descriptions.get(&name));
-        for (labels, value) in series {
-            write_line(&mut output, &name, "", &labels, None, value);
-        }
-        output.push('\n');
-    }
-
-    let gauges = by_name(
-        read(&metrics.gauges)
-            .iter()
-            .map(|(key, gauge)| (key, f64::from_bits(gauge.load(Ordering::Acquire)))),
-    );
-    for (name, series) in gauges {
-        write_header(&mut output, &name, "gauge", descriptions.get(&name));
-        for (labels, value) in series {
-            write_line(&mut output, &name, "", &labels, None, value);
-        }
-        output.push('\n');
-    }
-
-    let histograms = by_name(read(&metrics.histograms).iter().map(|(key, samples)| {
-        let summary =
-            samples.with_summary(|summary| (summary.recent(now), summary.sum(), summary.count()));
-        (key, summary)
-    }));
-    for (name, series) in histograms {
-        write_header(&mut output, &name, "summary", descriptions.get(&name));
-        for (labels, (recent, sum, count)) in series {
-            for quantile in QUANTILES {
-                let value = recent.quantile(quantile).unwrap_or(0.0);
-                write_line(&mut output, &name, "", &labels, Some(quantile), value);
+    {
+        let counters = read(&metrics.counters);
+        for (name, series) in by_name(counters.keys()) {
+            write_header(&mut output, &name, "counter", descriptions.get(&name));
+            for (labels, key) in series {
+                let value = counters[key].load(Ordering::Acquire);
+                write_line(&mut output, &name, "", &labels, None, &value);
             }
-            write_line(&mut output, &name, "_sum", &labels, None, sum);
-            write_line(&mut output, &name, "_count", &labels, None, count);
+            output.push('\n');
         }
-        output.push('\n');
+    }
+
+    {
+        let gauges = read(&metrics.gauges);
+        for (name, series) in by_name(gauges.keys()) {
+            write_header(&mut output, &name, "gauge", descriptions.get(&name));
+            for (labels, key) in series {
+                let value = f64::from_bits(gauges[key].load(Ordering::Acquire));
+                write_line(&mut output, &name, "", &labels, None, &value);
+            }
+            output.push('\n');
+        }
+    }
+
+    {
+        let histograms = read(&metrics.histograms);
+        for (name, series) in by_name(histograms.keys()) {
+            write_header(&mut output, &name, "summary", descriptions.get(&name));
+            for (labels, key) in series {
+                let (recent, sum, count) = histograms[key]
+                    .with_summary(|summary| (summary.recent(now), summary.sum(), summary.count()));
+                for quantile in QUANTILES {
+                    let value = recent.quantile(quantile).unwrap_or(0.0);
+                    write_line(&mut output, &name, "", &labels, Some(quantile), &value);
+                }
+                write_line(&mut output, &name, "_sum", &labels, None, &sum);
+                write_line(&mut output, &name, "_count", &labels, None, &count);
+            }
+            output.push('\n');
+        }
     }
 
     output
 }
 
-/// Groups `metrics` by sanitized name, then by rendered labels.
-fn by_name<'a, T>(
-    metrics: impl Iterator<Item = (&'a Key, T)>,
-) -> BTreeMap<String, BTreeMap<String, T>> {
-    let mut by_name: BTreeMap<String, BTreeMap<String, T>> = BTreeMap::new();
-    for (key, value) in metrics {
+/// Groups metric `keys` by sanitized name, then by rendered labels.
+///
+/// When keys sanitize to the same name and labels, the last one is kept. Grouping keys rather
+/// than values keeps one copy of this code for every kind of metric.
+fn by_name<'a>(keys: impl Iterator<Item = &'a Key>) -> BTreeMap<String, BTreeMap<String, &'a Key>> {
+    let mut by_name: BTreeMap<String, BTreeMap<String, &Key>> = BTreeMap::new();
+    for key in keys {
         by_name
             .entry(sanitize_metric_name(key.name()))
             .or_default()
-            .insert(render_labels(key), value);
+            .insert(render_labels(key), key);
     }
     by_name
 }
@@ -135,7 +134,7 @@ fn write_line(
     suffix: &str,
     labels: &str,
     quantile: Option<f64>,
-    value: impl Display,
+    value: &dyn Display,
 ) {
     output.push_str(name);
     output.push_str(suffix);

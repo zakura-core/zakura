@@ -130,7 +130,7 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 32] = [
+const ALLOWED: [(&str, &str, &str); 38] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -247,6 +247,36 @@ const ALLOWED: [(&str, &str, &str); 32] = [
         RESOURCE_PROBE,
     ),
     (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
         "crates/zakura-network/src/zakura/transport/observe.rs",
         "std::sync::Mutex",
         TRANSPORT_TAP,
@@ -324,6 +354,13 @@ const TRANSPORT_TAP: &str = "the transport observer's own state, which must add 
 const RESOURCE_PROBE: &str = "the header resource probe's handles, which a boundary \
      read upgrades and so must take no scheduling point, not code under test";
 
+/// Why the transport probes may use std's `Weak`. They compile only under
+/// `cfg(zakura_sim)`, and read only inside a boundary read, which
+/// `zakura_rt`'s `Weak::upgrade` would fail with its preemption point.
+const TRANSPORT_PROBE: &str = "a transport probe's handles to a connection's gates and \
+     load: a simulated run's boundary read upgrades them, so they must take no scheduling \
+     point, and they are harness code, not code under test";
+
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 
 const MODULE_IMPORT: &str = "zakura_rt names, imported by item";
@@ -370,11 +407,21 @@ pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     .into())
 }
 
-#[derive(Default)]
 struct Findings {
     files: usize,
     violations: Vec<Violation>,
     allowances_used: [bool; ALLOWED.len()],
+}
+
+// Std derives `Default` only for arrays of at most 32 elements.
+impl Default for Findings {
+    fn default() -> Self {
+        Findings {
+            files: 0,
+            violations: Vec::new(),
+            allowances_used: [false; ALLOWED.len()],
+        }
+    }
 }
 
 fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {

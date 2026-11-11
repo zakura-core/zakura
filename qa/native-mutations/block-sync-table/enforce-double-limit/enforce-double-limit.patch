@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/regulated/session.rs b/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
+index 6e7d8cc7c8..5fbce89b39 100644
+--- a/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
++++ b/crates/zakura-network/src/zakura/block_sync/regulated/session.rs
+@@ -190,7 +190,9 @@ impl Serving {
+                 OutputOrder::Ready,
+                 Arc::new(producer),
+                 peer,
+-                self.advertised,
++                // Mutation: the session enforces twice the limit the node
++                // advertised.
++                self.advertised.saturating_mul(2),
+                 send,
+                 cancel,
+                 connection,

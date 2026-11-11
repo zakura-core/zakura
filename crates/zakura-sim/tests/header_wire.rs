@@ -826,6 +826,7 @@ fn tap_run(edit: fn(Vec<Observation>) -> Vec<Observation>) -> RunReport {
         reporter.observe(TransportEvent::Registered {
             conn_id: 1,
             remote: peer_addr(0, 0),
+            shared_id: [0; 16],
         });
         reporter.observe(TransportEvent::Admitted {
             conn_id: 1,

@@ -91,6 +91,10 @@ use crate::zakura::{
 mod model;
 mod state;
 
+#[cfg(any(test, zakura_sim))]
+use super::super::observe::{PublicationChange, PublisherSite};
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::regulation::ServeInUse;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use model::{
     trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
@@ -163,6 +167,10 @@ struct PublisherOwner {
     slots: PublicationSlots,
     waits: CapacityWaits,
     reporter: PublicationReporter<u64>,
+    /// Where the owner reports its ledger's transitions and its containers,
+    /// in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    life: Option<super::CreditTap>,
 }
 
 impl PublisherOwner {
@@ -175,14 +183,24 @@ impl PublisherOwner {
             slots: PublicationSlots::new(&limits),
             waits: CapacityWaits::default(),
             reporter: PublicationReporter::new(limits),
+            #[cfg(any(test, zakura_sim))]
+            life: None,
         }
     }
 
-    /// This owner, reporting its subscription transitions through `tap` if
-    /// there is one.
+    /// This owner, reporting its subscription transitions through `tap`'s
+    /// regulation tap, and its ledger's transitions and containers through
+    /// its credit tap, where there are any.
     #[cfg(any(test, zakura_sim))]
-    fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<u64>>) -> Self {
-        self.reporter = self.reporter.observed_by(tap);
+    fn observed_by(
+        mut self,
+        tap: (
+            Option<crate::zakura::RegulationTap<u64>>,
+            Option<super::CreditTap>,
+        ),
+    ) -> Self {
+        self.reporter = self.reporter.observed_by(tap.0);
+        self.life = tap.1;
         self
     }
 
@@ -199,6 +217,11 @@ impl PublisherOwner {
                 }
                 opened.map(|opened| {
                     self.reporter.opened(&id, update.added_credit, opened);
+                    #[cfg(any(test, zakura_sim))]
+                    {
+                        self.report_change(id, PublicationChange::Opened);
+                        self.report_serving(PublisherSite::Open, None);
+                    }
                     Applied::Live
                 })
             }
@@ -218,14 +241,20 @@ impl PublisherOwner {
     /// End every subscription state says is due, report each end, and return
     /// the outcomes in order.
     fn end_due(&mut self) -> Vec<HeadersOutcomeCode> {
-        self.state
+        let outcomes = self
+            .state
             .end_due()
             .into_iter()
             .map(|(id, outcome)| {
                 self.reporter.ended(&id);
+                #[cfg(any(test, zakura_sim))]
+                self.report_change(id, PublicationChange::Ended);
                 outcome
             })
-            .collect()
+            .collect();
+        #[cfg(any(test, zakura_sim))]
+        self.report_serving(PublisherSite::EndDue, None);
+        outcomes
     }
 
     /// Take the next terminal outcome state lets the task write, and bind it
@@ -264,6 +293,68 @@ impl PublisherOwner {
             Output::Stall(Stall::Capacity(wait), "capacity"),
             latest,
         );
+    }
+
+    /// Commits `page` for job `key`, as [`PublisherState::commit`] does,
+    /// and reports the containers right after a commit, since it grows the
+    /// subscription's sent-cursor ring ([`PublisherSite::Commit`]).
+    #[cfg(any(test, zakura_sim))]
+    fn commit_reported(&mut self, key: JobKey, page: &Page) -> bool {
+        let committed = self.state.commit(key, page);
+        if committed {
+            self.report_serving(PublisherSite::Commit, None);
+        }
+        committed
+    }
+
+    /// Reports the ledger's `change` of `subscription` to the credit tap's
+    /// observer ([`ReactorEvent::PublicationChanged`]).
+    #[cfg(any(test, zakura_sim))]
+    fn report_change(&self, subscription: u64, change: PublicationChange) {
+        if let Some(life) = &self.life {
+            life.observer
+                .observe(super::super::observe::ReactorEvent::PublicationChanged {
+                    peer: life.peer.clone(),
+                    session_id: life.session_id,
+                    subscription,
+                    change,
+                });
+        }
+    }
+
+    /// Reports this owner's containers at `site`, and at a pass the serving
+    /// budgets `in_use`, to the credit tap's observer
+    /// ([`ReactorEvent::PublisherServing`]).
+    #[cfg(any(test, zakura_sim))]
+    fn report_serving(&self, site: PublisherSite, in_use: Option<ServeInUse>) {
+        let Some(life) = &self.life else {
+            return;
+        };
+        let (live, tombstones, job, subscriptions) = self.state.serving();
+        let mut waits: Vec<u64> = self.waits.signals.iter().map(|(wait, _)| wait.0).collect();
+        waits.sort_unstable();
+        let mut stalls: Vec<u64> = self
+            .state
+            .capacity_waits()
+            .into_iter()
+            .map(|wait| wait.0)
+            .collect();
+        stalls.sort_unstable();
+        life.observer
+            .observe(super::super::observe::ReactorEvent::PublisherServing {
+                peer: life.peer.clone(),
+                session_id: life.session_id,
+                site,
+                live,
+                subscriptions,
+                tombstones,
+                terminals: self.state.queued_terminals(),
+                job,
+                slots: self.slots.peek_held(),
+                waits,
+                stalls,
+                in_use,
+            });
     }
 
     /// The signals stalled subscriptions wait on. It forgets every other.
@@ -335,6 +426,48 @@ struct OwnedTerminal {
 struct EncodedPage {
     page: Page,
     frame: Frame,
+    #[cfg(any(test, zakura_sim))]
+    queued: QueuedPage,
+}
+
+/// What [`ReactorEvent::PageQueued`] reports of an encoded page, and where.
+/// The frame took its entries, so the page keeps their header hashes here.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct QueuedPage {
+    subscription_id: u64,
+    common_ancestor: Frontier,
+    headers: Vec<block::Hash>,
+    initial_target: block::Hash,
+    reaches_target: bool,
+    /// The handle of the retained-path lease the page's read used, which
+    /// [`run_job`] attaches once the read returns the page.
+    lease: Option<u64>,
+    /// The publisher's tap, which [`start_page`] attaches once its job
+    /// returns the page, if the publisher has one.
+    tap: Option<super::CreditTap>,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl QueuedPage {
+    /// Reports the page to its tap, if it has one.
+    fn report(self) {
+        if let Some(tap) = self.tap {
+            tap.observer
+                .observe(super::super::observe::ReactorEvent::PageQueued {
+                    peer: tap.peer,
+                    session_id: tap.session_id,
+                    lease: self
+                        .lease
+                        .expect("run_job names every page's read lease before returning it"),
+                    subscription_id: self.subscription_id,
+                    common_ancestor: self.common_ancestor,
+                    headers: self.headers,
+                    initial_target: self.initial_target,
+                    reaches_target: self.reaches_target,
+                });
+        }
+    }
 }
 
 /// What a page job found instead of a page.
@@ -360,8 +493,9 @@ impl Publisher {
     /// and can close the session.
     ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
-    /// version 9 codec. In test and simulator builds, `tap` reports the
-    /// subscription transitions.
+    /// version 9 codec. In test and simulator builds, `tap`'s regulation
+    /// tap reports the subscription transitions, and its credit tap the
+    /// task's start and end ([`PublisherLife`]).
     pub(crate) fn spawn<const HEADER_BYTES: usize>(
         port: Arc<dyn Port>,
         push: Push,
@@ -369,10 +503,23 @@ impl Publisher {
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
-        #[cfg(any(test, zakura_sim))] tap: Option<crate::zakura::RegulationTap<u64>>,
+        #[cfg(any(test, zakura_sim))] tap: (
+            Option<crate::zakura::RegulationTap<u64>>,
+            Option<super::CreditTap>,
+        ),
     ) -> (Self, JoinHandle<()>) {
+        #[cfg(any(test, zakura_sim))]
+        let (tap, life) = tap;
+        // The token goes to the observer before the task exists, and so
+        // before the service queues the session's admission, so the session
+        // can't end before its token is known.
+        #[cfg(any(test, zakura_sim))]
+        if let Some(life) = &life {
+            life.observer
+                .session_cancel(&life.peer, life.session_id, cancel.clone());
+        }
         let shared = Arc::new(Mutex::new(sim_chain!(
-            PublisherOwner::new(limits) => observed_by(tap)
+            PublisherOwner::new(limits) => observed_by((tap, life.clone()))
         )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
@@ -387,6 +534,8 @@ impl Publisher {
                     push,
                     owner,
                     panics,
+                    #[cfg(any(test, zakura_sim))]
+                    life,
                 },
                 send,
                 panicked,
@@ -446,6 +595,40 @@ struct Task {
     owner: LeaseOwner,
     /// Page jobs report a panic here, even after their page was abandoned.
     panics: mpsc::Sender<Box<dyn Any + Send>>,
+    /// Where the task reports its start and end, if anywhere.
+    #[cfg(any(test, zakura_sim))]
+    life: Option<super::CreditTap>,
+}
+
+/// Reports a publisher task's start as it's made and its end as it drops,
+/// so every way the task ends reports, including an unwind.
+#[cfg(any(test, zakura_sim))]
+struct PublisherLife(super::CreditTap);
+
+#[cfg(any(test, zakura_sim))]
+impl PublisherLife {
+    /// Reports `tap`'s session's publisher started.
+    fn start(tap: super::CreditTap) -> Self {
+        tap.observer
+            .observe(super::super::observe::ReactorEvent::PublisherStarted {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+            });
+        PublisherLife(tap)
+    }
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Drop for PublisherLife {
+    /// Reports the session's publisher ended.
+    fn drop(&mut self) {
+        self.0
+            .observer
+            .observe(super::super::observe::ReactorEvent::PublisherEnded {
+                peer: self.0.peer.clone(),
+                session_id: self.0.session_id,
+            });
+    }
 }
 
 /// A page in progress: its permit wait, its job, and its transport slot.
@@ -482,6 +665,14 @@ async fn publish<const HEADER_BYTES: usize>(
     mut panicked: mpsc::Receiver<Box<dyn Any + Send>>,
     cancel: CancellationToken,
 ) {
+    #[cfg(any(test, zakura_sim))]
+    let _life = task.life.as_ref().map(|tap| {
+        PublisherLife::start(super::CreditTap {
+            observer: tap.observer.clone(),
+            peer: tap.peer.clone(),
+            session_id: tap.session_id,
+        })
+    });
     let mut selected = task.port.selected_chain();
     let mut selected_open = true;
     // The page in progress, under the key state recorded for its job.
@@ -539,7 +730,19 @@ async fn publish<const HEADER_BYTES: usize>(
                 continue;
             }
         }
+        #[cfg(not(any(test, zakura_sim)))]
         let capacity = lock(&task.shared).capacity_signals();
+        // The same pruning, reported under the same lock, since a simulated
+        // lock is a scheduling point.
+        #[cfg(any(test, zakura_sim))]
+        let capacity = {
+            let mut owner = lock(&task.shared);
+            let capacity = owner.capacity_signals();
+            if task.life.is_some() {
+                owner.report_serving(PublisherSite::Pass, Some(task.push.in_use()));
+            }
+            capacity
+        };
         // The page in progress goes first, so a stream of wakes cannot starve
         // it. Each wake still reaches `end_due` on the next pass.
         zakura_rt::select! {
@@ -617,8 +820,17 @@ fn settle(
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
         Progress::Page(encoded, slot) => {
+            #[cfg(not(any(test, zakura_sim)))]
             if lock(shared).state.commit(key, &encoded.page) {
                 slot.send(encoded.frame);
+            }
+            // The same commit, reported under the same lock, since it grows
+            // the subscription's sent-cursor ring, and the same send, which
+            // reports the queued page. Release keeps the statement above
+            // unchanged.
+            #[cfg(any(test, zakura_sim))]
+            if lock(shared).commit_reported(key, &encoded.page) {
+                queue_page(slot, encoded);
             }
             ControlFlow::Continue(())
         }
@@ -649,6 +861,17 @@ fn settle(
             ControlFlow::Continue(())
         }
         Progress::Closed => ControlFlow::Break(lock(shared).state.closed()),
+    }
+}
+
+/// Queues committed `encoded`'s frame on its transport `slot`, the page's
+/// hand-off to the writer, then reports the page
+/// ([`ReactorEvent::PageQueued`]) if the queue took it, so a page whose
+/// frame isn't queued, such as one sent to a closed queue, reports nothing.
+#[cfg(any(test, zakura_sim))]
+fn queue_page(slot: PushSend<'_>, encoded: EncodedPage) {
+    if slot.send(encoded.frame) {
+        encoded.queued.report();
     }
 }
 
@@ -684,6 +907,12 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let seen = job.selected.clone();
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
     let check = job.count == 0;
+    #[cfg(any(test, zakura_sim))]
+    let tap = task.life.as_ref().map(|life| super::CreditTap {
+        observer: life.observer.clone(),
+        peer: life.peer.clone(),
+        session_id: life.session_id,
+    });
     Box::pin(async move {
         let permit = if check {
             Admission::Check {
@@ -721,6 +950,14 @@ fn start_page<'a, const HEADER_BYTES: usize>(
                 unreachable!("a check runs `check_following`, which reads no page")
             }
             (Err(refusal), _) => return Progress::Refused(refusal),
+        };
+        #[cfg(any(test, zakura_sim))]
+        let encoded = EncodedPage {
+            queued: QueuedPage {
+                tap,
+                ..encoded.queued
+            },
+            ..encoded
         };
         let Ok(slot) = permit.reserve_send(send).await else {
             return Progress::Closed;
@@ -830,7 +1067,17 @@ async fn run_job<const HEADER_BYTES: usize>(
             want_tree_aux: job.schema == AuxSchema::V1,
         };
         match port.read_header_path(path.clone(), read).await {
+            #[cfg(not(any(test, zakura_sim)))]
             Ok(ReadPathReply::Page(page)) => return page_output::<HEADER_BYTES>(job, *page),
+            // The same page, naming the lease its read used.
+            #[cfg(any(test, zakura_sim))]
+            Ok(ReadPathReply::Page(page)) => {
+                let lease = path.handle_id();
+                return page_output::<HEADER_BYTES>(job, *page).map(|mut encoded| {
+                    encoded.queued.lease = Some(lease);
+                    encoded
+                });
+            }
             // The lease expired or state evicted it. Acquire it again from
             // the last header sent.
             Ok(ReadPathReply::Unavailable) => release(port, job.id, path).await,
@@ -975,6 +1222,16 @@ fn page_output<const HEADER_BYTES: usize>(
     };
     let last = Frontier::new(block::Height(height), last.header.hash());
     let reaches_target = reaches_target(job.following, last.hash, job.initial_target);
+    #[cfg(any(test, zakura_sim))]
+    let queued = QueuedPage {
+        subscription_id: job.id,
+        common_ancestor: page.common_ancestor,
+        headers: entries.iter().map(|entry| entry.header.hash()).collect(),
+        initial_target: job.initial_target,
+        reaches_target,
+        lease: None,
+        tap: None,
+    };
     let frame = encode_frame(&Message::<HEADER_BYTES>::Headers(Headers {
         subscription_id: job.id,
         initial_target_tip_hash: job.initial_target,
@@ -996,6 +1253,8 @@ fn page_output<const HEADER_BYTES: usize>(
                     payload_len: frame.payload.len(),
                 },
                 frame,
+                #[cfg(any(test, zakura_sim))]
+                queued,
             })
         }
         _ => Err(Output::Stall(Stall::Local, "encode").into()),

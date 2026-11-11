@@ -186,6 +186,7 @@ fn bypasses_follow_their_committed_input() {
         [
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
+            "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",

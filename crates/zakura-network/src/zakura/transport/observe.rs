@@ -36,6 +36,11 @@ use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 pub trait TransportObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: TransportEvent);
+
+    /// Receives a probe of connection `conn_id`'s transport resources, once
+    /// its gates exist, right after its registration. The default drops it.
+    #[cfg(zakura_sim)]
+    fn connection(&self, _conn_id: ZakuraConnId, _probe: super::ConnectionProbe) {}
 }
 
 /// One transport event.
@@ -65,6 +70,9 @@ pub enum TransportEvent {
     HandshakeRefused {
         /// The remote address the connection was admitted from.
         remote: SocketAddr,
+        /// The ID both ends derive from the connection's TLS handshake
+        /// ([`zakura_quic::Conn::shared_id`]).
+        shared_id: [u8; 16],
         /// The handshake error, or the refusal's trace label.
         reason: String,
     },
@@ -74,6 +82,9 @@ pub enum TransportEvent {
         conn_id: ZakuraConnId,
         /// The remote address the connection was admitted from.
         remote: SocketAddr,
+        /// The ID both ends derive from the connection's TLS handshake
+        /// ([`zakura_quic::Conn::shared_id`]).
+        shared_id: [u8; 16],
     },
     /// A service session's stream started, with the limits and queue depths
     /// its worker installed.
@@ -277,6 +288,23 @@ pub enum Transition {
         objects: u32,
         /// Bytes the grant adds.
         bytes: u32,
+    },
+    /// Serving counted the commitment of a request it admits, before it
+    /// checked the count against the margin. It's reported right after the
+    /// count changes, with no preemption point between.
+    CommitmentCounted {
+        /// The request's position among the stream's reads, or `None` if it
+        /// didn't come through a tagged reader.
+        seq: Option<u64>,
+        /// The request row's message type.
+        message_type: u16,
+    },
+    /// Serving released one commitment of a request row: the request's
+    /// ending entered the output, or the request was dropped. It's reported
+    /// right after the count changes, with no preemption point between.
+    CommitmentReleased {
+        /// The request row's message type.
+        message_type: u16,
     },
 }
 

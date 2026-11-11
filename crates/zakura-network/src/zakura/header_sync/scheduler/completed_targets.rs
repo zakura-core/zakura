@@ -48,6 +48,24 @@ impl CompletedHeaderTargets {
             .retain(|key| key.generation == generation && key.branch.anchor_hash == finalized.hash);
     }
 
+    /// Every completed target, by generation and branch, sorted.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn keys(&self) -> Vec<(HeaderGeneration, BranchId)> {
+        let mut keys: Vec<(HeaderGeneration, BranchId)> = self
+            .0
+            .iter()
+            .map(|key| (key.generation, key.branch))
+            .collect();
+        keys.sort_unstable_by_key(|(generation, branch)| {
+            (
+                generation.get(),
+                branch.anchor_hash.0,
+                branch.target_tip_hash.0,
+            )
+        });
+        keys
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()

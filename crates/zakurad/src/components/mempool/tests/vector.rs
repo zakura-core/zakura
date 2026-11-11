@@ -28,6 +28,7 @@ use zakura_chain::{
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
@@ -307,13 +308,13 @@ fn transaction_data_failures_ban_every_version() {
 /// its upgrade, and the verifier rejects a mismatch before these checks.
 #[test]
 fn upgrade_dependent_failures_ban_only_v5_and_later() {
-    use zakura_chain::primitives::{ed25519, reddsa, redjubjub};
+    use zakura_chain::primitives::{reddsa, redjubjub};
 
     for error in [
         TransactionError::Script(zakura_script::Error::ScriptInvalid),
         TransactionError::SaplingVerificationFailed,
         TransactionError::Halo2VerificationFailed,
-        TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+        TransactionError::Ed25519("invalid signature".to_owned()),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
         TransactionError::DisabledAddToOrchardPool,
@@ -2667,7 +2668,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Don't commit the mainnet genesis block; we commit the generated chain instead.
     let (
-        mut mempool,
+        mempool,
         mut peer_set,
         mut state_service,
         mut chain_tip_change,
@@ -2675,6 +2676,9 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup(&network, u64::MAX, false).await;
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
+    let mut mempool =
+        mempool.with_trace(JsonlEventEmitter::new(JsonlTracer::new(trace_tx), "test"));
 
     // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
     // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
@@ -2795,8 +2799,12 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Commit the next block (a plain `Grow`). This increases the tip height past the expected
     // tip height that the tx was verified at, so the mempool must re-verify it.
-    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, grow_block)
-        .await;
+    commit_block_and_wait_for_tip_change(
+        &mut state_service,
+        &mut chain_tip_change,
+        grow_block.clone(),
+    )
+    .await;
 
     // Query the mempool to make it poll tx_downloads.pending and try reverifying transactions
     // because the tip height has changed.
@@ -2806,6 +2814,29 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
+
+    // The trace records the reset that re-queued the transaction, then the grow.
+    let mut rows = Vec::new();
+    while let Ok(written) = trace_rx.try_recv() {
+        let row: serde_json::Value =
+            serde_json::from_slice(&written.line).expect("each trace row is JSON");
+        rows.push(row);
+    }
+    for (block, action, requeued) in [(&reset_block, "reset", 1), (&grow_block, "grow", 0)] {
+        let row = rows
+            .iter()
+            .find(|row| row["tip_hash"] == block.hash().to_string())
+            .unwrap_or_else(|| panic!("no row for {}: {rows:?}", block.hash()));
+        assert_eq!(row["event"], "mempool_tip_processed");
+        assert_eq!(row["action"], action);
+        assert_eq!(
+            row["tip_height"],
+            block.coinbase_height().expect("the block has a height").0
+        );
+        assert_eq!(row["tx_count_after"], 0);
+        assert_eq!(row["requeued"], requeued);
+        assert!(row["process_us"].is_u64(), "{row}");
+    }
 
     Ok(())
 }

@@ -1,0 +1,11 @@
+# A subscription's first page declares its common ancestor one height above
+# the one storage read from, with the right hash. On the served-one-header
+# witness the node's only page is a first page, so only the read's start
+# height can tell. The page publisher builds the declared ancestor, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.plan"

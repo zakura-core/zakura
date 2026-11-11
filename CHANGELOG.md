@@ -11,6 +11,187 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.6] - 2026-11-10
+
+This node release uses an explicitly approved patch-version exception, including
+the removals documented below. Published library crates retain their independently
+required version bumps ([#2278](https://github.com/zakura-core/zakura/pull/2278)).
+
+### Added
+
+- Added `network.unconditional_peers`, a list of peer IP addresses and CIDR
+  ranges that Zakura never scores, bans, or penalizes with mempool cooldowns
+  and their disconnects. CIDR entries must have no host bits set. Zakura ignores misbehavior reports
+  for these peers, so tip lag, upgrade boundaries, or bugs cannot get your own
+  nodes, miners, or sidecars banned. The default is empty
+  ([#1231](https://github.com/zakura-core/zakura/pull/1231)).
+- Added `rpc.allow_unauthenticated_admin` (disabled by default) to allow
+  `invalidateblock`, `reconsiderblock`, and `preciousblock` without cookie
+  authentication on the primary RPC listener. Enabling this assumes the
+  administrator has correctly configured firewall rules restricting access to
+  trusted clients. Browser requests, which carry an `Origin` header, are
+  rejected so web pages can't reach these methods
+  ([#2088](https://github.com/zakura-core/zakura/pull/2088)).
+- Added a `sprout` cargo feature that gates Sprout JoinSplit proof
+  verification. It is enabled by default for now. Builds without it refuse
+  JoinSplits as a retryable verifier failure, so they stall rather than fork
+  on a pre-NU7 block above the last checkpoint
+  ([#2149](https://github.com/zakura-core/zakura/pull/2149)).
+- Added the `sync.header.peer.lifecycle_refused.total` metric, which counts
+  header sync sessions refused because the node fell behind on peer
+  connections and disconnections
+  ([#2211](https://github.com/zakura-core/zakura/pull/2211)).
+- Added three JSONL trace tables that `zakurad` writes when
+  `network.zakura.trace_dir` is set: `chain_tip.jsonl`, `mempool.jsonl`, and
+  `mining_template.jsonl`. They record each stage from a new best tip to the
+  `getblocktemplate` response, with the state writer's queue and commit times.
+  The `ts` field in every trace table now counts from one origin per process,
+  so rows from different tables can be compared
+  ([#2261](https://github.com/zakura-core/zakura/pull/2261)).
+
+### Changed
+
+- Renamed the `[network]` settings `advert_window_min` to `advert_window_full_block` and
+  `advert_window_max` to `advert_window_small_block`, so each name says which block size
+  it applies to. The old names still load from a config file. Rename the
+  `ZAKURA_NETWORK__ADVERT_WINDOW_MIN` and `ZAKURA_NETWORK__ADVERT_WINDOW_MAX`
+  environment variables to `ZAKURA_NETWORK__ADVERT_WINDOW_FULL_BLOCK` and
+  `ZAKURA_NETWORK__ADVERT_WINDOW_SMALL_BLOCK` too: an old variable plus a regenerated
+  config that holds the new name fails startup with a duplicate field error
+  ([#2081](https://github.com/zakura-core/zakura/pull/2081)).
+- The `sprout` cargo feature now also gates Sprout Ed25519 `joinSplitSig`
+  verification, so builds without it contain no Sprout verifier. It remains
+  enabled by default
+  ([#2167](https://github.com/zakura-core/zakura/pull/2167)).
+- `zakura-network`'s `ZakuraNodeRecord::signature` is now `[u8; 64]`
+  instead of an `ed25519-zebra` signature. Discovery records and their wire
+  format are unchanged
+  ([#2170](https://github.com/zakura-core/zakura/pull/2170)).
+- `zakura-chain` holds a transaction's `joinSplitPubKey` and `joinSplitSig`
+  as plain bytes (`JoinSplitPubKey`, `JoinSplitSig`) and no longer re-exports
+  `ed25519-zebra` as `primitives::ed25519`. Their serialized forms are
+  unchanged. `zakura-consensus`'s `TransactionError::Ed25519` now carries the
+  error message
+  ([#2171](https://github.com/zakura-core/zakura/pull/2171)).
+- Reduced database reads when finalizing blocks above the checkpoint by reusing
+  the spent transparent outputs that contextual validation already resolved
+  ([#2188](https://github.com/zakura-core/zakura/pull/2188)).
+- `getblock` and `getrawtransaction` with verbosity 0 return finalized blocks
+  and transactions from their stored bytes instead of decoding and
+  re-serializing them. Responses are unchanged. State request metrics label
+  these reads `raw_block` and `any_chain_raw_transaction` instead of `block`
+  and `any_chain_transaction`
+  ([#2201](https://github.com/zakura-core/zakura/pull/2201)).
+- `zakura-state` adds `ReadRequest::RawBlock` and
+  `ReadRequest::AnyChainRawTransaction`, answered by `ReadResponse::RawBlock`
+  and `ReadResponse::RawTransaction`. Code that matches every `ReadRequest` or
+  `ReadResponse` variant must handle them
+  ([#2201](https://github.com/zakura-core/zakura/pull/2201)).
+- The indexer gRPC `GetBlock` method and the `hex` field of verbose
+  `getrawtransaction` return finalized blocks and transactions from their
+  stored bytes instead of re-serializing them. Responses are unchanged
+  ([#2205](https://github.com/zakura-core/zakura/pull/2205)).
+- `zakura-state`'s `ReadResponse::AnyChainTransaction` also carries the
+  transaction's consensus serialization, and `zakura-rpc` adds
+  `BlockAndHash::from_serialized` and
+  `TransactionObject::from_serialized_transaction`
+  ([#2205](https://github.com/zakura-core/zakura/pull/2205)).
+- The RPC retry queue checks whether queued transactions were mined with one
+  transaction index lookup per transaction, instead of reading and decoding
+  each transaction after every block. A queued transaction whose transaction
+  ID was mined with different authorizing data is now removed instead of
+  being retried until it expires. State request metrics label these reads
+  `mined_transaction_ids` instead of `transaction`
+  ([#2206](https://github.com/zakura-core/zakura/pull/2206)).
+- `zakura-state` adds `ReadRequest::MinedTransactionIds`, answered by
+  `ReadResponse::MinedTransactionIds`. Code that matches every `ReadRequest`
+  or `ReadResponse` variant must handle them
+  ([#2206](https://github.com/zakura-core/zakura/pull/2206)).
+- RPC methods encode and decode block and transaction hex with a SIMD codec.
+  Per 2 MB block, `getblocktemplate` transaction encoding drops from about
+  7 ms to 2 ms and `submitblock` decoding from about 2 ms to 0.6 ms on x86-64.
+  Responses and accepted inputs are unchanged
+  ([#2207](https://github.com/zakura-core/zakura/pull/2207)).
+- The RPC server parses a plain JSON-RPC 2.0 request body once instead of
+  twice, which saves about 0.7 ms per 2 MB block in `submitblock` on x86-64.
+  Requests and responses are unchanged
+  ([#2210](https://github.com/zakura-core/zakura/pull/2210)).
+- `zakura-network`: `HeaderSyncStartup::new` now takes the node's admitted
+  connection count as a required argument instead of defaulting it to 92,
+  since that count now sizes the header sync lifecycle queue
+  ([#2211](https://github.com/zakura-core/zakura/pull/2211)).
+- The RPC server also parses `submitblock` calls with a work ID, and calls
+  from JSON-RPC 1.0 and bitcoind-style clients, once instead of re-encoding
+  them, which saves about 3.6 ms per 2 MB block on x86-64. Requests and
+  responses are unchanged
+  ([#2219](https://github.com/zakura-core/zakura/pull/2219)).
+- Transaction gossip no longer waits for every peer in a broadcast to finish
+  before sending the next batch, so one slow peer can't delay transaction
+  propagation by up to 6 seconds per hop. The gossip task now also times out
+  while waiting for the network to be ready, and keeps the waiting transaction
+  IDs pending until it can send them
+  ([#2220](https://github.com/zakura-core/zakura/pull/2220)).
+- Block announcements now reach peers outside the initial group after one
+  500 ms delay instead of immediately. `advert_delay` replaces
+  `advert_delay_min` and `advert_delay_max`; configs with the old names still
+  load, using `advert_delay_max` as the delay and ignoring `advert_delay_min`
+  ([#2237](https://github.com/zakura-core/zakura/pull/2237)).
+- Updated Common to 5.4.0, bringing faster proof verification, point
+  decompression, and Orchard bundle decoding
+  ([#2274](https://github.com/zakura-core/zakura/pull/2274)).
+
+### Removed
+
+- `zakura-chain` no longer defines the unused Sprout types
+  `sprout::keys::PayingKey` and `sprout::commitment::CommitmentRandomness`
+  ([#2200](https://github.com/zakura-core/zakura/pull/2200)).
+- Removed the `audit-historical-treestates` and `verify-historical-treestates`
+  subcommands from default `zakurad` builds. Build with the
+  `debug-commands` feature to use them
+  ([#2226](https://github.com/zakura-core/zakura/pull/2226)).
+
+### Fixed
+
+- Include native commit ownership and fallback phase in fleet stall alerts when the node exports them ([#1021](https://github.com/zakura-core/zakura/pull/1021)).
+- Reduced block-validation time and memory use for output-heavy transparent workloads
+  by reusing outputs in retained block records
+  ([#2151](https://github.com/zakura-core/zakura/pull/2151)).
+- A peer flood that spends header sync's Tokio cooperative budget no longer
+  hides ready storage completions or committed-state changes from the run
+  loop's per-turn checks. Before, a VCT apply that finished at its hard
+  deadline could stay hidden while the loop read the state it published, and
+  the deadline check then shut the node down
+  ([#2152](https://github.com/zakura-core/zakura/pull/2152)).
+- Header sync no longer enforces a deadline before it handles the ready
+  completion or VCT repair status that would retire that work. Before, a
+  VCT apply that finished at its hard deadline could still shut the node
+  down, and a repair supplier could be charged for a request the repair no
+  longer needed ([#2178](https://github.com/zakura-core/zakura/pull/2178)).
+- Header sync charges a peer for a request it left unanswered when it
+  replaces its session. Before, a peer could open a new session just before
+  each request timeout and hold a header slot without ever answering
+  ([#2182](https://github.com/zakura-core/zakura/pull/2182)).
+
+### Security
+
+- Header sync now keeps at most as many readmission cooldowns as it admits
+  header peers, so a stream of fresh identities that each fault can no longer
+  grow that state and the reactor work on it without bound
+  ([#2131](https://github.com/zakura-core/zakura/pull/2131)).
+- Header sync now remembers at most as many `HistoryPruned` backoffs as it
+  admits header peers, so peers that keep reconnecting under new identities
+  can no longer grow that state and the reactor's scan over it without bound
+  ([#2209](https://github.com/zakura-core/zakura/pull/2209)).
+- Peers that dial in to a v2 node can now hold at most three quarters of its
+  connection and control-handshake slots (69 of 92 and 24 of 32 by default),
+  so inbound load can no longer stop the node from dialing peers it picks
+  itself ([#2242](https://github.com/zakura-core/zakura/pull/2242)).
+- A v2 node now counts each global IPv6 /64 as one host for its per-IP
+  connection and handshake limits, so one machine can no longer bypass the
+  16-connection cap by using a fresh address from its /64 for each identity.
+  IPv4 and non-global IPv6 addresses still count one by one
+  ([#2243](https://github.com/zakura-core/zakura/pull/2243)).
+
 ## [1.8.5] - 2026-11-07
 
 ### Changed

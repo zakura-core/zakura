@@ -1,0 +1,12 @@
+# The planner treats a same-anchor insertion under an older generation as
+# current, rewriting its owner to the engine's generation. The witness
+# holds one fork's apply while the other fork commits, so the held apply
+# changes the engine under the generation before that commit.
+# The planner, the queue and the reactor decide when each fork's apply runs
+# and under which generation, so a change there can move the witness off it.
+checks = ["crates/zakura-header-chain/src/transition", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-chain-fork-stale-apply.json"
+plan = "crates/zakura-sim/tests/fixtures/header-chain-fork-stale-apply.plan"

@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index deb8ffc631..341c8a930e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -670,7 +670,10 @@ impl PeerWorkQueue {
+         #[cfg(any(test, zakura_sim))]
+         self.end_as(peer, ReservationEnd::Released);
+         self.request_reservations.remove(peer);
+-        self.staged_capacity.remove(peer);
++        // Mutation: a released round's lease list empties but keeps its key.
++        if let Some(leases) = self.staged_capacity.get_mut(peer) {
++            leases.clear();
++        }
+     }
+ 
+     pub(in crate::zakura::header_sync) fn stage(

@@ -482,7 +482,9 @@ impl MetaAddr {
         self.addr
     }
 
-    /// Return the address preference level for this `MetaAddr`.
+    /// Validate this address, returning equal preference for all valid listening ports.
+    ///
+    /// This published accessor remains available, but no longer ranks default ports.
     pub fn peer_preference(&self) -> Result<PeerPreference, &'static str> {
         PeerPreference::new(self.addr, None)
     }
@@ -1186,7 +1188,13 @@ impl MetaAddrChange {
                 // This is a wall clock time, but we already checked that responses are in order.
                 // Even if the wall clock time has jumped, we want to use the latest time.
                 last_response: self.last_response(local_now).or(previous.last_response),
-                rtt: self.rtt(),
+                // Only measurements from the current connection remain useful.
+                rtt: match self {
+                    MetaAddrChange::UpdatePingSent { .. }
+                    | MetaAddrChange::UpdateResponded { .. }
+                    | MetaAddrChange::UpdateMisbehavior { .. } => self.rtt().or(previous.rtt),
+                    _ => None,
+                },
                 ping_sent_at: self.ping_sent_at(),
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
@@ -1218,8 +1226,7 @@ impl Ord for MetaAddr {
         // First, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
-        // Then, try addresses that are more likely to be valid.
-        // Currently, this prefers addresses with canonical Zcash ports.
+        // Keep valid addresses before invalid ones, without ranking their ports.
         let more_likely_valid = self.peer_preference().cmp(&other.peer_preference());
 
         // # Security and Correctness

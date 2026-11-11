@@ -18,6 +18,10 @@ pub enum Assume {
     BoundedAdversary,
     /// No connects or disconnects after a start step.
     StableMembership,
+    /// From a start step on, the run's picks and draws follow the recovery
+    /// policy, which picks each action that stays enabled within a bounded
+    /// number of picks (see the `plan` module).
+    FairScheduling,
 }
 
 /// One assumption a scenario declares, with its parameters, as the trace's
@@ -38,7 +42,8 @@ pub struct AssumeRecord {
 /// A property that assumes something the scenario doesn't declare is
 /// `NotApplicable`. The harness enforces what it declares, so `holds` is
 /// false only while the scenario deliberately breaks an assumption, as
-/// during a fault.
+/// during a fault. Only the environment breaks one, never the node under
+/// test ([`EndedBy`](super::EndedBy)).
 pub struct Assumptions<S> {
     declared: Vec<AssumeRecord>,
     pub(crate) holds: fn(&S, Assume) -> bool,

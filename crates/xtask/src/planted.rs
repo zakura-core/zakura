@@ -4,8 +4,12 @@
 //!
 //! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
 //! change that bypasses the property's guard, with `<name>.toml` beside it
-//! naming the committed fuzz input that must find the bug. The input's own
-//! sidecar names its harness.
+//! naming what must find the bug: either the committed fuzz input, whose
+//! own sidecar names its harness, or a typed case, a `[typed]` table naming
+//! the harness, a committed scenario as that harness's JSON and the Plan
+//! bytes it runs under. A typed case is for a scenario the harness's
+//! grammar can't encode, such as one with a control step or more mirrors
+//! than the grammar takes.
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
@@ -15,16 +19,21 @@
 //! 1. records the input with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
 //!    expecting `holds`;
-//! 2. applies the patch, rebuilds and records the input again, which must
-//!    violate exactly the case's property and pass its witness test
-//!    expecting `violated`;
+//! 2. applies the patch, which must not change, delete or rename the
+//!    case's witness files (its input and sidecar, or its scenario and
+//!    Plan bytes), so both runs read the same committed witness. It then
+//!    rebuilds and records the input again, which must violate the case's
+//!    property and no property outside the case's `also_violates`, and pass
+//!    its witness test expecting `violated` beside those;
 //! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
 //!    pass the witness test. A case file's `also_violates` names properties
-//!    the patch's bug breaks too, and a campaign run may violate one of
-//!    them instead;
-//! 4. resets the worktree to `HEAD`, so the next patched build recompiles
+//!    the patch's bug breaks too. Any run may violate them beside the case's
+//!    property, and a campaign run may violate one of them instead;
+//! 4. for a typed case, replays the patched trace in a fresh `zakura-sim
+//!    replay`, which must match Exact, since no fuzz target can confirm it;
+//! 5. resets the worktree to `HEAD`, so the next patched build recompiles
 //!    only what the two patches touch.
 //!
 //! It then removes the worktree, keeping every trace as evidence.
@@ -34,17 +43,17 @@
 //! simulator's own witness tests use, and writes the result beside the
 //! trace.
 //!
-//! A patch that doesn't apply, a build that fails, a harness failure, a
-//! violation of another property, a patch the input doesn't catch, and a
-//! catch that misses the trigger history are each reported as their own
-//! failure, never as a catch. The campaign reports how many of its inputs
+//! A patch that doesn't apply or changes a witness file, a build that
+//! fails, a harness failure, a violation of another property, a patch the
+//! input doesn't catch, and a catch that misses the trigger history are
+//! each reported as their own failure, never as a catch. The campaign reports how many of its inputs
 //! caught the patch, and how the others' runs ended. It fails the case only
 //! on a run that fails, ends at a harness failure, violates another
 //! property not in `also_violates`, doesn't report the case's property, or
 //! violates it without its trigger history, so the gate stays the committed
-//! input, which must violate exactly the case's property.
+//! input, which must violate the case's property.
 //!
-//! `--targets` runs only the cases whose committed input runs on a harness
+//! `--targets` runs only the cases whose committed fuzz input runs on a harness
 //! that a simulator fuzz target runs, as the fuzz package's
 //! `[package.metadata.zakura-sim.targets]` table maps them, and prints
 //! each target's cases, or that it has none. After step 3 it also confirms
@@ -65,9 +74,9 @@
 //! holds no case fails the run, so a run that passes ran at least one case.
 //! A case's shard follows from its position, so adding or removing a case
 //! moves every later case to another shard: across that change, a case can
-//! run on two nights in a row, or wait up to `2 * count - 1` nights. The
-//! nightly job runs one shard a night, and a remote host runs the whole
-//! catalogue (qa/fuzz/sim's README, Long runs).
+//! run in two consecutive shard runs, or wait up to `2 * count - 1` shard
+//! runs. The nightly job runs two shards a night, and a remote host runs
+//! the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -102,16 +111,21 @@ use crate::{
     BoxError,
 };
 
+mod mutation_loop;
 mod pilot;
 
 #[allow(dead_code)]
 #[path = "../../zakura-sim/build/provenance.rs"]
-mod provenance;
+pub(super) mod provenance;
 
+/// Where the cases live and the property each bypasses, shared with the
+/// simulator's checks of the catalogue.
+#[path = "../../zakura-sim/src/planted.rs"]
+mod planted_layout;
+
+pub(super) use mutation_loop::run as mutation_loop;
 pub(super) use pilot::run as pilot;
-
-/// Where the planted cases live, relative to the repository root.
-const PLANTED_DIR: &str = "qa/planted";
+use planted_layout::PLANTED_DIR;
 
 /// What every case runs on, relative to the repository root: xtask, which
 /// holds this runner and the flags and arguments it runs with, the
@@ -132,7 +146,7 @@ const SHARED: &[&str] = &[
 /// The cargo profile every case builds with: optimized, with the dev
 /// profile's debug assertions and overflow checks (the workspace's
 /// `Cargo.toml`).
-const PROFILE: &str = "planted";
+pub(super) const PROFILE: &str = "planted";
 
 /// Fuzz inputs the short campaign records after the committed input.
 const CAMPAIGN_INPUTS: usize = 32;
@@ -193,35 +207,112 @@ struct Case {
     property: String,
     /// The patch.
     patch: PathBuf,
-    /// The committed fuzz input that must find it, relative to the
-    /// repository root.
-    input: PathBuf,
+    /// What must find it.
+    witness: Witness,
     /// Other paths whose change can break the catch, relative to the
     /// repository root.
     checks: Vec<PathBuf>,
-    /// Other properties the patch's bug breaks, which a campaign run may
-    /// violate instead of the case's property.
+    /// Other properties the patch's bug breaks, which any run may violate
+    /// beside the case's property, and a campaign run instead of it.
     also_violates: Vec<String>,
     /// The simulator fuzz target that runs the input's harness, with
     /// `--targets`.
     target: Option<String>,
 }
 
+/// What a case runs, with paths relative to the repository root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Witness {
+    /// A committed fuzz input, whose sidecar names its harness.
+    Input(PathBuf),
+    /// A committed scenario, as `harness`'s JSON, run under the Plan bytes
+    /// in `plan`.
+    Typed {
+        /// The harness.
+        harness: String,
+        /// The scenario file.
+        scenario: PathBuf,
+        /// The Plan bytes file.
+        plan: PathBuf,
+    },
+}
+
+impl Witness {
+    /// The harness it runs on, read from the input's sidecar under
+    /// `root` for a fuzz input.
+    fn harness(&self, root: &Path) -> Result<String, BoxError> {
+        match self {
+            Witness::Input(input) => harness_of(root, input),
+            Witness::Typed { harness, .. } => Ok(harness.clone()),
+        }
+    }
+
+    /// Its committed files: the input and its sidecar, or the scenario and
+    /// the Plan bytes.
+    fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Witness::Input(input) => vec![input.clone(), input.with_extension("toml")],
+            Witness::Typed { scenario, plan, .. } => vec![scenario.clone(), plan.clone()],
+        }
+    }
+
+    /// Its files under `root`, as [`record`] runs them.
+    fn located(&self, root: &Path) -> Located {
+        match self {
+            Witness::Input(input) => Located::Input(root.join(input)),
+            Witness::Typed { scenario, plan, .. } => Located::Typed {
+                scenario: root.join(scenario),
+                plan: root.join(plan),
+            },
+        }
+    }
+}
+
+/// What [`record`] runs, by its files' paths.
+#[derive(Clone, Debug)]
+pub(super) enum Located {
+    /// A full fuzz input.
+    Input(PathBuf),
+    /// A scenario file and its Plan bytes file.
+    Typed {
+        /// The scenario file.
+        scenario: PathBuf,
+        /// The Plan bytes file.
+        plan: PathBuf,
+    },
+}
+
+/// A typed case's `[typed]` table.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedFile {
+    /// The harness the scenario runs on.
+    harness: String,
+    /// The scenario, as the harness's JSON, relative to the repository
+    /// root.
+    scenario: PathBuf,
+    /// The Plan bytes, relative to the repository root.
+    plan: PathBuf,
+}
+
 /// A case's `<name>.toml`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
-    /// The committed fuzz input, relative to the repository root.
-    input: PathBuf,
+    /// The committed fuzz input, relative to the repository root. A case
+    /// names this or `typed`, never both.
+    input: Option<PathBuf>,
+    /// The typed case, for a scenario the harness's grammar can't encode.
+    typed: Option<TypedFile>,
     /// Files or directories, relative to the repository root, whose change
     /// can break the catch besides the files the patch changes and
     /// [`SHARED`], such as the rest of the patched module.
     #[serde(default)]
     checks: Vec<PathBuf>,
-    /// Other properties the patched bug breaks, by ID. A campaign input's
-    /// run may violate one of them instead of the case's property, as when
-    /// a leaked charge also takes the byte budget past its bound. The
-    /// committed input must still violate exactly the case's property.
+    /// Other properties the patched bug breaks, by ID, as when a leaked
+    /// charge also takes the byte budget past its bound. Any run may violate
+    /// them beside the case's property, and a campaign input's run instead
+    /// of it. The committed input must still violate the case's property.
     #[serde(default)]
     also_violates: Vec<String>,
 }
@@ -249,9 +340,9 @@ enum Run {
     Ended {
         /// The violation that stopped the run, if one did.
         violation: Option<String>,
-        /// The first property other than the case's whose report is
-        /// `violated`, for a run no violation stopped.
-        other_violated: Option<String>,
+        /// Every property other than the case's whose report is
+        /// `violated`, in report order.
+        others_violated: Vec<String>,
         /// The case's property's outcome, such as `held`, or `None` if the
         /// run doesn't report it.
         outcome: Option<String>,
@@ -290,6 +381,9 @@ enum Verdict {
     BaselineFails(String),
     /// The patch doesn't apply to `HEAD`.
     PatchDoesntApply(String),
+    /// The patch changes, deletes or renames these witness files of the
+    /// case.
+    PatchesWitness(Vec<PathBuf>),
     /// The patched build or run failed before it wrote a trace.
     Failed(String),
     /// The patched run ended at a harness failure.
@@ -304,6 +398,8 @@ enum Verdict {
     /// The patched run violated the property, but its witness test failed,
     /// as when the run missed the trigger history.
     WitnessFails(String),
+    /// A typed case's patched trace didn't replay Exact in a fresh process.
+    ReplayMisses(String),
     /// The patched input didn't confirm through the fuzz target that runs
     /// its harness.
     TargetMisses {
@@ -344,6 +440,14 @@ impl fmt::Display for Verdict {
             }
             Verdict::BaselineFails(why) => write!(f, "the unpatched baseline fails: {why}"),
             Verdict::PatchDoesntApply(why) => write!(f, "the patch doesn't apply: {why}"),
+            Verdict::PatchesWitness(files) => {
+                f.write_str("the patch changes the case's witness files")?;
+                for (index, file) in files.iter().enumerate() {
+                    let lead = if index == 0 { ": " } else { ", " };
+                    write!(f, "{lead}{}", file.display())?;
+                }
+                Ok(())
+            }
             Verdict::Failed(why) => write!(f, "the patched run failed: {why}"),
             Verdict::Harness(why) => write!(f, "the patched run hit a harness failure: {why}"),
             Verdict::Unrelated(property) => {
@@ -355,6 +459,9 @@ impl fmt::Display for Verdict {
             Verdict::Unreported => f.write_str("the patched run didn't report the property"),
             Verdict::WitnessFails(why) => {
                 write!(f, "the patched run's witness test fails: {why}")
+            }
+            Verdict::ReplayMisses(why) => {
+                write!(f, "the patched trace doesn't replay Exact: {why}")
             }
             Verdict::TargetMisses { target, why } => {
                 write!(
@@ -390,7 +497,10 @@ pub(super) fn run(
         let harnesses = sim_minimize::fuzz_targets(repo_root)?;
         let mut on_targets = Vec::new();
         for mut case in cases {
-            case.target = target_of(&harnesses, &harness_of(repo_root, &case.input)?);
+            // A typed case has no fuzz input for a target to run.
+            if let Witness::Input(input) = &case.witness {
+                case.target = target_of(&harnesses, &harness_of(repo_root, input)?);
+            }
             if case.target.is_some() {
                 on_targets.push(case);
             }
@@ -470,24 +580,29 @@ pub(super) fn run(
     Ok(())
 }
 
+/// The index [`run`] gives case `name` of `property` when it runs that
+/// property without `--targets`: its position among the property's cases
+/// in path order, which names its `case-<index>` directory.
+pub(super) fn case_index(repo_root: &Path, property: &str, name: &str) -> Result<usize, BoxError> {
+    cases(repo_root)?
+        .into_iter()
+        .filter(|case| case.property == property)
+        .position(|case| case.patch.file_stem().and_then(|stem| stem.to_str()) == Some(name))
+        .ok_or_else(|| format!("{property}/{name} has no planted case").into())
+}
+
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
 fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
     let root = repo_root.join(PLANTED_DIR);
-    let mut patches = Vec::new();
-    find_patches(&root, &mut patches)?;
-    patches.sort();
-    patches
+    planted_layout::files(&root, "patch")?
         .into_iter()
         .map(|patch| {
-            let property = patch
-                .parent()
-                .and_then(|dir| dir.strip_prefix(&root).ok())
-                .and_then(Path::to_str)
-                .ok_or_else(|| format!("{} isn't under a property", patch.display()))?
-                .to_owned();
+            let property = planted_layout::property_id(&root, &patch)
+                .ok_or_else(|| format!("{} isn't under a property", patch.display()))?;
             let case_file = patch.with_extension("toml");
             let CaseFile {
                 input,
+                typed,
                 checks,
                 also_violates,
             } = toml::from_str(
@@ -495,7 +610,31 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
-            for path in std::iter::once(&input).chain(&checks) {
+            let witness = match (input, typed) {
+                (Some(input), None) => Witness::Input(input),
+                (
+                    None,
+                    Some(TypedFile {
+                        harness,
+                        scenario,
+                        plan,
+                    }),
+                ) => Witness::Typed {
+                    harness,
+                    scenario,
+                    plan,
+                },
+                (input, _) => {
+                    return Err(format!(
+                        "{}: a case names either `input` or `[typed]`, and this names {}",
+                        case_file.display(),
+                        if input.is_some() { "both" } else { "neither" }
+                    )
+                    .into())
+                }
+            };
+            let files = witness.files();
+            for path in files.iter().chain(&checks) {
                 if !is_plain_relative(path) {
                     return Err(format!(
                         "{}: {} isn't a plain path relative to the repository root",
@@ -508,7 +647,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             Ok(Case {
                 property,
                 patch,
-                input,
+                witness,
                 checks,
                 also_violates,
                 target: None,
@@ -573,8 +712,8 @@ fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxErr
 }
 
 /// Every path whose change can break `case`'s catch, relative to
-/// `repo_root`: the patch and its case file, the input and its sidecar, the
-/// files the patch changes, the case's checks, and [`SHARED`].
+/// `repo_root`: the patch and its case file, the witness's files, the files
+/// the patch changes, the case's checks, and [`SHARED`].
 fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
     let relative = |path: &Path| {
         path.strip_prefix(repo_root)
@@ -584,9 +723,8 @@ fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
     let mut watched = vec![
         relative(&case.patch)?,
         relative(&case.patch.with_extension("toml"))?,
-        case.input.clone(),
-        case.input.with_extension("toml"),
     ];
+    watched.extend(case.witness.files());
     watched.extend(SHARED.iter().map(PathBuf::from));
     watched.extend(patched_files(repo_root, &case.patch)?);
     watched.extend(case.checks.iter().cloned());
@@ -622,19 +760,6 @@ fn is_affected(watched: &[PathBuf], changed: &[PathBuf]) -> bool {
     changed
         .iter()
         .any(|path| watched.iter().any(|w| path.starts_with(w)))
-}
-
-/// Appends every `.patch` file under `dir` to `patches`.
-fn find_patches(dir: &Path, patches: &mut Vec<PathBuf>) -> Result<(), BoxError> {
-    for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            find_patches(&path, patches)?;
-        } else if path.extension().is_some_and(|e| e == "patch") {
-            patches.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Where confirmations through a fuzz target build, in the planted work
@@ -695,47 +820,101 @@ fn check_case(
     baseline: &Path,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
-    let harness = harness_of(worktree, &case.input)?;
-    let input = worktree.join(&case.input);
+    let harness = case.witness.harness(worktree)?;
+    let input = case.witness.located(worktree);
     let baseline = record(
         Command::new(baseline),
         &harness,
         &input,
         &case.property,
-        "holds",
+        Expect::Holds,
         &scratch.join("baseline"),
         None,
     )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
     }
-    if let Err(why) = apply(worktree, &case.patch) {
-        return Ok(Verdict::PatchDoesntApply(why));
+    if let Some(verdict) = apply_case_patch(worktree, case)? {
+        return Ok(verdict);
     }
     if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
         return Ok(Verdict::Failed(format!(
             "the patched build failed: {error}"
         )));
     }
-    let patched = record(
-        Command::new(target.join(PROFILE).join("zakura-sim")),
+    let verdict = judge_patched(
+        &target.join(PROFILE).join("zakura-sim"),
         &harness,
         &input,
-        &case.property,
-        "violated",
-        &scratch.join("patched"),
-        None,
+        case,
+        scratch,
     )?;
-    let verdict = match classify(&case.property, &patched) {
-        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
-        verdict => return Ok(verdict),
-    };
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
         }
         _ => Ok(verdict),
     }
+}
+
+/// Applies `case`'s patch to `worktree`, a checkout of `HEAD`. `Some` is
+/// the verdict of a case that can't go on: the patch doesn't apply, or it
+/// changes, deletes or renames one of the case's witness files. The
+/// patched runs read those files after the patch while the baseline read
+/// the committed ones, so a catch might come from the changed witness
+/// rather than the code change.
+fn apply_case_patch(worktree: &Path, case: &Case) -> Result<Option<Verdict>, BoxError> {
+    if let Err(why) = apply(worktree, &case.patch) {
+        return Ok(Some(Verdict::PatchDoesntApply(why)));
+    }
+    // `--no-renames` lists a renamed file's old path, not only its new one.
+    let output = git(worktree)
+        .args(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git diff` failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let changed = String::from_utf8(output.stdout)?;
+    let changed: Vec<&Path> = changed.split_terminator('\0').map(Path::new).collect();
+    let touched: Vec<PathBuf> = case
+        .witness
+        .files()
+        .into_iter()
+        .filter(|file| changed.contains(&file.as_path()))
+        .collect();
+    Ok((!touched.is_empty()).then_some(Verdict::PatchesWitness(touched)))
+}
+
+/// Records `input` on `harness` with the patched `zakura_sim` binary into
+/// `scratch`'s `patched`, and judges it: the patched run's verdict, then,
+/// for a catch, the campaign's, then, for a typed case, its fresh replay's.
+fn judge_patched(
+    zakura_sim: &Path,
+    harness: &str,
+    input: &Located,
+    case: &Case,
+    scratch: &Path,
+) -> Result<Verdict, BoxError> {
+    let trace = scratch.join("patched");
+    let patched = record(
+        Command::new(zakura_sim),
+        harness,
+        input,
+        &case.property,
+        Expect::Violated(&case.also_violates),
+        &trace,
+        None,
+    )?;
+    let verdict = match classify(&case.property, &case.also_violates, &patched) {
+        Verdict::Caught(None) => campaign(zakura_sim, harness, case, &scratch.join("campaign"))?,
+        verdict => return Ok(verdict),
+    };
+    typed_replay(verdict, &case.witness, || replay_misses(zakura_sim, &trace))
 }
 
 /// The fuzz target that runs `harness`, from the fuzz package's targets
@@ -751,8 +930,9 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
 /// Confirms `case`'s committed input in the patched `worktree` through the
 /// fuzz target `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
-/// property alone and name `harness`, `zakura-sim confirm` must find the
-/// property's trigger history, and a fresh replay must match Exact. Builds
+/// property, beside no other violation but the case's `also_violates`, and
+/// name `harness`, `zakura-sim confirm` must find the property's trigger
+/// history, and a fresh replay must match Exact. Builds
 /// under `builds`, which outlives the worktree, and writes under `scratch`.
 ///
 /// The builds are reused, so both pinned binaries must also name the
@@ -767,6 +947,9 @@ fn through_target(
     target: &str,
     harness: &str,
 ) -> Result<Option<Verdict>, BoxError> {
+    let Witness::Input(input) = &case.witness else {
+        unreachable!("`run` gives a typed case no target");
+    };
     let out = path::absolute(scratch.join("target"))?;
     if out.exists() {
         fs::remove_dir_all(&out)?;
@@ -774,8 +957,9 @@ fn through_target(
     let request = sim_minimize::Request {
         target: target.to_owned(),
         harness: harness.to_owned(),
-        input: path::absolute(worktree.join(&case.input))?,
+        input: path::absolute(worktree.join(input))?,
         property: case.property.clone(),
+        also_violates: case.also_violates.clone(),
         out: out.clone(),
         budget: sim_minimize::Budget {
             runs: 1,
@@ -826,7 +1010,7 @@ fn through_target(
 /// digest as `zakura-sim`'s build script computes it, so it was built from
 /// that source and not reused from an earlier one. A digest git couldn't
 /// compute names no source.
-fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+pub(super) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
     if source == provenance::UNKNOWN {
         return Err("git couldn't compute the patched checkout's source digest".to_owned());
     }
@@ -843,34 +1027,30 @@ fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
-/// build in `target`, which [`check_case`] built. Each input
-/// and its trace go under `dir`.
-fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
+/// `binary`, which [`check_case`] built. Each input and its trace go under
+/// `dir`.
+fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
     fs::create_dir_all(dir)?;
-    let binary = target.join(PROFILE).join("zakura-sim");
     let mut caught = 0;
     let mut missed = BTreeMap::new();
     for (index, bytes) in campaign_inputs(&case.property).into_iter().enumerate() {
         let input = dir.join(format!("input-{index}.bin"));
         fs::write(&input, bytes)?;
         let run = record(
-            Command::new(&binary),
+            Command::new(binary),
             harness,
-            &input,
+            &Located::Input(input.clone()),
             &case.property,
-            "violated",
+            Expect::Violated(&case.also_violates),
             &dir.join(format!("run-{index}")),
             None,
         )?;
-        match classify(&case.property, &run) {
+        match classify(&case.property, &case.also_violates, &run) {
             Verdict::Caught(_) => caught += 1,
             Verdict::NotCaught(outcome) => *missed.entry(outcome).or_default() += 1,
-            Verdict::Unrelated(violated) if case.also_violates.contains(&violated) => {
-                *missed.entry(format!("violated {violated}")).or_default() += 1;
-            }
             verdict => {
                 return Ok(Verdict::CampaignFails {
                     input,
@@ -958,7 +1138,7 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
 /// A bypass patch can leave the code it bypasses unused, so the build
 /// reports warnings but doesn't fail on them, even where the environment
 /// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
-fn cargo_sim(worktree: &Path, target: &Path) -> Command {
+pub(super) fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
@@ -979,9 +1159,37 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     command
 }
 
-/// Records `input` on `harness` with `zakura_sim`, a `zakura-sim` command,
-/// as a witness test of `property` that expects `expect`, writing the trace
-/// to `out`, and reads its `end` record and the test's result.
+/// What a witness test that [`record`] runs expects of the case's property.
+#[derive(Clone, Copy, Debug)]
+enum Expect<'a> {
+    /// The property applies and holds, and no property is violated.
+    Holds,
+    /// The property is violated, and no other property is, except the
+    /// listed ones, the case's `also_violates`.
+    Violated(&'a [String]),
+}
+
+impl Expect<'_> {
+    /// `zakura-sim record`'s `--expect` flag and value, then its
+    /// `--also-violates` flag and value if the list isn't empty.
+    fn args(self) -> Vec<String> {
+        match self {
+            Expect::Holds => vec!["--expect".to_owned(), "holds".to_owned()],
+            Expect::Violated(also_violates) => {
+                let mut args = vec!["--expect".to_owned(), "violated".to_owned()];
+                if !also_violates.is_empty() {
+                    args.extend(["--also-violates".to_owned(), also_violates.join(",")]);
+                }
+                args
+            }
+        }
+    }
+}
+
+/// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
+/// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
+/// `property` that expects `expect`, writing the trace to `out`, and reads
+/// its `end` record and the test's result.
 ///
 /// With a `deadline` and its interrupt flag, the command's output goes to
 /// `<out>.log`. A run past the deadline, or one that a signal killed, is
@@ -990,9 +1198,9 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
 fn record(
     mut zakura_sim: Command,
     harness: &str,
-    input: &Path,
+    input: &Located,
     property: &str,
-    expect: &str,
+    expect: Expect<'_>,
     out: &Path,
     deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
@@ -1000,11 +1208,12 @@ fn record(
         fs::remove_dir_all(out)?;
     }
     zakura_sim
-        .args(["record", "--sim", harness, "--input"])
-        .arg(input)
+        .args(["record", "--sim", harness])
+        .args(input_args(input)?)
         .arg("--out")
         .arg(out)
-        .args(["--witness", property, "--expect", expect]);
+        .args(["--witness", property])
+        .args(expect.args());
     let ended = match deadline {
         None => format!("exited with {}", zakura_sim.status()?),
         Some((deadline, interrupt)) => {
@@ -1050,6 +1259,57 @@ fn record(
     Ok(run)
 }
 
+/// `zakura-sim record`'s arguments for `input`: `--input` and the file, or
+/// `--scenario` with the scenario file's text and `--plan` with the Plan
+/// bytes file.
+fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
+    Ok(match input {
+        Located::Input(path) => vec!["--input".into(), path.into()],
+        Located::Typed { scenario, plan } => vec![
+            "--scenario".into(),
+            fs::read_to_string(scenario)
+                .map_err(|error| format!("{}: {error}", scenario.display()))?
+                .into(),
+            "--plan".into(),
+            plan.into(),
+        ],
+    })
+}
+
+/// `verdict`, unless `witness` is a typed case caught by its patched run and
+/// `replay`, the fresh replay of that run, says why it missed: then
+/// [`Verdict::ReplayMisses`]. A fuzz input, or a case not caught, never
+/// replays here.
+fn typed_replay(
+    verdict: Verdict,
+    witness: &Witness,
+    replay: impl FnOnce() -> Result<Option<String>, BoxError>,
+) -> Result<Verdict, BoxError> {
+    if !matches!(
+        (&verdict, witness),
+        (Verdict::Caught(_), Witness::Typed { .. })
+    ) {
+        return Ok(verdict);
+    }
+    Ok(match replay()? {
+        Some(why) => Verdict::ReplayMisses(why),
+        None => verdict,
+    })
+}
+
+/// Replays the trace in `trace` with `zakura_sim` in a fresh process, and
+/// says why it didn't match Exact, or `None` if it did.
+fn replay_misses(zakura_sim: &Path, trace: &Path) -> Result<Option<String>, BoxError> {
+    let output = Command::new(zakura_sim).arg("replay").arg(trace).output()?;
+    Ok((!output.status.success()).then(|| {
+        format!(
+            "`zakura-sim replay` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }))
+}
+
 /// Reads `line`, a trace's `end` record, for `property`.
 fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
     let line: Value = serde_json::from_str(line)?;
@@ -1073,11 +1333,12 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
     let id = |report: &Value| text(report.get("property")).unwrap_or_default();
     Ok(Run::Ended {
         violation: text(end.get("violation").and_then(|v| v.get("property"))),
-        other_violated: properties
+        others_violated: properties
             .iter()
             .filter(|report| id(report) != property)
-            .find(|report| outcome_name(report).as_deref() == Some("violated"))
-            .map(id),
+            .filter(|report| outcome_name(report).as_deref() == Some("violated"))
+            .map(id)
+            .collect(),
         outcome: properties
             .iter()
             .find(|report| id(report) == property)
@@ -1098,11 +1359,10 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
         Run::Ended {
             violation: Some(violated),
             ..
-        }
-        | Run::Ended {
-            other_violated: Some(violated),
-            ..
         } => Some(format!("{violated} is violated")),
+        Run::Ended {
+            others_violated, ..
+        } if !others_violated.is_empty() => Some(format!("{} is violated", others_violated[0])),
         Run::Ended { outcome, .. } if outcome.as_deref() != Some("held") => Some(format!(
             "{property} is {}",
             outcome.as_deref().unwrap_or("not reported")
@@ -1114,44 +1374,66 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
     }
 }
 
-/// What the patched run shows about `property`.
-fn classify(property: &str, patched: &Run) -> Verdict {
-    match patched {
-        Run::Failed(why) | Run::Killed(why) => Verdict::Failed(why.clone()),
+/// What the patched run shows about `property`. A violation of a property
+/// in `also_violates`, which the patched bug breaks too, is expected beside
+/// `property`'s: it neither counts as the catch nor fails the case. Any
+/// other violated property makes the verdict [`Verdict::Unrelated`]. The
+/// committed input and every campaign input are judged by this one rule.
+fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict {
+    let (violation, others_violated, outcome, witness) = match patched {
+        Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
-        } => Verdict::Harness(failure.clone()),
+        } => return Verdict::Harness(failure.clone()),
         Run::Ended {
-            violation: Some(violated),
+            violation,
+            others_violated,
+            outcome,
+            witness,
             ..
-        } if violated != property => Verdict::Unrelated(violated.clone()),
-        Run::Ended {
-            other_violated: Some(violated),
-            ..
-        } => Verdict::Unrelated(violated.clone()),
-        Run::Ended {
-            violation: None,
-            outcome: None,
-            ..
-        } => Verdict::Unreported,
-        Run::Ended {
-            violation: None,
-            outcome: Some(outcome),
-            ..
-        } if outcome != "violated" => Verdict::NotCaught(outcome.clone()),
-        Run::Ended {
-            witness: Some(why), ..
-        } => Verdict::WitnessFails(why.clone()),
-        Run::Ended { .. } => Verdict::Caught(None),
+        } => (violation, others_violated, outcome, witness),
+    };
+    let violated = || violation.iter().chain(others_violated);
+    if let Some(unrelated) = violated().find(|id| *id != property && !also_violates.contains(id)) {
+        return Verdict::Unrelated(unrelated.clone());
+    }
+    if violation.as_deref() != Some(property) && outcome.as_deref() != Some("violated") {
+        // A listed property's violation alone misses the patch.
+        return match violated().find(|id| *id != property) {
+            Some(listed) => Verdict::NotCaught(format!("violated {listed}")),
+            None => outcome
+                .clone()
+                .map_or(Verdict::Unreported, Verdict::NotCaught),
+        };
+    }
+    match witness {
+        Some(why) => Verdict::WitnessFails(why.clone()),
+        None => Verdict::Caught(None),
     }
 }
 
 /// `git` in `dir`.
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(dir);
     command
+}
+
+/// Runs `script` until it starts. A child that another test's thread forks
+/// while a script is open for writing holds it open until that child execs,
+/// and running the script meanwhile fails with ETXTBSY. Once it starts, no
+/// process holds it open for writing.
+#[cfg(all(test, unix))]
+fn wait_until_executable(script: &Path) {
+    while let Err(error) = Command::new(script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -1188,17 +1470,18 @@ mod tests {
     #[test]
     fn planted_passes_only_on_its_own_id() {
         assert_eq!(
-            classify(ID, &run(Some(ID), &[(ID, VIOLATED)])),
+            classify(ID, &[], &run(Some(ID), &[(ID, VIOLATED)])),
             Verdict::Caught(None)
         );
         // A violation that didn't stop the run, as for a Known property.
         assert_eq!(
-            classify(ID, &run(None, &[(ID, VIOLATED)])),
+            classify(ID, &[], &run(None, &[(ID, VIOLATED)])),
             Verdict::Caught(None)
         );
         assert_eq!(
             classify(
                 ID,
+                &[],
                 &run(
                     Some("sim/no-task-panic"),
                     &[(ID, HELD), ("sim/no-task-panic", VIOLATED)]
@@ -1207,17 +1490,103 @@ mod tests {
             Verdict::Unrelated("sim/no-task-panic".to_owned())
         );
         assert_eq!(
-            classify(ID, &run(None, &[(ID, VIOLATED), ("other/draft", VIOLATED)])),
+            classify(
+                ID,
+                &[],
+                &run(None, &[(ID, VIOLATED), ("other/draft", VIOLATED)])
+            ),
             Verdict::Unrelated("other/draft".to_owned())
         );
         assert_eq!(
-            classify(ID, &run(None, &[(ID, HELD)])),
+            classify(ID, &[], &run(None, &[(ID, HELD)])),
             Verdict::NotCaught("held".to_owned())
         );
-        assert_eq!(classify(ID, &run(None, &[])), Verdict::Unreported);
+        assert_eq!(classify(ID, &[], &run(None, &[])), Verdict::Unreported);
         assert_eq!(
-            classify(ID, &Run::Failed("build".to_owned())),
+            classify(ID, &[], &Run::Failed("build".to_owned())),
             Verdict::Failed("build".to_owned())
+        );
+    }
+
+    /// The witness test's flags carry the case's `also_violates` only for a
+    /// violated expectation, and only when the list isn't empty.
+    #[test]
+    fn witness_flags_carry_the_co_violations() {
+        let also = ["a/one".to_owned(), "b/two".to_owned()];
+        assert_eq!(Expect::Holds.args(), ["--expect", "holds"]);
+        assert_eq!(Expect::Violated(&[]).args(), ["--expect", "violated"]);
+        assert_eq!(
+            Expect::Violated(&also).args(),
+            ["--expect", "violated", "--also-violates", "a/one,b/two"]
+        );
+    }
+
+    /// A property in the case's `also_violates` may be violated beside the
+    /// case's own, on the committed input as on a campaign input. Only the
+    /// case's own violation catches the patch, and an unlisted violation
+    /// still fails it.
+    #[test]
+    fn listed_co_violations_are_expected() {
+        let also = ["other/conformant".to_owned()];
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(None, &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Caught(None)
+        );
+        // The case's own violation stopped the run, as for an `Active` one.
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(Some(ID), &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Caught(None)
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(
+                    None,
+                    &[
+                        (ID, VIOLATED),
+                        ("other/conformant", VIOLATED),
+                        ("other/draft", VIOLATED)
+                    ]
+                )
+            ),
+            Verdict::Unrelated("other/draft".to_owned())
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(None, &[(ID, HELD), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::NotCaught("violated other/conformant".to_owned())
+        );
+        assert_eq!(
+            classify(
+                ID,
+                &also,
+                &run(
+                    Some("other/conformant"),
+                    &[(ID, HELD), ("other/conformant", VIOLATED)]
+                )
+            ),
+            Verdict::NotCaught("violated other/conformant".to_owned())
+        );
+        // Without the listing, the co-violation is unrelated.
+        assert_eq!(
+            classify(
+                ID,
+                &[],
+                &run(None, &[(ID, VIOLATED), ("other/conformant", VIOLATED)])
+            ),
+            Verdict::Unrelated("other/conformant".to_owned())
         );
     }
 
@@ -1227,13 +1596,13 @@ mod tests {
         match run {
             Run::Ended {
                 violation,
-                other_violated,
+                others_violated,
                 outcome,
                 harness,
                 ..
             } => Run::Ended {
                 violation,
-                other_violated,
+                others_violated,
                 outcome,
                 harness,
                 witness: Some(why.to_owned()),
@@ -1248,7 +1617,7 @@ mod tests {
     fn planted_requires_the_trigger_history() {
         let lost = "witness test lost its trigger history";
         assert_eq!(
-            classify(ID, &judged(run(Some(ID), &[(ID, VIOLATED)]), lost)),
+            classify(ID, &[], &judged(run(Some(ID), &[(ID, VIOLATED)]), lost)),
             Verdict::WitnessFails(lost.to_owned())
         );
         assert_eq!(
@@ -1257,7 +1626,7 @@ mod tests {
         );
         // The end record's own failures still name themselves first.
         assert_eq!(
-            classify(ID, &judged(run(None, &[(ID, HELD)]), lost)),
+            classify(ID, &[], &judged(run(None, &[(ID, HELD)]), lost)),
             Verdict::NotCaught("held".to_owned())
         );
     }
@@ -1335,7 +1704,11 @@ mod tests {
     fn campaign_failures_name_their_input() {
         let verdict = Verdict::CampaignFails {
             input: PathBuf::from("campaign/input-3.bin"),
-            verdict: Box::new(classify(ID, &run(Some("sim/no-task-panic"), &[(ID, HELD)]))),
+            verdict: Box::new(classify(
+                ID,
+                &[],
+                &run(Some("sim/no-task-panic"), &[(ID, HELD)]),
+            )),
         };
         assert_eq!(
             verdict.to_string(),
@@ -1343,7 +1716,7 @@ mod tests {
         );
         let verdict = Verdict::CampaignFails {
             input: PathBuf::from("campaign/input-4.bin"),
-            verdict: Box::new(classify(ID, &run(None, &[]))),
+            verdict: Box::new(classify(ID, &[], &run(None, &[]))),
         };
         assert_eq!(
             verdict.to_string(),
@@ -1462,7 +1835,10 @@ mod tests {
         let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
         let mut on_targets = BTreeMap::new();
         for case in cases(&repo_root).expect("the planted cases parse") {
-            let harness = harness_of(&repo_root, &case.input).expect("the input has a sidecar");
+            let Witness::Input(input) = &case.witness else {
+                continue;
+            };
+            let harness = harness_of(&repo_root, input).expect("the input has a sidecar");
             if let Some(target) = target_of(&harnesses, &harness) {
                 assert_eq!(
                     harnesses.get(&target),
@@ -1551,6 +1927,99 @@ mod tests {
             .status()
             .expect("git runs");
         assert!(status.success(), "git {args:?}");
+    }
+
+    /// A case's patch may change only code: one that changes, deletes or
+    /// renames a witness file, typed or fuzz input, stops the case before
+    /// anything runs on the patched checkout.
+    #[test]
+    fn a_patch_may_not_change_the_witness() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let patches = tempfile::tempdir().expect("a patch directory");
+        let root = repo.path();
+        for (path, text) in [
+            ("src/lib.rs", "fn a() {}\n"),
+            ("s.json", "{}\n"),
+            ("p.bin", "plan\n"),
+            ("a.bin", "input\n"),
+            ("a.toml", "harness = \"h\"\n"),
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("a parent"))
+                .expect("the directory is created");
+            fs::write(root.join(path), text).expect("the file is written");
+        }
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-qm", "witnesses"]);
+        // Makes a patch from `edit`'s changes, then resets the checkout.
+        let patch = |name: &str, edit: &dyn Fn()| {
+            edit();
+            git_ok(root, &["add", "-A"]);
+            let diff = git(root)
+                .args(["diff", "--cached", "-M", "--binary"])
+                .output()
+                .expect("git diff runs");
+            assert!(diff.status.success());
+            git_ok(root, &["reset", "-q", "--hard", "HEAD"]);
+            let path = patches.path().join(name);
+            fs::write(&path, diff.stdout).expect("the patch is written");
+            path
+        };
+        let write = |path: &'static str| move || fs::write(root.join(path), "changed\n").unwrap();
+        let code = patch("code.patch", &write("src/lib.rs"));
+        let plan = patch("plan.patch", &|| {
+            write("src/lib.rs")();
+            write("p.bin")();
+        });
+        let moved = patch("moved.patch", &|| {
+            fs::rename(root.join("s.json"), root.join("t.json")).unwrap()
+        });
+        let sidecar = patch("sidecar.patch", &write("a.toml"));
+        let input = patch("input.patch", &|| {
+            fs::remove_file(root.join("a.bin")).unwrap()
+        });
+        let typed = Case {
+            property: ID.to_owned(),
+            patch: code.clone(),
+            witness: Witness::Typed {
+                harness: "h".to_owned(),
+                scenario: "s.json".into(),
+                plan: "p.bin".into(),
+            },
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: None,
+        };
+        let fuzz = Case {
+            witness: Witness::Input("a.bin".into()),
+            ..typed.clone()
+        };
+        let judge = |case: &Case, patch: &Path| {
+            let case = Case {
+                patch: patch.to_owned(),
+                ..case.clone()
+            };
+            let verdict = apply_case_patch(root, &case).expect("git runs");
+            git_ok(root, &["reset", "-q", "--hard", "HEAD"]);
+            git_ok(root, &["clean", "-fdq"]);
+            verdict
+        };
+        let touches = |files: &[&str]| {
+            Some(Verdict::PatchesWitness(
+                files.iter().map(PathBuf::from).collect(),
+            ))
+        };
+        assert_eq!(judge(&typed, &code), None, "a code patch goes on");
+        assert_eq!(judge(&fuzz, &code), None, "a code patch goes on");
+        assert_eq!(judge(&typed, &plan), touches(&["p.bin"]));
+        assert_eq!(judge(&typed, &moved), touches(&["s.json"]));
+        assert_eq!(judge(&fuzz, &sidecar), touches(&["a.toml"]));
+        assert_eq!(judge(&fuzz, &input), touches(&["a.bin"]));
+        assert_eq!(
+            judge(&typed, &input),
+            None,
+            "another case's input isn't this witness"
+        );
     }
 
     /// A renamed file or directory reports its old paths and its new ones,
@@ -1670,8 +2139,8 @@ mod tests {
         }
     }
 
-    /// Each committed case watches its patch's production files and its
-    /// listed checks, which all exist.
+    /// Each committed case patches only production code, and watches its
+    /// patch's files and its listed checks, which all exist.
     #[test]
     fn committed_cases_watch_existing_files() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
@@ -1686,26 +2155,285 @@ mod tests {
                 );
             }
             assert!(!case.checks.is_empty(), "{}", case.patch.display());
+            let patched = patched_files(&repo_root, &case.patch).expect("the patch parses");
             assert!(
-                watched
-                    .iter()
-                    .any(|path| path.starts_with("crates/zakura-network")
-                        || path.starts_with("crates/zakura-node-services")),
-                "{} watches the production file it patches",
+                !patched.is_empty(),
+                "{} changes no file",
                 case.patch.display()
             );
+            for path in &patched {
+                assert!(
+                    path.starts_with("crates")
+                        && !path.starts_with("crates/zakura-sim")
+                        && !path.starts_with("crates/xtask")
+                        && !path.components().any(|part| part.as_os_str() == "tests"),
+                    "{} patches {}, which isn't production code",
+                    case.patch.display(),
+                    path.display()
+                );
+            }
         }
     }
 
-    /// The committed cases parse, and each names an input with a sidecar.
+    /// The committed cases parse, and each names an input with a sidecar,
+    /// or a typed case's files.
     #[test]
     fn committed_cases_name_their_inputs() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let cases = cases(&repo_root).expect("the planted cases parse");
         assert!(cases.iter().any(|case| case.property == ID));
         for case in &cases {
-            harness_of(&repo_root, &case.input)
+            case.witness
+                .harness(&repo_root)
                 .unwrap_or_else(|error| panic!("{}: {error}", case.patch.display()));
+            for file in case.witness.files() {
+                assert!(
+                    repo_root.join(&file).is_file(),
+                    "{}: {} is committed",
+                    case.patch.display(),
+                    file.display()
+                );
+            }
         }
+    }
+
+    /// Writes `qa/planted/<ID>/case.patch` and `case.toml` with `toml` under
+    /// a fresh repository root, and reads its cases.
+    fn parse_case(toml: &str) -> Result<Vec<Case>, BoxError> {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let property = dir.path().join(PLANTED_DIR).join(ID);
+        fs::create_dir_all(&property).unwrap();
+        fs::write(property.join("case.patch"), "").unwrap();
+        fs::write(property.join("case.toml"), toml).unwrap();
+        cases(dir.path())
+    }
+
+    /// A case file names a fuzz input or a typed case, never both and never
+    /// neither, and a typed case's files are plain relative paths.
+    #[test]
+    fn a_case_names_an_input_or_a_typed_case() {
+        let input = parse_case(r#"input = "fixtures/a.bin""#).expect("an input case parses");
+        assert_eq!(input[0].witness, Witness::Input("fixtures/a.bin".into()));
+        let typed = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "qa/planted/x/case.scenario.json"
+            plan = "qa/planted/x/case.plan.bin"
+        "#;
+        let typed = parse_case(typed).expect("a typed case parses");
+        assert_eq!(
+            typed[0].witness,
+            Witness::Typed {
+                harness: "header-sync/storage".to_owned(),
+                scenario: "qa/planted/x/case.scenario.json".into(),
+                plan: "qa/planted/x/case.plan.bin".into(),
+            }
+        );
+        let both = r#"
+            input = "fixtures/a.bin"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "s.json"
+            plan = "p.bin"
+        "#;
+        let error = parse_case(both).expect_err("both is refused").to_string();
+        assert!(error.contains("names both"), "{error}");
+        let error = parse_case("checks = []")
+            .expect_err("neither is refused")
+            .to_string();
+        assert!(error.contains("names neither"), "{error}");
+        let outside = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "../s.json"
+            plan = "p.bin"
+        "#;
+        let error = parse_case(outside)
+            .expect_err("a path outside is refused")
+            .to_string();
+        assert!(error.contains("isn't a plain path"), "{error}");
+        let missing = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "s.json"
+        "#;
+        assert!(
+            parse_case(missing).is_err(),
+            "a typed case needs its Plan bytes"
+        );
+    }
+
+    /// A typed case that its patched run caught passes only if its fresh
+    /// replay matches. A miss is its own verdict, and a fuzz input or an
+    /// uncaught case never replays here.
+    #[test]
+    fn a_typed_catch_needs_its_fresh_replay() {
+        let typed = Witness::Typed {
+            harness: "header-sync/storage".to_owned(),
+            scenario: "s.json".into(),
+            plan: "p.bin".into(),
+        };
+        let caught = || Verdict::Caught(None);
+        assert_eq!(
+            typed_replay(caught(), &typed, || Ok(None)).unwrap(),
+            caught()
+        );
+        assert_eq!(
+            typed_replay(caught(), &typed, || Ok(Some(
+                "differs at step 3".to_owned()
+            )))
+            .unwrap(),
+            Verdict::ReplayMisses("differs at step 3".to_owned())
+        );
+        let unreachable =
+            || -> Result<Option<String>, BoxError> { panic!("only a typed catch replays") };
+        let input = Witness::Input("a.bin".into());
+        assert_eq!(
+            typed_replay(caught(), &input, unreachable).unwrap(),
+            caught()
+        );
+        assert_eq!(
+            typed_replay(Verdict::Unreported, &typed, unreachable).unwrap(),
+            Verdict::Unreported
+        );
+    }
+
+    /// The runner's patched judgment replays a caught typed case's own
+    /// patched trace: with a `zakura-sim` whose runs violate the case's
+    /// property, a replay that matches keeps the catch, and one that doesn't
+    /// makes it [`Verdict::ReplayMisses`]. A fuzz-input case never replays.
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_replays_a_caught_typed_case() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let end = end(Some(ID), &[(ID, VIOLATED)]);
+        // `record` writes a violating trace and a passed witness under
+        // `--out`. `replay` exits with `$code` for the case's own patched
+        // trace, and 9 for any other path.
+        let fake = |name: &str, code: u8| {
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ $# -gt 0 ] || exit 0\n\
+                 if [ \"$1\" = replay ]; then\n\
+                 case \"$2\" in */case/patched) exit {code} ;; *) exit 9 ;; esac\n\
+                 fi\n\
+                 out=; prev=\n\
+                 for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+                 mkdir -p \"$out\"\n\
+                 printf '%s\\n' '{end}' > \"$out/trace.jsonl\"\n\
+                 printf '%s\\n' '{{\"passed\":true,\"error\":null}}' > \"$out/witness.json\"\n"
+            );
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
+            path
+        };
+        let matches = fake("matches", 0);
+        let misses = fake("misses", 1);
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(dir.path().join("s.json"), "{}").unwrap();
+        let typed = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Typed {
+                harness: "header-sync/storage".to_owned(),
+                scenario: "s.json".into(),
+                plan: "p.bin".into(),
+            },
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: None,
+        };
+        let judge = |binary: &Path, case: &Case| {
+            judge_patched(
+                binary,
+                "header-sync/storage",
+                &case.witness.located(dir.path()),
+                case,
+                &scratch,
+            )
+            .expect("the fake binary runs")
+        };
+        assert!(
+            matches!(judge(&matches, &typed), Verdict::Caught(Some(_))),
+            "a matching replay keeps the catch"
+        );
+        assert!(
+            matches!(judge(&misses, &typed), Verdict::ReplayMisses(_)),
+            "a failed replay of the patched trace isn't a catch"
+        );
+        let input = Case {
+            witness: Witness::Input("a.bin".into()),
+            ..typed.clone()
+        };
+        assert!(
+            matches!(judge(&misses, &input), Verdict::Caught(Some(_))),
+            "a fuzz-input case doesn't replay here"
+        );
+    }
+
+    /// [`replay_misses`] reads the replay's exit status: a `zakura-sim`
+    /// that exits 0 matched, and one that exits 1 says why it didn't.
+    #[cfg(unix)]
+    #[test]
+    fn a_replay_miss_reads_the_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let fake = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
+            path
+        };
+        let matched = fake("matched", "test \"$1\" = replay || exit 2");
+        let missed = fake("missed", "echo 'pick 3 differs' >&2; exit 1");
+        assert_eq!(replay_misses(&matched, dir.path()).unwrap(), None);
+        let why = replay_misses(&missed, dir.path())
+            .unwrap()
+            .expect("a failed replay says why");
+        assert!(why.contains("pick 3 differs"), "{why}");
+    }
+
+    /// A typed case watches its scenario and Plan bytes, and runs with
+    /// `--scenario` holding the scenario's text.
+    #[test]
+    fn a_typed_case_watches_and_runs_its_files() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let witness = Witness::Typed {
+            harness: "header-sync/storage".to_owned(),
+            scenario: "s.json".into(),
+            plan: "p.bin".into(),
+        };
+        assert_eq!(
+            witness.files(),
+            vec![PathBuf::from("s.json"), PathBuf::from("p.bin")]
+        );
+        assert_eq!(
+            witness.harness(dir.path()).expect("a typed case names it"),
+            "header-sync/storage"
+        );
+        fs::write(dir.path().join("s.json"), r#"{"mirrors":2}"#).unwrap();
+        let args = input_args(&witness.located(dir.path())).expect("the scenario reads");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--scenario"),
+                OsString::from(r#"{"mirrors":2}"#),
+                OsString::from("--plan"),
+                dir.path().join("p.bin").into_os_string(),
+            ]
+        );
+        let input = Witness::Input("a.bin".into());
+        assert_eq!(
+            input_args(&input.located(dir.path())).expect("an input needs no read"),
+            vec![
+                OsString::from("--input"),
+                dir.path().join("a.bin").into_os_string()
+            ]
+        );
     }
 }

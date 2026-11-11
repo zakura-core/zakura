@@ -1,0 +1,11 @@
+# The reactor keeps the first locator read it was handed and starts every
+# later round from it, while each later read completes correctly. The
+# subscriber builds each Open faithfully from what it's handed.
+# The reactor, the subscriber and the queue decide how the witness's rounds
+# start and stage, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

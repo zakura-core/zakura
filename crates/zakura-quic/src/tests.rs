@@ -83,6 +83,7 @@ fn loopback() -> QuicBindConfig {
         max_bidi_streams: 64,
         max_connections: 1024,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 1024,
     }
 }
@@ -93,6 +94,7 @@ fn wildcard() -> QuicBindConfig {
         max_bidi_streams: 64,
         max_connections: 1024,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 1024,
     }
 }
@@ -160,7 +162,12 @@ struct StalledHandshake {
 }
 
 fn stalled_handshake(server: &Server) -> StalledHandshake {
-    let target = server.endpoint.local_addrs()[0];
+    stalled_handshake_to(&server.endpoint)
+}
+
+/// Starts a [`StalledHandshake`] from 127.0.0.1 to `server`'s first address.
+fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
+    let target = server.local_addrs()[0];
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut endpoint = quinn_proto::Endpoint::new(
         Arc::new(quinn_proto::EndpointConfig::default()),
@@ -169,7 +176,7 @@ fn stalled_handshake(server: &Server) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.endpoint.local_id(), &[ALPN])
+        .client_config(server.local_id(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -229,6 +236,25 @@ async fn dial_authenticates_both_sides_and_echoes() {
         assert_eq!(seen[0].remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!seen[0].validated);
         assert_eq!(seen[0].pending_total, 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// Both ends of a connection read the same shared ID, and a second
+/// connection between the same endpoints reads another.
+#[tokio::test]
+async fn both_ends_of_a_connection_share_its_id() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = client();
+        let first = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let first_inbound = server.handled.recv().await.unwrap();
+        let second = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let second_inbound = server.handled.recv().await.unwrap();
+        assert_eq!(first.shared_id(), first_inbound.shared_id());
+        assert_eq!(second.shared_id(), second_inbound.shared_id());
+        assert_ne!(first.shared_id(), second.shared_id());
     })
     .await
     .unwrap();
@@ -435,6 +461,40 @@ async fn dial_without_a_matching_family_fails_fast() {
         client.connect(v6_only, &[ALPN]).await,
         Err(ConnectError::NoUsableAddress)
     ));
+}
+
+/// A dial's attempt count drops families with no socket and folds an
+/// IPv4-mapped address into its IPv4 form, as the dial itself does.
+#[tokio::test]
+async fn dial_attempts_count_only_addresses_the_dial_would_try() {
+    let client = client();
+    let peer = NodeAddr::with_addrs(
+        NodeSecretKey::generate().public(),
+        [
+            "127.0.0.1:8233".parse().unwrap(),
+            "[::ffff:127.0.0.1]:8233".parse().unwrap(),
+            "127.0.0.1:8234".parse().unwrap(),
+            "[::1]:8233".parse().unwrap(),
+            "[::1]:8234".parse().unwrap(),
+        ],
+    );
+    assert_eq!(client.dial_attempt_count(&peer), 2);
+
+    // A dial can't claim more slots than the whole table holds.
+    let two_slots = QuicEndpoint::bind(
+        NodeSecretKey::generate(),
+        &QuicBindConfig {
+            max_connections: 2,
+            ..loopback()
+        },
+        &test_config(),
+    )
+    .unwrap();
+    let wide = NodeAddr::with_addrs(
+        peer.id,
+        (8233..8236).map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+    );
+    assert_eq!(two_slots.dial_attempt_count(&wide), 2);
 }
 
 #[tokio::test]
@@ -1967,6 +2027,80 @@ async fn handle_runs_before_the_pending_count_drops() {
     .unwrap();
 }
 
+/// Counts every pending handshake under `group`, and records what `admit`
+/// sees and, when `handle` runs, the pending count under the group, under the
+/// raw source IP and in total.
+struct GroupProbe {
+    pending: crate::endpoint::PendingTable,
+    group: IpAddr,
+    admitted: Arc<Mutex<Vec<IncomingInfo>>>,
+    handled: mpsc::UnboundedSender<(usize, usize, usize)>,
+}
+
+impl Acceptor for GroupProbe {
+    fn admit(&self, incoming: &IncomingInfo) -> Admit {
+        self.admitted.lock().unwrap().push(*incoming);
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        let source = conn.admitted_ip();
+        let _ = self.handled.send((
+            self.pending.for_ip(self.group),
+            self.pending.for_ip(source),
+            self.pending.total(),
+        ));
+        Box::pin(async move {
+            conn.closed().await;
+        })
+    }
+
+    fn pending_group(&self, _ip: IpAddr) -> IpAddr {
+        self.group
+    }
+}
+
+/// ADM-7: the endpoint counts an attempt's pending handshake under the group
+/// `Acceptor::pending_group` returns, and reports that group's count to the
+/// next attempt's `admit` as `pending_from_ip`. Using the raw source IP for
+/// either the count or the lookup would report zero.
+#[tokio::test]
+async fn pending_handshakes_count_under_the_acceptor_group() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+        let group = IpAddr::from([192, 0, 2, 1]);
+        let admitted = Arc::new(Mutex::new(Vec::new()));
+        let (handled, mut counts_at_handle) = mpsc::unbounded_channel();
+        server
+            .serve(GroupProbe {
+                pending: server.shared().pending.clone(),
+                group,
+                admitted: admitted.clone(),
+                handled,
+            })
+            .unwrap();
+        let _stalled = stalled_handshake_to(&server);
+        while admitted.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client = client();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let _conn = client.connect(addr, &[ALPN]).await.unwrap();
+        let seen = admitted.lock().unwrap().clone();
+        assert_eq!(seen[0].pending_from_ip, 0);
+        assert_eq!(seen[1].pending_from_ip, 1);
+        assert_eq!(counts_at_handle.recv().await, Some((2, 0, 2)));
+    })
+    .await
+    .unwrap();
+}
+
 // The three stream-lifecycle regressions from the PR 1354 audit
 // (art/inbox/iroh-deps/quinn-re-write), with a one-stream limit so a lost
 // stream shows up as a stall.
@@ -2118,13 +2252,42 @@ async fn churned_connections_stay_within_both_allowances() {
     const CAP: usize = 6;
     const RESERVE: usize = 2;
     const CLOSING: usize = 3;
+    let (peak_live, peak_closing) = churn(QuicBindConfig {
+        max_connections: CAP,
+        dial_reserve: RESERVE,
+        max_closing_connections: CLOSING,
+        ..loopback()
+    })
+    .await;
+    // Inbound attempts stop short of the dial reserve.
+    assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
+    assert!(peak_closing <= CLOSING);
+}
+
+/// ADM-12: an acceptor that closes each connection right after its TLS
+/// handshake, as Zakura does for a bad control hello, frees its own
+/// accounting while the connection is still live. The inbound cap keeps
+/// counting those connections until they close, so the churn stays within it
+/// even with room left below the dial reserve.
+#[tokio::test]
+async fn churned_connections_stay_within_the_inbound_cap() {
+    const INBOUND: usize = 3;
+    let (peak_live, _) = churn(QuicBindConfig {
+        max_connections: 12,
+        dial_reserve: 1,
+        max_inbound_connections: Some(INBOUND),
+        max_closing_connections: 24,
+        ..loopback()
+    })
+    .await;
+    assert!((1..=INBOUND).contains(&peak_live), "{peak_live}");
+}
+
+/// Runs twelve peers that each connect eight times to a [`ChurnAcceptor`]
+/// bound with `bind`, waits until every slot frees, and returns the most live
+/// and closing connections the server held.
+async fn churn(bind: QuicBindConfig) -> (usize, usize) {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let bind = QuicBindConfig {
-            max_connections: CAP,
-            dial_reserve: RESERVE,
-            max_closing_connections: CLOSING,
-            ..loopback()
-        };
         let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
         server.serve(ChurnAcceptor).unwrap();
         let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
@@ -2167,10 +2330,6 @@ async fn churned_connections_stay_within_both_allowances() {
         stop.store(true, Ordering::Relaxed);
         sampler.await.unwrap();
 
-        // Inbound attempts stop short of the dial reserve.
-        let peak_live = peaks.0.load(Ordering::Relaxed);
-        assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
-        assert!(peaks.1.load(Ordering::Relaxed) <= CLOSING);
         tokio::time::timeout(Duration::from_secs(5), async {
             while server.connection_count() + server.closing_connection_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2178,9 +2337,13 @@ async fn churned_connections_stay_within_both_allowances() {
         })
         .await
         .expect("every slot frees once its connection drains");
+        (
+            peaks.0.load(Ordering::Relaxed),
+            peaks.1.load(Ordering::Relaxed),
+        )
     })
     .await
-    .unwrap();
+    .unwrap()
 }
 
 /// ADM-12: inbound connections can't take the dial reserve, and a dial at the

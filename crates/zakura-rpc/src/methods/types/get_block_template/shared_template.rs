@@ -1,7 +1,8 @@
 //! One full block template per tip, shared by every long poll that asks for the same work.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use serde_json::value::RawValue;
 use tokio::sync::watch;
 use zakura_chain::block;
 
@@ -29,7 +30,44 @@ enum SharedTemplateState {
         tip: block::Hash,
         long_poll_id: LongPollId,
     },
-    Ready(Arc<BlockTemplateResponse>),
+    Ready(ReadyTemplate),
+}
+
+/// A finished template, with the JSON of the answers already given from it.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadyTemplate {
+    pub(crate) template: Arc<BlockTemplateResponse>,
+    pub(crate) json: Arc<SharedTemplateJson>,
+}
+
+/// A shared template's answer as JSON, encoded at most once for each value of `submit_old`.
+///
+/// `submit_old` is the only field that differs between the long polls that share a template,
+/// and a long poll's answer always has it, so each of its two values has one encoding that
+/// every caller with that value is given.
+#[derive(Debug, Default)]
+pub(crate) struct SharedTemplateJson {
+    submit_old: OnceLock<Box<RawValue>>,
+    discard_old: OnceLock<Box<RawValue>>,
+}
+
+impl SharedTemplateJson {
+    /// Returns the JSON of `template`, which must be the template this JSON is shared for with
+    /// its caller's `submit_old`. Encodes it on the first call for that `submit_old`.
+    ///
+    /// Returns `None` if `template` has no `submit_old` or cannot be encoded.
+    pub(crate) fn get_or_encode(&self, template: &BlockTemplateResponse) -> Option<&RawValue> {
+        let json = if template.submit_old? {
+            &self.submit_old
+        } else {
+            &self.discard_old
+        };
+        if let Some(json) = json.get() {
+            return Some(json);
+        }
+        let encoded = serde_json::value::to_raw_value(template).ok()?;
+        Some(json.get_or_init(|| encoded))
+    }
 }
 
 impl Default for SharedTemplate {
@@ -72,12 +110,14 @@ impl SharedTemplate {
         &self,
         tip: block::Hash,
         long_poll_id: &LongPollId,
-    ) -> Option<Arc<BlockTemplateResponse>> {
+    ) -> Option<ReadyTemplate> {
         let mut slot = self.0.subscribe();
         loop {
             match &*slot.borrow_and_update() {
-                SharedTemplateState::Ready(template) if template.long_poll_id == *long_poll_id => {
-                    return Some(template.clone());
+                SharedTemplateState::Ready(ready)
+                    if ready.template.long_poll_id == *long_poll_id =>
+                {
+                    return Some(ready.clone());
                 }
                 SharedTemplateState::Building {
                     tip: building,
@@ -105,7 +145,10 @@ pub(crate) struct SharedTemplateBuild {
 impl SharedTemplateBuild {
     /// Shares `template`, unless a build on another tip has replaced this one.
     pub(crate) fn publish(self, template: BlockTemplateResponse) {
-        self.replace(SharedTemplateState::Ready(Arc::new(template)));
+        self.replace(SharedTemplateState::Ready(ReadyTemplate {
+            template: Arc::new(template),
+            json: Arc::default(),
+        }));
     }
 
     fn replace(&self, next: SharedTemplateState) {

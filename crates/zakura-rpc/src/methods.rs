@@ -124,6 +124,7 @@ use types::{
             NEW_TIP_MEMPOOL_WAIT, ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
+        shared_template::ReadyTemplate,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
@@ -1681,9 +1682,10 @@ where
     /// still pass through the consensus verifier.
     async fn reuse_shared_template(
         &self,
-        template: &BlockTemplateResponse,
+        shared: ReadyTemplate,
         submit_old: Option<bool>,
     ) -> Result<Option<GetBlockTemplateResponse>> {
+        let ReadyTemplate { template, json } = shared;
         {
             let state = self.gbt.template_rejections.borrow();
             if state.needs_fallback()
@@ -1737,8 +1739,9 @@ where
                 return Ok(None);
             }
         }
-        let mut template = template.clone();
+        let mut template = BlockTemplateResponse::clone(&template);
         template.submit_old = submit_old;
+        template.shared_json = json.into();
         Ok(Some(template.into()))
     }
 
@@ -4070,8 +4073,7 @@ where
                     .wait_for(chain_info.tip_hash, &server_long_poll_id)
                     .await
                 {
-                    if let Some(response) =
-                        self.reuse_shared_template(&template, submit_old).await?
+                    if let Some(response) = self.reuse_shared_template(template, submit_old).await?
                     {
                         drop(full_first_answer);
                         if let GetBlockTemplateResponse::TemplateMode(template) = &response {

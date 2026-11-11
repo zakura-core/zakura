@@ -14,7 +14,7 @@ pub(crate) mod prepared_candidates;
 pub(crate) mod shared_template;
 pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
-use shared_template::SharedTemplate;
+use shared_template::{SharedTemplate, SharedTemplateJson};
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -24,10 +24,11 @@ use std::{
 };
 
 use crate::server::jsonrpc::RpcResult;
-use crate::server::jsonrpc::{ErrorCode, ErrorObject};
+use crate::server::jsonrpc::{is_writing_result, ErrorCode, ErrorObject};
 use derive_new::new;
 use getset::{CopyGetters, Getters};
 use rand_10::Rng;
+use serde_json::value::RawValue;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_protocol::memo::MemoBytes;
@@ -496,6 +497,48 @@ pub struct BlockTemplateResponse {
     #[serde(rename = "submitold")]
     #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
+
+    /// The JSON of this template's answer, when the template was taken from the store that
+    /// long polls share, so that the answer is encoded once for all of them.
+    ///
+    /// It describes the template as it was taken, with this `submit_old`. It is set as the
+    /// template is returned to its caller, and the template is not changed after that.
+    #[serde(skip)]
+    #[new(default)]
+    pub(crate) shared_json: SharedJson,
+}
+
+/// The JSON a [`BlockTemplateResponse`] shares with other answers from the same template, if it
+/// shares any.
+///
+/// It is a copy of what the template's fields already say, so it takes no part in comparing
+/// templates.
+#[derive(Clone, Default)]
+pub(crate) struct SharedJson(Option<Arc<SharedTemplateJson>>);
+
+impl From<Arc<SharedTemplateJson>> for SharedJson {
+    fn from(json: Arc<SharedTemplateJson>) -> Self {
+        Self(Some(json))
+    }
+}
+
+impl PartialEq for SharedJson {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SharedJson {}
+
+impl BlockTemplateResponse {
+    /// Returns this template's answer as finished JSON, if it shares one and is being written
+    /// into an RPC response.
+    fn shared_response_json(&self) -> Option<&RawValue> {
+        if !is_writing_result() {
+            return None;
+        }
+        self.shared_json.0.as_ref()?.get_or_encode(self)
+    }
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -692,6 +735,8 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
+
+            shared_json: SharedJson::default(),
         })
     }
 }
@@ -702,7 +747,7 @@ fn new_work_id() -> String {
     hex::encode(bytes)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(untagged)]
 /// A `getblocktemplate` RPC response.
 pub enum GetBlockTemplateResponse {
@@ -711,6 +756,21 @@ pub enum GetBlockTemplateResponse {
 
     /// `getblocktemplate` RPC request in proposal mode.
     ProposalMode(BlockProposalResponse),
+}
+
+/// Serializes the response as its template or its proposal result, with nothing around it.
+impl serde::Serialize for GetBlockTemplateResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // A template that long polls share is megabytes of JSON that is the same for each
+            // of them, so it is written from the copy they share.
+            Self::TemplateMode(template) => match template.shared_response_json() {
+                Some(json) => json.serialize(serializer),
+                None => template.serialize(serializer),
+            },
+            Self::ProposalMode(proposal) => proposal.serialize(serializer),
+        }
+    }
 }
 
 impl GetBlockTemplateResponse {

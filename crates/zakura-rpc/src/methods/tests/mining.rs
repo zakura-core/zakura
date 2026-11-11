@@ -612,7 +612,11 @@ fn template_build_paths_wait_for_the_build_slot() {
                     rpc.gbt.template_rejections.send_modify(|state| {
                         state.mark_prepared(chain.tip_hash, initial.work_id());
                     });
-                    rpc.reuse_shared_template(&initial, None)
+                    let shared = ReadyTemplate {
+                        template: Arc::new(initial.clone()),
+                        json: Arc::default(),
+                    };
+                    rpc.reuse_shared_template(shared, None)
                         .map(|result| {
                             result.map(|template| {
                                 template.expect("shared work is still on the current parent")
@@ -1616,6 +1620,52 @@ fn reused_unvalidated_work_is_served_without_registering_it() {
                 .resolve(shared.work_id(), header),
             Err(ResolvePreparedCandidateError::StaleWork)
         );
+    });
+}
+
+/// A template taken from the shared store is written into its response from JSON that is
+/// encoded once. The response must be the bytes that encoding the template afresh gives, for
+/// both values of `submit_old`, and outside a response the template serializes as its fields.
+#[test]
+fn shared_template_answer_is_the_bytes_of_a_fresh_encoding() {
+    use crate::server::jsonrpc::{Id, MethodResponse};
+
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+        // The same tip with no mempool transactions: only the mempool changed since.
+        let same_tip_id =
+            LongPollInput::new(next.tip_height, next.tip_hash, next.max_time, vec![]).generate_id();
+        let built = bounded(long_poll(&rpc, old_tip_id)).await.unwrap();
+
+        for (long_poll_id, submit_old) in [(old_tip_id, false), (same_tip_id, true)] {
+            // Asked twice, so the second answer is written from JSON the first one encoded.
+            for _ in 0..2 {
+                let shared = bounded(long_poll(&rpc, long_poll_id)).await.unwrap();
+                let mut afresh = shared.clone().try_into_template().unwrap();
+                assert_eq!(afresh.submit_old, Some(submit_old));
+                assert_eq!(
+                    afresh.work_id(),
+                    built.clone().try_into_template().unwrap().work_id()
+                );
+                afresh.shared_json = Default::default();
+                let afresh = GetBlockTemplateResponse::from(afresh);
+
+                let response = |template: &GetBlockTemplateResponse, limit| {
+                    MethodResponse::response(Id::Number(1), &Ok(template), limit)
+                };
+                assert_eq!(
+                    response(&shared, usize::MAX).as_json().get(),
+                    response(&afresh, usize::MAX).as_json().get()
+                );
+                assert_eq!(
+                    serde_json::to_value(&shared).unwrap(),
+                    serde_json::to_value(&afresh).unwrap()
+                );
+                // The shared JSON counts toward the response size limit like any other.
+                assert!(response(&shared, 200).is_error());
+            }
+        }
     });
 }
 

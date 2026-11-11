@@ -128,6 +128,11 @@ impl VerifiedSet {
             .clone()
     }
 
+    /// Returns the current shared lists only if a reader already requested them.
+    pub fn cached_mining_snapshot(&self) -> Option<MiningSnapshot> {
+        self.mining_snapshot.clone()
+    }
+
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the set.
     pub fn transactions(&self) -> &HashMap<transaction::Hash, VerifiedUnminedTx> {
         &self.transactions

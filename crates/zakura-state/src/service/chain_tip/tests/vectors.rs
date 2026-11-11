@@ -126,3 +126,41 @@ fn late_broadcast_completion_does_not_rewind_the_tip_cursor() {
         (block::Hash([3; 32]), block::Height(3))
     );
 }
+
+/// Reading tip metadata borrows the transaction vector rather than allocating a copy.
+#[test]
+fn tip_metadata_reads_do_not_clone_block_transactions() {
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("the fixture is a valid block");
+    let mut initial = tip(1, 1, 0);
+    initial.transactions = block.transactions.iter().cloned().map(Into::into).collect();
+    let transactions_ptr = initial.transactions.as_ptr();
+    let expected_time = initial.time;
+    let (sender, latest, mut changes) = ChainTipSender::new(Some(initial), &Mainnet);
+
+    assert_eq!(latest.best_tip_height(), Some(block::Height(1)));
+    assert_eq!(latest.best_tip_hash(), Some(block::Hash([1; 32])));
+    assert_eq!(
+        latest.best_tip_height_and_hash(),
+        Some((block::Height(1), block::Hash([1; 32])))
+    );
+    assert_eq!(latest.best_tip_block_time(), Some(expected_time));
+    assert_eq!(
+        latest.best_tip_height_and_block_time(),
+        Some((block::Height(1), expected_time))
+    );
+    latest.with_chain_tip_metadata(|tip| {
+        assert_eq!(
+            tip.transactions.as_ptr(),
+            transactions_ptr,
+            "metadata reads use the published vector without cloning it"
+        );
+    });
+    // Once the initial tip is seen, repeated polling takes the scalar-only path.
+    changes.last_tip_change();
+    assert!(changes.last_tip_change().is_none());
+    drop(sender);
+}

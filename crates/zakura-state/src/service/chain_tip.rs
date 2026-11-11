@@ -440,37 +440,48 @@ impl LatestChainTip {
         self.receiver
             .with_watch_data(|chain_tip_block| chain_tip_block.as_ref().map(f))
     }
+
+    /// Reads only scalar metadata or shared IDs while briefly borrowing the watched tip.
+    ///
+    /// Callers must copy fields or clone an `Arc`, without taking another lock or doing I/O.
+    /// Block consumers keep using `with_chain_tip_block` to own their transaction handles.
+    fn with_chain_tip_metadata<U: 'static>(
+        &self,
+        f: impl FnOnce(&ChainTipBlock) -> U,
+    ) -> Option<U> {
+        self.receiver.borrow_mapped(|tip| tip.as_ref().map(f))
+    }
 }
 
 impl ChainTip for LatestChainTip {
     #[instrument(level = "trace", skip(self))]
     fn best_tip_height(&self) -> Option<block::Height> {
-        self.with_chain_tip_block(|block| block.height)
+        self.with_chain_tip_metadata(|block| block.height)
     }
 
     #[instrument(level = "trace", skip(self))]
     fn best_tip_hash(&self) -> Option<block::Hash> {
-        self.with_chain_tip_block(|block| block.hash)
+        self.with_chain_tip_metadata(|block| block.hash)
     }
 
     #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_hash(&self) -> Option<(block::Height, block::Hash)> {
-        self.with_chain_tip_block(|block| (block.height, block.hash))
+        self.with_chain_tip_metadata(|block| (block.height, block.hash))
     }
 
     #[instrument(level = "trace", skip(self))]
     fn best_tip_block_time(&self) -> Option<DateTime<Utc>> {
-        self.with_chain_tip_block(|block| block.time)
+        self.with_chain_tip_metadata(|block| block.time)
     }
 
     #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_block_time(&self) -> Option<(block::Height, DateTime<Utc>)> {
-        self.with_chain_tip_block(|block| (block.height, block.time))
+        self.with_chain_tip_metadata(|block| (block.height, block.time))
     }
 
     #[instrument(level = "trace", skip(self))]
     fn best_tip_mined_transaction_ids(&self) -> Arc<[transaction::Hash]> {
-        self.with_chain_tip_block(|block| block.transaction_hashes.clone())
+        self.with_chain_tip_metadata(|block| block.transaction_hashes.clone())
             .unwrap_or_else(|| Arc::new([]))
     }
 
@@ -602,6 +613,11 @@ impl ChainTipChange {
             network = ?self.network,
         ))]
     pub fn last_tip_change(&mut self) -> Option<TipAction> {
+        // Polling an unchanged tip needs only its hash, not a copy of every transaction handle.
+        if self.latest_chain_tip.best_tip_hash() == self.last_change_hash {
+            return None;
+        }
+
         let block = self.latest_chain_tip.with_chain_tip_block(|block| {
             if Some(block.hash) != self.last_change_hash {
                 Some(block.clone())

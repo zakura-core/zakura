@@ -2014,13 +2014,10 @@ async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
     Ok(())
 }
 
-/// The mempool publishes its transactions with the block they were last checked
-/// against each time it finishes processing: when it is enabled, after a tip
-/// reset, after new transactions, after a block that removes some, and when it
-/// is disabled. A snapshot holds what a `FullTransactions` request is answered
-/// with at that point, and a poll that changes nothing publishes nothing new.
+/// Tip changes and explicit list requests publish current snapshots. Admission only
+/// withdraws the previous list, and unchanged polls keep shared allocations.
 #[tokio::test]
-async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Result<(), Report> {
+async fn mempool_publishes_snapshots_on_tip_changes_and_list_requests() -> Result<(), Report> {
     let network = Network::Mainnet;
     let (
         mut mempool,
@@ -2077,7 +2074,7 @@ async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Resu
     assert_eq!(published().last_seen_tip_hash, block1.hash());
     assert!(published().transactions.is_empty());
 
-    // Newly added transactions are published on the same block.
+    // Admission withdraws the old snapshot without building a replacement.
     let expiring = expiry_fixture_transaction(1, Height(2), None);
     let staying = expiry_fixture_transaction(2, Height(0), None);
     let expiring_id = expiring.transaction.id();
@@ -2089,11 +2086,12 @@ async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Resu
         .storage()
         .insert(staying, Vec::new(), Some(Height(1)))?;
     mempool.dummy_call().await;
-    let on_block1 = published();
-    assert_eq!(on_block1.last_seen_tip_hash, block1.hash());
-    assert_eq!(tx_ids(&on_block1), HashSet::from([expiring_id, staying_id]));
+    assert!(snapshots.latest().is_none());
+    assert!(mempool.storage().cached_mining_snapshot().is_none());
+    mempool.dummy_call().await;
+    assert!(mempool.storage().cached_mining_snapshot().is_none());
 
-    // The snapshot is what a request for the mempool's transactions is answered with.
+    // An explicit request builds and publishes the same shared lists it returns.
     let Response::FullTransactions {
         transactions,
         transaction_dependencies,
@@ -2105,6 +2103,9 @@ async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Resu
     else {
         panic!("the mempool answers a full transactions request with full transactions");
     };
+    let on_block1 = published();
+    assert_eq!(on_block1.last_seen_tip_hash, block1.hash());
+    assert_eq!(tx_ids(&on_block1), HashSet::from([expiring_id, staying_id]));
     assert_eq!(last_seen_tip_hash, on_block1.last_seen_tip_hash);
     assert!(Arc::ptr_eq(&transactions, &on_block1.transactions));
     assert!(Arc::ptr_eq(
@@ -2136,6 +2137,11 @@ async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Resu
     let on_block2 = published();
     assert_eq!(on_block2.last_seen_tip_hash, block2.hash());
     assert_eq!(tx_ids(&on_block2), HashSet::from([staying_id]));
+    assert_eq!(
+        tx_ids(&on_block1),
+        HashSet::from([expiring_id, staying_id]),
+        "retained snapshots remain immutable after expiration"
+    );
 
     // These old blocks are far behind the network tip, so the mempool is
     // disabled once it is no longer forced on.

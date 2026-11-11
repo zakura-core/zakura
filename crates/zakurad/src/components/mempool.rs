@@ -717,19 +717,19 @@ impl Mempool {
     /// Returns a reader of the snapshots this mempool publishes: its verified transactions
     /// and the block they were last checked against.
     ///
-    /// The mempool publishes one each time a request makes it process the chain tip and its
-    /// finished verifications. It is what [`Request::FullTransactions`] would answer at that
-    /// point, and is `None` while the mempool is not active.
+    /// A new tip or a [`Request::FullTransactions`] request publishes the current lists.
+    /// Other mutations withdraw them until the next such request, so admission does not
+    /// repeatedly copy the entire mempool. Disabled mempools publish no snapshot.
     pub(crate) fn snapshots(&self) -> MempoolSnapshotReceiver {
         self.snapshot_sender.subscribe()
     }
 
     /// Publishes the verified transactions and the block they were last checked against, or
-    /// that the mempool is not active.
+    /// that no current snapshot is available.
     ///
-    /// Call this when the transactions and that block agree: after a new block's mined,
-    /// conflicting and expired transactions have been removed.
-    fn publish_snapshot(&mut self) {
+    /// Rebuild only after processing a new tip. Otherwise keep a current cached list or
+    /// withdraw an invalidated one without copying transactions during admission.
+    fn publish_snapshot(&mut self, rebuild: bool) {
         let snapshot = match &mut self.active_state {
             ActiveState::Disabled => None,
             ActiveState::Enabled {
@@ -737,9 +737,12 @@ impl Mempool {
                 last_seen_tip_hash,
                 ..
             } => {
-                let (transactions, transaction_dependencies) = storage.mining_snapshot();
-
-                Some(MempoolSnapshot {
+                let lists = if rebuild {
+                    Some(storage.mining_snapshot())
+                } else {
+                    storage.cached_mining_snapshot()
+                };
+                lists.map(|(transactions, transaction_dependencies)| MempoolSnapshot {
                     last_seen_tip_hash: *last_seen_tip_hash,
                     transactions,
                     transaction_dependencies,
@@ -920,13 +923,14 @@ impl Service<Request> for Mempool {
             .flatten();
 
         let is_state_changed = self.update_state(tip_action.as_ref(), is_caught_up_to_start);
+        let publish_for_tip = is_state_changed || tip_action.is_some();
 
         tracing::trace!(is_enabled = ?self.is_enabled(), ?is_state_changed, "started polling the mempool...");
 
         // When the mempool is disabled we still return that the service is ready.
         // Otherwise, callers could block waiting for the mempool to be enabled.
         if !self.is_enabled() {
-            self.publish_snapshot();
+            self.publish_snapshot(true);
             return Poll::Ready(Ok(()));
         }
 
@@ -989,7 +993,7 @@ impl Service<Request> for Mempool {
                 );
             }
 
-            self.publish_snapshot();
+            self.publish_snapshot(true);
             return Poll::Ready(Ok(()));
         }
 
@@ -1202,6 +1206,12 @@ impl Service<Request> for Mempool {
                 );
             }
 
+            // Withdraw invalidated lists before notifying listeners, including when sending
+            // a notification fails. Only a new tip or a list request pays to rebuild them.
+            if storage.cached_mining_snapshot().is_none() {
+                self.snapshot_sender.publish(None);
+            }
+
             // Send transactions that were not rejected nor expired to peers and RPC listeners.
             if !send_to_peers_ids.is_empty() {
                 tracing::trace!(
@@ -1249,7 +1259,7 @@ impl Service<Request> for Mempool {
             }
         }
 
-        self.publish_snapshot();
+        self.publish_snapshot(publish_for_tip);
         Poll::Ready(Ok(()))
     }
 
@@ -1358,6 +1368,11 @@ impl Service<Request> for Mempool {
                     trace!(?req, "got mempool request");
 
                     let (transactions, transaction_dependencies) = storage.mining_snapshot();
+                    self.snapshot_sender.publish(Some(MempoolSnapshot {
+                        last_seen_tip_hash: *last_seen_tip_hash,
+                        transactions: transactions.clone(),
+                        transaction_dependencies: transaction_dependencies.clone(),
+                    }));
 
                     trace!(?req, transactions_count = ?transactions.len(), "answered mempool request");
 

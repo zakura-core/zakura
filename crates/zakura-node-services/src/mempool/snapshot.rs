@@ -1,9 +1,9 @@
 //! The mempool's published snapshot: its verified transactions, tagged with the block they
 //! were last checked against.
 //!
-//! The mempool publishes a snapshot each time it finishes processing, so a reader gets the
-//! same answer as a [`Request::FullTransactions`](super::Request::FullTransactions) without
-//! sending a request and waiting behind the mempool's other callers.
+//! New tips and explicit transaction-list requests publish a snapshot. Other mutations
+//! withdraw it until the next list request, avoiding full-mempool copies during admission.
+//! A reader uses a published snapshot or requests the current lists from the service.
 
 use std::sync::Arc;
 
@@ -52,10 +52,11 @@ impl MempoolSnapshotSender {
         Self(watch::Sender::new(None))
     }
 
-    /// Publishes `snapshot`, or `None` while the mempool is not active.
+    /// Publishes `snapshot`, or `None` when the mempool is inactive or its lists changed.
     ///
     /// Readers are woken only when it differs from the snapshot published last.
     pub fn publish(&self, snapshot: Option<MempoolSnapshot>) {
+        let mut replaced = None;
         self.0.send_if_modified(|published| {
             let is_unchanged = match (&*published, &snapshot) {
                 (None, None) => true,
@@ -64,11 +65,14 @@ impl MempoolSnapshotSender {
             };
 
             if !is_unchanged {
-                *published = snapshot;
+                replaced = std::mem::replace(published, snapshot);
             }
 
             !is_unchanged
         });
+        // Releasing the last reader walks every transaction. Do that after the channel's
+        // write lock has been released so new readers are not blocked by destruction.
+        drop(replaced);
     }
 
     /// Returns a reader of the snapshots published on this channel.
@@ -88,7 +92,7 @@ impl Default for MempoolSnapshotSender {
 pub struct MempoolSnapshotReceiver(watch::Receiver<Option<MempoolSnapshot>>);
 
 impl MempoolSnapshotReceiver {
-    /// Returns the latest snapshot, or `None` while the mempool is not active.
+    /// Returns the latest snapshot, or `None` when no current list has been published.
     pub fn latest(&self) -> Option<MempoolSnapshot> {
         self.0.borrow().clone()
     }

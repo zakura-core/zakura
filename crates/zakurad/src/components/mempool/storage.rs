@@ -821,6 +821,11 @@ impl Storage {
         self.verified.mining_snapshot()
     }
 
+    /// Returns the current shared lists without rebuilding them after a mutation.
+    pub fn cached_mining_snapshot(&self) -> Option<MiningSnapshot> {
+        self.verified.cached_mining_snapshot()
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
     #[cfg(test)]
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {

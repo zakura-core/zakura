@@ -65,6 +65,26 @@ fn honest_control_handshake_holds() {
 }
 
 #[test]
+fn conformant_control_and_prelude_are_accepted() {
+    for family in [0, 1] {
+        let mut input = [0; Wire::SCENARIO_BYTES];
+        input[0] = family;
+        let report = run(Wire::draw(&input));
+        assert_witness_holds(
+            &report,
+            if family == 0 {
+                "handshake/hello/conformant-never-refused"
+            } else {
+                "handshake/ack/conformant-never-refused"
+            },
+        );
+        if family == 0 {
+            assert_witness_holds(&report, "handshake/prelude/conformant-never-refused");
+        }
+    }
+}
+
+#[test]
 fn every_family_draws_a_conformant_control_exchange() {
     for family in 0..10 {
         let mut input = [0; Wire::SCENARIO_BYTES];
@@ -329,7 +349,7 @@ fn wrong_network_is_refused_and_releases_its_slot() {
     });
     let report = run(scenario);
     assert_held(&report, "handshake/hello/wrong-network-refused");
-    assert_held(&report, "handshake/hello/refusal-releases-slot");
+    assert_witness_holds(&report, "handshake/hello/refusal-releases-slot");
 }
 
 fn assert_held(report: &zakura_sim::RunReport, id: &str) {
@@ -362,7 +382,7 @@ fn hello_guards_refuse_each_corrupt_field() {
             &report,
             &format!("handshake/hello/{}-refused", fault.label()),
         );
-        assert_held(&report, "handshake/hello/refusal-releases-slot");
+        assert_witness_holds(&report, "handshake/hello/refusal-releases-slot");
     }
 }
 
@@ -377,7 +397,7 @@ fn ack_guards_refuse_each_corrupt_field() {
         });
         let report = run(scenario);
         assert_witness_holds(&report, &format!("handshake/ack/{}-refused", fault.label()));
-        assert_held(&report, "handshake/ack/refusal-releases-slot");
+        assert_witness_holds(&report, "handshake/ack/refusal-releases-slot");
     }
 }
 

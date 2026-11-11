@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1035,7 +1035,7 @@
+         &self,
+         expected: &ZakuraControlValidation<'_>,
+     ) -> Result<(), ZakuraValidationError> {
+-        if self.magic != CONTROL_HELLO_MAGIC {
++        if self.magic == CONTROL_HELLO_MAGIC {
+             return Err(ZakuraValidationError::MalformedControl);
+         }
+         if self.control_version < CONTROL_VERSION {

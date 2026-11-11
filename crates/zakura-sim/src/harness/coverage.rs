@@ -294,6 +294,31 @@ const fn handshake_guard(
 
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
+    handshake_guard(
+        "handshake/hello/refusal-releases-slot",
+        "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/refusal-releases-slot",
+        "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/conformant-never-refused",
+        "handshake-table/refuse-conformant-hello/refuse-conformant-hello.patch",
+        "conformant_control_and_prelude_are_accepted",
+    ),
+    handshake_guard(
+        "handshake/ack/conformant-never-refused",
+        "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch",
+        "conformant_control_and_prelude_are_accepted",
+    ),
+    handshake_guard(
+        "handshake/prelude/conformant-never-refused",
+        "handshake-table/refuse-conformant-prelude/refuse-conformant-prelude.patch",
+        "conformant_control_and_prelude_are_accepted",
+    ),
     Coverage {
         property: "handshake/counts-match-permits",
         passing: passes(

@@ -1129,5 +1129,55 @@
       "test_target": "handshake"
     },
     "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "handshake-table/refuse-conformant-hello/refuse-conformant-hello.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/conformant-never-refused",
+    "witness": {
+      "test": "conformant_control_and_prelude_are_accepted",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/conformant-never-refused",
+    "witness": {
+      "test": "conformant_control_and_prelude_are_accepted",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/refuse-conformant-prelude/refuse-conformant-prelude.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/conformant-never-refused",
+    "witness": {
+      "test": "conformant_control_and_prelude_are_accepted",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+    "entry": "handshake-release",
+    "property": "handshake/hello/refusal-releases-slot",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+    "entry": "handshake-release",
+    "property": "handshake/ack/refusal-releases-slot",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
   }
 ]

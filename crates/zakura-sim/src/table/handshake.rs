@@ -209,7 +209,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_conformant::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
         });
     }
     for row in ["hello", "ack"] {
@@ -223,7 +223,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_released::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::PropertyLog(handshake_refusal_reached)),
         });
     }
     properties.push(Property {
@@ -234,7 +234,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         needs: &[Source::Closes],
         status: Status::Active,
         check: check_conformant_prelude::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
     });
     for &(label, consequence) in PRELUDE {
         properties.push(Property {
@@ -713,7 +713,8 @@ fn handshake_label_reached(property: &str, log: &crate::ObservationLog) -> bool 
         return false;
     };
     let Some(label) = claim
-        .strip_suffix("-refused")
+        .strip_suffix("-never-refused")
+        .or_else(|| claim.strip_suffix("-refused"))
         .or_else(|| claim.strip_suffix("-resets"))
         .or_else(|| claim.strip_suffix("-closes"))
     else {
@@ -850,6 +851,17 @@ fn resource_released(key: &ObligationKey, obs: &Observation) -> bool {
     matches!(obs, Observation::Transport {
         event: TransportFact::Handshake { shared_id, stage, .. }, ..
     } if key.subject == Subject::Owner(format!("{shared_id}/{stage}")))
+}
+
+fn handshake_refusal_reached(property: &str, log: &crate::ObservationLog) -> bool {
+    let Some(row) = property.split('/').nth(1) else {
+        return false;
+    };
+    log.entries().iter().any(|entry| {
+        matches!(&entry.obs, Observation::Transport {
+            event: TransportFact::Handshake { stage, error: Some(_), .. }, ..
+        } if stage == row)
+    })
 }
 
 fn check_released<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {

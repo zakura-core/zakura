@@ -1209,5 +1209,12 @@
       "test_target": "handshake"
     },
     "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "teardown/retain-replaced-reservation/retain-replaced-reservation.patch",
+    "package": "zakura-network",
+    "test": "zakura::regulation::session_table::tests::replacement_keeps_capacity_until_retired_snapshot_owners_drop",
+    "source": "crates/zakura-network/src/zakura/regulation/session_table/tests.rs",
+    "required_failure": "retired reservation remains after its last snapshot owner drops"
   }
 ]

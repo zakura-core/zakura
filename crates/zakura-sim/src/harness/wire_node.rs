@@ -811,14 +811,12 @@ impl TransportTap {
                         max_pending_per_ip,
                         retry_threshold,
                     },
-                    HandshakeEvent::Started { remote, deadline } => {
-                        TransportFact::QuicTlsStarted {
-                            remote: remote.to_string(),
-                            deadline_ms: deadline.map(|duration| {
-                                u64::try_from(duration.as_millis()).expect("QUIC timeouts fit u64")
-                            }),
-                        }
-                    }
+                    HandshakeEvent::Started { remote, deadline } => TransportFact::QuicTlsStarted {
+                        remote: remote.to_string(),
+                        deadline_ms: deadline.map(|duration| {
+                            u64::try_from(duration.as_millis()).expect("QUIC timeouts fit u64")
+                        }),
+                    },
                     HandshakeEvent::Finished { remote, error } => {
                         TransportFact::QuicHandshakeFinished {
                             remote: remote.to_string(),

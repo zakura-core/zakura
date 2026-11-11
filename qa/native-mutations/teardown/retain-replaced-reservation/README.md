@@ -11,3 +11,7 @@ The patched run must fail with `retired reservation remains after its last snaps
 
 This native assertion supplements the wire capacity property. It does not claim
 a simulator property kill or generator coverage.
+
+The droplet verified commit `989a9034d2`: the unchanged and restored builds each
+passed one exact test. The patched build failed that one test at the declared
+assertion. The report and logs are under `/root/handshake-replacement-989/`.

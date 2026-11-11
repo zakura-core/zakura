@@ -1651,6 +1651,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "v1-record-charged-twice",
+            REPAIR,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "wrong-acknowledgement",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -1839,6 +1845,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "supplier-twice",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "unbounded-slots",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,

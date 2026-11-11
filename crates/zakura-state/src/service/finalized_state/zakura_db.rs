@@ -9,7 +9,7 @@
 //! [`crate::constants::state_database_format_version_in_code()`] must be incremented
 //! each time the database format (column, serialization, etc) changes.
 
-use std::{path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
@@ -261,7 +261,21 @@ impl ZakuraDb {
             read_only,
         )?;
 
-        let static_file_dir = disk_db.path().join(STATIC_FILE_DIR);
+        let state_static_file_dir = disk_db.path().join(STATIC_FILE_DIR);
+        let external_static_file_dir =
+            config.external_static_files_path(format_version_in_code.major, network);
+        if let Some(configured) = &external_static_file_dir {
+            // Static files in both places would leave one copy unused, and the
+            // database's records unmatched by the other.
+            if fs::symlink_metadata(&state_static_file_dir).is_ok() {
+                return Err(StateInitError::StaticFilesInStateDir {
+                    found: state_static_file_dir,
+                    configured: configured.clone(),
+                });
+            }
+        }
+        let is_external = external_static_file_dir.is_some();
+        let static_file_dir = external_static_file_dir.unwrap_or(state_static_file_dir);
         let static_files = StaticFiles::open(
             static_file_dir.clone(),
             !read_only,
@@ -280,6 +294,18 @@ impl ZakuraDb {
             db: disk_db,
             static_files: Arc::new(static_files),
         };
+
+        // A database without blocks never moved any, so these belong to another
+        // node or a deleted state, and healing would delete them.
+        if !read_only
+            && is_external
+            && db.finalized_tip_height().is_none()
+            && db.static_files.tip().is_some()
+        {
+            return Err(StateInitError::StaticFilesWithoutDatabase {
+                path: db.static_files.dir().to_owned(),
+            });
+        }
 
         // Like reth, check the static files against the database before anything
         // reads them. A read-only secondary leaves that to the primary.

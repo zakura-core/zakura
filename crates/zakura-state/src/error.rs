@@ -249,8 +249,9 @@ pub enum StateInitError {
     /// files were damaged or deleted, and those bodies are gone.
     #[error(
         "transaction static files at {path:?} are missing block {first_missing:?}, but the \
-         database moved bodies up to {database_tip:?}. Hint: restore the state directory from \
-         a backup or resync"
+         database moved bodies up to {database_tip:?}. Hint: if the static files moved, set \
+         `state.static_files_dir` to their location, otherwise restore the state from a backup \
+         or resync"
     )]
     StaticFilesMissingBlocks {
         /// The static file directory.
@@ -259,6 +260,35 @@ pub enum StateInitError {
         first_missing: zakura_chain::block::Height,
         /// The highest block the database recorded as moved.
         database_tip: zakura_chain::block::Height,
+    },
+
+    /// `state.static_files_dir` is set, but the state directory has its own static files.
+    ///
+    /// This happens after restoring a snapshot taken with the default layout.
+    #[error(
+        "found transaction static files at {found:?}, but `state.static_files_dir` puts them at \
+         {configured:?}. Hint: move the contents of {found:?} into {configured:?}, or unset \
+         `state.static_files_dir`"
+    )]
+    StaticFilesInStateDir {
+        /// The static file directory inside the state directory.
+        found: PathBuf,
+        /// The static file directory under `state.static_files_dir`.
+        configured: PathBuf,
+    },
+
+    /// A new database found blocks in its external static file directory.
+    ///
+    /// Opening would delete them, and they likely belong to another node or to a
+    /// deleted state.
+    #[error(
+        "the state database is new, but its transaction static file directory {path:?} already \
+         holds blocks. Hint: give each node its own `state.static_files_dir`, or delete \
+         {path:?} if its state was deleted"
+    )]
+    StaticFilesWithoutDatabase {
+        /// The static file directory under `state.static_files_dir`.
+        path: PathBuf,
     },
 
     /// A read-only state was requested, but the configured cache directory is

@@ -872,6 +872,14 @@ impl StaticFiles {
         }
         // A linked directory would let jar files live anywhere.
         match fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(corrupt(
+                    &dir,
+                    "static file directory is a link, which Zakura doesn't follow. To keep \
+                     static files on another disk, set `state.static_files_dir` or mount the \
+                     disk at this path",
+                ));
+            }
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(corrupt(&dir, "static file directory is not a directory"));
             }

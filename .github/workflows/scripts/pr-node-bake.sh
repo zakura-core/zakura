@@ -163,6 +163,9 @@ fetch_state() {
     echo "${sha}  ${tarball}" | sha256sum -c -
   fi
   mkdir -p "$dest"
+  # Snapshots use the default layout, with transaction static files inside
+  # state/vN/<network>/static_files, so baked nodes must not set
+  # state.static_files_dir.
   zstd -dc "$tarball" | tar -x -C "$dest"
   rm -f "$tarball"
   ls -d "$dest"/state/v*/"$network" >/dev/null || {

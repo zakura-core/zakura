@@ -679,3 +679,213 @@ fn rollback_truncates_static_files() {
     );
     assert_chain_reads(&state.db, &blocks);
 }
+
+/// Returns [`config_at`] with static files under `static_files_root`.
+fn external_config_at(dir: &Path, static_files_root: &Path) -> Config {
+    Config {
+        static_files_dir: Some(static_files_root.to_path_buf()),
+        ..config_at(dir)
+    }
+}
+
+/// Returns the names of the files in `dir`, sorted, or none if it's missing.
+fn file_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| {
+            entry
+                .expect("entry reads")
+                .file_name()
+                .into_string()
+                .expect("test file names are UTF-8")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn external_static_files_open_reopen_and_serve_a_secondary() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let root = TempDir::new().expect("temp dir");
+    let config = external_config_at(dir.path(), root.path());
+    let major = crate::constants::state_database_format_version_in_code().major;
+    let external_dir = root.path().join(format!("v{major}")).join("mainnet");
+    assert_eq!(
+        config.external_static_files_path(major, &network),
+        Some(external_dir.clone())
+    );
+
+    let mut primary = FinalizedState::new(&config, &network).expect("state opens");
+    commit(&mut primary, &blocks);
+    assert_eq!(primary.db.static_file_transactions_tip(), Some(MOVED_TIP));
+    assert!(
+        !primary.db.path().join(STATIC_FILE_DIR).exists(),
+        "nothing is written inside the state directory"
+    );
+    assert!(!file_names(&external_dir).is_empty());
+
+    let (_read_state, secondary, _non_finalized) = crate::init_read_only(config.clone(), &network)
+        .expect("secondary opens alongside the primary");
+    assert_chain_reads(&secondary, &blocks);
+    drop(secondary);
+    drop(primary);
+
+    let state = FinalizedState::new(&config, &network).expect("state reopens");
+    assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
+    assert_chain_reads(&state.db, &blocks);
+}
+
+#[test]
+fn external_static_files_are_isolated_per_network() {
+    let _init_guard = zakura_test::init();
+    let blocks = test_chain();
+    let root = TempDir::new().expect("temp dir");
+    let mainnet_dir = TempDir::new().expect("temp dir");
+    let testnet_dir = TempDir::new().expect("temp dir");
+    let mainnet_config = external_config_at(mainnet_dir.path(), root.path());
+
+    let mut mainnet = FinalizedState::new(&mainnet_config, &Network::Mainnet).expect("state opens");
+    commit(&mut mainnet, &blocks);
+    drop(mainnet);
+
+    // A new testnet database sharing the root heals its own, empty directory.
+    let testnet = Network::new_default_testnet();
+    drop(
+        FinalizedState::new(
+            &external_config_at(testnet_dir.path(), root.path()),
+            &testnet,
+        )
+        .expect("a testnet state shares the static file root"),
+    );
+
+    let state = FinalizedState::new(&mainnet_config, &Network::Mainnet).expect("state reopens");
+    assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
+    assert_chain_reads(&state.db, &blocks);
+}
+
+#[test]
+fn a_reused_major_version_moves_external_static_files() {
+    use crate::{constants::STATE_DATABASE_KIND, service::finalized_state::disk_db::DiskDb};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let root = TempDir::new().expect("temp dir");
+    let config = external_config_at(dir.path(), root.path());
+    let current = crate::constants::state_database_format_version_in_code();
+    let previous = semver::Version::new(current.major - 1, 0, 0);
+    let current_db = config.db_path(STATE_DATABASE_KIND, current.major, &network);
+    let previous_db = config.db_path(STATE_DATABASE_KIND, previous.major, &network);
+    let current_static = config
+        .external_static_files_path(current.major, &network)
+        .expect("static files are external");
+    let previous_static = config
+        .external_static_files_path(previous.major, &network)
+        .expect("static files are external");
+
+    // Make the current database look like one the previous release left.
+    {
+        let mut state = FinalizedState::new(&config, &network).expect("state opens");
+        commit(&mut state, &blocks);
+        crate::write_database_format_version_to_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            current.major,
+            &previous,
+            &network,
+        )
+        .expect("fixture version is written");
+    }
+    let static_names = file_names(&current_static);
+    for (from, to) in [
+        (&current_db, &previous_db),
+        (&current_static, &previous_static),
+    ] {
+        std::fs::create_dir_all(to.parent().expect("versioned paths have a parent"))
+            .expect("older version parent exists");
+        std::fs::rename(from, to).expect("fixture moves to the older version directory");
+    }
+
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[current.major],
+            &current,
+            &config,
+            STATE_DATABASE_KIND,
+            &network,
+        ),
+        Some(previous.clone()),
+    );
+    assert_eq!(file_names(&current_static), static_names);
+    assert!(!previous_static.exists());
+    assert!(
+        !root.path().join(format!("v{}", previous.major)).exists(),
+        "the empty old version directory is removed"
+    );
+
+    // Put the version back, so the reused database opens without a format change.
+    crate::write_database_format_version_to_disk(
+        &config,
+        STATE_DATABASE_KIND,
+        current.major,
+        &current,
+        &network,
+    )
+    .expect("fixture version is written");
+    let state = FinalizedState::new(&config, &network).expect("reused state opens");
+    assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
+    assert_chain_reads(&state.db, &blocks);
+}
+
+#[test]
+fn a_new_database_refuses_external_static_files_it_did_not_write() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let root = TempDir::new().expect("temp dir");
+    let first = TempDir::new().expect("temp dir");
+    let second = TempDir::new().expect("temp dir");
+
+    let mut state = FinalizedState::new(&external_config_at(first.path(), root.path()), &network)
+        .expect("state opens");
+    commit(&mut state, &test_chain());
+    drop(state);
+
+    // A second node, or a resync after deleting only the state, would delete them.
+    assert!(matches!(
+        FinalizedState::new(&external_config_at(second.path(), root.path()), &network),
+        Err(StateInitError::StaticFilesWithoutDatabase { .. })
+    ));
+    let state = FinalizedState::new(&external_config_at(first.path(), root.path()), &network)
+        .expect("the first state still opens");
+    assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
+}
+
+#[test]
+fn static_files_left_in_the_state_directory_are_reported() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let dir = TempDir::new().expect("temp dir");
+    let root = TempDir::new().expect("temp dir");
+
+    // Like a snapshot taken with the default layout.
+    let mut state = FinalizedState::new(&config_at(dir.path()), &network).expect("state opens");
+    commit(&mut state, &test_chain());
+    drop(state);
+
+    let config = external_config_at(dir.path(), root.path());
+    assert!(matches!(
+        FinalizedState::new(&config, &network),
+        Err(StateInitError::StaticFilesInStateDir { .. })
+    ));
+    assert!(matches!(
+        crate::init_read_only(config, &network),
+        Err(StateInitError::StaticFilesInStateDir { .. })
+    ));
+}

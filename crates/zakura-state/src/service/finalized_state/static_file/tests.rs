@@ -647,8 +647,14 @@ fn a_linked_static_file_directory_is_rejected() {
     let static_dir = dir.path().join(STATIC_FILE_DIR);
     symlink_dir(&elsewhere, &static_dir);
 
-    assert!(StaticFiles::open(static_dir.clone(), true, 1_000).is_err());
-    assert!(StaticFiles::open(static_dir, false, 1_000).is_err());
+    for writable in [true, false] {
+        let error = StaticFiles::open(static_dir.clone(), writable, 1_000)
+            .expect_err("a linked directory is rejected");
+        assert!(
+            error.to_string().contains("state.static_files_dir"),
+            "the error points at the config field: {error}"
+        );
+    }
 }
 
 #[cfg(windows)]

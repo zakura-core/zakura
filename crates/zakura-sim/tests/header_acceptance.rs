@@ -3339,21 +3339,29 @@ fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
             .expect("under src")
             .display()
             .to_string();
-        for (at, _) in text.match_indices("cx.pending(") {
-            let call = &text[at + "cx.pending(".len()..];
-            let site = call
-                .strip_prefix("Pending::")
-                .and_then(|rest| rest.split_once(')'))
-                .map(|(site, _)| site)
-                .filter(|site| site.chars().all(|c| c.is_ascii_alphanumeric()))
-                .unwrap_or_else(|| panic!("{relative}: a pending mark the scan can't read"));
-            producers
-                .entry(site.to_owned())
-                .or_default()
-                .insert(relative.clone());
+        for site in marked_sites(&text, &relative) {
+            producers.entry(site).or_default().insert(relative.clone());
         }
     }
     producers
+}
+
+/// Each site `text`, the source of `file`, marks pending: every
+/// `.pending(` call with an argument, whatever its receiver, must name a
+/// `Pending::` literal. One with no argument is a query, not a mark.
+fn marked_sites(text: &str, file: &str) -> Vec<String> {
+    text.match_indices(".pending(")
+        .map(|(at, _)| &text[at + ".pending(".len()..])
+        .filter(|call| !call.starts_with(')'))
+        .map(|call| {
+            call.strip_prefix("Pending::")
+                .and_then(|rest| rest.split_once(')'))
+                .map(|(site, _)| site)
+                .filter(|site| site.chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or_else(|| panic!("{file}: a pending mark the scan can't read"))
+                .to_owned()
+        })
+        .collect()
 }
 
 /// C20: the reason inventory lists every `NotApplicable` reason exactly
@@ -3422,6 +3430,17 @@ fn the_not_applicable_inventory_lists_every_reason() {
     // `a_dry_end_fails_an_unread_boundary_as_missing_evidence` shows.
     let converted = [Pending::UnreadBoundary].map(|site| format!("{site:?}"));
     let header_sites: BTreeSet<String> = listed.iter().filter_map(site_of).collect();
+    // The scan reads a mark whatever its receiver is called, fails on an
+    // argument it can't read, and skips a `pending()` query (Terra 3, round
+    // 3).
+    let text = "cx.pending(Pending::FaultOpen);\nctx.pending(Pending::BlockTeardownOpen);\n\
+                let ops = self.port.pending();\n";
+    assert_eq!(
+        marked_sites(text, "t.rs"),
+        ["FaultOpen", "BlockTeardownOpen"]
+    );
+    let unreadable = std::panic::catch_unwind(|| marked_sites("view.pending(site);", "t.rs"));
+    assert!(unreadable.is_err(), "a mark the scan can't read fails it");
     let producers = pending_producers();
     let by_header = |site: &String| {
         producers

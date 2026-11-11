@@ -650,7 +650,9 @@ where
 /// DNS before initialization can finish. Seeds still resolving when every admitted
 /// attempt has finished are returned unresolved, and reach discovery after they resolve.
 /// With a startup target of one, a cached peer therefore takes the slot when seeds
-/// resolve later than the cache loads.
+/// resolve later than the cache loads. More generally, a full cache can spend the
+/// entire startup attempt budget before DNS resolves; those seeds reach discovery
+/// rather than receiving an extra startup dial.
 async fn dial_initial_peers<S>(
     config: Config,
     seed_peers: BoxFuture<'static, Vec<PeerSocketAddr>>,
@@ -737,9 +739,11 @@ where
 
         // Keep the seed fallback when an undersized cache has no live connection.
         // A working cached connection must let initialization finish without DNS.
+        // Reservations held by aborting failed handshakes are not successful peers.
         let must_wait_for_seeds = admitted_total < config.peerset_initial_target_size
             && !seed_peers.is_terminated()
-            && active_outbound_connections.update_count() == 0;
+            && (handshake_success_total == 0
+                || active_outbound_connections.update_open_count() == 0);
         if handshakes.is_empty() && !must_wait_for_seeds {
             break;
         }

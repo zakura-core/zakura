@@ -76,8 +76,9 @@ const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Startup dials with seeds supplied by the test, where every attempt fails.
 ///
-/// Returns the attempted addresses in admission order, the addresses sent to the
-/// address book, and the startup result.
+/// Returns the attempted addresses in task execution order, the addresses sent
+/// to the address book, and the startup result. Admission order is tested through
+/// the shared `InitialPeerOrder`, since spawned tasks may run in another order.
 async fn dial_initial_peers_without_network(
     config: Config,
     seed_peers: futures::future::BoxFuture<'static, Vec<PeerSocketAddr>>,
@@ -183,12 +184,13 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     let (attempts, published, connections) =
         dial_initial_peers_without_network(config, future::ready(seed_peers).boxed()).await;
     assert_eq!(attempts.len(), 4);
-    assert_eq!(attempts[0], cached[0]);
-    assert_eq!(attempts[2], cached[1]);
-    // Seeds remain shuffled, but get alternate turns regardless of listening port.
+    // The admission prefix takes two preferred cached peers and two fresh seeds.
+    // Their spawned connector tasks need not execute in admission order.
     assert_eq!(
-        IndexSet::from([attempts[1], attempts[3]]),
+        attempts.into_iter().collect::<IndexSet<_>>(),
         IndexSet::from([
+            cached[0],
+            cached[1],
             "127.0.0.2:8233".parse().unwrap(),
             "127.0.0.3:9000".parse().unwrap()
         ]),
@@ -258,7 +260,11 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
         } else {
             [cached_addr(0), seed, cached_addr(3)]
         };
-        assert_eq!(attempts, expected);
+        assert_eq!(attempts.len(), expected.len());
+        assert_eq!(
+            attempts.into_iter().collect::<IndexSet<_>>(),
+            expected.into_iter().collect::<IndexSet<_>>()
+        );
         assert_eq!(
             published.len(),
             cached.len() + 1,
@@ -308,7 +314,11 @@ async fn cached_startup_dials_before_seed_resolution_and_keeps_late_seeds() {
         } else {
             vec![cached, other]
         };
-        assert_eq!(attempts, expected);
+        assert_eq!(attempts.len(), expected.len());
+        assert_eq!(
+            attempts.into_iter().collect::<IndexSet<_>>(),
+            expected.into_iter().collect::<IndexSet<_>>()
+        );
         assert_eq!(published, IndexSet::from([cached, same_ip, other]));
 
         let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
@@ -403,6 +413,107 @@ async fn seeds_resolved_during_startup_get_startup_dials() {
     assert!(connections.pending_seed_peers.is_none());
 }
 
+/// Delayed seeds join an open admission window, but remain discovery candidates
+/// after a full cache has spent the entire startup attempt budget.
+#[tokio::test]
+async fn delayed_seeds_respect_a_full_cached_startup_window() {
+    let _init_guard = zakura_test::init();
+    let window = constants::INITIAL_PEER_DIAL_CONCURRENCY;
+    let target = window + 1;
+    let cached: IndexSet<PeerSocketAddr> = (1..=target)
+        .map(|i| format!("127.0.{}.{}:8233", i / 256, i % 256).parse().unwrap())
+        .collect();
+    let seed: PeerSocketAddr = "127.1.0.1:8233".parse().unwrap();
+
+    for seeds_during_window in [true, false] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: target,
+            ..test_defaults()
+        };
+        config.update_peer_cache(cached.clone()).await.unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector = {
+            let release = release.clone();
+            service_fn(move |request: OutboundConnectorRequest| {
+                attempt_tx.send(request.addr).unwrap();
+                let release = release.clone();
+                async move {
+                    let _permit = release.acquire().await.unwrap();
+                    Err::<DiscoveredPeer, BoxError>("peer unavailable".into())
+                }
+            })
+        };
+        let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+        let mut seed_tx = Some(seed_tx);
+        let (peerset_tx, _peerset_rx) = mpsc::channel(target);
+        let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(target + 2);
+        let startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
+            config,
+            async move { seed_rx.await.unwrap() }.boxed(),
+            connector,
+            peerset_tx,
+            book_tx.clone(),
+        )));
+        let mut first_window = IndexSet::new();
+        for _ in 0..window {
+            first_window.insert(next_attempt(&mut attempt_rx).await);
+        }
+        assert_eq!(
+            first_window,
+            cached.iter().copied().take(window).collect::<IndexSet<_>>()
+        );
+        assert!(attempt_rx.try_recv().is_err(), "the dial window is bounded");
+
+        if seeds_during_window {
+            seed_tx.take().unwrap().send(vec![seed]).unwrap();
+            // Observe seed publication before allowing any cached attempt to finish.
+            tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, async {
+                while book_rx.recv().await.unwrap().addr() != seed {}
+            })
+            .await
+            .unwrap();
+        }
+        release.add_permits(target);
+        let last_attempt = next_attempt(&mut attempt_rx).await;
+        assert_eq!(
+            last_attempt,
+            if seeds_during_window {
+                seed
+            } else {
+                cached[window]
+            }
+        );
+        let connections = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            attempt_rx.try_recv().is_err(),
+            "startup keeps its total budget"
+        );
+
+        if seeds_during_window {
+            assert!(connections.pending_seed_peers.is_none());
+        } else {
+            assert!(connections.pending_seed_peers.is_some());
+            let late_seeds = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                send_late_seed_peers(connections.pending_seed_peers, book_tx),
+            ));
+            seed_tx.take().unwrap().send(vec![seed]).unwrap();
+            tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, async {
+                while book_rx.recv().await.unwrap().addr() != seed {}
+            })
+            .await
+            .unwrap();
+            drop(late_seeds);
+        }
+    }
+}
+
 /// A live cached connection must let initialization finish even when the cache is
 /// smaller than the target and every seed lookup keeps retrying.
 #[tokio::test]
@@ -479,58 +590,105 @@ async fn small_healthy_cache_finishes_startup_with_unresolved_seeds() {
 #[tokio::test]
 async fn failed_cached_attempt_with_pending_cleanup_waits_for_seeds() {
     let _init_guard = zakura_test::init();
-    let cache_dir = tempfile::tempdir().unwrap();
-    let config = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        peerset_initial_target_size: 3,
-        ..test_defaults()
-    };
     let cached: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let seed: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
-    write_peer_cache_file(&config, &["127.0.0.1:8233"]);
+    let successful: PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
 
-    // An aborted inner handshake can retain its reservation until it is polled
-    // again. Hold the unmarked tracker to exercise that boundary deterministically.
-    let pending_cleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
-    let connector = {
-        let pending_cleanup = pending_cleanup.clone();
-        service_fn(move |request: OutboundConnectorRequest| {
-            attempt_tx.send(request.addr).unwrap();
-            pending_cleanup
-                .lock()
+    for had_success in [false, true] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: 3,
+            ..test_defaults()
+        };
+        let cache = if had_success {
+            vec!["127.0.0.1:8233", "127.0.0.3:8233"]
+        } else {
+            vec!["127.0.0.1:8233"]
+        };
+        write_peer_cache_file(&config, &cache);
+
+        // An aborted inner handshake can retain its reservation until it is polled
+        // again. Hold unmarked trackers to exercise that boundary deterministically.
+        let pending_cleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector = {
+            let pending_cleanup = pending_cleanup.clone();
+            let live_connections = live_connections.clone();
+            let release = release.clone();
+            service_fn(move |mut request: OutboundConnectorRequest| {
+                attempt_tx.send(request.addr).unwrap();
+                let is_success = request.addr == successful;
+                if is_success {
+                    request.connection_tracker.mark_open();
+                    live_connections
+                        .lock()
+                        .unwrap()
+                        .push(request.connection_tracker);
+                } else {
+                    pending_cleanup
+                        .lock()
+                        .unwrap()
+                        .push(request.connection_tracker);
+                }
+                let release = release.clone();
+                async move {
+                    if is_success {
+                        let (client, _harness) = ClientTestHarness::build().finish();
+                        Ok::<DiscoveredPeer, BoxError>((request.addr, client))
+                    } else {
+                        let _permit = release.acquire().await.unwrap();
+                        Err("handshake timed out".into())
+                    }
+                }
+            })
+        };
+        let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+        let (peerset_tx, mut peerset_rx) = mpsc::channel(10);
+        let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+        let mut startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
+            config,
+            async move { seed_rx.await.unwrap() }.boxed(),
+            connector,
+            peerset_tx,
+            book_tx,
+        )));
+        let mut attempts = IndexSet::new();
+        for _ in 0..cache.len() {
+            attempts.insert(next_attempt(&mut attempt_rx).await);
+        }
+        assert!(attempts.contains(&cached));
+        if had_success {
+            let connected = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, peerset_rx.next())
+                .await
                 .unwrap()
-                .push(request.connection_tracker);
-            async { Err::<DiscoveredPeer, BoxError>("handshake timed out".into()) }
-        })
-    };
-    let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
-    let (peerset_tx, _peerset_rx) = mpsc::channel(10);
-    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
-    let mut startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
-        config,
-        async move { seed_rx.await.unwrap() }.boxed(),
-        connector,
-        peerset_tx,
-        book_tx,
-    )));
-    assert_eq!(next_attempt(&mut attempt_rx).await, cached);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut startup)
+                .unwrap();
+            assert_eq!(connected.0, successful);
+            // The formerly successful connection closes before the last failure.
+            live_connections.lock().unwrap().clear();
+            drop(connected);
+        }
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut startup)
+                .await
+                .is_err(),
+            "a failed attempt's reservation must not bypass the seed fallback"
+        );
+        seed_tx.send(vec![seed]).unwrap();
+        assert_eq!(next_attempt(&mut attempt_rx).await, seed);
+        let mut connections = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
             .await
-            .is_err(),
-        "a failed attempt's reservation must not bypass the seed fallback"
-    );
-    seed_tx.send(vec![seed]).unwrap();
-    assert_eq!(next_attempt(&mut attempt_rx).await, seed);
-    let mut connections = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(connections.pending_seed_peers.is_none());
-    pending_cleanup.lock().unwrap().clear();
-    assert_eq!(connections.active_connections.update_count(), 0);
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(connections.pending_seed_peers.is_none());
+        assert_eq!(connections.active_connections.update_open_count(), 0);
+        pending_cleanup.lock().unwrap().clear();
+        assert_eq!(connections.active_connections.update_count(), 0);
+    }
 }
 
 /// Empty, missing, unreadable, and invalid caches wait for seeds.

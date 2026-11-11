@@ -18,6 +18,9 @@ use crate::{
 /// [`crate::FullStateEvidenceAuthority::authorizes_validation_lease`]. Omitting
 /// required leases fails planning as [`crate::TransitionFailure::MissingDurableFacts`],
 /// not as store I/O.
+///
+/// [`crate::HeaderChainEngine::needs_validation_lease`] says whether planning can read the
+/// lease for one parent. The adapter may omit a lease it answers `false` for.
 #[derive(Clone, Debug, Default)]
 pub struct HeaderValidationFacts {
     /// Exact predecessor leases available for missing retained parents.

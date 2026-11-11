@@ -31,7 +31,8 @@ use zakura_scheduler::{
 
 use crate::{
     action::{
-        enabled_set, Action, ActionSource, Boundary, DrainClock, EnabledInputs, Offer, SourceId,
+        enabled_set, Action, ActionSource, Boundary, DrainClock, Enabled, EnabledInputs, Offer,
+        SourceId,
     },
     check::{Checker, OpenKind, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
@@ -605,21 +606,33 @@ impl Sim {
                 offers: &offers,
                 clock,
             };
-            let enabled =
-                match enabled_set(&inputs(free.as_deref().unwrap_or(&ready))).and_then(|enabled| {
+            let mut enabled = match enabled_set(&inputs(free.as_deref().unwrap_or(&ready)))
+                .and_then(|enabled| {
                     if enabled.is_empty() && free.is_some() {
                         enabled_set(&inputs(&ready))
                     } else {
                         Ok(enabled)
                     }
                 }) {
-                    Ok(enabled) => enabled,
-                    Err(identity) => {
-                        return st.end_harness(HarnessFailure::DuplicateIdentity {
-                            identity: identity.to_string(),
-                        })
-                    }
-                };
+                Ok(enabled) => enabled,
+                Err(identity) => {
+                    return st.end_harness(HarnessFailure::DuplicateIdentity {
+                        identity: identity.to_string(),
+                    })
+                }
+            };
+            // The clock never moves while a task is ready, even one with no
+            // worker for it, so no deadline passes before that task runs. A
+            // drain left with nothing else ends dry, where a worker-starved
+            // end with a check open fails as stuck.
+            let advances = |enabled: &[Enabled]| {
+                enabled
+                    .iter()
+                    .any(|enabled| matches!(enabled.action, Action::AdvanceTime(_)))
+            };
+            if advances(&enabled) && self.sched().status() == Status::WorkerStarved {
+                enabled.retain(|enabled| !matches!(enabled.action, Action::AdvanceTime(_)));
+            }
             if enabled.is_empty() {
                 // A live end that the drain can still resolve enters it.
                 let resolvable = match phase {
@@ -667,10 +680,7 @@ impl Sim {
             if phase == Phase::Drain {
                 // Before the clock moves toward an expiry that would blame
                 // the node, work no recovery action finishes fails the run.
-                let advances = enabled
-                    .iter()
-                    .any(|enabled| matches!(enabled.action, Action::AdvanceTime(_)));
-                if let Some(failure) = advances.then(|| self.stranded()).flatten() {
+                if let Some(failure) = advances(&enabled).then(|| self.stranded()).flatten() {
                     return st.end_harness(failure);
                 }
                 if drained >= self.config.drain_bound {

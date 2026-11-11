@@ -44,7 +44,7 @@ enum Name {
 type Facts = Vec<(u64, Name)>;
 
 /// One step of the harness's task.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Act {
     /// Records a view-side fact.
     Fact(Name),
@@ -59,6 +59,9 @@ enum Act {
     Store,
     /// Breaks the harness's evidence in this way.
     Break(Broken),
+    /// Spawns a holder that yields holding a lock and two waiters that park
+    /// on it, one per worker, so the holder is ready with no worker.
+    Starve,
 }
 
 /// How a harness's evidence breaks. Each way, its view panics if read.
@@ -185,6 +188,31 @@ impl Subsystem for Stamped {
         let task_broken = Rc::clone(&broken);
         let storage = FakeStorage::new("store", Duration::from_millis(1));
         sim.add_source(Box::new(storage.clone()));
+        // `Starve`'s tasks: a holder that takes a lock and yields holding
+        // it, and two waiters that park on it once it's held, one per
+        // worker.
+        let starve = zakura_rt::sync::CancellationToken::new();
+        if script.acts.contains(&Act::Starve) {
+            let lock = Rc::new(Mutex::new(()));
+            let held = zakura_rt::sync::CancellationToken::new();
+            let (start, taken, holder_lock) = (starve.clone(), held.clone(), Rc::clone(&lock));
+            sim.scheduler().spawn_root("holder", async move {
+                start.cancelled().await;
+                #[allow(clippy::await_holding_lock)]
+                {
+                    let _guard = holder_lock.lock().expect("no task panics holding it");
+                    taken.cancel();
+                    task::yield_now().await;
+                }
+            });
+            for _ in 0..2 {
+                let (held, lock) = (held.clone(), Rc::clone(&lock));
+                sim.scheduler().spawn_root("waiter", async move {
+                    held.cancelled().await;
+                    drop(lock.lock().expect("no task panics holding it"));
+                });
+            }
+        }
         sim.scheduler().spawn_root("stamper", async move {
             for act in acts {
                 match act {
@@ -199,6 +227,7 @@ impl Subsystem for Stamped {
                     Act::Point => drop(lock.lock().expect("no task panics holding it")),
                     Act::Store => drop(storage.submit().await),
                     Act::Break(how) => task_broken.set(Some(how)),
+                    Act::Starve => starve.cancel(),
                 }
             }
         });
@@ -479,6 +508,41 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     );
     assert_eq!(violation.actual, "still open at 60000000000 ns");
     assert_eq!(violation.witness, [1, violation.step]);
+}
+
+/// Sol 1, round 4: a deferred deadline doesn't pass while a task is ready
+/// with no worker for it. The clock stays, and the run fails as stuck
+/// rather than expire the obligation against the node.
+#[test]
+fn a_deferred_deadline_does_not_pass_while_a_task_is_starved() {
+    let script = Script {
+        acts: vec![Fact(Wait), Fact(Defer(1)), Act::Starve],
+        budget: 50,
+        drain: 10,
+        release_at_end: false,
+    };
+    let report = match run_harness::<Stamped>(
+        &script,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        None,
+    ) {
+        Ok(report) => report,
+        Err(zakura_sim::harness::HarnessError::Run { report, .. }) => *report,
+        Err(error) => panic!("the harness builds: {error}"),
+    };
+    assert_eq!(
+        report.end.harness,
+        Some(zakura_sim::HarnessFailure::StuckWithoutAction {
+            status: "worker-starved"
+        }),
+        "{:?}",
+        report.end
+    );
+    assert_eq!(
+        outcome(&report, SERVED),
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
+    );
 }
 
 /// Keeps the lifecycle points it's handed.

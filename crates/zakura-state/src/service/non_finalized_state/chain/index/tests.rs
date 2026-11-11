@@ -28,6 +28,118 @@ use super::{
 const VALUE: i64 = 1_000;
 
 #[test]
+fn duplicate_spends_in_one_block_panic_during_push() {
+    for starts_empty in [false, true] {
+        let (chain, template) = chain_and_template(false);
+        let chain = if starts_empty {
+            empty_chain_at(template.coinbase_height().unwrap())
+        } else {
+            chain
+        };
+        let (mut block, _) = child_with_spends(&template, 0, 2);
+        let transactions = &mut Arc::make_mut(&mut block).transactions;
+        let inputs = transactions[1].inputs().to_vec();
+        match Arc::make_mut(&mut transactions[2]) {
+            Transaction::V4 { inputs: second, .. } => *second = inputs,
+            _ => unreachable!("the fixture creates V4 transactions"),
+        }
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            block.prepare(),
+            HashMap::from([finalized_output(0)]),
+        )
+        .expect("each transaction preserves value");
+        assert_push_panics(chain, contextual, "unexpected duplicate spent output");
+    }
+}
+
+#[test]
+fn duplicate_transactions_in_one_block_panic_during_push() {
+    for starts_empty in [false, true] {
+        let (chain, template) = chain_and_template(false);
+        let chain = if starts_empty {
+            empty_chain_at(template.coinbase_height().unwrap())
+        } else {
+            chain
+        };
+        let (mut block, _) = child_with_spends(&template, 0, 1);
+        let transactions = &mut Arc::make_mut(&mut block).transactions;
+        transactions.push(transactions[1].clone());
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            block.prepare(),
+            HashMap::from([finalized_output(0)]),
+        )
+        .expect("each transaction preserves value");
+        assert_push_panics(
+            chain,
+            contextual,
+            "transactions must be unique within a single chain",
+        );
+    }
+}
+
+fn assert_push_panics(chain: Chain, block: ContextuallyVerifiedBlock, expected: &str) {
+    let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chain.push(block)))
+    else {
+        panic!("pushing the invalid block must trigger its index invariant");
+    };
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("the invariant panic has a string message");
+    assert!(message.contains(expected), "unexpected panic: {message}");
+}
+
+#[test]
+fn finalized_entries_can_be_replaced_before_they_are_swept() {
+    let (chain, template) = chain_and_template(false);
+    let (root, contextual) = child_with_spends(&template, 0, 300);
+    let chain = push(chain, contextual);
+    let (tip, contextual) = child_with_spends(&root, 1_000, 0);
+    let mut chain = push(chain, contextual);
+    chain.pop_root();
+    chain.pop_root();
+
+    let (seed, transaction) = root
+        .transactions
+        .iter()
+        .skip(1)
+        .enumerate()
+        .find(|(seed, tx)| {
+            let outpoint = finalized_output(u32::try_from(*seed).unwrap()).0;
+            chain.tx_loc_by_hash.get(&tx.hash()).is_some()
+                && chain.spent_utxos.get(&outpoint).is_some()
+        })
+        .expect("most finalized entries are still waiting for a sweep");
+    let mut block = tip.make_fake_child();
+    Arc::make_mut(&mut block)
+        .transactions
+        .push(transaction.clone());
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        block.prepare(),
+        HashMap::from([finalized_output(u32::try_from(seed).unwrap())]),
+    )
+    .expect("the repeated transaction preserves value");
+    let height = contextual.height;
+    // Exercise only the index backstop: full validation would reject spending an
+    // already-finalized output, but finalized index residue must allow replacement.
+    let chain = push(chain, contextual);
+    assert_eq!(
+        chain
+            .transaction_location(&transaction.hash())
+            .unwrap()
+            .height,
+        height
+    );
+    assert!(chain
+        .spent_utxo(&finalized_output(u32::try_from(seed).unwrap()).0)
+        .is_some());
+}
+
+#[test]
 fn utxo_query_resolves_outputs_across_many_transactions() {
     let (chain, template) = chain_and_template(false);
     let (mut block, contextual) = child_with_spends(&template, 0, 256);
@@ -239,7 +351,17 @@ fn chain_and_template(skip_address_index: bool) -> (Chain, Arc<Block>) {
     Arc::make_mut(&mut template).transactions.truncate(1);
     let finalized_tip =
         (template.coinbase_height().expect("the block has a height") - 1).expect("above genesis");
-    let chain = Chain::new(
+    let chain =
+        empty_chain_at(finalized_tip).skipping_transparent_address_index(skip_address_index);
+    let chain = push(
+        chain,
+        template.clone().prepare().test_with_zero_spent_utxos(),
+    );
+    (chain, template)
+}
+
+fn empty_chain_at(finalized_tip: Height) -> Chain {
+    Chain::new(
         &Network::Mainnet,
         finalized_tip,
         Default::default(),
@@ -249,12 +371,6 @@ fn chain_and_template(skip_address_index: bool) -> (Chain, Arc<Block>) {
         Default::default(),
         ValueBalance::fake_populated_pool(),
     )
-    .skipping_transparent_address_index(skip_address_index);
-    let chain = push(
-        chain,
-        template.clone().prepare().test_with_zero_spent_utxos(),
-    );
-    (chain, template)
 }
 
 fn push(chain: Chain, block: ContextuallyVerifiedBlock) -> Chain {

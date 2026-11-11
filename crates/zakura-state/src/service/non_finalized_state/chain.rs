@@ -2121,8 +2121,12 @@ impl Chain {
             let prior_location = self
                 .tx_loc_by_hash
                 .insert(transaction_hash, transaction_location);
+            // Only entries below the root are finalized residue. Entries from
+            // earlier in this block are not in `blocks` yet, but are duplicates.
             assert!(
-                prior_location.is_none_or(|prior| !self.blocks.contains_key(&prior.height)),
+                prior_location.is_none_or(|prior| {
+                    prior.height < self.blocks.keys().next().copied().unwrap_or(height)
+                }),
                 "transactions must be unique within a single chain"
             );
 
@@ -2396,7 +2400,9 @@ impl
             // Index the spent outpoint in the chain
             let prior_spend = self.spent_utxos.insert(spent_outpoint, spend);
             assert!(
-                prior_spend.is_none_or(|prior| !self.blocks.contains_key(&prior.height)),
+                prior_spend.is_none_or(|prior| {
+                    prior.height < self.blocks.keys().next().copied().unwrap_or(height)
+                }),
                 "unexpected duplicate spent output: should be checked earlier"
             );
         }

@@ -3294,11 +3294,76 @@ fn the_narrowing_rules_match_their_pin() {
     );
 }
 
+/// The variant names of `pub enum {name}` in the crate source file `file`:
+/// each identifier that opens a line at the enum body's top level.
+fn enum_variants(file: &str, name: &str) -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+    let text = std::fs::read_to_string(&path).expect("the enum's source file reads");
+    let open = format!("pub enum {name} {{\n");
+    let body = &text[text.find(&open).expect("the enum is defined there") + open.len()..];
+    let body = &body[..body.find("\n}\n").expect("the enum's body closes")];
+    body.lines()
+        .filter_map(|line| line.strip_prefix("    "))
+        .filter(|line| line.starts_with(|c: char| c.is_ascii_uppercase()))
+        .map(|line| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .expect("a line has a first word")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every site a check in the crate's `src` marks pending, with the files
+/// that mark it, relative to `src`. Every `cx.pending(` call must name its
+/// site as a `Pending::` literal, so the scan sees each one.
+fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let mut producers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("a source file reads");
+        let relative = file
+            .strip_prefix(&src)
+            .expect("under src")
+            .display()
+            .to_string();
+        for (at, _) in text.match_indices("cx.pending(") {
+            let call = &text[at + "cx.pending(".len()..];
+            let site = call
+                .strip_prefix("Pending::")
+                .and_then(|rest| rest.split_once(')'))
+                .map(|(site, _)| site)
+                .filter(|site| site.chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or_else(|| panic!("{relative}: a pending mark the scan can't read"));
+            producers
+                .entry(site.to_owned())
+                .or_default()
+                .insert(relative.clone());
+        }
+    }
+    producers
+}
+
 /// C20: the reason inventory lists every `NotApplicable` reason exactly
 /// once, in `NA_REASONS` for the ones a header ID can carry or `NOT_HEADER`
-/// for the rest, and each in the trace's typed form. The match is
-/// exhaustive, so a new reason or `Pending` site fails to compile here until
-/// it's classified.
+/// for the rest, and each in the trace's typed form. The complete set comes
+/// from the enums' definitions, and a pending site's side from the checks
+/// that mark it: a site a header source marks is a header reason, unless
+/// the dry end turns it into missing evidence, and each header site has a
+/// header producer. The match is exhaustive too, so a new reason or
+/// `Pending` site fails to compile here until it's classified.
 #[test]
 fn the_not_applicable_inventory_lists_every_reason() {
     use zakura_sim::{property::Pending, NaReason};
@@ -3332,31 +3397,54 @@ fn the_not_applicable_inventory_lists_every_reason() {
         listed.len() + excluded.len(),
         "a reason is listed twice"
     );
-    // Every unit reason, and every site, which the match above keeps
-    // exhaustive.
-    let sites = [
-        Pending::FaultOpen,
-        Pending::UnreadBoundary,
-        Pending::TeardownOpen,
-        Pending::BlockTeardownOpen,
-        Pending::WatchOpen,
-        Pending::UnreadTrigger,
-        Pending::UnjudgedDeparture,
-    ];
-    let every: BTreeSet<NaReason> = [
-        NaReason::NeverApplied,
-        NaReason::Undeclared,
-        NaReason::Excluded,
-        NaReason::AssumptionsNeverHeld,
-        NaReason::AssumptionLost,
-        NaReason::StoppedByViolation,
-        NaReason::HarnessFailed,
-        NaReason::NodeStopped,
-    ]
-    .into_iter()
-    .chain(sites.map(|site| NaReason::Unsettled { site }))
-    .collect();
-    assert_eq!(all, every);
+    // Every variant, as the enums define them.
+    let site_of = |reason: &NaReason| match reason {
+        NaReason::Unsettled { site } => Some(format!("{site:?}")),
+        _ => None,
+    };
+    let variant_of = |reason: &NaReason| match site_of(reason) {
+        Some(_) => "Unsettled".to_owned(),
+        None => format!("{reason:?}"),
+    };
+    assert_eq!(
+        all.iter().map(variant_of).collect::<BTreeSet<_>>(),
+        enum_variants("src/check.rs", "NaReason"),
+        "every reason"
+    );
+    assert_eq!(
+        all.iter().filter_map(site_of).collect::<BTreeSet<_>>(),
+        enum_variants("src/property/verdict.rs", "Pending"),
+        "every pending site"
+    );
+    // The one site a header check marks that no header ID ends with: the
+    // registry's dry end fails the run at it instead, as
+    // `tests/drain.rs`'s
+    // `a_dry_end_fails_an_unread_boundary_as_missing_evidence` shows.
+    let converted = [Pending::UnreadBoundary].map(|site| format!("{site:?}"));
+    let header_sites: BTreeSet<String> = listed.iter().filter_map(site_of).collect();
+    let producers = pending_producers();
+    let by_header = |site: &String| {
+        producers
+            .get(site)
+            .is_some_and(|files| files.iter().any(|file| file.contains("header")))
+    };
+    for site in producers.keys().filter(|site| by_header(site)) {
+        assert!(
+            header_sites.contains(site) || converted.contains(site),
+            "a header check marks {site}, which NA_REASONS doesn't list"
+        );
+    }
+    for site in &header_sites {
+        assert!(by_header(site), "no header check marks {site}");
+    }
+    for site in &converted {
+        assert!(
+            NOT_HEADER
+                .iter()
+                .any(|(reason, _)| site_of(reason).as_ref() == Some(site)),
+            "{site}"
+        );
+    }
     for entry in NA_REASONS {
         assert!(
             header(entry.reason),

@@ -92,9 +92,9 @@ struct Store {
     settled: Option<(u64, Option<String>)>,
     /// How many settled points the drains judged.
     settled_points: u64,
-    /// The mirrors whose own reactors admitted a session with the node
-    /// ([`MirrorAdmits`]).
-    mirrors_admitted: HashSet<String>,
+    /// The mirrors whose own reactors admitted or refused a session with
+    /// the node ([`MirrorDecisions`]).
+    mirrors_decided: HashSet<String>,
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
@@ -146,29 +146,30 @@ impl ForkChoiceEvidence {
     }
 
     /// The observer for the mirror named `mirror`, which records its own
-    /// reactor admitting a session with `node`, the node under test
-    /// ([`MirrorAdmits`]).
+    /// reactor admitting or refusing a session with `node`, the node under
+    /// test ([`MirrorDecisions`]).
     pub fn mirror(&self, mirror: &str, node: ZakuraPeerId) -> Arc<dyn HeaderSyncObserver> {
-        Arc::new(MirrorAdmits {
+        Arc::new(MirrorDecisions {
             mirror: mirror.to_owned(),
             node,
             evidence: self.clone(),
         })
     }
 
-    /// How many mirrors' own reactors have admitted a session with the
-    /// node.
-    fn mirrors_admitted(&self) -> usize {
-        self.with(|store| store.mirrors_admitted.len())
+    /// How many mirrors' own reactors have admitted or refused a session
+    /// with the node.
+    fn mirrors_decided(&self) -> usize {
+        self.with(|store| store.mirrors_decided.len())
     }
 }
 
 /// A mirror's observer, which records the mirror's reactor admitting a
-/// session with the node under test, so settled points count a mirror the
-/// node itself refused ([`settled`]). It ignores every other event and adds
-/// no scheduling point, so the mirror runs as it would unobserved.
+/// session with the node under test or refusing it at capacity, so settled
+/// points count a mirror the node itself refused, even when the mirrors run
+/// the same refusing reactor ([`settled`]). It ignores every other event and
+/// adds no scheduling point, so the mirror runs as it would unobserved.
 #[derive(Debug)]
-struct MirrorAdmits {
+struct MirrorDecisions {
     /// The mirror's harness name.
     mirror: String,
     /// The node under test.
@@ -176,15 +177,19 @@ struct MirrorAdmits {
     evidence: ForkChoiceEvidence,
 }
 
-impl HeaderSyncObserver for MirrorAdmits {
-    /// Records the mirror if `event` admits a session with the node.
+impl HeaderSyncObserver for MirrorDecisions {
+    /// Records the mirror if `event` admits a session with the node or
+    /// refuses one at capacity.
     fn observe(&self, event: ReactorEvent) {
-        if let ReactorEvent::SessionAdmitted { peer, .. } = event {
-            if peer == self.node {
-                self.evidence.with(|store| {
-                    store.mirrors_admitted.insert(self.mirror.clone());
-                });
-            }
+        let (ReactorEvent::SessionAdmitted { peer, .. }
+        | ReactorEvent::SessionAtCapacity { peer, .. }) = event
+        else {
+            return;
+        };
+        if peer == self.node {
+            self.evidence.with(|store| {
+                store.mirrors_decided.insert(self.mirror.clone());
+            });
         }
     }
 }
@@ -298,7 +303,7 @@ impl ForkChoice {
         // also run before the run's clock does.
         let verdict = match (&mut self.settled, self.tainted) {
             (Some(settled), false) if step > 0 => {
-                settled.judge(self.selected, outside, self.evidence.mirrors_admitted())
+                settled.judge(self.selected, outside, self.evidence.mirrors_decided())
             }
             _ => None,
         };

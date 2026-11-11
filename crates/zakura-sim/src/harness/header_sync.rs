@@ -27,10 +27,8 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    observe::{HeaderSyncObserver, ReactorEvent},
-    spawn_header_sync_reactor,
-    v9::RegtestMessage,
-    FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
+    spawn_header_sync_reactor, v9::RegtestMessage, FullStateFrontiers, HeaderSyncStartup,
+    ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_scheduler::SchedulerConfig;
@@ -664,24 +662,6 @@ fn mirror(index: usize) -> String {
     format!("mirror-{index}")
 }
 
-/// A [`StorageScenario`] mirror's observer: the publication check's record
-/// of the mirror refusing what the node sent and the settled points' record
-/// of its own reactor admitting the node. Neither takes the session token,
-/// the resource probe or the capacity handle, so only events are forwarded.
-#[derive(Debug)]
-struct MirrorObserver {
-    refusals: Arc<dyn HeaderSyncObserver>,
-    admits: Arc<dyn HeaderSyncObserver>,
-}
-
-impl HeaderSyncObserver for MirrorObserver {
-    /// Hands `event` to both records.
-    fn observe(&self, event: ReactorEvent) {
-        self.admits.observe(event.clone());
-        self.refusals.observe(event);
-    }
-}
-
 /// The scenario's storage, with each actor's chain committed before the
 /// run, and the node's session view. Cloning shares both, so a test can read
 /// them after a run. One prepared `Ports` serves one run.
@@ -1308,10 +1288,7 @@ impl Subsystem for Storage {
             .enumerate()
         {
             let name = format!("mirror-{index}");
-            let observer: Arc<dyn HeaderSyncObserver> = Arc::new(MirrorObserver {
-                refusals: ports.publication.mirror(&name, nodes[0].id.clone()),
-                admits: ports.fork_choice.mirror(&name, nodes[0].id.clone()),
-            });
+            let observer = ports.fork_choice.mirror(&name, nodes[0].id.clone());
             let mut config = ZakuraHeaderSyncConfig::default();
             if let Some(limit) = spec.max_headers_per_response {
                 config.max_headers_per_response = limit;
@@ -1339,7 +1316,8 @@ impl Subsystem for Storage {
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
                 .with_sessions(ports.sessions.clone())
-                .with_delayed_page(ports.delayed_page.clone()),
+                .with_delayed_page(ports.delayed_page.clone())
+                .with_refusals(ports.publication.clone()),
         );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {

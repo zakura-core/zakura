@@ -23,7 +23,7 @@ fn fixture() -> (HeaderFixture, ForkFixture) {
     )
 }
 
-/// Both of [`fixture`]'s mirrors, admitted by their own reactors.
+/// Both of [`fixture`]'s mirrors, decided by their own reactors.
 const BOTH: usize = 2;
 
 /// Nothing outside the reactor busy, at `now`, with the host's clock,
@@ -68,7 +68,7 @@ fn a_settled_node_must_be_on_the_heaviest_tip() {
 }
 
 /// Each condition the tap reads keeps a point from being settled: a mirror
-/// whose own reactor hasn't admitted its session, a slot, a pending call, a
+/// whose own reactor hasn't decided on its session, a slot, a pending call, a
 /// busy port, a harness close or relink, and a deferred pass whose refill
 /// hasn't come.
 #[test]

@@ -81,6 +81,7 @@ use self::{
     ends::EnvironmentAction,
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
+    publication::PublicationEvidence,
     recovery::{
         Driver, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED, RELINK, UNREACHED,
     },
@@ -798,6 +799,9 @@ pub struct Topology {
     stopping: Cell<bool>,
     /// The mirror whose pages the harness holds back, if any.
     delayed_page: Option<DelayedPage>,
+    /// The publication evidence told of each mirror's side of each link
+    /// with the node under test, if any.
+    refusals: Option<PublicationEvidence>,
 }
 
 /// A mirror whose first `Headers` frame on each of its links the harness
@@ -954,6 +958,18 @@ impl Topology {
             sessions: None,
             stopping: Cell::new(false),
             delayed_page: None,
+            refusals: None,
+        }
+    }
+
+    /// This topology, handing `evidence` each mirror's side of each link
+    /// with the node under test, so a mirror's protocol reject breaks
+    /// `state-publication-consistent`
+    /// ([`PublicationEvidence::watch_mirror_link`]).
+    pub fn with_refusals(self, evidence: PublicationEvidence) -> Self {
+        Topology {
+            refusals: Some(evidence),
+            ..self
         }
     }
 
@@ -1218,6 +1234,8 @@ impl Topology {
             .with_origin(origin);
             if local == 0 {
                 ended(&peer.service_cancel_token());
+            } else if let Some(refusals) = self.refusals.as_ref().filter(|_| remote == 0) {
+                refusals.watch_mirror_link(&self.nodes[local].name, id, peer.close_cause_reader());
             }
             self.nodes[local].service.add_peer(peer);
         }

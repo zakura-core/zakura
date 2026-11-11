@@ -42,10 +42,11 @@
 //! - **Served pages are what was read.** Every page a publisher hands its
 //!   writer is the page read it was built from, and declares that read's
 //!   start ([`served`]).
-//! - **Mirrors take what they're sent.** No mirror ends its session with
-//!   the node on a protocol reject ([`MirrorRefusals`]). A mirror's own
+//! - **Mirrors take what they're sent.** No mirror closes a connection
+//!   with the node on a protocol reject ([`MirrorLink`]). A mirror's own
 //!   subscriber judges each page against its `Open`, so a page that
-//!   matches its read but not what was asked for shows here.
+//!   matches its read but not what was asked for shows here. Mirrors are
+//!   honest, so the node is to blame, whatever message the mirror refused.
 //!
 //! **Liveness facts.** A harness that arms the evidence
 //! ([`PublicationEvidence::armed`]) also gets stamped facts, which the
@@ -74,10 +75,7 @@ use std::{
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
-use zakura_network::zakura::{
-    observe::{HeaderSyncObserver, ReactorEvent},
-    Status, ZakuraPeerId,
-};
+use zakura_network::zakura::{observe::ReactorEvent, CloseCauseReader, Status, ZakuraPeerId};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::EngineRun;
 
@@ -171,9 +169,29 @@ struct Store {
     names: Vec<(ZakuraPeerId, String)>,
     /// Each page the served-page rule judged, in order.
     pages: Vec<ServedPage>,
-    /// Each refusal a mirror reported since the last drain
-    /// ([`MirrorRefusals`]).
-    refused: Vec<String>,
+    /// Each mirror's side of each of its connections with the node.
+    mirror_links: Vec<MirrorLink>,
+}
+
+/// The close cause a connection's side records when its service refused a
+/// frame it read as breaking the protocol.
+const PROTOCOL_REJECT: &str = "service_protocol_reject";
+
+/// A mirror's side of one of its connections with the node under test,
+/// whose close cause the transport records when the pipe exits, before the
+/// mirror's reactor hears of the disconnect. A relink can replace the
+/// session first, and the reactor then reports no end for it, so the cause
+/// is the boundary that keeps every refusal.
+#[derive(Debug)]
+struct MirrorLink {
+    /// The mirror's harness name.
+    mirror: String,
+    /// The connection's ID.
+    connection: u64,
+    /// Its close cause, as the mirror's side records it.
+    cause: CloseCauseReader,
+    /// Whether a drain already broke the check for it.
+    reported: bool,
 }
 
 /// A page the served-page rule judged: what a witness reads of it.
@@ -293,14 +311,38 @@ impl PublicationEvidence {
         self.with(|store| store.pages.clone())
     }
 
-    /// The observer for the mirror named `mirror`, which the node `node`
-    /// under test serves, that records each session with the node the
-    /// mirror ended on a protocol reject ([`MirrorRefusals`]).
-    pub fn mirror(&self, mirror: &str, node: ZakuraPeerId) -> Arc<dyn HeaderSyncObserver> {
-        Arc::new(MirrorRefusals {
-            mirror: mirror.to_owned(),
-            node,
-            evidence: self.clone(),
+    /// Watches the mirror named `mirror`'s side of its connection
+    /// `connection` with the node under test through `cause`, its close
+    /// cause, so a drain breaks the check once the mirror closed it on a
+    /// protocol reject ([`MirrorLink`]).
+    pub fn watch_mirror_link(&self, mirror: &str, connection: u64, cause: CloseCauseReader) {
+        self.with(|store| {
+            store.mirror_links.push(MirrorLink {
+                mirror: mirror.to_owned(),
+                connection,
+                cause,
+                reported: false,
+            });
+        });
+    }
+
+    /// A break for each watched mirror link newly closed on a protocol
+    /// reject, which marks the check applicable.
+    fn refusals(&self) -> Vec<String> {
+        self.with(|store| {
+            let mut refused = Vec::new();
+            for link in &mut store.mirror_links {
+                if !link.reported && link.cause.get() == Some(PROTOCOL_REJECT) {
+                    link.reported = true;
+                    refused.push(format!(
+                        "MirrorRefused: {} closed connection {} with the node on a protocol \
+                         reject",
+                        link.mirror, link.connection
+                    ));
+                }
+            }
+            store.pending |= !refused.is_empty();
+            refused
         })
     }
 
@@ -361,47 +403,6 @@ impl PublicationEvidence {
                 .owed
                 .filter(|_| store.settled == Some(true) && store.tainted.is_none())
         })
-    }
-}
-
-/// A mirror's observer, which breaks the check when the mirror ends its
-/// session with the node on a protocol reject: something the node sent, a
-/// served page its subscriber's `receive_page` refuses or another message,
-/// broke the protocol as the far end of the link judges it. Mirrors are
-/// honest, so the node is to blame. It ignores every other event and adds
-/// no scheduling point, so the mirror runs as it would unobserved.
-#[derive(Debug)]
-struct MirrorRefusals {
-    /// The mirror's harness name.
-    mirror: String,
-    /// The node under test.
-    node: ZakuraPeerId,
-    evidence: PublicationEvidence,
-}
-
-impl HeaderSyncObserver for MirrorRefusals {
-    /// Records `event` if it ends the mirror's session with the node on a
-    /// protocol reject.
-    fn observe(&self, event: ReactorEvent) {
-        if let ReactorEvent::SessionEnded {
-            peer,
-            session_id,
-            reason: "service_protocol_reject",
-        } = event
-        {
-            if peer != self.node {
-                return;
-            }
-            let detail = format!(
-                "MirrorRefused: {} ended session {session_id} with the node on a protocol \
-                 reject",
-                self.mirror
-            );
-            self.evidence.with(|store| {
-                store.refused.push(detail);
-                store.pending = true;
-            });
-        }
     }
 }
 
@@ -789,18 +790,18 @@ impl Publication {
         if step == 0 {
             return Vec::new();
         }
-        let refused = self.evidence.with(|store| {
+        if !self.tainted {
+            let refused = self.evidence.refusals();
+            self.breaks.extend(refused);
+        }
+        self.evidence.with(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
             if std::mem::take(&mut store.taint_pending) {
                 store.tainted.get_or_insert(step);
             }
-            std::mem::take(&mut store.refused)
         });
-        if !self.tainted {
-            self.breaks.extend(refused);
-        }
         std::mem::take(&mut self.breaks)
     }
 

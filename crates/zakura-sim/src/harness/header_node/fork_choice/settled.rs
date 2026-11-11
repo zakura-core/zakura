@@ -19,14 +19,15 @@
 //! the fixture headers' times.
 //!
 //! A settled point is a step after which no task can run, once every
-//! mirror's own reactor has admitted its session with the node, with no
-//! work slot, no storage call the reactor counts as pending or any port
-//! future it polls, no operation pending or held at the port, and no
-//! cached-offer pass deferred to a refill that hasn't come yet. The
-//! admissions come from each mirror's observer, not the node's, so a node
-//! that refuses a mirror's session still reaches settled points. The slots
-//! come from the queue's `Slots`, the calls and futures from the reactor's
-//! `Sizes` at each unit of work's end, and the deferral from
+//! mirror's own reactor has admitted its session with the node or refused
+//! it at capacity, with no work slot, no storage call the reactor counts as
+//! pending or any port future it polls, no operation pending or held at the
+//! port, and no cached-offer pass deferred to a refill that hasn't come
+//! yet. The decisions come from each mirror's observer, not the node's, so
+//! a node that refuses a mirror's session still reaches settled points, and
+//! so does one whose mirrors, running the same reactor, refuse it too. The
+//! slots come from the queue's `Slots`, the calls and futures from the
+//! reactor's `Sizes` at each unit of work's end, and the deferral from
 //! `CachedPassDeferred`. Links are in-memory, so by then every session the
 //! node admitted has delivered its mirror's `Status`. Whether no task can
 //! run is the scheduler's, which the property reads after the step.
@@ -137,17 +138,18 @@ impl Settled {
     }
 
     /// Whether a step that leaves the run with no task able to run is a
-    /// settled point, given `outside` and `mirrors_admitted`, how many
-    /// mirrors' own reactors have admitted a session with the node, and if so whether `selected`, the
-    /// engine's newest selected tip, breaks the rule: `Some(None)` if it
-    /// holds, `Some(Some(detail))` if it breaks, `None` if it isn't one.
+    /// settled point, given `outside` and `mirrors_decided`, how many
+    /// mirrors' own reactors have admitted or refused a session with the
+    /// node, and if so whether `selected`, the engine's newest selected
+    /// tip, breaks the rule: `Some(None)` if it holds, `Some(Some(detail))`
+    /// if it breaks, `None` if it isn't one.
     /// The first call fixes whether the run's clock admits every mirror
     /// header; the check makes it at the first drain past setup.
     pub(super) fn judge(
         &mut self,
         selected: block::Hash,
         outside: Outside,
-        mirrors_admitted: usize,
+        mirrors_decided: usize,
     ) -> Option<Option<String>> {
         let times = &self.times;
         let admissible = *self.admissible.get_or_insert_with(|| {
@@ -156,7 +158,7 @@ impl Settled {
                 .all(|time| !super::deferred_at(*time, outside.clock))
         });
         let settled = admissible
-            && mirrors_admitted >= self.mirrors
+            && mirrors_decided >= self.mirrors
             && self.no_slots
             && self.no_calls
             && !outside.port_busy

@@ -1616,6 +1616,10 @@ struct ZakuraPeerConnectionEntry {
     /// The [`admission_host`] this connection is charged to, if its IP is
     /// known.
     host: Option<IpAddr>,
+    /// The registered QUIC connection, read only for its measured round-trip
+    /// time. Set just after registration. Dropped with this entry when the
+    /// connection task deregisters, so it never keeps a connection open.
+    connection: Option<Connection>,
 }
 
 impl ZakuraSupervisorState {
@@ -1875,6 +1879,38 @@ impl ZakuraSupervisorHandle {
         self.id
     }
 
+    /// Records `connection` as the source of `peer_id`'s round-trip time, if
+    /// `conn_id` is still that peer's registered connection.
+    async fn attach_rtt_source(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        connection: Connection,
+    ) {
+        let mut state = self.inner.lock().await;
+        if let Some(entry) = state.active_by_peer.get_mut(peer_id) {
+            if entry.conn_id == conn_id {
+                entry.connection = Some(connection);
+            }
+        }
+    }
+
+    /// Returns the smoothed round-trip time QUIC measures on `peer_id`'s
+    /// registered connection, or `None` while the peer is not registered or
+    /// its connection task has ended.
+    pub(crate) async fn peer_rtt(&self, peer_id: &ZakuraPeerId) -> Option<Duration> {
+        // Clone the connection out so the supervisor lock is not held while
+        // waiting on the connection task.
+        let connection = {
+            let state = self.inner.lock().await;
+            state.active_by_peer.get(peer_id)?.connection.clone()?
+        };
+        connection
+            .stats()
+            .await
+            .map(|stats| stats.connection.path.rtt)
+    }
+
     /// Returns queue-backed handles for peers currently able to accept outbound work.
     ///
     /// A peer whose disconnect has been requested stays in `active_by_peer`
@@ -2042,6 +2078,7 @@ impl ZakuraSupervisorHandle {
                 let entry = ZakuraPeerConnectionEntry {
                     conn_id,
                     outbound_handle,
+                    connection: None,
                     disconnect_token,
                     registered_at: Instant::now(),
                     host,
@@ -4454,6 +4491,9 @@ impl ZakuraProtocolHandler {
                 disconnect_token,
             } => {
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
+                self.supervisor
+                    .attach_rtt_source(&peer_id, conn_id, connection.clone())
+                    .await;
                 context.conn.trace_connection(
                     "accepted",
                     Some(context.role),

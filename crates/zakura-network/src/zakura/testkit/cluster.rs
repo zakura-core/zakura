@@ -433,6 +433,29 @@ mod tests {
     /// A never finishes preparing, so it accepts no page and stops granting
     /// once its staging budget is full. B's publisher must stop at A's credit
     /// window without a fault. A's session reader must still apply B's
+    /// A registered native peer reports the round-trip time its QUIC
+    /// connection measures, which the legacy liveness keeper saves for the
+    /// peer cache. An unknown peer reports none.
+    #[tokio::test]
+    async fn registered_native_peer_reports_quic_rtt() -> Result<(), BoxError> {
+        let dialer = ZakuraTestNode::builder(211).spawn().await?;
+        let listener = ZakuraTestNode::builder(212).spawn().await?;
+        dialer.connect_native(&listener, Duration::from_secs(5)).await?;
+
+        let listener_id = crate::zakura::ZakuraPeerId::new(
+            listener.node_addr().await.id.as_bytes().to_vec(),
+        )?;
+        let rtt = dialer.supervisor().peer_rtt(&listener_id).await;
+        assert!(
+            rtt.is_some_and(|rtt| rtt > Duration::ZERO),
+            "a registered peer reports its QUIC round-trip time, got {rtt:?}",
+        );
+
+        let unknown = crate::zakura::ZakuraPeerId::new(vec![7; 32])?;
+        assert_eq!(dialer.supervisor().peer_rtt(&unknown).await, None);
+        Ok(())
+    }
+
     /// Grants and Close while A's own work waits: B receives A's whole chain
     /// across several grants, and A's terminal outcome after B's Close lets
     /// B open again.

@@ -206,6 +206,10 @@ const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// the Zakura connection is alive.
 const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 
+/// How long the liveness keeper waits for a peer's QUIC round-trip time before
+/// refreshing liveness without one.
+const ZAKURA_LIVENESS_RTT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The result of routing a mutually P2P-v2-capable legacy handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ZakuraUpgradeOutcome {
@@ -433,6 +437,12 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
+        let supervisor = endpoint.supervisor();
+        let measure_rtt = move || {
+            let supervisor = supervisor.clone();
+            let peer_id = peer_id.clone();
+            async move { supervisor.peer_rtt(&peer_id).await }
+        };
         spawn_erased_named(
             "legacy_liveness_keeper",
             run_legacy_liveness_keeper(
@@ -440,6 +450,7 @@ impl ZakuraHandshakeConnector {
                 address_book_updater,
                 dial_lifetime,
                 ZAKURA_LIVENESS_REFRESH_INTERVAL,
+                measure_rtt,
             ),
         );
     }
@@ -512,22 +523,40 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
 /// native dial owns the peer.
 ///
+/// Each refresh carries the round-trip time QUIC currently measures for the
+/// peer, so the legacy peer cache ranks upgraded peers by speed like legacy
+/// peers. While the peer is reconnecting no time is available, and the address
+/// book keeps the last one.
+///
 /// See [`ZakuraHandshakeConnector::spawn_legacy_liveness_keeper`]. A successful
 /// upgrade already proves that the peer registered. The keeper exits when dial
 /// ownership ends or when the address book updater closes.
-async fn run_legacy_liveness_keeper(
+async fn run_legacy_liveness_keeper<M, F>(
     book_addr: PeerSocketAddr,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     dial_lifetime: CancellationToken,
     refresh_interval: Duration,
-) {
+    mut measure_rtt: M,
+) where
+    M: FnMut() -> F,
+    F: std::future::Future<Output = Option<Duration>>,
+{
     loop {
+        // A connection task that stops answering must not delay the refresh
+        // that keeps the crawler from re-dialing the peer.
+        let rtt = zakura_rt::select! {
+            biased;
+            _ = dial_lifetime.cancelled() => return,
+            rtt = zakura_rt::time::timeout(ZAKURA_LIVENESS_RTT_TIMEOUT, measure_rtt()) => {
+                rtt.ok().flatten()
+            }
+        };
         // Refresh the peer's `Responded` liveness so the crawler treats it as a
         // live (Zakura) peer instead of re-dialing it over legacy TCP.
         let sent = zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => return,
-            sent = address_book_updater.send(MetaAddr::new_responded(book_addr, None)) => sent,
+            sent = address_book_updater.send(MetaAddr::new_responded(book_addr, rtt)) => sent,
         };
         if sent.is_err() {
             // The address book updater is gone: the node is shutting down.
@@ -616,6 +645,7 @@ mod tests {
             updater_tx,
             dial_lifetime.clone(),
             Duration::from_millis(250),
+            || async { None },
         ));
 
         let first_change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
@@ -658,6 +688,7 @@ mod tests {
             updater_tx,
             dial_lifetime,
             Duration::from_millis(20),
+            || async { None },
         ));
 
         tokio::time::timeout(Duration::from_secs(2), keeper)
@@ -669,5 +700,39 @@ mod tests {
             updater_rx.try_recv().is_err(),
             "keeper must not refresh liveness after dial ownership ends",
         );
+    }
+
+    /// Each refresh carries the peer's current QUIC round-trip time, and a
+    /// refresh while the peer is reconnecting carries none.
+    #[tokio::test]
+    async fn legacy_liveness_keeper_reports_quic_rtt() {
+        let (updater_tx, mut updater_rx) = tokio::sync::mpsc::channel(16);
+        let dial_lifetime = CancellationToken::new();
+        let mut measurements = vec![Some(Duration::from_millis(40)), None].into_iter();
+
+        let keeper = tokio::spawn(run_legacy_liveness_keeper(
+            test_book_addr(),
+            updater_tx,
+            dial_lifetime.clone(),
+            Duration::from_millis(20),
+            move || std::future::ready(measurements.next().flatten()),
+        ));
+
+        for expected in [Some(Duration::from_millis(40)), None] {
+            let change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
+                .await
+                .expect("keeper refreshes liveness")
+                .expect("the keeper holds the sender open");
+            let MetaAddrChange::UpdateResponded { rtt, .. } = change else {
+                panic!("keeper should refresh responded liveness, got {change:?}");
+            };
+            assert_eq!(rtt, expected);
+        }
+
+        dial_lifetime.cancel();
+        tokio::time::timeout(Duration::from_secs(2), keeper)
+            .await
+            .expect("keeper exits after maintained dial ownership ends")
+            .expect("keeper task does not panic");
     }
 }

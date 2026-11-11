@@ -17,7 +17,7 @@ use crate::{
     TransitionContext, TransitionFailure, UntrustedAuxDeliveryRow,
 };
 
-use super::planner::derive_transition_plan;
+use super::planner::{derive_transition_plan, needs_validation_lease};
 use install::{merge_auxiliary_delivery_changes, merge_projection_delta, verify_projection};
 pub(crate) use recovery::validate_recovered_auxiliary_rows;
 
@@ -318,6 +318,27 @@ impl HeaderChainEngine {
         context: &TransitionContext<'_>,
     ) -> Result<EngineTransition, TransitionFailure> {
         derive_transition_plan(self, input, context)
+    }
+
+    /// Returns whether [`Self::plan_transition`] can read a durable [`crate::ValidationLease`]
+    /// rooted at `parent` when it plans under `context`.
+    ///
+    /// An adapter may leave that lease out of [`HeaderValidationFacts`] when this returns `false`:
+    /// the plan is the same with or without it. It returns `false` only when both hold:
+    ///
+    /// - the retained graph holds every header contextual validation reads from `parent`
+    ///   downward, so no walk through `parent` runs out of retained headers; and
+    /// - `parent` is not a retention reference that only a lease can authenticate.
+    ///
+    /// Ask with the engine that will plan the transition, before anything else changes it, and
+    /// with the retention references and authority that planning will use. The answer does not
+    /// depend on which leases that authority authorizes.
+    pub fn needs_validation_lease(
+        &self,
+        parent: block::Hash,
+        context: &TransitionContext<'_>,
+    ) -> bool {
+        needs_validation_lease(self, parent, context)
     }
 
     /// Install a verified transition after its durable batch has committed.

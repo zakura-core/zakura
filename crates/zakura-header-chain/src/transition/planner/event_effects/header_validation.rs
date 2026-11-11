@@ -13,90 +13,33 @@ use crate::{
     TransitionContext,
 };
 
-/// Reconstruct difficulty/time context for a retained parent, splicing durable leases when needed.
-pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView>(
-    graph: &G,
-    parent: Frontier,
-    facts: Option<&crate::HeaderValidationFacts>,
-    transition: &TransitionContext<'_>,
-) -> Result<
-    Vec<(
-        zakura_chain::work::difficulty::CompactDifficulty,
-        chrono::DateTime<chrono::Utc>,
-    )>,
-    TransitionFailure,
-> {
-    let required = usize::try_from(parent.height.0)
+/// One header of difficulty/time context: its threshold, its time, and where it sits.
+type ContextEntry = (CompactDifficulty, DateTime<Utc>, Frontier);
+
+/// The number of headers contextual validation reads from `parent` downward, `parent` included.
+fn required_context_len(parent: Frontier) -> Result<usize, StoreError> {
+    Ok(usize::try_from(parent.height.0)
         .map_err(|_| StoreError::Unavailable("retained parent height does not fit in memory"))?
         .checked_add(1)
         .ok_or(StoreError::Unavailable(
             "retained parent context length overflowed",
         ))?
-        .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+        .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN))
+}
+
+/// Walk the retained graph from `parent` toward finality, newest first.
+///
+/// Stops after `required` headers, or earlier at the first header the graph does not retain.
+fn retained_graph_context<G: HeaderGraphView>(
+    graph: &G,
+    parent: Frontier,
+    required: usize,
+) -> Vec<ContextEntry> {
     let mut context = Vec::with_capacity(required);
     let mut hash = parent.hash;
     while context.len() < required {
         let Some(node) = graph.view_header_node(hash) else {
-            let Some(facts) = facts else {
-                return Err(TransitionFailure::MissingDurableFacts(
-                    "retained predecessor context is incomplete",
-                ));
-            };
-            let authorized_lease = facts.validation_leases.iter().find_map(|lease| {
-                if !lease.is_coherent(
-                    transition.config.network(),
-                    transition.config.trust_anchor_digest(),
-                ) || !transition
-                    .full_state_authority
-                    .is_some_and(|authority| authority.authorizes_validation_lease(lease))
-                {
-                    return None;
-                }
-                let overlap = context
-                    .iter()
-                    .position(|(_, _, frontier)| *frontier == lease.parent())
-                    .or_else(|| {
-                        context
-                            .is_empty()
-                            .then_some(0)
-                            .filter(|_| lease.parent() == parent)
-                    })?;
-                let graph_overlap = &context[overlap..];
-                let lease_overlap = lease.predecessors().get(..graph_overlap.len())?;
-                graph_overlap
-                    .iter()
-                    .zip(lease_overlap)
-                    .all(|((_, _, frontier), fact)| *frontier == fact.frontier)
-                    .then_some((lease, overlap))
-            });
-            let Some((lease, overlap)) = authorized_lease else {
-                return Err(TransitionFailure::MissingDurableFacts(
-                    "durable predecessor context is incoherent",
-                ));
-            };
-            context.truncate(overlap);
-            context.extend(
-                lease
-                    .predecessors()
-                    .iter()
-                    .take(required.saturating_sub(context.len()))
-                    .map(|fact| {
-                        (
-                            fact.header.difficulty_threshold,
-                            fact.header.time,
-                            fact.frontier,
-                        )
-                    }),
-            );
-            if context.len() != required {
-                return Err(TransitionFailure::MissingDurableFacts(
-                    "durable predecessor context is incomplete",
-                ));
-            }
-            return Ok(context
-                .into_iter()
-                .map(|(difficulty, time, _)| (difficulty, time))
-                .collect());
+            break;
         };
         context.push((
             node.header.difficulty_threshold,
@@ -105,10 +48,111 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
         ));
         hash = node.parent_hash;
     }
+    context
+}
+
+/// Returns whether the retained graph alone supplies the difficulty/time context for `parent`.
+///
+/// When it does, [`retained_header_context`] never reads a durable lease for a walk that starts
+/// at `parent` or passes through it. A `parent` the graph does not retain returns `false`.
+pub(in crate::transition::planner) fn graph_retains_header_context<G: HeaderGraphView>(
+    graph: &G,
+    parent: block::Hash,
+) -> bool {
+    let Some(node) = graph.view_header_node(parent) else {
+        return false;
+    };
+    let parent = Frontier::new(node.height, node.hash);
+    required_context_len(parent)
+        .is_ok_and(|required| retained_graph_context(graph, parent, required).len() == required)
+}
+
+/// Reconstruct difficulty/time context for a retained parent, splicing durable leases when needed.
+pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView>(
+    graph: &G,
+    parent: Frontier,
+    facts: Option<&crate::HeaderValidationFacts>,
+    transition: &TransitionContext<'_>,
+) -> Result<Vec<(CompactDifficulty, DateTime<Utc>)>, TransitionFailure> {
+    let required = required_context_len(parent)?;
+    let mut context = retained_graph_context(graph, parent, required);
+    if context.len() < required {
+        splice_durable_lease(&mut context, parent, required, facts, transition)?;
+    }
     Ok(context
         .into_iter()
         .map(|(difficulty, time, _)| (difficulty, time))
         .collect())
+}
+
+/// Complete a context the retained graph cut short, from one authorized durable lease.
+///
+/// The lease must start at `parent` or at a header already in `context`, and agree with every
+/// header the two share.
+fn splice_durable_lease(
+    context: &mut Vec<ContextEntry>,
+    parent: Frontier,
+    required: usize,
+    facts: Option<&crate::HeaderValidationFacts>,
+    transition: &TransitionContext<'_>,
+) -> Result<(), TransitionFailure> {
+    let Some(facts) = facts else {
+        return Err(TransitionFailure::MissingDurableFacts(
+            "retained predecessor context is incomplete",
+        ));
+    };
+    let authorized_lease = facts.validation_leases.iter().find_map(|lease| {
+        if !lease.is_coherent(
+            transition.config.network(),
+            transition.config.trust_anchor_digest(),
+        ) || !transition
+            .full_state_authority
+            .is_some_and(|authority| authority.authorizes_validation_lease(lease))
+        {
+            return None;
+        }
+        let overlap = context
+            .iter()
+            .position(|(_, _, frontier)| *frontier == lease.parent())
+            .or_else(|| {
+                context
+                    .is_empty()
+                    .then_some(0)
+                    .filter(|_| lease.parent() == parent)
+            })?;
+        let graph_overlap = &context[overlap..];
+        let lease_overlap = lease.predecessors().get(..graph_overlap.len())?;
+        graph_overlap
+            .iter()
+            .zip(lease_overlap)
+            .all(|((_, _, frontier), fact)| *frontier == fact.frontier)
+            .then_some((lease, overlap))
+    });
+    let Some((lease, overlap)) = authorized_lease else {
+        return Err(TransitionFailure::MissingDurableFacts(
+            "durable predecessor context is incoherent",
+        ));
+    };
+    context.truncate(overlap);
+    context.extend(
+        lease
+            .predecessors()
+            .iter()
+            .take(required.saturating_sub(context.len()))
+            .map(|fact| {
+                (
+                    fact.header.difficulty_threshold,
+                    fact.header.time,
+                    fact.frontier,
+                )
+            }),
+    );
+    if context.len() != required {
+        return Err(TransitionFailure::MissingDurableFacts(
+            "durable predecessor context is incomplete",
+        ));
+    }
+    Ok(())
 }
 
 /// Apply branch-local difficulty and median-time rules for one parent-linked header.

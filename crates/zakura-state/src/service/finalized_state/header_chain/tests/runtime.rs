@@ -3431,12 +3431,18 @@ fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_i
         .transition_engine
         .lock()
         .expect("the fixture writer is unlocked");
+    let lease_context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
     let retained = make_request(
         path[3].clone(),
         VerifiedChangeCause::CheckpointFinalizedGrow,
     );
     let input = runtime
-        .build_transition_input(retained.clone(), &before, runtime.config.network(), &engine)
+        .build_transition_input(retained.clone(), &before, &lease_context, &engine)
         .expect("retained checkpoint input needs no durable context");
     assert!(input
         .header_validation_facts()
@@ -3447,7 +3453,7 @@ fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_i
         .build_transition_input(
             make_request(path[3].clone(), VerifiedChangeCause::Grow),
             &before,
-            runtime.config.network(),
+            &lease_context,
             &engine,
         )
         .expect("ordinary growth keeps its context");
@@ -3465,7 +3471,7 @@ fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_i
         .build_transition_input(
             make_request(missing, VerifiedChangeCause::CheckpointFinalizedGrow),
             &before,
-            runtime.config.network(),
+            &lease_context,
             &engine,
         )
         .expect("a missing header receives durable context");
@@ -4233,6 +4239,222 @@ fn repeated_validation_contexts_reread_every_row_and_build_identical_leases() {
         .expect("the span fits in u64");
     assert_eq!(first_reads, expected);
     assert_eq!(second_reads, expected);
+}
+
+/// The index in the [`hashed_evidence_fixture`] path of the lowest parent whose whole validation
+/// context the retained graph holds. The fixture finalizes its third header, so the graph
+/// retains nothing below it.
+fn lowest_fully_retained_parent_index() -> usize {
+    let finalized_height = 3;
+    let parent_height = finalized_height + zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
+    // The path starts at height one.
+    parent_height - 1
+}
+
+/// One child header of `parent`, distinct from any child the fixture already holds.
+fn child_header(parent: &VerifiedHeaderRef) -> VerifiedHeaderRef {
+    let mut header = *parent.header;
+    header.previous_block_hash = parent.hash;
+    header.time += chrono::Duration::seconds(1);
+    header.nonce.0[31] ^= 0x5a;
+    let header = Arc::new(header);
+    VerifiedHeaderRef {
+        height: parent.height.next().expect("the fixture stays in range"),
+        hash: header.hash(),
+        header,
+    }
+}
+
+/// A request to insert one child header on `parent`, prepared the way header sync prepares it:
+/// against a lease read from the store.
+fn child_insertion(runtime: &HeaderChainRuntime, parent: &VerifiedHeaderRef) -> TransitionRequest {
+    let snapshot = runtime.publisher().snapshot();
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the parent validation context is coherent")
+        .expect("the parent is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
+    let child = child_header(parent);
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child.header)),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the child prepares through production validation");
+    TransitionRequest {
+        expected_version: snapshot.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: header_owner(&snapshot, child.hash, 1, 1),
+            source: SourceId::from_digest([0x71; 32]),
+            parent_hash: parent.hash,
+            target_tip_hash: child.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: lease.parent(),
+            },
+            batch,
+            aux: Vec::new(),
+        })),
+    }
+}
+
+fn header_insertion_context(runtime: &HeaderChainRuntime) -> TransitionContext<'_> {
+    TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    }
+}
+
+#[test]
+fn inserting_a_header_on_a_fully_retained_parent_reads_no_stored_predecessors() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let parent = &path[lowest_fully_retained_parent_index()];
+    let request = child_insertion(&runtime, parent);
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let result = runtime.apply(request, &header_insertion_context(&runtime));
+
+    assert!(matches!(result, Ok(ApplyResult::Committed)), "{result:?}");
+    assert_eq!(
+        HeaderChainStore::header_node_disk_reads(),
+        1,
+        "the store looks up the one header row it writes and reads no predecessor: the \
+         retained graph already holds every header the difficulty check reads",
+    );
+}
+
+#[test]
+fn growing_a_fully_retained_verified_tip_reads_no_stored_predecessors() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let before = runtime.publisher().snapshot();
+    let tip = path.last().expect("the fixture path is nonempty");
+    assert_eq!(
+        before.frontiers.verified_best,
+        Frontier::new(tip.height, tip.hash)
+    );
+    let evidence = EvidenceId::from_digest([0xd1; 32]);
+    let authority = Authority(evidence);
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![child_header(tip)],
+            cause: VerifiedChangeCause::Grow,
+        }),
+    };
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let result = runtime.apply(
+        request,
+        &TransitionContext {
+            config: &runtime.config,
+            clock: &SystemClock,
+            full_state_authority: Some(&authority),
+            retention_references: &[],
+        },
+    );
+
+    assert!(matches!(result, Ok(ApplyResult::Committed)), "{result:?}");
+    assert_eq!(
+        HeaderChainStore::header_node_disk_reads(),
+        1,
+        "the store looks up the one header row it writes and reads no predecessor: the \
+         retained graph already holds every header the difficulty check reads",
+    );
+}
+
+#[test]
+fn inserting_a_header_one_short_of_full_retention_rereads_and_checks_every_predecessor() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let parent_index = lowest_fully_retained_parent_index() - 1;
+    let parent = &path[parent_index];
+    let request = child_insertion(&runtime, parent);
+    let span = u64::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
+        .expect("the span fits in u64");
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let result = runtime.apply(request, &header_insertion_context(&runtime));
+    assert!(matches!(result, Ok(ApplyResult::Committed)), "{result:?}");
+    assert!(
+        HeaderChainStore::header_node_disk_reads() > span,
+        "the parent and each predecessor are read from the store",
+    );
+
+    // The same insertion on a store with one altered predecessor row fails.
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let request = child_insertion(&runtime, &path[parent_index]);
+    rewrite_node_row(&runtime, path[parent_index - 5].hash, |row| {
+        row[4 + 100] ^= 0x01;
+    });
+    assert!(matches!(
+        runtime.apply(request, &header_insertion_context(&runtime)),
+        Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+            "durable header-chain read failed"
+        )))
+    ));
+}
+
+#[test]
+fn header_sync_lease_rereads_and_checks_every_row_on_a_fully_retained_parent() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let span = u64::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
+        .expect("the span fits in u64");
+    // The writer would skip this parent's lease: the retained graph holds its whole context.
+    assert!(!runtime
+        .transition_engine
+        .lock()
+        .expect("the fixture writer is unlocked")
+        .needs_validation_lease(parent, &header_insertion_context(&runtime)));
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    runtime
+        .reader()
+        .validation_context(parent)
+        .expect("the uncorrupted context is coherent")
+        .expect("the parent is retained");
+    assert!(
+        HeaderChainStore::header_node_disk_reads() > span,
+        "header sync's lease reads the parent and each predecessor from the store",
+    );
+
+    rewrite_node_row(&runtime, path[path.len() - 5].hash, |row| {
+        row[4 + 100] ^= 0x01;
+    });
+    assert!(matches!(
+        runtime.reader().validation_context(parent),
+        Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+            "durable header-chain read failed"
+        )))
+    ));
+}
+
+#[test]
+fn startup_rejects_a_retained_header_row_with_altered_header_bytes() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(8);
+    let (engine_config, _, _) = fixture();
+    drop(runtime);
+    let (runtime, _) = HeaderChainStore::new(db.clone())
+        .startup(&engine_config)
+        .expect("the unaltered store restarts");
+
+    rewrite_node_row(&runtime, path[5].hash, |row| {
+        row[4 + 100] ^= 0x01;
+    });
+    drop(runtime);
+
+    let restarted = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .map(|_| ());
+    assert!(
+        matches!(restarted, Err(HeaderChainStoreError::Recovery(_))),
+        "{restarted:?}"
+    );
 }
 
 #[test]

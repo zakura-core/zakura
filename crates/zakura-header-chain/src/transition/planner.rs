@@ -101,6 +101,19 @@ pub enum TransitionFailure {
     Invariant(#[from] super::InvariantViolation),
 }
 
+/// Returns whether planning under `context` can read a durable validation lease rooted at `parent`.
+///
+/// The planner reads such a lease in two places: to complete difficulty/time context the retained
+/// graph cuts short, and to authenticate a retention reference the authority does not vouch for.
+pub(super) fn needs_validation_lease(
+    engine: &HeaderChainEngine,
+    parent: zakura_chain::block::Hash,
+    context: &TransitionContext<'_>,
+) -> bool {
+    !event_effects::header_validation::graph_retains_header_context(engine.graph(), parent)
+        || admission::retention_reference_needs_lease(parent, context)
+}
+
 /// Derive one atomic transition without mutating the engine.
 ///
 /// Pure: freezes `engine` as the snapshot before commit, projects `input` under

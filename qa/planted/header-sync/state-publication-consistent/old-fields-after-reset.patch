@@ -1,0 +1,24 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index e4c6d7bee1..bbde6d7edc 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2646,7 +2646,18 @@ impl HeaderSyncReactor {
+             verified_block_tip: snapshot.frontiers.verified_best.height,
+             verified_block_hash: snapshot.frontiers.verified_best.hash,
+         };
+-        let status = Status::from_snapshot(&snapshot, self.page_limits);
++        #[allow(unused_mut)]
++        let mut status = Status::from_snapshot(&snapshot, self.page_limits);
++        // Mutation: after a generation change, the status publishers keep
++        // the previous snapshot's tip under the new snapshot's other fields.
++        if let Some(old) = self
++            .committed_snapshot
++            .as_ref()
++            .filter(|_| header_authority_changed)
++        {
++            status.selected_tip_height = old.frontiers.header_best.height;
++            status.selected_tip_hash = old.frontiers.header_best.hash;
++        }
+         let now = Instant::now();
+         self.committed_snapshot = Some(snapshot);
+         observe!(self, ReactorEvent::stored(self.committed_snapshot.as_ref()));

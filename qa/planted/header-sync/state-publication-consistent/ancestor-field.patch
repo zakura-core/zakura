@@ -1,0 +1,62 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index 132f2ca64b..150470c829 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -1143,10 +1143,16 @@ fn page_output<const HEADER_BYTES: usize>(
+     };
+     let last = Frontier::new(block::Height(height), last.header.hash());
+     let reaches_target = reaches_target(job.following, last.hash, job.initial_target);
++    // Mutation: a later page names its subscription's first locator as its
++    // common ancestor, while its headers are right.
++    let declared = match (job.parent, job.open_first) {
++        (Some(_), Some(first)) => Frontier::new(page.common_ancestor.height, first),
++        _ => page.common_ancestor,
++    };
+     #[cfg(any(test, zakura_sim))]
+     let queued = QueuedPage {
+         subscription_id: job.id,
+-        common_ancestor: page.common_ancestor,
++        common_ancestor: declared,
+         headers: entries.iter().map(|entry| entry.header.hash()).collect(),
+         initial_target: job.initial_target,
+         reaches_target,
+@@ -1156,8 +1162,8 @@ fn page_output<const HEADER_BYTES: usize>(
+     let frame = encode_frame(&Message::<HEADER_BYTES>::Headers(Headers {
+         subscription_id: job.id,
+         initial_target_tip_hash: job.initial_target,
+-        common_ancestor_height: page.common_ancestor.height,
+-        common_ancestor_hash: page.common_ancestor.hash,
++        common_ancestor_height: declared.height,
++        common_ancestor_hash: declared.hash,
+         reaches_initial_target: reaches_target,
+         tree_aux_schema: job.schema,
+         entries,
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+index 23d8fafeec..679ea8df5c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -145,6 +145,8 @@ pub(super) struct Job {
+     /// The initial target on the path, then the selected tip.
+     pub(super) lease_target: block::Hash,
+     pub(super) locators: Vec<block::Hash>,
++    /// Mutation: the subscription's first `Open` locator, while it has one.
++    pub(super) open_first: Option<block::Hash>,
+     /// The header the page must extend, once a page was sent or the target
+     /// was reached.
+     pub(super) parent: Option<Frontier>,
+@@ -529,6 +531,7 @@ impl PublisherState {
+                     initial_target: subscription.fixed.target,
+                     lease_target: tip.hash,
+                     locators: vec![last.hash],
++                    open_first: subscription.locators.first().copied(),
+                     parent: Some(last),
+                     probe: false,
+                     pin: subscription.pin.filter(|pin| count > 0 && *pin != tip),
+@@ -552,6 +555,7 @@ impl PublisherState {
+                         Some(last) => vec![last.hash],
+                         None => subscription.locators.clone(),
+                     },
++                    open_first: subscription.locators.first().copied(),
+                     parent: last,
+                     // Before the first page, check that the target is still
+                     // selected.

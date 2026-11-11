@@ -469,6 +469,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("wrong-request"),
     },
     Coverage {
+        property: super::super::domain::header_sync::STATE_PUBLICATION_CONSISTENT,
+        passing: passes(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("publication-skipped"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::EXPECTED_CHAIN_SELECTED,
+        passing: passes(
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("score-corrupted"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",

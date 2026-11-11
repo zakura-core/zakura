@@ -1239,6 +1239,8 @@ mod tests {
                 authority: Default::default(),
                 outstanding: Default::default(),
                 recovery: self.recovery.clone(),
+                fork_choice: Default::default(),
+                publication: Default::default(),
             }
         }
     }

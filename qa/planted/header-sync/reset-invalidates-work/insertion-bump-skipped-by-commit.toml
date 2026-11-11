@@ -1,0 +1,13 @@
+# The insertion-bump-skipped mutation on the harness-commit witness: the
+# planner keeps the header generation when a commit inserts headers, and
+# its self-check expects the same. The node has nothing to fetch, so the
+# only insertion inside the run is a harness commit straight into its
+# engine, whose engine run the port's harness-commit hook records and no
+# storage fact carries. The planner decides how the commit installs, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-harness-commit.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-harness-commit.plan"

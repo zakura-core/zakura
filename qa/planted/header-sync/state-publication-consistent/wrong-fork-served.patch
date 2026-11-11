@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index 92f6a1aaac..efd0e8cb81 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -1115,6 +1115,14 @@ fn page_output<const HEADER_BYTES: usize>(
+             tree_aux,
+         });
+     }
++    // Mutation: a one-header page serves a sibling of its header, on
++    // another fork from the same cursor: the same parent and fields but a
++    // different nonce.
++    if entries.len() == 1 {
++        let mut sibling = (*entries[0].header).clone();
++        sibling.nonce.0[0] ^= 1;
++        entries[0].header = std::sync::Arc::new(sibling);
++    }
+     let Some(last) = entries.last() else {
+         return Err(on_empty_page(job.following).into());
+     };

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 3df7185a65..39c7375fd6 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2721,7 +2721,11 @@ impl HeaderSyncReactor {
+         }) else {
+             return false;
+         };
+-        match session.try_send_status(status.clone()) {
++        // Mutation: every queue attempt fails, so the publisher defers and
++        // retries forever.
++        let refused: Result<(), crate::zakura::transport::OrderedSendError> =
++            Err(crate::zakura::transport::OrderedSendError::Full);
++        match refused {
+             Ok(()) => {
+                 observe!(
+                     self,

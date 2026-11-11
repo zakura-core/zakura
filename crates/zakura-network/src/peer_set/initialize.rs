@@ -373,7 +373,7 @@ where
 
     // Create an mpsc channel for peerset demand signaling,
     // based on the maximum number of outbound peers.
-    let (mut demand_tx, demand_rx) =
+    let (demand_tx, demand_rx) =
         futures::channel::mpsc::channel::<MorePeers>(config.peerset_outbound_connection_limit());
 
     // Create a oneshot to send background task JoinHandles to the peer set
@@ -432,70 +432,23 @@ where
             peerset_tx.clone(),
             address_book_updater.clone(),
         );
-        let initial_peers_join =
-            AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
-
         // 3. Outgoing peers we connect to in response to load.
-        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
+        let candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
-        // Wait for the initial seed peer count
-        let InitialPeerConnections {
-            active_connections: mut active_outbound_connections,
-            pending_seed_peers,
-        } = initial_peers_join
-            .await
-            .panic_if_task_has_panicked()
-            .expect("initial peer task is not cancelled")
-            .expect("unexpected error connecting to initial peers");
-        let active_initial_peer_count = active_outbound_connections.update_count();
-
-        // We need to await candidates.update() here,
-        // because zcashd rate-limits `addr`/`addrv2` messages per connection,
-        // and if we only have one initial peer,
-        // we need to ensure that its `Response::Addr` is used by the crawler.
-        //
-        // TODO: this might not be needed after we added the Connection peer address cache,
-        //       try removing it in a future release?
-        info!(
-            ?active_initial_peer_count,
-            "sending initial request for peers"
-        );
-        let _ = candidates
-            .update_initial(active_initial_peer_count)
-            .boxed()
-            .await;
-
-        // Compute remaining connections to open.
-        let demand_count = config
-            .peerset_initial_target_size
-            .saturating_sub(active_outbound_connections.update_count());
-
-        for _ in 0..demand_count {
-            let _ = demand_tx.try_send(MorePeers);
-        }
-
-        // Start the peer crawler. Seeds that resolve later still reach discovery.
-        let late_seed_peers =
-            send_late_seed_peers(pending_seed_peers, address_book_updater.clone());
-        let crawl_fut = crawl_and_dial(
+        // Startup dials, the initial address request and the crawler run in the
+        // background, so the node starts its other services while dials finish.
+        let legacy_outbound_fut = legacy_outbound_peers(
             config.clone(),
+            initial_peers_fut,
+            candidates,
             demand_tx,
             demand_rx,
-            candidates,
             outbound_connector,
             peerset_tx,
-            active_outbound_connections,
             address_book_updater,
-            Arc::new(AtomicBool::new(false)),
         );
-        let crawl_fut = async move {
-            tokio::select! {
-                crawl_result = crawl_fut => crawl_result,
-                never = late_seed_peers => match never {},
-            }
-        };
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
-            crawl_fut.in_current_span(),
+            legacy_outbound_fut.in_current_span(),
         ))));
     } else {
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
@@ -600,6 +553,86 @@ impl std::fmt::Debug for InitialPeerConnections {
             .field("active_connections", &self.active_connections)
             .field("seed_peers_pending", &self.pending_seed_peers.is_some())
             .finish()
+    }
+}
+
+/// Runs the legacy outbound side of the peer set: waits for `initial_peers`, sends
+/// the initial address request, requests the remaining outbound peers, then runs
+/// the crawler.
+///
+/// `init` spawns this task and returns without waiting for startup dials.
+#[allow(clippy::too_many_arguments)]
+async fn legacy_outbound_peers<C, S>(
+    config: Config,
+    initial_peers: impl Future<Output = Result<InitialPeerConnections, BoxError>>,
+    mut candidates: CandidateSet<S>,
+    mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
+    demand_rx: futures::channel::mpsc::Receiver<MorePeers>,
+    outbound_connector: C,
+    peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+) -> Result<(), BoxError>
+where
+    C: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    C::Future: Send + 'static,
+    S: Service<Request, Response = Response, Error = BoxError> + Send + Sync + 'static,
+    S::Future: Send + 'static,
+{
+    let InitialPeerConnections {
+        active_connections: mut active_outbound_connections,
+        pending_seed_peers,
+    } = initial_peers
+        .await
+        .expect("unexpected error connecting to initial peers");
+    let active_initial_peer_count = active_outbound_connections.update_count();
+
+    // We need to await candidates.update() here,
+    // because zcashd rate-limits `addr`/`addrv2` messages per connection,
+    // and if we only have one initial peer,
+    // we need to ensure that its `Response::Addr` is used by the crawler.
+    //
+    // TODO: this might not be needed after we added the Connection peer address cache,
+    //       try removing it in a future release?
+    info!(
+        ?active_initial_peer_count,
+        "sending initial request for peers"
+    );
+    let _ = candidates
+        .update_initial(active_initial_peer_count)
+        .boxed()
+        .await;
+
+    // Compute remaining connections to open.
+    let demand_count = config
+        .peerset_initial_target_size
+        .saturating_sub(active_outbound_connections.update_count());
+
+    for _ in 0..demand_count {
+        let _ = demand_tx.try_send(MorePeers);
+    }
+
+    // Start the peer crawler. Seeds that resolve later still reach discovery.
+    let late_seed_peers = send_late_seed_peers(pending_seed_peers, address_book_updater.clone());
+    let crawl_fut = crawl_and_dial(
+        config,
+        demand_tx,
+        demand_rx,
+        candidates,
+        outbound_connector,
+        peerset_tx,
+        active_outbound_connections,
+        address_book_updater,
+        Arc::new(AtomicBool::new(false)),
+    );
+    tokio::select! {
+        crawl_result = crawl_fut => crawl_result,
+        never = late_seed_peers => match never {},
     }
 }
 

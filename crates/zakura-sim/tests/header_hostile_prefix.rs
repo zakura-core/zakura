@@ -634,7 +634,10 @@ fn replay(records: &[Record], until: u64) -> Vec<PlanChoice> {
 /// the policy's bound is on picks. Both runs take the same round-robin
 /// defaults before the `Recover` pick, and the unfair Plan is built here
 /// pick by pick from each run's own records, so it follows the code as it
-/// changes. It prints both counts.
+/// changes. The fair run's round-robin Plan is fair with or without the
+/// policy, so the same unfair Plan then replays with the policy on, which
+/// must still apply within the `n` steps: that's the policy, not the Plan,
+/// keeping recovery's storage running. It prints all three counts.
 #[test]
 #[allow(clippy::print_stdout)]
 fn an_unfair_plan_starves_the_recovery_the_fair_policy_completes() {
@@ -691,9 +694,24 @@ fn an_unfair_plan_starves_the_recovery_the_fair_policy_completes() {
         run.applied,
         run.recovered
     );
+    // The adversary's Plan against the fair policy: the policy overrides
+    // the starving picks, so the apply still lands within the window.
+    let defended = scripted(&fair, script);
+    let end = &defended.end;
+    assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+    let defended_end = defended.recovered + steps;
+    assert!(
+        defended.applied.is_some_and(|step| step <= defended_end),
+        "the fair policy under the unfair Plan applied at {:?}, past {steps} steps from its pick \
+         at {}",
+        defended.applied,
+        defended.recovered
+    );
     println!(
-        "fair: applied {steps} steps after its pick; unfair: {:?} after, in {rounds} rounds",
-        run.applied.map(|step| step - run.recovered)
+        "fair: applied {steps} steps after its pick; unfair: {:?} after, in {rounds} rounds; \
+         the unfair Plan with the policy on: {:?} after",
+        run.applied.map(|step| step - run.recovered),
+        defended.applied.map(|step| step - defended.recovered)
     );
 }
 

@@ -53,11 +53,11 @@ fn misend(report: Option<&RunReport>, witnesses: &[SeedWitness]) -> Option<Strin
     }
     witnesses.iter().find_map(|witness| {
         let ended = outcome(&witness.property);
-        let fits = match (witness.expect.as_str(), ended) {
-            ("holds" | "applicable", Some(PropertyOutcome::Held { .. })) => true,
-            ("violated", Some(PropertyOutcome::Violated { .. })) => true,
-            _ => false,
-        };
+        let fits = matches!(
+            (witness.expect.as_str(), ended),
+            ("holds" | "applicable", Some(PropertyOutcome::Held { .. }))
+                | ("violated", Some(PropertyOutcome::Violated { .. }))
+        );
         (!fits).then(|| {
             format!(
                 "{} expected {}, got {ended:?}",

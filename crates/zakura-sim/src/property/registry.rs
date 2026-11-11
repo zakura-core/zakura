@@ -1052,11 +1052,12 @@ fn concluded<S: HasView>(
 /// 4. assumptions that never all held give `AssumptionsNeverHeld`;
 /// 5. a run an `Active` violation stopped, with an obligation, a deferred
 ///    one or a pending mark still open, gives `StoppedByViolation`;
-/// 6. a pending mark left gives `NodeStopped` for a [`Pending::WatchOpen`]
+/// 6. an assumption lost, with no evaluation applied in the whole run,
+///    gives `AssumptionLost` (#1840 rule 4), even beside a pending mark a
+///    later evaluation left once the assumption held again;
+/// 7. a pending mark left gives `NodeStopped` for a [`Pending::WatchOpen`]
 ///    the stopping exempted, and `Unsettled` with its site otherwise, the
 ///    first in [`Pending`]'s order;
-/// 7. an assumption lost, with no evaluation applied, gives
-///    `AssumptionLost`;
 /// 8. otherwise `Held` if an evaluation applied, else `NeverApplied`.
 ///
 /// No obligation survives to it open but at a violation's stop (rule 5) or
@@ -1083,13 +1084,13 @@ fn outcome<S: HasView>(
         NaReason::AssumptionsNeverHeld
     } else if ended == Outcome::Violation && !(state.open.is_empty() && state.pending.is_empty()) {
         NaReason::StoppedByViolation
+    } else if state.assumption_lost && state.applicable == 0 {
+        NaReason::AssumptionLost
     } else if let Some(&site) = state.pending.first() {
         match site {
             Pending::WatchOpen if stopping => NaReason::NodeStopped,
             site => NaReason::Unsettled { site },
         }
-    } else if state.assumption_lost && state.applicable == 0 {
-        NaReason::AssumptionLost
     } else if state.applicable > 0 {
         return PropertyOutcome::Held {
             applicable: state.applicable,
@@ -1155,16 +1156,16 @@ mod tests {
         /// An `Active` violation stopped the run (rule 5, with something
         /// open).
         Stopped,
-        /// A pending mark at this site (rule 6).
+        /// A pending mark at this site (rule 7).
         Mark(Pending),
-        /// A `WatchOpen` mark with the harness stopping the node (rule 6).
+        /// A `WatchOpen` mark with the harness stopping the node (rule 7).
         WatchStopping,
         /// An open obligation (rule 5). Only a violation's stop and a
         /// harness end leave one open.
         Open,
         /// A deferred obligation (rule 5), as `Open`.
         Deferred,
-        /// An assumption lost while an obligation was open (rule 7).
+        /// An assumption lost while an obligation was open (rule 6).
         Lost,
         /// An evaluation applied (rules 7 and 8).
         Applied,
@@ -1314,7 +1315,7 @@ mod tests {
             (&[Stopped, Open, Applied], na(NaReason::StoppedByViolation)),
             (&[Stopped, Lost], na(NaReason::AssumptionLost)),
             (&[Stopped, Applied], held.clone()),
-            // Rule 6: the first mark in `Pending`'s order, NodeStopped only
+            // Rule 7: the first mark in `Pending`'s order, NodeStopped only
             // when the watch mark is that one.
             (
                 &[Mark(Pending::FaultOpen), WatchStopping],
@@ -1338,18 +1339,24 @@ mod tests {
                 ],
                 unsettled(Pending::TeardownOpen),
             ),
+            // Rule 6 beside a mark a later evaluation left once the
+            // assumption held again (Terra, the complete pass).
             (
                 &[Mark(Pending::FaultOpen), Lost],
-                unsettled(Pending::FaultOpen),
+                na(NaReason::AssumptionLost),
             ),
             (
                 &[Mark(Pending::WatchOpen), Applied],
                 unsettled(Pending::WatchOpen),
             ),
-            (&[WatchStopping, Lost], na(NaReason::NodeStopped)),
+            (&[WatchStopping, Lost], na(NaReason::AssumptionLost)),
             (&[WatchStopping, Applied], na(NaReason::NodeStopped)),
-            // Rule 7 needs no evaluation applied.
+            // Rule 6 needs no evaluation applied.
             (&[Lost, Applied], held.clone()),
+            (
+                &[Lost, Applied, Mark(Pending::FaultOpen)],
+                unsettled(Pending::FaultOpen),
+            ),
         ];
         for (facts, expected) in rows {
             assert_eq!(judged(facts), expected, "{facts:?}");

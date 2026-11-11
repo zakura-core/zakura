@@ -620,7 +620,15 @@ impl Sim {
                 };
             if enabled.is_empty() {
                 // A live end that the drain can still resolve enters it.
-                if phase == Phase::Live && self.resolvable(checker, now, &ready) {
+                let resolvable = match phase {
+                    Phase::Live => self.resolvable(checker, now, &ready),
+                    Phase::Drain => Ok(false),
+                };
+                let resolvable = match resolvable {
+                    Ok(resolvable) => resolvable,
+                    Err(failure) => return st.end_harness(failure),
+                };
+                if resolvable {
                     ready = match self.enter_drain(st) {
                         Ok(ready) => ready,
                         Err(failure) => return st.end_harness(failure),
@@ -871,13 +879,14 @@ impl Sim {
     /// Whether a live run that has nothing enabled at `now` still has work
     /// the drain can resolve: a recovery action, a recovery boundary, or an
     /// open obligation with a deadline or a timer for the clock to reach.
-    /// Asked as the drain's first step would be, starting now.
+    /// Asked as the drain's first step would be, starting now, so two
+    /// offers that share an identity fail it as they would fail that step.
     fn resolvable(
         &self,
         checker: &dyn Checker,
         now: SimInstant,
         ready: &[(Identity, TaskId)],
-    ) -> bool {
+    ) -> Result<bool, HarnessFailure> {
         let offers = self.offers(Phase::Drain, now, ready.is_empty());
         enabled_set(&EnabledInputs {
             phase: Phase::Drain,
@@ -887,7 +896,10 @@ impl Sim {
             offers: &offers,
             clock: self.clock(checker, Some(now)),
         })
-        .is_ok_and(|enabled| !enabled.is_empty())
+        .map(|enabled| !enabled.is_empty())
+        .map_err(|identity| HarnessFailure::DuplicateIdentity {
+            identity: identity.to_string(),
+        })
     }
 
     /// The first source's work that nothing will finish

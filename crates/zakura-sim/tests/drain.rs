@@ -1236,3 +1236,29 @@ fn a_worker_starved_drain_keeps_its_status_and_does_not_settle() {
         assert!(!zakura_sim::harness::header_node::adoption::settled(end));
     }
 }
+
+/// Terra T3: two recovery offers that share an identity at a live idle end
+/// are a harness failure, as they are in the drain itself, not an idle end
+/// that would conclude what's open against the node.
+#[test]
+fn a_duplicate_recovery_identity_at_a_live_idle_end_fails_the_run() {
+    let report = run(
+        config(2, 100),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.add_source(Box::new(Recovering(Rc::default())));
+            sim.add_source(Box::new(Recovering(Rc::default())));
+            sim.scheduler().spawn_root("done", async {});
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert!(
+        matches!(
+            &report.end.harness,
+            Some(HarnessFailure::DuplicateIdentity { identity }) if identity == "peer:ctl:recovered"
+        ),
+        "{:?}",
+        report.end.harness
+    );
+}

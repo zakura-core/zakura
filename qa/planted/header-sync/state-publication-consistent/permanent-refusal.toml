@@ -4,6 +4,11 @@
 # from its admission passes. The reactor's status sending decides when a
 # `Status` goes, so a change there can move the witness off it.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The mirrors run the same patched reactor, so in a recovery fixture the
+# node is never sent a `Status` naming the heaviest member chain and never
+# recovers. A campaign input that draws one breaks
+# `bounded-adversary-progress` instead.
+also_violates = ["header-sync/bounded-adversary-progress"]
 
 [typed]
 harness = "header-sync/liveness"

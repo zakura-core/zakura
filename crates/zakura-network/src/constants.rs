@@ -252,6 +252,13 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 /// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
 pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The maximum number of concurrent legacy connection attempts to initial peers at startup.
+///
+/// Each completed attempt immediately admits the next initial peer, so startup is not paced by
+/// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`]. `peerset_initial_target_size` still bounds the total
+/// number of startup attempts.
+pub const INITIAL_PEER_DIAL_CONCURRENCY: usize = 50;
+
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
 ///

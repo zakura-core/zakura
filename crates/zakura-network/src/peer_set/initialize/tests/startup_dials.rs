@@ -1,7 +1,6 @@
 //! Event-driven startup dialing and cancellation regressions.
 
 use std::{
-    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -16,6 +15,7 @@ use tower::{service_fn, util::BoxCloneService};
 
 use crate::{
     config::CacheDir,
+    constants::INITIAL_PEER_DIAL_CONCURRENCY,
     meta_addr::MetaAddrChange,
     peer::{ClientTestHarness, OutboundConnectorRequest},
     peer_set::{ActiveConnectionCounter, ConnectionTracker},
@@ -135,7 +135,7 @@ async fn startup_window_refills_on_success_and_failure() {
     let _init_guard = zakura_test::init();
     let expected = peers(55);
     let (config, _cache) = cached_config(&expected, expected.len());
-    assert_eq!(config.initial_peer_dial_concurrency.get(), 50);
+    assert_eq!(INITIAL_PEER_DIAL_CONCURRENCY, 50);
     let (connector, mut attempts, live) = controlled_connector();
     let (task, mut discovered, _book) = spawn_initial(config, connector);
 
@@ -144,7 +144,7 @@ async fn startup_window_refills_on_success_and_failure() {
     tokio::time::pause();
     let started_at = Instant::now();
     let mut pending = vec![first];
-    for _ in 1..50 {
+    for _ in 1..INITIAL_PEER_DIAL_CONCURRENCY {
         pending.push(next_attempt(&mut attempts).await);
     }
     assert_eq!(Instant::now(), started_at);
@@ -202,47 +202,35 @@ async fn startup_window_preserves_target_and_ip_limits() {
     let expected = peers(5);
     let mut cached = vec![expected[0], "127.0.0.1:9000".parse().unwrap()];
     cached.extend_from_slice(&expected[1..]);
-    for concurrency in [1, 50] {
-        let (mut config, _cache) = cached_config(&cached, 3);
-        config.initial_peer_dial_concurrency = NonZeroUsize::new(concurrency).unwrap();
-        let (connector, mut attempts, _live) = controlled_connector();
-        let (task, _discovered, mut book) = spawn_initial(config, connector);
-        let mut dialed = Vec::new();
-        for _ in 0..3 {
-            let attempt = next_attempt(&mut attempts).await;
-            dialed.push(attempt.addr);
-            attempt.finish.send(false).unwrap();
-        }
-        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
-        assert_eq!(
-            dialed
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>(),
-            expected[..3].iter().copied().collect()
-        );
-        if concurrency == 1 {
-            assert_eq!(dialed, expected[..3], "serial admission keeps cache order");
-        }
-        assert!(attempts.recv().await.is_none());
-        let mut addresses = Vec::new();
-        while let Some(change) = book.recv().await {
-            addresses.push(change.addr());
-        }
-        assert_eq!(addresses, cached, "even skipped candidates reach discovery");
+    let (config, _cache) = cached_config(&cached, 3);
+    let (connector, mut attempts, _live) = controlled_connector();
+    let (task, _discovered, mut book) = spawn_initial(config, connector);
+    let mut dialed = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let attempt = next_attempt(&mut attempts).await;
+        dialed.insert(attempt.addr);
+        attempt.finish.send(false).unwrap();
     }
+    timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
+    assert_eq!(dialed, expected[..3].iter().copied().collect());
+    assert!(attempts.recv().await.is_none());
+    let mut addresses = Vec::new();
+    while let Some(change) = book.recv().await {
+        addresses.push(change.addr());
+    }
+    assert_eq!(addresses, cached, "even skipped candidates reach discovery");
 }
 
 /// Dropping startup aborts every admitted connector and never starts the queued suffix.
 #[tokio::test]
 async fn cancelling_startup_aborts_in_flight_dials() {
     let _init_guard = zakura_test::init();
-    let (mut config, _cache) = cached_config(&peers(6), 6);
-    config.initial_peer_dial_concurrency = NonZeroUsize::new(3).unwrap();
+    let count = INITIAL_PEER_DIAL_CONCURRENCY + 3;
+    let (config, _cache) = cached_config(&peers(count.try_into().unwrap()), count);
     let (connector, mut attempts, _live) = controlled_connector();
     let (task, _discovered, _book) = spawn_initial(config, connector);
     let mut pending = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..INITIAL_PEER_DIAL_CONCURRENCY {
         pending.push(next_attempt(&mut attempts).await);
     }
     assert!(attempts.try_recv().is_err());
@@ -263,12 +251,12 @@ async fn cancelling_startup_aborts_in_flight_dials() {
 #[tokio::test]
 async fn startup_delivery_failure_aborts_remaining_dials() {
     let _init_guard = zakura_test::init();
-    let (mut config, _cache) = cached_config(&peers(6), 6);
-    config.initial_peer_dial_concurrency = NonZeroUsize::new(3).unwrap();
+    let count = INITIAL_PEER_DIAL_CONCURRENCY + 3;
+    let (config, _cache) = cached_config(&peers(count.try_into().unwrap()), count);
     let (connector, mut attempts, live) = controlled_connector();
     let (task, discovered, _book) = spawn_initial(config, connector);
     let mut pending = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..INITIAL_PEER_DIAL_CONCURRENCY {
         pending.push(next_attempt(&mut attempts).await);
     }
     drop(discovered);

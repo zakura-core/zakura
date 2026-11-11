@@ -5,7 +5,6 @@ use std::{
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -317,16 +316,6 @@ pub struct Config {
     /// syncing, try reducing the peer set size. You can also reduce the peer
     /// set size to reduce Zakura's bandwidth usage.
     pub peerset_initial_target_size: usize,
-
-    /// Maximum concurrent legacy startup connection attempts. Defaults to 50.
-    ///
-    /// Cached and seed peers enter this window in initial-peer order. A completed
-    /// attempt immediately makes room for the next peer, without a timer between
-    /// attempts. This does not change the total peer target, per-IP limits, or
-    /// the steady-state crawler's connection rate limit.
-    ///
-    /// Must be non-zero. Set to 1 to attempt startup peers serially.
-    pub initial_peer_dial_concurrency: NonZeroUsize,
 
     /// How frequently we attempt to crawl the network to discover new peer
     /// addresses.
@@ -1113,8 +1102,6 @@ impl Default for Config {
             // But Zakura should only make a small number of initial outbound connections,
             // so that idle peers don't use too many connection slots.
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
-            initial_peer_dial_concurrency: NonZeroUsize::new(50)
-                .expect("the default startup dial concurrency is non-zero"),
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
             unconditional_peers: UnconditionalPeers::default(),
@@ -1314,7 +1301,6 @@ struct DConfig {
     v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
-    initial_peer_dial_concurrency: NonZeroUsize,
     #[serde(
         alias = "new_peer_interval",
         with = "zakura_chain::serialization::serde_adapters::duration"
@@ -1371,7 +1357,6 @@ impl Default for DConfig {
             v2_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
-            initial_peer_dial_concurrency: config.initial_peer_dial_concurrency,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
@@ -1449,7 +1434,6 @@ impl From<Config> for DConfig {
             p2p_stack,
             zakura,
             peerset_initial_target_size,
-            initial_peer_dial_concurrency,
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
@@ -1497,7 +1481,6 @@ impl From<Config> for DConfig {
             v2_p2p: None,
             zakura,
             peerset_initial_target_size,
-            initial_peer_dial_concurrency,
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
@@ -1533,7 +1516,6 @@ impl<'de> Deserialize<'de> for Config {
             v2_p2p,
             zakura,
             peerset_initial_target_size,
-            initial_peer_dial_concurrency,
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
@@ -1699,7 +1681,6 @@ impl<'de> Deserialize<'de> for Config {
             p2p_stack,
             zakura,
             peerset_initial_target_size,
-            initial_peer_dial_concurrency,
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,

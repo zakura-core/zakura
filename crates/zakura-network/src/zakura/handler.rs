@@ -4819,7 +4819,7 @@ impl ZakuraProtocolHandler {
                         .counts()
                         .refund_cadence(connection.admitted_ip(), Instant::now());
                     #[cfg(any(test, zakura_sim))]
-                    self.observe_handshake_cadence(connection.admitted_addr(), "refunded", false);
+                    self.observe_handshake_cadence(connection.admitted_addr(), "registered", false);
                 }
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
                 context.conn.trace_connection(
@@ -4989,7 +4989,7 @@ impl Acceptor for ZakuraProtocolHandler {
             .counts()
             .refund_cadence(incoming.remote.ip(), Instant::now());
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(incoming.remote, "refunded", false);
+        self.observe_handshake_cadence(incoming.remote, "cancelled", false);
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {

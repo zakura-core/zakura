@@ -157,6 +157,8 @@ pub(crate) struct Shared {
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
+    #[cfg(zakura_sim)]
+    admission_observer: std::sync::Mutex<Option<Arc<dyn Fn(SocketAddr) + Send + Sync>>>,
     pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
@@ -168,6 +170,18 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    #[cfg(zakura_sim)]
+    pub(crate) fn observe_handshake_attempt(&self, remote: SocketAddr) {
+        let observer = self
+            .admission_observer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(remote);
+        }
+    }
+
     /// One socket's endpoint config, with the injected seed, reset key and
     /// CID generator.
     pub(crate) fn endpoint_config(&self) -> quinn_proto::EndpointConfig {
@@ -272,6 +286,8 @@ impl QuicEndpoint {
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
             pending: PendingTable::default(),
+            #[cfg(zakura_sim)]
+            admission_observer: std::sync::Mutex::new(None),
             connections: ConnectionSlots::new(
                 bind.max_connections,
                 bind.dial_reserve,
@@ -1041,6 +1057,17 @@ impl AdmissionProbe {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut *events)
+    }
+
+    /// Reports each Initial that reaches cryptographic handshake processing.
+    /// The callback runs without adding a scheduler preemption point.
+    pub fn observe_attempts(&self, observer: impl Fn(SocketAddr) + Send + Sync + 'static) {
+        if let Some(shared) = self.0.upgrade() {
+            *shared
+                .admission_observer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(observer));
+        }
     }
 
     /// Reads through peeks. A held pending lock leaves the transition unsampled.

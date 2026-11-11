@@ -118,7 +118,7 @@ pub enum TransportEvent {
     HandshakeCadence {
         /// The source address, including its connection's port.
         remote: SocketAddr,
-        /// Admitted, exhausted, capacity, or refunded.
+        /// Admitted, exhausted, capacity, registered, or cancelled.
         action: &'static str,
         /// This charge created a new full bucket.
         fresh: bool,

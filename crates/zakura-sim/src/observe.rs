@@ -2035,9 +2035,11 @@ pub enum TransportFact {
         /// Configured stream-open burst and refill per second.
         rate: u32,
     },
-    /// The receiver charged or refunded a handshake attempt before TLS.
+    /// An accepted Initial reached the production QUIC cryptographic handshake.
+    QuicHandshakeStarted,
+    /// The receiver admitted, refused, or refunded a handshake attempt.
     HandshakeCadence {
-        /// Admitted, exhausted, capacity, or refunded.
+        /// Admitted, exhausted, capacity, registered, or cancelled.
         action: String,
         /// The production ledger created this address bucket for the charge.
         fresh: bool,

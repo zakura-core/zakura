@@ -813,6 +813,22 @@ fn fast_fail_handshakes_exhaust_the_address_cadence() {
         zakura_sim::Observation::Transport { event: zakura_sim::observe::TransportFact::HandshakeCadence { action, .. }, .. }
             if action == "exhausted"
     )), "fast failures must reach the cadence refusal");
+    assert!(
+        report
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| matches!(
+                &entry.obs,
+                zakura_sim::Observation::Transport {
+                    event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                    ..
+                }
+            ))
+            .count()
+            >= 16,
+        "the witness must consume the burst with actual TLS attempts"
+    );
 }
 
 #[test]
@@ -843,10 +859,16 @@ fn sixteen_conformant_dialers_share_an_address_cadence() {
                 action, "exhausted",
                 "sixteen one-second dialers keep to the cadence"
             );
-            admitted += usize::from(action == "admitted");
-            if action == "admitted" {
-                last_admitted = now;
+        }
+        if matches!(
+            &entry.obs,
+            zakura_sim::Observation::Transport {
+                event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                ..
             }
+        ) {
+            admitted += 1;
+            last_admitted = now;
         }
     }
     assert!(

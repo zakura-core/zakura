@@ -557,13 +557,15 @@ fn cadence_burst_reached(log: &crate::ObservationLog) -> bool {
         let Observation::Transport {
             instance,
             remote,
-            event: TransportFact::HandshakeCadence { action, .. },
+            event,
             ..
         } = &entry.obs
         else {
             continue;
         };
-        if action != "admitted" && action != "exhausted" {
+        if !matches!(event, TransportFact::QuicHandshakeStarted)
+            && !matches!(event, TransportFact::HandshakeCadence { action, .. } if action == "exhausted")
+        {
             continue;
         }
         let remote: std::net::SocketAddr = remote
@@ -611,10 +613,13 @@ fn scripted_host(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+/// Counts actual QUIC attempts for the rate bound. Checks admission decisions
+/// against a separate balance that includes charges cancelled before TLS.
 fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     use std::collections::BTreeMap;
     use zakura_network::zakura::DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF;
 
+    let rate = cx.id().as_str() == "handshake/attempts-within-cadence";
     if !cx.observations().any(|obs| {
         matches!(
             obs,
@@ -622,11 +627,17 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                 event: TransportFact::HandshakeCadence { .. },
                 ..
             }
-        )
+        ) || (rate
+            && matches!(
+                obs,
+                Observation::Transport {
+                    event: TransportFact::QuicHandshakeStarted,
+                    ..
+                }
+            ))
     }) {
         return Verdict::NotApplicable;
     }
-    let rate = cx.id().as_str() == "handshake/attempts-within-cadence";
     let mut now = 0u64;
     let mut limits = BTreeMap::new();
     let mut balances = BTreeMap::new();
@@ -652,17 +663,12 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         {
             limits.insert(*instance, (*address_cap, connection_cap + cap));
         }
-        let TransportFact::HandshakeCadence {
-            action,
-            fresh,
-            capacity,
-            refill_ns,
-            hosts,
-            host_limit,
-        } = event
-        else {
+        if !matches!(
+            event,
+            TransportFact::HandshakeCadence { .. } | TransportFact::QuicHandshakeStarted
+        ) {
             continue;
-        };
+        }
         let Some(&(address_cap, expected_hosts)) = limits.get(instance) else {
             return cx.violated(
                 "admission limits observed before a cadence charge",
@@ -672,26 +678,37 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         let cap = u32::try_from(address_cap).unwrap();
         let interval = u64::try_from(DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF.as_nanos()).unwrap()
             / u64::from(cap);
-        if rate
-            && (*capacity != cap
-                || *refill_ns != interval
-                || *host_limit != expected_hosts
-                || hosts > host_limit)
-        {
-            return cx.violated(
-                "cadence derives its rate and memory bounds from admission and redial limits",
-                format!("{event:?}"),
-            );
-        }
-        if action == "capacity" {
-            if !rate && hosts < host_limit {
-                return cx.violated(
-                    "a new address enters a non-full cadence ledger",
-                    format!("{event:?}"),
-                );
+        let (action, fresh) = match event {
+            TransportFact::QuicHandshakeStarted => ("started", false),
+            TransportFact::HandshakeCadence {
+                action,
+                fresh,
+                capacity,
+                refill_ns,
+                hosts,
+                host_limit,
+            } => {
+                if rate
+                    && (*capacity != cap
+                        || *refill_ns != interval
+                        || *host_limit != expected_hosts
+                        || hosts > host_limit)
+                {
+                    return cx.violated("cadence derives its rate and memory bounds from admission and redial limits", format!("{event:?}"));
+                }
+                if action == "capacity" {
+                    if !rate && hosts < host_limit {
+                        return cx.violated(
+                            "a new address enters a non-full cadence ledger",
+                            format!("{event:?}"),
+                        );
+                    }
+                    continue;
+                }
+                (action.as_str(), *fresh)
             }
-            continue;
-        }
+            _ => unreachable!("only cadence and QUIC attempt events pass the filter"),
+        };
         let remote: std::net::SocketAddr = remote
             .parse()
             .expect("transport addresses use socket syntax");
@@ -703,7 +720,7 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX))
             .min(cap);
         *last += earned * interval;
-        if *fresh {
+        if fresh {
             if rate && *tokens != cap {
                 return cx.violated(
                     "a depleted address retains its cadence debt",
@@ -712,14 +729,16 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             }
             *last = now;
         }
-        match action.as_str() {
-            "admitted" => {
-                if rate && *tokens == 0 {
+        match action {
+            "started" if rate => {
+                if *tokens == 0 {
                     return cx.violated("TLS requires an address token", remote.to_string());
                 }
                 *tokens = tokens.saturating_sub(1);
             }
-            "refunded" => *tokens = tokens.saturating_add(1).min(cap),
+            "admitted" if !rate => *tokens = tokens.saturating_sub(1),
+            "registered" => *tokens = tokens.saturating_add(1).min(cap),
+            "cancelled" if !rate => *tokens = tokens.saturating_add(1).min(cap),
             "exhausted" if !rate && *tokens != 0 => {
                 return cx.violated(
                     "an address with a token is never exhausted",

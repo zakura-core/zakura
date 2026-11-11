@@ -631,7 +631,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/handshake.rs",
             "fast_fail_handshakes_exhaust_the_address_cadence",
         ),
-        bypass: Bypass::Planted("no-attempt-charge"),
+        bypass: Bypass::Planted("bypass-cadence-admission"),
     },
     Coverage {
         property: "handshake/cadence-never-refuses-conformant",

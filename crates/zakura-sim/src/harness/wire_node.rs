@@ -475,6 +475,9 @@ struct Buffer {
 
 /// One event in the tap's buffer: the transport's, or the wire node's own.
 enum Reported {
+    QuicHandshakeStarted {
+        remote: SocketAddr,
+    },
     /// Node-wide admission counts changed.
     HandshakeLoad(TransportFact),
     /// What the transport reported.
@@ -485,13 +488,24 @@ enum Reported {
         shared_id: [u8; 16],
     },
     /// The handshake harness started one of its node dials.
-    DialStarted { remote: SocketAddr },
+    DialStarted {
+        remote: SocketAddr,
+    },
     /// A dial to `remote` failed with `error`.
-    DialFailed { remote: SocketAddr, error: String },
+    DialFailed {
+        remote: SocketAddr,
+        error: String,
+    },
     /// Connection `conn_id`'s shared ID, right after its registration.
-    SharedId { conn_id: u64, id: [u8; 16] },
+    SharedId {
+        conn_id: u64,
+        id: [u8; 16],
+    },
     /// Connection `conn_id`'s resources changed to `load`.
-    Load { conn_id: u64, load: TransportFact },
+    Load {
+        conn_id: u64,
+        load: TransportFact,
+    },
 }
 
 impl TapState {
@@ -591,6 +605,14 @@ impl TransportObserver for TapObserver {
             .push((remote, shared_id, probe));
     }
     fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
+        if self.0.handshake_sampling.load(Ordering::Relaxed) {
+            let state = Arc::downgrade(&self.0);
+            probe.observe_attempts(move |remote| {
+                if let Some(state) = state.upgrade() {
+                    state.push(Reported::QuicHandshakeStarted { remote });
+                }
+            });
+        }
         *self
             .0
             .quic_admission
@@ -984,6 +1006,9 @@ impl TransportTap {
                         elapsed_ms: None,
                     },
                 ))
+            }
+            Reported::QuicHandshakeStarted { remote } => {
+                return Ok((None, remote, TransportFact::QuicHandshakeStarted));
             }
             Reported::Event(event) => event,
             Reported::DialStarted { remote } => {

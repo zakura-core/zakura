@@ -513,6 +513,8 @@ impl<F: SocketFactory> EndpointTask<F> {
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));
+                #[cfg(zakura_sim)]
+                self.shared.observe_handshake_attempt(remote);
                 match self.endpoint.accept(
                     incoming,
                     now(),

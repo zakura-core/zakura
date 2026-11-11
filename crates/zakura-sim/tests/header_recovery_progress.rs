@@ -136,10 +136,11 @@ fn run(fixture: RecoveryFixture, input: PlanInput) -> Run {
     for property in &report.properties {
         if property.property != BOUNDED_ADVERSARY_PROGRESS {
             assert!(
-                matches!(
-                    property.outcome,
-                    PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-                ),
+                match &property.outcome {
+                    PropertyOutcome::Held { .. } => true,
+                    PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                    PropertyOutcome::Violated { .. } => false,
+                },
                 "{fixture:?}: {}: {:?}",
                 property.property,
                 property.outcome
@@ -407,7 +408,7 @@ fn every_recovery_control_holds() {
                 assert_eq!(objective, None, "{fixture:?}");
                 assert_eq!(
                     outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
-                    &PropertyOutcome::NotApplicable,
+                    &PropertyOutcome::not_applicable(zakura_sim::NaReason::NeverApplied),
                     "{fixture:?}"
                 );
                 continue;

@@ -226,6 +226,7 @@ impl RecoveryFixture {
         let mirror = |chain| MirrorSpec {
             chain,
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         };
         let fork = |main, len| Chain {
             main,

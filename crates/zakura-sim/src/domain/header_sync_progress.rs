@@ -227,7 +227,8 @@ const RECOVERY_SUBJECT: &str = "recovery";
 /// until the environment ends a member ([`RecoveryEvidence::holds`]), so a
 /// node that drops its honest source still owes the successor. A recovery
 /// that ends unreached never holds them, which leaves the run
-/// `Inconclusive`. hdr-13 decides how that counts.
+/// `NotApplicable { AssumptionsNeverHeld }`. hdr-13 decides how that
+/// counts.
 ///
 /// [`RecoveryEvidence::holds`]: crate::harness::header_node::recovery::RecoveryEvidence::holds
 pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<S> {

@@ -223,7 +223,7 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
     )
     .await
     .expect("startup peer selection finishes within the test deadline")
-        .addresses;
+    .addresses;
     assert_eq!(selected, IndexSet::from([seed]));
     let mut discovered = IndexSet::new();
     while let Some(change) = book_rx.recv().await {
@@ -277,7 +277,7 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
         )
         .await
         .expect("startup peer selection finishes within the test deadline")
-        .addresses;
+    .addresses;
         let expected = if max_connections_per_ip == 1 {
             IndexSet::from([cached[0], cached[3], cached[4]])
         } else {
@@ -418,9 +418,11 @@ async fn unusable_cache_waits_for_seeds_without_losing_candidates() {
             book_tx,
         );
         tokio::pin!(startup);
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut startup)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut startup)
+                .await
+                .is_err()
+        );
         seed_tx.send(vec![seed]).unwrap();
         let initial = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
             .await

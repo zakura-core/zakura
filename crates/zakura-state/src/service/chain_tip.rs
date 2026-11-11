@@ -440,11 +440,15 @@ impl LatestChainTip {
         self.receiver
             .with_watch_data(|chain_tip_block| chain_tip_block.as_ref().map(f))
     }
+
     /// Reads only scalar metadata or shared IDs while briefly borrowing the watched tip.
     ///
     /// Callers must copy fields or clone an `Arc`, without taking another lock or doing I/O.
     /// Block consumers keep using `with_chain_tip_block` to own their transaction handles.
-    fn with_chain_tip_metadata<U>(&self, f: impl FnOnce(&ChainTipBlock) -> U) -> Option<U> {
+    fn with_chain_tip_metadata<U: 'static>(
+        &self,
+        f: impl FnOnce(&ChainTipBlock) -> U,
+    ) -> Option<U> {
         self.receiver.borrow_mapped(|tip| tip.as_ref().map(f))
     }
 }

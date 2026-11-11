@@ -1,0 +1,12 @@
+# A later page names its subscription's first locator as its common
+# ancestor, while its headers are right. On the served-in-pages witness the
+# subscription's second page declares the mirror's tip at the page's
+# height, which is neither its read's start nor the cursor the first page
+# left. The page publisher decides what a page declares, so a change there
+# can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-in-pages.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-in-pages.plan"

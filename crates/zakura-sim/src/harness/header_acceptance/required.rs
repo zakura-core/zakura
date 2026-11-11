@@ -501,6 +501,13 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         // commits, whose credit and update rules are exchange rules too.
         "header-sync/reset-invalidates-work" | "header-sync/stale-chain-effect-inert" => vec![G2],
         "header-sync/commit-only-authorized" => vec![G2, G3],
+        // Which tip a settled node selects, judged at the engine that owns
+        // the choice.
+        "header-sync/expected-chain-selected" => vec![G2],
+        // A committed state's publication, adoption and advertisement in
+        // order, each served page as an exchange with what was read, and a
+        // timely status.
+        "header-sync/state-publication-consistent" => vec![G1, G3, G4],
         "header-sync/chunk-budget-bound"
         | "header-sync/teardown-returns-baseline"
         | "header-sync/stale-completion-inert"

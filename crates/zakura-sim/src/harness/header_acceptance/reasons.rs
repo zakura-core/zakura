@@ -285,6 +285,32 @@ pub static NA_REASONS: &[NaProducer] = &[
     },
     NaProducer {
         file: "src/domain/header_sync.rs",
+        function: "check_expected_chain_selected",
+        fingerprint: "f73227e6ef4f55d5",
+        constructions: &[
+            step(
+                "a corrupt engine state, which commit-only-authorized owns, tainted the fork-choice evidence by this step",
+                RETURN,
+            ),
+            step(
+                "no fork-choice step had applied by this step and the node hadn't settled",
+                TAIL,
+            ),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
+        function: "check_state_publication",
+        fingerprint: "d61ab900be190998",
+        constructions: &[
+            step(
+                "no commit, adoption, status debt or served page had applied by this step, or a corrupt engine state tainted the publication evidence",
+                RETURN,
+            ),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
         function: "check_outstanding_work_bounded",
         fingerprint: "4722d816dec8d8c8",
         constructions: &[step(

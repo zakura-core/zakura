@@ -1,0 +1,12 @@
+# After a generation change, the reactor's status publishers keep the
+# previous snapshot's tip under the new snapshot's other fields. On the
+# invalidate-only witness the reset moves the tip down and every session's
+# `Status` is queued with the old tip, so it names no adoption the reactor
+# holds. The reactor's adoption and status scheduling decide when the
+# statuses go, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-invalidate-only.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-invalidate-only.plan"

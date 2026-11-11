@@ -1,0 +1,24 @@
+diff --git a/crates/zakura-header-chain/src/graph/mod.rs b/crates/zakura-header-chain/src/graph/mod.rs
+index 3fb67ac561..9c67a1c847 100644
+--- a/crates/zakura-header-chain/src/graph/mod.rs
++++ b/crates/zakura-header-chain/src/graph/mod.rs
+@@ -887,6 +887,7 @@ impl MemHeaderStore {
+             );
+             let rank = |tip: Frontier, score: ChainScore| {
+                 (
++                    tip.height,
+                     score.suffix_work,
+                     Some(tip) == self.preferred_header_tip,
+                     tip.hash.0,
+diff --git a/crates/zakura-header-chain/src/graph/overlay.rs b/crates/zakura-header-chain/src/graph/overlay.rs
+index ac441ed27d..3c00b2c94a 100644
+--- a/crates/zakura-header-chain/src/graph/overlay.rs
++++ b/crates/zakura-header-chain/src/graph/overlay.rs
+@@ -1113,6 +1113,7 @@ impl<'a> GraphOverlay<'a> {
+             );
+             let rank = |tip: Frontier, score: ChainScore| {
+                 (
++                    tip.height,
+                     score.suffix_work,
+                     Some(tip) == self.base_graph.preferred_header_tip,
+                     tip.hash.0,

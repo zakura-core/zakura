@@ -615,6 +615,7 @@ fn template_build_paths_wait_for_the_build_slot() {
                     let shared = ReadyTemplate {
                         template: Arc::new(initial.clone()),
                         json: Arc::default(),
+                        built_ahead: false,
                     };
                     rpc.reuse_shared_template(shared, None)
                         .map(|result| {

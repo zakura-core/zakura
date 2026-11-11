@@ -38,6 +38,8 @@ enum SharedTemplateState {
 pub(crate) struct ReadyTemplate {
     pub(crate) template: Arc<BlockTemplateResponse>,
     pub(crate) json: Arc<SharedTemplateJson>,
+    /// Whether the node built the template ahead of requests, rather than a request building it.
+    pub(crate) built_ahead: bool,
 }
 
 /// A shared template's answer as JSON, encoded at most once for each value of `submit_old`.
@@ -155,12 +157,30 @@ pub(crate) struct SharedTemplateBuild {
 }
 
 impl SharedTemplateBuild {
-    /// Shares `template` and returns it as stored, unless a build on another tip has replaced
-    /// this one.
+    /// Shares `template`, built by a request, and returns it as stored, unless a build on
+    /// another tip has replaced this one.
     pub(crate) fn publish(self, template: BlockTemplateResponse) -> Option<ReadyTemplate> {
+        self.publish_from(template, false)
+    }
+
+    /// Shares `template`, built ahead of requests, and returns it as stored, unless a build on
+    /// another tip has replaced this one.
+    pub(crate) fn publish_built_ahead(
+        self,
+        template: BlockTemplateResponse,
+    ) -> Option<ReadyTemplate> {
+        self.publish_from(template, true)
+    }
+
+    fn publish_from(
+        self,
+        template: BlockTemplateResponse,
+        built_ahead: bool,
+    ) -> Option<ReadyTemplate> {
         let ready = ReadyTemplate {
             template: Arc::new(template),
             json: Arc::default(),
+            built_ahead,
         };
         self.replace(SharedTemplateState::Ready(ready.clone()))
             .then_some(ready)

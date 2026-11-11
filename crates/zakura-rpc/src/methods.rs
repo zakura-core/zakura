@@ -125,7 +125,10 @@ use types::{
         },
         proposal::proposal_block_from_template,
         shared_template::ReadyTemplate,
-        trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
+        trace::{
+            next_request_id, AheadOutcome, AheadTimes, BuildTimes, MiningTemplateTrace,
+            NewTipMempool, TemplateSource, WaitReason,
+        },
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
     },
@@ -1785,22 +1788,40 @@ where
 
             // Tip changes from here on end this tip's build and start the next one.
             tip.mark_best_tip_seen();
+            let started = std::time::Instant::now();
+            let mut tip_hash = None;
+            let mut times = AheadTimes::default();
             tokio::select! {
                 biased;
 
                 changed = tip.best_tip_changed() => {
+                    self.gbt.trace.ahead(
+                        tip_hash,
+                        AheadOutcome::TipChanged,
+                        times,
+                        started.elapsed(),
+                    );
                     if changed.is_err() {
                         return;
                     }
                     continue;
                 }
-                built = self.build_template_ahead(miner_params, &mut rejections) => {
-                    if let Err(error) = built {
+                built = self.build_template_ahead(
+                    miner_params,
+                    &mut rejections,
+                    &mut tip_hash,
+                    &mut times,
+                ) => {
+                    let outcome = built.unwrap_or_else(|error| {
                         tracing::debug!(
                             ?error,
                             "could not build a mining template ahead of requests on this tip"
                         );
-                    }
+                        AheadOutcome::Failed
+                    });
+                    self.gbt
+                        .trace
+                        .ahead(tip_hash, outcome, times, started.elapsed());
                 }
             }
             if tip.best_tip_changed().await.is_err() {
@@ -1821,17 +1842,24 @@ where
     ///
     /// Waits for the mempool to process the tip's block for as long as that takes. The caller
     /// drops this future when the tip changes.
+    ///
+    /// Returns what it did, for the trace. It sets `tip_hash` once it has read the tip from the
+    /// state, and fills `times` with each step it finishes, so the caller can also trace a build
+    /// it drops.
     async fn build_template_ahead(
         &self,
         miner_params: &types::get_block_template::MinerParams,
         rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
-    ) -> Result<()> {
+        traced_tip_hash: &mut Option<block::Hash>,
+        times: &mut AheadTimes,
+    ) -> Result<AheadOutcome> {
         use types::get_block_template::{check_synced_to_tip, fetch_chain_info};
 
-        if self.gbt.has_waiting_long_poll()
-            || check_synced_to_tip(&self.network, self.latest_chain_tip.clone()).is_err()
-        {
-            return Ok(());
+        if self.gbt.has_waiting_long_poll() {
+            return Ok(AheadOutcome::LongPollWaiting);
+        }
+        if check_synced_to_tip(&self.network, self.latest_chain_tip.clone()).is_err() {
+            return Ok(AheadOutcome::NotSynced);
         }
         let chain_info = tokio::time::timeout(
             BUILD_AHEAD_STATE_TIMEOUT,
@@ -1840,26 +1868,30 @@ where
         .await
         .map_misc_error()??;
         let tip_hash = chain_info.tip_hash;
+        *traced_tip_hash = Some(tip_hash);
         let height = chain_info.tip_height.next().map_misc_error()?;
         if matches!(
             TemplateBuildWork::for_coinbase(&self.network, height, miner_params),
             TemplateBuildWork::Proof
         ) {
-            return Ok(());
+            return Ok(AheadOutcome::NeedsProof);
         }
 
         let mut mempool_snapshots = self.mempool_snapshots.clone();
-        let Some(mempool) = mempool_snapshots.on_tip(tip_hash).await else {
-            return Ok(());
+        let mempool_wait_started = std::time::Instant::now();
+        let mempool = mempool_snapshots.on_tip(tip_hash).await;
+        times.mempool_wait = mempool_wait_started.elapsed();
+        let Some(mempool) = mempool else {
+            return Ok(AheadOutcome::NoMempool);
         };
 
         // Read after the wait for the mempool, so the template is named for the rejection state
         // a request arriving now would read.
         let Some(rejection_state) = self.track_template_parent(tip_hash, rejections) else {
-            return Ok(());
+            return Ok(AheadOutcome::Rejection);
         };
         if rejection_state.needs_fallback() {
-            return Ok(());
+            return Ok(AheadOutcome::Rejection);
         }
         let mut long_poll_id = LongPollInput::new(
             chain_info.tip_height,
@@ -1872,12 +1904,12 @@ where
 
         let store = &self.gbt.shared_template;
         if store.ready(&long_poll_id).is_some() {
-            return Ok(());
+            return Ok(AheadOutcome::AlreadyBuilt);
         }
         let Some(build) = store.claim(tip_hash, long_poll_id) else {
-            return Ok(());
+            return Ok(AheadOutcome::BuildRunning);
         };
-        let (template, _selection, _build_times) = self
+        let (template, selection, build_times) = self
             .select_and_build_template(
                 miner_params,
                 &chain_info,
@@ -1886,8 +1918,11 @@ where
                 &mempool.transaction_dependencies,
             )
             .await?;
-        let Some(shared) = build.publish(template) else {
-            return Ok(());
+        times.selection = selection;
+        times.build = build_times.run;
+        times.tx_count = template.transactions.len();
+        let Some(shared) = build.publish_built_ahead(template) else {
+            return Ok(AheadOutcome::Replaced);
         };
 
         // Validate the template in the background, as a request's build does.
@@ -1909,7 +1944,8 @@ where
             }
         })
         .await
-        .map_misc_error()
+        .map_misc_error()?;
+        Ok(AheadOutcome::Stored)
     }
 
     /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
@@ -1925,7 +1961,7 @@ where
         shared: ReadyTemplate,
         submit_old: Option<bool>,
     ) -> Result<Option<GetBlockTemplateResponse>> {
-        let ReadyTemplate { template, json } = shared;
+        let ReadyTemplate { template, json, .. } = shared;
         {
             let state = self.gbt.template_rejections.borrow();
             if state.needs_fallback()
@@ -2001,6 +2037,7 @@ where
     /// that wait.
     async fn populated_mempool_on_new_tip(
         &self,
+        request_id: u64,
         tip_hash: block::Hash,
     ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
         let mut mempool_snapshots = self.mempool_snapshots.clone();
@@ -2025,26 +2062,41 @@ where
             }
         };
 
-        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_on_tip).await {
+        let started = std::time::Instant::now();
+        let (outcome, mempool) = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_on_tip)
+            .await
+        {
             Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
-                Some((transactions, dependencies))
+                (NewTipMempool::Populated, Some((transactions, dependencies)))
             }
-            Ok(Ok(_empty_or_on_an_older_tip)) => None,
+            Ok(Ok(Some(_no_transactions))) => (NewTipMempool::Empty, None),
+            Ok(Ok(None)) => (NewTipMempool::OlderTip, None),
             Ok(Err(error)) => {
                 tracing::debug!(
-                    ?error,
-                    "mempool request failed on a new tip; answering with the coinbase-only template"
-                );
-                None
+                        ?error,
+                        "mempool request failed on a new tip; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::Failed, None)
             }
             Err(_elapsed) => {
                 tracing::debug!(
-                    ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
-                );
-                None
+                        ?NEW_TIP_MEMPOOL_WAIT,
+                        "mempool did not answer in time on a new tip; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::TimedOut, None)
             }
-        }
+        };
+        self.gbt.trace.new_tip_mempool(
+            request_id,
+            tip_hash,
+            outcome,
+            mempool
+                .as_ref()
+                .map_or(0, |(transactions, _dependencies)| transactions.len()),
+            started.elapsed(),
+        );
+
+        mempool
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template
@@ -4060,15 +4112,30 @@ where
                         let coinbase_has_head_start = precomputed_coinbase.is_some()
                             && coinbase_needs_proof(&self.network, next_height, miner_params);
                         let populated_mempool = if coinbase_has_head_start {
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::Skipped,
+                                0,
+                                Duration::ZERO,
+                            );
                             None
                         } else if let Some(place) = self.gbt.try_reserve_full_first_answer() {
-                            let populated_mempool =
-                                self.populated_mempool_on_new_tip(tip_hash).await;
+                            let populated_mempool = self
+                                .populated_mempool_on_new_tip(request_id, tip_hash)
+                                .await;
                             if populated_mempool.is_some() {
                                 full_first_answer = Some(place);
                             }
                             populated_mempool
                         } else {
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::OverLimit,
+                                0,
+                                Duration::ZERO,
+                            );
                             None
                         };
 
@@ -4330,6 +4397,11 @@ where
                     .filter(|shared| shared.template.has_times_of(&chain_info))
             };
             if let Some(shared) = shared {
+                let source = if shared.built_ahead {
+                    TemplateSource::Ahead
+                } else {
+                    TemplateSource::Shared
+                };
                 if let Some(response) = self.reuse_shared_template(shared, submit_old).await? {
                     drop(full_first_answer);
                     if let GetBlockTemplateResponse::TemplateMode(template) = &response {
@@ -4337,6 +4409,8 @@ where
                         self.gbt.trace.full_returned(
                             request_id,
                             template,
+                            client_long_poll_id.is_some(),
+                            source,
                             wait_reason,
                             Duration::ZERO,
                             BuildTimes {
@@ -4384,6 +4458,8 @@ where
                     self.gbt.trace.full_returned(
                         request_id,
                         template,
+                        client_long_poll_id.is_some(),
+                        TemplateSource::Built,
                         wait_reason,
                         selection,
                         build_times,

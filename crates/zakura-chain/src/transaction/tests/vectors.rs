@@ -3413,3 +3413,65 @@ fn shielded_action_counts_separate_orchard_and_ironwood_actions() {
         assert_eq!(counts.cost(), count(orchard_actions + ironwood_actions));
     }
 }
+
+/// Building a transaction's librustzcash Sapling bundle from its parsed fields
+/// gives the same transaction data as parsing the whole transaction.
+#[test]
+fn direct_sapling_bundle_matches_librustzcash_parse() {
+    let _init_guard = zakura_test::init();
+
+    let mut sapling_transactions = 0;
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        let blocks = if network.is_mainnet() {
+            zakura_test::vectors::MAINNET_BLOCKS.iter()
+        } else {
+            zakura_test::vectors::TESTNET_BLOCKS.iter()
+        };
+        for (&height, bytes) in blocks {
+            let block: Block = bytes
+                .zcash_deserialize_into()
+                .expect("vectors are valid blocks");
+            let nu = NetworkUpgrade::current(&network, Height(height));
+            for transaction in &block.transactions {
+                if !transaction.has_sapling_shielded_data() {
+                    continue;
+                }
+                let Ok(parsed) = zcash_primitives::transaction::TransactionData::read(
+                    &transaction
+                        .zcash_serialize_to_vec()
+                        .expect("vec writes succeed")[..],
+                    zcash_protocol::consensus::BranchId::try_from(
+                        nu.branch_id()
+                            .expect("Sapling-era upgrades have branch IDs"),
+                    )
+                    .expect("known branch IDs convert"),
+                ) else {
+                    continue;
+                };
+                sapling_transactions += 1;
+
+                let built = transaction
+                    .to_librustzcash_data(nu)
+                    .expect("a transaction librustzcash parses converts");
+
+                assert_eq!(
+                    format!("{:?}", built.sapling_bundle()),
+                    format!("{:?}", parsed.sapling_bundle()),
+                );
+                let write = |data: zcash_primitives::transaction::TransactionData<_>| {
+                    let mut bytes = Vec::new();
+                    data.freeze()
+                        .expect("vector transactions freeze")
+                        .write(&mut bytes)
+                        .expect("vec writes succeed");
+                    bytes
+                };
+                assert_eq!(write(built), write(parsed));
+            }
+        }
+    }
+    assert!(
+        sapling_transactions > 10,
+        "the vectors have Sapling transactions"
+    );
+}

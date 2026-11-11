@@ -283,8 +283,10 @@ pub enum StateInitError {
     /// deleted state.
     #[error(
         "the state database is new, but its transaction static file directory {path:?} already \
-         holds blocks. Hint: give each node its own `state.static_files_dir`, or delete \
-         {path:?} if its state was deleted"
+         holds blocks. Hint: if an earlier start logged a failed state cache move for a major \
+         upgrade, these are the only copy of its moved bodies, so don't delete them. Move the \
+         old state cache into place instead. Otherwise give each node its own \
+         `state.static_files_dir`, or delete {path:?} if its state was deleted"
     )]
     StaticFilesWithoutDatabase {
         /// The static file directory under `state.static_files_dir`.

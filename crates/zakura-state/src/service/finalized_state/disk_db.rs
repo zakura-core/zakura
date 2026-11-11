@@ -1631,8 +1631,10 @@ impl DiskDb {
                     }
                 };
 
-                // External static files move first, so if this stops before the
-                // database moves, the next start finds them in place and moves it.
+                // External static files move first. If the process stops before the
+                // database moves, the next start finds them in place and moves it. If
+                // the database move fails, the new version's static files have no
+                // database, so the arm below stops startup.
                 if let (Some(old_static), Some(new_static)) = (
                     config.external_static_files_path(old_major_db_ver, network),
                     config.external_static_files_path(major_db_ver, network),
@@ -1708,6 +1710,23 @@ impl DiskDb {
                         return Some(disk_version);
                     }
                     Err(e) => {
+                        // Checks the directory rather than this call's move, so it
+                        // also covers a crash between the two moves. A fresh database
+                        // here would refuse these files on every start.
+                        if let Some(new_static) =
+                            config.external_static_files_path(major_db_ver, network)
+                        {
+                            let has_static_files = fs::read_dir(&new_static)
+                                .is_ok_and(|mut entries| entries.next().is_some());
+                            if has_static_files {
+                                panic!(
+                                    "transaction static files at {new_static:?} were moved for \
+                                     a major upgrade, but the state cache could not move from \
+                                     {old_path:?} to {new_path:?}: {e}. Fix this and restart \
+                                     to finish the upgrade. Do not delete either directory."
+                                );
+                            }
+                        }
                         warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
                     }
                 };

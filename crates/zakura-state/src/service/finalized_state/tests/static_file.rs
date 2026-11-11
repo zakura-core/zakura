@@ -907,3 +907,68 @@ fn static_files_left_in_the_state_directory_are_reported() {
     assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
     assert_chain_reads(&state.db, &test_chain());
 }
+
+#[test]
+#[should_panic(expected = "Do not delete either directory")]
+fn a_failed_database_move_after_moving_external_static_files_stops_startup() {
+    use crate::{constants::STATE_DATABASE_KIND, service::finalized_state::disk_db::DiskDb};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let dir = TempDir::new().expect("temp dir");
+    let root = TempDir::new().expect("temp dir");
+    let config = external_config_at(dir.path(), root.path());
+    let current = crate::constants::state_database_format_version_in_code();
+    let previous = semver::Version::new(current.major - 1, 0, 0);
+    let current_db = config.db_path(STATE_DATABASE_KIND, current.major, &network);
+    let previous_db = config.db_path(STATE_DATABASE_KIND, previous.major, &network);
+    let current_static = config
+        .external_static_files_path(current.major, &network)
+        .expect("static files are external");
+    let previous_static = config
+        .external_static_files_path(previous.major, &network)
+        .expect("static files are external");
+
+    // Make the current database look like one the previous release left.
+    {
+        let mut state = FinalizedState::new(&config, &network).expect("state opens");
+        commit(&mut state, &test_chain());
+        crate::write_database_format_version_to_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            current.major,
+            &previous,
+            &network,
+        )
+        .expect("fixture version is written");
+    }
+    for (from, to) in [
+        (&current_db, &previous_db),
+        (&current_static, &previous_static),
+    ] {
+        std::fs::create_dir_all(to.parent().expect("versioned paths have a parent"))
+            .expect("older version parent exists");
+        std::fs::rename(from, to).expect("fixture moves to the older version directory");
+    }
+
+    // A stray non-database directory makes the database rename fail after the
+    // static files moved.
+    std::fs::create_dir_all(&current_db).expect("stray directory is created");
+    std::fs::write(current_db.join("stray"), b"not a database").expect("stray file is written");
+
+    let reused = std::panic::catch_unwind(|| {
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[current.major],
+            &current,
+            &config,
+            STATE_DATABASE_KIND,
+            &network,
+        )
+    });
+
+    // Nothing created a database in the way of a retry, and both copies survive.
+    assert_eq!(file_names(&current_db), vec!["stray".to_string()]);
+    assert!(!file_names(&current_static).is_empty());
+    assert!(!file_names(&previous_db).is_empty());
+    std::panic::resume_unwind(reused.expect_err("startup stops instead of creating a database"));
+}

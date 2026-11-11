@@ -277,7 +277,7 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
         )
         .await
         .expect("startup peer selection finishes within the test deadline")
-    .addresses;
+        .addresses;
         let expected = if max_connections_per_ip == 1 {
             IndexSet::from([cached[0], cached[3], cached[4]])
         } else {

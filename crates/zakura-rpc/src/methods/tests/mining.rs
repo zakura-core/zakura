@@ -1685,6 +1685,49 @@ fn shared_template_is_not_served_on_a_newer_tip() {
     });
 }
 
+/// A long poll that waits for a shared build is not handed its template when the tip moves on
+/// during the build, even though the template has the long poll ID it asked for: it answers on
+/// the new tip instead.
+#[test]
+fn shared_template_finished_after_a_tip_change_is_not_served() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let shared = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+
+        // Stand in for another long poll's build of the same work on `next`.
+        let build = rpc
+            .gbt
+            .shared_template
+            .claim(next.tip_hash, shared.long_poll_id)
+            .expect("no other build is running");
+        let mut waiter = long_poll(&rpc, initial.long_poll_id);
+        assert!(
+            futures::poll!(&mut waiter).is_pending(),
+            "a long poll for the work being built waits for it"
+        );
+
+        let newest = chain_info(4, 3, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &newest);
+        build.publish(shared.clone());
+
+        let template = bounded(waiter).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, newest.tip_hash);
+        assert_ne!(template.work_id(), shared.work_id());
+    });
+}
+
 #[tokio::test]
 async fn long_poll_preserves_negative_balance_error() {
     let (info_tx, info) = watch::channel(chain_info(2, 1, 0));

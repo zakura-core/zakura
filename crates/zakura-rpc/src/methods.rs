@@ -4052,8 +4052,9 @@ where
             // - Sharing one template between long polls
             //
             // Long polls that ask for the same work share one template: the first of them builds
-            // it and the rest take it. A caller without a long poll ID asks for a template now,
-            // and a template past its time range must be rebuilt, so neither shares.
+            // it and the rest take it. A long poll waits only for a build of its own long poll ID,
+            // never for other work on the same tip. A caller without a long poll ID asks for a
+            // template now, and a template past its time range must be rebuilt, so neither shares.
             let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
                 if let Some(template) = self
                     .gbt
@@ -4082,7 +4083,9 @@ where
                         return Ok(response);
                     }
                 }
-                self.gbt.shared_template.claim(chain_info.tip_hash)
+                self.gbt
+                    .shared_template
+                    .claim(chain_info.tip_hash, server_long_poll_id)
             } else {
                 None
             };

@@ -23,8 +23,7 @@
 //! A page with no completed read under its lease breaks too. Whether its
 //! subscriber takes the page, toward the target its `Open` asked for, is
 //! the subscriber's own `receive_page` to judge: a mirror that refuses one
-//! closes its connection with the node on a protocol reject, which
-//! [`super::MirrorLink`] breaks. So a page still in flight when its link
+//! reports it, which [`super::MirrorRefusals`] breaks. So a page still in flight when its link
 //! closes or the run ends is judged here only against its read.
 
 use std::collections::HashMap;

@@ -20,12 +20,12 @@
 //!
 //! A settled point is a step after which no task can run, once every
 //! mirror's own reactor has admitted its session with the node or refused
-//! it at capacity, with no work slot, no storage call the reactor counts as
-//! pending or any port future it polls, no operation pending or held at the
-//! port, and no cached-offer pass deferred to a refill that hasn't come
-//! yet. The decisions come from each mirror's observer, not the node's, so
-//! a node that refuses a mirror's session still reaches settled points, and
-//! so does one whose mirrors, running the same reactor, refuse it too. The
+//! it, with no work slot, no storage call the reactor counts as pending or
+//! any port future it polls, no operation pending or held at the port, and
+//! no cached-offer pass deferred to a refill that hasn't come yet. The
+//! decisions come from each mirror's observer, not the node's, so a node
+//! that refuses a mirror's session still reaches settled points, and so
+//! does one whose mirrors, running the same reactor, refuse it too. The
 //! slots come from the queue's `Slots`, the calls and futures from the
 //! reactor's `Sizes` at each unit of work's end, and the deferral from
 //! `CachedPassDeferred`. Links are in-memory, so by then every session the

@@ -92,8 +92,8 @@ struct Store {
     settled: Option<(u64, Option<String>)>,
     /// How many settled points the drains judged.
     settled_points: u64,
-    /// The mirrors whose own reactors admitted or refused a session with
-    /// the node ([`MirrorDecisions`]).
+    /// The mirrors whose own reactors decided on a session with the node
+    /// ([`MirrorDecisions`]).
     mirrors_decided: HashSet<String>,
 }
 
@@ -163,10 +163,12 @@ impl ForkChoiceEvidence {
     }
 }
 
-/// A mirror's observer, which records the mirror's reactor admitting a
-/// session with the node under test or refusing it at capacity, so settled
-/// points count a mirror the node itself refused, even when the mirrors run
-/// the same refusing reactor ([`settled`]). It ignores every other event and
+/// A mirror's observer, which records the mirror's reactor deciding on a
+/// session with the node under test: admitting it, or refusing it in its
+/// readmission cooldown or at capacity, the three ways its handling of a
+/// new session ends. So settled points count a mirror the node itself
+/// refused, even when the mirrors run the same refusing reactor
+/// ([`settled`]). It ignores every other event and
 /// adds no scheduling point, so the mirror runs as it would unobserved.
 #[derive(Debug)]
 struct MirrorDecisions {
@@ -178,10 +180,11 @@ struct MirrorDecisions {
 }
 
 impl HeaderSyncObserver for MirrorDecisions {
-    /// Records the mirror if `event` admits a session with the node or
-    /// refuses one at capacity.
+    /// Records the mirror if `event` admits or refuses a session with the
+    /// node.
     fn observe(&self, event: ReactorEvent) {
         let (ReactorEvent::SessionAdmitted { peer, .. }
+        | ReactorEvent::SessionRefused { peer, .. }
         | ReactorEvent::SessionAtCapacity { peer, .. }) = event
         else {
             return;

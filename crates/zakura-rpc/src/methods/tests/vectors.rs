@@ -5870,6 +5870,7 @@ fn speculative_test_template(parent: Hash) -> BlockTemplateResponse {
         &chain_info,
         long_poll_id,
         vec![],
+        &Default::default(),
         None,
     )
     .expect("the test template is valid")

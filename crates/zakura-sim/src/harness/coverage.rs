@@ -279,6 +279,14 @@ const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "session/installed-services-authorized",
+        passing: passes(
+            "tests/handshake.rs",
+            "installed_services_follow_each_peers_negotiation",
+        ),
+        bypass: Bypass::Planted("install-unnegotiated-service"),
+    },
+    Coverage {
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
         passing: passes(
             "tests/block_resource_properties.rs",

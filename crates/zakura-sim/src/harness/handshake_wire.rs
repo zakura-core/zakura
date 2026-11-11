@@ -69,11 +69,15 @@ pub struct Prepared {
 }
 
 /// Checks only the handshake while the installed services remain idle.
-pub struct Wire;
+pub struct Wire {
+    scenario: Arc<Scenario>,
+}
 
 impl HasView for Wire {
-    type View = ();
-    fn view(&self) {}
+    type View = Arc<Scenario>;
+    fn view(&self) -> Self::View {
+        self.scenario.clone()
+    }
 }
 
 impl Subsystem for Wire {
@@ -251,15 +255,20 @@ impl Subsystem for Wire {
             }
         }
         sim.add_source(Box::new(control));
-        Wire
+        Wire {
+            scenario: Arc::new(scenario.clone()),
+        }
     }
 
     fn properties() -> Vec<Property<Self>> {
-        crate::table::handshake::properties()
+        let mut properties = crate::table::handshake::properties();
+        properties.push(crate::table::handshake::installed_services_authorized());
+        properties
     }
 
     fn sources() -> Sources {
         Sources::observed(&[
+            Source::View,
             Source::Schedule,
             Source::Datagrams,
             Source::Frames,

@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -3578,7 +3578,7 @@
+         let conn_id = context.conn_id;
+         let connection_token = context.connection_token;
+         let close_cause = context.close_cause;
+-        let accepted_capabilities = context.accepted_capabilities;
++        let accepted_capabilities = context.accepted_capabilities | super::ZAKURA_CAP_DISCOVERY;
+         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
+         let limits_owner_bound = self.limits.owner_bound();
+         let connection_resources = self.resources.connection(accepted_capabilities);

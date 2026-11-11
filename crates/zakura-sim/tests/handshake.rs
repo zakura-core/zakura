@@ -45,6 +45,7 @@ fn honest_control_handshake_holds() {
     assert_held(&report, "handshake/hello/conformant-never-refused");
     assert_held(&report, "handshake/prelude/conformant-never-refused");
     assert_held(&report, "handshake/finishes-in-time");
+    assert_held(&report, "session/installed-services-authorized");
     for id in [
         "handshake/pending-bounded",
         "handshake/connections-per-address-bounded",
@@ -348,5 +349,53 @@ fn prelude_guards_apply_each_declared_consequence() {
             .unwrap()
             .1;
         assert_held(&report, &format!("handshake/prelude/{label}-{effect}"));
+    }
+}
+
+#[test]
+fn installed_services_follow_each_peers_negotiation() {
+    use zakura_network::zakura::{ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC};
+    use zakura_sim::peer::PeerSpec;
+    for node_dials in [false, true] {
+        let mut scenario = Scenario::default();
+        scenario.peers = [
+            ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC | (1 << 60) | (1 << 61),
+        ]
+        .into_iter()
+        .map(|capabilities| PeerSpec {
+            capabilities,
+            ..if node_dials {
+                PeerSpec::listening()
+            } else {
+                PeerSpec::dialing()
+            }
+        })
+        .collect();
+        let report = run(scenario);
+        assert_held(&report, "session/installed-services-authorized");
+        if node_dials {
+            assert!(
+                report.log.entries().iter().any(|entry| matches!(
+                    entry.obs,
+                    zakura_sim::Observation::Transport {
+                        event: zakura_sim::observe::TransportFact::Admitted {
+                            kind: 900,
+                            version: 2,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                "the node must install the selected alternative layout"
+            );
+        }
+        zakura_sim::witness::judge_report::<Wire>(
+            &report,
+            "session/installed-services-authorized",
+            zakura_sim::witness::Expect::Holds,
+        )
+        .unwrap();
     }
 }

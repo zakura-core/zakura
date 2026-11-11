@@ -982,3 +982,148 @@ fn prelude_effect(key: &ObligationKey, obs: &Observation) -> bool {
     matches!(obs, Observation::ConnectionClosed { connection, cause }
         if key.subject == Subject::Owner(format!("close/{connection}")) && cause == expected)
 }
+
+/// Checks worker installation against this fixture's offered capabilities and layouts.
+pub fn installed_services_authorized<S>() -> Property<S>
+where
+    S: HasView<View = std::sync::Arc<crate::harness::handshake_wire::Scenario>>,
+{
+    Property {
+        id: PropertyId::new("session/installed-services-authorized"),
+        claim: "Every installed stream belongs to the connection's negotiated and enabled layout.",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View, Source::Closes],
+        status: Status::Active,
+        check: check_installed_services::<S>,
+        witness: Some(TriggerHistory::Log(|log| {
+            log.entries().iter().any(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::Transport {
+                        event: TransportFact::Admitted { .. },
+                        ..
+                    }
+                )
+            })
+        })),
+    }
+}
+
+/// The fixture declares these layouts independently of the registry's selection code.
+fn authorized_stream(capabilities: u64, kind: u16, version: u16) -> bool {
+    use zakura_network::zakura::{
+        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+    };
+    match kind {
+        ZAKURA_STREAM_HEADER_SYNC => {
+            capabilities & ZAKURA_CAP_HEADER_SYNC != 0
+                && version == ZAKURA_HEADER_SYNC_STREAM_VERSION
+        }
+        ZAKURA_STREAM_DISCOVERY => {
+            capabilities & ZAKURA_CAP_DISCOVERY != 0 && version == ZAKURA_DISCOVERY_STREAM_VERSION
+        }
+        900 => match version {
+            2 => capabilities & (1 << 61) != 0,
+            1 => capabilities & (1 << 60) != 0 && capabilities & (1 << 61) == 0,
+            _ => false,
+        },
+        901 => version == 1 && capabilities & (1 << 62) != 0,
+        _ => false,
+    }
+}
+
+fn check_installed_services<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView<View = std::sync::Arc<crate::harness::handshake_wire::Scenario>>,
+{
+    use std::collections::BTreeMap;
+    if !cx.observations().any(|obs| {
+        matches!(
+            obs,
+            Observation::Transport {
+                event: TransportFact::Admitted { .. },
+                ..
+            }
+        )
+    }) {
+        return Verdict::NotApplicable;
+    }
+    let scenario = cx.view();
+    let mut handshakes = BTreeMap::new();
+    let mut connections = BTreeMap::new();
+    let mut enabled = BTreeMap::new();
+    let mut finding = None;
+    for entry in cx.log.entries() {
+        let Observation::Transport {
+            instance,
+            connection,
+            remote,
+            event,
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        match event {
+            TransportFact::CapabilitiesChanged { supported } => {
+                enabled.insert(*instance, *supported);
+            }
+            TransportFact::Negotiated {
+                local, negotiated, ..
+            } => {
+                let peer = remote
+                    .parse()
+                    .ok()
+                    .and_then(crate::peer::peer_of)
+                    .and_then(|index| scenario.peers.get(index));
+                let expected = peer.map(|peer| peer.capabilities & local);
+                handshakes.insert((*instance, remote.clone()), (*negotiated, expected));
+            }
+            TransportFact::Registered => {
+                if let Some(connection) = connection {
+                    connections.insert(
+                        (*instance, *connection),
+                        handshakes.get(&(*instance, remote.clone())).copied(),
+                    );
+                }
+            }
+            TransportFact::TornDown => {
+                if let Some(connection) = connection {
+                    connections.remove(&(*instance, *connection));
+                }
+            }
+            TransportFact::Admitted {
+                kind,
+                version,
+                session_id,
+                ..
+            } if entry.step == cx.step => {
+                let permission = connection.and_then(|connection| {
+                    connections.get(&(*instance, connection)).copied().flatten()
+                });
+                let allowed = permission.is_some_and(|(negotiated, expected)| {
+                    expected == Some(negotiated)
+                        && authorized_stream(
+                            negotiated & enabled.get(instance).copied().unwrap_or(u64::MAX),
+                            *kind,
+                            *version,
+                        )
+                });
+                if !allowed {
+                    finding = Some(format!("connection {connection:?}, session {session_id}, stream {kind}v{version}, permissions {permission:?}"));
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match finding {
+        Some(actual) => cx.violated(
+            "an installed stream has fixture-negotiated permission on a live connection",
+            actual,
+        ),
+        None => Verdict::Holds,
+    }
+}

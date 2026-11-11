@@ -3123,11 +3123,19 @@ impl HeaderChainRuntime {
                             .validation_context(event.parent_hash, context.config.network())?,
                     );
                 }
-                if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
-                    validation_leases.extend(self.validation_lease_if_needed(
-                        engine,
+                // Header admission walks only from the batch's parent, so it reads the finalized
+                // header's lease only when that walk runs out of retained headers.
+                if anchor_changed
+                    && event.parent_hash != before.frontiers.finalized.hash
+                    && engine.needs_validation_lease_beside_walk(
+                        event.parent_hash,
                         before.frontiers.finalized.hash,
                         context,
+                    )
+                {
+                    validation_leases.push(self.store.validation_context(
+                        before.frontiers.finalized.hash,
+                        context.config.network(),
                     )?);
                 }
                 validation_leases.dedup_by_key(|lease| lease.parent());

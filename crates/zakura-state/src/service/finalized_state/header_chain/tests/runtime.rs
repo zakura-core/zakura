@@ -4369,6 +4369,57 @@ fn growing_a_fully_retained_verified_tip_reads_no_stored_predecessors() {
 }
 
 #[test]
+fn inserting_after_finality_moved_loads_the_finalized_lease_only_when_the_parent_walk_runs_short() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let before = runtime.publisher().snapshot();
+    let finalized = before.frontiers.finalized.hash;
+    assert_ne!(
+        path[0].hash, finalized,
+        "the fixture finalizes above its first header"
+    );
+    // Header sync prepared the batch while an older header was still the finalized one.
+    let mut older = before.clone();
+    older.frontiers.finalized = Frontier::new(path[0].height, path[0].hash);
+    let loaded_lease_roots = |parent_index: usize| {
+        let mut request = child_insertion(&runtime, &path[parent_index]);
+        let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+            unreachable!("child_insertion builds a header insertion");
+        };
+        insert.owner = header_owner(&older, insert.target_tip_hash, 1, 1);
+        let engine = runtime
+            .transition_engine
+            .lock()
+            .expect("the fixture writer is unlocked");
+        runtime
+            .build_transition_input(
+                request,
+                &before,
+                &header_insertion_context(&runtime),
+                &engine,
+            )
+            .expect("the insertion input builds")
+            .header_validation_facts()
+            .expect("an insertion carries validation facts")
+            .validation_leases
+            .iter()
+            .map(|lease| lease.parent().hash)
+            .collect::<Vec<block::Hash>>()
+    };
+
+    let deep = lowest_fully_retained_parent_index();
+    assert_eq!(
+        loaded_lease_roots(deep),
+        Vec::<block::Hash>::new(),
+        "the walk from a fully retained parent never needs the finalized header's lease",
+    );
+    assert_eq!(
+        loaded_lease_roots(deep - 1),
+        vec![path[deep - 1].hash, finalized],
+        "a walk one header short needs the parent's lease and may continue into the finalized one",
+    );
+}
+
+#[test]
 fn inserting_a_header_one_short_of_full_retention_rereads_and_checks_every_predecessor() {
     let (runtime, path, _) = hashed_evidence_fixture();
     let parent_index = lowest_fully_retained_parent_index() - 1;

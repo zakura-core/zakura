@@ -7,7 +7,7 @@ use super::super::{
     HeaderValidationCheck, HeaderValidationSource, HeaderViolation, InvalidTransitionEvidence,
     TransitionFailure,
 };
-use crate::graph::HeaderGraphView;
+use crate::graph::{HeaderGraphView, HeaderNode};
 use crate::{
     EligibilityReason, Frontier, HeaderValidationFacts, HeaderValidationState, StoreError,
     TransitionContext,
@@ -27,6 +27,18 @@ fn required_context_len(parent: Frontier) -> Result<usize, StoreError> {
         .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN))
 }
 
+/// The headers the retained graph holds from `parent` toward finality, newest first.
+///
+/// Ends at the first header the graph does not retain.
+fn retained_graph_walk<G: HeaderGraphView>(
+    graph: &G,
+    parent: block::Hash,
+) -> impl Iterator<Item = &HeaderNode> {
+    std::iter::successors(graph.view_header_node(parent), |node| {
+        graph.view_header_node(node.parent_hash)
+    })
+}
+
 /// Walk the retained graph from `parent` toward finality, newest first.
 ///
 /// Stops after `required` headers, or earlier at the first header the graph does not retain.
@@ -36,18 +48,17 @@ fn retained_graph_context<G: HeaderGraphView>(
     required: usize,
 ) -> Vec<ContextEntry> {
     let mut context = Vec::with_capacity(required);
-    let mut hash = parent.hash;
-    while context.len() < required {
-        let Some(node) = graph.view_header_node(hash) else {
-            break;
-        };
-        context.push((
-            node.header.difficulty_threshold,
-            node.header.time,
-            Frontier::new(node.height, node.hash),
-        ));
-        hash = node.parent_hash;
-    }
+    context.extend(
+        retained_graph_walk(graph, parent.hash)
+            .take(required)
+            .map(|node| {
+                (
+                    node.header.difficulty_threshold,
+                    node.header.time,
+                    Frontier::new(node.height, node.hash),
+                )
+            }),
+    );
     context
 }
 
@@ -62,9 +73,8 @@ pub(in crate::transition::planner) fn graph_retains_header_context<G: HeaderGrap
     let Some(node) = graph.view_header_node(parent) else {
         return false;
     };
-    let parent = Frontier::new(node.height, node.hash);
-    required_context_len(parent)
-        .is_ok_and(|required| retained_graph_context(graph, parent, required).len() == required)
+    required_context_len(Frontier::new(node.height, node.hash))
+        .is_ok_and(|required| retained_graph_walk(graph, parent).take(required).count() == required)
 }
 
 /// Reconstruct difficulty/time context for a retained parent, splicing durable leases when needed.

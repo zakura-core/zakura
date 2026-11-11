@@ -434,6 +434,48 @@ fn a_lease_is_needed_exactly_when_the_graph_cuts_the_context_short() {
 }
 
 #[test]
+fn a_lease_beside_the_walk_is_needed_only_when_the_walk_runs_short_or_it_vouches_for_a_reference() {
+    let finalized = 20;
+    let deep = lowest_fully_retained_parent(finalized);
+    let (store, config, frontiers, _) = build_finalized_chain(finalized, &[]);
+    let finalized_hash = frontiers[finalized as usize].hash;
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let ctx = context(&config, &clock, Some(&authority));
+    let engine = test_engine(&store);
+    let needs_finalized_lease = |walk_from: u32, ctx: &TransitionContext<'_>| {
+        engine.needs_validation_lease_beside_walk(
+            frontiers[walk_from as usize].hash,
+            finalized_hash,
+            ctx,
+        )
+    };
+
+    assert!(
+        engine.needs_validation_lease(finalized_hash, &ctx),
+        "a walk from the finalized header itself runs out at once"
+    );
+    assert!(
+        !needs_finalized_lease(deep, &ctx),
+        "a walk from a fully retained parent never reaches past the finalized header"
+    );
+    assert!(
+        needs_finalized_lease(deep - 1, &ctx),
+        "a walk one retained header short continues into the finalized header's lease"
+    );
+
+    let references = [finalized_hash];
+    let unvouched = TransitionContext {
+        retention_references: &references,
+        ..context(&config, &clock, Some(&authority))
+    };
+    assert!(
+        needs_finalized_lease(deep, &unvouched),
+        "only the lease can authenticate the finalized header as a retention reference"
+    );
+}
+
+#[test]
 fn a_retention_reference_only_a_lease_can_authenticate_needs_the_lease() {
     let finalized = 20;
     let (store, config, frontiers, _) = build_finalized_chain(finalized, &[]);

@@ -338,7 +338,25 @@ impl HeaderChainEngine {
         parent: block::Hash,
         context: &TransitionContext<'_>,
     ) -> bool {
-        needs_validation_lease(self, parent, context)
+        needs_validation_lease(self, parent, parent, context)
+    }
+
+    /// Returns whether [`Self::plan_transition`] can read a durable [`crate::ValidationLease`]
+    /// rooted at `lease_root` when every difficulty/time walk it runs starts at `walk_from` or
+    /// passes through it.
+    ///
+    /// A header insertion runs one such walk, from the parent of its batch, so the lease rooted at
+    /// another header, such as the finalized header, is read only when that walk runs out of
+    /// retained headers, or when `lease_root` is a retention reference that only a lease can
+    /// authenticate. The same conditions as [`Self::needs_validation_lease`] apply to the engine,
+    /// references and authority used to ask.
+    pub fn needs_validation_lease_beside_walk(
+        &self,
+        walk_from: block::Hash,
+        lease_root: block::Hash,
+        context: &TransitionContext<'_>,
+    ) -> bool {
+        needs_validation_lease(self, walk_from, lease_root, context)
     }
 
     /// Install a verified transition after its durable batch has committed.

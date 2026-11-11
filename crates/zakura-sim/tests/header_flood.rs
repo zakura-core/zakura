@@ -345,8 +345,9 @@ fn a_wire_flood_keeps_the_events_queue_loaded() {
 }
 
 /// `scenario` cut after `budget` live steps, under the empty Plan, through
-/// the storage harness with its properties.
-fn cut(scenario: &StorageScenario, budget: u64) -> RunReport {
+/// the storage harness with its properties, and the harness's view at the
+/// run's end, before cleanup ends every session.
+fn cut(scenario: &StorageScenario, budget: u64) -> (RunReport, StorageView) {
     let config = RunConfig {
         budget,
         ..storage_config()
@@ -358,15 +359,28 @@ fn cut(scenario: &StorageScenario, budget: u64) -> RunReport {
         Storage::prepare(scenario),
     ));
     let registry = Registry::new(storage_properties()).expect("the storage IDs are unique");
-    let mut checker = RegistryChecker::new(
+    let checker = RegistryChecker::new(
         registry,
         Rc::clone(&storage),
         Assumptions::none(),
         &storage_sources(),
     );
+    let at_end = Rc::new(RefCell::new(None));
+    let (read, kept) = (Rc::clone(&storage), Rc::clone(&at_end));
+    let mut checker = zakura_sim::property::Tee(
+        checker,
+        zakura_sim::check::FnChecker::new(
+            |_: &zakura_sim::StepCtx<'_>| None,
+            move |_: &zakura_sim::RunEnd, _: &zakura_sim::ObservationLog| {
+                *kept.borrow_mut() = Some(read.view());
+                Vec::new()
+            },
+        ),
+    );
     let report = sim.run(&mut checker, &mut MemorySink::default());
     drop((checker, storage));
-    report
+    let view = at_end.take().expect("the run ended");
+    (report, view)
 }
 
 /// The drain picks of `report` that run a flood task.
@@ -380,36 +394,53 @@ fn flood_picks(report: &RunReport) -> usize {
 
 /// E1's generator retirement: 16 floods still sending when the budget cuts
 /// the run are cancelled at the drain's start, without closing their
-/// links, so the drain runs dry rather than flooding to its bound.
+/// links, so the drain runs dry rather than flooding to its bound. Each
+/// flood's admitted session outlives its retirement: the flood stops
+/// sending but keeps its streams, so the node never sees an end the
+/// harness caused (Sol 1, round 3).
 #[test]
 fn a_flood_cut_by_the_budget_drains_dry() {
-    let report = cut(&flooded(ControlAction::Flood), BUDGET);
+    let (report, view) = cut(&flooded(ControlAction::Flood), BUDGET);
     assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert!(flood_picks(&report) > 0, "each flood woke to stop");
+    // Each mirror's last link is its flood's.
+    let floods = &view.sessions[view.sessions.len() - FLOODERS..];
+    assert!(
+        floods.iter().all(|session| session.until.is_none()),
+        "{floods:?}"
+    );
+}
+
+/// Whether a flood task in `report`'s run reached a send.
+fn flood_sent(report: &RunReport) -> bool {
+    report
+        .picks
+        .iter()
+        .any(|pick| pick.identity.contains("flood") && pick.identity.contains(":send#"))
 }
 
 /// A cut right after a `Flood` pick leaves the control task to start the
 /// flood in the drain. The flood registers after the generators retired,
-/// so it's cancelled at once and never floods, and the drain runs dry.
+/// so it's cancelled at once and never sends, though it keeps reading
+/// what the node sends to keep the session open, and the drain runs dry.
 #[test]
 fn a_flood_picked_at_the_budget_is_cancelled_at_once() {
     let scenario = scenario(vec![step("mirror-0", ControlAction::Flood)]);
-    let full = cut(&scenario, BUDGET);
+    let (full, _) = cut(&scenario, BUDGET);
     let picked = full
         .picks
         .iter()
         .find(|pick| pick.identity == "peer:mirror-0:flood")
         .map(|pick| pick.step)
         .expect("the run picks the flood");
-    let report = cut(&scenario, picked);
+    assert!(flood_sent(&full), "a flood started live sends");
+    let (report, view) = cut(&scenario, picked);
     assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
-    assert!(
-        flood_picks(&report) < 8,
-        "the flood stopped at once: {}",
-        flood_picks(&report)
-    );
+    assert!(!flood_sent(&report), "the flood stopped at once");
+    let flood = view.sessions.last().expect("the flood's link");
+    assert_eq!(flood.until, None, "the flood keeps its session");
 }
 
 /// Under 16 `Churn` steps, once the lifecycle queue fills, each turn's

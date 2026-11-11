@@ -941,11 +941,13 @@ struct FarEnd {
 /// Floods the node under test over `far`. It waits for the node's first
 /// `Status` on the session, then sends that frame back as fast as the node
 /// takes it, reading whatever the node sends meanwhile, until `far`'s token
-/// is cancelled, by the link's close or the generator's retirement, or
+/// is cancelled, by `link`'s close or the generator's retirement, or
 /// either stream ends. The node's receiver awaits room in its
 /// events queue for each `Status` it forwards, so the session stays open
-/// while the queue is full.
-async fn flood(far: FarEnd) {
+/// while the queue is full. A retirement only stops the sending: the flood
+/// then [`keep`]s its streams until the link closes, so the node's session
+/// outlives it.
+async fn flood(far: FarEnd, link: CancellationToken) {
     let FarEnd {
         mut from_node,
         to_node,
@@ -954,7 +956,7 @@ async fn flood(far: FarEnd) {
     let status = loop {
         let frame = zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => frame,
         };
         let Some(frame) = frame else {
@@ -970,11 +972,29 @@ async fn flood(far: FarEnd) {
     loop {
         zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => if frame.is_none() {
                 return;
             },
             sent = to_node.send(status.clone()) => if sent.is_err() {
+                return;
+            },
+        }
+    }
+}
+
+/// Keeps a retired flood's session open, as a quiet peer would: holds the
+/// stream to the node and reads and drops what the node sends, until
+/// `link` closes or the node ends the stream. Dropping the streams instead
+/// would end the session with an EOF that no harness close records, which
+/// the session view would blame on the node.
+async fn keep(mut from_node: FramedRecv, to_node: FramedSend, link: &CancellationToken) {
+    let _to_node = to_node;
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = link.cancelled() => return,
+            frame = from_node.recv() => if frame.is_none() {
                 return;
             },
         }
@@ -1347,12 +1367,13 @@ impl Topology {
     fn flood(&self, peer: &str, generators: &Generators) {
         let (_, far) = self.open(self.index(peer), 0, true);
         let far = far.expect("an open with a far end hands it back");
-        let stop = far.cancel.child_token();
+        let link = far.cancel.clone();
+        let stop = link.child_token();
         let far = FarEnd {
             cancel: stop.clone(),
             ..far
         };
-        generators.spawn("flood", stop, flood(far));
+        generators.spawn("flood", stop, flood(far, link));
     }
 
     /// Whether the node under test's shutdown has begun: a `Shutdown` step

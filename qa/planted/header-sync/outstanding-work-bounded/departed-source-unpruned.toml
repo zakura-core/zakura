@@ -1,0 +1,9 @@
+# A departed VCT repair supplier's history gets no hold, so its tried
+# entry outlives its session and nothing ever prunes it. The input's
+# supplier holds no tree records, so the node charges it as tried, and
+# then it leaves. The report right after the departure finds a tried
+# source that's neither an admitted peer nor a held departure. The
+# reactor's repair path decides when a supplier is charged and when its
+# history is pruned, so a change there can move the input off it.
+input = "crates/zakura-sim/tests/fixtures/header-repair-supplier-pruned.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -57,6 +57,19 @@ message BlockRangeRequest {
   uint32 end_height = 2;
 };
 
+// A request for a transaction by its ID.
+message TransactionRequest {
+  // The 32-byte transaction ID in display order.
+  bytes txid = 1;
+};
+
+// An encoded transaction.
+message RawTransaction {
+  // The transaction's consensus encoding, the bytes `getrawtransaction` with
+  // verbosity 0 returns as hex.
+  bytes data = 1;
+};
+
 // A request to subscribe to non-finalized state changes.
 message NonFinalizedStateChangeRequest {
   // The hashes of the chain tips the caller already has, in display order.
@@ -127,4 +140,11 @@ service Indexer {
   // wire from a clean end. Rejects ranges whose end is below their start
   // with `INVALID_ARGUMENT`.
   rpc GetBlockRange(BlockRangeRequest) returns (stream BlockAndHeight);
+
+  // Returns the encoded transaction with the given ID from any chain in the
+  // state, as stored, without hex or JSON.
+  //
+  // Mempool transactions are not included. Rejects an ID that is not 32 bytes
+  // with `INVALID_ARGUMENT`, and returns `NOT_FOUND` for an unknown ID.
+  rpc GetTransaction(TransactionRequest) returns (RawTransaction);
 }

@@ -216,10 +216,9 @@ fn the_wake_fixtures_hold_under_every_plan() {
 ///
 /// An empty list means the fixture holds nothing at the end, not that the
 /// node is idle. Its status refreshes keep starting rounds, so work younger
-/// than the bound can still be in flight when the budget runs out, and the
-/// drain offers no storage completions to finish it. No hold picks that
-/// work, so a drain that completes storage operations, as #1840 proposes,
-/// can finish it.
+/// than the bound can still be in flight when a run ends. No hold picks
+/// that work, and the drain offers each pending operation's completion
+/// (#1840 rule 1), so work the live phase started finishes there.
 fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
     let storage = scenario.storage();
     let bound = Duration::from_millis(

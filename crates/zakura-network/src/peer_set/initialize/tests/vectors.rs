@@ -88,6 +88,7 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
         .into_iter()
         .collect(),
         peerset_initial_target_size: 4,
+        initial_peer_dial_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
         ..test_defaults()
     };
     let cached: IndexSet<PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.8:9000"]
@@ -188,8 +189,9 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     assert_alternating(&attempts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
     for pair in attempts.windows(2) {
         assert_eq!(
-            pair[1].1 - pair[0].1,
-            constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+            pair[1].1,
+            pair[0].1,
+            "serial startup attempts do not require a timer"
         );
     }
 }
@@ -2088,37 +2090,31 @@ async fn listener_peer_limit_many_handshake_ok_stay_open() {
     );
 }
 
-/// Test if the initial seed peer connections is rate-limited.
+/// Immediate startup failures do not delay the next attempt.
 #[tokio::test]
-async fn add_initial_peers_is_rate_limited() {
+async fn add_initial_peers_immediate_failures_do_not_wait() {
     let _init_guard = zakura_test::init();
 
     // This test should not require network access.
 
-    // We don't need to actually connect to the peers; we only need to check
-    // if the connection attempts is rate-limited. Therefore, just return an error.
+    // Return immediate errors so every completion can refill the startup window.
     let outbound_connector =
         service_fn(|_| async { Err("test outbound connector always returns errors".into()) });
 
     const PEER_COUNT: usize = 10;
 
-    let before = Instant::now();
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
 
     let (initial_peers_task_handle, peerset_rx, address_book_updater_task_handle) =
         spawn_add_initial_peers(PEER_COUNT, outbound_connector).await;
     let connections = peerset_rx.take(PEER_COUNT).collect::<Vec<_>>().await;
 
-    let elapsed = Instant::now() - before;
+    let elapsed = tokio::time::Instant::now() - before;
 
-    // Errors are ignored, so we don't expect any peers here
+    // Errors are ignored, so we don't expect any peers here.
     assert_eq!(connections.len(), 0);
-    // Make sure the rate limiting worked by checking if it took long enough
-    assert!(
-        elapsed
-            > constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
-                .saturating_mul((PEER_COUNT - 1) as u32),
-        "elapsed only {elapsed:?}"
-    );
+    assert_eq!(elapsed, Duration::ZERO, "startup must not add a timer");
 
     let initial_peers_result = initial_peers_task_handle.await;
     assert!(

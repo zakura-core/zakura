@@ -1,0 +1,15 @@
+# The publisher's capacity-wait pruning keeps every wait, so a wait no
+# subscription is stalled on stays. The witness's mirror relinks while
+# storage holds its first serving read, so the new session's acquire is
+# refused for the old session's lease and the publisher registers a wait.
+# A commit then changes the node's selected chain, before or after the
+# publisher stalls on that wait. Either way no stall references the wait
+# afterwards, and the next pass's pruning keeps it anyway. The publisher, the
+# serving capacity and storage's lease registry decide when the acquire
+# is refused, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/serve", "crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-capacity-waits.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-capacity-waits.plan"

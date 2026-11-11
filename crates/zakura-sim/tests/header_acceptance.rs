@@ -3373,7 +3373,10 @@ fn marked_sites(text: &str, file: &str) -> Vec<String> {
         file: &'a str,
         found: Vec<String>,
     }
-    /// Whether `attrs` mark test-only code.
+    /// Whether `attrs` mark test-only code: `#[test]`, or a `cfg` whose
+    /// whole condition is `test`. Any other condition that names `test`,
+    /// such as `any(test, zakura_sim)` or `not(test)`, can hold in a
+    /// simulator build, so its code is scanned.
     fn test_only(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
             attr.path().is_ident("test")
@@ -3381,7 +3384,7 @@ fn marked_sites(text: &str, file: &str) -> Vec<String> {
                     && attr
                         .meta
                         .require_list()
-                        .is_ok_and(|list| list.tokens.to_string().contains("test")))
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
         })
     }
     /// Fails on a `use` tree that imports from `Pending` or renames it.
@@ -3504,8 +3507,9 @@ fn the_not_applicable_inventory_lists_every_reason() {
     let header_sites: BTreeSet<String> = listed.iter().filter_map(site_of).collect();
     // The scan reads a site however the mark is spelled: whatever its
     // receiver, through `CheckCtx::pending`, or through a variable (Terra 3,
-    // rounds 3 and 7). Test code doesn't count, and a `use` that would hide
-    // a site's path fails it.
+    // rounds 3 and 7). Test-only code doesn't count, but code a simulator
+    // build compiles does (Terra, round 8), and a `use` that would hide a
+    // site's path fails it.
     let text = "fn check(cx: &mut Cx) {\n\
                     cx.pending(Pending::FaultOpen);\n\
                     ctx.pending(Pending::BlockTeardownOpen);\n\
@@ -3517,14 +3521,20 @@ fn the_not_applicable_inventory_lists_every_reason() {
                 #[cfg(test)]\n\
                 mod tests {\n\
                     fn t() { let _ = Pending::UnreadTrigger; }\n\
-                }\n";
+                }\n\
+                #[cfg(any(test, zakura_sim))]\n\
+                fn sim() { cx.pending(Pending::UnjudgedDeparture); }\n\
+                #[cfg(not(test))]\n\
+                fn live() { cx.pending(Pending::UnreadBoundary); }\n";
     assert_eq!(
         marked_sites(text, "t.rs"),
         [
             "FaultOpen",
             "BlockTeardownOpen",
             "TeardownOpen",
-            "WatchOpen"
+            "WatchOpen",
+            "UnjudgedDeparture",
+            "UnreadBoundary"
         ]
     );
     for hidden in [

@@ -7,8 +7,9 @@
 //! The recovery policy picks the action enabled the longest, and the
 //! harness offers `recovered` only at a quiet step, so with no hostile
 //! prefix the node has synced from its source by the `recovered` pick. Each
-//! witness here is met at the pick. A later adoption meeting it is unit
-//! tested (`RecoveryEvidence::progress`), and the bypass runs the deadline.
+//! witness here is met at the pick. A unit test in `recovery.rs` covers a
+//! later adoption: the property's obligation discharges only on a header
+//! the objective holds. The bypass runs to the deadline.
 #![cfg(zakura_sim)]
 
 mod support;

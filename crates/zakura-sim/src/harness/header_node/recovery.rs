@@ -1094,16 +1094,22 @@ mod tests {
 
     /// The node's adoption at `height` on branch 0, reported to `adoption`.
     fn adopt(adoption: &AdoptionEvidence, height: u32) {
+        adopt_tip(adoption, header(0, height));
+    }
+
+    /// The node's adoption of `tip`, reported to `adoption`.
+    fn adopt_tip(adoption: &AdoptionEvidence, tip: Frontier) {
         use zakura_header_chain::{HeaderGeneration, StateVersion, VerifiedGeneration};
 
         let anchor = header(0, 0);
+        let height = tip.height.0;
         adoption.record(
             Duration::ZERO,
             AdoptionFact::Adopted(super::super::adoption::Adoption {
                 state_version: StateVersion::new(u64::from(height)),
                 header_generation: HeaderGeneration::new(1),
                 finalized: anchor,
-                header_best: header(0, height),
+                header_best: tip,
                 suffix_work: zakura_chain::work::difficulty::U256::from(height),
                 oldest_retained: anchor.height,
                 verified_generation: VerifiedGeneration::new(1),
@@ -1194,5 +1200,99 @@ mod tests {
             recovery.progress(&adoption, &ends),
             RecoveryProgress::Concluded
         );
+    }
+
+    /// A harness whose view holds only a recovery's evidence, for driving
+    /// `bounded-adversary-progress`'s check directly.
+    struct RecoveryOnly {
+        adoption: AdoptionEvidence,
+        recovery: RecoveryEvidence,
+        ends: EndEvidence,
+    }
+
+    impl crate::property::HasView for RecoveryOnly {
+        type View = crate::harness::header_sync::StorageView;
+
+        /// A view with the harness's recovery, adoption and end evidence,
+        /// and empty everything else.
+        fn view(&self) -> Self::View {
+            use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
+
+            crate::harness::header_sync::StorageView {
+                port: Arc::new(ControlledPort::new(&HeaderFixture::regtest())),
+                direct_dispatch_broken: false,
+                honest_peers: Default::default(),
+                adoption: self.adoption.clone(),
+                sessions: Vec::new(),
+                faults: Default::default(),
+                capacity: Default::default(),
+                claims: Default::default(),
+                rounds: Default::default(),
+                stale_calls: Default::default(),
+                wake: Default::default(),
+                hold_wake: Default::default(),
+                ends: self.ends.clone(),
+                stamps: self.ends.stamps(),
+                round_life: Default::default(),
+                retirement: Default::default(),
+                chain_effect: Default::default(),
+                authority: Default::default(),
+                outstanding: Default::default(),
+                recovery: self.recovery.clone(),
+            }
+        }
+    }
+
+    /// At the `recovered` pick with the node still at its baseline, the
+    /// property opens one obligation, and only a later adoption of a header
+    /// the objective holds discharges it. The baseline's tip again, a fork
+    /// tip off the objective and a fact that isn't an adoption answer
+    /// nothing.
+    #[test]
+    fn the_obligation_discharges_only_on_an_adoption_the_objective_holds() {
+        use crate::{
+            check::{Phase, StepCtx},
+            domain::header_sync_progress::bounded_adversary_progress,
+            property::{CheckCtx, FactAnswer, HasView, Verdict},
+        };
+
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        adopt(&adoption, 3);
+        let harness = RecoveryOnly {
+            recovery: owing(&ends),
+            adoption: adoption.clone(),
+            ends: ends.clone(),
+        };
+        let registered = [bounded_adversary_progress::<RecoveryOnly>()];
+        let pick = crate::Identity::advance_time(at(2_000));
+        let log = crate::ObservationLog::default();
+        // The record's step, so the check judges the pick.
+        let step = StepCtx {
+            step: 7,
+            pick: &pick,
+            enabled: &[],
+            phase: Phase::Live,
+            now: at(2_000),
+            status: zakura_scheduler::Status::Quiescent,
+            log: &log,
+        };
+        let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), Some(&[]));
+        assert_eq!((registered[0].check)(&mut cx), Verdict::Holds);
+        let parts = cx.into_parts();
+        let [obligation] = &parts.obliged[..] else {
+            panic!("one obligation: {}", parts.obliged.len());
+        };
+        let facts = obligation.facts.as_ref().expect("a fact obligation");
+        let answer = || (facts.answer)(&obligation.key, &harness.view(), ends.stamps().issued());
+
+        adopt(&adoption, 3);
+        assert_eq!(answer(), FactAnswer::Unrelated, "the baseline's tip");
+        adopt_tip(&adoption, header(1, 4));
+        assert_eq!(answer(), FactAnswer::Unrelated, "a fork tip");
+        ends.record(EndFact::ReactorExited { step: 9 });
+        assert_eq!(answer(), FactAnswer::Unrelated, "not an adoption");
+        adopt(&adoption, 4);
+        assert_eq!(answer(), FactAnswer::Discharges, "the successor");
     }
 }

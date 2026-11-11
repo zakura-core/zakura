@@ -118,10 +118,12 @@ impl RepairScenario {
                 MirrorSpec {
                     chain: Chain::main(TIP),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::main(TIP + 1),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {

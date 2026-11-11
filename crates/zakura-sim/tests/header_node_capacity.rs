@@ -85,6 +85,7 @@ pub fn witness() -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(300),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         controls: vec![
             step(

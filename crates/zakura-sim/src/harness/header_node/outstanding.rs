@@ -34,7 +34,8 @@
 //!   entry is ever removed here. The peak equals the connections the run
 //!   opened and says nothing about production. Whether a closed
 //!   connection's entry goes is the transport cleanup's contract
-//!   (`RegisteredPeerCleanupGuard`). See Open coverage.
+//!   (`RegisteredPeerCleanupGuard`). See Open coverage in the hdr-9 to
+//!   hdr-13 implementation plan.
 //! - Publisher tasks (hdr-9d.2): at most one runs per session, by
 //!   `PublisherStarted` and `PublisherEnded`, and a run that comes to rest
 //!   has none running whose session's token is cancelled, whatever
@@ -66,8 +67,12 @@
 //!   At most 2 of those, tombstones, unwritten terminal outcomes and
 //!   publication slots, since each holds a slot, and each subscription's
 //!   sent-cursor ring within 4,096. At a pass, at most 2 kept waits, every
-//!   one a subscription is stalled on, at most 8 node and 2 peer execution
-//!   slots, and at most 64 MiB of a peer's output. The node output bytes
+//!   one a subscription is stalled on. No fixture reaches `CapacityBusy`
+//!   to keep a wait, so zakura-network's
+//!   `the_owner_holds_a_capacity_signal_only_while_a_stall_waits` is what
+//!   catches a pass that skips the pruning (Open coverage). At most 8 node
+//!   and 2 peer execution slots, and at most 64 MiB of a peer's output.
+//!   The node output bytes
 //!   and the response slots are listed, not checked: their limits follow
 //!   the node's configured session count through the toolkit's sizing.
 //! - Serving peer budgets (hdr-9d.2): no size bound, since production has
@@ -109,7 +114,7 @@
 //!   `header-fault-penalized` owns a header fault's cooldown, in the wire
 //!   harness. `bounded-adversary-progress` owns a pause that never lifts
 //!   (hdr-13). An unproductive peer's strikes, hold and cooldown have no
-//!   owner; see Open coverage.
+//!   owner; see Open coverage in the hdr-9 to hdr-13 implementation plan.
 //! - Session handles and scheduling state: exactly the admitted peers.
 //! - Locator reads: every entry names a `Dispatched` locator call for its
 //!   peer with no `CallEnded`.
@@ -130,11 +135,11 @@
 //!   engine's headers above the anchor, and a check that took an unknown
 //!   target as known breaks.
 //!
-//! Three rows are listed and not checked: the pruned-peer map, whose cap
-//! waits on its fix (#2209), and the VCT repair requirement's source
-//! entries and its open context reads, since no fixture reaches a repair
-//! episode (#2180's repair harness on main may now reach one). Cooldowns
-//! are capped by #2131.
+//! Two rows are listed and not checked: the VCT repair requirement's source
+//! entries and its open context reads. No storage fixture reaches a repair
+//! episode, and `Sizes` reports the source sets only as one sum, so their
+//! per-set bound has no fact to judge. Cooldowns are capped by #2131, and
+//! the pruned-peer map by #2209, each at the admitted peer limit.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -976,8 +981,7 @@ impl Outstanding {
             supplier_order,
             departed_strikes,
             cooldowns,
-            // Listed, not checked: its cap waits on its fix.
-            pruned_peers: _,
+            pruned_peers,
             completed_targets,
             // Listed, not checked: no fixture reaches a repair episode.
             repair_sources: _,
@@ -1010,6 +1014,7 @@ impl Outstanding {
             ("supplier order", supplier_order.len(), limit),
             ("departed strikes", departed_strikes.len(), limit),
             ("cooldowns", cooldowns.len(), limit),
+            ("pruned peers", pruned_peers.len(), limit),
         ];
         for (row, size, bound) in bounds {
             self.peak(row, size);

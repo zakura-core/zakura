@@ -1337,6 +1337,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
             mirrors: vec![MirrorSpec {
                 chain: Chain::default(),
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             }],
             policy: Policy {
                 holds: vec![
@@ -1481,6 +1482,7 @@ fn locator_permits_wait_for_accepted_work() {
                         fork: Some(Fork { branch, len: 1 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 })
                 .collect(),
             policy: Policy {

@@ -70,6 +70,7 @@ impl FloodScenario {
         let at_tip = || MirrorSpec {
             chain: Chain::main(NODE_TIP),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         };
         let step = |peer: String, action| ControlStep {
             peer,
@@ -95,6 +96,7 @@ impl FloodScenario {
                 mirrors.push(MirrorSpec {
                     chain: Chain::main(NODE_TIP + 1),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 });
                 let locator = Select::nth(OpKind::Locator, 1);
                 holds.push(Hold {

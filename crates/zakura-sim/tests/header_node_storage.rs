@@ -79,7 +79,11 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Ports) {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// The worked example under `policy`: the node at A3, `mirror-0` dialing in

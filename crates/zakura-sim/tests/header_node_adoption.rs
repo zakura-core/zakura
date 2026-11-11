@@ -214,10 +214,12 @@ fn grow_witness() -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(3),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
             MirrorSpec {
                 chain: Chain::main(9),
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             },
         ],
         policy: Policy {
@@ -423,6 +425,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(5),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy::converging(),
         controls: Vec::new(),

@@ -71,6 +71,7 @@ fn scenario(controls: Vec<ControlStep>) -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(8),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         weights: Weights::default(),
         policy: Policy::converging(),
@@ -435,6 +436,7 @@ fn recovered_waits_for_other_links_to_settle() {
     scenario.mirrors.push(MirrorSpec {
         chain: Chain::main(5),
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     });
     for input in inputs(16, 256) {
         let run = run(&scenario, input);

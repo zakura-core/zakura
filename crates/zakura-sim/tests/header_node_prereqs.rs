@@ -315,6 +315,7 @@ fn a_control_step_waits_for_a_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::default(),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario
     };
@@ -333,6 +334,7 @@ fn a_continuation_counts_as_another_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::main(300),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario(
             Vec::new(),

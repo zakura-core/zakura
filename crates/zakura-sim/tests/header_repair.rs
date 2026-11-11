@@ -27,7 +27,7 @@ use zakura_chain::block;
 use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
 use zakura_sim::{
-    domain::header_sync::STALE_COMPLETION_INERT,
+    domain::header_sync::{COMMIT_ONLY_AUTHORIZED, STALE_COMPLETION_INERT},
     explore::{classify, ExploreOutcome},
     harness::{
         self,
@@ -474,6 +474,10 @@ fn regenerate_repair_seeds() {
              \n\
              [[witness]]\n\
              property = \"{STALE_COMPLETION_INERT}\"\n\
+             expect = \"holds\"\n\
+             \n\
+             [[witness]]\n\
+             property = \"{COMMIT_ONLY_AUTHORIZED}\"\n\
              expect = \"holds\"\n",
             harness = RepairHarness::NAME,
             generator = RepairHarness::GENERATOR,

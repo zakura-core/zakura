@@ -3,6 +3,9 @@
 //! repair, on `header-sync/repair`. On each committed repair input both
 //! properties apply and hold, and the repair's apply commits and leaves the
 //! engine's header generation unchanged, so it adds no header to the chain.
+//! The repair round opens under V1 and its mirror serves auxiliary records,
+//! so this is the end-to-end case for a V1 Open's credit, and the
+//! `v1-record-charged-twice` planted case breaks it there.
 #![cfg(zakura_sim)]
 
 use zakura_sim::{

@@ -535,6 +535,17 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
         ),
         (
             StorageScenario {
+                mirrors: vec![MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                    max_headers_per_response: Some(235),
+                }],
+                ..StorageScenario::default()
+            },
+            "a mirror's response limit is 235",
+        ),
+        (
+            StorageScenario {
                 controls: vec![step(
                     "node",
                     ControlAction::RepairStatus {

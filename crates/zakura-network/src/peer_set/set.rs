@@ -1453,7 +1453,7 @@ where
             peers,
             block.hash,
             self.block_gossip_fanout.window(block.size),
-            tokio::time::Instant::now() + self.block_gossip_fanout.delay(block.size),
+            tokio::time::Instant::now() + self.block_gossip_fanout.delay(),
         )
     }
 

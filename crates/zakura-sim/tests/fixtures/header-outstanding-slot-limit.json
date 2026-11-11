@@ -1,0 +1,145 @@
+{
+  "node": {
+    "main": 0,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 1,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 3,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 4,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 5,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 7,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 8,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 9,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 10,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 11,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 12,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 13,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 14,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 15,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 16,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 17,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "prepare"
+        },
+        "until": {
+          "virtual-time": 3000
+        },
+        "then": [
+          "engine"
+        ]
+      }
+    ]
+  },
+  "controls": []
+}

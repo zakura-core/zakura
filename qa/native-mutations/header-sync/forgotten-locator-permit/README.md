@@ -10,9 +10,12 @@ owner event stays clean.
 The witness is `the_probe_matches_the_accounting_through_close_relink_and_shutdown`
 in `crates/zakura-sim/tests/header_node_capacity.rs`. The node takes two
 locator reads before its shutdown, and the teardown read once its reactor
-is gone finds both permits still out. The reactor tap fails the run with
-`TeardownLocatorPermits: the stopped reactor is gone with 14 of 16 locator
-permits free, and storage holds 0`.
+is gone finds both permits still out.
+The reactor tap finds `TeardownLocatorPermits: the reactor is gone
+with 14 of 16 locator permits free, and storage holds 0`, which violates
+`header-sync/teardown-returns-baseline` at node settlement. It stays a native
+mutation, since no committed input can shut the node down until the storage
+grammar has a shutdown step.
 
 Run it from a clean checkout:
 
@@ -27,6 +30,6 @@ git apply -R qa/native-mutations/header-sync/forgotten-locator-permit/forgotten-
 ```
 
 Restore the patch even if the mutant fails unexpectedly. The baseline and
-restored runs must pass. Only the `TeardownLocatorPermits` harness failure counts as
-detection. A build error, a timeout, a panic or another property's failure
-doesn't.
+restored runs must pass. Only a `header-sync/teardown-returns-baseline`
+violation naming `TeardownLocatorPermits` counts as detection. A build error,
+a timeout, a panic, a harness failure or another property's failure doesn't.

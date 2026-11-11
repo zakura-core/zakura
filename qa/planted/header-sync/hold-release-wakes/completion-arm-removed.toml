@@ -1,0 +1,20 @@
+# The reactor's `select!` loses its completion arm, so a storage reply is
+# seen only by the drain at the top of a later turn. The input holds the
+# node's first locator read until a `Release` step, with one mirror ahead
+# of the node, so nothing else wakes the reactor once the read's reply is
+# delivered. It stays parked with the reply unhandled, and the obligation
+# expires at the next quiescence.
+# Besides reactor.rs, which the patch changes, the queue and the offer
+# policy decide when the locator read is dispatched, and the session
+# readers decide which events wake the reactor. A change there can move the
+# input off its quiet release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# A reactor that no longer wakes for a reply also never hands a departed
+# peer's target off, so a campaign input that draws a departure fixture
+# breaks `peer-retirement-progress`'s hand-off too.
+also_violates = ["header-sync/peer-retirement-progress"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.plan"

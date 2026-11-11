@@ -3,7 +3,7 @@
 //! Each history also folds through [`observe::HeaderWorkLedger`], so a test that
 //! pins one call's ownership also holds the ledger to the real event order.
 
-use observe::{HeaderWorkEnd, HeaderWorkLedger};
+use observe::{ClaimRule, HeaderWorkEnd, HeaderWorkLedger};
 
 use super::*;
 use crate::zakura::header_sync::scheduler::peer_work::{RetainedHeaders, StorageCall};
@@ -148,7 +148,20 @@ fn ledger_accepts(events: &[ReactorEvent]) -> HeaderWorkLedger {
             .observe(event)
             .unwrap_or_else(|broken| panic!("{broken}\n{events:#?}"));
     }
+    let claims = ledger.take_claims();
+    assert!(claims.is_empty(), "{claims:?}\n{events:#?}");
     ledger
+}
+
+/// Folds `events` through the ledger as a torn-down reactor's, runs its
+/// teardown check, and requires both clean, claim breaks included.
+fn ledger_settles(events: &[ReactorEvent]) {
+    let mut ledger = ledger_accepts(events);
+    ledger
+        .finish()
+        .unwrap_or_else(|broken| panic!("{broken}\n{events:#?}"));
+    let claims = ledger.take_claims();
+    assert!(claims.is_empty(), "{claims:?}\n{events:#?}");
 }
 
 /// A sealed prepare hands its headers to its apply: nothing releases between
@@ -210,9 +223,7 @@ async fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
     let applied = recorder.take_all();
     assert_eq!(ownership(&applied), vec![(2, Some(HeaderWorkEnd::Settled))]);
     let history: Vec<_> = handed.into_iter().chain(applied).collect();
-    ledger_accepts(&torn_down(reactor, &recorder, history))
-        .finish()
-        .expect("every call ended");
+    ledger_settles(&torn_down(reactor, &recorder, history));
 }
 
 /// A call from an earlier round cannot settle a later round with the same owner,
@@ -270,9 +281,7 @@ async fn an_earlier_rounds_prepare_cannot_settle_a_later_round_with_the_same_own
         ]
     );
     assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 0));
-    ledger_accepts(&torn_down(reactor, &recorder, events))
-        .finish()
-        .expect("every call ended");
+    ledger_settles(&torn_down(reactor, &recorder, events));
 }
 
 /// A prepare the reactor answers itself still ends the headers it held.
@@ -307,13 +316,20 @@ async fn a_prepare_that_storage_never_sees_ends_its_headers() {
         vec![(1, None), (1, Some(HeaderWorkEnd::PrepareFailed))]
     );
     // The oversized prepare isn't the round's own payload, which the ledger
-    // also catches.
+    // also claims.
     let mut ledger = HeaderWorkLedger::default();
-    let broken = events
-        .iter()
-        .find_map(|event| ledger.observe(event).err())
-        .expect("the ledger refuses the hand-built prepare");
-    assert!(broken.starts_with("WrongPayload"), "{broken}");
+    for event in &events {
+        ledger
+            .observe(event)
+            .expect("a claim break doesn't refuse the history");
+    }
+    let claims = ledger.take_claims();
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.rule == ClaimRule::WrongPayload),
+        "{claims:?}"
+    );
 }
 
 /// A panic before or after submission ends the call's headers as panicked.
@@ -341,9 +357,7 @@ async fn a_panicking_call_ends_its_headers() {
             "{panic:?}"
         );
         assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 0));
-        ledger_accepts(&torn_down(reactor, &recorder, events))
-            .finish()
-            .expect("every call ended");
+        ledger_settles(&torn_down(reactor, &recorder, events));
     }
 }
 
@@ -389,7 +403,7 @@ async fn teardown_ends_each_unfinished_call_and_its_headers() {
         )) < position(|event| matches!(event, ReactorEvent::HeadersEnded { .. })),
         "the call's end comes before anything its future holds drops"
     );
-    ledger_accepts(&events).finish().expect("every call ended");
+    ledger_settles(&events);
 }
 
 /// A completion with no committed snapshot to check it against has no authority.

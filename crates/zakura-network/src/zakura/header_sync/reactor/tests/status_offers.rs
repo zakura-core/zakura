@@ -609,6 +609,140 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
     assert!(!reactor.state.peers[&third].status_spent);
 }
 
+/// Records every event it's handed.
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<observe::ReactorEvent>>);
+
+impl observe::HeaderSyncObserver for Recorded {
+    fn observe(&self, event: observe::ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .push(event);
+    }
+}
+
+impl Recorded {
+    /// The `EventTaken` events recorded so far.
+    fn taken(&self) -> Vec<observe::ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .iter()
+            .filter(|event| matches!(event, observe::ReactorEvent::EventTaken { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// The `HeadroomWait` and `CachedPassDeferred` events recorded so far.
+    fn waits(&self) -> Vec<observe::ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    observe::ReactorEvent::HeadroomWait { .. }
+                        | observe::ReactorEvent::CachedPassDeferred { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// An offer held back with no header room left reports a `HeadroomWait`
+/// for its peer, session and target.
+#[test]
+fn a_held_back_offer_reports_its_headroom_wait() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 4000, 0);
+    let (waiting, _outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    let height = status.selected_tip_height;
+    reactor.handle_status(waiting.clone(), 0, status);
+    assert!(actions.try_recv().is_err(), "no room, so no locator read");
+    assert_eq!(
+        recorder.waits(),
+        [observe::ReactorEvent::HeadroomWait {
+            peer: waiting,
+            session_id: 0,
+            target_tip_hash: target,
+            target_height: height,
+        }]
+    );
+}
+
+/// A locator that finds no room to reserve reports a `HeadroomWait`.
+#[test]
+fn a_locator_with_no_room_reports_its_headroom_wait() {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 - 401),
+        block::Hash([0x40; 32]),
+    );
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let (waiting, _outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let mut status = status_for(&snapshot, target);
+    status.selected_tip_height = block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1);
+    reactor.handle_status(waiting.clone(), 0, status);
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 151, 250);
+    complete_locator(&mut reactor, &snapshot, &waiting, scope, target, true);
+    assert_eq!(
+        recorder.waits(),
+        [observe::ReactorEvent::HeadroomWait {
+            peer: waiting,
+            session_id: 0,
+            target_tip_hash: target,
+            target_height: block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1),
+        }]
+    );
+}
+
+/// A wanted cached-offer pass the pass budget refuses reports
+/// `CachedPassDeferred` with the time left to the budget's next refill, a
+/// whole interval just after a refill and less once part of it has passed.
+#[tokio::test(start_paused = true)]
+async fn a_refused_cached_pass_reports_its_refill() {
+    let (mut reactor, _actions, _snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.schedule_cached_statuses();
+    let elapsed = state::CACHED_PASS_REFILL / 4;
+    time::advance(elapsed).await;
+    reactor.schedule_cached_statuses();
+    assert_eq!(
+        recorder.waits(),
+        [
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL,
+            },
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL - elapsed,
+            },
+        ]
+    );
+}
+
 #[test]
 fn locator_losing_headroom_keeps_offer_for_body_progress() {
     let (mut reactor, mut actions, mut snapshot) = offers_reactor();
@@ -1609,6 +1743,360 @@ async fn a_slow_pass_earns_no_refill_while_it_runs() {
     assert!(!budget.try_take(end), "the scan time refilled nothing");
     assert_eq!(budget.next_refill(), end + CACHED_PASS_REFILL);
     assert!(budget.try_take(end + CACHED_PASS_REFILL));
+}
+
+/// The run loop reports each event it takes, from which queue, where in the
+/// turn, and how many are left. Three queued `Status` events go: the first
+/// at the turn's start with two left, so the queue is ready for the turn's
+/// `select!`, which takes the second with one left, and the next turn's
+/// start takes the last.
+#[tokio::test]
+async fn the_run_loop_reports_each_event_it_takes() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (_snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    for byte in 1..=3 {
+        handle
+            .try_send(Event::Status {
+                peer: peer.clone(),
+                session_id: 0,
+                status: status_for(&snapshot, block::Hash([byte; 32])),
+            })
+            .expect("the events queue has room");
+    }
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let taken = |point, queued| observe::ReactorEvent::EventTaken {
+        queue: observe::EventQueue::Wire,
+        point,
+        queued,
+    };
+    assert_eq!(
+        recorder.taken(),
+        [
+            taken(observe::TakePoint::TurnStart, 2),
+            taken(observe::TakePoint::Select, 1),
+            taken(observe::TakePoint::TurnStart, 0),
+        ]
+    );
+}
+
+/// Runs a reactor whose committed watch starts at a snapshot, and publishes
+/// the next state version on it before the run loop starts if `early`, or
+/// once the loop waits in its `select!` otherwise. Returns the
+/// `WatchObserved` events it reported and the new version.
+async fn watch_reads(
+    early: bool,
+) -> (
+    Vec<observe::ReactorEvent>,
+    zakura_header_chain::StateVersion,
+) {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let mut next = snapshot;
+    next.state_version = next.state_version.checked_next().unwrap();
+    if early {
+        snapshots.send_replace(Some(next.clone()));
+    }
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    if !early {
+        snapshots.send_replace(Some(next.clone()));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let reads = recorder
+        .0
+        .lock()
+        .expect("no test panics holding it")
+        .iter()
+        .filter(|event| matches!(event, observe::ReactorEvent::WatchObserved { .. }))
+        .cloned()
+        .collect();
+    (reads, next.state_version)
+}
+
+/// A snapshot published before the run loop starts is read by the first
+/// turn's watch check, which reports it once.
+#[tokio::test]
+async fn the_turn_start_watch_check_reports_its_read() {
+    let (reads, version) = watch_reads(true).await;
+    assert_eq!(
+        reads,
+        [observe::ReactorEvent::WatchObserved {
+            state_version: version
+        }]
+    );
+}
+
+/// A snapshot published while the run loop waits in its `select!` is read
+/// by the committed watch's arm, which reports it once.
+#[tokio::test]
+async fn the_select_watch_arm_reports_its_read() {
+    let (reads, version) = watch_reads(false).await;
+    assert_eq!(
+        reads,
+        [observe::ReactorEvent::WatchObserved {
+            state_version: version
+        }]
+    );
+}
+
+/// One step of a flooded run, in the order the run loop took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloodStep {
+    /// The loop took a wire event. `budget_spent` says the task's Tokio
+    /// cooperative budget was used up once it had.
+    Taken { budget_spent: bool },
+    /// The test changed the watch.
+    Published,
+    /// The loop started handling a watch read.
+    Read,
+}
+
+/// The watch a flooded run changes.
+#[derive(Clone, Copy, Debug)]
+enum FloodedWatch {
+    CommittedSnapshots,
+    VctRootRepairs,
+}
+
+/// Keeps the wire queue full from inside the run loop, and changes a watch
+/// at the first wire take of about half the turns, until `left` runs out.
+/// Running inside the loop's own task lets it see that task's cooperative
+/// budget.
+///
+/// Which turns change the watch decides where in a turn the budget runs out.
+/// A turn spends one unit on its `select!` take, and without the fix one
+/// more when its probe reads a change. A fixed pattern can keep the budget
+/// running out at the same point: changing the watch every turn spends two
+/// units a turn, so Tokio's even budget always runs out on the read itself.
+/// A hashed bit per turn (Fibonacci hashing) makes it run out at every
+/// point, with or without the fix.
+struct FloodPublisher {
+    steps: std::sync::Mutex<Vec<FloodStep>>,
+    turns: std::sync::atomic::AtomicU64,
+    left: std::sync::atomic::AtomicUsize,
+    refill: Box<dyn Fn() + Send + Sync>,
+    publish: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for FloodPublisher {
+    /// Names the publisher, since its closures have no `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FloodPublisher")
+    }
+}
+
+impl observe::HeaderSyncObserver for FloodPublisher {
+    /// Records wire takes and watch reads. While publications are left, it
+    /// replaces each taken event, and changes the watch at a turn's first
+    /// take when the turn's hashed bit is clear.
+    fn observe(&self, event: observe::ReactorEvent) {
+        use std::sync::atomic::Ordering;
+        let mut steps = self.steps.lock().expect("no test panics holding it");
+        match event {
+            observe::ReactorEvent::EventTaken {
+                queue: observe::EventQueue::Wire,
+                point,
+                ..
+            } => {
+                steps.push(FloodStep::Taken {
+                    budget_spent: !zakura_rt::task::coop::has_budget_remaining(),
+                });
+                if self.left.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+                (self.refill)();
+                if point != observe::TakePoint::TurnStart {
+                    return;
+                }
+                let turn = self.turns.fetch_add(1, Ordering::Relaxed);
+                if (turn.wrapping_mul(2_654_435_761) >> 16) & 1 == 0 {
+                    self.left.fetch_sub(1, Ordering::Relaxed);
+                    (self.publish)();
+                    steps.push(FloodStep::Published);
+                }
+            }
+            observe::ReactorEvent::CauseSet {
+                cause: observe::ReactorCause::Watch,
+            } => steps.push(FloodStep::Read),
+            _ => {}
+        }
+    }
+}
+
+/// Runs a reactor on the test's Tokio runtime with its wire queue kept full
+/// until [`FloodPublisher`] has changed `watched` `publications` times and
+/// the loop has read the last change, and returns the steps in order.
+async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<FloodStep> {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let (repairs, repairs_rx) = watch::channel(Default::default());
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    let status = status_for(&snapshot, block::Hash([1; 32]));
+    let message = move || Event::Status {
+        peer: peer.clone(),
+        session_id: 0,
+        status: status.clone(),
+    };
+    while handle.try_send(message()).is_ok() {}
+    let refill = Box::new(move || {
+        let _ = handle.try_send(message());
+    });
+    let publish: Box<dyn Fn() + Send + Sync> = match watched {
+        FloodedWatch::CommittedSnapshots => Box::new(move || {
+            snapshots.send_modify(|snapshot| {
+                let snapshot = snapshot.as_mut().expect("the test publishes a snapshot");
+                snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+            });
+        }),
+        FloodedWatch::VctRootRepairs => {
+            Box::new(move || repairs.send_modify(|status| status.generation += 1))
+        }
+    };
+    let publisher = Arc::new(FloodPublisher {
+        steps: Default::default(),
+        turns: Default::default(),
+        left: publications.into(),
+        refill,
+        publish,
+    });
+    reactor.startup.observer.0 = Some(publisher.clone());
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..100_000 {
+        if publisher.left.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && every_change_read(&publisher.steps.lock().expect("no test panics holding it"))
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let steps = publisher
+        .steps
+        .lock()
+        .expect("no test panics holding it")
+        .clone();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| **step == FloodStep::Published)
+            .count(),
+        publications,
+        "every publication ran before shutdown"
+    );
+    assert!(every_change_read(&steps), "the last change was read");
+    assert!(
+        spent_with_a_change_unread(&steps),
+        "the flood used up the loop's cooperative budget with a change unread"
+    );
+    steps
+}
+
+/// Whether a watch read follows the last watch change.
+fn every_change_read(steps: &[FloodStep]) -> bool {
+    steps
+        .iter()
+        .rev()
+        .find(|step| matches!(step, FloodStep::Published | FloodStep::Read))
+        .is_none_or(|step| *step == FloodStep::Read)
+}
+
+/// Whether the budget ran out on a wire take that came after some watch
+/// change and before its read, which is when a budgeted probe would miss it.
+fn spent_with_a_change_unread(steps: &[FloodStep]) -> bool {
+    let mut unread = false;
+    steps.iter().any(|step| {
+        match step {
+            FloodStep::Published => unread = true,
+            FloodStep::Read => unread = false,
+            FloodStep::Taken { budget_spent } => return unread && *budget_spent,
+        }
+        false
+    })
+}
+
+/// The most wire events the loop took after any watch change and before its
+/// next watch read.
+fn most_taken_before_a_read(steps: &[FloodStep]) -> usize {
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| **step == FloodStep::Published)
+        .map(|(at, _)| {
+            steps[at + 1..]
+                .iter()
+                .take_while(|step| **step != FloodStep::Read)
+                .filter(|step| matches!(step, FloodStep::Taken { .. }))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A flooded wire queue spends the run loop's Tokio cooperative budget, and
+/// a spent budget makes a watch's `changed` report pending. The loop must
+/// still read a committed snapshot within two wire events of its change,
+/// as each turn's start checks the watch, takes one event, and its
+/// `select!` takes one more. The simulator polls with no Tokio budget, so
+/// only these native tests guard the turn start's budget-free probes.
+#[tokio::test]
+async fn a_spent_budget_hides_no_snapshot() {
+    let steps = flooded_watch_steps(FloodedWatch::CommittedSnapshots, 1_000).await;
+    let most = most_taken_before_a_read(&steps);
+    assert!(most <= 2, "a change waited through {most} wire events");
+}
+
+/// The same bound for the VCT root repair watch, which the turn start also
+/// checks.
+#[tokio::test]
+async fn a_spent_budget_hides_no_repair_status() {
+    let steps = flooded_watch_steps(FloodedWatch::VctRootRepairs, 1_000).await;
+    let most = most_taken_before_a_read(&steps);
+    assert!(most <= 2, "a change waited through {most} wire events");
 }
 
 /// A continuously ready Status queue cannot hide the snapshot that releases a resource stall.

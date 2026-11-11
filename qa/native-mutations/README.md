@@ -3,13 +3,21 @@
 Each patch here plants a bug that a named test detects outside the planted
 runner. The README beside each patch names that test and how to run it.
 
-`cargo xtask planted` reads a case file and a committed fuzz input for every
-patch under `qa/planted`. These patches have neither, so they live here.
+`cargo xtask planted` reads a case file for every patch under `qa/planted`,
+and the case file names either a committed fuzz input or a typed case: a
+committed scenario and the Plan bytes it runs under, for a scenario the fuzz
+grammar can't encode. These patches have no case file, so they live here.
 
 `cases.json` maps every patch to its package, exact test selector, source,
 and intended assertion. Most cases use library tests. The handoff case uses
 the `zakura-sim` integration test named in its `test_target` field and needs
 `RUSTFLAGS="--cfg zakura_sim"`.
+
+The mutation loop's patches live in `<entry>/<name>/`, one directory per
+patch, where `<entry>` is a `work-list.toml` entry. A generator writes them
+from `PROMPT.md`. Their `cases.json` entries name a property and its witness
+instead of a native test. `cargo xtask planted loop` runs them on the remote
+host. `python3 scripts/mutation_inventory.py --loop` checks them.
 
 Run `python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"`
 from the repository root to check patch application and binding metadata.

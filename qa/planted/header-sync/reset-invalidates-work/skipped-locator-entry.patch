@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-header-chain/src/discovery/mod.rs b/crates/zakura-header-chain/src/discovery/mod.rs
+index cdaecbeffd..fae284b591 100644
+--- a/crates/zakura-header-chain/src/discovery/mod.rs
++++ b/crates/zakura-header-chain/src/discovery/mod.rs
+@@ -579,7 +579,9 @@ impl HeaderLocator {
+                 ))?;
+         let mut entries: Vec<Frontier> = Vec::with_capacity(MAX_HEADER_LOCATOR_HASHES);
+         for offset in SELECTED_PATH_OFFSETS {
+-            if offset > distance {
++            // Mutation: the entry one below the tip is left out, so the
++            // locator skips a header of the selected path.
++            if offset > distance || offset == 1 {
+                 continue;
+             }
+             let height = block::Height(tip.height.0 - offset);

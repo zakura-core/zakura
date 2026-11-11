@@ -8,48 +8,21 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::inputs;
+use support::{inputs, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
-        header_node::{
-            policy::{OpKind, ReplyHold, Select, Trigger},
-            Chain, Policy,
-        },
-        header_sync::{grammar, Dialer, MirrorSpec, Storage, StorageScenario},
+        header_node::policy::{OpKind, Select},
+        header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
     observe::{ReactorFact, StorageFact, StorageRequest},
     MemorySink, Observation, PlanInput, RunReport,
 };
 
-/// The node at genesis syncing from `mirror-0` at A5 and serving
-/// `mirror-1`, which starts at genesis too. The first apply's reply is held
-/// until the node has served `mirror-1` its first page, which the node can
-/// do only from the committed headers.
+/// [`storage_witnesses::reply_hold`].
 fn scenario() -> StorageScenario {
-    StorageScenario {
-        node: Chain::default(),
-        mirrors: vec![
-            MirrorSpec {
-                chain: Chain::main(5),
-                dialer: Dialer::Mirror,
-            },
-            MirrorSpec {
-                chain: Chain::default(),
-                dialer: Dialer::Node,
-            },
-        ],
-        policy: Policy {
-            reply_holds: vec![ReplyHold {
-                select: Select::nth(OpKind::Apply, 1),
-                until: Trigger::Completed(Select::nth(OpKind::Read, 1)),
-            }],
-            ..Policy::converging()
-        },
-        controls: Vec::new(),
-        weights: Default::default(),
-    }
+    storage_witnesses::reply_hold()
 }
 
 /// Runs [`scenario`] under `input`, which must end without a violation or
@@ -238,11 +211,10 @@ fn a_reply_hold_of_another_kind_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 has no reply hold, so it can't encode one.
+/// Generator 3 encodes a reply hold, so the scenario round-trips through
+/// its canonical prefix.
 #[test]
-fn the_grammar_cant_encode_a_reply_hold() {
-    assert!(grammar::encode(&scenario()).is_err());
-    let mut plain = scenario();
-    plain.policy.reply_holds.clear();
-    assert!(grammar::encode(&plain).is_ok());
+fn the_grammar_encodes_a_reply_hold() {
+    let prefix = grammar::encode(&scenario()).unwrap();
+    assert_eq!(grammar::decode(&prefix).unwrap(), scenario());
 }

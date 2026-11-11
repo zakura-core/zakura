@@ -80,7 +80,7 @@ use crate::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, frame_cap_carries_payload, spawn_block_sync_reactor,
+        admission_host, canonical_ip, frame_cap_carries_payload, spawn_block_sync_reactor,
         spawn_header_sync_reactor, supported_p2p_v2_alpns, zakura_protocol_for_alpn,
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
@@ -98,6 +98,11 @@ use crate::{
         ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
+
+// A legacy upgrade hand-off dials at most `MAX_IROH_DIRECT_ADDRESSES`, so the
+// QUIC dial reserve that fits one discovery record fits one hand-off too (see
+// `ZakuraLocalLimits::quic_bind_config`).
+const _: () = assert!(super::MAX_IROH_DIRECT_ADDRESSES <= discovery::MAX_DIRECT_ADDRS_PER_RECORD);
 
 /// Default total Zakura connections when P2P v2 is enabled: 92, the count
 /// the previous 8 GiB budget admitted at the default windows. The default peer
@@ -328,6 +333,9 @@ pub struct ZakuraConfig {
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
     ///
+    /// Inbound peers leave a quarter of it, rounded down but at least one
+    /// slot once it is 2 or more, free for this node's dials (see
+    /// [`ZakuraLocalLimits::max_inbound_connections`]).
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
     pub max_connections: usize,
@@ -352,12 +360,20 @@ pub struct ZakuraConfig {
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
+    /// A global unicast IPv6 source counts by its /64, since one host can hold
+    /// every address in it. Other sources count by their exact address, after
+    /// IPv4 transition encodings fold to the IPv4 address.
+    ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
     /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
-    /// stricter per-IP default. Global caps and outbound peer diversity remain
-    /// the primary eclipse-resistance controls.
+    /// stricter per-IP default. The outbound share of
+    /// [`max_connections`](Self::max_connections) remains the primary
+    /// eclipse-resistance control.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Inbound handshakes leave the same reserve free as
+    /// [`max_connections`](Self::max_connections).
     ///
     /// Also the QUIC connections that
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
@@ -373,6 +389,8 @@ pub struct ZakuraConfig {
     /// the production trace schema and the legacy sync pipeline writes `legacy_sync.jsonl` into
     /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
+    /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
+    /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
@@ -815,23 +833,73 @@ impl ZakuraLocalLimits {
     /// Returns the QUIC bind settings for `addrs` under these limits.
     ///
     /// The transport holds the admitted connections plus
-    /// `max_pending_handshakes` more live ones, half of those (rounded up, so
-    /// at least one) kept for dials, and two closing connections per live slot
-    /// (see `peer_memory`).
+    /// `max_pending_handshakes` more live ones, and two closing connections
+    /// per live slot (see `peer_memory`). Inbound attempts may hold
+    /// [`Self::max_inbound_connections`] plus [`Self::max_inbound_handshakes`]
+    /// of the live slots (93 at the defaults), counted until each connection
+    /// closes, so a peer that this node closes right after its TLS handshake
+    /// still counts until the close finishes.
+    ///
+    /// The dial reserve fits one maintained dial of a full address record
+    /// ([`discovery::MAX_DIRECT_ADDRS_PER_RECORD`]), within the slots inbound can't
+    /// hold: 8 at the defaults. Discovery stops at the reserve, so with
+    /// inbound full it keeps the slots between the two. That's the whole
+    /// outbound share (23 at the defaults) whenever the handshake reserve is
+    /// at least the address cap, which holds from 32 pending handshakes up.
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
         let max_connections = self
             .max_connections
             .saturating_add(self.max_pending_handshakes);
+        let max_inbound_connections = self
+            .max_inbound_connections()
+            .saturating_add(self.max_inbound_handshakes());
+        let outbound_slots = max_connections.saturating_sub(max_inbound_connections);
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
             max_connections,
-            dial_reserve: self.max_pending_handshakes.div_ceil(2),
+            dial_reserve: outbound_slots.clamp(1, discovery::MAX_DIRECT_ADDRS_PER_RECORD),
+            max_inbound_connections: Some(max_inbound_connections),
             max_closing_connections: max_connections
                 .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }
     }
+
+    /// Connections inbound peers may hold at once: `max_connections` less the
+    /// outbound reserve (69 of the default 92). See
+    /// [`without_outbound_reserve`] for the reserve's size.
+    ///
+    /// Peers that dial this node can't take the slots its own dials need, so
+    /// they can't crowd out the peers it chose. Dials may still use any free
+    /// slot, inbound's share included.
+    pub fn max_inbound_connections(&self) -> usize {
+        without_outbound_reserve(self.max_connections)
+    }
+
+    /// Control handshakes inbound peers may run at once:
+    /// `max_pending_handshakes` less the same outbound reserve (24 of the
+    /// default 32), as [`Self::max_inbound_connections`] explains.
+    pub fn max_inbound_handshakes(&self) -> usize {
+        without_outbound_reserve(self.max_pending_handshakes)
+    }
 }
+
+/// One cap's share left to inbound peers after reserving a quarter of it,
+/// rounded down, for this node's dials. Any cap of 2 or more reserves at least
+/// one slot, so small caps still leave dials room. A cap of 1 stays inbound's,
+/// since a node that accepts nothing can't be reached.
+fn without_outbound_reserve(cap: usize) -> usize {
+    let reserve = if cap >= 2 {
+        (cap / OUTBOUND_RESERVE_DIVISOR).max(1)
+    } else {
+        0
+    };
+    cap - reserve
+}
+
+/// Inbound peers leave `1 / OUTBOUND_RESERVE_DIVISOR` of the connection and
+/// control-handshake caps to outbound work.
+const OUTBOUND_RESERVE_DIVISOR: usize = 4;
 
 /// Per-connection limits after negotiation and clamping.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1387,6 +1455,7 @@ pub struct ZakuraSupervisorHandle {
 
 /// Connections charged to each source IP: registered connections, and inbound
 /// connections still in their control handshake (zakura-quic ADM-3 rule 2).
+/// Each count is keyed by [`admission_host`], so an IPv6 /64 is one IP here.
 ///
 /// A std mutex guards the counts, so the QUIC acceptor, which must not block,
 /// reads them without the supervisor's async lock (zakura-quic ADM-4).
@@ -1564,7 +1633,9 @@ struct ZakuraPeerConnectionEntry {
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
     registered_at: Instant,
-    remote_ip: Option<IpAddr>,
+    /// The [`admission_host`] this connection is charged to, if its IP is
+    /// known.
+    host: Option<IpAddr>,
 }
 
 impl ZakuraSupervisorState {
@@ -1586,7 +1657,7 @@ impl ZakuraSupervisorState {
             self.ip_slots.registered_total(),
             self.active_by_peer
                 .values()
-                .filter(|entry| entry.remote_ip.is_some())
+                .filter(|entry| entry.host.is_some())
                 .count(),
             "Zakura per-IP registered totals must match active peer registrations with known IPs",
         );
@@ -1778,7 +1849,7 @@ impl ZakuraSupervisorHandle {
         max_handshakes_per_ip: usize,
         validated: bool,
     ) -> IpAdmission {
-        let ip = canonical_ip(remote_ip);
+        let ip = admission_host(remote_ip);
         let registered = self.ip_slots.registered(ip);
         let in_flight = self.ip_slots.handshaking(ip).saturating_add(pending);
         if in_flight >= max_handshakes_per_ip {
@@ -1811,7 +1882,7 @@ impl ZakuraSupervisorHandle {
     /// Counts an inbound control handshake against `remote_ip` until the guard
     /// drops at registration (zakura-quic ADM-3 rule 2).
     fn enter_control_handshake(&self, remote_ip: IpAddr) -> ControlHandshakeGuard {
-        self.ip_slots.enter_handshake(canonical_ip(remote_ip))
+        self.ip_slots.enter_handshake(admission_host(remote_ip))
     }
 
     /// Returns the currently registered authenticated Zakura peer ids.
@@ -1947,7 +2018,10 @@ impl ZakuraSupervisorHandle {
         disconnect_token: CancellationToken,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
+        // Discovery matches the registered IP against advertised addresses,
+        // so it keeps the address itself. Only accounting uses the host.
         let remote_ip = remote_ip.map(canonical_ip);
+        let host = remote_ip.map(admission_host);
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
@@ -1960,10 +2034,10 @@ impl ZakuraSupervisorHandle {
         let same_ip_duplicate_redial = state
             .active_by_peer
             .get(&peer_id)
-            .is_some_and(|entry| entry.remote_ip == remote_ip);
-        if let Some(remote_ip) = remote_ip {
+            .is_some_and(|entry| entry.host == host);
+        if let Some(host) = host {
             if !same_ip_duplicate_redial
-                && state.ip_slots.registered(remote_ip) >= state.max_connections_per_ip
+                && state.ip_slots.registered(host) >= state.max_connections_per_ip
             {
                 metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
                 return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
@@ -1990,14 +2064,14 @@ impl ZakuraSupervisorHandle {
                     outbound_handle,
                     disconnect_token,
                     registered_at: Instant::now(),
-                    remote_ip,
+                    host,
                 };
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
-                    state.decrement_ip(old_entry.remote_ip);
+                    state.decrement_ip(old_entry.host);
                     old_entry.disconnect_token.cancel();
                     metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
-                state.increment_ip(remote_ip);
+                state.increment_ip(host);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
@@ -2071,7 +2145,7 @@ impl ZakuraSupervisorHandle {
             .active_by_peer
             .remove(peer_id)
             .expect("peer entry exists because it was just checked");
-        state.decrement_ip(entry.remote_ip);
+        state.decrement_ip(entry.host);
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
@@ -2102,7 +2176,7 @@ impl ZakuraSupervisorHandle {
         in_flight_count: usize,
     ) -> bool {
         self.ip_slots
-            .registered(canonical_ip(remote_ip))
+            .registered(admission_host(remote_ip))
             .saturating_add(in_flight_count)
             < self.max_connections_per_ip
     }
@@ -2809,8 +2883,15 @@ pub struct ZakuraProtocolHandler {
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
     next_stream_id: Arc<AtomicU64>,
+    /// Every established or handshaking connection, in either direction.
     admission: Arc<Semaphore>,
+    /// Inbound connections, which also hold an `admission` permit.
+    inbound_admission: Arc<Semaphore>,
+    /// Control handshakes in either direction.
     pending_handshakes: Arc<Semaphore>,
+    /// Inbound control handshakes, which also hold a `pending_handshakes`
+    /// permit.
+    inbound_handshakes: Arc<Semaphore>,
     /// Node-wide owners of raw frames, unfunded output, and request workers.
     resources: NodeResources,
     shutdown: CancellationToken,
@@ -2921,7 +3002,9 @@ impl ZakuraProtocolHandler {
             // and late completions from colliding after a node restart.
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
+            inbound_admission: Arc::new(Semaphore::new(limits.max_inbound_connections())),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            inbound_handshakes: Arc::new(Semaphore::new(limits.max_inbound_handshakes())),
             resources,
             shutdown: CancellationToken::new(),
             limits,
@@ -2968,6 +3051,7 @@ impl ZakuraProtocolHandler {
             super::TransportEvent::Registered {
                 conn_id,
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
             }
         );
     }
@@ -2980,6 +3064,7 @@ impl ZakuraProtocolHandler {
             self.transport_observer,
             super::TransportEvent::HandshakeRefused {
                 remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
                 reason: reason.to_string(),
             }
         );
@@ -3051,8 +3136,10 @@ impl ZakuraProtocolHandler {
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
     fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
+        let inbound = self.inbound_admission.clone().try_acquire_owned().ok()?;
         let admission = self.admission.clone().try_acquire_owned().ok()?;
         Some(InboundClaim {
+            _inbound: inbound,
             _admission: admission,
             control_handshake: self
                 .supervisor
@@ -3063,6 +3150,7 @@ impl ZakuraProtocolHandler {
     async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
         let conn_id = trace_conn_id(&connection);
         let Some(InboundClaim {
+            _inbound,
             _admission,
             control_handshake,
         }) = claim
@@ -3165,7 +3253,18 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
+        // The shared permit is taken only once the inbound one is held, so a
+        // refused inbound handshake never holds a slot a dial needs.
+        let permits = self
+            .inbound_handshakes
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .and_then(|inbound| {
+                let shared = self.pending_handshakes.clone().try_acquire_owned().ok()?;
+                Some((inbound, shared))
+            });
+        let Some(_handshake) = permits else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
                 "rejected.admission",
@@ -3291,6 +3390,10 @@ impl ZakuraProtocolHandler {
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
         self.resources.report_usage(limits_owner_bound);
+        #[cfg(zakura_sim)]
+        if let Some(observer) = &self.transport_observer {
+            observer.connection(conn_id, connection_resources.probe(connection.load_probe()));
+        }
         // Set once, for the kinds this connection negotiated (zakura-quic
         // API-9). The handshake window stays inside it for the control stream.
         let _ = connection.set_limits(
@@ -4456,9 +4559,9 @@ enum IpAdmission {
 }
 
 impl Acceptor for ZakuraProtocolHandler {
-    /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap before
-    /// any handshake work. The endpoint applies rules 3 and 5 itself, and
-    /// Zakura has no native IP ban list for rule 1.
+    /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap, each
+    /// within inbound's share, before any handshake work. The endpoint applies
+    /// rules 3 and 5 itself, and Zakura has no native IP ban list for rule 1.
     fn admit(&self, incoming: &IncomingInfo) -> Admit {
         if self.shutdown.is_cancelled() {
             return Admit::Ignore;
@@ -4481,12 +4584,22 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
             return Admit::Refuse;
         }
+        // Every pending transport handshake is inbound, so it counts against
+        // both the inbound share and the whole handshake budget.
         let control_handshakes = self
             .limits
             .max_pending_handshakes
             .saturating_sub(self.pending_handshakes.available_permits());
+        let inbound_control_handshakes = self
+            .limits
+            .max_inbound_handshakes()
+            .saturating_sub(self.inbound_handshakes.available_permits());
         if incoming.pending_total.saturating_add(control_handshakes)
             >= self.limits.max_pending_handshakes
+            || incoming
+                .pending_total
+                .saturating_add(inbound_control_handshakes)
+                >= self.limits.max_inbound_handshakes()
         {
             // As above: spoofed Initials could fill the budget, so an
             // unvalidated source gets a Retry instead of a refusal.
@@ -4497,7 +4610,9 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
-        if self.admission.available_permits() == 0 {
+        if self.admission.available_permits() == 0
+            || self.inbound_admission.available_permits() == 0
+        {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
@@ -4506,6 +4621,12 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn alpns(&self) -> Vec<Vec<u8>> {
         supported_p2p_v2_alpns()
+    }
+
+    /// Counts pending handshakes by [`admission_host`], the key every per-IP
+    /// count here uses, so one IPv6 /64 gets one share of the budget.
+    fn pending_group(&self, ip: IpAddr) -> IpAddr {
+        admission_host(ip)
     }
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
@@ -4518,6 +4639,9 @@ impl Acceptor for ZakuraProtocolHandler {
 /// An inbound connection's share of the connection cap and its per-IP control
 /// handshake slot, held from `Acceptor::handle` on.
 struct InboundClaim {
+    /// A slot within the inbound share (see
+    /// [`ZakuraLocalLimits::max_inbound_connections`]).
+    _inbound: OwnedSemaphorePermit,
     _admission: OwnedSemaphorePermit,
     control_handshake: ControlHandshakeGuard,
 }
@@ -4882,6 +5006,7 @@ async fn spawn_zakura_endpoint_inner(
             .clone()
             .for_node_connections(limits.max_connections),
         limits.max_frame_bytes,
+        limits.max_connections,
     );
     let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
     startup.fatal_events = Some(header_sync_fatal_tx);
@@ -4973,10 +5098,13 @@ async fn spawn_zakura_endpoint_inner(
             registry_streams(&registry),
             limits.max_frame_bytes,
         )?;
-        let quic = QuicEndpoint::bind(
-            secret_key,
-            &limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr)),
-            &limits.quic,
+        let bind = limits.quic_bind_config(native_bind_addrs(config.zakura.listen_addr));
+        let quic = QuicEndpoint::bind(secret_key, &bind, &limits.quic)?;
+        super::discovery::check_bootstrap_dials_fit(
+            &config.zakura.bootstrap_peers,
+            local_node_id,
+            bind.dial_reserve,
+            |node_addr| quic.dial_attempt_count(node_addr),
         )?;
         Ok((registry, quic))
     });
@@ -8646,7 +8774,7 @@ mod tests {
                 .get(&peer)
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
-            assert_eq!(entry.remote_ip, Some(remote_ip));
+            assert_eq!(entry.host, Some(remote_ip));
             assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }
@@ -9069,6 +9197,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         startup.shutdown = shutdown;
         startup
@@ -9270,6 +9399,50 @@ mod tests {
         })
         .await
         .expect("the reactor shares fund every native frame");
+        drop(endpoint);
+    }
+
+    /// Startup refuses a bootstrap identity whose dial would need more slots
+    /// than the dial reserve (8 at the defaults), counting only the
+    /// addresses the bound endpoint would dial.
+    #[tokio::test]
+    async fn startup_refuses_a_bootstrap_dial_wider_than_the_reserve() {
+        let _guard = zakura_test::init();
+        let remote = NodeSecretKey::generate().public();
+        let config_with = |addrs: &[String]| {
+            let mut config = Config::for_test(P2pStack::Zakura);
+            config.zakura.bootstrap_peers = addrs
+                .iter()
+                .map(|addr| format!("{remote}@{addr}"))
+                .collect();
+            config
+        };
+        let v4 = |port: u16| format!("127.0.0.1:{port}");
+        let mapped = |port: u16| format!("[::ffff:127.0.0.1]:{port}");
+        let spawn = |config: Config| async move {
+            spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+                Arc::new(NoopService) as Arc<dyn Service>
+            })
+            .await
+        };
+
+        let nine = (8233..8242).map(v4).collect::<Vec<_>>();
+        let error = spawn(config_with(&nine))
+            .await
+            .expect_err("a nine-address dial can't fit the eight-slot reserve");
+        assert!(
+            error.to_string().contains("zakura.bootstrap_peers"),
+            "unexpected error: {error}",
+        );
+
+        // Sixteen configured addresses, but the mapped ones fold into their
+        // IPv4 forms, so the dial makes eight attempts.
+        let folded = (8233..8241)
+            .flat_map(|port| [v4(port), mapped(port)])
+            .collect::<Vec<_>>();
+        let endpoint = spawn(config_with(&folded))
+            .await
+            .expect("eight attempts fit the reserve");
         drop(endpoint);
     }
 
@@ -13750,6 +13923,356 @@ mod tests {
                     Admit::Accept
                 );
             }
+        }
+    }
+
+    async fn register_test_peer_from(
+        supervisor: &ZakuraSupervisorHandle,
+        peer: &ZakuraPeerId,
+        ip: &str,
+        token: CancellationToken,
+    ) -> ZakuraRegistration {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        supervisor
+            .register(
+                test_conn_id(),
+                peer.clone(),
+                Some(ip.parse().expect("test ip parses")),
+                [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
+                token,
+                ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await
+    }
+
+    /// #645: every address in a global IPv6 /64 shares one per-IP cap, so a
+    /// host that holds a /64 can't fill the node by using a fresh address per
+    /// identity. Another /64 and unique-local addresses keep their own caps.
+    #[tokio::test]
+    async fn ipv6_slash_64_shares_one_per_ip_cap() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let register = |byte: u8, ip: &'static str| {
+            let supervisor = supervisor.clone();
+            async move {
+                register_test_peer_from(&supervisor, &test_peer(byte), ip, CancellationToken::new())
+                    .await
+            }
+        };
+        assert!(matches!(
+            register(1, "2001:db8:a:b::1").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        assert!(matches!(
+            register(2, "2001:db8:a:b::2").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        assert!(matches!(
+            register(3, "2001:db8:a:b:ffff:ffff:ffff:3").await,
+            ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
+        ));
+        let full_slash_64 = "2001:db8:a:b::99".parse().expect("test ip parses");
+        assert!(!supervisor.can_accept_remote_ip_with_in_flight(full_slash_64, 0));
+
+        let other_slash_64 = "2001:db8:a:c::1".parse().expect("test ip parses");
+        assert!(supervisor.can_accept_remote_ip_with_in_flight(other_slash_64, 1));
+        assert!(!supervisor.can_accept_remote_ip_with_in_flight(other_slash_64, 2));
+        assert!(matches!(
+            register(4, "2001:db8:a:c::1").await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        for (byte, unique_local) in [(5, "fd00::1"), (6, "fd00::2"), (7, "fd00::3")] {
+            assert!(
+                matches!(
+                    register(byte, unique_local).await,
+                    ZakuraRegistration::Registered { .. }
+                ),
+                "{unique_local} has its own cap",
+            );
+        }
+    }
+
+    /// Registration charges the /64, but reports the peer's own address,
+    /// which discovery matches exactly against the addresses the peer
+    /// advertises.
+    #[tokio::test]
+    async fn registration_reports_the_address_not_its_slash_64() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let registration = register_test_peer_from(
+            &supervisor,
+            &test_peer(1),
+            "2001:db8:a:b::7",
+            CancellationToken::new(),
+        )
+        .await;
+        let ZakuraRegistration::Registered { remote_ip, .. } = registration else {
+            panic!("a fresh peer registers: {registration:?}");
+        };
+        assert_eq!(
+            remote_ip,
+            Some("2001:db8:a:b::7".parse().expect("test ip parses"))
+        );
+        assert_eq!(
+            supervisor
+                .ip_slots
+                .registered("2001:db8:a:b::".parse().expect("test ip parses")),
+            1
+        );
+    }
+
+    /// A restarted peer that comes back on another address of its /64, as
+    /// RFC 8981 temporary addresses do, still takes the same-IP redial path:
+    /// it passes a full cap and evicts its stale incumbent on the short gate.
+    #[tokio::test(start_paused = true)]
+    async fn redial_from_the_same_slash_64_is_a_same_ip_duplicate() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer = test_peer(60);
+        let incumbent = CancellationToken::new();
+        assert!(matches!(
+            register_test_peer_from(&supervisor, &peer, "2001:db8:a:b::1", incumbent.clone()).await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        tokio::time::advance(ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE + Duration::from_secs(1)).await;
+        assert!(matches!(
+            register_test_peer_from(
+                &supervisor,
+                &peer,
+                "2001:db8:a:b::2",
+                CancellationToken::new()
+            )
+            .await,
+            ZakuraRegistration::Duplicate { .. }
+        ));
+        assert!(incumbent.is_cancelled());
+    }
+
+    /// The acceptor charges control handshakes and the transport's pending
+    /// handshakes to the /64 too, so one /64 gets one share of the handshake
+    /// budget however many addresses it uses.
+    #[test]
+    fn handshakes_from_one_slash_64_count_together() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        let ip = |ip: &str| -> IpAddr { ip.parse().expect("test ip parses") };
+        assert_eq!(
+            handler.pending_group(ip("2001:db8:a:b::7")),
+            ip("2001:db8:a:b::")
+        );
+        let _controls = [
+            supervisor.enter_control_handshake(ip("2001:db8:a:b::1")),
+            supervisor.enter_control_handshake(ip("2001:db8:a:b::2")),
+        ];
+        let attempt = |remote: &str| IncomingInfo {
+            remote: SocketAddr::new(ip(remote), 8234),
+            validated: true,
+            pending_total: 0,
+            pending_from_ip: 0,
+        };
+        assert_eq!(handler.admit(&attempt("2001:db8:a:b::3")), Admit::Refuse);
+        assert_eq!(handler.admit(&attempt("2001:db8:a:c::3")), Admit::Accept);
+    }
+
+    /// ADM-3's inbound share (#1367): once inbound connections or inbound
+    /// handshakes fill three quarters of their caps, the acceptor turns new
+    /// inbound attempts away, and a dial still finds the reserved quarter.
+    #[test]
+    fn inbound_load_leaves_the_outbound_reserve() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        assert_eq!(limits.max_inbound_connections(), 69);
+        assert_eq!(limits.max_inbound_handshakes(), 24);
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let attempt = |validated: bool, pending_total: usize| IncomingInfo {
+            remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
+            validated,
+            pending_total,
+            pending_from_ip: 0,
+        };
+        let take = |semaphore: &Arc<Semaphore>, count: usize| {
+            semaphore
+                .clone()
+                .try_acquire_many_owned(u32::try_from(count).expect("test counts are small"))
+                .expect("the test holds free permits")
+        };
+
+        // Pending transport handshakes count against the inbound share, which
+        // fills before the whole budget does.
+        assert_eq!(handler.admit(&attempt(true, 23)), Admit::Accept);
+        assert_eq!(handler.admit(&attempt(true, 24)), Admit::Refuse);
+        assert_eq!(handler.admit(&attempt(false, 24)), Admit::Retry);
+
+        // So do inbound control handshakes, and dials keep the rest.
+        let inbound_handshakes = (
+            take(&handler.inbound_handshakes, 24),
+            take(&handler.pending_handshakes, 24),
+        );
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
+        assert_eq!(handler.pending_handshakes.available_permits(), 8);
+        drop(inbound_handshakes);
+
+        // Inbound connections stop at their share, and dials keep the rest.
+        let inbound = (
+            take(&handler.inbound_admission, 69),
+            take(&handler.admission, 69),
+        );
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
+        let dials = take(&handler.admission, 23);
+        assert_eq!(handler.admission.available_permits(), 0);
+        drop((inbound, dials));
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
+    }
+
+    /// Dials may use inbound's unused share, and once they fill the whole cap
+    /// inbound attempts are refused, as before the reserve.
+    #[test]
+    fn dials_may_use_the_inbound_share() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let _dials = handler
+            .admission
+            .clone()
+            .try_acquire_many_owned(u32::try_from(limits.max_connections).expect("92 fits"))
+            .expect("dials may take every slot");
+        assert_eq!(
+            handler.admit(&IncomingInfo {
+                remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
+                validated: true,
+                pending_total: 0,
+                pending_from_ip: 0,
+            }),
+            Admit::Refuse
+        );
+    }
+
+    /// The real inbound paths hold the inbound share: `claim_inbound` holds a
+    /// connection slot from it until the claim drops, and the responder
+    /// handshake holds a handshake slot from it while it runs, so dials keep
+    /// the reserve in both.
+    #[tokio::test]
+    async fn inbound_paths_hold_the_inbound_share() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 4;
+        limits.max_pending_handshakes = 4;
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(64),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        assert_eq!(limits.max_inbound_connections(), 3);
+        assert_eq!(limits.max_inbound_handshakes(), 3);
+
+        let server = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0001)
+            .await?;
+        let (connection_tx, mut connection_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx,
+            stream_tx,
+        })?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let client = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0002)
+            .await?;
+        let mut client_connections = Vec::new();
+        let mut inbound = Vec::new();
+        for _ in 0..5 {
+            client_connections.push(client.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?);
+            inbound.push(
+                timeout(Duration::from_secs(10), connection_rx.recv())
+                    .await?
+                    .expect("the capture acceptor sends each accepted connection"),
+            );
+        }
+
+        // Connection slots: the fourth inbound claim finds its share full
+        // while a dial still finds a slot.
+        let claims: Vec<_> = inbound[..3]
+            .iter()
+            .map(|connection| handler.claim_inbound(connection))
+            .collect();
+        assert!(claims.iter().all(Option::is_some));
+        assert!(handler.claim_inbound(&inbound[3]).is_none());
+        assert_eq!(handler.admission.available_permits(), 1);
+        drop(claims);
+        assert_eq!(handler.inbound_admission.available_permits(), 3);
+        assert_eq!(handler.admission.available_permits(), 4);
+
+        // Handshake slots: a responder handshake waiting for a hello that
+        // never comes holds one inbound and one shared slot.
+        let responder = |connection: Connection| {
+            let handler = handler.clone();
+            async move {
+                let peer = ZakuraPeerId::new(connection.remote_id().as_bytes().to_vec())?;
+                let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&connection), &peer);
+                handler
+                    .run_native_responder_handshake_with_permit(&connection, &peer, &conn)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let waiting = tokio::spawn(responder(inbound[0].clone()));
+        timeout(Duration::from_secs(10), async {
+            while handler.inbound_handshakes.available_permits() == 3 {
+                zakura_rt::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(handler.inbound_handshakes.available_permits(), 2);
+        assert_eq!(handler.pending_handshakes.available_permits(), 3);
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(handler.inbound_handshakes.available_permits(), 3);
+        assert_eq!(handler.pending_handshakes.available_permits(), 4);
+
+        // With the inbound share full, a responder handshake is refused
+        // without taking a shared slot.
+        let full = handler
+            .inbound_handshakes
+            .clone()
+            .try_acquire_many_owned(3)
+            .expect("the test holds free permits");
+        assert!(matches!(
+            responder(inbound[4].clone()).await,
+            Err(ZakuraHandlerError::ResourceLimit("pending handshake"))
+        ));
+        assert_eq!(handler.pending_handshakes.available_permits(), 4);
+        drop(full);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_reserve_rounds_down_but_keeps_one_slot() {
+        for (cap, inbound) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (7, 6),
+            (8, 6),
+            (16, 12),
+            (32, 24),
+            (92, 69),
+        ] {
+            assert_eq!(without_outbound_reserve(cap), inbound, "cap {cap}");
         }
     }
 

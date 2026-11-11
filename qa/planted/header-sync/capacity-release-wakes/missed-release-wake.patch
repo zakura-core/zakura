@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index 38e8a2be7f..a0fcc9fb01 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -192,11 +192,7 @@ impl HeaderChunkBudget {
+         // Under the lock, so the report comes before the wake below.
+         #[cfg(any(test, zakura_sim))]
+         self.report(before, *usage, owner);
+-        if count != 0 {
+-            self.0
+-                .released
+-                .send_modify(|revision| *revision = revision.wrapping_add(1));
+-        }
++        // Mutation: returned headers don't wake the reactor.
+     }
+ 
+     /// Reports the change from `before` to `after` as `owner`'s, unless

@@ -1,0 +1,178 @@
+{
+  "node": {
+    "main": 0,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 3,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 4,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 5,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 7,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 8,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "prepare"
+        },
+        "until": {
+          "count": [
+            6,
+            {
+              "submitted": {
+                "kind": "prepare"
+              }
+            }
+          ]
+        },
+        "then": [
+          "engine"
+        ]
+      }
+    ]
+  },
+  "controls": [
+    {
+      "peer": "mirror-0",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 1
+        }
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-0"
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 2
+        }
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-1"
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 3
+        }
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-2"
+      }
+    },
+    {
+      "peer": "mirror-3",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 4
+        }
+      }
+    },
+    {
+      "peer": "mirror-3",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-3"
+      }
+    },
+    {
+      "peer": "mirror-4",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 5
+        }
+      }
+    },
+    {
+      "peer": "mirror-4",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-4"
+      }
+    },
+    {
+      "peer": "mirror-5",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 6
+        }
+      }
+    },
+    {
+      "peer": "mirror-5",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-5"
+      }
+    }
+  ]
+}

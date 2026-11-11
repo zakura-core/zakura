@@ -1,0 +1,18 @@
+# Keeps one needed-block query in flight across a body-work authority
+# change, and accepts its reply under whatever authority it names. The input
+# holds the node's first query in storage while the mirrors' chain grows and
+# the node's header sync takes the new headers, so the query's reply reaches
+# the reactor after the reactor adopted the longer chain's authority, and
+# installs the old target's work.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-retired-query.bin"
+# Besides reactor/state.rs, which the patch changes, header sync's apply and
+# the rest of block sync decide when the reply arrives.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]
+# The adoption no longer retires the pending query, and the reactor
+# dispatches no query for the new authority, so the bug also breaks
+# `reactor-query-lifecycle`, which the patched run violates first.
+also_violates = ["block-sync/reactor-query-lifecycle"]
+# The adoption clears the reactor's queries, so in this input every old
+# reply is `Stale` before the `StaleAuthority` guard can judge it. A patch
+# that removes only that guard survives the input; this patch also keeps the
+# query across the adoption to reach it.

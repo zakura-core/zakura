@@ -6,6 +6,7 @@ pub mod feed;
 pub mod prepare_fault;
 pub mod script;
 pub mod steer;
+pub mod storage_witnesses;
 
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};

@@ -16,7 +16,10 @@ use zakura_storage::{
 };
 
 use crate::{
-    observe::{block_sync_entries, reactor_entries, storage_entries, transport_entries},
+    observe::{
+        block_sync_entries, peer_transport_entries, reactor_entries, storage_entries,
+        transport_entries,
+    },
     Observation,
 };
 
@@ -46,11 +49,11 @@ pub(crate) trait LiveEvidence {
     /// detail.
     fn health(&self) -> Option<&'static str>;
 
-    /// Why the publisher's evidence would be incomplete if the run ended now,
-    /// as a failure detail, beyond [`health`](LiveEvidence::health). A run
-    /// that ends idle or at its budget checks it once, before it reports its
-    /// properties. None by default.
-    fn unfinished(&self) -> Option<&'static str> {
+    /// Why the publisher's evidence would be incomplete if the run ended
+    /// at `end`, as a failure detail, beyond [`health`](LiveEvidence::health).
+    /// A run that ends idle or at its budget checks it once, before it
+    /// reports its properties. None by default.
+    fn unfinished(&self, _end: &crate::RunEnd) -> Option<&'static str> {
         None
     }
 }
@@ -116,6 +119,11 @@ pub(crate) enum EvidenceKind {
         /// The node's name.
         node: String,
     },
+    /// A transport tap on the peer named `peer`, a display label only.
+    PeerTransport {
+        /// The peer's name.
+        peer: String,
+    },
 }
 
 impl EvidenceKind {
@@ -143,6 +151,7 @@ impl EvidenceKind {
             EvidenceKind::Reactor { .. } => reactor_entries(observations, instance),
             EvidenceKind::BlockSync { .. } => block_sync_entries(observations, instance),
             EvidenceKind::Transport { .. } => transport_entries(observations, instance),
+            EvidenceKind::PeerTransport { .. } => peer_transport_entries(observations, instance),
         }
     }
 
@@ -153,6 +162,7 @@ impl EvidenceKind {
             EvidenceKind::Reactor { node } => format!("reactor:{node}#{instance}"),
             EvidenceKind::BlockSync { node } => format!("block-sync:{node}#{instance}"),
             EvidenceKind::Transport { node } => format!("transport:{node}#{instance}"),
+            EvidenceKind::PeerTransport { peer } => format!("peer-transport:{peer}#{instance}"),
         }
     }
 
@@ -167,7 +177,8 @@ impl EvidenceKind {
             },
             EvidenceKind::Reactor { .. }
             | EvidenceKind::BlockSync { .. }
-            | EvidenceKind::Transport { .. } => Words {
+            | EvidenceKind::Transport { .. }
+            | EvidenceKind::PeerTransport { .. } => Words {
                 source: "tap",
                 publisher: "tap",
                 entries: "events",

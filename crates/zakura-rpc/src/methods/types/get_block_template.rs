@@ -11,6 +11,7 @@ pub mod zip317;
 mod tests;
 
 pub(crate) mod prepared_candidates;
+pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
 
 use std::{
@@ -841,6 +842,9 @@ where
 
     /// Stops speculative preparation for a parent whose template missed its deadline.
     pub(crate) speculation_breaker: SpeculationBreaker,
+
+    /// Records the stages of each template this handler returns.
+    pub(crate) trace: trace::MiningTemplateTrace,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -873,6 +877,7 @@ where
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
+            trace: trace::MiningTemplateTrace::default(),
         }
     }
 

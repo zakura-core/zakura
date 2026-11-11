@@ -6,21 +6,26 @@
 
 mod support;
 
-use std::process::{Command, Output};
+use std::{
+    process::{Command, Output},
+    rc::Rc,
+};
 
 use support::inputs;
 use tempfile::TempDir;
 use zakura_sim::{
+    domain::header_sync::TEARDOWN_RETURNS_BASELINE,
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Chain, ControlAction, ControlStep, Policy,
         },
-        header_sync::{Storage, StorageScenario},
+        header_sync::{storage_properties, storage_sources, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
     observe::{ReactorFact, StorageFact, StorageRequest},
-    MemorySink, Observation, PlanInput, RunReport,
+    property::{Assumptions, Registry, RegistryChecker},
+    MemorySink, Observation, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Runs `scenario` on freshly prepared ports under `input`. The run must end
@@ -139,8 +144,7 @@ fn shutdown_witness() -> StorageScenario {
 }
 
 /// A planned stop with a prepare in flight drops that call, logs the
-/// reactor's last events and passes the teardown checks, where an
-/// unannounced stop would fail as `ReactorGone`. Nothing the reactor reports
+/// reactor's last events and passes the teardown checks. Nothing the reactor reports
 /// comes after its final drain. Some plans let the reactor's request
 /// timeout end the prepare first, so only some must drop it.
 #[test]
@@ -172,11 +176,14 @@ fn a_shutdown_stops_the_node_and_passes_its_teardown_checks() {
 }
 
 /// A run cut off right after it picks `Shutdown`, before the control task
-/// carries it out, fails as `ShutdownIncomplete`: the stop counts from its
-/// pick, so a run can't end with a chosen stop silently untaken. The test
-/// searches budgets for a run whose last step is that pick, with no drain.
+/// carries it out, leaves the stop honestly unfinished: its drain was cut
+/// off at its bound. It's no harness failure, and
+/// `header-sync/teardown-returns-baseline` is inconclusive, so a chosen stop
+/// still never ends silently untaken. The stop counts from its pick. The
+/// test searches budgets for a run whose last step is that pick, with no
+/// drain.
 #[test]
-fn a_run_cut_off_at_the_shutdown_pick_fails() {
+fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
     let scenario = scenario(
         Vec::new(),
         vec![ControlStep {
@@ -193,15 +200,36 @@ fn a_run_cut_off_at_the_shutdown_pick_fails() {
                 ..zakura_sim::harness::header_sync::storage_config()
             };
             let mut sim = zakura_sim::Sim::new(config, PlanInput::Bytes(Vec::new()));
-            let storage = Storage::build(&mut sim, &scenario, Storage::prepare(&scenario));
-            let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
-            drop(storage);
+            let storage = Rc::new(Storage::build(
+                &mut sim,
+                &scenario,
+                Storage::prepare(&scenario),
+            ));
+            let registry = Registry::new(storage_properties()).expect("unique IDs");
+            let mut checker = RegistryChecker::new(
+                registry,
+                Rc::clone(&storage),
+                Assumptions::none(),
+                &storage_sources(),
+            );
+            let report = sim.run(&mut checker, &mut MemorySink::default());
+            drop((checker, storage));
             let last = report.picks.last().map(|pick| pick.identity.as_str());
             (last == Some("peer:node:shutdown")).then_some(report)
         })
         .expect("some budget ends the run at the shutdown pick");
-    let failure = format!("{:?}", cut.end.harness);
-    assert!(failure.contains("ShutdownIncomplete"), "{failure}");
+    assert_eq!(cut.end.harness, None, "{:?}", cut.end);
+    let teardown = cut
+        .properties
+        .iter()
+        .find(|property| property.property == TEARDOWN_RETURNS_BASELINE)
+        .map(|property| property.outcome.clone());
+    assert_eq!(
+        teardown,
+        Some(PropertyOutcome::Inconclusive {
+            reason: "teardown-open".to_owned()
+        })
+    );
 }
 
 /// A shutdown step must name the node under test, and a second shutdown or

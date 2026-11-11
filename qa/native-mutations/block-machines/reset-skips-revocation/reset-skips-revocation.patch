@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+index 2a6e606b45..a77d077e68 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -992,7 +992,7 @@ impl WorkQueueState {
+                 .in_flight
+                 .pop_last()
+                 .expect("last_key_value returned Some");
+-            revocation |= item.budget.is_reserved() || item.answered_elsewhere;
++            revocation |= item.answered_elsewhere;
+             let charge = item.budget.release_reserved();
+             self.settle_in_flight(item.owner, charge);
+             released = self.add_to_total(released, charge);

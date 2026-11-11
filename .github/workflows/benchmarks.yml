@@ -15,7 +15,7 @@ concurrency:
 # with `harness = false` in the crate's `Cargo.toml`.
 env:
   BENCHES: |
-    criterion -p zakura-consensus --bench groth16
+    criterion -p zakura-consensus --bench groth16 --features sprout
     criterion -p zakura-consensus --bench halo2
     criterion -p zakura-consensus --bench sapling
     criterion -p zakura-chain --bench transaction

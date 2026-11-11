@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 72571d2955..d7c101f3c9 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -799,10 +799,7 @@ impl ReactorState {
+                     .and_then(RepairRequirement::next_deadline),
+             )
+             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
+-            .chain(
+-                self.cached_pass_deferred
+-                    .then(|| self.cached_pass_budget.next_refill()),
+-            )
++            // Mutation: a deferred cached pass arms no refill deadline.
+             .chain(
+                 self.vct_local_operation
+                     .as_ref()

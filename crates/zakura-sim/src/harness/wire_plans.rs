@@ -9,8 +9,9 @@
 //! for any act, so P3d's witnesses reuse it.
 
 use super::{
-    header_node::{Chain, Policy},
-    header_sync::WireScenario,
+    header_node::{Base, Chain, Policy},
+    header_sync::{WireScenario, PROGRESS_LINK, PROGRESS_STORAGE_BOUND_MS},
+    NetScenario,
 };
 use crate::peer::{
     adversary::{Act, AdversarySpec, ContentRule, CursorField, Row},
@@ -39,14 +40,20 @@ pub enum SavedPlan {
     /// An adversary dials the node and takes `act` once its setup history
     /// is done.
     Act(Act),
+    /// `header-sync/honest-progress`'s fixture (hdr-8): an honest peer
+    /// holding one header past the node's 50 dials it
+    /// ([`progress_scenario`]).
+    HonestProgress,
 }
 
 impl SavedPlan {
     /// Every saved Plan: the honest sync, then one act per violation
     /// category of the action table: a stateless fault on `status`, and
     /// for `bad-cursor` and `bad-content` the case M5-E1's guard test
-    /// takes. M5-E1 marks no category unreachable.
-    pub const ALL: [SavedPlan; 14] = [
+    /// takes. M5-E1 marks no category unreachable. Then the progress
+    /// fixture and a lower-locator page, last so the earlier plans keep
+    /// their tags.
+    pub const ALL: [SavedPlan; 16] = [
         SavedPlan::HonestSync,
         SavedPlan::Act(Act::ShortPayload { row: Row::Status }),
         SavedPlan::Act(Act::LongPayload { row: Row::Status }),
@@ -68,14 +75,23 @@ impl SavedPlan {
         SavedPlan::Act(Act::BadContent {
             rule: ContentRule::Linkage,
         }),
+        SavedPlan::HonestProgress,
+        SavedPlan::Act(Act::BadContent {
+            rule: ContentRule::LowerLocator,
+        }),
     ];
 
-    /// The fixture's name, `header-wire-<name>.bin`: `honest-sync`, or the
-    /// act's identity name.
+    /// The fixture's name, `header-wire-<name>.bin`: `honest-sync`, the
+    /// act's identity name, `lower-locator` for that content rule's act,
+    /// or `honest-progress`.
     pub fn name(self) -> &'static str {
         match self {
             SavedPlan::HonestSync => "honest-sync",
+            SavedPlan::Act(Act::BadContent {
+                rule: ContentRule::LowerLocator,
+            }) => "lower-locator",
             SavedPlan::Act(act) => act.name(),
+            SavedPlan::HonestProgress => "honest-progress",
         }
     }
 
@@ -86,7 +102,7 @@ impl SavedPlan {
             .iter()
             .position(|plan| *plan == self)
             .expect("every saved Plan is listed");
-        // 14 plans fit a byte.
+        // 16 plans fit a byte.
         [TAG, (index + 1) as u8]
     }
 
@@ -113,7 +129,36 @@ impl SavedPlan {
                 ..WireScenario::default()
             },
             SavedPlan::Act(act) => act_scenario(act),
+            SavedPlan::HonestProgress => progress_scenario(),
         }
+    }
+}
+
+/// `header-sync/honest-progress`'s fixed fixture
+/// ([`progress_fixture`](super::header_sync::progress_fixture)): the node at
+/// 50, dialed by one honest peer holding 51 headers, on
+/// [`PROGRESS_LINK`]s, with storage succeeding within
+/// [`PROGRESS_STORAGE_BOUND_MS`].
+pub fn progress_scenario() -> WireScenario {
+    WireScenario {
+        net: NetScenario {
+            default_link: PROGRESS_LINK,
+            ..NetScenario::default()
+        },
+        node: Chain::main(PRELOAD),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: PRELOAD + 1,
+                subscribe: None,
+            }),
+            ..PeerSpec::dialing()
+        }],
+        policy: Policy {
+            base: Base::SuccessOnly,
+            bound_ms: Some(PROGRESS_STORAGE_BOUND_MS),
+            holds: Vec::new(),
+            reply_holds: Vec::new(),
+        },
     }
 }
 

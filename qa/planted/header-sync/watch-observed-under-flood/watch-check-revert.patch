@@ -1,0 +1,39 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index dd496a9605..d9a41affdb 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -684,31 +684,9 @@ impl HeaderSyncReactor {
+         if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+             self.handle_port_completion(completion);
+         }
+-        // `changed` delivers a final unseen value before reporting channel closure.
+-        // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
+-        if let Some(snapshots) = committed_snapshots.as_mut() {
+-            match coop::unconstrained(snapshots.changed()).now_or_never() {
+-                Some(Ok(())) => {
+-                    let snapshot = snapshots.borrow_and_update().clone();
+-                    if let Some(snapshot) = snapshot {
+-                        observe!(
+-                            self,
+-                            ReactorEvent::WatchObserved {
+-                                state_version: snapshot.state_version,
+-                            }
+-                        );
+-                        caused!(
+-                            self,
+-                            ReactorCause::Watch,
+-                            self.observe_latest_committed_snapshot(snapshot)
+-                        );
+-                    }
+-                }
+-                Some(Err(_)) => *committed_snapshots = None,
+-                None => {}
+-            }
+-        }
+-        self.probe_vct_root_repairs(vct_root_repairs);
++        // Mutation: #1566 reverted, so the turn checks no watch before its
++        // events.
++        let _ = (committed_snapshots, vct_root_repairs);
+     }
+ 
+     /// Reads the VCT root repair watch if it changed.

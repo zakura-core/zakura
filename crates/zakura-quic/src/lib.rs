@@ -29,6 +29,8 @@ mod driver;
 mod endpoint;
 mod error;
 mod inputs;
+#[cfg(zakura_sim)]
+mod probe;
 #[cfg(any(test, zakura_sim))]
 pub mod sim;
 mod socket;
@@ -48,6 +50,8 @@ pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };
 pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
+#[cfg(zakura_sim)]
+pub use probe::LoadProbe;
 pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
 pub use stream::{CreditHold, RecvStream, SendStream};
 

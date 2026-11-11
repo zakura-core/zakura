@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9905b6dafc..2d19720f44 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -334,9 +334,7 @@ impl SubscriberState {
+         // refusal is local, so the peer would otherwise stay connected.
+         let mut previous_hash = parent.hash;
+         for (index, entry) in page.entries.iter().enumerate() {
+-            if entry.header.previous_block_hash != previous_hash {
+-                return Err(SubscriberFault::Linkage);
+-            }
++            // Mutation: the subscriber skips its linkage check.
+             if !live.reached && index > 0 {
+                 if previous_hash == live.target {
+                     return Err(SubscriberFault::PastTarget);

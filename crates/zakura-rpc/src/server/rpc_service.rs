@@ -103,7 +103,7 @@ impl<M: RpcMethods> RpcServiceT for RpcService<M> {
     }
 }
 
-/// Answers a request body that starts with `{` if `is_single`, or `[` otherwise.
+/// Answers a JSON-RPC 2.0 request body that starts with `{` if `is_single`, or `[` otherwise.
 ///
 /// Each batched call goes through `service` on its own, so per-call middleware sees it. Batches
 /// can have up to `max_batch_entries` entries, and batch responses can be up to
@@ -115,7 +115,17 @@ pub async fn handle_rpc_call<S: RpcServiceT>(
     max_batch_entries: usize,
     max_response_body_size: usize,
 ) -> MethodResponse {
-    match Body::parse(body, is_single, max_batch_entries) {
+    let body = Body::parse(body, is_single, max_batch_entries);
+    handle_parsed_body(body, service, max_response_body_size).await
+}
+
+/// Answers a parsed request body, like [`handle_rpc_call`].
+pub(crate) async fn handle_parsed_body<S: RpcServiceT>(
+    body: Body<'_>,
+    service: &S,
+    max_response_body_size: usize,
+) -> MethodResponse {
+    match body {
         Body::Call(request) => service.call(request).await,
         Body::Notification(notification) => service.notification(notification).await,
         Body::Error(response) => response,

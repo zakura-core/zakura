@@ -126,10 +126,76 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/replay_exact.rs"
+test = "regenerate_discovery_book_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_authority.rs"
+test = "regenerate_authority_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed authority witnesses from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
+test = "regenerate_reset_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_hold_release.rs"
+test = "regenerate_hold_fixtures"
+run = false
+reason = "a tool, not a test: it rewrites the committed hold fixtures from their names"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_peer_retirement.rs"
+test = "regenerate_retirement_fixtures"
+run = false
+reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_stale_chain.rs"
+test = "regenerate_chain_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/sync_wire.rs"
+test = "regenerate_saved_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved scenarios"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_saved_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved scenarios"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
+test = "regenerate_saved_plans"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved Plans"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
+test = "regenerate_planted_reader_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the planted cases' scenarios"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
+test = "regenerate_planted_guard_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the planted cases' scenarios"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_storage_seeds.rs"
@@ -138,10 +204,40 @@ run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
+test = "regenerate_witness_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed witness seeds"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"
 test = "regenerate_reset_mid_flight_input"
 run = false
 reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_capacity_frontier_first_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed frontier-first input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_flood_watch.rs"
+test = "regenerate_flood_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_release_wake.rs"
+test = "regenerate_release_wake_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_repair.rs"
+test = "regenerate_repair_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
@@ -187,6 +283,24 @@ package = "sim"
 name = "header_sync_storage"
 smoke-secs = 60
 args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
+# `sync/storage`'s two-byte prefix picks a saved scenario or the default
+# one, so the target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "sync_storage"
+smoke-secs = 60
+timeout-secs = 1800
+
+# `sync/wire`'s two-byte prefix picks a saved scenario, fuzz-13's combined
+# actions (a chain change at a pipeline stage, a connection replacement and
+# a read stall), or the honest scenario. The target fuzzes the schedule of
+# each.
+[[target]]
+package = "sim"
+name = "sync_wire"
+smoke-secs = 60
 timeout-secs = 1800
 
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
@@ -296,6 +410,26 @@ owner = "E5a"
 reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
 
 [[missing-target]]
+harness = "header-sync/flood"
+owner = "E5a"
+reason = "no target: the harness has two fixed scenarios, the flood fixtures, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "header-sync/release-wake"
+owner = "E5a"
+reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "header-sync/repair"
+owner = "E5a"
+reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "header-sync/liveness"
+owner = "E5a"
+reason = "no target: the harness has fixed scenarios, the hdr-10 liveness fixtures, and no plan maps it to a target"
+
+[[missing-target]]
 harness = "block-sync/storage"
 owner = "E5a"
 reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
@@ -305,92 +439,19 @@ harness = "header-sync/wire"
 owner = "E5a"
 reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
 
+[[missing-target]]
+harness = "discovery/wire"
+owner = "fuzz-10"
+reason = "no target yet; no plan maps it to a target, and disc-3 registers the properties one would check"
+
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and
 # then the check fails until its row here goes.
-[[pending]]
-id = "header-sync/stale-completion-inert"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/chunk-budget-bound"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/teardown-returns-baseline"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/capacity-release-wakes"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/watch-observed-under-flood"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/watch-observed-under-lifecycle-flood"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
 [[pending]]
 id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/honest-progress"
-kind = "property"
-owner = "P4c"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/commit-only-authorized"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/stale-chain-effect-inert"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/reset-invalidates-work"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/outstanding-work-bounded"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/hold-release-wakes"
-kind = "property"
-owner = "H2"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/peer-retirement-progress"
-kind = "property"
-owner = "H2"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
 id = "header-sync/expected-chain-selected"
@@ -411,63 +472,9 @@ owner = "H5"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
-id = "sync/storage"
-kind = "harness"
-owner = "P8a"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/block-requests-follow-headers"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/query-work-authorized"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/header-reorg-retires-block-work"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/frontier-work-consistent"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
 id = "sync/stale-block-completion-inert"
 kind = "property"
 owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/tips-consistent"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/wire"
-kind = "harness"
-owner = "P8c"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "session/replacement-preserves-authorization"
-kind = "property"
-owner = "P8c"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/teardown-returns-baseline"
-kind = "property"
-owner = "P8d"
 plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
 
 # The protocol-state features of the G1–G3 plan's feature table, whose

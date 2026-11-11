@@ -1,0 +1,33 @@
+# Work that is in the changelog but not released to operators yet.
+#
+# A changelog entry belongs to a group when its first sentence matches one of
+# the group's case-insensitive regular expressions. Only the first sentence is
+# checked: entries name their subject first, and mixed entries that mention
+# this work later in passing usually still matter to everyone else. The summary
+# leaves these entries' PRs out, and they don't count toward its required
+# coverage; the full changelog still lists them. Remove a group once its work
+# is released.
+
+[[unreleased]]
+# Off by default on Mainnet: `network.p2p_stack` resolves to `legacy` there.
+name = "the experimental Zakura P2P v2 stack"
+patterns = [
+  '\bv2 (?:nodes?|stack|peers?|connections?)\b',
+  '\bp2p[ -]v2\b',
+  '\bzakura p2p\b',
+  '(?<![=-])\bnative\b',
+  '\bzakura[- ]only\b',
+  '\bzakura (?:connection|peer|stream|session|protocol|transport|endpoint|handshake)s?\b',
+  '\bcompatibility streams?\b',
+  '\bheader[- ]sync',
+  '\bblock[- ]sync',
+  '(?<!block )(?<!block-)\bdiscovery\b(?! rounds?\b)',
+  '\bvct\b',
+  '\bquic\b',
+  '\biroh\b',
+  'network\.zakura',
+  '\bzakura\.(?:block_sync|header_sync|p2p|quic|discovery)',
+  '\btrace_dir\b',
+  '\b(?:JSONL )?trace (?:endpoint|tables?)\b',
+  '\bpeer_memory_budget',
+]

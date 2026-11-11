@@ -28,6 +28,11 @@ use crate::zakura::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::zakura::{
+    header_sync::observe::{CreditKind, CreditTotals, HeaderSyncObserver, ReactorEvent},
+    ZakuraPeerId,
+};
+
 impl Admitted {
     /// `page` as admitted, for a reactor test that seeds work without a
     /// session subscriber. Production admits pages only through
@@ -1126,6 +1131,147 @@ fn grants_refill_half_window_prefixes() {
     assert_eq!(grant.added_credit.objects, 6);
 }
 
+/// Records each event it's handed.
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Recorded {
+    /// Keeps every credit fact. The subscriber's container reports
+    /// (`SubscriberServing`) are the simulator's outstanding-work rule's to
+    /// judge, so the credit tests leave them out.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(event, ReactorEvent::SubscriberServing { .. }) {
+            return;
+        }
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .push(event);
+    }
+}
+
+/// An observed subscriber reports each credit it gives as it records it,
+/// with its peer, session and subscription, the update exactly as it built
+/// it and its target's height: the `Open`'s whole window, a grant through
+/// acceptance, and a grant through `grant_due`. Each acceptance reports the
+/// cursor it accepted through, before any grant it makes due. A `Close`
+/// reports the update it built, and each claimed page the cursor it
+/// recorded with the page's own size.
+#[test]
+fn observed_credit_reports_each_open_grant_and_close() {
+    let (tree, chain) = chain(20);
+    let recorded = Arc::new(Recorded::default());
+    let peer = ZakuraPeerId::new(vec![9; 32]).expect("32 bytes is a valid peer ID");
+    let mut sub = subscriber().observed_by(Some(CreditTap {
+        observer: recorded.clone(),
+        peer: peer.clone(),
+        session_id: 7,
+    }));
+    let (open, _) = sub
+        .open(&status(chain[20]), &[chain[0]], AuxSchema::None, 8)
+        .expect("the first Open is recorded");
+    let id = open.subscription_id;
+    let mut fixture = Fixture {
+        tree,
+        sub,
+        id,
+        target: chain[20],
+        schema: AuxSchema::None,
+    };
+    // The primitive's totals after each fact: every update's credit so far
+    // and every claimed page's.
+    let totals = |granted: &[&SubscribeHeaders], consumed: Option<&Cursor>| CreditTotals {
+        granted_headers: granted
+            .iter()
+            .map(|update| u64::from(update.added_credit.objects))
+            .sum(),
+        granted_bytes: granted
+            .iter()
+            .map(|update| u64::from(update.added_credit.bytes))
+            .sum(),
+        consumed_headers: consumed.map_or(0, |cursor| cursor.headers),
+        consumed_bytes: consumed.map_or(0, |cursor| cursor.bytes),
+    };
+    let credit = |kind, message: &SubscribeHeaders, totals| ReactorEvent::CreditIssued {
+        kind,
+        peer: peer.clone(),
+        session_id: 7,
+        subscription: id,
+        objects: message.added_credit.objects,
+        bytes: message.added_credit.bytes,
+        update: Box::new(message.clone()),
+        target_height: chain[20].height,
+        totals,
+    };
+    let accepted = |through: &Cursor, totals| ReactorEvent::CursorsAccepted {
+        peer: peer.clone(),
+        session_id: 7,
+        subscription: id,
+        through: Frontier::new(through.height, through.hash),
+        headers: through.headers,
+        bytes: through.bytes,
+        stored: (
+            Frontier::new(through.height, through.hash),
+            through.headers,
+            through.bytes,
+        ),
+        totals,
+    };
+    let mut expected = vec![credit(CreditKind::Open, &open, totals(&[&open], None))];
+    let cursors: Vec<_> = (1..=8)
+        .map(|height| {
+            fixture
+                .page(chain[height - 1], &chain[height..=height], false)
+                .expect("a one-header page")
+                .cursor
+        })
+        .collect();
+    let mut before = 0;
+    for cursor in &cursors {
+        expected.push(ReactorEvent::CursorClaimed {
+            peer: peer.clone(),
+            session_id: 7,
+            subscription: id,
+            through: Frontier::new(cursor.height, cursor.hash),
+            headers: cursor.headers,
+            bytes: cursor.bytes,
+            page_last: Frontier::new(cursor.height, cursor.hash),
+            page_headers: 1,
+            page_bytes: cursor.bytes - before,
+            totals: totals(&[&open], Some(cursor)),
+        });
+        before = cursor.bytes;
+    }
+    let grant = fixture
+        .sub
+        .accept_through(id, &cursors[3], 8)
+        .expect("a received cursor")
+        .expect("four headers reach the prefix");
+    let all = Some(&cursors[7]);
+    expected.push(accepted(&cursors[3], totals(&[&open], all)));
+    expected.push(credit(
+        CreditKind::Grant,
+        &grant,
+        totals(&[&open, &grant], all),
+    ));
+    assert_eq!(fixture.sub.accept_through(id, &cursors[7], 2), Ok(None));
+    expected.push(accepted(&cursors[7], totals(&[&open, &grant], all)));
+    let second = fixture.sub.grant_due(8).expect("a larger budget refills");
+    let granted = totals(&[&open, &grant, &second], all);
+    expected.push(credit(CreditKind::Grant, &second, granted));
+    let close = fixture.sub.close().expect("the live subscription closes");
+    expected.push(ReactorEvent::CloseBuilt {
+        peer: peer.clone(),
+        session_id: 7,
+        subscription: id,
+        update: Box::new(close),
+        totals: granted,
+    });
+
+    let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
+    assert_eq!(reported, expected);
+}
+
 /// Updates acknowledge only cursors the reactor accepted: a cursor with a
 /// changed field, one already passed, or one for another subscription is
 /// refused locally. A page that fails contextual validation is never
@@ -1803,7 +1949,9 @@ fn subscriber_state_runs_on_plain_tools() {
     let update = tools
         .open(plan.id, plan.window, plan.start)
         .expect("the tools record the Open");
-    let first = state.opened(plan, update).subscription_id;
+    let first = state
+        .opened(plan, update, CreditTotals::default())
+        .subscription_id;
     assert!(state.retract(&mut tools, first));
     assert_eq!((state.live(), tools.len()), (None, 0));
 
@@ -1814,7 +1962,9 @@ fn subscriber_state_runs_on_plain_tools() {
     let update = tools
         .open(plan.id, plan.window, plan.start)
         .expect("the tools record the Open");
-    let second = state.opened(plan, update).subscription_id;
+    let second = state
+        .opened(plan, update, CreditTotals::default())
+        .subscription_id;
     assert_ne!(first, second);
     let frame = page_frame(
         &tree,

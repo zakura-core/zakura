@@ -297,6 +297,20 @@ impl HasView for Planted {
             adoption: Default::default(),
             sessions: Default::default(),
             faults: Default::default(),
+            capacity: Default::default(),
+            claims: Default::default(),
+            rounds: Default::default(),
+            stale_calls: Default::default(),
+            wake: Default::default(),
+            hold_wake: Default::default(),
+            ends: Default::default(),
+            stamps: Default::default(),
+            round_life: Default::default(),
+            retirement: Default::default(),
+            chain_effect: Default::default(),
+            authority: Default::default(),
+            outstanding: Default::default(),
+            recovery: Default::default(),
         }
     }
 }

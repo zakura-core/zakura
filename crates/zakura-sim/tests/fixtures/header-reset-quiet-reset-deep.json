@@ -1,0 +1,42 @@
+{
+  "node": {
+    "main": 3,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 3,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  },
+  "controls": [
+    {
+      "peer": "node",
+      "action": {
+        "reset": {
+          "invalidate": {
+            "depth": 1
+          }
+        }
+      },
+      "when": null
+    },
+    {
+      "peer": "node",
+      "action": {
+        "reset": "reconsider"
+      },
+      "when": {
+        "reset": "node"
+      }
+    }
+  ]
+}

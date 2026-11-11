@@ -1,0 +1,24 @@
+# The reactor returns by itself at the first locator reply, leaving it
+# unhandled. The input's first locator read is held until a `Release`
+# step, so its delivered reply opens the obligation, and the reactor's
+# clean return is the node's own end: the tap records `ReactorExited`, the
+# run goes on, and the obligation expires at the next quiescence (Rule 13).
+# The reactor returns at once, before it settles the call or retires any
+# work. A later report of its containers would still show the slot that
+# read was for, waiting on a read that already ended, and that slot
+# belongs to `outstanding-work-bounded`.
+# This is hdr-10a's witness that an early exit leaves an open obligation
+# violated rather than passing the run.
+# Besides reactor.rs, which the patch changes, the queue and the offer
+# policy decide when the locator read is dispatched. A change there can move
+# the input off its held read.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# A reactor that no longer wakes for a reply also never hands a departed
+# peer's target off, so a campaign input that draws a departure fixture
+# breaks `peer-retirement-progress`'s hand-off too.
+also_violates = ["header-sync/peer-retirement-progress"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.plan"

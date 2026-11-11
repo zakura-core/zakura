@@ -1,0 +1,11 @@
+# Drops every committed view the engine publishes, so the reactor keeps the
+# authority it adopted at spawn and reports no transition. The node's header
+# sync still applies the mirrors' headers, so the engine's newest view moves
+# past the startup authority. Once no task can run, the reactor's authority
+# differs from the engine's newest view's. The model takes the startup
+# authority from the harness at spawn, so a reactor that never reports a
+# transition is still judged.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-retired-query.bin"
+# Besides reactor.rs, which the patch changes, header sync's apply and the
+# rest of block sync decide when the views arrive.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

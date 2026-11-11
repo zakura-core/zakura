@@ -1,6 +1,11 @@
 //! Fixed test vectors for zakura-network configuration.
 
-use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use zakura_chain::{
     amount::Amount,
@@ -22,7 +27,7 @@ use crate::{
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack,
+    CacheDir, Config, P2pStack, UnconditionalPeers,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -932,26 +937,29 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         Ok(256)
     );
 
-    // The transport holds the admitted connections and the headroom, half of
-    // it kept for dials (zakura-quic ADM-12), and two closing connections per
-    // live slot (ADM-13).
+    // The transport holds the admitted connections and the headroom, keeps
+    // one discovery record's 8 addresses for dials, lets inbound hold its
+    // connection and handshake shares (zakura-quic ADM-12), and keeps two
+    // closing connections per live slot (ADM-13).
     let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (288, 16, 576)
+        (288, 8, Some(216), 576)
     );
     let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (124, 16, 248)
+        (124, 8, Some(93), 248)
     );
 
     // With a 1 GiB receive window, the handshake headroom alone exceeds the
@@ -1503,6 +1511,101 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
     );
 }
 
+#[test]
+fn unconditional_peers_default_to_empty() {
+    assert!(Config::default().unconditional_peers.is_empty());
+
+    let config: Config = toml::from_str("").unwrap();
+    assert!(config.unconditional_peers.is_empty());
+}
+
+#[test]
+fn unconditional_peers_parse_ips_and_cidr_ranges_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::1', '2001:db8:1::/48']",
+    )
+    .expect("IP addresses and CIDR ranges parse");
+
+    assert_eq!(config.unconditional_peers.len(), 4);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1", "198.51.100.0/24", "2001:db8::1", "2001:db8:1::/48"]"#
+        ),
+        "plain IP addresses serialize without a prefix length:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+}
+
+#[test]
+fn unconditional_peers_reject_invalid_entries() {
+    for entry in [
+        "not an ip",
+        "zakura.example.com",
+        "192.0.2.1:8233",
+        "192.0.2.0/33",
+        "192.0.2.5/24",
+        "2001:db8::1/32",
+        "::ffff:192.0.2.5/120",
+        "",
+    ] {
+        let error = toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']"))
+            .expect_err("invalid unconditional peer entries must fail config load");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid network.unconditional_peers entry"),
+            "unexpected error for {entry:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unconditional_peers_match_addresses_in_configured_ranges() {
+    let peers: UnconditionalPeers = toml::from_str::<Config>(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8:1::/48']",
+    )
+    .unwrap()
+    .unconditional_peers;
+
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    assert!(peers.contains(ip("192.0.2.1")));
+    assert!(!peers.contains(ip("192.0.2.2")));
+
+    assert!(peers.contains(ip("198.51.100.0")));
+    assert!(peers.contains(ip("198.51.100.255")));
+    assert!(!peers.contains(ip("198.51.101.0")));
+
+    assert!(peers.contains(ip("2001:db8:1:ffff::1")));
+    assert!(!peers.contains(ip("2001:db8:2::1")));
+}
+
+#[test]
+fn unconditional_peers_match_ipv4_mapped_ipv6_forms() {
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let ipv4_entry: Config = toml::from_str("unconditional_peers = ['192.0.2.0/24']").unwrap();
+    assert!(ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.7")));
+    assert!(!ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.3.7")));
+
+    let mapped_entry: Config =
+        toml::from_str("unconditional_peers = ['::ffff:192.0.2.1']").unwrap();
+    assert!(mapped_entry.unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(mapped_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.1")));
+    assert!(!mapped_entry.unconditional_peers.contains(ip("192.0.2.2")));
+}
+
 /// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
 /// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
 /// the deployer writes, which a TOML parser alone cannot.
@@ -1720,20 +1823,20 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("").expect("empty config parses");
-    assert_eq!(config.advert_window_min, 32);
-    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_full_block, 32);
+    assert_eq!(config.advert_window_small_block, 64);
     assert_eq!(config.advert_window_small_size_bytes, 102_400);
     assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
     let config: Config = toml::from_str(
-        "advert_window_min = 2\n\
-         advert_window_max = 16\n\
+        "advert_window_full_block = 2\n\
+         advert_window_small_block = 16\n\
          advert_window_small_size_bytes = 100\n\
          advert_window_full_size_bytes = 1000\n",
     )
     .expect("configured fan-out parses");
-    assert_eq!(config.advert_window_min, 2);
-    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_full_block, 2);
+    assert_eq!(config.advert_window_small_block, 16);
     assert_eq!(config.advert_window_small_size_bytes, 100);
     assert_eq!(config.advert_window_full_size_bytes, 1000);
 
@@ -1742,9 +1845,13 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     assert_eq!(roundtrip, config);
 
     // Equal bounds are a fixed window.
-    let config: Config = toml::from_str("advert_window_min = 50\nadvert_window_max = 50")
-        .expect("equal bounds parse");
-    assert_eq!(config.advert_window_min, config.advert_window_max);
+    let config: Config =
+        toml::from_str("advert_window_full_block = 50\nadvert_window_small_block = 50")
+            .expect("equal bounds parse");
+    assert_eq!(
+        config.advert_window_full_block,
+        config.advert_window_small_block
+    );
 
     let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
         .expect("a zero small-size boundary parses");
@@ -1757,42 +1864,90 @@ fn advert_windows_preserve_explicit_values() {
     let _init_guard = zakura_test::init();
     for (text, expected) in [
         ("", (32, 64)),
-        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
         (
-            "advert_window_min = 1000\nadvert_window_max = 1000",
+            "advert_window_full_block = 32\nadvert_window_small_block = 64",
+            (32, 64),
+        ),
+        (
+            "advert_window_full_block = 1000\nadvert_window_small_block = 1000",
             (1000, 1000),
         ),
-        ("advert_window_min = 16\nadvert_window_max = 64", (16, 64)),
-        ("advert_window_max = 16", (16, 16)),
-        ("advert_window_min = 1001", (1001, 1001)),
+        (
+            "advert_window_full_block = 16\nadvert_window_small_block = 64",
+            (16, 64),
+        ),
+        ("advert_window_small_block = 16", (16, 16)),
+        ("advert_window_full_block = 1001", (1001, 1001)),
     ] {
         let config: Config = toml::from_str(text).unwrap();
         assert_eq!(
-            (config.advert_window_min, config.advert_window_max),
+            (
+                config.advert_window_full_block,
+                config.advert_window_small_block
+            ),
             expected
         );
     }
 }
 
+/// The previous names `advert_window_min` and `advert_window_max` still load, and resolve
+/// omitted windows the same way as the new names.
 #[test]
-fn advert_delays_roundtrip_and_validate() {
+fn previous_advert_window_names_still_load() {
     let _init_guard = zakura_test::init();
-    let config: Config =
-        toml::from_str("advert_delay_min = '25ms'\nadvert_delay_max = '500ms'").unwrap();
-    assert_eq!(config.advert_delay_min, Duration::from_millis(25));
-    assert_eq!(config.advert_delay_max, Duration::from_millis(500));
+    for (text, expected) in [
+        ("advert_window_min = 16\nadvert_window_max = 48", (16, 48)),
+        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
+        ("advert_window_max = 16", (16, 16)),
+        ("advert_window_min = 1001", (1001, 1001)),
+    ] {
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            (
+                config.advert_window_full_block,
+                config.advert_window_small_block
+            ),
+            expected,
+            "{text}"
+        );
+    }
+    assert!(
+        toml::from_str::<Config>("advert_window_min = 10\nadvert_window_max = 9").is_err(),
+        "the previous names keep the same validation"
+    );
+}
+
+#[test]
+fn advert_delay_roundtrips_and_validates() {
+    let _init_guard = zakura_test::init();
+    let config: Config = toml::from_str("advert_delay = '250ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(250));
     let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
     assert_eq!(config, roundtrip);
     let default: Config = toml::from_str("").unwrap();
-    assert_eq!(default.advert_delay_min, Duration::ZERO);
-    assert_eq!(default.advert_delay_max, Duration::ZERO);
-    for text in [
-        "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
-        "advert_delay_min = '-1s'",
-        "advert_delay_max = '-1s'",
-    ] {
-        assert!(toml::from_str::<Config>(text).is_err(), "{text}");
-    }
+    assert_eq!(default.advert_delay, Duration::from_millis(500));
+    assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
+}
+
+/// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
+/// the maximum becomes the delay, and the minimum is ignored.
+#[test]
+fn previous_advert_delay_names_load() {
+    let _init_guard = zakura_test::init();
+    let config: Config =
+        toml::from_str("advert_delay_min = '0s'\nadvert_delay_max = '500ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay_max = '0s'\nadvert_delay = '250ms'").unwrap();
+    assert_eq!(
+        config.advert_delay,
+        Duration::from_millis(250),
+        "the new name wins over the previous name"
+    );
+    let config: Config = toml::from_str("advert_delay_min = '25ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("advert_delay = "), "{serialized}");
+    assert!(!serialized.contains("advert_delay_m"), "{serialized}");
 }
 
 #[test]
@@ -1800,10 +1955,10 @@ fn invalid_advert_fanout_config_is_rejected() {
     let _init_guard = zakura_test::init();
 
     for (config, field) in [
-        ("advert_window_min = 0", "advert_window_min"),
+        ("advert_window_full_block = 0", "advert_window_full_block"),
         (
-            "advert_window_min = 10\nadvert_window_max = 9",
-            "advert_window_min",
+            "advert_window_full_block = 10\nadvert_window_small_block = 9",
+            "advert_window_full_block",
         ),
         (
             "advert_window_full_size_bytes = 0",

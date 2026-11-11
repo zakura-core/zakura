@@ -378,6 +378,29 @@ jobs:
           cargo test --locked -p zakura-chain balance_ignores_transfers
           cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
+  sprout-disabled:
+    name: consensus without sprout
+    needs: changes
+    # zakurad enables `sprout` by default, and workspace feature unification
+    # turns it on for zakura-consensus in the shared archive. Test the
+    # consensus crate on its own, where `sprout` is off, so the disabled path
+    # keeps coverage.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Test zakura-consensus without Sprout verification
+        run: cargo test --locked -p zakura-consensus
+
   network-dependent:
     name: network-dependent acceptance tests
     needs: changes
@@ -512,21 +535,29 @@ jobs:
   # unpatched simulator once, and applies each patch there in turn. Each
   # case rebuilds the patched simulator and runs a campaign of fuzz inputs,
   # which takes minutes, so the whole catalogue outgrew this job's limit.
-  # The job runs one of seven shards, picked by the UTC weekday, so each
-  # case runs once a week. A case's shard follows from its position, so
-  # adding or removing a case can move a later case's run by up to six
-  # nights. Each shard has its own failure issue, and only a passing run of
-  # that shard closes it, so the job stays out of test-success. It runs
-  # nightly and on manual dispatch, never on pull requests or pushes.
-  # scripts/sim-long-runs.sh runs the whole catalogue on a remote host.
+  # The catalogue splits into fourteen shards. Each night the job's two
+  # parts run the two shards the UTC weekday picks, so each case runs once
+  # a week. A case's shard follows from its position, so adding or removing
+  # a case can move a later case's run by up to six nights. Each shard has
+  # its own failure issue, and only a passing run of that shard closes it,
+  # so the job stays out of test-success. It runs nightly and on manual
+  # dispatch, never on pull requests or pushes. scripts/sim-long-runs.sh
+  # runs the whole catalogue on a remote host.
   sim-planted:
-    name: zakura_sim planted
+    name: zakura_sim planted ${{ matrix.part }}
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       issues: write
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    env:
+      # Seven weekdays times the matrix's two parts.
+      SHARDS: 14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -539,12 +570,14 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Pick tonight's shard
         id: shard
-        run: echo "index=$(date -u +%w)" >> "$GITHUB_OUTPUT"
+        run: echo "index=$((2 * $(date -u +%w) + PART))" >> "$GITHUB_OUTPUT"
+        env:
+          PART: ${{ matrix.part }}
       # The step's limit leaves the issue step time to run.
       - name: Check tonight's shard of the planted bypass patches
         id: planted
         timeout-minutes: 40
-        run: cargo xtask planted --shard "${SHARD}/7"
+        run: cargo xtask planted --shard "${SHARD}/${SHARDS}"
         env:
           RUSTFLAGS: --cfg zakura_sim
           SHARD: ${{ steps.shard.outputs.index }}
@@ -556,19 +589,19 @@ jobs:
           SHARD: ${{ steps.shard.outputs.index }}
           SHARD_RESULT: ${{ steps.planted.outcome }}
         run: |
-          issue_title="[nightly] zakura_sim planted shard ${SHARD}/7 failed"
+          issue_title="[nightly] zakura_sim planted shard ${SHARD}/${SHARDS} failed"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           issue_number="$(gh issue list --state open --search "\"${issue_title}\" in:title" --json number,title --jq ".[] | select(.title == \"${issue_title}\") | .number" | head -n 1)"
 
           if [[ "${SHARD_RESULT}" != "success" ]]; then
-            message="Planted shard ${SHARD}/7 failed: ${run_url}"
+            message="Planted shard ${SHARD}/${SHARDS} failed: ${run_url}"
             if [[ -n "${issue_number}" ]]; then
               gh issue comment "${issue_number}" --body "${message}"
             else
               gh issue create --title "${issue_title}" --body "${message}"
             fi
           elif [[ -n "${issue_number}" ]]; then
-            gh issue comment "${issue_number}" --body "Planted shard ${SHARD}/7 recovered: ${run_url}"
+            gh issue comment "${issue_number}" --body "Planted shard ${SHARD}/${SHARDS} recovered: ${run_url}"
             gh issue close "${issue_number}" --reason completed
           fi
 
@@ -783,6 +816,7 @@ jobs:
       - unit-tests
       - zakura-config
       - extended-reissuance-properties
+      - sprout-disabled
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -799,7 +833,7 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # These jobs are skipped outside their event or changed-path scope:
-          # build-tests / unit-tests / network-dependent skip on pull requests
+          # build-tests / unit-tests / sprout-disabled / network-dependent skip on pull requests
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
@@ -809,7 +843,7 @@ jobs:
           # this status and reaches report-nightly-result. sim-planted
           # reports to one failure issue per shard instead.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-disabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

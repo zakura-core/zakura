@@ -9,6 +9,9 @@
 //! point in every run. The node takes inbound dials through `quic.serve`
 //! and dials out through the public `ZakuraEndpoint::dial`.
 //!
+//! [`WireEndpoint`] is that endpoint and handler for any service set, so
+//! the discovery node (disc-2.1) runs behind the same transport and tap.
+//!
 //! The tap is the transport observer. It buffers each event, and the run
 //! drains the buffer at every observation into [`Observation::Transport`],
 //! checked through its checkpoint as reactor taps are. A connection's events
@@ -24,6 +27,7 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     mem,
     net::SocketAddr,
     sync::{
@@ -35,10 +39,10 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        HeaderCheck, HeaderSyncService, Service, ServiceRegistry, SessionStep, Transition,
-        TransportEvent, TransportObserver, ZakuraConnectionLimits, ZakuraEndpoint,
-        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle,
-        ZakuraTrace,
+        ConnectionProbe, ConnectionSample, HeaderCheck, HeaderSyncService, Service,
+        ServiceRegistry, SessionStep, Transition, TransportEvent, TransportObserver, ZakuraConnId,
+        ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
+        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
     },
     Config,
 };
@@ -53,14 +57,16 @@ use super::header_node::{session::SessionEvidence, HeaderNode};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
-    observe::{HeaderCheckFact, SessionStepFact, TransitionFact, TransportFact, TransportLimits},
-    peer::{key_index, peer_addr, peer_of, NODE_ADDR},
+    observe::{
+        HeaderCheckFact, KindLoad, SessionStepFact, TransitionFact, TransportFact, TransportLimits,
+    },
+    peer::{key_index, peer_addr, peer_of, SharedIds, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
 /// The node's network config: production defaults on the fixture's
 /// network.
-fn config(network: &Network) -> Config {
+pub(crate) fn config(network: &Network) -> Config {
     Config {
         network: network.clone(),
         ..Config::default()
@@ -68,17 +74,13 @@ fn config(network: &Network) -> Config {
 }
 
 /// The node's endpoint and the limits it dials with, once it's bound.
-type Bound = Option<(ZakuraEndpoint, ZakuraLocalLimits)>;
+pub(crate) type Bound = Option<(ZakuraEndpoint, ZakuraLocalLimits)>;
 
 /// The node under test on real QUIC.
 pub struct WireNode {
     /// The reactor, its port and its handle.
     pub header: HeaderNode,
-    seed: [u8; 32],
-    /// Set once the node serves.
-    endpoint: watch::Receiver<Bound>,
-    /// Where its failed dials go.
-    dials: DialReporter,
+    endpoint: WireEndpoint,
 }
 
 impl WireNode {
@@ -96,22 +98,153 @@ impl WireNode {
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
     ) -> Self {
-        let (bound, endpoint) = watch::channel(None);
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
-        let config = config(network);
+        let endpoint = WireEndpoint::spawn(
+            sim,
+            network,
+            net,
+            seed,
+            observer,
+            dials,
+            move |_, _| (vec![service], ()),
+            |_, _, ()| async {},
+        );
+        WireNode { header, endpoint }
+    }
+
+    /// [`WireEndpoint::dial`].
+    pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
+        self.endpoint.dial(sim, index, listening);
+    }
+}
+
+/// A node's endpoint on real QUIC: the handler in front of the node's
+/// service set, its transport tap's observer, and its dials.
+pub struct WireEndpoint {
+    seed: [u8; 32],
+    /// Set once the node serves.
+    endpoint: watch::Receiver<Bound>,
+    /// Where its failed dials go, if a tap reports them.
+    dials: Option<DialReporter>,
+}
+
+impl WireEndpoint {
+    /// Binds a node to [`NODE_ADDR`] on `net`, with the key and endpoint
+    /// inputs `seed` gives index 0, behind a handler that registers the
+    /// services `services` builds from the node's supervisor and limits, at
+    /// production limits on `network`, and reports to `observer`, with
+    /// failed dials to `dials`. Once the node serves, it runs `started` on
+    /// the endpoint, its limits and what `services` handed it, and keeps
+    /// what that returns for the run. All of it runs in the node's own root
+    /// task, so the handler draws its session-ID seed from the `Plan` at the
+    /// same point in every run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn<T, F, K>(
+        sim: &mut Sim,
+        network: &Network,
+        net: SimNet,
+        seed: [u8; 32],
+        observer: Arc<dyn TransportObserver>,
+        dials: DialReporter,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
+        WireEndpoint::spawn_at(
+            sim,
+            network,
+            net,
+            seed,
+            None,
+            observer,
+            Some(dials),
+            services,
+            started,
+        )
+    }
+
+    /// [`WireEndpoint::spawn`], binding the node at `index`: [`NODE_ADDR`]
+    /// with key 0 for `None`, or peer `i`'s first address,
+    /// [`peer_addr`]`(i, 0)`, with its key for `Some(i)`. A peer's failed
+    /// dials go to `dials` if given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_at<T, F, K>(
+        sim: &mut Sim,
+        network: &Network,
+        net: SimNet,
+        seed: [u8; 32],
+        index: Option<usize>,
+        observer: Arc<dyn TransportObserver>,
+        dials: Option<DialReporter>,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
+        WireEndpoint::spawn_configured(
+            sim,
+            config(network),
+            net,
+            seed,
+            index,
+            observer,
+            dials,
+            services,
+            started,
+        )
+    }
+
+    /// [`WireEndpoint::spawn_at`], with the node's network config `config`
+    /// in place of production defaults on its network.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_configured<T, F, K>(
+        sim: &mut Sim,
+        config: Config,
+        net: SimNet,
+        seed: [u8; 32],
+        index: Option<usize>,
+        observer: Arc<dyn TransportObserver>,
+        dials: Option<DialReporter>,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
+        let (addr, key) = index.map_or((NODE_ADDR, 0), |index| {
+            (peer_addr(index, 0), key_index(index))
+        });
+        let (bound, endpoint) = watch::channel(None);
         sim.scheduler().spawn_root("wire-node", async move {
             let limits = ZakuraLocalLimits::from_config(&config);
             let quic = QuicEndpoint::bind_with(
-                SeededInputs::node_key(seed, 0),
-                &limits.quic_bind_config(vec![NODE_ADDR]),
+                SeededInputs::node_key(seed, key),
+                &limits.quic_bind_config(vec![addr]),
                 &limits.quic,
                 net,
-                SeededInputs::new(seed, 0).endpoint_inputs(),
+                SeededInputs::new(seed, key).endpoint_inputs(),
             )
             .expect("the node binds its address");
-            let registry = ServiceRegistry::new(vec![service]).expect("header sync registers");
+            let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
+            let (services, handed) = services(&supervisor, &limits);
+            let registry = ServiceRegistry::new(services).expect("the node's services register");
             let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
-                ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip),
+                supervisor,
                 config.network.clone(),
                 ZakuraHandshakeConfig::for_network(&config.network),
                 limits.clone(),
@@ -121,16 +254,23 @@ impl WireNode {
             .with_local_node_id(quic.local_id())
             .with_transport_observer(observer);
             quic.serve(handler.clone()).expect("the node serves");
-            bound.send_replace(Some((ZakuraEndpoint::new(quic, handler), limits)));
-            // The endpoint lives as long as the run.
+            let endpoint = ZakuraEndpoint::new(quic, handler);
+            bound.send_replace(Some((endpoint.clone(), limits.clone())));
+            // What the node started, and the endpoint, live as long as the
+            // run.
+            let _started = started(endpoint, limits, handed).await;
             std::future::pending::<()>().await;
         });
-        WireNode {
-            header,
+        WireEndpoint {
             seed,
             endpoint,
             dials,
         }
+    }
+
+    /// The endpoint and its limits, once it serves.
+    pub(crate) fn bound(&self) -> watch::Receiver<Bound> {
+        self.endpoint.clone()
     }
 
     /// Spawns a task that dials peer `index` once the node serves and
@@ -156,7 +296,9 @@ impl WireNode {
             let (endpoint, limits) = bound.expect("the wait returns a bound node");
             // A connection's own events show how it went once it registers.
             if let Err(error) = endpoint.dial(target, &limits).await {
-                dials.report(remote, error.to_string());
+                if let Some(dials) = dials {
+                    dials.report(remote, error.to_string());
+                }
             }
         });
     }
@@ -191,6 +333,24 @@ pub struct TransportTap {
     peers: Vec<String>,
     /// Each registered connection's remote address.
     remotes: BTreeMap<u64, SocketAddr>,
+    /// Where it hands over the shared ID of each `registered` and
+    /// `handshake-refused` event it logs.
+    shared_ids: SharedIds,
+    /// The end it reads.
+    role: TapRole,
+    /// The last load it logged for each connection it samples.
+    loads: BTreeMap<u64, TransportFact>,
+}
+
+/// The end of its connections a [`TransportTap`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapRole {
+    /// The node under test: it logs [`Observation::Transport`] rows, each
+    /// admitted session's [`Observation::Session`] row, and opens loss on
+    /// each session's links.
+    Node,
+    /// A peer: it logs [`Observation::PeerTransport`] rows and nothing more.
+    Peer,
 }
 
 /// What the observer and the reader share.
@@ -205,6 +365,11 @@ struct TapState {
     buffer: Mutex<Buffer>,
     /// The node's session view, fed each transport event as it's reported.
     sessions: Option<SessionEvidence>,
+    /// Whether the tap samples each connection's resources and logs its
+    /// shared ID (sim-9.3).
+    sampling: bool,
+    /// Each registered connection's resource probe, in registration order.
+    probes: Mutex<Vec<(u64, ConnectionProbe)>>,
 }
 
 /// Events reported and not yet drained.
@@ -222,6 +387,10 @@ enum Reported {
     Event(TransportEvent),
     /// A dial to `remote` failed with `error`.
     DialFailed { remote: SocketAddr, error: String },
+    /// Connection `conn_id`'s shared ID, right after its registration.
+    SharedId { conn_id: u64, id: [u8; 16] },
+    /// Connection `conn_id`'s resources changed to `load`.
+    Load { conn_id: u64, load: TransportFact },
 }
 
 impl TapState {
@@ -242,13 +411,37 @@ impl TapState {
         if let (Some(sessions), Reported::Event(event)) = (&self.sessions, &event) {
             sessions.transport(event);
         }
+        let shared = match &event {
+            Reported::Event(TransportEvent::Registered {
+                conn_id, shared_id, ..
+            }) if self.sampling => Some(Reported::SharedId {
+                conn_id: *conn_id,
+                id: *shared_id,
+            }),
+            _ => None,
+        };
         let mut buffer = self.buffer();
-        buffer.last = buffer
-            .last
-            .checked_add(1)
-            .expect("a run reports fewer than 2^64 events");
-        let seq = buffer.last;
-        buffer.events.push((seq, event));
+        for event in std::iter::once(event).chain(shared) {
+            buffer.last = buffer
+                .last
+                .checked_add(1)
+                .expect("a run reports fewer than 2^64 events");
+            let seq = buffer.last;
+            buffer.events.push((seq, event));
+        }
+    }
+
+    /// Keeps connection `conn_id`'s probe, or refuses it outside the tap's
+    /// run, as [`TapState::push`] does.
+    fn probe(&self, conn_id: u64, probe: ConnectionProbe) {
+        if zakura_rt::sim::run_id() != Some(self.run) {
+            self.refused.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((conn_id, probe));
     }
 }
 
@@ -285,6 +478,11 @@ impl TransportObserver for TapObserver {
     fn observe(&self, event: TransportEvent) {
         self.0.push(Reported::Event(event));
     }
+
+    /// Keeps `probe` for the tap's samples, as [`TapState::probe`] does.
+    fn connection(&self, conn_id: ZakuraConnId, probe: ConnectionProbe) {
+        self.0.probe(conn_id, probe);
+    }
 }
 
 impl TransportTap {
@@ -319,6 +517,51 @@ impl TransportTap {
         peers: Vec<String>,
         sessions: Option<SessionEvidence>,
     ) -> (Arc<dyn TransportObserver>, TransportTap) {
+        TransportTap::tap(sim, node, net, peers, sessions, TapRole::Node, false)
+    }
+
+    /// [`TransportTap::new`], also sampling each connection's resources
+    /// after every step into a `load` row when they change, and logging each
+    /// connection's shared ID after its registration (sim-9.3).
+    ///
+    /// # Panics
+    ///
+    /// As [`TransportTap::new`] does.
+    pub fn sampling(
+        sim: &mut Sim,
+        node: &str,
+        net: Net,
+        peers: Vec<String>,
+    ) -> (Arc<dyn TransportObserver>, TransportTap) {
+        TransportTap::tap(sim, node, net, peers, None, TapRole::Node, true)
+    }
+
+    /// A sampling tap on the transport of the peer named `peer`, which logs
+    /// [`Observation::PeerTransport`] rows and no session rows, and opens no
+    /// links (sim-9.3). Returns the observer, for the peer's handler and
+    /// nothing else, and the reader.
+    ///
+    /// # Panics
+    ///
+    /// Outside a run, which can't happen while `sim` exists.
+    pub fn of_peer(
+        sim: &mut Sim,
+        peer: &str,
+        net: Net,
+    ) -> (Arc<dyn TransportObserver>, TransportTap) {
+        TransportTap::tap(sim, peer, net, Vec::new(), None, TapRole::Peer, true)
+    }
+
+    /// A tap of `role` on the transport of the endpoint named `node`.
+    fn tap(
+        sim: &mut Sim,
+        node: &str,
+        net: Net,
+        peers: Vec<String>,
+        sessions: Option<SessionEvidence>,
+        role: TapRole,
+        sampling: bool,
+    ) -> (Arc<dyn TransportObserver>, TransportTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
@@ -327,20 +570,27 @@ impl TransportTap {
                 refused: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 sessions,
+                sampling,
+                probes: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
         let live: Weak<dyn LiveEvidence> = Arc::<TapState>::downgrade(&state);
-        let checkpoint = Checkpoint::new(
-            EvidenceKind::Transport {
+        let kind = match role {
+            TapRole::Node => EvidenceKind::Transport {
                 node: node.to_owned(),
             },
-            live,
-        );
+            TapRole::Peer => EvidenceKind::PeerTransport {
+                peer: node.to_owned(),
+            },
+        };
+        let checkpoint = Checkpoint::new(kind, live);
         let id = sim.register(checkpoint.clone());
         // Session rows name no tap, so the checkpoint covers them only
-        // while the run holds one.
-        assert_eq!(id.index, 0, "a run taps one node's transport");
+        // while the run holds one node tap.
+        if role == TapRole::Node {
+            assert_eq!(id.index, 0, "a run taps one node's transport");
+        }
         let tap = TransportTap {
             state,
             checkpoint,
@@ -350,13 +600,41 @@ impl TransportTap {
             net,
             peers,
             remotes: BTreeMap::new(),
+            shared_ids: SharedIds::default(),
+            role,
+            loads: BTreeMap::new(),
         };
         (observer, tap)
+    }
+
+    /// Buffers a `load` row for each probed connection whose resources
+    /// changed since the row last logged for it, read inside a boundary
+    /// read.
+    fn sample(&mut self) {
+        let probes = self
+            .state
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for (conn_id, probe) in probes {
+            let load = load(&zakura_rt::sim::boundary_read(|| probe.read()));
+            if self.loads.get(&conn_id) != Some(&load) {
+                self.loads.insert(conn_id, load.clone());
+                self.state.push(Reported::Load { conn_id, load });
+            }
+        }
     }
 
     /// The reporter the wire node's dials fail into.
     pub fn dials(&self) -> DialReporter {
         DialReporter(self.state.clone())
+    }
+
+    /// Where it hands over the shared ID of each `registered` and
+    /// `handshake-refused` event it logs, for the peers' evidence.
+    pub(crate) fn shared_ids(&self) -> SharedIds {
+        self.shared_ids.clone()
     }
 
     /// The remote address of registered connection `conn_id`.
@@ -374,16 +652,29 @@ impl TransportTap {
             .ok_or_else(|| format!("AmbiguousIdentity: no peer binds {remote}"))
     }
 
-    /// `event` as its connection, remote address and plain fields. A
-    /// `registered` event records its connection's address first.
+    /// `event`, numbered `seq`, as its connection, remote address and plain
+    /// fields. A `registered` event records its connection's address first.
+    /// It and a `handshake-refused` event hand over their shared ID.
     fn fact(
         &mut self,
+        seq: u64,
         event: Reported,
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
         let event = match event {
             Reported::Event(event) => event,
             Reported::DialFailed { remote, error } => {
                 return Ok((None, remote, TransportFact::DialFailed { error }));
+            }
+            Reported::SharedId { conn_id, id } => {
+                let id = id.iter().map(|byte| format!("{byte:02x}")).collect();
+                return Ok((
+                    Some(conn_id),
+                    self.remote(conn_id)?,
+                    TransportFact::SharedId { id },
+                ));
+            }
+            Reported::Load { conn_id, load } => {
+                return Ok((Some(conn_id), self.remote(conn_id)?, load));
             }
         };
         Ok(match event {
@@ -401,15 +692,25 @@ impl TransportTap {
                     negotiated,
                 },
             ),
-            TransportEvent::HandshakeRefused { remote, reason } => {
+            TransportEvent::HandshakeRefused {
+                remote,
+                shared_id,
+                reason,
+            } => {
+                self.shared_ids.borrow_mut().insert(seq, shared_id);
                 (None, remote, TransportFact::HandshakeRefused { reason })
             }
-            TransportEvent::Registered { conn_id, remote } => {
+            TransportEvent::Registered {
+                conn_id,
+                remote,
+                shared_id,
+            } => {
                 if self.remotes.insert(conn_id, remote).is_some() {
                     return Err(format!(
                         "AmbiguousIdentity: connection {conn_id} registered twice"
                     ));
                 }
+                self.shared_ids.borrow_mut().insert(seq, shared_id);
                 (Some(conn_id), remote, TransportFact::Registered)
             }
             TransportEvent::Admitted {
@@ -552,6 +853,30 @@ impl TransportTap {
     }
 }
 
+/// `sample` as a `load` row. A connection whose QUIC handles are gone
+/// reads as zero load.
+fn load(sample: &ConnectionSample) -> TransportFact {
+    let quic = sample.quic.as_ref();
+    TransportFact::Load {
+        receive_window: sample.receive_window,
+        data_blocked: quic.map_or(0, |load| load.frame_rx.data_blocked),
+        stream_data_blocked: quic.map_or(0, |load| load.frame_rx.stream_data_blocked),
+        queued_send_bytes: quic.map_or(0, |load| load.queued_send_bytes),
+        send_blocked_streams: quic.map_or(0, |load| load.send_blocked_streams),
+        kinds: sample
+            .kinds
+            .iter()
+            .map(|kind| KindLoad {
+                kind: kind.kind,
+                raw_held: kind.raw_held,
+                raw_capacity: kind.raw_capacity,
+                output_held: kind.output_held,
+                output_capacity: kind.output_capacity,
+            })
+            .collect(),
+    }
+}
+
 /// `step` in plain fields.
 fn session_step(step: SessionStep) -> SessionStepFact {
     match step {
@@ -678,6 +1003,12 @@ fn transition(transition: Transition) -> Result<TransitionFact, String> {
             objects,
             bytes,
         },
+        Transition::CommitmentCounted { seq, message_type } => {
+            TransitionFact::CommitmentCounted { seq, message_type }
+        }
+        Transition::CommitmentReleased { message_type } => {
+            TransitionFact::CommitmentReleased { message_type }
+        }
         unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
     })
 }
@@ -705,11 +1036,27 @@ impl ActionSource for TransportTap {
         if log.run() != self.id.run {
             return Err("ForeignRun: transport tap registered with another run".to_owned());
         }
+        if self.state.sampling {
+            self.sample();
+        }
         let events = mem::take(&mut self.state.buffer().events);
         let last = events.last().map_or(self.delivered, |(seq, _)| *seq);
         let mut sent = Vec::with_capacity(events.len());
         for (seq, event) in events {
-            let (connection, remote, event) = self.fact(event)?;
+            let (connection, remote, event) = self.fact(seq, event)?;
+            if self.role == TapRole::Peer {
+                let obs = Observation::PeerTransport {
+                    instance: self.id.index,
+                    seq,
+                    peer: self.node.clone(),
+                    connection,
+                    remote: remote.to_string(),
+                    event,
+                };
+                log.push(obs.clone());
+                sent.push(obs);
+                continue;
+            }
             let session = match (&event, connection) {
                 (
                     TransportFact::Admitted {

@@ -22,6 +22,11 @@
 //! labelled by the same models and by the content labeller, and the node's
 //! evidence judges each at the reader stage that decides it ([`stage`]).
 //!
+//! A peer with a [`DiscoveryScript`] runs it on a negotiated discovery
+//! stream (disc-2.2, [`discovery`]). Its frames there are labelled by
+//! discovery's role models and logged as on a header stream, and the frames
+//! it reads as `PeerReceived`s, with no `NodeFrame`.
+//!
 //! Actions follow M4's `Control` pattern. [`PeerControl`] offers a peer's
 //! next action as `peer:<name>:<action>` only while the peer is settled and
 //! idle, so the `Plan` picks when it happens, `execute` only queues it, and
@@ -31,6 +36,7 @@
 pub mod adapter;
 pub mod adversary;
 mod content;
+pub mod discovery;
 mod evidence;
 pub(crate) mod handshake;
 pub mod honest;
@@ -38,13 +44,16 @@ pub mod limit;
 mod stage;
 
 use std::{
-    cell::Cell,
-    collections::BTreeMap,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+    },
     time::Duration,
 };
 
@@ -52,8 +61,8 @@ use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
     v9::{Cursor, Headers, Message, Operation, RegtestMessage},
     wire_codec::{decode_frame, encode_frame},
-    Frame, P2P_V2_ALPN, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    ZAKURA_STREAM_HEADER_SYNC,
+    DiscoveryMessage, Frame, Stream, P2P_V2_ALPN, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_quic::{
     sim::{SeededInputs, SimNet},
@@ -66,10 +75,11 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote, SharedIds};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
+    discovery::{DiscoveryAct, DiscoveryPeer, DiscoveryScript, Request},
     evidence::WireEvidence,
     handshake::{Echo, Local},
     honest::{Honest, HonestChain, HonestSpec},
@@ -177,6 +187,11 @@ pub struct PeerSpec {
     /// serialized scenario when false, so saved ones keep their form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalid_tip: bool,
+    /// If set, it runs this script on the discovery stream its handshake
+    /// negotiates. Left out of a serialized scenario when unset, so saved
+    /// ones keep their form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryScript>,
 }
 
 impl PeerSpec {
@@ -190,6 +205,7 @@ impl PeerSpec {
             honest: None,
             adversary: None,
             invalid_tip: false,
+            discovery: None,
         }
     }
 
@@ -199,6 +215,14 @@ impl PeerSpec {
             dialer: Dialer::Node,
             ..PeerSpec::dialing()
         }
+    }
+
+    /// True if the peer's script holds a discovery act, so it's an
+    /// adversary on its discovery stream.
+    pub fn discovers_adversarially(&self) -> bool {
+        self.script
+            .iter()
+            .any(|action| matches!(action, PeerAction::Discover { .. }))
     }
 
     /// True if the peer is `HonestPeer`: it runs the honest script on a
@@ -249,6 +273,17 @@ pub enum PeerAction {
         /// The act.
         act: Act,
     },
+    /// Sends `request` on the peer's discovery stream.
+    Ask {
+        /// The request.
+        request: Request,
+    },
+    /// A discovery act on the peer's discovery stream, offered once the
+    /// stream holds the state it needs.
+    Discover {
+        /// The act.
+        act: DiscoveryAct,
+    },
 }
 
 impl PeerAction {
@@ -262,6 +297,8 @@ impl PeerAction {
             PeerAction::Redial => "redial",
             PeerAction::Grant => "grant",
             PeerAction::Act { act } => act.name(),
+            PeerAction::Ask { request } => request.name(),
+            PeerAction::Discover { act } => act.name(),
         }
     }
 }
@@ -363,6 +400,8 @@ impl Slot {
 /// while that peer is ready for it.
 pub struct PeerControl {
     slots: Vec<Slot>,
+    /// Whether it logged the scripts' acts yet.
+    acts_logged: bool,
     failure: PeerFailure,
     /// What the peers' tasks recorded, until the identity map places it.
     records: PeerRecords,
@@ -370,14 +409,28 @@ pub struct PeerControl {
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`, and the peers' tasks
-    /// record into `records`.
-    pub(crate) fn new(failure: PeerFailure, records: PeerRecords) -> Self {
+    /// No peers yet. Failures land in `failure`, the peers' tasks record
+    /// into `records`, and the transport tap hands over each connection's
+    /// shared ID in `shared_ids`.
+    pub(crate) fn new(failure: PeerFailure, records: PeerRecords, shared_ids: SharedIds) -> Self {
         PeerControl {
             slots: Vec::new(),
+            acts_logged: false,
             failure,
             records,
-            evidence: WireEvidence::default(),
+            evidence: WireEvidence::new(shared_ids),
+        }
+    }
+
+    /// Also logs the peers' frames on `stream`, discovery's, which the
+    /// evidence judges none of.
+    pub(crate) fn with_discovery(self, stream: &Stream) -> Self {
+        PeerControl {
+            evidence: self.evidence.with_discovery(StreamId {
+                kind: stream.kind,
+                version: stream.version,
+            }),
+            ..self
         }
     }
 
@@ -449,6 +502,20 @@ impl ActionSource for PeerControl {
     /// source is added after the transport tap, so the identity rows it
     /// reads are logged first.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if !std::mem::replace(&mut self.acts_logged, true) {
+            let acts: Vec<String> = self
+                .slots
+                .iter()
+                .flat_map(|slot| &slot.script)
+                .filter_map(|action| match action {
+                    PeerAction::Act { act } => Some(act.name().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            if !acts.is_empty() {
+                log.push(crate::Observation::ActsScripted { acts });
+            }
+        }
         let observed = self.evidence.observe(&self.records, log);
         if let Some(failure) = self.failure.get() {
             return Err(format!("PeerActionFailed: {failure}"));
@@ -478,10 +545,19 @@ pub(crate) struct PeerTask {
     pub(crate) chain: Option<Arc<HonestChain>>,
     /// Where it records its frames.
     pub(crate) records: PeerRecords,
+    /// The peers that closed their own connection, by index, which this one
+    /// joins when it takes a scripted close.
+    pub(crate) closed: PeerCloses,
     /// How many scripted actions it has taken, so its next is
     /// `spec.script[taken]`.
     pub(crate) taken: usize,
 }
+
+/// The peers that closed their own connection with a scripted
+/// [`PeerAction::Close`] or [`PeerAction::Disconnect`], by index. Shared by
+/// the peers' tasks and the harness, which reads it as the environment's
+/// end of a peer's membership.
+pub(crate) type PeerCloses = Rc<RefCell<BTreeSet<usize>>>;
 
 /// How a connection's service ended.
 enum Ended {
@@ -495,8 +571,10 @@ enum Ended {
 enum StreamEvent {
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
-    /// A whole frame from the node arrived on header stream `id`, read at
-    /// `at` since the run's start.
+    /// The node opened a discovery stream: the peer's half to write on.
+    Discovery { id: u64, send: SendStream },
+    /// A whole frame from the node arrived on header or discovery stream
+    /// `id`, read at `at` since the run's start.
     Frame { id: u64, frame: Frame, at: Duration },
 }
 
@@ -599,15 +677,20 @@ impl Crafted {
 
     /// The header and payload bytes, as written.
     fn bytes(&self) -> Vec<u8> {
-        // Crafted lengths stay far below 4 GiB.
-        let len = u32::try_from(self.header.payload_len).expect("a crafted payload fits u32");
-        let mut bytes = Vec::with_capacity(8 + self.payload.len());
-        bytes.extend(self.header.message_type.to_le_bytes());
-        bytes.extend(self.header.flags.to_le_bytes());
-        bytes.extend(len.to_le_bytes());
-        bytes.extend(&self.payload);
-        bytes
+        frame_bytes(&self.header, &self.payload)
     }
+}
+
+/// `header`'s 8 bytes, then `payload`, as a peer writes them.
+fn frame_bytes(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
+    // Written lengths stay far below 4 GiB.
+    let len = u32::try_from(header.payload_len).expect("a written payload fits u32");
+    let mut bytes = Vec::with_capacity(8 + payload.len());
+    bytes.extend(header.message_type.to_le_bytes());
+    bytes.extend(header.flags.to_le_bytes());
+    bytes.extend(len.to_le_bytes());
+    bytes.extend(payload);
+    bytes
 }
 
 /// One header stream's role models, which label each frame a peer sends
@@ -772,6 +855,7 @@ impl StreamModels {
                 // A frame's declared length is under 4 GiB.
                 payload: header.payload_len as u64,
                 prepares,
+                asks: None,
             }],
         }
     }
@@ -938,7 +1022,7 @@ fn credit(message: &RegtestMessage) -> Option<PeerCredit> {
     }
 }
 
-/// The header stream a peer writes on.
+/// A header or discovery stream a peer writes on.
 struct HeaderStream {
     id: u64,
     send: SendStream,
@@ -951,17 +1035,36 @@ fn bind_config(addr: SocketAddr) -> QuicBindConfig {
         max_bidi_streams: 16,
         max_connections: 16,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 16,
     }
 }
 
 /// Hands each connection the node opens to the peer's task, and holds it
-/// until it closes.
-struct Forward(mpsc::Sender<Conn>);
+/// until it closes. It holds one at a time.
+struct Forward {
+    to_task: mpsc::Sender<Conn>,
+    /// Connections handed over and not closed yet.
+    live: Arc<AtomicUsize>,
+}
+
+/// Counts one live connection of a [`Forward`] until dropped.
+struct Live(Arc<AtomicUsize>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl Acceptor for Forward {
-    /// Accepts every attempt.
-    fn admit(&self, _: &IncomingInfo) -> Admit {
+    /// Accepts an attempt while no other is in its handshake or live, and
+    /// refuses it otherwise. So the connections the node opens reach the
+    /// peer's task one after another, since it serves one at a time.
+    fn admit(&self, incoming: &IncomingInfo) -> Admit {
+        if incoming.pending_total > 0 || self.live.load(Ordering::SeqCst) > 0 {
+            return Admit::Refuse;
+        }
         Admit::Accept
     }
 
@@ -970,10 +1073,14 @@ impl Acceptor for Forward {
         vec![P2P_V2_ALPN.to_vec()]
     }
 
-    /// Forwards the connection, then holds it until it closes.
+    /// Counts the connection live before the endpoint drops its pending
+    /// handshake, forwards it, then holds it until it closes.
     fn handle(&self, conn: Conn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let forward = self.0.clone();
+        let forward = self.to_task.clone();
+        self.live.fetch_add(1, Ordering::SeqCst);
+        let live = Live(self.live.clone());
         Box::pin(async move {
+            let _live = live;
             if forward.send(conn.clone()).await.is_ok() {
                 conn.closed().await;
             }
@@ -981,11 +1088,16 @@ impl Acceptor for Forward {
     }
 }
 
-/// Reads frames from the node on header stream `id` until it ends, and
-/// forwards each whole one. Every read is drained, so the node's writer
-/// never stalls on this peer.
-async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSender<StreamEvent>) {
-    let cap = usize::try_from(RegtestMessage::LAYOUT[0].frame_cap).unwrap_or(usize::MAX);
+/// Reads frames of at most `cap` bytes from the node on stream `id` until
+/// it ends, and forwards each whole one. Every read is drained, so the
+/// node's writer never stalls on this peer.
+async fn read_frames(
+    id: u64,
+    mut recv: RecvStream,
+    cap: u32,
+    events: mpsc::UnboundedSender<StreamEvent>,
+) {
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     loop {
         let mut header = [0; 8];
         if recv.read_exact(&mut header).await.is_err() {
@@ -1019,21 +1131,35 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
 }
 
 /// Serves one stream the node opened on peer `name`'s connection: a header
-/// stream goes to the peer and is read, and any other is held and drained
-/// until it ends. A header stream at a version the peer doesn't speak fails
-/// the run through `failure` instead, since the node only opens the version
-/// it negotiated.
+/// stream goes to the peer and is read, and so does a `discovery` stream,
+/// if the peer runs a discovery script. Any other is held and drained until it ends. A header or
+/// discovery stream at a version the peer doesn't speak fails the run
+/// through `failure` instead, since the node only opens the version it
+/// negotiated.
 async fn serve_stream(
     send: SendStream,
     mut recv: RecvStream,
     events: mpsc::UnboundedSender<StreamEvent>,
+    discovery: Option<Stream>,
     name: String,
     failure: PeerFailure,
 ) {
     let Ok(prelude) = handshake::read_prelude(&mut recv).await else {
         return;
     };
-    if prelude.stream_kind == ZAKURA_STREAM_HEADER_SYNC {
+    if let Some(stream) = discovery.filter(|stream| prelude.stream_kind == stream.kind) {
+        let id = recv.id();
+        if prelude.stream_version != stream.version {
+            failure.record(format!(
+                "{name}: the node opened discovery stream {id} at version {}, not {}",
+                prelude.stream_version, stream.version
+            ));
+            return;
+        }
+        if events.send(StreamEvent::Discovery { id, send }).is_ok() {
+            read_frames(id, recv, stream.frame_cap, events).await;
+        }
+    } else if prelude.stream_kind == ZAKURA_STREAM_HEADER_SYNC {
         let id = recv.id();
         if prelude.stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION {
             failure.record(format!(
@@ -1044,7 +1170,7 @@ async fn serve_stream(
             return;
         }
         if events.send(StreamEvent::Header { id, send }).is_ok() {
-            read_frames(id, recv, events).await;
+            read_frames(id, recv, RegtestMessage::LAYOUT[0].frame_cap, events).await;
         }
     } else {
         let _held = send;
@@ -1053,23 +1179,33 @@ async fn serve_stream(
 }
 
 /// Accepts every stream the node opens on peer `name`'s `conn`, each in its
-/// own task, with failures going to `failure`.
+/// own task, with failures going to `failure`. A `discovery` stream goes to
+/// the peer as [`serve_stream`] says.
 async fn accept_streams(
     conn: Conn,
     events: mpsc::UnboundedSender<StreamEvent>,
+    discovery: Option<Stream>,
     name: String,
     failure: PeerFailure,
 ) {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let stream = serve_stream(send, recv, events.clone(), name.clone(), failure.clone());
+        let stream = serve_stream(
+            send,
+            recv,
+            events.clone(),
+            discovery,
+            name.clone(),
+            failure.clone(),
+        );
         zakura_rt::task::spawn_named("peer_stream", stream);
     }
 }
 
-/// The scripts a peer runs on its header streams.
+/// The scripts a peer runs on its header and discovery streams.
 struct Scripts {
     honest: Option<Honest>,
     adversary: Option<Adversary>,
+    discovery: Option<DiscoveryPeer>,
 }
 
 impl Scripts {
@@ -1087,7 +1223,13 @@ impl Scripts {
 
 impl PeerTask {
     /// Runs the peer until the run ends.
-    pub(crate) async fn run(mut self) {
+    pub(crate) async fn run(self) {
+        self.run_with(None).await;
+    }
+
+    /// Runs the peer until the run ends, with `discovery`'s stream, the one
+    /// `DiscoveryService::streams()` declares, for its discovery script.
+    pub(crate) async fn run_with(mut self, discovery: Option<Stream>) {
         let local = Local::regtest();
         let adversary = self.spec.adversary.clone().map(Adversary::new);
         let (announce, serve) = adversary.as_ref().map_or((true, true), |adversary| {
@@ -1103,7 +1245,28 @@ impl PeerTask {
             .script
             .iter()
             .any(|action| matches!(action, PeerAction::Act { .. }));
-        let mut scripts = Scripts { honest, adversary };
+        let discovery = match (self.spec.discovery.clone(), discovery) {
+            (Some(script), Some(stream)) => {
+                let secret = SeededInputs::node_key(self.seed, key_index(self.index));
+                match DiscoveryPeer::new(stream, script, secret, peer_addr(self.index, 0)) {
+                    Ok(peer) => Some(peer),
+                    Err(why) => {
+                        self.fail(why);
+                        return std::future::pending().await;
+                    }
+                }
+            }
+            (Some(_), None) => {
+                self.fail("a discovery script needs discovery's stream");
+                return std::future::pending().await;
+            }
+            (None, _) => None,
+        };
+        let mut scripts = Scripts {
+            honest,
+            adversary,
+            discovery,
+        };
         match self.spec.dialer {
             _ if scripts.adversary.is_some() && scripts.honest.is_none() => {
                 self.fail("an adversary needs an honest chain");
@@ -1158,7 +1321,10 @@ impl PeerTask {
             else {
                 return;
             };
-            let remote = peer_addr(self.index, dial);
+            let remote = Remote {
+                addr: peer_addr(self.index, dial),
+                shared_id: conn.shared_id(),
+            };
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
                 return;
             }
@@ -1187,9 +1353,12 @@ impl PeerTask {
     /// Listens for the node's dials, and answers each one's handshake.
     async fn listen(&mut self, local: &Local, scripts: &mut Scripts) {
         let quic = self.bind(0);
-        let (forward, mut incoming) = mpsc::channel(4);
-        quic.serve(Forward(forward))
-            .expect("a peer's endpoint serves");
+        let (to_task, mut incoming) = mpsc::channel(4);
+        quic.serve(Forward {
+            to_task,
+            live: Arc::default(),
+        })
+        .expect("a peer's endpoint serves");
         self.listening.send_replace(true);
         let echo = if self.spec.bad_nonce_echo {
             Echo::Wrong
@@ -1197,14 +1366,15 @@ impl PeerTask {
             Echo::Faithful
         };
         while let Some(conn) = incoming.recv().await {
+            let remote = Remote {
+                addr: peer_addr(self.index, 0),
+                shared_id: conn.shared_id(),
+            };
             let answered =
                 handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
                     .await;
             let ended = match answered {
-                Ok(negotiated) => {
-                    self.serve(&conn, negotiated, peer_addr(self.index, 0), scripts)
-                        .await
-                }
+                Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {
                     conn.closed().await;
                     Ended::Closed
@@ -1218,7 +1388,7 @@ impl PeerTask {
 
     /// Records `body` on `remote`'s QUIC stream `quic_stream`, for
     /// [`PeerControl`] to place.
-    fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
+    fn record(&self, remote: Remote, quic_stream: u64, body: RecordBody) {
         self.records.borrow_mut().push_back(PeerRecord {
             remote,
             quic_stream,
@@ -1231,7 +1401,7 @@ impl PeerTask {
     /// False once a write fails, which leaves the rest unwritten.
     async fn write(
         &self,
-        remote: SocketAddr,
+        remote: Remote,
         stream: &mut HeaderStream,
         frames: Vec<Outgoing>,
     ) -> bool {
@@ -1259,18 +1429,22 @@ impl PeerTask {
     /// it's idle and settled: no header stream is expected, or the node's
     /// first frame has arrived on it, which the node sends once it admits
     /// the session, and the honest script, if it runs one, is settled too.
+    /// The same holds for a discovery stream, if the peer runs a discovery
+    /// script and the handshake negotiated discovery.
     async fn serve(
         &mut self,
         conn: &Conn,
         negotiated: u64,
-        remote: SocketAddr,
+        remote: Remote,
         scripts: &mut Scripts,
     ) -> Ended {
         let header_sync = negotiated & ZAKURA_CAP_HEADER_SYNC != 0;
+        let discovers = negotiated & ZAKURA_CAP_DISCOVERY != 0 && scripts.discovery.is_some();
         let (events, mut stream_events) = mpsc::unbounded_channel();
         let accept = accept_streams(
             conn.clone(),
             events.clone(),
+            scripts.discovery.as_ref().map(DiscoveryPeer::stream),
             self.name.clone(),
             self.failure.clone(),
         );
@@ -1294,7 +1468,8 @@ impl PeerTask {
                 return Ended::Closed;
             }
             let id = send.id();
-            zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, events.clone()));
+            let cap = RegtestMessage::LAYOUT[0].frame_cap;
+            zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, cap, events.clone()));
             reads.insert(id, 0);
             let mut stream = HeaderStream { id, send };
             if let Some(honest) = scripts.honest.as_mut() {
@@ -1305,20 +1480,74 @@ impl PeerTask {
             }
             header = Some(stream);
         }
+        // The discovery stream the peer writes on, and whether it's settled.
+        let mut discovery: Option<HeaderStream> = None;
+        let mut discovery_settled = !discovers;
+        if discovers && self.spec.dialer == Dialer::Peer {
+            let script = scripts
+                .discovery
+                .as_mut()
+                .expect("the peer runs a discovery script");
+            let layout = script.stream();
+            let Ok((mut send, recv)) = conn.open_bi().await else {
+                return Ended::Closed;
+            };
+            if handshake::write_prelude(&mut send, layout.kind, layout.version)
+                .await
+                .is_err()
+            {
+                return Ended::Closed;
+            }
+            let id = send.id();
+            zakura_rt::task::spawn_named(
+                "peer_discovery",
+                read_frames(id, recv, layout.frame_cap, events.clone()),
+            );
+            reads.insert(id, 0);
+            let mut stream = HeaderStream { id, send };
+            let frames = script.start();
+            if !self.write(remote, &mut stream, frames).await {
+                return Ended::Closed;
+            }
+            discovery = Some(stream);
+        }
+        // Every discovery stream the node opened or the peer opened, so
+        // their frames are read as discovery's.
+        let mut discovery_ids = BTreeSet::new();
+        discovery_ids.extend(discovery.as_ref().map(|stream| stream.id));
         loop {
             let now = Instant::now();
             let next = self.spec.script.get(self.taken).copied();
             let wake = scripts.wake(next);
-            let ready =
-                settled && (scripts.honest.is_none() || wake.is_some_and(|wake| now >= wake));
+            let discovery_ready = match next {
+                Some(PeerAction::Discover { act }) => scripts
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|script| discovery.is_some() && script.ready(act)),
+                _ => true,
+            };
+            let ready = settled
+                && discovery_settled
+                && discovery_ready
+                && (scripts.honest.is_none() || wake.is_some_and(|wake| now >= wake));
             self.readiness.set(ready);
             // The honest script's next timer: its refresh, or when it may
-            // become settled, which makes the peer ready.
-            let deadline = scripts.honest.as_ref().map(|honest| {
+            // become settled, which makes the peer ready. Then the
+            // discovery script's next held answer. One timer serves both, so
+            // a peer's `select!` keeps its branches, and its draws, as they
+            // were before discovery.
+            let honest_deadline = scripts.honest.as_ref().map(|honest| {
                 wake.filter(|wake| *wake > now)
                     .map_or(honest.deadline(), |wake| wake.min(honest.deadline()))
             });
+            let held = scripts.discovery.as_ref().and_then(DiscoveryPeer::deadline);
+            let deadline = match (honest_deadline, held) {
+                (Some(honest), Some(held)) => Some(honest.min(held)),
+                (deadline, None) | (None, deadline) => deadline,
+            };
             let mut frames = Vec::new();
+            let mut ran = None;
+            let mut answers = Vec::new();
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
                     StreamEvent::Header { id, send } => {
@@ -1326,6 +1555,38 @@ impl PeerTask {
                         header = Some(HeaderStream { id, send });
                         if let Some(honest) = scripts.honest.as_mut() {
                             frames = honest.start_stream();
+                        }
+                    }
+                    StreamEvent::Discovery { id, send } => {
+                        reads.insert(id, 0);
+                        discovery_ids.insert(id);
+                        discovery = Some(HeaderStream { id, send });
+                        if let Some(script) = scripts.discovery.as_mut() {
+                            answers = script.start();
+                        }
+                    }
+                    StreamEvent::Frame { id, frame, at } if discovery_ids.contains(&id) => {
+                        let read = reads.get_mut(&id).expect("a discovery stream's reader is known");
+                        let seq = *read;
+                        *read += 1;
+                        let current = discovery.as_ref().is_some_and(|stream| stream.id == id);
+                        discovery_settled |= current;
+                        self.record(remote, id, RecordBody::Received {
+                            seq,
+                            message_type: frame.message_type,
+                            // A frame's payload is under its stream's cap.
+                            payload: frame.payload.len() as u64,
+                            credit: None,
+                            frame: frame.clone(),
+                            at,
+                        });
+                        let Ok(message) = decode_frame::<DiscoveryMessage>(&frame) else {
+                            return self.fail(format!(
+                                "the node's frame {seq} on discovery stream {id} doesn't decode"
+                            ));
+                        };
+                        if let Some(script) = scripts.discovery.as_mut().filter(|_| current) {
+                            answers = script.receive(&message);
                         }
                     }
                     StreamEvent::Frame { id, frame, at } => {
@@ -1376,6 +1637,7 @@ impl PeerTask {
                             settled = self.spec.dialer == Dialer::Peer;
                         }
                         PeerAction::Close | PeerAction::Disconnect => {
+                            self.closed.borrow_mut().insert(self.index);
                             conn.close(VarInt::from_u32(0), b"close");
                             if let Some(stream) = &header {
                                 self.record(remote, stream.id, RecordBody::Closed);
@@ -1398,15 +1660,65 @@ impl PeerTask {
                                 return self.fail("only an adversary can act");
                             };
                             match adversary.act(act, honest) {
-                                Ok(acted) => frames = acted,
+                                Ok(Some(acted)) => {
+                                    frames = acted;
+                                    ran = Some(act.name());
+                                }
+                                // Its precondition expired after it was
+                                // offered. The skip is logged on the
+                                // header stream, so a witness test can see
+                                // the act never ran.
+                                Ok(None) => match &header {
+                                    Some(stream) => self.record(
+                                        remote,
+                                        stream.id,
+                                        RecordBody::ActSkipped { act: act.name() },
+                                    ),
+                                    None => {
+                                        return self.fail(format!(
+                                            "{} was skipped with no header stream to log it on",
+                                            act.name()
+                                        ))
+                                    }
+                                },
+                                Err(why) => return self.fail(why),
+                            }
+                        }
+                        PeerAction::Ask { request } => {
+                            let script =
+                                scripts.discovery.as_mut().filter(|_| discovery.is_some());
+                            let Some(script) = script else {
+                                return self.fail(format!(
+                                    "can't {} without a discovery stream",
+                                    request.name()
+                                ));
+                            };
+                            answers = vec![script.ask(request)];
+                        }
+                        PeerAction::Discover { act } => {
+                            let script =
+                                scripts.discovery.as_mut().filter(|_| discovery.is_some());
+                            let Some(script) = script else {
+                                return self.fail(format!(
+                                    "can't {} without a discovery stream",
+                                    act.name()
+                                ));
+                            };
+                            match script.act(act) {
+                                Ok(acted) => answers = acted,
                                 Err(why) => return self.fail(why),
                             }
                         }
                     }
                 }
                 () = zakura_rt::time::sleep_until(deadline.unwrap_or(now)), if deadline.is_some() => {
-                    if let Some(honest) = scripts.honest.as_mut() {
-                        frames = honest.tick();
+                    if honest_deadline.is_some_and(|honest| honest <= Instant::now()) {
+                        if let Some(honest) = scripts.honest.as_mut() {
+                            frames = honest.tick();
+                        }
+                    }
+                    if let Some(script) = scripts.discovery.as_mut() {
+                        answers = script.tick();
                     }
                 }
                 _ = conn.closed() => {
@@ -1416,6 +1728,16 @@ impl PeerTask {
             }
             if let Some(stream) = header.as_mut() {
                 if !frames.is_empty() && !self.write(remote, stream, frames).await {
+                    return Ended::Closed;
+                }
+                // Only once its frames are written, so "ran" means they
+                // went out.
+                if let Some(act) = ran.take() {
+                    self.record(remote, stream.id, RecordBody::ActRan { act });
+                }
+            }
+            if let Some(stream) = discovery.as_mut() {
+                if !answers.is_empty() && !self.write(remote, stream, answers).await {
                     return Ended::Closed;
                 }
             }
@@ -1438,4 +1760,35 @@ async fn open(conn: &Conn, kind: u16, version: u16) {
     }
     let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
     let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listening peer's acceptor admits an attempt only while no other is
+    /// in its QUIC handshake or live, so the node's connections reach the
+    /// peer's task one after another.
+    #[test]
+    fn a_listening_peer_admits_one_connection_at_a_time() {
+        let (to_task, _incoming) = mpsc::channel(1);
+        let forward = Forward {
+            to_task,
+            live: Arc::default(),
+        };
+        let attempt = |pending_total| IncomingInfo {
+            remote: NODE_ADDR,
+            validated: true,
+            pending_total,
+            pending_from_ip: pending_total,
+        };
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Accept));
+        assert!(matches!(forward.admit(&attempt(1)), Admit::Refuse));
+        // `handle` counts a connection live until its future ends.
+        forward.live.fetch_add(1, Ordering::SeqCst);
+        let live = Live(forward.live.clone());
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Refuse));
+        drop(live);
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Accept));
+    }
 }

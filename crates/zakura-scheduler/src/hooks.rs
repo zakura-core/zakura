@@ -167,6 +167,12 @@ pub fn now() -> Option<SimInstant> {
     with_run(|s| s.now)
 }
 
+/// How `task` of the current run ended, or `None` while it runs or outside
+/// a run.
+pub fn task_exit(task: TaskId) -> Option<TaskExit> {
+    with_run(|s| s.done.get(&task).copied()).flatten()
+}
+
 /// Registers `waker` to fire when time reaches `deadline`.
 ///
 /// Store the `Waker` the timer's future was polled with, not the task's.

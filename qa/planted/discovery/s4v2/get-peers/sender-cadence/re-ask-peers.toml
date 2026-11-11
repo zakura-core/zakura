@@ -1,0 +1,10 @@
+# The node asks for peers again as soon as each answer settles, past the
+# peer's bucket. The scenario is the honest exchange.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-peers/sender-cadence/re-ask-peers.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-peers/sender-cadence/re-ask-peers.plan.bin"

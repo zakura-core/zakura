@@ -15,7 +15,10 @@ use support::{
     steer::{before, steer, Steer},
 };
 use zakura_sim::{
-    domain::session::HONEST_NEVER_PUNISHED,
+    domain::{
+        header_sync::COMMIT_ONLY_AUTHORIZED, header_sync_progress::HONEST_PROGRESS,
+        session::HONEST_NEVER_PUNISHED,
+    },
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -31,7 +34,11 @@ use zakura_sim::{
         DatagramOutcome, Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest,
         StorageResult, TransportFact,
     },
-    peer::{adversary::Act, honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
+    peer::{
+        adversary::{Act, ContentRule},
+        honest::HonestSpec,
+        peer_addr, PeerAction, PeerSpec, NODE_ADDR,
+    },
     seed, Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
@@ -795,8 +802,10 @@ fn judging(label: Label, row: &str) -> String {
 /// with its sidecar, replays to its pinned end record,
 /// `header-wire-*.end.json`. Its prefix picks the saved scenario. The
 /// honest sync reaches the 120-header tip with `conformant-never-closes`
-/// and `session/honest-never-punished` held, and each act's frame gets its
-/// label with the matching `<label>-closes` held, applied. No run fails.
+/// and `session/honest-never-punished` held, each act's frame gets its
+/// label with the matching `<label>-closes` held, applied, and the progress
+/// fixture reaches its one successor with `header-sync/honest-progress`
+/// held. No run fails.
 ///
 /// This fails if a saved Plan's end record changes. After a deliberate
 /// change, regenerate them with `regenerate_saved_plans`.
@@ -855,6 +864,11 @@ fn saved_plans_replay_their_end_records() {
                 assert!(labelled, "{}: no frame got {:?}", plan.name(), act.label());
                 held(&judging(act.label(), row));
             }
+            SavedPlan::HonestProgress => {
+                held(HONEST_PROGRESS);
+                held(HONEST_NEVER_PUNISHED);
+                assert_eq!(ports.selected_tip(), Chain::main(51).tip(&ports.fixture));
+            }
         }
         assert_eq!(
             end,
@@ -885,8 +899,9 @@ fn over_credit_objects_eager_delivery_holds_no_livelock() {
 }
 
 /// Rewrites every saved Plan: its input, its sidecar and its end record.
-/// The honest sync's Plan is the first of M5.1's 64 inputs, and each act's
-/// is the default Plan, the one M5-E1's action test runs. Run it with
+/// The honest sync's Plan is the first of M5.1's 64 inputs. Each act's is
+/// the default Plan, the one M5-E1's action test runs, and so is the
+/// progress fixture's. Run it with
 /// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
 /// header_wire_lifecycle -- --ignored regenerate_saved_plans`.
 #[test]
@@ -898,13 +913,29 @@ fn regenerate_saved_plans() {
                 PlanInput::Bytes(bytes) => bytes,
                 _ => unreachable!("inputs are bytes"),
             },
-            SavedPlan::Act(_) => Vec::new(),
+            SavedPlan::Act(_) | SavedPlan::HonestProgress => Vec::new(),
         };
         let input: Vec<u8> = plan.tag().into_iter().chain(bytes).collect();
         let (_, end, _) = replay(&input);
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
+        // The progress fixture and the three refused-page acts are planted
+        // cases' inputs, which `cargo xtask planted` records as witnesses
+        // expecting a hold.
+        let holds = |property: &str| {
+            format!("\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n")
+        };
+        let witness = match plan {
+            SavedPlan::HonestProgress => holds(HONEST_PROGRESS),
+            SavedPlan::Act(
+                Act::BadContent {
+                    rule: ContentRule::Linkage | ContentRule::LowerLocator,
+                }
+                | Act::OverCreditObjects,
+            ) => holds(COMMIT_ONLY_AUTHORIZED),
+            SavedPlan::HonestSync | SavedPlan::Act(_) => String::new(),
+        };
         let sidecar = format!(
             "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\
              # runs it, the generator version it was built for, and its SHA-256. Its\n\
@@ -914,7 +945,7 @@ fn regenerate_saved_plans() {
              generator = {generator}\n\
              sha256 = \"{digest}\"\n\
              scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_wire_lifecycle.rs\"\n",
+             source = \"crates/zakura-sim/tests/header_wire_lifecycle.rs\"\n{witness}",
             name = plan.name(),
             harness = HeaderWire::NAME,
             generator = HeaderWire::GENERATOR,

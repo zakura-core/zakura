@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-header-chain/src/transition/planner/event_effects/operator_policy.rs b/crates/zakura-header-chain/src/transition/planner/event_effects/operator_policy.rs
+index f354058dbe..dc9400d977 100644
+--- a/crates/zakura-header-chain/src/transition/planner/event_effects/operator_policy.rs
++++ b/crates/zakura-header-chain/src/transition/planner/event_effects/operator_policy.rs
+@@ -60,7 +60,13 @@ pub(super) fn project_operator_invalidation(
+     }
+     projected.add_operator_invalidation(
+         event.target,
+-        EligibilityReason::operator_invalid(event.target, event.id, event.evidence),
++        // Mutation: the stored reason carries another invalidation ID, so
++        // a reconsideration of the target can't find it.
++        EligibilityReason::operator_invalid(
++            event.target,
++            crate::OperatorInvalidationId::new([0xab; 16]),
++            event.evidence,
++        ),
+     )?;
+     Ok(())
+ }

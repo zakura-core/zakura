@@ -361,6 +361,13 @@ impl Conn {
         *self.inner.shared.load.borrow()
     }
 
+    /// A probe that reads [`Self::load`]'s snapshot without holding the
+    /// connection open, for the simulator's transport taps.
+    #[cfg(zakura_sim)]
+    pub fn load_probe(&self) -> crate::LoadProbe {
+        crate::LoadProbe::of(&self.inner.shared)
+    }
+
     /// Changes this connection's runtime limits (API-9). Returns the close
     /// reason if the connection has closed.
     pub fn set_limits(&self, limits: ConnLimits) -> Result<(), ConnectionError> {
@@ -378,6 +385,19 @@ impl Conn {
     /// A process-unique ID for this connection.
     pub fn stable_id(&self) -> usize {
         self.inner.shared.stable_id
+    }
+
+    /// An ID both ends of this connection derive from its TLS handshake, so
+    /// a test or the simulator can join what each end saw of it. Another
+    /// handshake gives another ID.
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub fn shared_id(&self) -> [u8; 16] {
+        *self
+            .inner
+            .shared
+            .shared_id
+            .get()
+            .expect("a Conn exists only once its handshake completed, which sets the ID")
     }
 
     async fn request(

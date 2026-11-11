@@ -93,6 +93,7 @@ use tracing::Instrument;
 
 use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_rpc::EarlyMinedBlockChannel;
@@ -689,6 +690,19 @@ impl StartCmd {
             misbehavior_sender.clone(),
         );
 
+        // The mempool and `getblocktemplate` trace the path from a new tip to a mining template.
+        // They share one writer.
+        let template_path_trace = JsonlEventEmitter::new(
+            config
+                .network
+                .zakura
+                .trace_dir
+                .clone()
+                .map(JsonlTracer::spawn)
+                .unwrap_or_else(JsonlTracer::noop),
+            zakura_jsonl_trace::node_id(),
+        );
+
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
             &config.mempool,
@@ -702,7 +716,9 @@ impl StartCmd {
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
+            config.network.unconditional_peers.clone(),
         );
+        let mempool = mempool.with_trace(template_path_trace.clone());
         let mempool_verification_finished = mempool.verification_finished();
         let mempool = spawn_buffer(
             BoxService::new(mempool),
@@ -755,6 +771,7 @@ impl StartCmd {
             pending_blocks,
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
+        let rpc_impl = rpc_impl.with_template_trace(template_path_trace);
         node_tasks.track(&rpc_tx_queue_handle);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {

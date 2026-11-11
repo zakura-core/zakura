@@ -234,6 +234,12 @@ impl Sources {
         self
     }
 
+    /// Whether the harness observes every source in `needs`, so a property
+    /// that needs them can run there rather than report its exclusion.
+    pub fn observes_all(&self, needs: &[Source]) -> bool {
+        needs.iter().all(|source| self.observed.contains(source))
+    }
+
     /// Whether the harness has `source`: `Ok` if it observes it,
     /// `Err(Some(reason))` if its tier excludes it, and `Err(None)` if it
     /// lacks it.
@@ -951,7 +957,10 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState<S::View>) -
             witness: violation.witness.clone(),
         };
     }
-    if !state.declared || state.excluded.is_some() {
+    if !state.declared {
+        return PropertyOutcome::NotApplicable;
+    }
+    if state.excluded.is_some() {
         return PropertyOutcome::NotApplicable;
     }
     let reason = if !property.assumes.is_empty() && !state.ever_held {

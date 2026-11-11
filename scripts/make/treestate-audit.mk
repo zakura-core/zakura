@@ -11,6 +11,8 @@
 	treestate-audit-roots \
 	treestate-audit-differential
 
+# `audit-historical-treestates` is only built with the `debug-commands` feature:
+#   cargo build --release -p zakura --bin zakurad --features debug-commands
 TREESTATE_ZAKURAD_BIN ?= $(CURDIR)/target/release/zakurad
 TREESTATE_CHECK_SCRIPT ?= $(CURDIR)/scripts/differential-treestate-check.py
 TREESTATE_CACHE_DIR ?= $(HOME)/.local/zakura-dev/cache

@@ -75,13 +75,15 @@ use super::{
     rows, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Status, SubscribeHeaders,
     SUBSCRIBE_HEADERS,
 };
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::{header_sync::observe::HeaderSyncObserver, ZakuraPeerId};
 use crate::zakura::{
     header_sync::wire::AuxSchema,
     regulation::{
         ExchangeWriter, SharedSubscriptions, SubscribeRefused, SubscriptionFault,
         SubscriptionLimits, Subscriptions, WriterFence,
     },
-    transport::sim_chain,
+    transport::{sim_arg, sim_chain},
     Frame, FramedRecv,
 };
 
@@ -257,6 +259,15 @@ pub(crate) struct Subscriber {
     state: SubscriberState,
 }
 
+/// Who a [`Subscriber`]'s credit reports to, and for which peer and session.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+pub(crate) struct CreditTap {
+    pub(crate) observer: Arc<dyn HeaderSyncObserver>,
+    pub(crate) peer: ZakuraPeerId,
+    pub(crate) session_id: u64,
+}
+
 /// The reader's tap for this session's subscription tables, if it has one.
 /// The reader waits for the precheck the caller attaches next, so tagging
 /// starts before it reads the first frame.
@@ -288,6 +299,14 @@ impl Subscriber {
             fence,
             state: SubscriberState::new(header_bytes),
         }
+    }
+
+    /// This subscriber, reporting the credit it gives through `tap`, if
+    /// there is one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<CreditTap>) -> Self {
+        self.state.credit = tap;
+        self
     }
 
     /// The encoded header size of the subscriber's network.
@@ -341,11 +360,29 @@ impl Subscriber {
         let plan = self.state.plan_open(status, locators, schema, staging)?;
         let exchange = self.fence.open().ok_or(SubscribeError::Fenced)?;
         let writer = exchange.writer();
+        #[cfg(not(any(test, zakura_sim)))]
         let update = self
             .tools
             .lock()
             .open_fenced(plan.id, plan.window, plan.start, exchange)?;
-        Ok((self.state.opened(plan, update), writer))
+        // The totals are read under the lock that recorded the `Open`, which
+        // a second lock would add a scheduling point to.
+        #[cfg(any(test, zakura_sim))]
+        let (update, totals) = {
+            let mut tools = self.tools.lock();
+            let update = tools.open_fenced(plan.id, plan.window, plan.start, exchange)?;
+            let totals = state::totals(&tools, plan.id);
+            if let Some(tap) = &self.state.credit {
+                state::serving(
+                    tap,
+                    &tools,
+                    plan.id,
+                    crate::zakura::header_sync::observe::SubscriberChange::Open,
+                );
+            }
+            (update, totals)
+        };
+        Ok((sim_arg!(self.state.opened(plan, update); totals), writer))
     }
 
     /// Remove a subscription whose `Open` failed to send. If no byte was

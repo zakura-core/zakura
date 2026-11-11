@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue.rs b/crates/zakura-network/src/zakura/block_sync/work_queue.rs
+index 7c3d774e0b..1d3c1f6a4a 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue.rs
+@@ -414,10 +414,7 @@ impl WorkQueue {
+         receipt: u64,
+         retired: u64,
+     ) -> Result<ByteReservation, ReservationError> {
+-        let funding = receipt
+-            .checked_add(retired)
+-            .ok_or(ReservationError::Amount)
+-            .and_then(|bytes| inner.funding.split(bytes));
++        let funding = Ok(retired).and_then(|bytes| inner.funding.split(bytes));
+         if funding.is_err() {
+             self.budget.close(BudgetClosure::Arithmetic {
+                 operation: "receipt settlement",

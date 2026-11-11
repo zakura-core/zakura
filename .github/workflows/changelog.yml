@@ -67,3 +67,4 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
           bash scripts/tests/test_release_packages.sh
+          python3 scripts/release-readiness.py self-test

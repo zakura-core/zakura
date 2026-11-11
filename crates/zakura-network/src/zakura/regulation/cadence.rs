@@ -412,7 +412,9 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
     /// `min_gap` passed since the row's last frame and the sender's copy of the
     /// receiver's bucket keeps more than `reserve` tokens, so bursts after an
     /// outage, which the bucket is sized for, still fit. Otherwise it behaves
-    /// as [`Self::send_row`].
+    /// as [`Self::send_row`], except that a deferral ends as soon as an early
+    /// send would be allowed: after `min_gap`, or once the bucket refills
+    /// above `reserve`, if either comes before the send interval.
     pub(crate) fn send_row_early(
         &mut self,
         message_type: u16,
@@ -429,13 +431,21 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
             .iter_mut()
             .find(|slot| slot.message_type == message_type)
             .ok_or(CadenceSendError::NoCadence { message_type })?;
-        let gap_passed = slot.last_sent.is_none_or(|last| last + min_gap <= now);
         slot.mirror.refill(now);
-        if gap_passed && slot.mirror.tokens > reserve {
-            send_slot_at(slot, now, send, true)
+        let gap_ends = slot.last_sent.map_or(now, |last| last + min_gap);
+        let tokens_at = if slot.mirror.tokens > reserve {
+            now
         } else {
-            send_slot(slot, now, send)
+            slot.mirror.last_refill + slot.mirror.cadence.refill_interval
+        };
+        let early_at = gap_ends.max(tokens_at);
+        if early_at <= now {
+            return send_slot_at(slot, now, send, true);
         }
+        Ok(match send_slot(slot, now, send)? {
+            RowSend::DeferredUntil(due) => RowSend::DeferredUntil(due.min(early_at)),
+            other => other,
+        })
     }
 
     /// Queue every due value on `send` without waiting.

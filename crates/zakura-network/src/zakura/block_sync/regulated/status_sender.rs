@@ -331,9 +331,10 @@ mod tests {
         );
         recv.recv().await.unwrap();
 
-        // Too soon after the previous Status: the receiver would only defer it.
+        // Too soon after the previous Status: the receiver would only defer it,
+        // so it is due when the gap ends, not at the 30 s interval.
         tokio::time::advance(Duration::from_millis(500)).await;
-        let due = StatusSend::Deferred(first_at + Duration::from_secs(30));
+        let due = StatusSend::Deferred(first_at + TIP_MIN_GAP);
         assert_eq!(sender.try_send(at(11, 2), &send).unwrap(), due);
         tokio::time::advance(Duration::from_millis(500)).await;
         let tip_at = Instant::now();
@@ -395,6 +396,25 @@ mod tests {
             .windows(2)
             .all(|pair| pair[1] - pair[0] == TIP_MIN_GAP));
         assert!(queued[burst] - queued[burst - 1] > TIP_MIN_GAP);
+        // Once the reserve is reached, a refused tip is due at the next refill,
+        // not at the 30 s interval. The gap has passed on each attempt here.
+        let mut deferred = None;
+        for offset in 0..20 {
+            tokio::time::advance(TIP_MIN_GAP).await;
+            let now = Instant::now();
+            match sender.try_send(at(10_000 + offset, 0), &send).unwrap() {
+                StatusSend::Queued => {
+                    recv.recv().await.unwrap();
+                }
+                StatusSend::Deferred(due) => {
+                    deferred = Some((now, due));
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let (refused_at, due) = deferred.expect("the bucket copy stops a burst at the reserve");
+        assert!(due > refused_at && due <= refused_at + Duration::from_secs(15));
         // After the burst, one per refill interval (15 s), not per send interval (30 s).
         let after = queued.len() - burst;
         let refills = (600 - burst) / 15;

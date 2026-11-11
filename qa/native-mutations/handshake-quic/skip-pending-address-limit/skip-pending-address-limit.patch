@@ -1,6 +1,6 @@
 --- a/crates/zakura-quic/src/endpoint.rs
 +++ b/crates/zakura-quic/src/endpoint.rs
-@@ -842,13 +842,6 @@
+@@ -863,14 +863,6 @@
      let decision = acceptor.admit(info);
      if decision != Admit::Accept {
          return decision;
@@ -10,6 +10,7 @@
 -        .max_pending_per_ip
 -        .is_some_and(|limit| info.pending_from_ip >= limit as usize)
 -    {
+-        acceptor.cancel_admission(info);
 -        return Admit::Refuse;
      }
      // Rule 5.

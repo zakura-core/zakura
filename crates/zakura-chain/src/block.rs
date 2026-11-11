@@ -162,6 +162,12 @@ impl BlockRef {
         self.0.transactions.iter().map(Arc::as_ref)
     }
 
+    /// Borrow a transaction by its block-order index in constant time, without
+    /// cloning its shared handle. Returns `None` if the index is out of bounds.
+    pub fn transaction_at(&self, index: usize) -> Option<&Transaction> {
+        self.0.transactions.get(index).map(Arc::as_ref)
+    }
+
     /// Number of allocated slots in the transaction vector.
     pub fn transaction_capacity(&self) -> usize {
         self.0.transactions.capacity()

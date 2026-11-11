@@ -29,7 +29,6 @@ use crate::{
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
-mod address_transfers;
 mod backup;
 mod chain;
 mod proposal_results;
@@ -41,10 +40,13 @@ pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 #[cfg(feature = "internal-bench")]
-pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
+pub use chain::{
+    benchmark_height_map, benchmark_transparent_indexes, benchmark_transparent_spend_check,
+    AllocationProbe, HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig,
+    TransparentIndexBenchmarkSample,
+};
 pub(crate) use chain::{Chain, SpendingTransactionId};
 use proposal_results::{NotPrepared, PreparedProposal, ProposalResults};
 pub(crate) use shared_map::SharedMap;
@@ -885,13 +887,8 @@ impl NonFinalizedState {
         let transparent_spend_start = Instant::now();
         let spent_utxos = match cached_spends {
             Some(spent_utxos) => Ok(spent_utxos),
-            None => check::utxo::transparent_spend(
-                &prepared,
-                |outpoint| new_chain.created_ordered_utxo(outpoint),
-                &new_chain.spent_utxos,
-                finalized_state,
-            )
-            .map(Arc::new),
+            None => check::utxo::transparent_spend(&prepared, Some(&new_chain), finalized_state)
+                .map(Arc::new),
         };
         contextual_metrics.record_duration(
             "state.contextual.transparent_spend.duration_seconds",

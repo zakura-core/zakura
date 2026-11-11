@@ -1096,5 +1096,38 @@
       "test_target": "handshake"
     },
     "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "handshake-admission/retain-pending-charge/retain-pending-charge.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/counts-match-permits",
+    "witness": {
+      "test": "counts_trace_replays_with_each_named_rule",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/pending-bounded",
+    "witness": {
+      "test": "inbound_control_pressure_preserves_a_wire_dial",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting",
+    "also_violates": [
+      "handshake/dial-reserve-kept"
+    ]
+  },
+  {
+    "patch": "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/dial-reserve-kept",
+    "witness": {
+      "test": "inbound_connection_pressure_preserves_a_wire_dial",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
   }
 ]

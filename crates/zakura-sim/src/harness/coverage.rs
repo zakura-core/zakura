@@ -295,6 +295,36 @@ const fn handshake_guard(
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "handshake/counts-match-permits",
+        passing: passes(
+            "tests/handshake.rs",
+            "counts_trace_replays_with_each_named_rule",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/retain-pending-charge/retain-pending-charge.patch",
+        ),
+    },
+    Coverage {
+        property: "handshake/pending-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "inbound_control_pressure_preserves_a_wire_dial",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+        ),
+    },
+    Coverage {
+        property: "handshake/dial-reserve-kept",
+        passing: passes(
+            "tests/handshake.rs",
+            "inbound_connection_pressure_preserves_a_wire_dial",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+        ),
+    },
+    Coverage {
         property: "handshake/connections-per-address-bounded",
         passing: passes(
             "tests/handshake.rs",

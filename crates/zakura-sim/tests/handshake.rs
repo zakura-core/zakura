@@ -15,6 +15,15 @@ use zakura_sim::{
 #[test]
 fn counts_trace_replays_with_each_named_rule() {
     let input = [0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0];
+    (handshake_counts::ENTRY.witness)(
+        &(handshake_counts::ENTRY.draw)(&input),
+        PlanInput::Bytes(Vec::new()),
+        "handshake/counts-match-permits",
+        zakura_sim::witness::Expect::Holds,
+        &[],
+        &mut NullSink,
+    )
+    .unwrap();
     let dir = tempfile::TempDir::new().unwrap();
     let trace = harness::record(
         &handshake_counts::ENTRY,
@@ -147,7 +156,7 @@ fn shared_address_registrations_stop_at_the_cap() {
 
 fn assert_dial_under_load(report: &zakura_sim::RunReport, pending: usize, connections: usize) {
     use zakura_sim::{observe::TransportFact, Observation};
-    assert_held(report, "handshake/dial-reserve-kept");
+    assert_witness_holds(report, "handshake/dial-reserve-kept");
     let (dial_seq, dial) = report
         .log
         .entries()
@@ -195,10 +204,11 @@ fn assert_dial_under_load(report: &zakura_sim::RunReport, pending: usize, connec
 fn inbound_control_pressure_preserves_a_wire_dial() {
     let mut input = [0; Wire::SCENARIO_BYTES];
     input[0] = 7;
-    input[1] = 24;
+    input[1] = 25;
     input[3] = 225;
     input[4] = 100;
     let report = run(Wire::draw(&input));
+    assert_witness_holds(&report, "handshake/pending-bounded");
     assert_dial_under_load(&report, 24, 24);
 }
 
@@ -206,7 +216,7 @@ fn inbound_control_pressure_preserves_a_wire_dial() {
 fn inbound_connection_pressure_preserves_a_wire_dial() {
     let mut input = [0; Wire::SCENARIO_BYTES];
     input[0] = 7;
-    input[1] = 69;
+    input[1] = 70;
     input[4] = 100;
     input[5] = 10;
     let report = run(Wire::draw(&input));

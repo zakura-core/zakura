@@ -152,10 +152,13 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::Closes],
-            status: Status::Active,
+            status: if id == "handshake/pending-bounded" {
+                Status::Known { issue: 2341 }
+            } else {
+                Status::Active
+            },
             check: check_counts::<S>,
-            witness: (id == "handshake/connections-per-address-bounded")
-                .then_some(TriggerHistory::Log(registered_address_reached)),
+            witness: Some(TriggerHistory::PropertyLog(admission_reached)),
         });
     }
     properties.push(Property {
@@ -166,7 +169,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         needs: &[Source::Closes],
         status: Status::Active,
         check: check_reserve::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::PropertyLog(admission_reached)),
     });
     properties.push(Property {
         id: PropertyId::new("handshake/finishes-in-time"),
@@ -333,11 +336,46 @@ fn capability_flip_reached(log: &crate::ObservationLog) -> bool {
     false
 }
 
-fn registered_address_reached(log: &crate::ObservationLog) -> bool {
-    log.entries().iter().any(|entry| matches!(&entry.obs,
-        Observation::Transport { event: TransportFact::HandshakeCounts { address_cap, hosts, .. }, .. }
-            if *address_cap > 0 && hosts.iter().any(|(_, registered, _)| registered >= address_cap)
-    ))
+fn admission_reached(property: &str, log: &crate::ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        let Observation::Transport {
+            event:
+                TransportFact::HandshakeCounts {
+                    address_cap,
+                    hosts,
+                    pending,
+                    quic_pending,
+                    inbound,
+                    cap,
+                    connections,
+                    inbound_connections,
+                    connection_cap,
+                    ..
+                },
+            ..
+        } = &entry.obs
+        else {
+            return false;
+        };
+        match property {
+            "handshake/connections-per-address-bounded" => {
+                *address_cap > 0
+                    && hosts
+                        .iter()
+                        .any(|(_, registered, _)| registered >= address_cap)
+            }
+            "handshake/counts-match-permits" => *pending > 0 || *connections > 0,
+            "handshake/pending-bounded" => {
+                *cap > 0 && inbound + quic_pending >= cap - reserve(*cap)
+            }
+            "handshake/dial-reserve-kept" => {
+                (*cap > 0 && *inbound >= cap - reserve(*cap))
+                    || (*connection_cap > 0
+                        && *inbound_connections >= connection_cap - reserve(*connection_cap))
+            }
+            _ => false,
+        }
+    })
 }
 
 fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {

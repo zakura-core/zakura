@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use zakura_network::zakura::{HandshakeCounts, IpAdmission};
 
 use super::{machine::Machine, HarnessEntry};
+use crate::property::Status;
 use crate::record::machine::{CountsStep, CountsView, FailurePhase, MachineFailure, MachineStep};
 
 /// Pending handshake bounds.
@@ -33,18 +34,22 @@ const MACHINE: Machine = Machine {
         (
             PENDING,
             "QUIC and control handshakes stay within total, inbound and address bounds.",
+            Status::Known { issue: 2341 },
         ),
         (
             ADDRESS,
             "Registered connections stay within the per-address cap.",
+            Status::Active,
         ),
         (
             RESERVE,
             "Inbound connections and handshakes preserve the dial reserve.",
+            Status::Active,
         ),
         (
             COUNTS,
             "Machine charges equal the live connection, handshake, and registration owners.",
+            Status::Active,
         ),
     ],
     generator: 3,
@@ -486,6 +491,42 @@ mod tests {
         }
         input.extend([6, 0, 0]);
         holds(&input);
+    }
+
+    #[test]
+    fn outbound_control_claims_ignore_pending_quic_owners() {
+        let mut input = Vec::new();
+        for slot in 0..24u8 {
+            let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+            input.extend([0, slot, host]);
+        }
+        for slot in 24..33 {
+            input.extend([1, slot, 0, 2, slot, 0]);
+        }
+        let steps = history(&input);
+        let MachineStep::Handshake(last) = &steps.last().unwrap().1 else {
+            panic!("the admission harness records handshake steps");
+        };
+        assert_eq!(last.actual.pending, 9);
+        assert_eq!(last.actual.inbound_pending, 0);
+        assert_eq!(last.failures.len(), 1);
+        assert_eq!(last.failures[0].0, PENDING);
+        assert_eq!(
+            last.failures[0].1.message,
+            "live handshake owners exceed a pending bound"
+        );
+        assert!(steps[..steps.len() - 1]
+            .iter()
+            .all(|(_, step)| step.failure().is_none()));
+        (ENTRY.witness)(
+            &(ENTRY.draw)(&input),
+            crate::PlanInput::Bytes(Vec::new()),
+            PENDING,
+            crate::witness::Expect::Violated,
+            &[],
+            &mut crate::NullSink,
+        )
+        .unwrap();
     }
 
     #[test]

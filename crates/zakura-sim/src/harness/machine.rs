@@ -51,7 +51,7 @@ pub struct Machine {
     pub claim: &'static str,
     /// Named rules for a machine with several independent invariants.
     /// An empty slice keeps the single rule named by `name` and `claim`.
-    pub rules: &'static [(&'static str, &'static str)],
+    pub rules: &'static [(&'static str, &'static str, Status)],
     /// The decoder's version.
     pub generator: u32,
     /// The most operations the decoder returns.
@@ -147,7 +147,7 @@ pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
 }
 
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
-    let fallback = [(machine.name, machine.claim)];
+    let fallback = [(machine.name, machine.claim, Status::Active)];
     let rules = if machine.rules.is_empty() {
         &fallback[..]
     } else {
@@ -155,13 +155,13 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     };
     rules
         .iter()
-        .map(|&(id, claim)| Property {
+        .map(|&(id, claim, status)| Property {
             id: PropertyId::new(id),
             claim,
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
-            status: Status::Active,
+            status,
             check,
             witness: None,
         })
@@ -453,16 +453,18 @@ pub fn witness(
     also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    if !registered(machine).iter().any(|rule| rule.id == property) {
-        return Err(WitnessError::Unregistered);
-    }
+    let status = registered(machine)
+        .into_iter()
+        .find(|rule| rule.id == property)
+        .ok_or(WitnessError::Unregistered)?
+        .status;
     let mut evidence = WitnessSink {
         sink,
         steps: Vec::new(),
     };
     let report = run(machine, value, input, &mut evidence)
         .map_err(|error| WitnessError::HarnessEnd(error.to_string()))?;
-    crate::witness::judge(&report, property, Status::Active, expect, also_violates)?;
+    crate::witness::judge(&report, property, status, expect, also_violates)?;
     if expect != Expect::Applicable && !(machine.reached)(&evidence.steps, expect) {
         return Err(WitnessError::LostTriggerHistory);
     }

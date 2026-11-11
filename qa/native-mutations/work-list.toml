@@ -550,7 +550,7 @@ shared = []
 [[entry.instance]]
 property = "handshake/pending-bounded"
 code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
-witness = { test = "shared_addresses_hold_pending_and_permit_bounds", test_target = "handshake" }
+witness = { test = "inbound_control_pressure_preserves_a_wire_dial", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/connections-per-address-bounded"
@@ -565,7 +565,7 @@ witness = { test = "counts_trace_replays_with_each_named_rule", test_target = "h
 [[entry.instance]]
 property = "handshake/dial-reserve-kept"
 code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
-witness = { test = "inbound_control_pressure_preserves_a_wire_dial", test_target = "handshake" }
+witness = { test = "inbound_connection_pressure_preserves_a_wire_dial", test_target = "handshake" }
 
 [[entry]]
 id = "handshake-release"

@@ -151,11 +151,9 @@ impl TryFrom<redjubjub::VerificationKey<SpendAuth>> for ValidatingKey {
     ///
     /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
     fn try_from(key: redjubjub::VerificationKey<SpendAuth>) -> Result<Self, Self::Error> {
-        if bool::from(
-            jubjub::AffinePoint::from_bytes(key.into())
-                .unwrap()
-                .is_small_order(),
-        ) {
+        // `key` already holds its decoded point. Reusing it avoids decompressing
+        // the encoding a second time, which dominated Sapling block decoding.
+        if bool::from(jubjub::AffinePoint::from(key).is_small_order()) {
             Err("jubjub::AffinePoint value for Sapling ValidatingKey is of small order")
         } else {
             Ok(Self(key))

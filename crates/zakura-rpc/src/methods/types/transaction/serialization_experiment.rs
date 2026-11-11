@@ -136,6 +136,26 @@ fn measure(name: &str, iterations: usize, mut run: impl FnMut()) -> serde_json::
     serde_json::json!({"stage": name, "iterations": iterations, "total_ns": elapsed.as_nanos()})
 }
 
+#[derive(Default)]
+struct CountingWriter(usize);
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).unwrap();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_json_bytes(value: &impl Serialize) -> usize {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, black_box(value)).unwrap();
+    black_box(writer.0)
+}
+
 #[test]
 fn checked_fragments_preserve_hex_and_metadata() {
     for bytes in [vec![], vec![0, 0x22, 0x5c, 0xff], (0..=255).collect()] {
@@ -236,7 +256,7 @@ fn benchmark_json_data_serialization() {
         for is_raw in order {
             if is_raw {
                 stages.push(measure("raw_sink", 100, || {
-                    serde_json::to_writer(io::sink(), black_box(&raw)).unwrap();
+                    black_box(count_json_bytes(&raw));
                 }));
                 stages.push(measure("raw_reused_buffer", 100, || {
                     output.clear();
@@ -276,7 +296,7 @@ fn benchmark_json_data_serialization() {
                 }));
             } else {
                 stages.push(measure("string_sink", 100, || {
-                    serde_json::to_writer(io::sink(), black_box(&hex)).unwrap();
+                    black_box(count_json_bytes(&hex));
                 }));
                 stages.push(measure("string_reused_buffer", 100, || {
                     output.clear();
@@ -328,5 +348,46 @@ fn benchmark_json_data_serialization() {
     println!(
         "JSON_DATA_BENCH {}",
         serde_json::json!({"response_bytes": expected_json.len(), "transactions":165, "stages":stages, "raw_retained_bytes":raw_retained})
+    );
+}
+
+#[test]
+#[ignore = "requires the real replay fixture on an isolated benchmark host"]
+#[allow(clippy::print_stdout)]
+fn benchmark_escape_scanning() {
+    let transactions = fixture();
+    let bytes: Vec<_> = transactions[..165]
+        .iter()
+        .map(|tx| {
+            tx.transaction
+                .transaction()
+                .zcash_serialize_to_vec()
+                .unwrap()
+        })
+        .collect();
+    let strings: Vec<_> = bytes.iter().map(crate::methods::hex_data::encode).collect();
+    let raw: Vec<_> = bytes.iter().map(|bytes| checked_hex_json(bytes)).collect();
+    assert_eq!(count_json_bytes(&strings), count_json_bytes(&raw));
+    let mut stages = Vec::new();
+    for iteration in 0..3 {
+        if iteration % 2 == 0 {
+            stages.push(measure("string_counting_sink", 100, || {
+                black_box(count_json_bytes(&strings));
+            }));
+            stages.push(measure("raw_counting_sink", 100, || {
+                black_box(count_json_bytes(&raw));
+            }));
+        } else {
+            stages.push(measure("raw_counting_sink", 100, || {
+                black_box(count_json_bytes(&raw));
+            }));
+            stages.push(measure("string_counting_sink", 100, || {
+                black_box(count_json_bytes(&strings));
+            }));
+        }
+    }
+    println!(
+        "JSON_SCAN_BENCH {}",
+        serde_json::json!({"stages": stages, "output_bytes": count_json_bytes(&raw)})
     );
 }

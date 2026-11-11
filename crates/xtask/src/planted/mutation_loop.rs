@@ -64,11 +64,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, changed_since_rev, git, is_affected, patched_files,
-    pilot::{
-        add_worktree, file_sha256, fresh_dir, head, hex, sim_build_failure, BuildFailure,
-        INTERRUPTED_ERROR,
-    },
+    apply, changed_since_rev, git, is_affected,
+    lane::{sim_build_failure, BuildFailure},
+    patched_files,
+    pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
     planted_layout, provenance, remove_worktree, CaseFile, TypedFile, PLANTED_DIR, PROFILE, SHARED,
 };
 use crate::{

@@ -111,6 +111,7 @@ use crate::{
     BoxError,
 };
 
+mod lane;
 mod mutation_loop;
 mod pilot;
 

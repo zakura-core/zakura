@@ -193,6 +193,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-repair-applied" => value(RepairScenario::Applied),
         "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),
         "header-repair-apply-departs" => value(RepairScenario::ApplyDeparts),
+        "header-repair-supplier-pruned" => value(RepairScenario::SupplierPruned),
         _ => None,
     }
 }

@@ -3,7 +3,7 @@
 # first two bytes pick the saved `retired-query` scenario, and
 # `sync-storage-retired-query.end.json` is its pinned end record.
 harness = "sync/storage"
-generator = 2
+generator = 3
 sha256 = "66b2f4dc6fb0ed9f9af56bf6d9fa83d4be6bbae24170e4dee673fb233a03a160"
 scenario_sha256 = "5954d0fde8c2ec74b9428147bae73f7411191c20099d1721bd36468618a5c24a"
 source = "crates/zakura-sim/tests/sync_harness.rs"

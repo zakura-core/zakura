@@ -428,7 +428,7 @@ reason = "no target: the harness has two fixed scenarios, the wake fixtures, and
 [[missing-target]]
 harness = "header-sync/repair"
 owner = "E5a"
-reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
+reason = "no target: the harness has four fixed scenarios, the repair fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "header-sync/liveness"

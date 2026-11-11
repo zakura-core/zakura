@@ -1,10 +1,16 @@
 //! `header-sync/stale-completion-inert` through a VCT body repair, on
-//! `header-sync/repair`. The node runs a repair against a mirror that holds
-//! the repaired headers' tree records, and the repair applies. When the
+//! `header-sync/repair`. In the repairing fixtures, the node runs a repair
+//! against a mirror that holds the repaired headers' tree records, and the
+//! repair applies. When the
 //! supplier leaves while the repair prepares or applies, the node keeps the
 //! round, so its calls are current, not stale, and its apply still
 //! succeeds. Each fixture also makes one ordinary stale prepare, so the
 //! property applies and holds.
+//!
+//! `header-sync/outstanding-work-bounded` holds on every committed input
+//! too. On the supplier-pruned input, whose supplier lacks the tree records
+//! so the repair retires `HistoryPruned` and never applies, it judges the
+//! repair requirement's source sets through a charge and a departure.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -28,10 +34,13 @@ use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
 use zakura_sim::NaReason;
 use zakura_sim::{
-    domain::header_sync::{COMMIT_ONLY_AUTHORIZED, STALE_COMPLETION_INERT},
+    domain::header_sync::{
+        COMMIT_ONLY_AUTHORIZED, OUTSTANDING_WORK_BOUNDED, STALE_COMPLETION_INERT,
+    },
     explore::{classify, ExploreOutcome},
     harness::{
         self,
+        header_node::outstanding::OutstandingEvidence,
         header_node::stale::{StaleEvidence, StaleWindow, Staleness},
         header_sync::{RepairHarness, RepairScenario, REPAIR_HEIGHT},
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
@@ -52,15 +61,21 @@ const APPLIED_INPUT: &[u8] = include_bytes!("fixtures/header-repair-applied.bin"
 const PREPARE_DEPARTS_INPUT: &[u8] = include_bytes!("fixtures/header-repair-prepare-departs.bin");
 /// See [`APPLIED_INPUT`].
 const APPLY_DEPARTS_INPUT: &[u8] = include_bytes!("fixtures/header-repair-apply-departs.bin");
+/// See [`APPLIED_INPUT`].
+const SUPPLIER_PRUNED_INPUT: &[u8] = include_bytes!("fixtures/header-repair-supplier-pruned.bin");
 
 /// A committed input's file stem, its fixture, and how
 /// [`regenerate_repair_seeds`] picks its Plan from [`support::byte_inputs`]:
 /// the stream's count and longest input, then the index.
 type Seed = (&'static str, RepairScenario, usize, usize, usize);
 
-/// Every committed input, in the order of [`committed`]. Any Plan reaches
-/// each fixture's history.
-const SEEDS: [Seed; 3] = [
+/// Every committed input, in the order of [`committed`]. The first three
+/// repair, and [`SUPPLIER_PRUNED`] doesn't. Each fixture's history waits on
+/// control steps with no deadline, such as the stale peer's close, so a
+/// Plan that keeps one waiting until the step budget never reaches the
+/// rest of it. The committed Plans and the generated ones reach every
+/// fixture's history.
+const SEEDS: [Seed; 4] = [
     ("header-repair-applied", RepairScenario::Applied, 4, 256, 0),
     (
         "header-repair-prepare-departs",
@@ -76,11 +91,34 @@ const SEEDS: [Seed; 3] = [
         256,
         0,
     ),
+    SUPPLIER_PRUNED,
 ];
 
+/// The committed input whose supplier lacks the tree records.
+const SUPPLIER_PRUNED: Seed = (
+    "header-repair-supplier-pruned",
+    RepairScenario::SupplierPruned,
+    4,
+    256,
+    0,
+);
+
 /// The committed inputs, in the order of [`SEEDS`].
-fn committed() -> [&'static [u8]; 3] {
-    [APPLIED_INPUT, PREPARE_DEPARTS_INPUT, APPLY_DEPARTS_INPUT]
+fn committed() -> [&'static [u8]; 4] {
+    [
+        APPLIED_INPUT,
+        PREPARE_DEPARTS_INPUT,
+        APPLY_DEPARTS_INPUT,
+        SUPPLIER_PRUNED_INPUT,
+    ]
+}
+
+/// The committed inputs whose repair applies, with their seeds.
+fn repairing() -> impl Iterator<Item = (Seed, &'static [u8])> {
+    SEEDS
+        .into_iter()
+        .zip(committed())
+        .filter(|((_, scenario, ..), _)| *scenario != RepairScenario::SupplierPruned)
 }
 
 /// Polls `future` once. An engine port's operation outside a run finishes
@@ -107,6 +145,7 @@ fn byte(scenario: RepairScenario) -> u8 {
         RepairScenario::Applied => 0,
         RepairScenario::PrepareDeparts => 1,
         RepairScenario::ApplyDeparts => 2,
+        RepairScenario::SupplierPruned => 3,
     }
 }
 
@@ -123,11 +162,13 @@ fn plan(input: &[u8]) -> PlanInput {
     Plan::from_fuzz(&input[RepairHarness::SCENARIO_BYTES..])
 }
 
-/// One run of a fixture: its report, the node's stale calls and port.
+/// One run of a fixture: its report, the node's stale calls, port and
+/// outstanding-work peaks.
 struct Run {
     report: RunReport,
     stale: StaleEvidence,
     node: std::sync::Arc<ControlledPort>,
+    outstanding: OutstandingEvidence,
 }
 
 /// `scenario`'s run under `input`.
@@ -135,6 +176,7 @@ fn run(scenario: RepairScenario, input: PlanInput) -> Run {
     let ports = RepairHarness::prepare(&scenario);
     let stale = ports.stale_calls.clone();
     let node = ports.node.clone();
+    let outstanding = ports.outstanding.clone();
     let report =
         run_prepared::<RepairHarness>(&scenario, ports, input, &mut MemorySink::default(), None)
             .unwrap_or_else(|error| panic!("{error}"));
@@ -142,6 +184,7 @@ fn run(scenario: RepairScenario, input: PlanInput) -> Run {
         report,
         stale,
         node,
+        outstanding,
     }
 }
 
@@ -277,13 +320,13 @@ fn repaired(run: &Run) {
     assert_eq!(context.selected_header_count(), 1);
 }
 
-/// `header-sync/stale-completion-inert` holds on each committed input
-/// through the registered harness, and each run repairs as [`repaired`]
-/// checks.
+/// `header-sync/stale-completion-inert` holds on each committed repairing
+/// input through the registered harness, and each run repairs as
+/// [`repaired`] checks.
 #[test]
 fn the_committed_repair_inputs_hold_stale_completion_inert() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
-    for ((stem, scenario, ..), input) in SEEDS.into_iter().zip(committed()) {
+    for ((stem, scenario, ..), input) in repairing() {
         let result = (entry.witness)(
             &entry.scenario(&input[..RepairHarness::SCENARIO_BYTES]),
             plan(input),
@@ -297,23 +340,91 @@ fn the_committed_repair_inputs_hold_stale_completion_inert() {
     }
 }
 
-/// Each fixture repairs and holds under every plan, not only the committed
-/// ones.
+/// Each repairing fixture repairs and holds under generated plans, not only
+/// the committed ones, and the supplier-pruned one makes its charged
+/// history under them as [`charged`] checks.
 #[test]
 fn the_repair_fixtures_hold_under_every_plan() {
     for input in support::inputs(8, 256) {
-        for (_, scenario, ..) in SEEDS {
+        for ((_, scenario, ..), _) in repairing() {
             repaired(&run(scenario, input.clone()));
         }
+        charged(&run(RepairScenario::SupplierPruned, input));
     }
 }
 
-/// The scenario byte picks the fixture modulo 3.
+/// `header-sync/outstanding-work-bounded` holds on every committed input
+/// through the registered harness.
+#[test]
+fn the_committed_repair_inputs_hold_outstanding_work_bounded() {
+    let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
+    for ((stem, ..), input) in SEEDS.into_iter().zip(committed()) {
+        let result = (entry.witness)(
+            &entry.scenario(&input[..RepairHarness::SCENARIO_BYTES]),
+            plan(input),
+            OUTSTANDING_WORK_BOUNDED,
+            Expect::Holds,
+            &[],
+            &mut MemorySink::default(),
+        );
+        assert_eq!(result, Ok(()), "committed {stem} input");
+    }
+    charged(&run(
+        RepairScenario::SupplierPruned,
+        plan(SUPPLIER_PRUNED_INPUT),
+    ));
+}
+
+/// Checks that every property of the supplier-pruned `run` held or didn't
+/// apply, that `outstanding-work-bounded` applied, that the repair retired
+/// `history_pruned` and never prepared, and that the repair requirement
+/// held the supplier's charge across its departure: one tried source and,
+/// with the supplier gone, one departed one.
+fn charged(run: &Run) {
+    let report = &run.report;
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    for property in &report.properties {
+        assert!(
+            matches!(
+                property.outcome,
+                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+            ),
+            "{property:?}"
+        );
+    }
+    let outcome = report
+        .properties
+        .iter()
+        .find(|property| property.property == OUTSTANDING_WORK_BOUNDED)
+        .map(|property| property.outcome.clone());
+    assert!(
+        matches!(outcome, Some(PropertyOutcome::Held { .. })),
+        "{outcome:?}"
+    );
+    let facts = facts(report);
+    assert_eq!(repair_calls(&facts), [], "the repair never prepares");
+    let retirements: Vec<_> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            ReactorFact::Retired {
+                request, reason, ..
+            } if request.owner.kind == "body-repair" => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retirements, ["history_pruned"]);
+    let peaks = run.outstanding.peaks();
+    assert_eq!(peaks.get("tried repair sources"), Some(&1), "{peaks:?}");
+    assert_eq!(peaks.get("departed repair sources"), Some(&1), "{peaks:?}");
+}
+
+/// The scenario byte picks the fixture modulo 4.
 #[test]
 fn the_scenario_byte_picks_the_fixture() {
     for value in 0..=u8::MAX {
         let picked = RepairHarness::draw(&[value]);
-        assert_eq!(byte(picked), value % 3, "{value}");
+        assert_eq!(byte(picked), value % 4, "{value}");
     }
 }
 
@@ -467,7 +578,18 @@ fn regenerate_repair_seeds() {
         let input = generated(seed);
         let base = fixtures().join(stem);
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
+        // The repairing inputs witness the repair's own properties too. The
+        // supplier-pruned input witnesses only the repair source rows.
+        let witnesses: &[&str] = if scenario == RepairScenario::SupplierPruned {
+            &[OUTSTANDING_WORK_BOUNDED]
+        } else {
+            &[
+                STALE_COMPLETION_INERT,
+                COMMIT_ONLY_AUTHORIZED,
+                OUTSTANDING_WORK_BOUNDED,
+            ]
+        };
+        let mut sidecar = format!(
             "# The committed fuzz input `{stem}.bin`: the harness that runs it, the\n\
              # generator version it was built for, and its SHA-256. Its first byte\n\
              # picks the repair fixture, then come the Plan bytes.\n\
@@ -475,15 +597,7 @@ fn regenerate_repair_seeds() {
              generator = {generator}\n\
              sha256 = \"{digest}\"\n\
              scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_repair.rs\"\n\
-             \n\
-             [[witness]]\n\
-             property = \"{STALE_COMPLETION_INERT}\"\n\
-             expect = \"holds\"\n\
-             \n\
-             [[witness]]\n\
-             property = \"{COMMIT_ONLY_AUTHORIZED}\"\n\
-             expect = \"holds\"\n",
+             source = \"crates/zakura-sim/tests/header_repair.rs\"\n",
             harness = RepairHarness::NAME,
             generator = RepairHarness::GENERATOR,
             digest = seed::sha256(&input),
@@ -491,6 +605,11 @@ fn regenerate_repair_seeds() {
                 &serde_json::to_value(scenario).expect("scenarios serialize")
             ),
         );
+        for property in witnesses {
+            sidecar.push_str(&format!(
+                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
+            ));
+        }
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

@@ -124,7 +124,7 @@ use types::{
             NEW_TIP_MEMPOOL_WAIT, ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
-        trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
+        trace::{next_request_id, BuildTimes, MiningTemplateTrace, NewTipMempool, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse,
     },
@@ -1661,30 +1661,45 @@ where
     /// template, so the mempool never delays work on a new tip by more than that wait.
     async fn populated_mempool_on_new_tip(
         &self,
+        request_id: u64,
         tip_hash: block::Hash,
     ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
         let mut mempool_snapshots = self.mempool_snapshots.clone();
         let snapshot_on_tip = mempool_snapshots.on_tip(tip_hash);
 
-        let snapshot = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, snapshot_on_tip).await {
-            Ok(Some(snapshot)) => snapshot,
+        let started = std::time::Instant::now();
+        let (outcome, snapshot) = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, snapshot_on_tip)
+            .await
+        {
+            Ok(Some(snapshot)) if !snapshot.transactions.is_empty() => {
+                (NewTipMempool::Populated, Some(snapshot))
+            }
+            Ok(Some(_no_transactions)) => (NewTipMempool::Empty, None),
             Ok(None) => {
                 tracing::debug!(
-                    "mempool shut down before processing a new tip; answering with the coinbase-only template"
-                );
-                return None;
+                        "mempool shut down before processing a new tip; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::Failed, None)
             }
             Err(_elapsed) => {
                 tracing::debug!(
-                    ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not process a new tip in time; answering with the coinbase-only template"
-                );
-                return None;
+                        ?NEW_TIP_MEMPOOL_WAIT,
+                        "mempool did not process a new tip in time; answering with the coinbase-only template"
+                    );
+                (NewTipMempool::TimedOut, None)
             }
         };
+        self.gbt.trace.new_tip_mempool(
+            request_id,
+            tip_hash,
+            outcome,
+            snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.transactions.len()),
+            started.elapsed(),
+        );
 
-        (!snapshot.transactions.is_empty())
-            .then_some((snapshot.transactions, snapshot.transaction_dependencies))
+        snapshot.map(|snapshot| (snapshot.transactions, snapshot.transaction_dependencies))
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template
@@ -3699,15 +3714,30 @@ where
                             && coinbase_needs_proof(&self.network, next_height, miner_params, None)
                                 .map_misc_error()?;
                         let populated_mempool = if coinbase_has_head_start {
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::Skipped,
+                                0,
+                                Duration::ZERO,
+                            );
                             None
                         } else if let Some(place) = self.gbt.try_reserve_full_first_answer() {
-                            let populated_mempool =
-                                self.populated_mempool_on_new_tip(tip_hash).await;
+                            let populated_mempool = self
+                                .populated_mempool_on_new_tip(request_id, tip_hash)
+                                .await;
                             if populated_mempool.is_some() {
                                 full_first_answer = Some(place);
                             }
                             populated_mempool
                         } else {
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::OverLimit,
+                                0,
+                                Duration::ZERO,
+                            );
                             None
                         };
 

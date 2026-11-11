@@ -3987,7 +3987,7 @@ async fn first_answer_on_new_tip_waits_for_the_mempool_to_process_the_block() {
     )));
     let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
 
-    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    let populated_mempool = rpc.populated_mempool_on_new_tip(0, LONG_POLL_NEW_TIP);
     tokio::pin!(populated_mempool);
     assert!(
         tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
@@ -4024,7 +4024,7 @@ async fn first_answer_on_new_tip_stops_waiting_for_the_mempool_after_the_bounded
 
     let started = tokio::time::Instant::now();
     assert!(rpc
-        .populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+        .populated_mempool_on_new_tip(0, LONG_POLL_NEW_TIP)
         .await
         .is_none());
     assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
@@ -4182,7 +4182,7 @@ async fn check_template_trace_on_new_tip(populated: bool) {
             serde_json::from_slice(&written.line).expect("each trace row is JSON");
         rows.push(row);
     }
-    assert_eq!(rows.len(), 5, "{rows:#?}");
+    assert_eq!(rows.len(), 7, "{rows:#?}");
 
     let full = &rows[0];
     assert_eq!(full["event"], "gbt_full_returned");
@@ -4195,13 +4195,22 @@ async fn check_template_trace_on_new_tip(populated: bool) {
     }
 
     for (rows, template, wait_reason) in [
-        (&rows[1..3], &woken, "tip"),
-        (&rows[3..5], &stale, "immediate"),
+        (&rows[1..4], &woken, "tip"),
+        (&rows[4..7], &stale, "immediate"),
     ] {
-        let (woke, returned) = (&rows[0], &rows[1]);
+        let (woke, mempool, returned) = (&rows[0], &rows[1], &rows[2]);
         assert_eq!(woke["event"], "gbt_tip_woke");
         assert_eq!(woke["tip_height"], new_height.0);
         assert_eq!(woke["tip_hash"], new_tip.to_string());
+        assert_eq!(mempool["event"], "gbt_new_tip_mempool");
+        assert_eq!(mempool["request_id"], woke["request_id"]);
+        assert_eq!(mempool["tip_hash"], new_tip.to_string());
+        assert_eq!(
+            mempool["outcome"],
+            if populated { "populated" } else { "empty" }
+        );
+        assert_eq!(mempool["tx_count"], u64::from(populated));
+        assert!(mempool["wait_us"].is_u64(), "{mempool}");
         assert_eq!(returned["request_id"], woke["request_id"]);
         assert_ne!(returned["request_id"], full["request_id"]);
         assert_eq!(returned["tip_hash"], new_tip.to_string());
@@ -4218,7 +4227,7 @@ async fn check_template_trace_on_new_tip(populated: bool) {
             assert!(template.transactions.is_empty());
         }
     }
-    assert_ne!(rows[1]["request_id"], rows[3]["request_id"]);
+    assert_ne!(rows[1]["request_id"], rows[4]["request_id"]);
 }
 
 #[tokio::test]

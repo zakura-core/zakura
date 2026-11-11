@@ -664,13 +664,13 @@ fn mirror(index: usize) -> String {
     format!("mirror-{index}")
 }
 
-/// A [`StorageScenario`] mirror's observer: the served-page rule's record of
-/// the mirror's `Open`s and the settled points' record of its own reactor
-/// admitting the node. Neither takes the session token or the resource
-/// probe, so only events and the capacity handle are forwarded.
+/// A [`StorageScenario`] mirror's observer: the publication check's record
+/// of the mirror refusing what the node sent and the settled points' record
+/// of its own reactor admitting the node. Neither takes the session token,
+/// the resource probe or the capacity handle, so only events are forwarded.
 #[derive(Debug)]
 struct MirrorObserver {
-    opens: Arc<dyn HeaderSyncObserver>,
+    refusals: Arc<dyn HeaderSyncObserver>,
     admits: Arc<dyn HeaderSyncObserver>,
 }
 
@@ -678,13 +678,7 @@ impl HeaderSyncObserver for MirrorObserver {
     /// Hands `event` to both records.
     fn observe(&self, event: ReactorEvent) {
         self.admits.observe(event.clone());
-        self.opens.observe(event);
-    }
-
-    /// The `Open` record's handle, which the subscriber's credit reports
-    /// go to.
-    fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
-        self.opens.capacity_observer()
+        self.refusals.observe(event);
     }
 }
 
@@ -1315,7 +1309,7 @@ impl Subsystem for Storage {
         {
             let name = format!("mirror-{index}");
             let observer: Arc<dyn HeaderSyncObserver> = Arc::new(MirrorObserver {
-                opens: ports.publication.subscriber(&name),
+                refusals: ports.publication.mirror(&name, nodes[0].id.clone()),
                 admits: ports.fork_choice.mirror(&name, nodes[0].id.clone()),
             });
             let mut config = ZakuraHeaderSyncConfig::default();

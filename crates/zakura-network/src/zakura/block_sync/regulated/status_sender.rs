@@ -5,13 +5,43 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::wire::Message;
+use super::wire::{Message, RULES};
 use crate::zakura::{
     block_sync::{state::RateMeter, BlockSyncStatus, MSG_BS_STATUS},
     regulation::{CadenceSendError, CadenceSender, RowSend},
-    FramedSend, OrderedSendError,
+    FramedSend, MessageRole, OrderedSendError,
 };
 use std::time::Duration;
+
+/// The soonest a Status announcing a new tip follows the previous Status. A
+/// peer applies at most one Status a second with one extra range change, so
+/// a faster announcement would wait there instead.
+const TIP_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// The Status row's bucket capacity, which every receiver observes.
+const STATUS_BUCKET_CAPACITY: u32 = match RULES[0].role {
+    MessageRole::Announcement { cadence } if RULES[0].message_type == 1 => cadence.capacity,
+    _ => panic!("the first block-sync row is the Status announcement"),
+};
+
+/// Tokens of the receiver's Status bucket that a prompt tip announcement
+/// leaves unspent: half, so the bursts after an outage that the bucket is
+/// sized for still fit, and a sender's tip announcements never exhaust it.
+const TIP_RESERVE_TOKENS: u32 = STATUS_BUCKET_CAPACITY / 2;
+
+/// Whether `latest` announces blocks that `previous` did not: a higher
+/// servable tip, or a different tip block at the same height. A lower tip or
+/// a pruned low end is a correction and keeps the Status interval.
+pub(in crate::zakura::block_sync) fn announces_new_tip(
+    previous: Option<&BlockSyncStatus>,
+    latest: &BlockSyncStatus,
+) -> bool {
+    previous.is_none_or(|previous| {
+        latest.servable_high > previous.servable_high
+            || (latest.servable_high == previous.servable_high
+                && latest.tip_hash != previous.tip_hash)
+    })
+}
 
 /// What one attempt did with the latest local Status.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -52,9 +82,17 @@ pub(in crate::zakura::block_sync) struct ReceivedStatus {
 
 #[derive(Debug)]
 pub(crate) struct StatusSender {
-    sender: Mutex<CadenceSender<Message>>,
+    sender: Mutex<OutboundStatus>,
     received: Mutex<StoredStatus>,
     max_inflight_requests: u32,
+}
+
+/// The outbound Status cadence and the tip of the last Status it queued.
+#[derive(Debug)]
+struct OutboundStatus {
+    cadence: CadenceSender<Message>,
+    /// The last Status queued, as given before the serving limit applied.
+    queued: Option<BlockSyncStatus>,
 }
 
 /// The stored inbound Status state and the routine generation that owns it.
@@ -72,11 +110,14 @@ impl StatusSender {
     /// [`super::session::serving_max_inflight_requests`]. Updates are at least
     /// `interval` apart, or the row's cadence if that is longer.
     pub(crate) fn new(max_inflight_requests: u32, interval: Duration) -> Self {
-        let sender = CadenceSender::new()
+        let cadence = CadenceSender::new()
             .with_min_interval(u16::from(MSG_BS_STATUS), interval)
             .expect("the Status row declares a cadence");
         Self {
-            sender: Mutex::new(sender),
+            sender: Mutex::new(OutboundStatus {
+                cadence,
+                queued: None,
+            }),
             received: Mutex::new(StoredStatus::default()),
             max_inflight_requests,
         }
@@ -129,16 +170,31 @@ impl StatusSender {
     }
 
     /// Replace the pending Status and queue it if the cadence allows.
+    ///
+    /// A Status that [announces a new tip](announces_new_tip) over the last
+    /// queued one goes out before the send interval ends, at least [`TIP_MIN_GAP`] after the previous Status,
+    /// while the receiver's Status bucket keeps more than
+    /// [`TIP_RESERVE_TOKENS`]. Other changes, such as pruning, keep the interval.
     pub(crate) fn try_send(
         &self,
         status: BlockSyncStatus,
         send: &FramedSend,
     ) -> Result<StatusSend, OrderedSendError> {
         let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
-        sender
+        let OutboundStatus { cadence, queued } = &mut *sender;
+        cadence
             .update(Message::Status(self.advertised(status)))
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
-        match sender.send_row(u16::from(MSG_BS_STATUS), send) {
+        let row = u16::from(MSG_BS_STATUS);
+        let sent = if announces_new_tip(queued.as_ref(), &status) {
+            cadence.send_row_early(row, send, TIP_MIN_GAP, TIP_RESERVE_TOKENS)
+        } else {
+            cadence.send_row(row, send)
+        };
+        if sent == Ok(RowSend::Queued) {
+            *queued = Some(status);
+        }
+        match sent {
             Ok(RowSend::Queued) => Ok(StatusSend::Queued),
             Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at)),
             Ok(RowSend::Unwritten) => Ok(StatusSend::Unwritten),
@@ -252,6 +308,100 @@ mod tests {
             tokio::time::advance(interval).await;
             assert_eq!(sender.try_send(status, &send).unwrap(), StatusSend::Queued);
         }
+    }
+
+    fn at(high: u32, hash: u8) -> BlockSyncStatus {
+        BlockSyncStatus {
+            servable_high: block::Height(high),
+            tip_hash: block::Hash([hash; 32]),
+            ..BlockSyncStatus::default()
+        }
+    }
+
+    /// A new tip goes out a second after the previous Status instead of waiting
+    /// for the 30 s interval; corrections that announce no new blocks still wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_tip_skips_the_interval_and_corrections_do_not() {
+        let sender = StatusSender::new(u32::MAX, Duration::from_secs(30));
+        let (send, mut recv) = framed_channel(8);
+        let first_at = Instant::now();
+        assert_eq!(
+            sender.try_send(at(10, 1), &send).unwrap(),
+            StatusSend::Queued
+        );
+        recv.recv().await.unwrap();
+
+        // Too soon after the previous Status: the receiver would only defer it.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let due = StatusSend::Deferred(first_at + Duration::from_secs(30));
+        assert_eq!(sender.try_send(at(11, 2), &send).unwrap(), due);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let tip_at = Instant::now();
+        assert_eq!(
+            sender.try_send(at(11, 2), &send).unwrap(),
+            StatusSend::Queued
+        );
+        assert_eq!(
+            BlockSyncMessage::decode_frame(recv.recv().await.unwrap()).unwrap(),
+            BlockSyncMessage::Status(at(11, 2))
+        );
+
+        // A different block at the same height is a new tip.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            sender.try_send(at(11, 3), &send).unwrap(),
+            StatusSend::Queued
+        );
+        recv.recv().await.unwrap();
+        let reorg_at = Instant::now();
+
+        // A lower tip and a pruned low end are corrections, paced as before.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let due = StatusSend::Deferred(reorg_at + Duration::from_secs(30));
+        assert_eq!(sender.try_send(at(10, 1), &send).unwrap(), due);
+        let pruned = BlockSyncStatus {
+            servable_low: block::Height(5),
+            ..at(11, 3)
+        };
+        assert_eq!(sender.try_send(pruned, &send).unwrap(), due);
+        assert!(tip_at < reorg_at);
+        assert!(recv.try_recv().is_err());
+    }
+
+    /// Announcing a new tip every second spends at most half of the receiver's
+    /// Status bucket, then follows its refill: a receiver never sees the bucket
+    /// exhausted, and its reserve for bursts after an outage stays.
+    #[tokio::test(start_paused = true)]
+    async fn tip_announcements_never_exhaust_the_receivers_status_bucket() {
+        use crate::zakura::regulation::{CadenceBuckets, CadenceCharge};
+
+        let sender = StatusSender::new(u32::MAX, Duration::from_secs(30));
+        let (send, mut recv) = framed_channel(8);
+        let mut receiver = CadenceBuckets::new(crate::zakura::RealClock);
+        let rule = &RULES[0];
+        let started = Instant::now();
+        let mut queued = Vec::new();
+        for height in 1..=600 {
+            if sender.try_send(at(height, 0), &send).unwrap() == StatusSend::Queued {
+                recv.recv().await.unwrap();
+                assert_eq!(receiver.charge(0, rule), CadenceCharge::Admit);
+                queued.push(Instant::now().saturating_duration_since(started));
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        // The first Status, then one per second while more than the reserve is left.
+        let burst = usize::try_from(STATUS_BUCKET_CAPACITY - TIP_RESERVE_TOKENS).unwrap();
+        assert!(queued[..burst]
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] == TIP_MIN_GAP));
+        assert!(queued[burst] - queued[burst - 1] > TIP_MIN_GAP);
+        // After the burst, one per refill interval (15 s), not per send interval (30 s).
+        let after = queued.len() - burst;
+        let refills = (600 - burst) / 15;
+        assert!(
+            after.abs_diff(refills) <= 2,
+            "{after} announcements after the burst for {refills} refills"
+        );
     }
 
     /// Regulated Status carries the serving limit without lowering smaller advertisements.

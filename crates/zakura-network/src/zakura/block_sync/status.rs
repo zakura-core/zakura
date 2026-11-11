@@ -1,6 +1,6 @@
 //! Per-peer delivery of the latest local serving range.
 
-use super::{BlockSyncStatus, Duration, Instant};
+use super::{regulated::status_sender::announces_new_tip, BlockSyncStatus, Duration, Instant};
 
 const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -12,6 +12,10 @@ const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) struct StatusDelivery {
     last_queued: Option<BlockSyncStatus>,
     retry_at: Instant,
+    /// The Status a cadence deferral held back, and when. A Status with a
+    /// different tip is due at once, since the connection's cadence may send a
+    /// new tip early.
+    deferred: Option<(BlockSyncStatus, Instant)>,
 }
 
 impl StatusDelivery {
@@ -19,6 +23,7 @@ impl StatusDelivery {
         Self {
             last_queued: None,
             retry_at: now,
+            deferred: None,
         }
     }
 
@@ -28,16 +33,26 @@ impl StatusDelivery {
         latest: BlockSyncStatus,
         received_status: bool,
     ) -> Option<Instant> {
-        (self.last_queued != Some(latest) || !received_status).then_some(self.retry_at)
+        if self.last_queued == Some(latest) && received_status {
+            return None;
+        }
+        match self.deferred {
+            Some((deferred, deferred_at)) if announces_new_tip(Some(&deferred), &latest) => {
+                Some(self.retry_at.min(deferred_at))
+            }
+            _ => Some(self.retry_at),
+        }
     }
 
     pub(super) fn queued(&mut self, status: BlockSyncStatus) {
         self.last_queued = Some(status);
+        self.deferred = None;
     }
 
-    /// The cadence allows the next send at `at`.
-    pub(super) fn deferred_until(&mut self, at: Instant) {
+    /// The cadence held back `status` at `now` and allows the next send at `at`.
+    pub(super) fn deferred_until(&mut self, status: BlockSyncStatus, now: Instant, at: Instant) {
         self.retry_at = at;
+        self.deferred = Some((status, now));
     }
 
     /// Back off a full queue or an unwritten previous Status without waiting
@@ -74,8 +89,17 @@ mod tests {
         let correction = status(1_000, 6_001);
         assert_eq!(delivery.next_deadline(correction, true), Some(now));
         let cadence = now + Duration::from_secs(30);
-        delivery.deferred_until(cadence);
+        delivery.deferred_until(correction, now, cadence);
         assert_eq!(delivery.next_deadline(correction, true), Some(cadence));
+        // A pruning change or a lower tip keeps the deferral.
+        let pruned = status(1_000, 5_999);
+        assert_eq!(delivery.next_deadline(pruned, true), Some(cadence));
+        let pruned = status(1_001, 6_001);
+        assert_eq!(delivery.next_deadline(pruned, true), Some(cadence));
+        // A new tip is due at once; the connection's cadence decides whether
+        // it may go out early.
+        let new_tip = status(1_000, 6_002);
+        assert_eq!(delivery.next_deadline(new_tip, true), Some(now));
         delivery.queued(correction);
         assert_eq!(delivery.next_deadline(correction, true), None);
     }

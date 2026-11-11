@@ -1540,7 +1540,7 @@ impl ReactorIO {
             // The connection's cadence allows the next Status later.
             // Legal pacing is not queue pressure.
             Ok(StatusSend::Deferred(at)) => {
-                delivery.deferred_until(at);
+                delivery.deferred_until(status, now, at);
                 self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
                 return false;
             }

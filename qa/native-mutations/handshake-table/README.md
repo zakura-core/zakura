@@ -13,3 +13,11 @@ a mutation of the second comparison as a killed security guard.
 The work list registers the required witnesses. Mutation generation, remote
 classification, and survivor triage must still cover every active rule before
 this plan is complete.
+
+The `b0ba4955a1` droplet rerun killed both previously inconclusive guards with
+their named retained witnesses. The selected-version generator also killed
+`handshake/prelude/unselected-version-resets` at seed 11, run 87, and fresh
+confirmation passed. Shrinking rejected that trace because it also violated
+`session/installed-services-authorized`. This is a confirmed finding without a
+successful shrink. The requested-limit generator never applied its property in
+100 runs at seed 11; its retained-witness kill does not establish generator reach.

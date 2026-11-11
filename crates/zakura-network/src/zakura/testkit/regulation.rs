@@ -579,3 +579,30 @@ impl Rates {
         self.buckets.credit_pause(layout, rules, paused);
     }
 }
+
+/// The production session capacity for simulator service fixtures.
+#[derive(Debug)]
+pub struct SessionCapacityHandle(crate::zakura::regulation::SessionCapacity);
+
+impl SessionCapacityHandle {
+    /// Construct the same permit pools that production services use.
+    pub fn new(limits: &crate::zakura::ServicePeerLimits) -> Self {
+        Self(crate::zakura::regulation::SessionCapacity::new(
+            "sim_session",
+            limits,
+        ))
+    }
+
+    /// Reserve the setup and direction permits through production admission.
+    pub fn reserve(
+        &self,
+        direction: crate::zakura::ServicePeerDirection,
+    ) -> Result<Arc<dyn crate::zakura::SessionResources>, crate::zakura::SessionFull> {
+        self.0.reserve(direction)
+    }
+
+    /// Observe the actual permits and reservation owners without scheduling.
+    pub fn probe(&self) -> crate::zakura::SessionSlotsProbe {
+        self.0.probe()
+    }
+}

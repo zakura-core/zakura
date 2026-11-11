@@ -96,6 +96,19 @@ pub const ACK: &[&str] = &[
 /// Generates the control rows through the table property's usual registry and obligations.
 pub fn properties<S: HasView>() -> Vec<Property<S>> {
     let mut properties = Vec::new();
+    for (id, claim) in [
+        ("session/capacity-conserved", "Live reservations, including retained owners, account for every direction and setup permit."),
+        ("session/setup-slot-bounded", "Inbound partial sessions leave the outbound setup slot available and release setup permits within the prelude deadline.")
+    ] {
+        properties.push(Property {
+            id: PropertyId::new(id), claim, kind: Kind::Safety,
+            assumes: &[], needs: &[Source::Closes], status: Status::Active,
+            check: check_session_capacity::<S>,
+            witness: Some(TriggerHistory::Log(|log| log.entries().iter().any(|entry| matches!(entry.obs,
+                Observation::Transport { event: TransportFact::SessionCapacity { held, .. }, .. } if held[2] > 0
+            )))),
+        });
+    }
     properties.push(Property {
         id: PropertyId::new("session/stream-opens-bounded"),
         claim: "Setup and installed stream owners stay within the negotiated limit; inbound setup starts stay within the configured burst and refill rate, and teardown returns every stream permit.",
@@ -1040,6 +1053,7 @@ fn authorized_stream(capabilities: u64, kind: u16, version: u16) -> bool {
             _ => false,
         },
         901 => version == 1 && capabilities & (1 << 62) != 0,
+        902 | 903 => version == 1 && capabilities & (1 << 59) != 0,
         _ => false,
     }
 }
@@ -1232,5 +1246,110 @@ fn check_stream_opens<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             actual,
         ),
         None => Verdict::Holds,
+    }
+}
+
+fn check_session_capacity<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let bounds = cx.id().as_str() == "session/setup-slot-bounded";
+    if !cx.observations().any(|obs| {
+        matches!(
+            obs,
+            Observation::Transport {
+                event: TransportFact::SessionCapacity { .. },
+                ..
+            }
+        ) || (bounds && matches!(obs, Observation::TimeAdvanced { .. }))
+    }) {
+        return Verdict::NotApplicable;
+    }
+    // The wire fixture uses the production three-second prelude deadline.
+    // No await separates reservation from insertion into the pending session.
+    let mut now = 0;
+    let mut seen = std::collections::BTreeMap::new();
+    let mut applicable = false;
+    let mut finding = None;
+    for entry in cx.log.entries() {
+        if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+            if bounds {
+                for (id, start) in &seen {
+                    if now.saturating_sub(*start) > 3_000_000_000 {
+                        finding = Some(format!(
+                            "inbound reservation {id} retained setup for {} ns",
+                            now - start
+                        ));
+                        break;
+                    }
+                }
+                if finding.is_some() {
+                    break;
+                }
+            }
+        }
+        let Observation::Transport {
+            event:
+                TransportFact::SessionCapacity {
+                    free,
+                    held,
+                    capacity,
+                    inbound_setups,
+                },
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        applicable = true;
+        if bounds {
+            seen.retain(|id, _| inbound_setups.contains(id));
+            for id in inbound_setups {
+                let start = seen.entry(*id).or_insert(now);
+                if now.saturating_sub(*start) > 3_000_000_000 {
+                    finding = Some(format!(
+                        "inbound reservation {id} retained setup for {} ns",
+                        now - *start
+                    ));
+                    break;
+                }
+            }
+            if capacity[1] > 0 && held[3] >= capacity[2] && held[3] > 0 {
+                finding = Some(format!(
+                    "{} inbound setups consumed all {} setup slots",
+                    held[3], capacity[2]
+                ));
+            }
+        } else {
+            for index in 0..4 {
+                if free[index].checked_add(held[index]) != Some(capacity[index]) {
+                    finding = Some(format!(
+                        "pool {index}: {} free + {} held != {} capacity",
+                        free[index], held[index], capacity[index]
+                    ));
+                    break;
+                }
+            }
+        }
+        if finding.is_some() {
+            break;
+        }
+    }
+    if bounds && finding.is_none() {
+        for (id, start) in seen {
+            if now.saturating_sub(start) > 3_000_000_000 {
+                finding = Some(format!(
+                    "inbound reservation {id} retained setup for {} ns",
+                    now - start
+                ));
+                break;
+            }
+        }
+    }
+    match finding {
+        Some(actual) => cx.violated(
+            "reservations conserve capacity and preserve outbound setup",
+            actual,
+        ),
+        None if applicable => Verdict::Holds,
+        None => Verdict::NotApplicable,
     }
 }

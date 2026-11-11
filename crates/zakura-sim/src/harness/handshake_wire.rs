@@ -82,7 +82,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 3;
+    const GENERATOR: u32 = 4;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -154,6 +154,16 @@ impl Subsystem for Wire {
         } else {
             (observer, None)
         };
+        let sessions = scenario
+            .peers
+            .iter()
+            .any(|peer| peer.capabilities & (1 << 59) != 0)
+            .then(|| Arc::new(SessionLayouts::new()));
+        let tap = if let Some(sessions) = &sessions {
+            tap.with_session_capacity(sessions.capacity.probe())
+        } else {
+            tap
+        };
         let dials = tap.dials();
         let shared_ids = tap.shared_ids();
         sim.add_source(Box::new(tap.with_handshake_counts()));
@@ -189,13 +199,17 @@ impl Subsystem for Wire {
                 )
                 .expect("the Regtest discovery configuration is valid")
                 .with_verification_slots(1);
-                vec![
+                let mut services = vec![
                     Arc::new(DiscoveryService::with_max_connections(
                         handle,
                         limits.max_connections,
                     )) as Arc<dyn Service>,
                     Arc::new(PreludeLayouts),
-                ]
+                ];
+                if let Some(sessions) = sessions {
+                    services.push(sessions);
+                }
+                services
             },
             move |endpoint| async move {
                 use zakura_network::zakura::HandshakePhase;
@@ -288,7 +302,7 @@ impl Subsystem for Wire {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
         let mut scenario = Scenario::default();
         let mut script = HandshakeSpec::default();
-        match byte(0) % 9 {
+        match byte(0) % 10 {
             0 => script.control = HELLO_FAULTS[usize::from(byte(1)) % HELLO_FAULTS.len()],
             1 => {
                 scenario.peers[0] = PeerSpec::listening();
@@ -386,7 +400,22 @@ impl Subsystem for Wire {
                         .push(crate::peer::PeerAction::Close);
                 }
             }
-            _ => unreachable!("nine families"),
+            9 => {
+                if byte(1) != 0 {
+                    let mut peer = PeerSpec::dialing();
+                    peer.capabilities |= 1 << 59;
+                    peer.script = vec![
+                        crate::peer::PeerAction::Offer {
+                            kind: 902,
+                            version: 1,
+                            wire_id: 1,
+                        },
+                        crate::peer::PeerAction::Close,
+                    ];
+                    scenario.peers = vec![peer; usize::from(byte(1).min(8))];
+                }
+            }
+            _ => unreachable!("ten families"),
         }
         for peer in &mut scenario.peers {
             peer.handshake = Some(script.clone());
@@ -452,7 +481,7 @@ mod tests {
 
     #[test]
     fn draws_round_trip_millisecond_timing_and_address_families() {
-        for family in 0..9 {
+        for family in 0..10 {
             let mut bytes = [179; Wire::SCENARIO_BYTES];
             bytes[0] = family;
             let scenario = Wire::draw(&bytes);
@@ -530,4 +559,69 @@ impl Service for PreludeLayouts {
     }
     fn add_peer(&self, _peer: Peer) {}
     fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+}
+
+/// A two-member layout reserves production capacity while its second member is absent.
+#[derive(Debug)]
+struct SessionLayouts {
+    capacity: zakura_network::zakura::testkit::regulation::SessionCapacityHandle,
+    peers: zakura_rt::sync::Mutex<Vec<Peer>>,
+}
+
+impl SessionLayouts {
+    fn new() -> Self {
+        Self {
+            capacity: zakura_network::zakura::testkit::regulation::SessionCapacityHandle::new(
+                &zakura_network::zakura::ServicePeerLimits {
+                    max_inbound_peers: 4,
+                    max_outbound_peers: 1,
+                    max_pending_escalations: 2,
+                    ..Default::default()
+                },
+            ),
+            peers: zakura_rt::sync::Mutex::default(),
+        }
+    }
+}
+
+impl Service for SessionLayouts {
+    fn name(&self) -> &'static str {
+        "handshake-sessions"
+    }
+    fn streams(&self) -> &[Stream] {
+        &[
+            Stream {
+                kind: 902,
+                version: 1,
+                frame_cap: 1024,
+                capability: 1 << 59,
+                ..Stream::PERSISTENT
+            },
+            Stream {
+                kind: 903,
+                version: 1,
+                frame_cap: 1024,
+                capability: 1 << 59,
+                ..Stream::PERSISTENT
+            },
+        ]
+    }
+    fn reserve_session(
+        &self,
+        direction: zakura_network::zakura::ServicePeerDirection,
+    ) -> Result<
+        Option<Arc<dyn zakura_network::zakura::SessionResources>>,
+        zakura_network::zakura::SessionFull,
+    > {
+        self.capacity.reserve(direction).map(Some)
+    }
+    fn add_peer(&self, peer: Peer) {
+        self.peers.lock().unwrap().push(peer);
+    }
+    fn remove_peer(&self, _: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.peers
+            .lock()
+            .unwrap()
+            .retain(|peer| peer.conn_id != conn_id);
+    }
 }

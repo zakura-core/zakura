@@ -57,7 +57,7 @@ fn honest_control_handshake_holds() {
 
 #[test]
 fn every_family_draws_a_conformant_control_exchange() {
-    for family in 0..9 {
+    for family in 0..10 {
         let mut input = [0; Wire::SCENARIO_BYTES];
         input[0] = family;
         let report = run(Wire::draw(&input));
@@ -448,5 +448,160 @@ fn invalid_stream_churn_obeys_the_open_rate() {
     assert!(
         starts >= 32,
         "the hostile peer must consume the initial stream-open burst; got {starts}"
+    );
+}
+
+#[test]
+fn ownership_probe_counts_last_owners_and_setup_transfers() {
+    use zakura_network::zakura::{
+        testkit::regulation::SessionCapacityHandle, FreeSlots, ServicePeerDirection,
+        ServicePeerLimits,
+    };
+    const INBOUND: ServicePeerDirection = ServicePeerDirection::Inbound;
+    const OUTBOUND: ServicePeerDirection = ServicePeerDirection::Outbound;
+    let capacity = SessionCapacityHandle::new(&ServicePeerLimits {
+        max_inbound_peers: 2,
+        max_outbound_peers: 1,
+        max_pending_escalations: 2,
+        ..ServicePeerLimits::default()
+    });
+    let probe = capacity.probe();
+    let read = || zakura_rt::sim::boundary_read(|| probe.ownership().unwrap());
+    let baseline = read().free;
+    let inbound = capacity.reserve(INBOUND).unwrap();
+    let retained = inbound.clone();
+    let outbound = capacity.reserve(OUTBOUND).unwrap();
+    assert!(capacity.reserve(INBOUND).is_err());
+    assert_eq!(
+        read().held,
+        FreeSlots {
+            inbound: 1,
+            outbound: 1,
+            setup: 2,
+            inbound_setup: 1
+        }
+    );
+    inbound.admitted();
+    inbound.admitted();
+    assert_eq!(
+        read().held,
+        FreeSlots {
+            inbound: 1,
+            outbound: 1,
+            setup: 1,
+            inbound_setup: 0
+        }
+    );
+    drop(inbound);
+    drop(capacity);
+    assert_eq!(
+        read().held.inbound,
+        1,
+        "the last owner retains the direction slot"
+    );
+    drop(retained);
+    assert_eq!(read().held.inbound, 0);
+    drop(outbound);
+    assert_eq!(read().free, baseline);
+    assert_eq!(
+        read().held,
+        FreeSlots {
+            inbound: 0,
+            outbound: 0,
+            setup: 0,
+            inbound_setup: 0
+        }
+    );
+}
+
+#[test]
+fn partial_session_offers_release_setup_capacity() {
+    use zakura_sim::{
+        observe::{Observation, SessionStepFact, TransportFact},
+        peer::{PeerAction, PeerSpec},
+    };
+    let mut peer = PeerSpec::dialing();
+    peer.capabilities |= 1 << 59;
+    peer.handshake = Some(HandshakeSpec::default());
+    peer.script = vec![
+        PeerAction::Offer {
+            kind: 902,
+            version: 1,
+            wire_id: 1,
+        },
+        PeerAction::Close,
+    ];
+    let report = run(Scenario {
+        peers: vec![peer; 3],
+        ..Scenario::default()
+    });
+    for id in ["session/capacity-conserved", "session/setup-slot-bounded"] {
+        assert_held(&report, id);
+    }
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(
+            entry.obs,
+            Observation::Transport {
+                event: TransportFact::SessionLifecycle {
+                    kind: 902,
+                    step: SessionStepFact::OfferExpired { .. }
+                },
+                ..
+            }
+        )),
+        "the production pending session must expire"
+    );
+    let last = report
+        .log
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.obs {
+            Observation::Transport {
+                event:
+                    TransportFact::SessionCapacity {
+                        free,
+                        held,
+                        capacity,
+                        ..
+                    },
+                ..
+            } => Some((free, held, capacity)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last.0, last.2);
+    assert_eq!(*last.1, [0; 4]);
+    assert!(report.log.entries().iter().any(|entry| matches!(entry.obs,
+        Observation::Transport { event: TransportFact::SessionCapacity { held, .. }, .. } if held[2] == 1
+    )), "one inbound partial offer must reserve setup capacity");
+}
+
+#[test]
+fn complete_session_transfers_setup_to_installed_owners() {
+    use zakura_sim::{
+        observe::{Observation, TransportFact},
+        peer::PeerSpec,
+    };
+    let mut peer = PeerSpec::listening();
+    peer.capabilities |= 1 << 59;
+    peer.handshake = Some(HandshakeSpec::default());
+    let report = run(Scenario {
+        peers: vec![peer],
+        ..Scenario::default()
+    });
+    assert_held(&report, "session/capacity-conserved");
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(
+            entry.obs,
+            Observation::Transport {
+                event: TransportFact::SessionCapacity {
+                    held: [0, 1, 0, 0],
+                    ..
+                },
+                ..
+            }
+        )),
+        "the installed outbound session must release its setup permit"
     );
 }

@@ -421,6 +421,8 @@ pub struct TransportTap {
     loads: BTreeMap<u64, TransportFact>,
     stream_loads: BTreeMap<u64, TransportFact>,
     handshake_load: Option<TransportFact>,
+    session_capacity: Option<(zakura_network::zakura::SessionSlotsProbe, [usize; 4])>,
+    session_load: Option<TransportFact>,
 }
 
 /// The end of its connections a [`TransportTap`] reads.
@@ -738,6 +740,8 @@ impl TransportTap {
             loads: BTreeMap::new(),
             stream_loads: BTreeMap::new(),
             handshake_load: None,
+            session_capacity: None,
+            session_load: None,
         };
         (observer, tap)
     }
@@ -745,6 +749,19 @@ impl TransportTap {
     /// Enables admission samples for the handshake harness.
     pub(crate) fn with_handshake_counts(self) -> Self {
         self.state.handshake_sampling.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Samples the handshake fixture's production session capacity.
+    pub(crate) fn with_session_capacity(
+        mut self,
+        probe: zakura_network::zakura::SessionSlotsProbe,
+    ) -> Self {
+        let free = zakura_rt::sim::boundary_read(|| probe.read());
+        self.session_capacity = Some((
+            probe,
+            [free.inbound, free.outbound, free.setup, free.inbound_setup],
+        ));
         self
     }
 
@@ -822,6 +839,24 @@ impl TransportTap {
 
     /// Buffers changed resource samples without taking scheduling points.
     fn sample(&mut self) {
+        if let Some((probe, capacity)) = &self.session_capacity {
+            if let Some(sample) = zakura_rt::sim::boundary_read(|| probe.ownership()) {
+                let slots = |s: zakura_network::zakura::FreeSlots| {
+                    [s.inbound, s.outbound, s.setup, s.inbound_setup]
+                };
+                let load = TransportFact::SessionCapacity {
+                    inbound_setups: sample.inbound_setups,
+                    free: slots(sample.free),
+                    held: slots(sample.held),
+                    capacity: *capacity,
+                };
+                if self.session_load.as_ref() != Some(&load) {
+                    self.session_load = Some(load.clone());
+                    self.state.push(Reported::HandshakeLoad(load));
+                }
+            }
+        }
+
         if self.state.handshake_sampling.load(Ordering::Relaxed) {
             self.sample_handshakes();
         }

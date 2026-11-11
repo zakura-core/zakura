@@ -279,6 +279,22 @@ const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "session/capacity-conserved",
+        passing: passes(
+            "tests/handshake.rs",
+            "partial_session_offers_release_setup_capacity",
+        ),
+        bypass: Bypass::Planted("leak-setup-permits"),
+    },
+    Coverage {
+        property: "session/setup-slot-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "partial_session_offers_release_setup_capacity",
+        ),
+        bypass: Bypass::Planted("no-outbound-setup-reserve"),
+    },
+    Coverage {
         property: "session/stream-opens-bounded",
         passing: passes(
             "tests/handshake.rs",

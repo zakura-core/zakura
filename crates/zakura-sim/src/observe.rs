@@ -1971,6 +1971,17 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// Production session permits and their actual reservation owners.
+    SessionCapacity {
+        /// Live inbound reservations that still hold setup permits.
+        inbound_setups: Vec<usize>,
+        /// Free inbound, outbound, setup, and inbound-setup permits.
+        free: [usize; 4],
+        /// Reservations holding each kind of permit, in the same order.
+        held: [usize; 4],
+        /// Configured capacity of each permit pool, in the same order.
+        capacity: [usize; 4],
+    },
     /// The handler created a peer's stream setup.
     StreamSetupStarted {
         /// The QUIC stream.

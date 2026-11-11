@@ -1,0 +1,13 @@
+harness = "handshake/wire"
+generator = 4
+sha256 = "fe9eb8f68191ceed5c68a6282222cd4176ef73e4f6d564fbaa9886599639ac73"
+scenario_sha256 = "d0029cf8c9ae39aedc528adb34310ad7e4dcc84e3931746361439272730c6adc"
+source = "crates/zakura-sim/tests/handshake.rs"
+
+[[witness]]
+property = "session/capacity-conserved"
+expect = "holds"
+
+[[witness]]
+property = "session/setup-slot-bounded"
+expect = "holds"

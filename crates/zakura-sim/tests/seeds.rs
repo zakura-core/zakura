@@ -71,6 +71,27 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
     }
+    if stem == "handshake-partial-session" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction, PeerSpec},
+        };
+        let mut peer = PeerSpec::dialing();
+        peer.capabilities |= 1 << 59;
+        peer.handshake = Some(HandshakeSpec::default());
+        peer.script = vec![
+            PeerAction::Offer {
+                kind: 902,
+                version: 1,
+                wire_id: 1,
+            },
+            PeerAction::Close,
+        ];
+        return value(Scenario {
+            peers: vec![peer; 3],
+            ..Scenario::default()
+        });
+    }
     if stem == "handshake-stream-churn" {
         use zakura_sim::{
             harness::handshake_wire::Scenario,

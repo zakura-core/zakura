@@ -261,7 +261,7 @@ impl PeerSpec {
             && !self
                 .script
                 .iter()
-                .any(|action| matches!(action, PeerAction::Open { .. }))
+                .any(|action| matches!(action, PeerAction::Open { .. } | PeerAction::Offer { .. }))
     }
 }
 
@@ -277,6 +277,15 @@ pub enum PeerAction {
         kind: u16,
         /// The stream version.
         version: u16,
+    },
+    /// Offers one member of a multi-stream session and waits for refusal or expiry.
+    Offer {
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The generation identifier shared by the layout's members.
+        wire_id: u64,
     },
     /// Finishes the peer's side of its header stream. As the responder it
     /// then waits for the node to open the next one.
@@ -316,6 +325,7 @@ impl PeerAction {
     pub fn name(self) -> &'static str {
         match self {
             PeerAction::Open { .. } => "open",
+            PeerAction::Offer { .. } => "offer",
             PeerAction::FinishHeader => "finish-header",
             PeerAction::Close => "close",
             PeerAction::Disconnect => "disconnect",
@@ -1760,10 +1770,15 @@ impl PeerTask {
                     self.taken += 1;
                     match action {
                         PeerAction::Open { kind, version } => {
-                            if let Some((id, code)) = open(conn, kind, version).await {
+                            if let Some((id, code)) = open(conn, kind, version, None).await {
                                 if self.spec.handshake.is_some() {
                                     self.record(remote, id, RecordBody::Reset { code });
                                 }
+                            }
+                        }
+                        PeerAction::Offer { kind, version, wire_id } => {
+                            if let Some((id, code)) = open(conn, kind, version, Some(wire_id)).await {
+                                self.record(remote, id, RecordBody::Reset { code });
                             }
                         }
                         PeerAction::FinishHeader => {
@@ -1887,11 +1902,14 @@ impl PeerTask {
 /// Opens a `kind` stream at `version` on `conn` and waits, for at most
 /// [`REFUSAL_WAIT`], for the node to reset it, finish it, or close the
 /// connection.
-async fn open(conn: &Conn, kind: u16, version: u16) -> Option<(u64, u64)> {
+async fn open(conn: &Conn, kind: u16, version: u16, wire_id: Option<u64>) -> Option<(u64, u64)> {
     let (mut send, mut recv) = conn.open_bi().await.ok()?;
     handshake::write_prelude(&mut send, kind, version)
         .await
         .ok()?;
+    if let Some(wire_id) = wire_id {
+        send.write_all(&wire_id.to_le_bytes()).await.ok()?;
+    }
     let id = recv.id();
     let refused = async {
         loop {

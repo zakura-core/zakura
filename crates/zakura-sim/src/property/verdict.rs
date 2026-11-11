@@ -108,10 +108,13 @@ pub enum FactAnswer {
     /// From then on, the obligation no longer expires at quiescence, but at
     /// the first step whose time is past the instant, before that step's
     /// observations or facts count. An instant already behind the clock
-    /// expires it at once. If the run ends idle first, the instant can't
-    /// come, so it expires at the run's end. A run cut off by its budget
-    /// leaves it open. Every matching obligation defers, and a later
-    /// deferral replaces an earlier one.
+    /// expires it at once. A run cut off by its budget drains, and the
+    /// drain's clock moves just past the instant, so the obligation expires
+    /// there unless the drain discharges it first. A drain that runs dry
+    /// before the instant concludes it at its end, and one cut off at its
+    /// bound ends the run at [`crate::HarnessFailure::DrainBound`]. Every
+    /// matching obligation defers, and a later deferral replaces an earlier
+    /// one.
     DefersTo(SimInstant),
 }
 

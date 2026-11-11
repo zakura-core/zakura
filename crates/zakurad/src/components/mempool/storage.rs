@@ -20,12 +20,15 @@ use zakura_chain::{
     transaction::{self, zip317, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
+#[cfg(test)]
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_script::solver;
 
 use self::{
     eviction_list::EvictionList,
-    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
+    verified_set::{
+        MiningSnapshot, VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS,
+    },
 };
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
@@ -813,7 +816,13 @@ impl Storage {
         self.verified.transactions()
     }
 
+    /// Returns shared immutable transaction metadata and dependencies for this revision.
+    pub fn mining_snapshot(&mut self) -> MiningSnapshot {
+        self.verified.mining_snapshot()
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
+    #[cfg(test)]
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         self.verified.transaction_dependencies()
     }

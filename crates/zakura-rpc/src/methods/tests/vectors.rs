@@ -3612,7 +3612,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                         .expect_request(mempool::Request::FullTransactions)
                         .await
                         .respond(mempool::Response::FullTransactions {
-                            transactions: vec![],
+                            transactions: vec![].into(),
                             transaction_dependencies: Default::default(),
                             last_seen_tip_hash: tip_hash,
                         });
@@ -3740,7 +3740,7 @@ async fn old_tip_long_poll_answer(
                     .await;
             };
             Ok(mempool::Response::FullTransactions {
-                transactions: view.transactions,
+                transactions: view.transactions.into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: view.last_seen_tip_hash,
             })
@@ -3975,7 +3975,7 @@ async fn check_template_trace_on_new_tip(populated: bool) {
         let view = mempool_view_rx.borrow().clone();
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: view.transactions,
+                transactions: view.transactions.into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: view.last_seen_tip_hash,
             })
@@ -4159,7 +4159,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         mempool_calls.send_modify(|calls| *calls += 1);
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: parent,
             })
@@ -4409,19 +4409,20 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         }
     };
 
-    let make_mock_mempool_request_handler = |transactions, last_seen_tip_hash| {
-        let mut mempool = mempool.clone();
-        async move {
-            mempool
-                .expect_request(mempool::Request::FullTransactions)
-                .await
-                .respond(mempool::Response::FullTransactions {
-                    transactions,
-                    transaction_dependencies: Default::default(),
-                    last_seen_tip_hash,
-                });
-        }
-    };
+    let make_mock_mempool_request_handler =
+        |transactions: Vec<VerifiedUnminedTx>, last_seen_tip_hash| {
+            let mut mempool = mempool.clone();
+            async move {
+                mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await
+                    .respond(mempool::Response::FullTransactions {
+                        transactions: transactions.into(),
+                        transaction_dependencies: Default::default(),
+                        last_seen_tip_hash,
+                    });
+            }
+        };
 
     let get_block_template_fut = rpc.get_block_template(None);
     let (get_block_template, ..) = tokio::join!(
@@ -6270,7 +6271,7 @@ async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_templat
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {
         Ok::<_, BoxError>(mempool::Response::FullTransactions {
-            transactions: vec![],
+            transactions: vec![].into(),
             transaction_dependencies: Default::default(),
             last_seen_tip_hash: parent,
         })
@@ -6400,7 +6401,7 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
             let last_seen_tip_hash = *state_tip_rx.borrow();
             async move {
                 Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                    transactions: vec![],
+                    transactions: vec![].into(),
                     transaction_dependencies: Default::default(),
                     last_seen_tip_hash,
                 })
@@ -6498,7 +6499,7 @@ async fn a_timed_out_parent_is_not_speculated_on_again() {
     sync.set_is_close_to_tip(true);
     let mempool = tower::service_fn(move |_| async move {
         Ok::<_, BoxError>(mempool::Response::FullTransactions {
-            transactions: vec![],
+            transactions: vec![].into(),
             transaction_dependencies: Default::default(),
             last_seen_tip_hash: parent,
         })

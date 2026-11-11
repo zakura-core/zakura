@@ -874,7 +874,7 @@ mod tests {
             mempool_calls.send_modify(|calls| *calls += 1);
             async move {
                 Ok::<_, zakura_node_services::BoxError>(mempool::Response::FullTransactions {
-                    transactions: vec![],
+                    transactions: vec![].into(),
                     transaction_dependencies: Default::default(),
                     last_seen_tip_hash: parent,
                 })

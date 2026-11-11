@@ -5,6 +5,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
+    sync::Arc,
 };
 
 use zakura_chain::{
@@ -36,6 +37,9 @@ type EvictionCandidate = (
     transaction::Hash,
 );
 
+/// Metadata and dependencies copied together on the first request after a mutation.
+pub(super) type MiningSnapshot = (Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>);
+
 #[cfg(feature = "mempool-bench")]
 pub(super) mod benchmarks;
 
@@ -59,6 +63,9 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
     transactions: HashMap<transaction::Hash, VerifiedUnminedTx>,
+
+    /// Lazily rebuilt after any transaction or dependency mutation.
+    mining_snapshot: Option<MiningSnapshot>,
 
     /// One current eviction candidate per transaction, ordered cheapest first.
     eviction_order: BTreeSet<EvictionCandidate>,
@@ -109,6 +116,18 @@ impl Drop for VerifiedSet {
 }
 
 impl VerifiedSet {
+    /// Returns immutable lists from the same verified-set revision.
+    pub fn mining_snapshot(&mut self) -> MiningSnapshot {
+        self.mining_snapshot
+            .get_or_insert_with(|| {
+                (
+                    Arc::new(self.transactions.values().cloned().collect()),
+                    Arc::new(self.transaction_dependencies.clone()),
+                )
+            })
+            .clone()
+    }
+
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the set.
     pub fn transactions(&self) -> &HashMap<transaction::Hash, VerifiedUnminedTx> {
         &self.transactions
@@ -160,6 +179,7 @@ impl VerifiedSet {
     ///
     /// Also clears all internal caches.
     pub fn clear(&mut self) {
+        self.mining_snapshot = None;
         self.transactions.clear();
         self.eviction_order.clear();
         self.transaction_dependencies.clear();
@@ -232,6 +252,7 @@ impl VerifiedSet {
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
+        self.mining_snapshot = None;
         let affected = self.dependency_group(ancestors);
         self.remove_eviction_candidates(&affected);
 
@@ -531,6 +552,7 @@ impl VerifiedSet {
     /// Clears a list of mined transaction ids from the lists of dependencies for
     /// any other transactions in the mempool and removes their dependents.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
+        self.mining_snapshot = None;
         let affected: HashSet<_> = mined_ids
             .iter()
             .filter(|id| self.transactions.contains_key(id))
@@ -578,6 +600,7 @@ impl VerifiedSet {
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+        self.mining_snapshot = None;
         let affected = self.dependency_group([*key_to_remove]);
         self.remove_eviction_candidates(&affected);
         let removed_transactions: Vec<_> = self
@@ -873,6 +896,127 @@ impl MempoolMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mining_snapshot_reuses_metadata_until_insertion() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let empty = verified.mining_snapshot();
+        let reused = verified.mining_snapshot();
+        assert!(Arc::ptr_eq(&empty.0, &reused.0));
+        assert!(Arc::ptr_eq(&empty.1, &reused.1));
+
+        let tx = factory.tx(10_000);
+        verified
+            .insert(tx.clone(), vec![], &mut pending, None)
+            .unwrap();
+        let populated = verified.mining_snapshot();
+        assert!(!Arc::ptr_eq(&empty.0, &populated.0));
+        assert!(
+            empty.0.is_empty(),
+            "existing readers keep their immutable view"
+        );
+        assert_eq!(populated.0.len(), 1);
+
+        assert!(verified.insert(tx, vec![], &mut pending, None).is_err());
+        let after_rejection = verified.mining_snapshot();
+        assert!(Arc::ptr_eq(&populated.0, &after_rejection.0));
+        assert!(Arc::ptr_eq(&populated.1, &after_rejection.1));
+    }
+
+    #[test]
+    fn mining_snapshot_refreshes_after_removal_and_clear() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let first = factory.tx(10_000);
+        let first_id = first.transaction.id().mined_id();
+        verified.insert(first, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(factory.tx(10_000), vec![], &mut pending, None)
+            .unwrap();
+        let before = verified.mining_snapshot();
+
+        assert_eq!(verified.remove_all([first_id]).len(), 1);
+        let after_removal = verified.mining_snapshot();
+        assert_eq!(before.0.len(), 2);
+        assert_eq!(after_removal.0.len(), 1);
+        assert!(after_removal
+            .0
+            .iter()
+            .all(|tx| tx.transaction.id().mined_id() != first_id));
+        assert!(!Arc::ptr_eq(&before.0, &after_removal.0));
+
+        verified.clear();
+        let after_clear = verified.mining_snapshot();
+        assert!(after_clear.0.is_empty());
+        assert!(after_clear.1.dependencies().is_empty());
+        assert_eq!(after_removal.0.len(), 1);
+    }
+
+    #[test]
+    fn mining_snapshot_refreshes_when_only_dependencies_change() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let parent = factory.tx_with(10_000, 1, 0);
+        let parent_id = parent.transaction.id().mined_id();
+        let child = factory.tx(10_000);
+        let child_id = child.transaction.id().mined_id();
+        verified.insert(parent, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(
+                child,
+                vec![transparent::OutPoint::from_usize(parent_id, 0)],
+                &mut pending,
+                None,
+            )
+            .unwrap();
+        let before = verified.mining_snapshot();
+        assert!(before.1.direct_dependencies(&child_id).contains(&parent_id));
+
+        verified.clear_mined_dependencies(&HashSet::from([parent_id]));
+        let after = verified.mining_snapshot();
+        assert_eq!(before.0.len(), after.0.len());
+        assert!(after.1.direct_dependencies(&child_id).is_empty());
+        assert!(before.1.direct_dependencies(&child_id).contains(&parent_id));
+        assert!(!Arc::ptr_eq(&before.1, &after.1));
+    }
+
+    #[test]
+    fn mining_snapshot_removes_descendants_together() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let parent = factory.tx_with(10_000, 1, 0);
+        let parent_id = parent.transaction.id().mined_id();
+        verified.insert(parent, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(
+                factory.tx(10_000),
+                vec![transparent::OutPoint::from_usize(parent_id, 0)],
+                &mut pending,
+                None,
+            )
+            .unwrap();
+        let before = verified.mining_snapshot();
+
+        assert_eq!(verified.remove(&parent_id).len(), 2);
+        let after = verified.mining_snapshot();
+        assert!(after.0.is_empty());
+        assert!(after.1.dependencies().is_empty());
+        assert_eq!(before.0.len(), 2);
+        assert_eq!(before.1.dependencies().len(), 1);
+    }
 
     #[test]
     fn selection_rescores_only_changed_groups() {

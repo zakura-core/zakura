@@ -3216,7 +3216,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
             .expect_request(mempool::Request::FullTransactions)
             .await
             .respond(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 // tip hash needs to match chain info for long poll requests
                 last_seen_tip_hash: genesis_hash,

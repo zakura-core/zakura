@@ -21,6 +21,9 @@
 //! zakura-sim verify-archive <dir>
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
+//! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
+//!     [--max-bytes <n>] [--exclude <file>]
+//! zakura-sim generators
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
@@ -76,6 +79,11 @@ mod cli {
             self, Minimization, PinnedBinary, SimChildren, SimMinimize, TriageOptions,
             MINIMIZED_FILE, TRIAGE_FILE,
         },
+        explore::{
+            abandon_limit,
+            generate::{self, GenerateOptions, DEFAULT_MAX_BYTES, REPORT_FILE as GENERATE_FILE},
+            ABANDON_LIMIT_VAR,
+        },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
         seed::{self, Failed, SeedReport},
@@ -117,7 +125,10 @@ mod cli {
              zakura-sim properties --sim <name>\n  \
              zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
-             zakura-sim verify-archive <dir>\n",
+             zakura-sim verify-archive <dir>\n  \
+             zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
+             [--max-bytes <n>] [--exclude <file>]\n  \
+             zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
         text.push_str(
@@ -174,7 +185,19 @@ mod cli {
              `verify-archive` checks every bundle under a triage archive against its\n\
              SHA256SUMS, and each minimized bundle against its failure's bundle, counts\n\
              the bundles under each harness, provenance and signature, and exits 1 if any\n\
-             bundle doesn't match.\n",
+             bundle doesn't match.\n\
+             `generate` draws --runs inputs of up to --max-bytes (default 512) from a\n\
+             SplitMix64 stream that --seed starts, and runs each on the harness in this\n\
+             process. It skips each input whose SHA-256 the --exclude file lists, one per\n\
+             line. It stops at the first Active violation, harness failure, panic, or\n\
+             run past ZAKURA_SIM_ABANDON_LIMIT abandoned runs, and saves that input in\n\
+             --out. It writes generate.json to --out and prints it: the runs, the stop,\n\
+             the run index that stopped it, and each property's outcome counts. With\n\
+             ZAKURA_SIM_END_RECORDS set, it writes only the stopping run's end record\n\
+             there. It exits 0 once the report is written, whatever the search found.\n\
+             `generators` prints, as JSON, each registered property with the harnesses\n\
+             that `generate` can search it on: every harness that reports it and doesn't\n\
+             plant its bugs.\n",
         );
         text.push_str(super::campaign::HELP);
         text.push_str("\nHarnesses:\n");
@@ -205,6 +228,8 @@ mod cli {
             Some("verify-archive") => verify_archive(args.collect()),
             Some("campaign") => super::campaign::run(args.collect()),
             Some("targets") => super::campaign::targets(args.collect()),
+            Some("generate") => generate(args.collect()),
+            Some("generators") => generators(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())
@@ -1093,6 +1118,92 @@ mod cli {
                 bundles.len()
             ))),
         }
+    }
+
+    /// `generate`: searches one harness from a seed in this process, and
+    /// writes and prints the report.
+    #[allow(clippy::print_stdout)]
+    fn generate(args: Vec<String>) -> Result<(), Error> {
+        let names = [
+            "--sim",
+            "--seed",
+            "--runs",
+            "--out",
+            "--max-bytes",
+            "--exclude",
+        ];
+        let mut flags: [Option<String>; 6] = Default::default();
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let slot = names
+                .iter()
+                .position(|name| *name == flag)
+                .ok_or_else(|| Error::Usage(format!("unknown flag `{flag}`")))?;
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{flag} needs a value")))?;
+            if flags[slot].replace(value).is_some() {
+                return Err(Error::Usage(format!("{flag} given twice")));
+            }
+        }
+        let [sim, seed, runs, out, max_bytes, exclude] = flags;
+        let need = |value: Option<String>, flag: &str| {
+            value.ok_or_else(|| Error::Usage(format!("`generate` needs {flag}")))
+        };
+        let number = |value: String, flag: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|error| Error::Usage(format!("{flag}: {error}")))
+        };
+        let entry =
+            harness::find(&need(sim, "--sim")?).map_err(|error| Error::Usage(error.to_string()))?;
+        let exclude = match exclude {
+            None => Default::default(),
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|error| Error::Failed(format!("reading {path}: {error}")))?;
+                generate::read_exclusions(&text)
+                    .map_err(|error| Error::Usage(format!("--exclude {path}: {error}")))?
+            }
+        };
+        let options = GenerateOptions {
+            seed: number(need(seed, "--seed")?, "--seed")?,
+            runs: number(need(runs, "--runs")?, "--runs")?,
+            max_bytes: match max_bytes {
+                None => DEFAULT_MAX_BYTES,
+                Some(value) => value
+                    .parse()
+                    .map_err(|error| Error::Usage(format!("--max-bytes: {error}")))?,
+            },
+            exclude,
+            out: PathBuf::from(need(out, "--out")?),
+            records: trace::end_records::dir(),
+            abandon_limit: abandon_limit(std::env::var(ABANDON_LIMIT_VAR).ok().as_deref())
+                .map_err(Error::Usage)?,
+        };
+        let report = generate::generate(entry, &options).map_err(|error| {
+            Error::Failed(format!(
+                "writing {} in {}: {error}",
+                GENERATE_FILE,
+                options.out.display()
+            ))
+        })?;
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|error| Error::Failed(format!("serializing the report: {error}")))?;
+        println!("{text}");
+        Ok(())
+    }
+
+    /// `generators`: prints [`generate::generator_harnesses`] as JSON.
+    #[allow(clippy::print_stdout)]
+    fn generators(args: Vec<String>) -> Result<(), Error> {
+        if let Some(arg) = args.first() {
+            return Err(Error::Usage(format!("`generators` takes no `{arg}`")));
+        }
+        let text = serde_json::to_string_pretty(&generate::generator_harnesses())
+            .map_err(|error| Error::Failed(format!("serializing the map: {error}")))?;
+        println!("{text}");
+        Ok(())
     }
 
     /// Reads `record`'s flags. Each takes one value and may appear once.

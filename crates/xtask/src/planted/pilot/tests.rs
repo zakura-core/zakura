@@ -2,6 +2,8 @@
 //! observations. None builds or runs a simulator; one runs a shell script
 //! in its place.
 
+use std::ffi::OsString;
+
 use super::*;
 #[cfg(unix)]
 use crate::planted::wait_until_executable;
@@ -550,7 +552,7 @@ fn campaign_facts_read_saved_failures() {
 #[test]
 fn paired_campaigns_share_their_budget() {
     let catalogue = committed_catalogue();
-    let bounds = &catalogue.discovery;
+    let bounds = &catalogue.discovery.campaign;
     let corpus = Path::new("qa/mutation-pilot/discovery-empty");
     let baseline = start_args(
         bounds,

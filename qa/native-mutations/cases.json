@@ -696,5 +696,15 @@
       "test_target": "discovery_wire_witness"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch",
+    "entry": "session-capacity",
+    "property": "session/capacity-conserved",
+    "witness": {
+      "test": "complete_session_transfers_setup_to_installed_owners",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
   }
 ]

@@ -98,6 +98,7 @@ macro_rules! machine_entry {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },
             accepts: |_| true,
+            families: Vec::new,
             migrate: |_, generator| {
                 Err(format!(
                     "{} migrates no generator-{generator} input",

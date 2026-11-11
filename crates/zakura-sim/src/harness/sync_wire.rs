@@ -55,7 +55,7 @@ use super::{
     },
     wire_node::config as wire_config_for,
     wire_node::{Bound, TransportTap, WireEndpoint},
-    LinkSpec, NetScenario, Subsystem,
+    LinkSpec, NetScenario, ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
@@ -539,6 +539,20 @@ impl Subsystem for SyncWire {
             Source::Closes,
             "the wire tier has no in-memory reader to record a close cause",
         )
+    }
+
+    /// Each saved scenario's tag ([`SavedWire::tag`]), and
+    /// [`COMBINED_TAG`], whose next byte picks the combined actions.
+    /// [`SavedWire::Honest`]'s tag draws the untagged scenario, so it isn't
+    /// a family.
+    fn families() -> Vec<ScenarioFamily> {
+        let mut families: Vec<ScenarioFamily> = SavedWire::ALL
+            .into_iter()
+            .filter(|saved| *saved != SavedWire::Honest)
+            .map(|saved| ScenarioFamily::new(saved.name(), saved.tag()))
+            .collect();
+        families.push(ScenarioFamily::new("combined", [COMBINED_TAG]));
+        families
     }
 
     /// The saved scenario `prefix` tags ([`SavedWire::from_tag`]), or the

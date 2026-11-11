@@ -82,7 +82,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 4;
+    const GENERATOR: u32 = 5;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -298,6 +298,30 @@ impl Subsystem for Wire {
         ])
     }
 
+    fn families() -> Vec<super::ScenarioFamily> {
+        [
+            "hello",
+            "ack",
+            "prelude",
+            "pacing",
+            "shared-addresses",
+            "retries",
+            "capability-flip",
+            "dial-reserve",
+            "stream-churn",
+            "partial-session",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            super::ScenarioFamily::new(
+                name,
+                [u8::try_from(index).expect("ten families fit in a byte")],
+            )
+        })
+        .collect()
+    }
+
     fn draw(prefix: &[u8]) -> Scenario {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
         let mut scenario = Scenario::default();
@@ -412,6 +436,10 @@ impl Subsystem for Wire {
                         },
                         crate::peer::PeerAction::Close,
                     ];
+                    if byte(2) & 1 != 0 {
+                        peer.dialer = Dialer::Node;
+                        peer.script.clear();
+                    }
                     scenario.peers = vec![peer; usize::from(byte(1).min(8))];
                 }
             }

@@ -12,7 +12,11 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::super::{baseline_failure, classify as planted_verdict, Run, Verdict};
+use super::super::{
+    baseline_failure, classify as planted_verdict,
+    lane::{campaign_failure, left_failures, CampaignFacts},
+    Run, Verdict,
+};
 
 /// A process that ran past its deadline or died from a signal is a harness
 /// failure, never a baseline failure or a mutant's result.
@@ -259,43 +263,6 @@ pub(super) fn sensitivity(property: &str, run: &SensitivityRun) -> Classified {
     }
 }
 
-/// What one discovery campaign showed, from its store's records.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(super) struct CampaignFacts {
-    /// How the run ended: `complete`, `worker-stopped` or `interrupted`, or
-    /// `none` without an end record.
-    pub(super) status: String,
-    /// Inputs in the run's initial snapshot.
-    pub(super) initial_inputs: usize,
-    /// The properties a saved input violates, in order, each once.
-    pub(super) violated: Vec<String>,
-    /// Saved failures that aren't a property violation and that no worker
-    /// death explains: a harness failure, crash, abandoned run,
-    /// nondeterministic rerun or run without an end that the target saved,
-    /// and a libFuzzer OOM or leak.
-    pub(super) failures: Vec<String>,
-    /// libFuzzer's timeout inputs, and its crash inputs no saved violation
-    /// explains: a worker that ran past its input timeout or died from a
-    /// signal.
-    pub(super) killed: Vec<String>,
-    /// Every way the run's counts fall short, as the evidence lists it.
-    pub(super) incomplete: Vec<String>,
-    /// True if the intended property applied in some complete process.
-    pub(super) applied: bool,
-    /// Inputs the run's processes counted.
-    pub(super) runs: u64,
-    /// Inputs where the intended property applied, in complete processes.
-    pub(super) applicable_runs: u64,
-    /// How long the workers ran, in milliseconds.
-    pub(super) millis: u64,
-    /// The first saved input that violates the intended property, relative
-    /// to the store.
-    pub(super) intended_input: Option<String>,
-    /// Why the run's fuzzer build doesn't pair with the catalogue's, if it
-    /// doesn't.
-    pub(super) unpaired: Option<String>,
-}
-
 /// What one seed's paired discovery campaigns observed. A step that didn't
 /// run is `None`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -457,43 +424,6 @@ pub(super) fn discovery_baseline(
             format!("the baseline campaign {why}"),
         )
     })
-}
-
-/// Why `campaign` isn't a complete, clean, paired run from the empty
-/// corpus, other than a property violation, or `None` if it is.
-fn campaign_failure(campaign: &CampaignFacts) -> Option<String> {
-    if let Some(why) = &campaign.unpaired {
-        return Some(why.clone());
-    }
-    if campaign.initial_inputs > 0 {
-        return Some(format!(
-            "started from {} inputs, not the frozen empty corpus",
-            campaign.initial_inputs
-        ));
-    }
-    if let Some(why) = left_failures(campaign) {
-        return Some(why);
-    }
-    if campaign.status != "complete" || !campaign.incomplete.is_empty() {
-        return Some(format!(
-            "ended {} with incomplete evidence: {}",
-            campaign.status,
-            campaign.incomplete.join(", ")
-        ));
-    }
-    None
-}
-
-/// The saved failures and worker deaths `campaign` left, said in words, or
-/// `None` if it left none.
-fn left_failures(campaign: &CampaignFacts) -> Option<String> {
-    let left: Vec<&str> = campaign
-        .failures
-        .iter()
-        .chain(&campaign.killed)
-        .map(String::as_str)
-        .collect();
-    (!left.is_empty()).then(|| format!("left failures: {}", left.join(", ")))
 }
 
 /// The classes of a set of results, and the intended-detection rate's

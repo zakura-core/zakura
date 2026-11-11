@@ -586,10 +586,14 @@ fn complete_session_transfers_setup_to_installed_owners() {
     let mut peer = PeerSpec::listening();
     peer.capabilities |= 1 << 59;
     peer.handshake = Some(HandshakeSpec::default());
-    let report = run(Scenario {
+    let scenario = Scenario {
         peers: vec![peer],
         ..Scenario::default()
-    });
+    };
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[..3].copy_from_slice(&[9, 1, 1]);
+    assert_eq!(scenario, Wire::draw(&input));
+    let report = run(scenario);
     assert_held(&report, "session/capacity-conserved");
     assert!(
         report.log.entries().iter().any(|entry| matches!(

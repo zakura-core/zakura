@@ -66,7 +66,7 @@ use super::{
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
     wire_plans::SavedPlan,
-    NetScenario, Subsystem,
+    NetScenario, ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
@@ -1206,8 +1206,12 @@ impl Subsystem for Storage {
             .holds_when(|storage, assume| storage.recovery.holds(&storage.ends, assume))
     }
 
-    /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its
-    /// version byte.
+    /// The grammar's version byte selects generated storage scenarios.
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("grammar", [grammar::LAYOUT.version])]
+    }
+
+    /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its version byte.
     fn accepts(prefix: &[u8]) -> bool {
         grammar::decode(prefix).is_ok()
     }
@@ -1765,8 +1769,15 @@ impl Subsystem for HeaderWire {
         Assumptions::declare(declared).holds_when(wire_holds)
     }
 
-    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or
-    /// the default scenario.
+    /// Every saved wire scenario's tag.
+    fn families() -> Vec<ScenarioFamily> {
+        SavedPlan::ALL
+            .into_iter()
+            .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
+            .collect()
+    }
+
+    /// The saved Plan's scenario `prefix` tags, or the default scenario.
     fn draw(prefix: &[u8]) -> WireScenario {
         SavedPlan::from_tag(prefix).map_or_else(WireScenario::default, SavedPlan::scenario)
     }

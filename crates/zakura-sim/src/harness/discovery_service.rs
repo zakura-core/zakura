@@ -46,7 +46,7 @@ use zakura_quic::sim::{SeededInputs, SimNet};
 use super::{
     header_sync::wire_config,
     wire_node::{DialReporter, TransportTap, WireEndpoint},
-    NetScenario, Subsystem,
+    NetScenario, ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::discovery::late_response_admitted,
@@ -868,6 +868,14 @@ impl Subsystem for DiscoveryWire {
             Source::Frames,
             Source::Closes,
         ])
+    }
+
+    /// Each saved Plan's tag ([`SavedPlan::tag`]).
+    fn families() -> Vec<ScenarioFamily> {
+        SavedPlan::ALL
+            .into_iter()
+            .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
+            .collect()
     }
 
     /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or

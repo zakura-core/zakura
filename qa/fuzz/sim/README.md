@@ -32,9 +32,9 @@ whose target has no harness or no campaign.
 ## Targets
 
 - `handshake_wire` runs `handshake/wire` against the production QUIC endpoint
-  and protocol handler. Decoder v4's 32-byte prefix chooses control corruption,
+  and protocol handler. Decoder v5's 32-byte prefix chooses control corruption,
   prelude corruption, pacing, shared addresses, failed retries, capability flips,
-  inbound pressure during node dials, invalid stream-open churn, or partial session offers.
+  inbound pressure during node dials, invalid stream-open churn, or partial and complete session offers.
   Remaining bytes choose the schedule.
 - `handshake_counts` runs `handshake/counts` against production admission
   decisions. Its three-byte operations choose an action, owner slot, and

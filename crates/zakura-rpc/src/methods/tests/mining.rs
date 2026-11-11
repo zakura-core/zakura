@@ -337,7 +337,8 @@ fn counting_mining_rpc(
 }
 
 /// Returns a mining RPC whose mempool holds one transaction and has processed the tip `info`
-/// names, with its tip sender and the sender its mempool publishes snapshots on.
+/// names, with its tip sender, the sender its mempool publishes snapshots on, and a count of
+/// the requests sent to the mempool.
 ///
 /// The mempool service always answers for the tip `info` names. The caller publishes the
 /// snapshot for a tip to have the mempool process that block.
@@ -347,13 +348,17 @@ fn populated_mining_rpc(
     TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     mempool::MempoolSnapshotSender,
+    Arc<AtomicUsize>,
 ) {
     let (tip, sender) = MockChainTip::new();
     sender.send_best_tip_height(info.borrow().tip_height);
     sender.send_best_tip_hash(info.borrow().tip_hash);
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let requests = request_count.clone();
     let mempool_info = info.clone();
     let mempool = tower::service_fn(move |_| {
+        requests.fetch_add(1, Ordering::SeqCst);
         let hash = mempool_info.borrow().tip_hash;
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
@@ -374,7 +379,7 @@ fn populated_mining_rpc(
     });
     let (rpc, _) =
         rpc_reading_mempool_snapshots(network(), mempool, mempool_snapshots.subscribe(), read, tip);
-    (rpc, sender, mempool_snapshots)
+    (rpc, sender, mempool_snapshots, request_count)
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -1209,13 +1214,41 @@ fn simultaneous_long_polls_remain_responsive() {
 /// Long polls answered together on a new tip must not each select from the mempool and queue
 /// a full template build. Up to [`MAX_FULL_FIRST_ANSWERS`] of them build the full first
 /// answer, and the rest answer coinbase-only.
+///
+/// Here the mempool has published its snapshot for the new block, so no long poll sends the
+/// mempool a request.
 #[test]
 fn simultaneous_long_polls_build_a_bounded_number_of_full_first_answers() {
+    answer_simultaneous_long_polls_on_a_new_tip(MempoolSnapshotOnNewTip::Published);
+}
+
+/// While the mempool's snapshot is still behind the new block, only the long polls building a
+/// full first answer ask the mempool. The ones over the limit answer coinbase-only without
+/// sending it a request.
+#[test]
+fn simultaneous_long_polls_over_the_limit_do_not_ask_the_mempool() {
+    answer_simultaneous_long_polls_on_a_new_tip(MempoolSnapshotOnNewTip::Behind);
+}
+
+/// Whether the mempool has published its snapshot for the new block when long polls ask for
+/// their first answer on it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum MempoolSnapshotOnNewTip {
+    /// The snapshot is for the new block.
+    Published,
+    /// No snapshot is for the new block, so a long poll has to ask the mempool.
+    Behind,
+}
+
+/// Answers more long polls together on a new tip than may build a full first answer, and
+/// checks that [`MAX_FULL_FIRST_ANSWERS`] of them answer with the full template, that the
+/// rest answer coinbase-only, and how many requests they send the mempool between them.
+fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip) {
     const LONG_POLLS: usize = 8;
 
-    mining_runtime(async {
+    mining_runtime(async move {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
-        let (rpc, tip, mempool_snapshots) = populated_mining_rpc(info);
+        let (rpc, tip, mempool_snapshots, mempool_requests) = populated_mining_rpc(info);
         let initial = bounded(rpc.get_block_template(None))
             .await
             .unwrap()
@@ -1228,13 +1261,16 @@ fn simultaneous_long_polls_build_a_bounded_number_of_full_first_answers() {
             })))
         };
 
-        // A block lands, and the mempool has already processed it.
+        // A block lands. The mempool answers a request with its transactions for that block
+        // either way, and has published them only in the `Published` case.
         let next = chain_info(3, 2, 400_000_000);
-        mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
-            last_seen_tip_hash: next.tip_hash,
-            transactions: vec![fake_verified_mempool_tx()].into(),
-            transaction_dependencies: Default::default(),
-        }));
+        if snapshot == MempoolSnapshotOnNewTip::Published {
+            mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
+                last_seen_tip_hash: next.tip_hash,
+                transactions: vec![fake_verified_mempool_tx()].into(),
+                transaction_dependencies: Default::default(),
+            }));
+        }
         info_tx.send_replace(next.clone());
         tip.send_best_tip_height(next.tip_height);
         tip.send_best_tip_hash(next.tip_hash);
@@ -1242,9 +1278,21 @@ fn simultaneous_long_polls_build_a_bounded_number_of_full_first_answers() {
         // No template build can finish while the blocking pool is held, so every long poll
         // that starts a full first answer is still working on it when the others arrive.
         let gate = BlockingPoolGate::new().await;
+        let requests_before = mempool_requests.load(Ordering::SeqCst);
         let mut requests: Vec<_> = (0..LONG_POLLS).map(|_| old_tip_long_poll()).collect();
         for request in &mut requests {
             assert!(futures::poll!(request).is_pending());
+        }
+        let requests_sent = mempool_requests.load(Ordering::SeqCst) - requests_before;
+        match snapshot {
+            MempoolSnapshotOnNewTip::Published => assert_eq!(
+                requests_sent, 0,
+                "a snapshot for the new block answers without asking the mempool"
+            ),
+            MempoolSnapshotOnNewTip::Behind => assert_eq!(
+                requests_sent, MAX_FULL_FIRST_ANSWERS,
+                "only the long polls building a full first answer ask the mempool"
+            ),
         }
 
         gate.release().await;

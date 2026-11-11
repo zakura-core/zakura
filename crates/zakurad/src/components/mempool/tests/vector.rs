@@ -2150,6 +2150,89 @@ async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Resu
     Ok(())
 }
 
+/// A reader of the mempool's snapshots gets the one for a new block without sending the
+/// mempool a request: the queue checker sees the best tip change and has the mempool remove
+/// the block's expired transactions and publish.
+#[tokio::test]
+async fn queue_checker_has_the_mempool_publish_a_new_block_to_snapshot_readers(
+) -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _changes,
+    ) = setup(&network, u64::MAX, true).await;
+    let mut snapshots = mempool.snapshots();
+    mempool.enable(&mut recent_syncs).await;
+
+    // Block 1 resets the tip at the first network-upgrade boundary and empties the mempool.
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block1.clone(),
+        ),
+    )
+    .await?;
+    mempool.dummy_call().await;
+
+    let expiring = expiry_fixture_transaction(1, Height(2), None);
+    let staying = expiry_fixture_transaction(2, Height(0), None);
+    let staying_id = staying.transaction.id();
+    mempool
+        .storage()
+        .insert(expiring, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(staying, Vec::new(), Some(Height(1)))?;
+
+    // From here on the queue checker is the mempool's only caller.
+    let verification_finished = mempool.verification_finished();
+    let _queue_checker = QueueChecker::spawn(
+        Buffer::new(BoxService::new(mempool), 1),
+        verification_finished,
+        chain_tip_change.latest_chain_tip(),
+    );
+
+    // Block 2 grows the tip and expires one transaction.
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block2.clone(),
+        ),
+    )
+    .await?;
+
+    // This wait is far shorter than the queue checker's periodic fallback, so only the tip
+    // change can have started the check that publishes block 2.
+    let on_block2 = timeout(Duration::from_secs(2), snapshots.on_tip(block2.hash()))
+        .await?
+        .expect("the mempool is still running");
+    assert_eq!(on_block2.last_seen_tip_hash, block2.hash());
+    assert_eq!(
+        on_block2
+            .transactions
+            .iter()
+            .map(|tx| tx.transaction.id())
+            .collect::<HashSet<_>>(),
+        HashSet::from([staying_id]),
+        "the snapshot for block 2 holds only the transaction that block did not expire"
+    );
+
+    Ok(())
+}
+
 /// Measures actual service polling with an unchanged tip. Run the same harness
 /// on the control and candidate revisions; fixture setup is outside timings.
 #[tokio::test]

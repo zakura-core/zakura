@@ -2281,30 +2281,3 @@ fn invalid_advert_fanout_config_is_rejected() {
         assert!(error.contains(field), "{config:?} gave {error}");
     }
 }
-
-/// Startup concurrency is independently configurable and cannot disable all progress.
-#[test]
-fn initial_peer_dial_concurrency_configuration() {
-    let _init_guard = zakura_test::init();
-    let default: Config = toml::from_str("").unwrap();
-    assert_eq!(default.initial_peer_dial_concurrency.get(), 50);
-
-    for limit in [1, 7, 50, 500] {
-        let config: Config =
-            toml::from_str(&format!("initial_peer_dial_concurrency = {limit}")).unwrap();
-        assert_eq!(config.initial_peer_dial_concurrency.get(), limit);
-        assert_eq!(
-            config.peerset_initial_target_size,
-            default.peerset_initial_target_size
-        );
-        let round_trip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(round_trip.initial_peer_dial_concurrency.get(), limit);
-    }
-
-    for invalid in ["0", "-1", "'50'"] {
-        assert!(
-            toml::from_str::<Config>(&format!("initial_peer_dial_concurrency = {invalid}"))
-                .is_err()
-        );
-    }
-}

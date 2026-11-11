@@ -88,7 +88,6 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
         .into_iter()
         .collect(),
         peerset_initial_target_size: 4,
-        initial_peer_dial_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
         ..test_defaults()
     };
     let cached: IndexSet<PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.8:9000"]
@@ -192,7 +191,7 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     for pair in attempts.windows(2) {
         assert_eq!(
             pair[1].1, pair[0].1,
-            "serial startup attempts do not require a timer"
+            "startup attempts do not wait for a timer"
         );
     }
 }

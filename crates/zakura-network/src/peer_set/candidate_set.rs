@@ -3,11 +3,7 @@
 use std::{any::type_name, cmp::min, sync::Arc};
 
 use chrono::Utc;
-use futures::{
-    future::BoxFuture,
-    stream::{FuturesUnordered, StreamExt},
-    FutureExt,
-};
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::{sleep_until, timeout, Instant};
 use tower::{Service, ServiceExt};
 use tracing::Span;
@@ -138,11 +134,14 @@ where
     /// (see #1976).
     address_book: Arc<std::sync::Mutex<AddressBook>>,
 
-    /// Crawls share one service and cooldown, independently of candidate selection.
-    crawler: Arc<futures::lock::Mutex<CandidateCrawler<S>>>,
+    /// The peer set used to crawl the network for peers.
+    peer_service: S,
 
     /// A timer that enforces a rate-limit on new outbound connections.
     min_next_handshake: Instant,
+
+    /// A timer that enforces a rate-limit on peer set requests for more peers.
+    min_next_crawl: Instant,
 }
 
 impl<S> std::fmt::Debug for CandidateSet<S>
@@ -155,6 +154,7 @@ where
             .field("address_book", &self.address_book)
             .field("peer_service", &type_name::<S>())
             .field("min_next_handshake", &self.min_next_handshake)
+            .field("min_next_crawl", &self.min_next_crawl)
             .finish()
     }
 }
@@ -170,27 +170,18 @@ where
         peer_service: S,
     ) -> CandidateSet<S> {
         CandidateSet {
-            crawler: Arc::new(futures::lock::Mutex::new(CandidateCrawler {
-                address_book: address_book.clone(),
-                peer_service,
-                min_next_crawl: Instant::now(),
-            })),
             address_book,
+            peer_service,
             min_next_handshake: Instant::now(),
+            min_next_crawl: Instant::now(),
         }
     }
 
     /// Update the peer set from the network, using the default fanout limit.
     ///
     /// See [`update_initial`][Self::update_initial] for details.
-    ///
-    /// The returned future owns the crawl gate, not a borrow of this set, so
-    /// callers can release their candidate-selection lock before awaiting it.
-    pub fn update(&mut self) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
-    where
-        S: 'static,
-    {
-        self.update_timeout(None)
+    pub async fn update(&mut self) -> Result<Option<MorePeers>, BoxError> {
+        self.update_timeout(None).await
     }
 
     /// Update the peer set from the network, limiting the fanout to
@@ -227,26 +218,159 @@ where
     /// [`NeverAttemptedGossiped`]: crate::PeerAddrState::NeverAttemptedGossiped
     /// [`Failed`]: crate::PeerAddrState::Failed
     /// [`AttemptPending`]: crate::PeerAddrState::AttemptPending
-    pub fn update_initial(
+    pub async fn update_initial(
         &mut self,
         fanout_limit: usize,
-    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
-    where
-        S: 'static,
-    {
-        self.update_timeout(Some(fanout_limit))
+    ) -> Result<Option<MorePeers>, BoxError> {
+        self.update_timeout(Some(fanout_limit)).await
     }
 
-    /// Build an owned crawl future without holding the candidate-selection lock.
-    fn update_timeout(
-        &self,
+    /// Update the peer set from the network, limiting the fanout to
+    /// `fanout_limit`, and imposing a timeout on the entire fanout.
+    ///
+    /// See [`update_initial`][Self::update_initial] for details.
+    async fn update_timeout(
+        &mut self,
         fanout_limit: Option<usize>,
-    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
-    where
-        S: 'static,
-    {
-        let crawler = self.crawler.clone();
-        async move { crawler.lock().await.update_timeout(fanout_limit).await }.boxed()
+    ) -> Result<Option<MorePeers>, BoxError> {
+        let mut more_peers = None;
+
+        // SECURITY
+        //
+        // Rate limit sending `GetAddr` messages to peers.
+        if self.min_next_crawl <= Instant::now() {
+            // CORRECTNESS
+            //
+            // Use a timeout to avoid deadlocks when there are no connected
+            // peers, and:
+            // - we're waiting on a handshake to complete so there are peers, or
+            // - another task that handles or adds peers is waiting on this task
+            //   to complete.
+            if let Ok(fanout_result) = timeout(
+                constants::PEER_GET_ADDR_TIMEOUT,
+                self.update_fanout(fanout_limit),
+            )
+            .await
+            {
+                more_peers = fanout_result?;
+            } else {
+                // update must only return an error for permanent failures
+                info!("timeout waiting for peer service readiness or peer responses");
+            }
+
+            self.min_next_crawl = Instant::now() + constants::MIN_PEER_GET_ADDR_INTERVAL;
+        }
+
+        Ok(more_peers)
+    }
+
+    /// Update the peer set from the network, limiting the fanout to
+    /// `fanout_limit`.
+    ///
+    /// Opportunistically crawl the network on every update call to ensure
+    /// we're actively fetching peers. Continue independently of whether we
+    /// actually receive any peers, but always ask the network for more.
+    ///
+    /// Because requests are load-balanced across existing peers, we can make
+    /// multiple requests concurrently, which will be randomly assigned to
+    /// existing peers, but we don't make too many because update may be
+    /// called while the peer set is already loaded.
+    ///
+    /// See [`update_initial`][Self::update_initial] for more details.
+    ///
+    /// # Correctness
+    ///
+    /// This function does not have a timeout.
+    /// Use [`update_timeout`][Self::update_timeout] instead.
+    async fn update_fanout(
+        &mut self,
+        fanout_limit: Option<usize>,
+    ) -> Result<Option<MorePeers>, BoxError> {
+        let fanout_limit = fanout_limit
+            .map(|fanout_limit| min(fanout_limit, constants::GET_ADDR_FANOUT))
+            .unwrap_or(constants::GET_ADDR_FANOUT);
+        debug!(?fanout_limit, "sending GetPeers requests");
+
+        let mut responses = FuturesUnordered::new();
+        let mut more_peers = None;
+
+        // Launch requests
+        for attempt in 0..fanout_limit {
+            if attempt > 0 {
+                // Let other tasks run, so we're more likely to choose a different peer.
+                //
+                // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
+                tokio::task::yield_now().await;
+            }
+
+            let peer_service = self.peer_service.ready().await?;
+            responses.push(peer_service.call(Request::Peers));
+        }
+
+        let mut address_book_updates = FuturesUnordered::new();
+
+        // Process responses
+        while let Some(rsp) = responses.next().await {
+            match rsp {
+                Ok(Response::Peers(addrs)) => {
+                    trace!(
+                        addr_count = ?addrs.len(),
+                        ?addrs,
+                        "got response to GetPeers"
+                    );
+                    let addrs = validate_addrs(addrs, DateTime32::now());
+                    address_book_updates.push(self.send_addrs(addrs));
+                    more_peers = Some(MorePeers);
+                }
+                Err(e) => {
+                    // since we do a fanout, and new updates are triggered by
+                    // each demand, we can ignore errors in individual responses
+                    trace!(?e, "got error in GetPeers request");
+                }
+                Ok(_) => unreachable!("Peers requests always return Peers responses"),
+            }
+        }
+
+        // Wait until all the address book updates have finished
+        while let Some(()) = address_book_updates.next().await {}
+
+        Ok(more_peers)
+    }
+
+    /// Add new `addrs` to the address book.
+    async fn send_addrs(&self, addrs: impl IntoIterator<Item = MetaAddr>) {
+        // # Security
+        //
+        // New gossiped peers are rate-limited because:
+        // - Zebra initiates requests for new gossiped peers
+        // - the fanout is limited
+        // - the number of addresses per peer is limited
+        let addrs: Vec<MetaAddrChange> = addrs
+            .into_iter()
+            .map(MetaAddr::new_gossiped_change)
+            .map(|maybe_addr| maybe_addr.expect("Received gossiped peers always have services set"))
+            .collect();
+
+        debug!(count = ?addrs.len(), "sending gossiped addresses to the address book");
+
+        // Don't bother spawning a task if there are no addresses left.
+        if addrs.is_empty() {
+            return;
+        }
+
+        // # Correctness
+        //
+        // Spawn address book accesses on a blocking thread,
+        // to avoid deadlocks (see #1976).
+        //
+        // Extend handles duplicate addresses internally.
+        let address_book = self.address_book.clone();
+        let span = Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| address_book.lock().unwrap().extend(addrs))
+        })
+        .wait_for_panics()
+        .await
     }
 
     /// Returns the next candidate for a connection attempt, if any are available.
@@ -316,170 +440,6 @@ where
     #[allow(dead_code)]
     pub async fn address_book(&self) -> Arc<std::sync::Mutex<AddressBook>> {
         self.address_book.clone()
-    }
-}
-
-/// Serializes network crawls and their completion-based cooldown without
-/// blocking selection of already-known dial candidates.
-struct CandidateCrawler<S> {
-    address_book: Arc<std::sync::Mutex<AddressBook>>,
-    peer_service: S,
-    min_next_crawl: Instant,
-}
-
-impl<S> CandidateCrawler<S>
-where
-    S: Service<Request, Response = Response, Error = BoxError> + Send,
-    S::Future: Send + 'static,
-{
-    /// Update the peer set from the network, limiting the fanout to
-    /// `fanout_limit`, and imposing a timeout on the entire fanout.
-    ///
-    /// See [`CandidateSet::update_initial`] for details.
-    async fn update_timeout(
-        &mut self,
-        fanout_limit: Option<usize>,
-    ) -> Result<Option<MorePeers>, BoxError> {
-        let mut more_peers = None;
-
-        // SECURITY
-        //
-        // Rate limit sending `GetAddr` messages to peers.
-        if self.min_next_crawl <= Instant::now() {
-            // CORRECTNESS
-            //
-            // Use a timeout to avoid deadlocks when there are no connected
-            // peers, and:
-            // - we're waiting on a handshake to complete so there are peers, or
-            // - another task that handles or adds peers is waiting on this task
-            //   to complete.
-            if let Ok(fanout_result) = timeout(
-                constants::PEER_GET_ADDR_TIMEOUT,
-                self.update_fanout(fanout_limit),
-            )
-            .await
-            {
-                more_peers = fanout_result?;
-            } else {
-                // update must only return an error for permanent failures
-                info!("timeout waiting for peer service readiness or peer responses");
-            }
-
-            self.min_next_crawl = Instant::now() + constants::MIN_PEER_GET_ADDR_INTERVAL;
-        }
-
-        Ok(more_peers)
-    }
-
-    /// Update the peer set from the network, limiting the fanout to
-    /// `fanout_limit`.
-    ///
-    /// Opportunistically crawl the network on every update call to ensure
-    /// we're actively fetching peers. Continue independently of whether we
-    /// actually receive any peers, but always ask the network for more.
-    ///
-    /// Because requests are load-balanced across existing peers, we can make
-    /// multiple requests concurrently, which will be randomly assigned to
-    /// existing peers, but we don't make too many because update may be
-    /// called while the peer set is already loaded.
-    ///
-    /// See [`CandidateSet::update_initial`] for more details.
-    ///
-    /// # Correctness
-    ///
-    /// This function does not have a timeout.
-    /// Use [`update_timeout`][Self::update_timeout] instead.
-    async fn update_fanout(
-        &mut self,
-        fanout_limit: Option<usize>,
-    ) -> Result<Option<MorePeers>, BoxError> {
-        let fanout_limit = fanout_limit
-            .map(|fanout_limit| min(fanout_limit, constants::GET_ADDR_FANOUT))
-            .unwrap_or(constants::GET_ADDR_FANOUT);
-        debug!(?fanout_limit, "sending GetPeers requests");
-
-        let mut responses = FuturesUnordered::new();
-        let mut more_peers = None;
-
-        // Launch requests
-        for attempt in 0..fanout_limit {
-            if attempt > 0 {
-                // Let other tasks run, so we're more likely to choose a different peer.
-                //
-                // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                tokio::task::yield_now().await;
-            }
-
-            let peer_service = self.peer_service.ready().await?;
-            responses.push(peer_service.call(Request::Peers));
-        }
-
-        let mut address_book_updates = FuturesUnordered::new();
-
-        // Process responses
-        while let Some(rsp) = responses.next().await {
-            match rsp {
-                Ok(Response::Peers(addrs)) => {
-                    trace!(
-                        addr_count = ?addrs.len(),
-                        ?addrs,
-                        "got response to GetPeers"
-                    );
-                    let addrs = validate_addrs(addrs, DateTime32::now());
-                    address_book_updates.push(Self::send_addrs(self.address_book.clone(), addrs));
-                    more_peers = Some(MorePeers);
-                }
-                Err(e) => {
-                    // since we do a fanout, and new updates are triggered by
-                    // each demand, we can ignore errors in individual responses
-                    trace!(?e, "got error in GetPeers request");
-                }
-                Ok(_) => unreachable!("Peers requests always return Peers responses"),
-            }
-        }
-
-        // Wait until all the address book updates have finished
-        while let Some(()) = address_book_updates.next().await {}
-
-        Ok(more_peers)
-    }
-
-    /// Add new `addrs` to the address book.
-    async fn send_addrs(
-        address_book: Arc<std::sync::Mutex<AddressBook>>,
-        addrs: impl IntoIterator<Item = MetaAddr>,
-    ) {
-        // # Security
-        //
-        // New gossiped peers are rate-limited because:
-        // - Zebra initiates requests for new gossiped peers
-        // - the fanout is limited
-        // - the number of addresses per peer is limited
-        let addrs: Vec<MetaAddrChange> = addrs
-            .into_iter()
-            .map(MetaAddr::new_gossiped_change)
-            .map(|maybe_addr| maybe_addr.expect("Received gossiped peers always have services set"))
-            .collect();
-
-        debug!(count = ?addrs.len(), "sending gossiped addresses to the address book");
-
-        // Don't bother spawning a task if there are no addresses left.
-        if addrs.is_empty() {
-            return;
-        }
-
-        // # Correctness
-        //
-        // Spawn address book accesses on a blocking thread,
-        // to avoid deadlocks (see #1976).
-        //
-        // Extend handles duplicate addresses internally.
-        let span = Span::current();
-        tokio::task::spawn_blocking(move || {
-            span.in_scope(|| address_book.lock().unwrap().extend(addrs))
-        })
-        .wait_for_panics()
-        .await
     }
 }
 

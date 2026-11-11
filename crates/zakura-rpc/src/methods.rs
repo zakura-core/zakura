@@ -124,7 +124,7 @@ use types::{
         proposal::proposal_block_from_template,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
-        GetBlockTemplateParameters, GetBlockTemplateResponse,
+        GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
     },
     get_blockchain_info::GetBlockchainInfoBalance,
     get_mempool_info::GetMempoolInfoResponse,
@@ -1497,7 +1497,8 @@ where
         }
     }
 
-    /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    /// Builds a template, on the blocking pool when it needs a proof, and maps construction or
+    /// worker failures to RPC errors.
     ///
     /// Also returns how long the build waited to start and how long it ran.
     #[allow(clippy::too_many_arguments)]
@@ -1530,13 +1531,21 @@ where
             return Ok((template, times));
         }
 
+        let work = match (&precomputed_coinbase, chain_info.tip_height.next()) {
+            (None, Ok(height)) => {
+                TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
+            }
+            // A coinbase that is already built leaves no proof to create, and neither does a
+            // parent with no next height, which the build rejects.
+            _ => TemplateBuildWork::ProofFree,
+        };
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
         let requested = std::time::Instant::now();
         let (template, times) = self
             .gbt
-            .run_template_build(move || {
+            .run_template_build(work, move || {
                 let started = std::time::Instant::now();
                 let template = BlockTemplateResponse::new_internal(
                     &network,
@@ -3711,7 +3720,8 @@ where
                     // seconds if the miner mines to a shielded address, and we want to return fast
                     // when the tip changes.
                     let precompute_coinbase = |network, height, params| {
-                        self.gbt.run_template_build(move || {
+                        let work = TemplateBuildWork::for_coinbase(&network, height, &params);
+                        self.gbt.run_template_build(work, move || {
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,

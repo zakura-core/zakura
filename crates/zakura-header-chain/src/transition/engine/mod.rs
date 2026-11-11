@@ -350,7 +350,7 @@ impl HeaderChainEngine {
     /// retained headers, or when `lease_root` is a retention reference that only a lease can
     /// authenticate. The same conditions as [`Self::needs_validation_lease`] apply to the engine,
     /// references and authority used to ask.
-    pub fn needs_validation_lease_beside_walk(
+    pub fn needs_validation_lease_for_walk(
         &self,
         walk_from: block::Hash,
         lease_root: block::Hash,

@@ -434,7 +434,8 @@ fn a_lease_is_needed_exactly_when_the_graph_cuts_the_context_short() {
 }
 
 #[test]
-fn a_lease_beside_the_walk_is_needed_only_when_the_walk_runs_short_or_it_vouches_for_a_reference() {
+fn a_walk_needs_another_headers_lease_only_when_it_runs_short_or_the_lease_vouches_for_a_reference()
+{
     let finalized = 20;
     let deep = lowest_fully_retained_parent(finalized);
     let (store, config, frontiers, _) = build_finalized_chain(finalized, &[]);
@@ -444,7 +445,7 @@ fn a_lease_beside_the_walk_is_needed_only_when_the_walk_runs_short_or_it_vouches
     let ctx = context(&config, &clock, Some(&authority));
     let engine = test_engine(&store);
     let needs_finalized_lease = |walk_from: u32, ctx: &TransitionContext<'_>| {
-        engine.needs_validation_lease_beside_walk(
+        engine.needs_validation_lease_for_walk(
             frontiers[walk_from as usize].hash,
             finalized_hash,
             ctx,

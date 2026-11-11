@@ -1420,6 +1420,206 @@ fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip
     });
 }
 
+/// Returns a mining RPC with one mempool transaction, on a tip that has just moved to `next`,
+/// and the ID of a long poll made before the move.
+///
+/// Every long poll sent with that ID is answered at once with the full template on `next`.
+async fn rpc_with_long_poll_id_from_old_tip(
+    next: &GetBlockTemplateChainInfo,
+) -> (TestRpcImpl, types::long_poll::LongPollId) {
+    let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+    let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+    let initial = bounded(rpc.get_block_template(None))
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    move_populated_tip(&info_tx, &tip, &mempool_snapshots, next);
+    // The read service and the tip keep answering for `next` after their senders drop.
+    (rpc, initial.long_poll_id)
+}
+
+/// Moves the tip to `next`, with the mempool's snapshot for it already published.
+fn move_populated_tip(
+    info: &watch::Sender<GetBlockTemplateChainInfo>,
+    tip: &zakura_chain::chain_tip::mock::MockChainTipSender,
+    mempool_snapshots: &mempool::MempoolSnapshotSender,
+    next: &GetBlockTemplateChainInfo,
+) {
+    mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
+        last_seen_tip_hash: next.tip_hash,
+        transactions: vec![fake_verified_mempool_tx()].into(),
+        transaction_dependencies: Default::default(),
+    }));
+    info.send_replace(next.clone());
+    tip.send_best_tip_height(next.tip_height);
+    tip.send_best_tip_hash(next.tip_hash);
+}
+
+fn long_poll(
+    rpc: &TestRpcImpl,
+    long_poll_id: types::long_poll::LongPollId,
+) -> BoxFuture<'_, Result<GetBlockTemplateResponse>> {
+    rpc.get_block_template(Some(GetBlockTemplateParameters {
+        long_poll_id: Some(long_poll_id),
+        ..Default::default()
+    }))
+    .boxed()
+}
+
+/// Long polls that ask for the same work get one template: the first of them builds it, the
+/// ones that arrive during the build wait for it, and a later one takes the finished template.
+#[test]
+fn long_polls_asking_for_the_same_work_share_one_build() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let mut together: Vec<_> = (0..MAX_FULL_FIRST_ANSWERS)
+            .map(|_| long_poll(&rpc, old_tip_id))
+            .collect();
+        for request in &mut together {
+            assert!(futures::poll!(request).is_pending());
+        }
+        gate.release().await;
+
+        let mut templates: Vec<_> = bounded(futures::future::join_all(together))
+            .await
+            .into_iter()
+            .map(|response| response.unwrap().try_into_template().unwrap())
+            .collect();
+        templates.push(
+            bounded(long_poll(&rpc, old_tip_id))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap(),
+        );
+        for template in &templates {
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert_eq!(template.transactions.len(), 1);
+            assert_eq!(template.submit_old, Some(false));
+            assert_eq!(
+                template.work_id(),
+                templates[0].work_id(),
+                "every long poll must receive the one shared build"
+            );
+        }
+    });
+}
+
+/// A request without a long poll ID asks for a template now, so it builds its own.
+#[test]
+fn request_without_a_long_poll_id_does_not_take_a_shared_template() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+        let shared = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+
+        let own = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(own.long_poll_id, shared.long_poll_id);
+        assert_eq!(own.submit_old, None);
+        assert_ne!(own.work_id(), shared.work_id());
+    });
+}
+
+/// `generate` randomizes the coinbase data on a clone of the handler. The clone must not share
+/// templates built with the original miner parameters.
+#[test]
+fn randomized_miner_params_do_not_share_templates() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+        let shared = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let again = bounded(long_poll(&rpc, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(again.work_id(), shared.work_id());
+
+        let mut randomized = rpc.clone();
+        randomized.gbt.randomize_coinbase_data();
+        let own = bounded(long_poll(&randomized, old_tip_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(own.previous_block_hash, next.tip_hash);
+        assert_ne!(own.work_id(), shared.work_id());
+        assert_ne!(own.coinbase_txn.data, shared.coinbase_txn.data);
+    });
+}
+
+/// A build whose caller disconnects leaves the long polls waiting for it to build their own.
+#[test]
+fn abandoned_shared_build_falls_back_to_per_caller_build() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (rpc, old_tip_id) = rpc_with_long_poll_id_from_old_tip(&next).await;
+
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let mut builder = long_poll(&rpc, old_tip_id);
+        let mut waiter = long_poll(&rpc, old_tip_id);
+        assert!(futures::poll!(&mut builder).is_pending());
+        assert!(
+            futures::poll!(&mut waiter).is_pending(),
+            "a long poll waits for the shared build instead of building"
+        );
+        drop(builder);
+        gate.release().await;
+
+        let template = bounded(waiter).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, next.tip_hash);
+        assert_eq!(template.transactions.len(), 1);
+    });
+}
+
+/// A template shared on one tip is not served once the tip has moved on.
+#[test]
+fn shared_template_is_not_served_on_a_newer_tip() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let shared = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(shared.previous_block_hash, next.tip_hash);
+
+        let newest = chain_info(4, 3, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &newest);
+        let template = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(template.previous_block_hash, newest.tip_hash);
+        assert_ne!(template.work_id(), shared.work_id());
+    });
+}
+
 #[tokio::test]
 async fn long_poll_preserves_negative_balance_error() {
     let (info_tx, info) = watch::channel(chain_info(2, 1, 0));

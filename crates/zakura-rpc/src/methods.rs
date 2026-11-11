@@ -1625,15 +1625,8 @@ where
     ) -> Result<Option<GetBlockTemplateResponse>> {
         let mut state = self.gbt.template_rejections.borrow().clone();
 
-        // Transaction selection ran after the chain state was fetched, so re-check both the
-        // rejection state's parent and the chain tip itself: neither request retargets the other.
-        if state.parent != Some(chain_info.tip_hash)
-            || self
-                .latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != chain_info.tip_hash)
-            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
-        {
+        // Transaction selection ran after the chain state was fetched, so re-check it.
+        if self.template_superseded(&state, chain_info.tip_hash, template.long_poll_id.revision) {
             return Ok(None);
         }
 
@@ -1656,6 +1649,52 @@ where
 
         self.recover_template(template, chain_info, miner_params, &state)
             .await
+    }
+
+    /// Whether a template on `parent` with rejection `revision` no longer matches `state` or the
+    /// chain tip.
+    ///
+    /// Both the rejection state's parent and the chain tip itself are checked, because neither
+    /// request retargets the other. Fallback mode keeps a parent's revision moving, so the
+    /// revision only counts outside it.
+    fn template_superseded(
+        &self,
+        state: &types::get_block_template::TemplateRejections,
+        parent: block::Hash,
+        revision: u64,
+    ) -> bool {
+        state.parent != Some(parent)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != parent)
+            || (!state.needs_fallback() && state.revision != revision)
+    }
+
+    /// Returns a copy of a shared template for one more caller, unless the tip or a rejection
+    /// superseded it.
+    ///
+    /// The template's builder already queued its background preparation, so this does not.
+    fn reuse_shared_template(
+        &self,
+        template: &BlockTemplateResponse,
+        submit_old: Option<bool>,
+    ) -> Option<GetBlockTemplateResponse> {
+        {
+            let state = self.gbt.template_rejections.borrow();
+            if state.needs_fallback()
+                || self.template_superseded(
+                    &state,
+                    template.previous_block_hash,
+                    template.long_poll_id.revision,
+                )
+            {
+                return None;
+            }
+        }
+        let mut template = template.clone();
+        template.submit_old = submit_old;
+        Some(template.into())
     }
 
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
@@ -3973,6 +4012,42 @@ where
                 }
             };
 
+            // - Sharing one template between long polls
+            //
+            // Long polls that ask for the same work share one template: the first of them builds
+            // it and the rest take it. A caller without a long poll ID asks for a template now,
+            // and a template past its time range must be rebuilt, so neither shares.
+            let shared_build = if client_long_poll_id.is_some() && !max_time_reached {
+                if let Some(template) = self
+                    .gbt
+                    .shared_template
+                    .wait_for(chain_info.tip_hash, &server_long_poll_id)
+                    .await
+                {
+                    if let Some(response) = self.reuse_shared_template(&template, submit_old) {
+                        drop(full_first_answer);
+                        if let GetBlockTemplateResponse::TemplateMode(template) = &response {
+                            // Nothing was chosen or built for this answer.
+                            self.gbt.trace.full_returned(
+                                request_id,
+                                template,
+                                wait_reason,
+                                Duration::ZERO,
+                                BuildTimes {
+                                    wait: Duration::ZERO,
+                                    run: Duration::ZERO,
+                                },
+                                request_started.elapsed(),
+                            );
+                        }
+                        return Ok(response);
+                    }
+                }
+                self.gbt.shared_template.claim(chain_info.tip_hash)
+            } else {
+                None
+            };
+
             // - Processing fetched data to create a transaction template
             //
             // Apart from random weighted transaction selection,
@@ -4019,17 +4094,23 @@ where
 
             // - After this point, the template only depends on the previously fetched data.
 
-            let (template, build_times) = self
+            let (mut template, build_times) = self
                 .build_mining_template(
                     None,
                     miner_params,
                     &chain_info,
                     server_long_poll_id,
                     mempool_txs,
-                    submit_old,
+                    None,
                 )
                 .await?;
             drop(full_first_answer);
+            // Waiting long polls can take the template before this caller's checks below, because
+            // every caller checks a shared template again before it serves it.
+            if let Some(shared_build) = shared_build {
+                shared_build.publish(template.clone());
+            }
+            template.submit_old = submit_old;
             if let Some(response) = self
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?

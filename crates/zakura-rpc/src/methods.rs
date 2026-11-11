@@ -1110,8 +1110,8 @@ const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// new tip, before it gives up on that tip. No miner waits on it.
 const BUILD_AHEAD_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often the task that builds templates ahead of requests looks whether a long poll is
-/// still waiting, while one is and the task therefore sits out.
+/// How often the task that builds templates ahead of requests looks again while it sits out:
+/// until the node is first asked for a template, and while a long poll is waiting.
 const WAITING_LONG_POLL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The outcome of validating one server mining template.
@@ -1756,10 +1756,13 @@ where
     /// A request that arrives once the template is stored is answered from it instead of
     /// choosing transactions, building and encoding.
     ///
+    /// Builds nothing until the node has been asked for a template, so a node with a miner
+    /// address that no miner uses does no mining work on each block.
+    ///
     /// This task stays out of the way of a long poll that is already waiting when the block
     /// arrives. That long poll is woken by the same tip change and builds and stores the template
     /// itself, so there is nothing to gain, and working beside it measurably delayed its answer.
-    /// While a long poll is waiting, this task does not even listen for tip changes.
+    /// While a long poll is waiting, this task checks on a timer and does not start a build.
     ///
     /// Requests never wait for this task to get to a template. It claims the build only once it
     /// holds everything the build needs, so until then a request finds nothing in progress and
@@ -1773,6 +1776,13 @@ where
         };
         let mut tip = self.latest_chain_tip.clone();
         let mut rejections = self.gbt.template_rejections.subscribe();
+
+        while !self.gbt.template_requested() {
+            tokio::time::sleep(WAITING_LONG_POLL_CHECK_INTERVAL).await;
+            if zakura_chain::shutdown::is_shutting_down() {
+                return;
+            }
+        }
 
         while !zakura_chain::shutdown::is_shutting_down() {
             // A waiting long poll answers each new tip itself. Waking this task on the same tip
@@ -1877,13 +1887,21 @@ where
             return Ok(AheadOutcome::NeedsProof);
         }
 
-        let mut mempool_snapshots = self.mempool_snapshots.clone();
+        // Admitting a transaction withdraws the mempool's published list until a new block or a
+        // list request publishes it again, so ask the mempool when no list for this tip is
+        // published. Only a mempool that is still on an older block is waited for.
         let mempool_wait_started = std::time::Instant::now();
-        let mempool = mempool_snapshots.on_tip(tip_hash).await;
-        times.mempool_wait = mempool_wait_started.elapsed();
-        let Some(mempool) = mempool else {
-            return Ok(AheadOutcome::NoMempool);
+        let (transactions, transaction_dependencies) = match self.mempool_on_tip(tip_hash).await? {
+            Some(mempool) => mempool,
+            None => {
+                let mut mempool_snapshots = self.mempool_snapshots.clone();
+                let Some(snapshot) = mempool_snapshots.on_tip(tip_hash).await else {
+                    return Ok(AheadOutcome::NoMempool);
+                };
+                (snapshot.transactions, snapshot.transaction_dependencies)
+            }
         };
+        times.mempool_wait = mempool_wait_started.elapsed();
 
         // Read after the wait for the mempool, so the template is named for the rejection state
         // a request arriving now would read.
@@ -1897,7 +1915,7 @@ where
             chain_info.tip_height,
             tip_hash,
             chain_info.max_time,
-            mempool.transactions.iter().map(|tx| tx.transaction.id()),
+            transactions.iter().map(|tx| tx.transaction.id()),
         )
         .generate_id();
         long_poll_id.revision = rejection_state.revision;
@@ -1914,8 +1932,8 @@ where
                 miner_params,
                 &chain_info,
                 long_poll_id,
-                &mempool.transactions,
-                &mempool.transaction_dependencies,
+                &transactions,
+                &transaction_dependencies,
             )
             .await?;
         times.selection = selection;
@@ -1952,10 +1970,11 @@ where
     /// superseded it.
     ///
     /// Renews the compact-submission registration of validated work, restoring its block content
-    /// if it expired or was evicted. Work that has not been validated yet gets no registration
-    /// here: the builder's background validation registers it if it passes, as it does for the
-    /// builder's own answer. Registration grants no verification or relay authority; submissions
-    /// still pass through the consensus verifier.
+    /// if it expired or was evicted. Work that has not been validated yet is queued for
+    /// background validation, as each answer a request builds is, so a template whose own
+    /// validation a newer template replaced in the queue is still validated once it is served
+    /// again. That validation registers it if it passes. Registration grants no verification or
+    /// relay authority; submissions still pass through the consensus verifier.
     async fn reuse_shared_template(
         &self,
         shared: ReadyTemplate,
@@ -1976,13 +1995,17 @@ where
         }
 
         let candidates = self.gbt.prepared_candidates();
-        if !candidates.refresh_server_template(template.work_id())
-            && self
+        let registered = candidates.refresh_server_template(template.work_id());
+        let prepared = registered
+            || self
                 .gbt
                 .template_rejections
                 .borrow()
-                .is_prepared(template.work_id())
-        {
+                .is_prepared(template.work_id());
+        if !prepared {
+            // The queue skips a template it is already validating or holding.
+            self.prepare_template_in_background(&template);
+        } else if !registered {
             let retained_template = template.clone();
             let network = self.network.clone();
             self.gbt
@@ -2021,15 +2044,45 @@ where
         Ok(Some(template.into()))
     }
 
+    /// Returns the mempool's transactions and their dependencies as checked against `tip_hash`,
+    /// or `None` if the mempool answers that it is still on an older block.
+    ///
+    /// Takes them from the snapshot the mempool publishes when that snapshot was checked
+    /// against `tip_hash`. The caller then sends the mempool no request, so it does not queue
+    /// behind the mempool's other callers. A snapshot for any other block is never used:
+    /// while the published one is for another block, or none is published because a
+    /// transaction was admitted since, this asks the mempool, and takes the mempool's answer
+    /// or a snapshot for `tip_hash`, whichever comes first.
+    ///
+    /// Has no time limit of its own.
+    async fn mempool_on_tip(
+        &self,
+        tip_hash: block::Hash,
+    ) -> Result<Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)>> {
+        let mut mempool_snapshots = self.mempool_snapshots.clone();
+        let published = mempool_snapshots.on_tip(tip_hash);
+        let requested =
+            types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
+        tokio::pin!(published, requested);
+
+        tokio::select! {
+            // The snapshot is checked first, and the request is only sent once it is
+            // polled: a snapshot that already names the tip costs the mempool nothing.
+            biased;
+
+            // A mempool that has shut down publishes nothing more. Its answer to the
+            // request, an error, then decides.
+            Some(snapshot) = &mut published => {
+                Ok(Some((snapshot.transactions, snapshot.transaction_dependencies)))
+            }
+            answer = &mut requested => answer,
+        }
+    }
+
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
     /// the mempool has processed that block and holds any.
     ///
-    /// Takes them from the snapshot the mempool publishes when that snapshot was checked
-    /// against `tip_hash`. The long poll then sends the mempool no request, so it does not
-    /// queue behind the mempool's other callers. A snapshot for any other block is never
-    /// used: while the published one is for another block, this asks the mempool, as it did
-    /// before snapshots, and takes the mempool's answer or a snapshot for `tip_hash`,
-    /// whichever comes first.
+    /// Reads them with [`Self::mempool_on_tip`].
     ///
     /// Returns `None` when the mempool is empty, answers that it is still on an older tip,
     /// takes longer than [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the
@@ -2040,31 +2093,12 @@ where
         request_id: u64,
         tip_hash: block::Hash,
     ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
-        let mut mempool_snapshots = self.mempool_snapshots.clone();
-        let published = mempool_snapshots.on_tip(tip_hash);
-        let requested =
-            types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
-
-        let mempool_on_tip = async {
-            tokio::pin!(published, requested);
-
-            tokio::select! {
-                // The snapshot is checked first, and the request is only sent once it is
-                // polled: a snapshot that already names the tip costs the mempool nothing.
-                biased;
-
-                // A mempool that has shut down publishes nothing more. Its answer to the
-                // request, an error, then decides.
-                Some(snapshot) = &mut published => {
-                    Ok(Some((snapshot.transactions, snapshot.transaction_dependencies)))
-                }
-                answer = &mut requested => answer,
-            }
-        };
-
         let started = std::time::Instant::now();
-        let (outcome, mempool) = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_on_tip)
-            .await
+        let (outcome, mempool) = match tokio::time::timeout(
+            NEW_TIP_MEMPOOL_WAIT,
+            self.mempool_on_tip(tip_hash),
+        )
+        .await
         {
             Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
                 (NewTipMempool::Populated, Some((transactions, dependencies)))
@@ -3992,6 +4026,8 @@ where
 
         // To implement long polling correctly, we split this RPC into multiple phases.
         check_parameters(&parameters)?;
+        // From now on the node builds each new tip's template ahead of the requests for it.
+        self.gbt.note_template_requested();
 
         let request_id = next_request_id();
         let request_started = std::time::Instant::now();

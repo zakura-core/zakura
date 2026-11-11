@@ -27,7 +27,15 @@ use zakura_script::Sigops;
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::{MinerAddress, MinerParams, TemplatePreparationQueue};
+use super::{MinerAddress, MinerParams, PreparationKey, TemplatePreparationQueue};
+
+impl PreparationKey for u8 {
+    type Key = u8;
+
+    fn preparation_key(&self) -> u8 {
+        *self
+    }
+}
 
 #[test]
 fn template_rejection_targets_work_and_ignores_old_parents() {
@@ -107,6 +115,33 @@ fn template_preparation_queue_keeps_the_latest_pending_template() {
     assert!(queue.enqueue(3).is_none());
     assert_eq!(worker.next(), Some(3));
     assert_eq!(worker.next(), None);
+}
+
+/// A template that is being prepared, or is already waiting, is not queued again, so a template
+/// that many requests share is prepared once.
+#[test]
+fn template_preparation_queue_skips_a_template_it_already_holds() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    let (_first, mut worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert!(queue.enqueue(1).is_none());
+    assert_eq!(
+        worker.next(),
+        None,
+        "the running template is not queued again"
+    );
+
+    let (_first, mut worker) = queue.enqueue(1).expect("a released queue admits a worker");
+    assert!(queue.enqueue(2).is_none());
+    assert!(queue.enqueue(1).is_none());
+    assert!(queue.enqueue(2).is_none());
+    assert_eq!(worker.next(), Some(2), "the pending template is kept once");
+    assert!(queue.enqueue(2).is_none());
+    assert_eq!(
+        worker.next(),
+        None,
+        "the template now running is not queued again"
+    );
 }
 
 /// A loop that ends without taking its next template still releases the worker slot.

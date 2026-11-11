@@ -340,8 +340,9 @@ fn counting_mining_rpc(
 /// names, with its tip sender, the sender its mempool publishes snapshots on, and a count of
 /// the requests sent to the mempool.
 ///
-/// The mempool service always answers for the tip `info` names. The caller publishes the
-/// snapshot for a tip to have the mempool process that block.
+/// The mempool service always answers for the tip `info` names, as the mempool does once a
+/// request makes it process the new block. The caller publishes the snapshot for a tip to have
+/// the mempool process that block without a request.
 fn populated_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
@@ -350,16 +351,54 @@ fn populated_mining_rpc(
     mempool::MempoolSnapshotSender,
     Arc<AtomicUsize>,
 ) {
+    let (rpc, tip, mempool_snapshots, request_count, _) =
+        populated_mining_rpc_with(info, MempoolTip::FollowsChain);
+    (rpc, tip, mempool_snapshots, request_count)
+}
+
+/// The block that the mempool in [`populated_mining_rpc_with`] answers requests for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MempoolTip {
+    /// The tip the chain info names: a request makes the mempool process a new block.
+    FollowsChain,
+    /// The block of the last snapshot published, starting with the tip the chain info names
+    /// at first: the mempool has not seen a later block until its snapshot is published.
+    LastPublished,
+}
+
+/// Like [`populated_mining_rpc`], with the mempool answering for `mempool_tip`, and also
+/// returning the block verifier.
+fn populated_mining_rpc_with(
+    info: watch::Receiver<GetBlockTemplateChainInfo>,
+    mempool_tip: MempoolTip,
+) -> (
+    TestRpcImpl,
+    zakura_chain::chain_tip::mock::MockChainTipSender,
+    mempool::MempoolSnapshotSender,
+    Arc<AtomicUsize>,
+    Verifier,
+) {
     let (tip, sender) = MockChainTip::new();
     sender.send_best_tip_height(info.borrow().tip_height);
     sender.send_best_tip_hash(info.borrow().tip_hash);
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
     let request_count = Arc::new(AtomicUsize::new(0));
     let requests = request_count.clone();
+    let processed_tip = Arc::new(std::sync::Mutex::new(info.borrow().tip_hash));
+    let published = mempool_snapshots.subscribe();
     let mempool_info = info.clone();
     let mempool = tower::service_fn(move |_| {
         requests.fetch_add(1, Ordering::SeqCst);
-        let hash = mempool_info.borrow().tip_hash;
+        let hash = match mempool_tip {
+            MempoolTip::FollowsChain => mempool_info.borrow().tip_hash,
+            MempoolTip::LastPublished => {
+                let mut processed_tip = processed_tip.lock().unwrap();
+                if let Some(snapshot) = published.latest() {
+                    *processed_tip = snapshot.last_seen_tip_hash;
+                }
+                *processed_tip
+            }
+        };
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
                 transactions: vec![fake_verified_mempool_tx()].into(),
@@ -377,9 +416,9 @@ fn populated_mining_rpc(
             })
         }
     });
-    let (rpc, _) =
+    let (rpc, verifier) =
         rpc_reading_mempool_snapshots(network(), mempool, mempool_snapshots.subscribe(), read, tip);
-    (rpc, sender, mempool_snapshots, request_count)
+    (rpc, sender, mempool_snapshots, request_count, verifier)
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -1870,6 +1909,7 @@ fn build_ahead_waiting_for_capacity_is_cancelled_on_a_reorg() {
         let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
         move_populated_tip(&info_tx, &tip, &mempool_snapshots, &old);
         let gate = TemplateBuildGate::new(&rpc).await;
+        rpc.gbt.note_template_requested();
         let mut builder = Box::pin(rpc.clone().run_template_builder());
 
         assert!(futures::poll!(&mut builder).is_pending());
@@ -1929,6 +1969,7 @@ fn build_ahead_rejected_while_waiting_for_capacity_is_not_served() {
         let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
         move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
         let gate = TemplateBuildGate::new(&rpc).await;
+        rpc.gbt.note_template_requested();
         let mut builder = Box::pin(rpc.clone().run_template_builder());
         assert!(futures::poll!(&mut builder).is_pending());
         let id = populated_template_id(&next);
@@ -1964,12 +2005,18 @@ fn build_ahead_rejected_while_waiting_for_capacity_is_not_served() {
 
 /// The task that builds ahead waits for the mempool to process the new block for as long as
 /// that takes. A long poll that arrives meanwhile is not held for it: it is answered on the new
-/// tip by its own build.
+/// tip at once, and the template is built ahead once the mempool has processed the block.
 #[test]
 fn long_poll_is_not_held_while_the_build_ahead_waits_for_the_mempool() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
-        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        let (rpc, tip, mempool_snapshots, _, _verifier) =
+            populated_mining_rpc_with(info, MempoolTip::LastPublished);
+        mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
+            last_seen_tip_hash: chain_info(2, 1, 0).tip_hash,
+            transactions: vec![fake_verified_mempool_tx()].into(),
+            transaction_dependencies: Default::default(),
+        }));
         let initial = bounded(rpc.get_block_template(None))
             .await
             .unwrap()
@@ -1977,7 +2024,7 @@ fn long_poll_is_not_held_while_the_build_ahead_waits_for_the_mempool() {
             .unwrap();
         tokio::spawn(rpc.clone().run_template_builder());
 
-        // A block lands, and the mempool has not published its list for it.
+        // A block lands, and the mempool has not processed it yet.
         let next = chain_info(3, 2, 400_000_000);
         info_tx.send_replace(next.clone());
         tip.send_best_tip_height(next.tip_height);
@@ -1993,15 +2040,149 @@ fn long_poll_is_not_held_while_the_build_ahead_waits_for_the_mempool() {
             .unwrap();
         assert_eq!(answered.previous_block_hash, next.tip_hash);
         assert_eq!(answered.submit_old, Some(false));
+        assert!(
+            answered.transactions.is_empty(),
+            "without the mempool's list the long poll answers coinbase-only"
+        );
 
-        // Once the mempool publishes its list, the stored template is the long poll's.
+        // Once the mempool publishes its list, the template is built ahead.
         mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
             last_seen_tip_hash: next.tip_hash,
             transactions: vec![fake_verified_mempool_tx()].into(),
             transaction_dependencies: Default::default(),
         }));
         let stored = template_built_ahead(&rpc, &next).await;
-        assert_eq!(stored.work_id(), answered.work_id());
+        assert_eq!(stored.previous_block_hash, next.tip_hash);
+        assert_eq!(stored.transactions.len(), 1);
+    });
+}
+
+/// Admitting a transaction withdraws the mempool's published list, and nothing publishes it
+/// again until the next block or a request for it. The task that builds ahead then asks the
+/// mempool, and a request after it takes the template it stored.
+#[test]
+fn build_ahead_asks_the_mempool_when_its_list_was_withdrawn() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        rpc.gbt.note_template_requested();
+        tokio::spawn(rpc.clone().run_template_builder());
+
+        // The mempool processes the new block, then admits a transaction.
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        mempool_snapshots.publish(None);
+
+        let built_ahead = template_built_ahead(&rpc, &next).await;
+        assert_eq!(built_ahead.previous_block_hash, next.tip_hash);
+        assert_eq!(built_ahead.transactions.len(), 1);
+
+        let plain = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(plain.work_id(), built_ahead.work_id());
+    });
+}
+
+/// A node that has not been asked for a template builds none ahead, so a node with a miner
+/// address that no miner uses does no mining work on each block. After the first request, the
+/// next block's template is built ahead.
+#[test]
+fn nothing_is_built_ahead_until_a_template_is_requested() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, mempool_requests) = populated_mining_rpc(info);
+        tokio::time::pause();
+        tokio::spawn(rpc.clone().run_template_builder());
+
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        tokio::time::advance(WAITING_LONG_POLL_CHECK_INTERVAL * 3).await;
+        let_other_tasks_run().await;
+        assert!(rpc
+            .gbt
+            .shared_template
+            .ready(&populated_template_id(&next))
+            .is_none());
+        assert_eq!(mempool_requests.load(Ordering::SeqCst), 0);
+        tokio::time::resume();
+
+        bounded(rpc.get_block_template(None)).await.unwrap();
+        let after = chain_info(4, 3, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &after);
+        let built_ahead = template_built_ahead(&rpc, &after).await;
+        assert_eq!(built_ahead.previous_block_hash, after.tip_hash);
+    });
+}
+
+/// Background validation keeps only the newest waiting template, so a newer one can replace a
+/// shared template's own request for it. A long poll that takes the shared template asks again,
+/// so the template it is given is validated. Taking it again while it is being validated does
+/// not queue a second validation.
+#[test]
+fn a_shared_template_whose_validation_was_replaced_is_validated_when_taken() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_snapshots, _, mut verifier) =
+            populated_mining_rpc_with(info, MempoolTip::FollowsChain);
+        let is_prepare = |request: &zakura_consensus::Request| {
+            matches!(request, zakura_consensus::Request::Prepare { .. })
+        };
+
+        // The first template's validation holds the one validation slot.
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let initial_validation = verifier.expect_request_that(is_prepare).await;
+
+        // The first long poll on the new tip builds and stores the shared template. A newer
+        // template then replaces its waiting validation.
+        let next = chain_info(3, 2, 400_000_000);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let shared = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let mut newer = initial.clone();
+        newer.work_id = "newer-work".to_string();
+        assert!(rpc.gbt.queue_template_preparation(newer).is_none());
+
+        let taken = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(taken.work_id(), shared.work_id());
+
+        initial_validation.respond(Hash([9; 32]));
+        let shared_validation = verifier
+            .expect_request_that(|request| {
+                is_prepare(request) && request.block().header().previous_block_hash == next.tip_hash
+            })
+            .await;
+
+        let taken_again = bounded(long_poll(&rpc, initial.long_poll_id))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(taken_again.work_id(), shared.work_id());
+        shared_validation.respond(Hash([9; 32]));
+        let_other_tasks_run().await;
+        assert!(
+            verifier.try_next_request().now_or_never().is_none(),
+            "the template being validated is not queued again"
+        );
+        assert!(rpc
+            .gbt
+            .template_rejections
+            .borrow()
+            .is_prepared(shared.work_id()));
     });
 }
 
@@ -2012,6 +2193,7 @@ fn nothing_is_built_ahead_while_a_tip_recovers_from_a_rejection() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        rpc.gbt.note_template_requested();
         tokio::spawn(rpc.clone().run_template_builder());
 
         let next = chain_info(3, 2, 400_000_000);

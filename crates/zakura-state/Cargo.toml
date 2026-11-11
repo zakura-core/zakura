@@ -132,3 +132,8 @@ required-features = ["internal-bench"]
 name = "height_map"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "transparent_index_worst_case"
+harness = false
+required-features = ["internal-bench"]

@@ -103,6 +103,9 @@ impl MempoolSnapshotReceiver {
     ///
     /// Returns `None` if the mempool shut down without publishing one. The wait has no bound
     /// of its own: a mempool that is not active, or that never sees `tip_hash`, never ends it.
+    /// Admitting a transaction withdraws the published list until a new block or a request for
+    /// the full list publishes it again, so a reader that must not wait for that also asks the
+    /// mempool.
     pub async fn on_tip(&mut self, tip_hash: block::Hash) -> Option<MempoolSnapshot> {
         self.0
             .wait_for(|snapshot| {

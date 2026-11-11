@@ -20,7 +20,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -210,37 +210,66 @@ impl TemplateRejections {
 /// `running` admits exactly one preparation loop, and that loop does not take its next template
 /// until the previous template's verification has actually finished, so at most one speculative
 /// verification is ever in flight. Templates that arrive meanwhile replace `pending` rather than
-/// queueing behind it: only the newest is worth preparing.
+/// queueing behind it: only the newest is worth preparing. A template that is being prepared or
+/// is already pending is not queued again, so a template served many times is prepared once.
 #[derive(Clone, Debug)]
-struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
+struct TemplatePreparationQueue<T: PreparationKey>(Arc<Mutex<TemplatePreparationState<T>>>);
+
+/// Names a template, so the preparation queue can tell when the same one is queued again.
+pub(crate) trait PreparationKey {
+    /// What names the template.
+    type Key: Clone + Eq + fmt::Debug;
+
+    /// Returns what names this template.
+    fn preparation_key(&self) -> Self::Key;
+}
+
+impl PreparationKey for BlockTemplateResponse {
+    type Key = String;
+
+    fn preparation_key(&self) -> String {
+        self.work_id.clone()
+    }
+}
 
 #[derive(Debug)]
-struct TemplatePreparationState<T> {
-    running: bool,
+struct TemplatePreparationState<T: PreparationKey> {
+    /// The template being prepared, while a loop runs.
+    running: Option<T::Key>,
     pending: Option<T>,
 }
 
-impl<T> Default for TemplatePreparationQueue<T> {
+impl<T: PreparationKey> Default for TemplatePreparationQueue<T> {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(TemplatePreparationState {
-            running: false,
+            running: None,
             pending: None,
         })))
     }
 }
 
-impl<T> TemplatePreparationQueue<T> {
+impl<T: PreparationKey> TemplatePreparationQueue<T> {
     /// Queues `template`, and returns it with the worker slot when no loop is running.
+    ///
+    /// Drops `template` when it is the one being prepared or already pending.
     fn enqueue(&self, template: T) -> Option<(T, PreparationWorker<T>)> {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.running {
-            state.pending = Some(template);
+        let key = template.preparation_key();
+        if let Some(running) = &state.running {
+            let already_queued = *running == key
+                || state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.preparation_key() == key);
+            if !already_queued {
+                state.pending = Some(template);
+            }
             None
         } else {
-            state.running = true;
+            state.running = Some(key);
             drop(state);
             Some((
                 template,
@@ -258,9 +287,7 @@ impl<T> TemplatePreparationQueue<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next = state.pending.take();
-        if next.is_none() {
-            state.running = false;
-        }
+        state.running = next.as_ref().map(PreparationKey::preparation_key);
         next
     }
 }
@@ -270,12 +297,12 @@ impl<T> TemplatePreparationQueue<T> {
 /// The loop must release the slot however it ends, including a `break` or a panic. Leaving
 /// `running` set would stop every later template from ever being prepared, so the release is a
 /// `Drop` rather than something each exit has to remember.
-pub(crate) struct PreparationWorker<T> {
+pub(crate) struct PreparationWorker<T: PreparationKey> {
     queue: TemplatePreparationQueue<T>,
     released: bool,
 }
 
-impl<T> PreparationWorker<T> {
+impl<T: PreparationKey> PreparationWorker<T> {
     /// Returns the newest queued template, releasing the slot when there is none.
     pub(crate) fn next(&mut self) -> Option<T> {
         let next = self.queue.next_or_finish();
@@ -284,7 +311,7 @@ impl<T> PreparationWorker<T> {
     }
 }
 
-impl<T> Drop for PreparationWorker<T> {
+impl<T: PreparationKey> Drop for PreparationWorker<T> {
     fn drop(&mut self) {
         if self.released {
             return;
@@ -295,7 +322,7 @@ impl<T> Drop for PreparationWorker<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pending = None;
-        state.running = false;
+        state.running = None;
     }
 }
 
@@ -966,6 +993,10 @@ where
 
     /// How many long polls have waited for their work to change and are not answered yet.
     waiting_long_polls: Arc<AtomicUsize>,
+
+    /// Whether this node has been asked for a template since it started. Until it has, the
+    /// node builds no template ahead of requests.
+    template_requested: Arc<AtomicBool>,
 }
 
 /// A long poll that has waited for its work to change, until it is dropped.
@@ -1011,6 +1042,7 @@ where
             trace: trace::MiningTemplateTrace::default(),
             shared_template: SharedTemplate::default(),
             waiting_long_polls: Arc::default(),
+            template_requested: Arc::default(),
         }
     }
 
@@ -1095,6 +1127,16 @@ where
     /// A change of tip wakes every such long poll, and each answers on the new tip itself.
     pub(crate) fn has_waiting_long_poll(&self) -> bool {
         self.waiting_long_polls.load(Ordering::SeqCst) > 0
+    }
+
+    /// Records that this node has been asked for a template.
+    pub(crate) fn note_template_requested(&self) {
+        self.template_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this node has been asked for a template since it started.
+    pub(crate) fn template_requested(&self) -> bool {
+        self.template_requested.load(Ordering::Relaxed)
     }
 
     pub(crate) fn reserve_mined_submission(

@@ -746,5 +746,245 @@
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-hello-magic/skip-hello-magic.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-magic-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-hello-version/skip-hello-version.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-version-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-hello-protocol/skip-hello-protocol.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-protocol-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-handshake-path/skip-handshake-path.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-path-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-remote-role/skip-remote-role.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-role-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-chain-binding/skip-chain-binding.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/wrong-chain-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-required-channel/skip-required-channel.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/missing-capability-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-ack-protocol/skip-ack-protocol.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-protocol-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-ack-magic/skip-ack-magic.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-magic-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-ack-version/skip-ack-version.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-version-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-native-initiator-nonce/skip-native-initiator-nonce.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/nonzero-initiator-nonce-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-native-responder-nonce/skip-native-responder-nonce.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/nonzero-responder-nonce-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-native-transcript/skip-native-transcript.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/nonzero-native-transcript-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-frame-limits/skip-frame-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-frame-limit-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-frame-limits/skip-frame-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-frame-limit-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-message-limits/skip-message-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-message-limit-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-message-limits/skip-message-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-message-limit-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-stream-limits/skip-stream-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-stream-limit-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-stream-limits/skip-stream-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-stream-limit-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-queue-limits/skip-queue-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-queue-limit-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-queue-limits/skip-queue-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-queue-limit-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-idle-limits/skip-idle-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/bad-idle-limit-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-idle-limits/skip-idle-limits.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-idle-limit-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-requested-limit-ceilings/skip-requested-limit-ceilings.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/limits-above-request-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
   }
 ]

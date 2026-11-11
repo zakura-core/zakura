@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1052,9 +1052,6 @@
+         }
+         if self.network_id != expected.local.network_id {
+             return Err(ZakuraValidationError::WrongNetwork);
+-        }
+-        if self.chain_id != expected.local.chain_id {
+-            return Err(ZakuraValidationError::WrongChain);
+         }
+         if self.iroh_node_id.as_slice() != expected.authenticated_remote_id {
+             return Err(ZakuraValidationError::IdentityMismatch);

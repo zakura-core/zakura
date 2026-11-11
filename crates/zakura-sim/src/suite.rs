@@ -639,8 +639,8 @@ pub struct TestRow {
 pub struct WitnessRow {
     /// `witness/<property>/passing` or `witness/<property>/bypass`.
     pub id: String,
-    /// [`Expect::Pass`], or [`Expect::Unimplemented`] for a pending
-    /// bypass.
+    /// [`Expect::Pass`], [`Expect::Unimplemented`] for a pending bypass,
+    /// or [`Expect::Excluded`] for a separate native mutation campaign.
     pub expect: Expect,
     /// The property.
     pub property: String,
@@ -653,7 +653,7 @@ pub struct WitnessRow {
     pub unreachable: Option<&'static str>,
     /// For a planted bypass, the patch's name.
     pub patch: Option<&'static str>,
-    /// For a pending bypass, what its check is missing.
+    /// Why the bypass is pending or runs outside this suite.
     pub pending: Option<&'static str>,
     /// The row whose run decides it: the test binary, the on-demand test
     /// or the planted cases.
@@ -1788,6 +1788,17 @@ impl Builder<'_> {
                     unreachable: None,
                     patch: None,
                     pending: Some(reason),
+                    decided_by: None,
+                },
+                Bypass::Native(name) => WitnessRow {
+                    id,
+                    expect: Expect::Excluded,
+                    property: row.property.to_owned(),
+                    role: "bypass",
+                    test: None,
+                    unreachable: None,
+                    patch: Some(name),
+                    pending: Some("The separate droplet mutation campaign runs this native patch and records its classification in the PR."),
                     decided_by: None,
                 },
             };

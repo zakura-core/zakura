@@ -498,6 +498,26 @@ fn every_coverage_witness_exists_and_runs_where_it_says() {
                 );
                 vec![row.passing.witness()]
             }
+            Bypass::Native(name) => {
+                let directory = crate_dir.join("../../qa/native-mutations");
+                assert!(
+                    directory.join(name).is_file(),
+                    "{}: no {name}",
+                    row.property
+                );
+                let cases: Vec<serde_json::Value> = serde_json::from_str(
+                    &std::fs::read_to_string(directory.join("cases.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    cases
+                        .iter()
+                        .any(|case| case["patch"] == name && case["property"] == row.property),
+                    "{}: {name} has no native mutation binding",
+                    row.property
+                );
+                vec![row.passing.witness()]
+            }
             Bypass::Pending(_) => {
                 let statuses: Vec<_> = HARNESSES
                     .iter()

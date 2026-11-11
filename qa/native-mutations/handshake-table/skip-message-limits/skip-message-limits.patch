@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1727,8 +1727,6 @@
+     // frame handling applies the effective cap before payload allocation.
+     if !frame_cap_carries_payload(limits.max_frame_bytes)
+         || limits.max_frame_bytes > local.max_message_bytes
+-        || limits.max_message_bytes == 0
+-        || limits.max_message_bytes > local.max_message_bytes
+         || limits.max_open_streams == 0
+         || limits.max_open_streams > local.max_open_streams
+         || limits.max_inbound_queue_depth == 0

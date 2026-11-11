@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1045,9 +1045,6 @@
+             return Err(ZakuraValidationError::IncompatibleZakuraProtocol);
+         }
+         if self.handshake_path != expected.handshake_path {
+-            return Err(ZakuraValidationError::MalformedControl);
+-        }
+-        if self.role != expected.remote_role {
+             return Err(ZakuraValidationError::MalformedControl);
+         }
+         if self.network_id != expected.local.network_id {

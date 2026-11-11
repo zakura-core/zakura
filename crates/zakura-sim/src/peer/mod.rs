@@ -1080,6 +1080,7 @@ fn bind_config(addr: SocketAddr) -> QuicBindConfig {
 /// Hands each connection the node opens to the peer's task, and holds it
 /// until it closes. It holds one at a time.
 struct Forward {
+    alpn: Vec<u8>,
     to_task: mpsc::Sender<Conn>,
     /// Connections handed over and not closed yet.
     live: Arc<AtomicUsize>,
@@ -1105,9 +1106,9 @@ impl Acceptor for Forward {
         Admit::Accept
     }
 
-    /// Zakura's ALPN.
+    /// The scripted peer's configured ALPN.
     fn alpns(&self) -> Vec<Vec<u8>> {
-        vec![P2P_V2_ALPN.to_vec()]
+        vec![self.alpn.clone()]
     }
 
     /// Counts the connection live before the endpoint drops its pending
@@ -1383,7 +1384,13 @@ impl PeerTask {
         let mut dial = 0;
         loop {
             let quic = self.bind(dial);
-            let Ok(conn) = quic.connect(self.node.clone(), &[P2P_V2_ALPN]).await else {
+            let alpn = self
+                .spec
+                .handshake
+                .as_ref()
+                .and_then(|spec| spec.alpn.as_deref())
+                .unwrap_or(P2P_V2_ALPN);
+            let Ok(conn) = quic.connect(self.node.clone(), &[alpn]).await else {
                 return;
             };
             let Ok(negotiated) = handshake::initiate(
@@ -1449,6 +1456,12 @@ impl PeerTask {
         let quic = self.bind(0);
         let (to_task, mut incoming) = mpsc::channel(4);
         quic.serve(Forward {
+            alpn: self
+                .spec
+                .handshake
+                .as_ref()
+                .and_then(|spec| spec.alpn.clone())
+                .unwrap_or_else(|| P2P_V2_ALPN.to_vec()),
             to_task,
             live: Arc::default(),
         })
@@ -1946,6 +1959,7 @@ mod tests {
     fn a_listening_peer_admits_one_connection_at_a_time() {
         let (to_task, _incoming) = mpsc::channel(1);
         let forward = Forward {
+            alpn: P2P_V2_ALPN.to_vec(),
             to_task,
             live: Arc::default(),
         };

@@ -207,6 +207,12 @@ impl PreludeFault {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandshakeSpec {
+    /// Override the ALPN offered by a dialing peer or accepted by a listening peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<Vec<u8>>,
+    /// Advertise this identity to the node independently of the endpoint's real key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertised_identity: Option<usize>,
     /// Peer-side TLS timeout override for stalled-handshake scenarios.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_timeout_secs: Option<u32>,

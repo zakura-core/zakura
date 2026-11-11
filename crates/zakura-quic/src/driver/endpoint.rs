@@ -538,6 +538,11 @@ impl<F: SocketFactory> EndpointTask<F> {
                         );
                     }
                     Err(error) => {
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Finished {
+                            remote: raw_remote,
+                            error: Some(error.cause.to_string()),
+                        });
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);
                         tracing::trace!(target: "zakura_quic", cause = %error.cause, "accept failed");
                         if let Some(transmit) = error.response {

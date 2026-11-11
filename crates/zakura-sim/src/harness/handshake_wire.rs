@@ -90,7 +90,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 7;
+    const GENERATOR: u32 = 8;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -300,6 +300,7 @@ impl Subsystem for Wire {
     fn properties() -> Vec<Property<Self>> {
         let mut properties = crate::table::handshake::properties();
         properties.push(crate::table::handshake::installed_services_authorized());
+        properties.extend(crate::table::handshake::tls_authorization());
         properties
     }
 
@@ -344,11 +345,35 @@ impl Subsystem for Wire {
                 vec![254, u8::try_from(mode).expect("three QUIC modes fit u8")],
             ));
         }
+        families.push(super::ScenarioFamily::new("quic-alpn", vec![253, 0]));
+        families.push(super::ScenarioFamily::new("quic-identity", vec![253, 1]));
         families
     }
 
     fn draw(prefix: &[u8]) -> Scenario {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
+        if byte(0) == 253 {
+            let mut peer = if byte(1) % 2 == 0 {
+                PeerSpec::dialing()
+            } else {
+                PeerSpec::listening()
+            };
+            peer.handshake = Some(if byte(1) % 2 == 0 {
+                HandshakeSpec {
+                    alpn: Some(b"handshake-test/unsupported".to_vec()),
+                    ..HandshakeSpec::default()
+                }
+            } else {
+                HandshakeSpec {
+                    advertised_identity: Some(1 + usize::from(byte(2) % 8)),
+                    ..HandshakeSpec::default()
+                }
+            });
+            return Scenario {
+                peers: vec![peer],
+                ..Scenario::default()
+            };
+        }
         if byte(0) == 254 {
             return quic_scenario(byte(1) % 3, byte(2));
         }

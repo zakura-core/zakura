@@ -101,6 +101,51 @@ fn quic_deadline_ends_a_stalled_tls_attempt() {
 }
 
 #[test]
+fn quic_rejects_an_unsupported_alpn_before_control() {
+    let scenario = Wire::draw(&[253, 0]);
+    (harness::find(Wire::NAME).unwrap().witness)(
+        &serde_json::to_value(&scenario).unwrap(),
+        PlanInput::Bytes(Vec::new()),
+        "handshake/quic/alpn-required",
+        zakura_sim::witness::Expect::Holds,
+        &[],
+        &mut NullSink,
+    )
+    .unwrap();
+    let report = run(scenario);
+    assert_held(&report, "handshake/quic/alpn-required");
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport {
+            event: zakura_sim::observe::TransportFact::QuicHandshakeFinished { error: Some(error), .. }, ..
+        } if error.contains("ALPN") || error.contains("protocol")
+    )), "TLS must report the protocol mismatch");
+}
+
+#[test]
+fn quic_rejects_a_key_different_from_the_dialed_identity() {
+    let scenario = Wire::draw(&[253, 1]);
+    (harness::find(Wire::NAME).unwrap().witness)(
+        &serde_json::to_value(&scenario).unwrap(),
+        PlanInput::Bytes(Vec::new()),
+        "handshake/quic/identity-required",
+        zakura_sim::witness::Expect::Holds,
+        &[],
+        &mut NullSink,
+    )
+    .unwrap();
+    let report = run(scenario);
+    assert_held(&report, "handshake/quic/identity-required");
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(&entry.obs,
+            zakura_sim::Observation::Transport {
+                event: zakura_sim::observe::TransportFact::DialFailed { error }, ..
+            } if error.contains("different identity")
+        )),
+        "TLS must report the authenticated-key mismatch"
+    );
+}
+
+#[test]
 fn every_family_draws_a_conformant_control_exchange() {
     for family in 0..10 {
         let mut input = [0; Wire::SCENARIO_BYTES];

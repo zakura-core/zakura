@@ -295,6 +295,16 @@ const fn handshake_guard(
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     handshake_guard(
+        "handshake/quic/alpn-required",
+        "handshake-quic/accept-unsupported-alpn/accept-unsupported-alpn.patch",
+        "quic_rejects_an_unsupported_alpn_before_control",
+    ),
+    handshake_guard(
+        "handshake/quic/identity-required",
+        "handshake-quic/accept-wrong-dialed-key/accept-wrong-dialed-key.patch",
+        "quic_rejects_a_key_different_from_the_dialed_identity",
+    ),
+    handshake_guard(
         "handshake/quic/pending-per-address-bounded",
         "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch",
         "quic_pending_limit_refuses_another_tls_attempt",

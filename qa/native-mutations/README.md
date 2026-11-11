@@ -32,7 +32,7 @@ this mapping.
 
 The handshake PR includes the shared mut-4 generator and mutation-runner
 infrastructure. It keeps the existing harness decoders and registers their
-scenario-family selectors. `handshake/wire` lists ten families;
+scenario-family selectors. `handshake/wire` lists fifteen families;
 `handshake/counts` draws machine operations directly.
 
 Run searches and mutation campaigns on the droplet. For example:

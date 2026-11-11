@@ -166,7 +166,12 @@ impl WireNode {
         let target = NodeAddr::with_addrs(
             SeededInputs::node_key(
                 self.endpoint.seed,
-                key_index(script.identity.unwrap_or(index)),
+                key_index(
+                    script
+                        .advertised_identity
+                        .or(script.identity)
+                        .unwrap_or(index),
+                ),
             )
             .public(),
             [remote],

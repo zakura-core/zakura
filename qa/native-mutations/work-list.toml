@@ -662,9 +662,9 @@ witness = { test = "honest_peer_never_punished", test_target = "header_wire_witn
 [[entry]]
 id = "handshake-quic"
 kind = "shared-definition"
-claim = "QUIC admission preserves configured source limits, validates busy sources, and ends stalled TLS attempts."
+claim = "QUIC enforces source limits, Retry, TLS deadlines, supported ALPNs, and the dialed identity."
 check = ["crates/zakura-sim/src/table/handshake.rs"]
-shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
 
 [[entry.instance]]
 property = "handshake/quic/pending-per-address-bounded"
@@ -680,3 +680,13 @@ witness = { test = "quic_retry_validates_sources_before_tls", test_target = "han
 property = "handshake/quic/finishes-in-time"
 code = []
 witness = { test = "quic_deadline_ends_a_stalled_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/alpn-required"
+code = []
+witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/identity-required"
+code = []
+witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }

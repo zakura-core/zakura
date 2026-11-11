@@ -286,6 +286,122 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
     properties
 }
 
+/// TLS policy checks use the fixture's offered protocol and advertised identity.
+pub fn tls_authorization<S>() -> Vec<Property<S>>
+where
+    S: HasView<View = std::sync::Arc<crate::harness::handshake_wire::Scenario>>,
+{
+    vec![
+        Property {
+            id: PropertyId::new("handshake/quic/alpn-required"),
+            claim: "TLS rejects an unsupported ALPN before control starts.",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View, Source::Closes],
+            status: Status::Active,
+            check: check_tls_authorization::<S>,
+            witness: Some(TriggerHistory::View(
+                |view: &std::sync::Arc<crate::harness::handshake_wire::Scenario>, log| {
+                    tls_attempt_reached(view, log, false)
+                },
+            )),
+        },
+        Property {
+            id: PropertyId::new("handshake/quic/identity-required"),
+            claim: "A key different from the dialed identity never reaches the control handshake.",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View, Source::Closes],
+            status: Status::Active,
+            check: check_tls_authorization::<S>,
+            witness: Some(TriggerHistory::View(
+                |view: &std::sync::Arc<crate::harness::handshake_wire::Scenario>, log| {
+                    tls_attempt_reached(view, log, true)
+                },
+            )),
+        },
+    ]
+}
+
+fn tls_fault(peer: &crate::peer::PeerSpec, index: usize, identity: bool) -> bool {
+    let Some(spec) = &peer.handshake else {
+        return false;
+    };
+    if identity {
+        peer.dialer == crate::peer::Dialer::Node
+            && spec
+                .advertised_identity
+                .is_some_and(|advertised| advertised != spec.identity.unwrap_or(index))
+    } else {
+        spec.alpn.as_deref() == Some(b"handshake-test/unsupported")
+    }
+}
+
+fn tls_attempt_reached(
+    scenario: &crate::harness::handshake_wire::Scenario,
+    log: &crate::ObservationLog,
+    identity: bool,
+) -> bool {
+    scenario.peers.iter().enumerate().any(|(index, peer)| {
+        tls_fault(peer, index, identity)
+            && log.entries().iter().any(|entry| {
+                let Observation::Transport { remote, event, .. } = &entry.obs else {
+                    return false;
+                };
+                let source = match event {
+                    TransportFact::QuicTlsStarted { remote, .. }
+                    | TransportFact::QuicAdmission { remote, .. } => remote,
+                    TransportFact::DialStarted => remote,
+                    _ => return false,
+                };
+                *source == peer.address(index, 0).to_string()
+            })
+    })
+}
+
+fn check_tls_authorization<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView<View = std::sync::Arc<crate::harness::handshake_wire::Scenario>>,
+{
+    let identity = cx.id().as_str() == "handshake/quic/identity-required";
+    let scenario = cx.view();
+    let mut applies = false;
+    for (index, peer) in scenario.peers.iter().enumerate() {
+        if !tls_fault(peer, index, identity) {
+            continue;
+        }
+        let address = peer.address(index, 0).to_string();
+        for obs in cx.observations() {
+            let Observation::Transport { remote, event, .. } = obs else {
+                continue;
+            };
+            let source = match event {
+                TransportFact::QuicHandshakeFinished { remote, .. } => remote,
+                _ => remote,
+            };
+            if *source != address {
+                continue;
+            }
+            match event {
+                TransportFact::Handshake { .. }
+                | TransportFact::QuicHandshakeFinished { error: None, .. }
+                | TransportFact::Registered { .. } => {
+                    return cx
+                        .violated("TLS rejects the unsupported protocol or wrong key", address);
+                }
+                TransportFact::DialFailed { .. }
+                | TransportFact::QuicHandshakeFinished { error: Some(_), .. } => applies = true,
+                _ => {}
+            }
+        }
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
 fn quic_admission_applies(property: &str, event: &TransportFact) -> bool {
     let TransportFact::QuicAdmission {
         validated,

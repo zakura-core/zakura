@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -73,6 +73,7 @@
+     (ZAKURA_PROTOCOL_VERSION_MIN_NATIVE..=ZAKURA_PROTOCOL_VERSION_CURRENT)
+         .rev()
+         .map(p2p_v2_alpn)
++        .chain(std::iter::once(b"handshake-test/unsupported".to_vec()))
+         .collect()
+ }
+ 

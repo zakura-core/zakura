@@ -1216,5 +1216,25 @@
     "test": "zakura::regulation::session_table::tests::replacement_keeps_capacity_until_retired_snapshot_owners_drop",
     "source": "crates/zakura-network/src/zakura/regulation/session_table/tests.rs",
     "required_failure": "retired reservation remains after its last snapshot owner drops"
+  },
+  {
+    "patch": "handshake-quic/accept-unsupported-alpn/accept-unsupported-alpn.patch",
+    "entry": "handshake-quic",
+    "property": "handshake/quic/alpn-required",
+    "witness": {
+      "test": "quic_rejects_an_unsupported_alpn_before_control",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-quic/accept-wrong-dialed-key/accept-wrong-dialed-key.patch",
+    "entry": "handshake-quic",
+    "property": "handshake/quic/identity-required",
+    "witness": {
+      "test": "quic_rejects_a_key_different_from_the_dialed_identity",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
   }
 ]

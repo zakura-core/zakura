@@ -1,7 +1,7 @@
 //! Per-block transparent address indexes, and finalized entries left in shared chain indexes.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -26,6 +26,53 @@ use super::{
 };
 
 const VALUE: i64 = 1_000;
+
+#[test]
+fn utxo_query_resolves_outputs_across_many_transactions() {
+    let (chain, template) = chain_and_template(false);
+    let (mut block, contextual) = child_with_spends(&template, 0, 256);
+    let height = contextual.height;
+    // Include two outputs to the same address in the last transaction.
+    match Arc::make_mut(&mut Arc::make_mut(&mut block).transactions[256]) {
+        Transaction::V4 { outputs, .. } => {
+            outputs.push(transparent::Output::new(Amount::zero(), p2pkh(1_000_255).1))
+        }
+        _ => unreachable!("the fixture creates V4 transactions"),
+    }
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        block.clone().prepare(),
+        contextual.spent_outputs.as_ref().clone(),
+    )
+    .expect("adding a zero-value output preserves the transfer values");
+    let chain = push(chain, contextual);
+
+    for seeds in [(0..256).collect::<Vec<_>>(), vec![0, 31, 127, 255]] {
+        let mut addresses: HashSet<_> =
+            seeds.iter().map(|seed| p2pkh(1_000_000 + seed).0).collect();
+        addresses.insert(p2pkh(9_000_000).0);
+        let mut expected: BTreeMap<_, _> = seeds
+            .iter()
+            .map(|seed| {
+                let transaction_index = usize::try_from(seed + 1).unwrap();
+                (
+                    OutputLocation::from_usize(height, transaction_index, 0),
+                    block.transactions[transaction_index].outputs()[0].clone(),
+                )
+            })
+            .collect();
+        expected.insert(
+            OutputLocation::from_usize(height, 256, 1),
+            block.transactions[256].outputs()[1].clone(),
+        );
+        let (created, spent) = chain.partial_transparent_utxo_changes(&addresses);
+        assert_eq!(created, expected);
+        assert!(spent.is_empty());
+    }
+    let (created, spent) = chain.partial_transparent_utxo_changes(&HashSet::new());
+    assert!(created.is_empty());
+    assert!(spent.is_empty());
+}
 
 #[test]
 fn balance_query_cancels_large_transfers_between_addresses() {

@@ -10,7 +10,6 @@ use zakura_chain::{
     amount::{Amount, NegativeAllowed},
     block::BlockRef,
     parameters::Network,
-    transaction::Transaction,
     transparent,
 };
 
@@ -193,21 +192,10 @@ impl AddressBlockTransfers {
         &'a self,
         block: &'a BlockRef,
     ) -> impl Iterator<Item = (OutputLocation, &'a transparent::Output)> + 'a {
-        // `created` is in block order, so one pass over the transactions finds every output.
-        let mut transactions = block.transactions().enumerate();
-        let mut current: Option<(usize, &Transaction)> = None;
         self.created.iter().map(move |location| {
-            let index = location.transaction_index().as_usize();
-            let transaction = match current {
-                Some((current_index, transaction)) if current_index == index => transaction,
-                _ => {
-                    let found = transactions
-                        .find(|(next_index, _)| *next_index == index)
-                        .expect("address index locations are in block order");
-                    current = Some(found);
-                    found.1
-                }
-            };
+            let transaction = block
+                .transaction_at(location.transaction_index().as_usize())
+                .expect("address index locations refer to the block's transactions");
             let output = usize::try_from(location.output_index().index())
                 .ok()
                 .and_then(|index| transaction.outputs().get(index))

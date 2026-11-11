@@ -143,8 +143,23 @@ impl From<&VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
             "unexpected coinbase transaction in mempool"
         );
 
+        Self::with_data(tx, tx.transaction.transaction().as_ref().into())
+    }
+}
+
+impl TransactionTemplate<NonNegative> {
+    /// Rebuilds metadata while sharing only immutable payloads across template builds.
+    pub(crate) fn from_cached(tx: &VerifiedUnminedTx, cache: &json::TransactionDataCache) -> Self {
+        assert!(
+            !tx.transaction.transaction().is_coinbase(),
+            "unexpected coinbase transaction in mempool"
+        );
+        Self::with_data(tx, cache.get(&tx.transaction))
+    }
+
+    fn with_data(tx: &VerifiedUnminedTx, data: TransactionData) -> Self {
         Self {
-            data: tx.transaction.transaction().as_ref().into(),
+            data,
             hash: tx.transaction.id().mined_id(),
             auth_digest: tx
                 .transaction

@@ -1520,6 +1520,7 @@ where
                 chain_info,
                 long_poll_id,
                 mempool_txs,
+                &self.gbt.transaction_data,
                 submit_old,
             )
             .map_misc_error()?;
@@ -1534,6 +1535,7 @@ where
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
         let requested = std::time::Instant::now();
+        let transaction_data = self.gbt.transaction_data.clone();
         let (template, times) = self
             .gbt
             .run_template_build(move || {
@@ -1545,6 +1547,7 @@ where
                     &chain_info,
                     long_poll_id,
                     mempool_txs,
+                    &transaction_data,
                     submit_old,
                 );
                 let times = BuildTimes {

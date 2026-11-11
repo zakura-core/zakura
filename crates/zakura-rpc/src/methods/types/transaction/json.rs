@@ -12,6 +12,9 @@ use zakura_chain::{
 
 use super::TransactionTemplate;
 
+mod cache;
+pub(crate) use cache::TransactionDataCache;
+
 /// Clones share both bytes and first-use JSON; no global retention cache is involved.
 #[derive(Clone)]
 pub(crate) struct TransactionData(Arc<Payload>);

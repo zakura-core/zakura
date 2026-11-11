@@ -1,0 +1,16 @@
+# The reactor stops updating an existing session's status publisher when
+# it adopts a new snapshot, so a session admitted earlier keeps
+# advertising the state it was admitted under. This is the adopted-state
+# stale-status-cache native mutation, moved here as a case of its own
+# name. On the status-changing witness a harness commit lands once a
+# second after the mirror's session is admitted, and the session's next
+# `Status` still names the state it was admitted under.
+# Besides reactor.rs, which the patch changes, the status publisher
+# decides when a changed `Status` goes. A change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-status-changing.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-status-changing.plan"

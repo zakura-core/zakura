@@ -385,10 +385,21 @@ impl RoundLife {
         self.engine = engine;
     }
 
-    /// Judges an apply's engine `run`, which must advance the header
-    /// generation if it inserted a header.
+    /// Judges a harness commit's engine `run`, which no storage fact
+    /// carries, as [`run`](Self::run) judges an apply's.
+    pub(super) fn harness_run(&mut self, run: &EngineRun) {
+        self.run(run);
+    }
+
+    /// Judges an apply's or a harness commit's engine `run`, which must
+    /// advance the header generation if it inserted a header.
     fn run(&mut self, run: &EngineRun) {
-        if let RunKind::Apply(id, _) = &run.kind {
+        let what = match &run.kind {
+            RunKind::Apply(id, _) => Some(format!("apply operation {}", id.0)),
+            RunKind::HarnessCommit(_) => Some("a harness commit".to_owned()),
+            RunKind::Reset | RunKind::Locator(..) => None,
+        };
+        if let Some(what) = what {
             let inserted = run
                 .after
                 .graph
@@ -402,9 +413,8 @@ impl RoundLife {
                 let after = run.after.metadata.header_generation.get();
                 if after <= before {
                     self.breaks.push(format!(
-                        "ResetInvalidatesWork: apply operation {} inserted {inserted} headers \
-                         and left the header generation at {after}, from {before}",
-                        id.0
+                        "ResetInvalidatesWork: {what} inserted {inserted} headers and left the \
+                         header generation at {after}, from {before}"
                     ));
                 }
             }

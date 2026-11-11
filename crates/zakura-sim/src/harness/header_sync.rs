@@ -47,10 +47,12 @@ use super::{
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
+        fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
+        publication::{Arming, PublicationEvidence},
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
@@ -71,12 +73,13 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
-            outstanding_work_bounded, peer_retirement_progress, reset_invalidates_work,
-            retirement_end_violations, stale_chain_effect_inert, stale_completion_inert,
+            chunk_budget_bound, commit_only_authorized, expected_chain_selected,
+            outstanding_end_violations, outstanding_work_bounded, peer_retirement_progress,
+            publication_end_violations, reset_invalidates_work, retirement_end_violations,
+            stale_chain_effect_inert, stale_completion_inert, state_publication_consistent,
             teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
-            BudgetView, ChainView, HoldWakeView, OutstandingView, ResetView, RetirementView,
-            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
+            BudgetView, ChainView, ForkView, HoldWakeView, OutstandingView, PublicationView,
+            ResetView, RetirementView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -554,6 +557,97 @@ impl StorageScenario {
     }
 }
 
+/// The header window the reactor keeps ahead of verified bodies, restated
+/// from its `INTEGRATED_HEADER_BODY_WINDOW_V1`, which is the wire's
+/// `MAX_HS_RANGE`.
+pub const HEADER_BODY_WINDOW: u32 = 4_000;
+
+/// The reactor's refill batch, restated from its `HEADER_REFILL_BATCH_V1`:
+/// one maximum checkpoint gap plus its successor's first header. With less
+/// window left than this, it withholds a target the window doesn't reach.
+pub const HEADER_REFILL_BATCH: u32 = 401;
+
+/// The most headers the fork fixture's mirror chains hold together. The
+/// simulator never verifies a body, so the node's window stays the whole
+/// [`HEADER_BODY_WINDOW`] minus its selected height and the headers it has
+/// claimed. With every mirror chain counted, both stay at most this, so at
+/// least `HEADER_BODY_WINDOW - 2 * FORK_FIXTURE_MAX_HEADERS` is always left,
+/// more than a [`HEADER_REFILL_BATCH`]: no correct node waits on a body
+/// that never comes, which would settle it short of the heaviest tip.
+pub const FORK_FIXTURE_MAX_HEADERS: u32 = 1_000;
+
+/// `scenario`'s mirrors, if it's the fork fixture that settled convergence
+/// judges: the node at genesis, two or three mirrors whose initial chains
+/// are forks from one ancestor, none a prefix of another, holding at most
+/// [`FORK_FIXTURE_MAX_HEADERS`] headers together, storage success-only
+/// within a 10 ms bound, no holds and no controls. A mirror runs header
+/// sync too, so it may take a fork from the node later, but only one some
+/// mirror held at the start, so no mirror ever holds more work than the
+/// heaviest initial chain. See
+/// [`fork_choice::settled`](super::header_node::fork_choice::settled).
+pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
+    let Policy {
+        base,
+        bound_ms,
+        holds,
+        reply_holds,
+    } = &scenario.policy;
+    let declared = scenario.node == Chain::default()
+        && (2..=3).contains(&scenario.mirrors.len())
+        && *base == Base::SuccessOnly
+        && bound_ms.is_some_and(|bound| bound <= 10)
+        && holds.is_empty()
+        && reply_holds.is_empty()
+        && scenario.controls.is_empty()
+        && scenario
+            .mirrors
+            .iter()
+            .map(|mirror| {
+                mirror
+                    .chain
+                    .main
+                    .saturating_add(mirror.chain.fork.map_or(0, |fork| fork.len))
+            })
+            .fold(0u32, u32::saturating_add)
+            <= FORK_FIXTURE_MAX_HEADERS;
+    if !declared {
+        return None;
+    }
+    let fixture = scenario.weights.fixture();
+    let paths: Vec<Vec<zakura_chain::block::Hash>> = scenario
+        .mirrors
+        .iter()
+        .map(|mirror| {
+            mirror
+                .chain
+                .segments(&fixture)
+                .into_iter()
+                .flat_map(|(_, headers)| headers.into_iter().map(|header| header.hash()))
+                .collect()
+        })
+        .collect();
+    let mut shared = None;
+    for (index, left) in paths.iter().enumerate() {
+        for right in &paths[index + 1..] {
+            let common = left
+                .iter()
+                .zip(right)
+                .take_while(|(left, right)| left == right)
+                .count();
+            // A chain that's a prefix of another isn't a fork of it.
+            if common == left.len() || common == right.len() {
+                return None;
+            }
+            if *shared.get_or_insert(common) != common {
+                return None;
+            }
+        }
+    }
+    Some(ForkFixture {
+        mirrors: scenario.mirrors.iter().map(|mirror| mirror.chain).collect(),
+    })
+}
+
 /// `peer`'s control step `action`, offered once `when` holds.
 fn step(peer: &str, action: ControlAction, when: Option<Trigger>) -> ControlStep {
     ControlStep {
@@ -577,6 +671,9 @@ pub struct Ports {
     pub fixture: HeaderFixture,
     /// The node's controlled port.
     pub node: Arc<ControlledPort>,
+    /// The clock the node's chain was preloaded at, before the run, which
+    /// its headers' admission read: the host's, since no run had started.
+    pub preloaded_at: chrono::DateTime<chrono::Utc>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
     /// The node's session view, which its tap and links fill during the run.
@@ -625,6 +722,12 @@ pub struct Ports {
     /// The mirror whose first page on each link the harness holds back.
     /// `None` unless whoever prepared the ports set one.
     pub delayed_page: Option<DelayedPage>,
+    /// When the node's fork-choice check first applied, which its tap finds
+    /// during the run.
+    pub fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, and the tip it
+    /// still owes, which its tap finds during the run.
+    pub publication: PublicationEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -661,6 +764,10 @@ pub struct Storage {
     authority: AuthorityEvidence,
     /// The reactor's container peaks, from its tap.
     outstanding: OutstandingEvidence,
+    /// When the node's fork-choice check first applied, from its tap.
+    fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, from its tap.
+    publication: PublicationEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -682,9 +789,8 @@ pub struct StorageView {
     pub honest_peers: Rc<BTreeSet<usize>>,
     /// The node's adopted state and what it published from it.
     pub adoption: AdoptionEvidence,
-    /// Each of the node's sessions and how long it lasted, which the status
-    /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
-    /// knows them, from its links.
+    /// Each of the node's sessions and how long it lasted. Only
+    /// `header-sync/storage` knows them, from its links.
     pub sessions: Vec<SessionLife>,
     /// Whom the node's storage failures blamed, for the penalty rule
     /// ([`FaultEvidence::penalized`]).
@@ -722,6 +828,42 @@ pub struct StorageView {
     /// Each of the reactor's container peaks, and when the outstanding-work
     /// rule first applied.
     pub outstanding: OutstandingEvidence,
+    /// When the node's fork-choice check first applied. A harness that
+    /// doesn't run the check leaves it never applied.
+    pub fork_choice: ForkChoiceEvidence,
+    /// When the node's publication check first applied, and the tip it
+    /// still owes. A harness that doesn't run the check leaves it never
+    /// applied.
+    pub publication: PublicationEvidence,
+}
+
+impl PublicationView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::publication`].
+    fn publication(&self) -> &PublicationEvidence {
+        &self.publication
+    }
+
+    /// [`StorageView::ends`].
+    fn ends(&self) -> &EndEvidence {
+        &self.ends
+    }
+}
+
+impl ForkView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::fork_choice`].
+    fn fork_choice(&self) -> &ForkChoiceEvidence {
+        &self.fork_choice
+    }
 }
 
 impl AuthorityView for StorageView {
@@ -885,26 +1027,32 @@ impl HasView for Storage {
             authority: self.authority.clone(),
             outstanding: self.outstanding.clone(),
             recovery: self.recovery.clone(),
+            fork_choice: self.fork_choice.clone(),
+            publication: self.publication.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption, fault and round
-    /// evidence, for the tip, penalty and teardown rules.
+    /// Records the run's end in the node's adoption, fault, round and
+    /// publication evidence, for the tip, penalty and teardown rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
         self.rounds.end(end);
         self.outstanding.end(end);
         self.retirement.end(end);
+        self.publication
+            .end(super::header_node::adoption::settled(end));
     }
 
     /// [`fault_end_violations`], [`teardown_end_violations`],
-    /// [`outstanding_end_violations`] and [`retirement_end_violations`].
+    /// [`outstanding_end_violations`], [`retirement_end_violations`] and
+    /// [`publication_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
         found.extend(outstanding_end_violations(&self.outstanding));
         found.extend(retirement_end_violations(&self.retirement));
+        found.extend(publication_end_violations(&self.publication));
         found
     }
 
@@ -1007,6 +1155,9 @@ impl Subsystem for Storage {
         }
         let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
+        // Read just before, so a header the preload defers is deferred at
+        // this clock too, short of a deadline inside the preload itself.
+        let preloaded_at = zakura_rt::time::utc_now().into();
         preload(node.engine(), &fixture, &scenario.node);
         let mirrors = scenario
             .mirrors
@@ -1020,6 +1171,7 @@ impl Subsystem for Storage {
         Ports {
             fixture,
             node,
+            preloaded_at,
             mirrors,
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
@@ -1036,6 +1188,16 @@ impl Subsystem for Storage {
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
             delayed_page: None,
+            fork_choice: ForkChoiceEvidence::default(),
+            // A flood or churn scenario's adoption is the watch-flood
+            // properties' to judge, so it keeps no adoption facts there.
+            publication: PublicationEvidence::armed(Arming {
+                armed: !scenario
+                    .controls
+                    .iter()
+                    .any(|step| matches!(step.action, ControlAction::Flood | ControlAction::Churn)),
+                status: false,
+            }),
         }
     }
 
@@ -1074,17 +1236,35 @@ impl Subsystem for Storage {
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_retirement(ports.retirement.clone());
         tap.watch_chain(ports.chain_effect.clone());
-        let branches = scenario
+        let branches: Vec<u8> = scenario
             .mirrors
             .iter()
             .flat_map(|mirror| mirror.chain.branches())
-            .chain(scenario.node.branches());
-        tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
+            .chain(scenario.node.branches())
+            .collect();
+        tap.watch_authority(
+            ports.authority.clone(),
+            ports.fixture.clone(),
+            branches.clone(),
+            [],
+        );
         tap.watch_outstanding(
             ports.outstanding.clone(),
             storage_peer_limit(),
             storage_departed_limit(),
         );
+        tap.watch_fork_choice(
+            ports.fork_choice.clone(),
+            ports.fixture.clone(),
+            branches,
+            ports.preloaded_at,
+            fork_fixture(scenario),
+        );
+        tap.watch_publication(ports.publication.clone());
+        sim.on_frozen({
+            let publication = ports.publication.clone();
+            move || publication.freeze()
+        });
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1112,19 +1292,22 @@ impl Subsystem for Storage {
             .zip(2..)
             .enumerate()
         {
+            let name = format!("mirror-{index}");
+            // The served-page rule reads each mirror's `Open`s.
+            let observer = ports.publication.subscriber(&name);
             let mut config = ZakuraHeaderSyncConfig::default();
             if let Some(limit) = spec.max_headers_per_response {
                 config.max_headers_per_response = limit;
             }
             nodes.push(HeaderNode::spawn_configured(
                 sim,
-                &format!("mirror-{index}"),
+                &name,
                 seed,
                 port.clone(),
                 &ports.fixture,
                 spec.chain.tip(&ports.fixture),
                 dispatch.clone(),
-                None,
+                Some(observer),
                 config,
             ));
         }
@@ -1134,6 +1317,7 @@ impl Subsystem for Storage {
             .iter()
             .map(|node| (node.id.clone(), node.name.clone()))
             .collect();
+        ports.publication.name_peers(names.clone());
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
@@ -1186,6 +1370,8 @@ impl Subsystem for Storage {
             chain_effect: ports.chain_effect,
             authority: ports.authority,
             outstanding: ports.outstanding,
+            fork_choice: ports.fork_choice,
+            publication: ports.publication,
             ends,
             stamps,
             faults,
@@ -1415,8 +1601,7 @@ impl HasView for HeaderWire {
 
     /// The node's port, the dispatch guard's flag, the honest peers and the
     /// node's adoption facts. Its sessions run over the network, so the view
-    /// gives no lifetimes, and the status rule judges only what each queued
-    /// status advertises.
+    /// gives no lifetimes.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
@@ -1440,6 +1625,9 @@ impl HasView for HeaderWire {
             // The wire harness doesn't register outstanding-work-bounded.
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
+            // The wire harness doesn't judge fork choice or publication.
+            fork_choice: ForkChoiceEvidence::default(),
+            publication: PublicationEvidence::default(),
         }
     }
 
@@ -1959,7 +2147,9 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
 /// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
 /// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`],
-/// [`COMMIT_ONLY_AUTHORIZED`] and [`PEER_RETIREMENT_PROGRESS`], all active. A test harness that wraps [`Storage`] with its view registers
+/// [`COMMIT_ONLY_AUTHORIZED`], [`PEER_RETIREMENT_PROGRESS`],
+/// [`EXPECTED_CHAIN_SELECTED`] and [`STATE_PUBLICATION_CONSISTENT`], all
+/// active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
@@ -1969,6 +2159,8 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
 /// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
 /// [`PEER_RETIREMENT_PROGRESS`]: crate::domain::header_sync::PEER_RETIREMENT_PROGRESS
+/// [`EXPECTED_CHAIN_SELECTED`]: crate::domain::header_sync::EXPECTED_CHAIN_SELECTED
+/// [`STATE_PUBLICATION_CONSISTENT`]: crate::domain::header_sync::STATE_PUBLICATION_CONSISTENT
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -2000,6 +2192,8 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         commit_only_authorized(),
         outstanding_work_bounded(),
         peer_retirement_progress(),
+        expected_chain_selected(),
+        state_publication_consistent(),
     ]
 }
 
@@ -2245,6 +2439,64 @@ mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
 
+    /// The fork fixture's window constants restate production's, and its
+    /// header cap leaves more than a refill batch of window.
+    #[test]
+    fn the_fork_fixture_bound_restates_the_header_window() {
+        assert_eq!(HEADER_BODY_WINDOW, zakura_network::zakura::MAX_HS_RANGE);
+        let gap = zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+        assert_eq!(usize::try_from(HEADER_REFILL_BATCH).unwrap(), gap + 1);
+        const { assert!(HEADER_BODY_WINDOW - 2 * FORK_FIXTURE_MAX_HEADERS > HEADER_REFILL_BATCH) };
+    }
+
+    /// The fork fixture's mirrors on `chains`, from genesis, under the
+    /// fixture's policy.
+    fn forks(chains: Vec<Chain>) -> StorageScenario {
+        StorageScenario {
+            node: Chain::default(),
+            mirrors: chains
+                .into_iter()
+                .map(|chain| MirrorSpec {
+                    chain,
+                    dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
+                })
+                .collect(),
+            policy: Policy {
+                base: Base::SuccessOnly,
+                bound_ms: Some(10),
+                holds: Vec::new(),
+                reply_holds: Vec::new(),
+            },
+            controls: Vec::new(),
+            weights: Weights::default(),
+        }
+    }
+
+    /// Forks from one ancestor within the header cap are the fork fixture.
+    /// Past the cap, where a correct node's window could run out on bodies
+    /// the simulator never verifies, they aren't: two mirrors sharing
+    /// 4,000 main-line headers with one fork header each, for one. Nor are
+    /// chains one of which is a prefix of another, forks from two different
+    /// ancestors, one mirror, or a node off genesis.
+    #[test]
+    fn the_fork_fixture_declares_only_bounded_forks_from_one_ancestor() {
+        let fork = |main, branch, len| Chain {
+            main,
+            fork: Some(Fork { branch, len }),
+        };
+        assert!(fork_fixture(&forks(vec![fork(0, 1, 5), fork(0, 2, 3)])).is_some());
+        assert!(fork_fixture(&forks(vec![fork(10, 1, 490), fork(10, 2, 490)])).is_some());
+        assert!(fork_fixture(&forks(vec![fork(10, 1, 491), fork(10, 2, 490)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(4_000, 1, 1), fork(4_000, 2, 1)])).is_none());
+        assert!(fork_fixture(&forks(vec![Chain::main(5), Chain::main(3)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(2, 1, 2), fork(2, 2, 2), fork(0, 1, 2)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(0, 1, 5)])).is_none());
+        let mut off_genesis = forks(vec![fork(2, 1, 5), fork(2, 2, 3)]);
+        off_genesis.node = Chain::main(1);
+        assert!(fork_fixture(&off_genesis).is_none());
+    }
+
     /// A submission of operation `id`.
     fn submitted(id: u64) -> StorageFact {
         StorageFact::Submitted {
@@ -2459,6 +2711,8 @@ mod tests {
                 authority: AuthorityEvidence::default(),
                 outstanding: OutstandingEvidence::default(),
                 recovery: RecoveryEvidence::default(),
+                fork_choice: ForkChoiceEvidence::default(),
+                publication: PublicationEvidence::default(),
             }
         }
     }

@@ -1282,6 +1282,49 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "forks-sharing-a-header ",
                 "multi-page-sync ",
                 "relinked-mid-round ",
+                "harness-commit ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/expected-chain-selected"),
+            [
+                "stronger-first ",
+                "stronger-last ",
+                "three-forks ",
+                "equal-work ",
+                "heavier-offered-to-longer ",
+                "invalidated-then-reconsidered ",
+                "harness-commit ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/state-publication-consistent"),
+            [
+                "startup-only ",
+                "quiet-reset ",
+                "invalidate-only ",
+                "grow ",
+                "reset-inside-status-floor ",
+                "harness-commit ",
+                "sync ",
+                "served ",
+                "served-one-header ",
+                "served-from-a-lower-locator ",
+                "served-in-pages ",
+                "served-after-growth ",
+                "served-across-a-reset ",
             ]
             .iter()
             .flat_map(|name| plans(name, "inputs(8, 256)", 8))

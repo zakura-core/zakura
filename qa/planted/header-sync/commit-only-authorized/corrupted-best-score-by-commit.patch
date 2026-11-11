@@ -1,0 +1,38 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..9b323169eb 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,16 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: the header-best score keeps the selected tip's hash but
++    /// takes its parent's suffix work.
++    pub fn planted_corrupt(&mut self) {
++        let tip = self.metadata.frontiers.header_best;
++        let parent = self.graph.header_node(tip.hash).map(|node| node.parent_hash);
++        if let Some(Ok(score)) = parent.map(|parent| self.graph.header_chain_score(parent)) {
++            self.metadata.header_best_score = crate::ChainScore::new(score.suffix_work, tip.hash);
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..ee3d06b5be 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,12 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: every apply inside the run corrupts the engine after
++        // its install. The fixture's preload, before the run, applies
++        // faithfully.
++        if zakura_rt::sim::run_id().is_some() {
++            engine.planted_corrupt();
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);

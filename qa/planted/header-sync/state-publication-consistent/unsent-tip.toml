@@ -1,0 +1,14 @@
+# The reactor never sends its tip watch when an adopted snapshot changes
+# the selected tip, so only the watch's initial value is ever published.
+# This is the adopted-state unsent-tip native mutation, moved here as a
+# case of its own name. On the sync witness the node takes six headers from its
+# mirror, and its first adoption past genesis leaves that tip unpublished.
+# Besides reactor.rs, which the patch changes, the adoption path decides
+# when the node adopts a new tip. A change there can move the witness off
+# it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-sync.plan"

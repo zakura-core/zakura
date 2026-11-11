@@ -885,7 +885,25 @@ fn static_files_left_in_the_state_directory_are_reported() {
         Err(StateInitError::StaticFilesInStateDir { .. })
     ));
     assert!(matches!(
-        crate::init_read_only(config, &network),
+        crate::init_read_only(config.clone(), &network),
         Err(StateInitError::StaticFilesInStateDir { .. })
     ));
+
+    // Moving the contents as the docs say leaves an empty directory behind.
+    let major = crate::constants::state_database_format_version_in_code().major;
+    let state_static = config
+        .db_path(crate::constants::STATE_DATABASE_KIND, major, &network)
+        .join(STATIC_FILE_DIR);
+    let external = config
+        .external_static_files_path(major, &network)
+        .expect("static files are external");
+    std::fs::create_dir_all(&external).expect("external directory is created");
+    for name in file_names(&state_static) {
+        std::fs::rename(state_static.join(&name), external.join(&name)).expect("file moves");
+    }
+    assert!(state_static.is_dir(), "the empty directory is left behind");
+
+    let state = FinalizedState::new(&config, &network).expect("migrated state opens");
+    assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
+    assert_chain_reads(&state.db, &test_chain());
 }

@@ -266,8 +266,15 @@ impl ZakuraDb {
             config.external_static_files_path(format_version_in_code.major, network);
         if let Some(configured) = &external_static_file_dir {
             // Static files in both places would leave one copy unused, and the
-            // database's records unmatched by the other.
-            if fs::symlink_metadata(&state_static_file_dir).is_ok() {
+            // database's records unmatched by the other. Moving the contents
+            // out leaves an empty directory, which is fine. Links still count.
+            let has_state_static_files = match fs::symlink_metadata(&state_static_file_dir) {
+                Err(_) => false,
+                Ok(metadata) if metadata.is_dir() => fs::read_dir(&state_static_file_dir)
+                    .map_or(true, |mut entries| entries.next().is_some()),
+                Ok(_) => true,
+            };
+            if has_state_static_files {
                 return Err(StateInitError::StaticFilesInStateDir {
                     found: state_static_file_dir,
                     configured: configured.clone(),

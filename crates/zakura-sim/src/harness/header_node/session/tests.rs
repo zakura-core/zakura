@@ -416,8 +416,9 @@ fn shutdown_cleanup_cannot_retire_a_session() {
     );
 }
 
-/// A run that ended with `outcome` after a drain that `exhausted` or not.
-fn run_end(outcome: crate::Outcome, exhausted: bool) -> RunEnd {
+/// A run that ended with `outcome` after a drain that `exhausted` or not,
+/// with the scheduler at `rest` if it ran dry.
+fn run_end(outcome: crate::Outcome, exhausted: bool, rest: Option<SchedulerStatus>) -> RunEnd {
     RunEnd {
         outcome,
         steps: 100,
@@ -427,17 +428,19 @@ fn run_end(outcome: crate::Outcome, exhausted: bool) -> RunEnd {
             exhausted,
         }),
         harness: None,
+        rest,
     }
 }
 
-/// A departed session own-9 never retired is a leak once the run ended idle,
-/// and open when the run hasn't ended or stopped first, at its budget
-/// included, since a dry drain can leave a timer past the harness timer
-/// cap pending.
+/// A departed session own-9 never retired is a leak once the run ran dry
+/// idle, live or after a drain (Terra T6), and open when the run hasn't
+/// ended or stopped first, at a drain that ran dry with a timer past the
+/// harness timer cap pending included.
 #[test]
 fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
     let open = vec![("peer-0".to_owned(), 5)];
-    let idle = |status| Some(run_end(crate::Outcome::Idle { status }, false));
+    let idle = |status, rest| Some(run_end(crate::Outcome::Idle { status }, false, Some(rest)));
+    let dry = |rest| Some(run_end(crate::Outcome::Budget, false, Some(rest)));
     for (end, check) in [
         (None, EndCheck::Open(open.clone())),
         (
@@ -445,24 +448,39 @@ fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
                 harness: Some(crate::HarnessFailure::DrainBound {
                     open: "task:reactor.1:poll#1".to_owned(),
                 }),
-                ..run_end(crate::Outcome::Harness, true)
+                ..run_end(crate::Outcome::Harness, true, None)
             }),
             EndCheck::Open(open.clone()),
         ),
         (
-            Some(run_end(crate::Outcome::Budget, false)),
+            dry(SchedulerStatus::WaitingOnTime),
             EndCheck::Open(open.clone()),
         ),
         (
-            idle(crate::IdleStatus::Deadlock),
+            dry(SchedulerStatus::WorkerStarved),
             EndCheck::Open(open.clone()),
         ),
         (
-            idle(crate::IdleStatus::Quiescent),
+            dry(SchedulerStatus::Quiescent),
             EndCheck::Unretired(open.clone()),
         ),
         (
-            idle(crate::IdleStatus::WaitingOnExternal),
+            dry(SchedulerStatus::WaitingOnExternal),
+            EndCheck::Unretired(open.clone()),
+        ),
+        (
+            idle(crate::IdleStatus::Deadlock, SchedulerStatus::Deadlock),
+            EndCheck::Open(open.clone()),
+        ),
+        (
+            idle(crate::IdleStatus::Quiescent, SchedulerStatus::Quiescent),
+            EndCheck::Unretired(open.clone()),
+        ),
+        (
+            idle(
+                crate::IdleStatus::WaitingOnExternal,
+                SchedulerStatus::WaitingOnExternal,
+            ),
             EndCheck::Unretired(open.clone()),
         ),
     ] {

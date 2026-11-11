@@ -330,6 +330,7 @@ fn synthetic(
             }),
             drain: None,
             harness,
+            rest: None,
         },
         properties,
         cleanup: CleanupReport {

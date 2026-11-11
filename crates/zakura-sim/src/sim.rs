@@ -635,10 +635,14 @@ impl Sim {
                 if let Some(failure) = self.stranded() {
                     return st.end_harness(failure);
                 }
+                let rest = self.sched().status();
                 return match phase {
-                    Phase::Drain => st.end_budget(drained),
-                    Phase::Live => match idle_status(self.sched().status()) {
-                        Ok(status) => st.end(Outcome::Idle { status }),
+                    Phase::Drain => st.end_budget(drained, rest),
+                    Phase::Live => match idle_status(rest) {
+                        Ok(status) => RunEnd {
+                            rest: Some(rest),
+                            ..st.end(Outcome::Idle { status })
+                        },
                         Err(failure) => st.end_harness(failure),
                     },
                 };
@@ -1118,16 +1122,19 @@ impl State {
             violation: None,
             drain: None,
             harness: None,
+            rest: None,
         }
     }
 
-    /// An end after a drain of `steps` that ran dry.
-    fn end_budget(&self, steps: u64) -> RunEnd {
+    /// An end after a drain of `steps` that ran dry, with the scheduler at
+    /// `rest`.
+    fn end_budget(&self, steps: u64, rest: Status) -> RunEnd {
         RunEnd {
             drain: Some(Drain {
                 steps,
                 exhausted: false,
             }),
+            rest: Some(rest),
             ..self.end(Outcome::Budget)
         }
     }

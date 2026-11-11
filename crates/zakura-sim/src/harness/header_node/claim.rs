@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use zakura_network::zakura::observe::ClaimRule;
 
-use crate::{Outcome, RunEnd};
+use crate::RunEnd;
 
 /// A claim rule the tap checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,11 +182,7 @@ impl SettlementEvidence {
     /// dry, and not at a violation or a harness failure, a drain cut off at
     /// its bound included.
     pub(crate) fn end(&self, end: &RunEnd) {
-        let at_rest = match end.outcome {
-            Outcome::Idle { .. } => true,
-            Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
-            _ => false,
-        };
+        let at_rest = end.rest.is_some();
         self.with(|store| store.at_rest = at_rest);
     }
 

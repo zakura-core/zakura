@@ -69,8 +69,9 @@ use zakura_network::zakura::{
     ZakuraPeerId, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_rt::sim::RunId;
+use zakura_scheduler::Status as SchedulerStatus;
 
-use crate::{peer::peer_of, property::EndedBy, IdleStatus, Outcome, RunEnd};
+use crate::{peer::peer_of, property::EndedBy, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -344,18 +345,17 @@ impl SessionEvidence {
         }
     }
 
-    /// Records whether the run ended idle: with every task finished or
-    /// waiting outside the scheduler, and nothing enabled. Nothing can
-    /// retire a session after that. A drain fires a timer alone only within
-    /// the harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so
-    /// a dry drain can leave a later timer pending, and a session whose
+    /// Records whether the run ran dry idle ([`RunEnd::rest`]): with every
+    /// task finished or waiting outside the scheduler, no timer pending,
+    /// and nothing enabled, live or after a drain. Nothing can retire a
+    /// session after that. A drain fires a timer alone only within the
+    /// harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so a dry
+    /// drain can leave a later timer pending, and a session whose
     /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
         self.ledger().idle = Some(matches!(
-            end.outcome,
-            Outcome::Idle {
-                status: IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-            }
+            end.rest,
+            Some(SchedulerStatus::Quiescent | SchedulerStatus::WaitingOnExternal)
         ));
     }
 

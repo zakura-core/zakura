@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::{check::Violation, PlanError};
 use serde::{Deserialize, Serialize};
+use zakura_scheduler::Status;
 
 /// A failure of the simulation itself, not of the code under test.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,4 +247,11 @@ pub struct RunEnd {
     pub drain: Option<Drain>,
     /// The failure, for [`Outcome::Harness`].
     pub harness: Option<HarnessFailure>,
+    /// The scheduler's status where the run ran dry, with nothing left to
+    /// step: an [`Outcome::Idle`] end's, or a [`Outcome::Budget`] end's
+    /// after its drain ran dry. `None` for any other end. A dry drain can
+    /// end worker-starved, deadlocked, or waiting on a timer past the
+    /// harness timer cap, so a check that needs every task at rest reads
+    /// this, not the outcome.
+    pub rest: Option<Status>,
 }

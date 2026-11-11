@@ -286,6 +286,7 @@ fn run_checked(
         violation: None,
         drain: None,
         harness: checker.harness_failure(),
+        rest: None,
     };
     sink.record(Record::Init(InitRecord::default()));
     for (number, work) in history {
@@ -376,6 +377,8 @@ fn run_checked(
             status: IdleStatus::Quiescent,
         }
     };
+    // A machine's history runs no tasks, so an idle end is quiescent.
+    end.rest = matches!(end.outcome, Outcome::Idle { .. }).then_some(SchedulerStatus::Quiescent);
     let mut properties = checker.at_end(&end, &log);
     // A failure either checker found at the end fails a run that didn't
     // already fail, the registry's first, as in `Sim::run`.

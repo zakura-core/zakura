@@ -2376,6 +2376,7 @@ mod tests {
             violation: None,
             drain: None,
             harness: None,
+            rest: Some(zakura_scheduler::Status::Quiescent),
         });
         faults
     }

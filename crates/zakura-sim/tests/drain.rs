@@ -1201,3 +1201,38 @@ fn the_drain_retires_every_generator() {
         "a generator registered in the drain is cancelled at once"
     );
 }
+
+/// Terra T1: a drain that runs dry worker-starved ends with that status, and
+/// the header harness doesn't read it as settled, since the ready task never
+/// got a worker to finish its call.
+#[test]
+fn a_worker_starved_drain_keeps_its_status_and_does_not_settle() {
+    use zakura_scheduler::Status as SchedStatus;
+    // One worker: the holder yields while holding the lock, the waiter takes
+    // the worker and parks on the lock, and the holder can't get it back.
+    let starve = |sim: &mut Sim| {
+        let lock = Arc::new(zakura_rt::sync::Mutex::new(()));
+        let held = lock.clone();
+        sim.scheduler().spawn_root("holder", async move {
+            #[allow(clippy::await_holding_lock)]
+            {
+                let _guard = held.lock().unwrap();
+                task::yield_now().await;
+            }
+        });
+        sim.scheduler().spawn_root("waiter", async move {
+            drop(lock.lock().unwrap());
+        });
+    };
+    let starved: Vec<RunEnd> = support::inputs(200, 16)
+        .into_iter()
+        .map(|plan| run(config(1, 0), plan, starve, &mut zakura_sim::NoChecks).end)
+        .filter(|end| end.rest == Some(SchedStatus::WorkerStarved))
+        .collect();
+    assert!(!starved.is_empty(), "no plan starved the drain");
+    for end in &starved {
+        assert_eq!(end.outcome, Outcome::Budget);
+        assert!(!end.drain.unwrap().exhausted);
+        assert!(!zakura_sim::harness::header_node::adoption::settled(end));
+    }
+}

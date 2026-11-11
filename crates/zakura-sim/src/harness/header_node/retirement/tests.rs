@@ -907,6 +907,20 @@ fn run_end(outcome: crate::Outcome, drain: Option<bool>) -> crate::RunEnd {
             exhausted,
         }),
         harness: None,
+        // A dry end is quiescent unless it is an idle one that says
+        // otherwise.
+        rest: match outcome {
+            crate::Outcome::Idle { status } => Some(match status {
+                crate::IdleStatus::Quiescent => zakura_scheduler::Status::Quiescent,
+                crate::IdleStatus::Deadlock => zakura_scheduler::Status::Deadlock,
+                crate::IdleStatus::WorkerStarved => zakura_scheduler::Status::WorkerStarved,
+                crate::IdleStatus::WaitingOnExternal => zakura_scheduler::Status::WaitingOnExternal,
+            }),
+            crate::Outcome::Budget if drain == Some(false) => {
+                Some(zakura_scheduler::Status::Quiescent)
+            }
+            _ => None,
+        },
     }
 }
 

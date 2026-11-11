@@ -836,6 +836,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
         violation: None,
         drain: None,
         harness: None,
+        rest: Some(zakura_scheduler::Status::Quiescent),
     });
     assert_eq!(evidence.lingering_at_rest(), [(mirror(2), 1)]);
 
@@ -861,6 +862,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
         violation: None,
         drain: None,
         harness: None,
+        rest: Some(zakura_scheduler::Status::Quiescent),
     });
     assert_eq!(evidence.lingering_at_rest(), [(mirror(3), 6)]);
 

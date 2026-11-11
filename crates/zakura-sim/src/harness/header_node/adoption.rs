@@ -27,7 +27,8 @@ use zakura_network::zakura::{
 };
 
 use super::stamp::Stamps;
-use crate::{IdleStatus, Outcome, RunEnd};
+use crate::RunEnd;
+use zakura_scheduler::Status as SchedulerStatus;
 
 /// How long after an adoption that changes a session's status the reactor
 /// may wait before it queues that status or records a deferral:
@@ -251,22 +252,22 @@ impl AdoptionFact {
     }
 }
 
-/// Whether a run that ended as `end` settled: it ended with no task ready,
-/// idle with every task finished or waiting outside the scheduler, or after
-/// a drain that ran dry. Any other end, a violation or a harness failure,
-/// a drain cut off at its bound included, can stop a task partway through a
-/// synchronous call.
+/// Whether a run that ended as `end` settled: it ran dry
+/// ([`RunEnd::rest`]) with no task ready, every task finished, waiting
+/// outside the scheduler, or waiting on a timer a dry drain left past the
+/// harness timer cap. Any other end can stop a task partway through a
+/// synchronous call: a violation, a harness failure, a drain cut off at its
+/// bound included, or a run dry with a ready task that never got a worker
+/// or a deadlock.
 pub fn settled(end: &RunEnd) -> bool {
-    match end.outcome {
-        Outcome::Idle { status } => matches!(
-            status,
-            IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-        ),
-        // A drain cut off at its bound ends at a harness failure, so this
-        // reads only one that ran dry.
-        Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
-        Outcome::Violation | Outcome::Harness => false,
-    }
+    matches!(
+        end.rest,
+        Some(
+            SchedulerStatus::Quiescent
+                | SchedulerStatus::WaitingOnExternal
+                | SchedulerStatus::WaitingOnTime
+        )
+    )
 }
 
 /// An [`AdoptionFact`] and the virtual time since the run's start that the
@@ -743,6 +744,7 @@ mod tests {
     use crate::{
         domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
         end::Drain,
+        IdleStatus, Outcome,
     };
 
     /// An adoption at generation `generation` whose tip is at `height`.
@@ -868,6 +870,7 @@ mod tests {
                 exhausted: false,
             }),
             harness: None,
+            rest: Some(SchedulerStatus::Quiescent),
         };
         // A drain cut off at its bound is a harness failure.
         let cut = RunEnd {
@@ -879,6 +882,7 @@ mod tests {
             harness: Some(crate::HarnessFailure::DrainBound {
                 open: "task:reactor.1:poll#1".to_owned(),
             }),
+            rest: None,
             ..settled.clone()
         };
         let wedged = evidence(vec![(0, commit(2))], 0);
@@ -1059,12 +1063,24 @@ mod tests {
         // does.
         let cut = evidence(vec![(0, adopted(&first))], 60_000);
         assert!(matches!(cut.tip(), Acceptance::Open(_)));
-        let run_end = |outcome, drain| RunEnd {
+        // A dry end's status follows from its outcome, with a dry drain
+        // quiescent unless a case says otherwise.
+        let run_end = |outcome, drain: Option<Drain>| RunEnd {
             outcome,
             steps: 100,
             violation: None,
             drain,
             harness: None,
+            rest: match outcome {
+                Outcome::Idle {
+                    status: IdleStatus::Deadlock,
+                } => Some(SchedulerStatus::Deadlock),
+                Outcome::Idle { .. } => Some(SchedulerStatus::Quiescent),
+                Outcome::Budget if drain.is_some_and(|drain| !drain.exhausted) => {
+                    Some(SchedulerStatus::Quiescent)
+                }
+                _ => None,
+            },
         };
         let drained = |exhausted| {
             Some(Drain {
@@ -1100,6 +1116,15 @@ mod tests {
             None,
         ));
         assert!(matches!(cut.tip(), Acceptance::Open(_)));
+        // So can a drain that ran dry with the reactor ready but starved of
+        // a worker, or deadlocked (Terra T1).
+        for rest in [SchedulerStatus::WorkerStarved, SchedulerStatus::Deadlock] {
+            cut.end(&RunEnd {
+                rest: Some(rest),
+                ..run_end(Outcome::Budget, drained(false))
+            });
+            assert!(matches!(cut.tip(), Acceptance::Open(_)), "{rest:?}");
+        }
         held.end(&run_end(Outcome::Budget, drained(false)));
         assert_eq!(held.tip(), Acceptance::Holds);
         // Cleanup can finish the publication after the end, which changes

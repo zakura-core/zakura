@@ -815,6 +815,7 @@ mod tests {
                 violation: Some(violation(property, 3, &[3])),
                 drain: None,
                 harness: None,
+                rest: None,
             },
             properties: vec![violated_report(property, &[(3, &[3])])],
             cleanup: Default::default(),

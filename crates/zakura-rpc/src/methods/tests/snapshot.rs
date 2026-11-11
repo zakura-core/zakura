@@ -1054,6 +1054,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
         optimistic_block_inventory: true,
+        #[cfg(feature = "experimental-8mb-blocks")]
+        experimental_coinbase_padding_bytes: 0,
     };
 
     // nu5 block height

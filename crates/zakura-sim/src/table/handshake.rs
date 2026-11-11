@@ -104,9 +104,15 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             id: PropertyId::new(id), claim, kind: Kind::Safety,
             assumes: &[], needs: &[Source::Closes], status: Status::Active,
             check: check_session_capacity::<S>,
-            witness: Some(TriggerHistory::Log(|log| log.entries().iter().any(|entry| matches!(entry.obs,
-                Observation::Transport { event: TransportFact::SessionCapacity { held, .. }, .. } if held[2] > 0
-            )))),
+            witness: Some(TriggerHistory::Log(if id == "session/capacity-conserved" {
+                |log| log.entries().iter().any(|entry| matches!(entry.obs,
+                    Observation::Transport { event: TransportFact::SessionCapacity { held, .. }, .. } if held[0] > 0 || held[1] > 0
+                ))
+            } else {
+                |log| log.entries().iter().any(|entry| matches!(entry.obs,
+                    Observation::Transport { event: TransportFact::SessionCapacity { held, .. }, .. } if held[2] > 0
+                ))
+            })),
         });
     }
     properties.push(Property {

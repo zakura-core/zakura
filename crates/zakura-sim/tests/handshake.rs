@@ -593,6 +593,15 @@ fn complete_session_transfers_setup_to_installed_owners() {
     let mut input = [0; Wire::SCENARIO_BYTES];
     input[..3].copy_from_slice(&[9, 1, 1]);
     assert_eq!(scenario, Wire::draw(&input));
+    (harness::find(Wire::NAME).unwrap().witness)(
+        &serde_json::to_value(&scenario).unwrap(),
+        PlanInput::Bytes(Vec::new()),
+        "session/capacity-conserved",
+        zakura_sim::witness::Expect::Holds,
+        &[],
+        &mut NullSink,
+    )
+    .unwrap();
     let report = run(scenario);
     assert_held(&report, "session/capacity-conserved");
     assert!(

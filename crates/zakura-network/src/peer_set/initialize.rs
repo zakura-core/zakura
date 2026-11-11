@@ -26,7 +26,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, Instant},
+    time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -612,53 +612,44 @@ where
         "connecting to initial peer set"
     );
 
-    // # Security
-    //
-    // Resists distributed denial of service attacks by making sure that
-    // new peer connections are initiated at least `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL` apart.
-    //
-    // # Correctness
-    //
-    // Each `FuturesUnordered` can hold one `Buffer` or `Batch` reservation for
-    // an indefinite period. We can use `FuturesUnordered` without filling
-    // the underlying network buffers, because we immediately drive this
-    // single `FuturesUnordered` to completion, and handshakes have a short timeout.
-    let mut handshakes: FuturesUnordered<_> = initial_peers
-        .into_iter()
-        .enumerate()
-        .map(|(i, addr)| {
-            let connection_tracker = active_outbound_connections.track_connection();
+    // Admit only a bounded window of attempts. The selected prefix still obeys
+    // the total target, per-IP limit, and cached/seed preference order.
+    // Completed attempts refill the window without delaying unrelated peers.
+    let mut remaining_peers = initial_peers.into_iter();
+    let mut handshakes = FuturesUnordered::new();
+
+    loop {
+        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY {
+            let Some(addr) = remaining_peers.next() else {
+                break;
+            };
             let req = OutboundConnectorRequest {
                 addr,
-                connection_tracker,
+                connection_tracker: active_outbound_connections.track_connection(),
             };
             let outbound_connector = outbound_connector.clone();
 
-            // Spawn a new task to make the outbound connection.
-            tokio::spawn(erased(
+            // Drive handshakes independently of peer-set delivery, but abort
+            // outstanding attempts if startup fails or its caller shuts down.
+            let task = AbortOnDropHandle::new(tokio::spawn(erased(
                 async move {
-                    // Only spawn one outbound connector per
-                    // `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`,
-                    // by sleeping for the interval multiplied by the peer's index in the list.
-                    sleep(
-                        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL.saturating_mul(i as u32),
-                    )
-                    .await;
-
-                    // As soon as we create the connector future,
-                    // the handshake starts running as a spawned task.
                     outbound_connector
                         .oneshot(req)
                         .map_err(move |e| (addr, e))
                         .await
                 }
                 .in_current_span(),
-            ))
-            .wait_for_panics()
-        })
-        .collect();
+            )));
+            handshakes.push(async move {
+                task.await
+                    .panic_if_task_has_panicked()
+                    .expect("initial peer handshake tasks are not cancelled individually")
+            });
+        }
 
-    while let Some(handshake_result) = handshakes.next().await {
+        let Some(handshake_result) = handshakes.next().await else {
+            break;
+        };
         match handshake_result {
             Ok(change) => {
                 handshake_success_total += 1;

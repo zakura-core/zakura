@@ -474,6 +474,65 @@ async fn small_healthy_cache_finishes_startup_with_unresolved_seeds() {
     live_connections.lock().unwrap().clear();
 }
 
+/// Failed attempts must keep the seed fallback even while inner task cleanup
+/// still holds their connection reservations.
+#[tokio::test]
+async fn failed_cached_attempt_with_pending_cleanup_waits_for_seeds() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 3,
+        ..test_defaults()
+    };
+    let cached: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let seed: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    write_peer_cache_file(&config, &["127.0.0.1:8233"]);
+
+    // An aborted inner handshake can retain its reservation until it is polled
+    // again. Hold the unmarked tracker to exercise that boundary deterministically.
+    let pending_cleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connector = {
+        let pending_cleanup = pending_cleanup.clone();
+        service_fn(move |request: OutboundConnectorRequest| {
+            attempt_tx.send(request.addr).unwrap();
+            pending_cleanup
+                .lock()
+                .unwrap()
+                .push(request.connection_tracker);
+            async { Err::<DiscoveredPeer, BoxError>("handshake timed out".into()) }
+        })
+    };
+    let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+    let (peerset_tx, _peerset_rx) = mpsc::channel(10);
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let mut startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
+        config,
+        async move { seed_rx.await.unwrap() }.boxed(),
+        connector,
+        peerset_tx,
+        book_tx,
+    )));
+    assert_eq!(next_attempt(&mut attempt_rx).await, cached);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut startup)
+            .await
+            .is_err(),
+        "a failed attempt's reservation must not bypass the seed fallback"
+    );
+    seed_tx.send(vec![seed]).unwrap();
+    assert_eq!(next_attempt(&mut attempt_rx).await, seed);
+    let mut connections = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(connections.pending_seed_peers.is_none());
+    pending_cleanup.lock().unwrap().clear();
+    assert_eq!(connections.active_connections.update_count(), 0);
+}
+
 /// Empty, missing, unreadable, and invalid caches wait for seeds.
 #[tokio::test]
 async fn unusable_cache_waits_for_seeds() {

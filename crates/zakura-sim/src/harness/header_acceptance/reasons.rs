@@ -342,7 +342,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/header_sync_progress.rs",
         function: "check_bounded_adversary_progress",
-        fingerprint: "62529ae72528845d",
+        fingerprint: "ebc4c11128138ac7",
         constructions: &[
             step(
                 "no recovery ended unreached at this step, and none has recorded a `recovered` \

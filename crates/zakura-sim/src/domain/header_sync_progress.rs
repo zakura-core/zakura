@@ -256,7 +256,11 @@ pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<
 }
 
 /// Checks [`BOUNDED_ADVERSARY_PROGRESS`]. A recovery that ended unreached
-/// is violated at that pick. At the `recovered` pick, with a successor
+/// is violated at that pick. The run's last live step, or any drain step,
+/// with the successor still owed and its deadline not yet passed fails the
+/// run as missing evidence: the step budget ran out before the deadline
+/// could judge the obligation, which proves nothing either way (Rule 13).
+/// A step past the deadline is left to the registry's expiry. At the `recovered` pick, with a successor
 /// owed ([`RecoveryObjective`]), it applies. If the reactor's
 /// adopted tip already meets the objective, the pick discharges it at once.
 /// Otherwise it opens one obligation, which the first later
@@ -276,13 +280,25 @@ fn check_bounded_adversary_progress<S: HasView<View = StorageView>>(
             "every relink settled without a live session for the source".to_owned(),
         );
     }
+    let progress = view.recovery.progress(&view.adoption, &view.ends);
+    if let RecoveryProgress::Owed { since } = progress {
+        let deadline = recovery_deadline(since);
+        // Past the deadline, the registry's expiry judges it a violation.
+        if cx.step >= cx.budget && cx.now <= deadline {
+            cx.missing_evidence(format!(
+                "the step budget ran out at {:?} with the recovery's successor owed since \
+                 {:?}, before its deadline at {:?} judged it",
+                cx.now, since, deadline,
+            ));
+        }
+    }
     let Some((record, Some(_))) = view.recovery.objective() else {
         return Verdict::NotApplicable;
     };
     if record.step != cx.step {
         return Verdict::NotApplicable;
     }
-    if let RecoveryProgress::Owed { .. } = view.recovery.progress(&view.adoption, &view.ends) {
+    if let RecoveryProgress::Owed { .. } = progress {
         let obligation = cx.fact_obligation(
             None,
             Subject::Owner(RECOVERY_SUBJECT.to_owned()),

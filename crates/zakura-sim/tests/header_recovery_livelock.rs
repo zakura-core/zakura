@@ -3,6 +3,9 @@
 //! with `header-sync/bounded-adversary-progress` owed violates
 //! `sim/no-livelock` rather than running out its step budget (Rule 13 of
 //! the hdr-9 to hdr-13 plan). Honest recoveries stay well under the limit.
+//! A node that keeps the clock moving but runs out the budget first, with
+//! the successor still owed, fails the run as a harness failure, so a
+//! campaign never counts it clean.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -18,12 +21,12 @@ use zakura_sim::{
             recovered_bound, recovery_assumptions, recovery_source, storage_properties,
             storage_sources, Ports, Storage, StorageScenario, StorageView, RECOVERY_BUDGET,
         },
-        run_prepared, Subsystem,
+        run_prepared, HarnessError, Subsystem,
     },
     observe::Exit,
     property::{Assume, Assumptions, EndViolation, HasView, Property, Sources},
     sim::NO_LIVELOCK,
-    MemorySink, Observation, ObservationLog, Outcome, RunConfig, RunEnd, Sim,
+    HarnessFailure, MemorySink, Observation, ObservationLog, Outcome, RunConfig, RunEnd, Sim,
 };
 
 /// Every storage recovery witness hdr-13 runs: fuzz-12's five classes,
@@ -264,6 +267,140 @@ impl Subsystem for Spinning {
     /// Never drawn: spinning runs are typed.
     fn draw(_: &[u8]) -> StorageScenario {
         unreachable!("spinning runs are typed")
+    }
+}
+
+/// `header-sync/storage` on a scenario, with one more task: it waits, a
+/// millisecond at a time, for the `recovered` pick, then wakes every
+/// 10 µs from then on. It stands in for a reactor that keeps the clock
+/// moving, so the livelock limit never applies, while an obligation stays
+/// open.
+struct Ticking(Storage);
+
+impl Wraps for Ticking {
+    fn storage(&self) -> &Storage {
+        &self.0
+    }
+}
+
+impl HasView for Ticking {
+    type View = StorageView;
+
+    /// The storage harness's view.
+    fn view(&self) -> StorageView {
+        self.0.view()
+    }
+
+    /// The storage harness's end.
+    fn ended(&self, end: &RunEnd) {
+        self.0.ended(end);
+    }
+
+    /// The storage harness's end violations.
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        self.0.end_violations(log)
+    }
+
+    /// The storage harness's stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        self.0.stamps_after(after)
+    }
+}
+
+impl Subsystem for Ticking {
+    const NAME: &'static str = "test/recovery-ticking";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = StorageScenario;
+    type Prepared = Ports;
+
+    /// [`Storage`]'s.
+    fn config(scenario: &StorageScenario) -> RunConfig {
+        Storage::config(scenario)
+    }
+
+    /// [`Storage`]'s.
+    fn prepare(scenario: &StorageScenario) -> Ports {
+        Storage::prepare(scenario)
+    }
+
+    /// The storage harness, then the ticking task.
+    fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
+        let recovery: RecoveryEvidence = ports.recovery.clone();
+        let storage = Storage::build(sim, scenario, ports);
+        sim.scheduler().spawn_root("tick", async move {
+            while recovery.record().is_none() {
+                zakura_rt::time::sleep(Duration::from_millis(1)).await;
+            }
+            loop {
+                zakura_rt::time::sleep(Duration::from_micros(10)).await;
+            }
+        });
+        Ticking(storage)
+    }
+
+    /// [`Storage`]'s.
+    fn properties() -> Vec<Property<Self>> {
+        let mut properties = storage_properties();
+        properties.push(zakura_sim::domain::header_sync_progress::bounded_adversary_progress());
+        properties
+    }
+
+    /// [`Storage`]'s.
+    fn sources() -> Sources {
+        storage_sources()
+    }
+
+    /// [`Storage`]'s.
+    fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
+        recovering_assumptions(scenario)
+    }
+
+    /// Never drawn: ticking runs are typed.
+    fn draw(_: &[u8]) -> StorageScenario {
+        unreachable!("ticking runs are typed")
+    }
+}
+
+/// The owed reply-hold witness again, with a task that wakes every 10 µs
+/// after the `recovered` pick. The clock keeps moving, so the livelock
+/// limit never applies, and the run reaches its step budget well before
+/// the 30-second deadline, with the successor still owed. Under 8 plans
+/// the run then ends as a harness failure naming the property, not as a
+/// violation, since a budget end proves no missed deadline, and not as a
+/// clean run either.
+#[test]
+fn a_budget_end_with_the_successor_owed_is_a_harness_failure() {
+    let (_, scenario) = storage_witnesses::owed_recovery_witnesses()
+        .into_iter()
+        .find(|(class, _)| *class == "reply holds")
+        .expect("hdr-13 has an owed reply-hold witness");
+    for input in inputs(8, 256) {
+        let error = run_prepared::<Ticking>(
+            &scenario,
+            Ticking::prepare(&scenario),
+            input,
+            &mut MemorySink::default(),
+            None,
+        )
+        .expect_err("the budget end with the successor owed fails the run");
+        let HarnessError::Run { failure, report } = error else {
+            panic!("the run itself fails: {error}");
+        };
+        assert!(
+            matches!(
+                &failure,
+                HarnessFailure::MissingEvidence { property, .. }
+                    if property == BOUNDED_ADVERSARY_PROGRESS
+            ),
+            "{failure}"
+        );
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            report.end.steps >= Ticking::config(&scenario).budget,
+            "it ran out its budget: {:?}",
+            report.end
+        );
     }
 }
 

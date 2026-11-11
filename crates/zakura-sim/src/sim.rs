@@ -571,6 +571,7 @@ impl Sim {
                 pick: &chosen.identity,
                 enabled: &enabled,
                 phase,
+                budget: self.config.budget,
                 now: self.sched().now(),
                 status: self.sched().status(),
                 log: &st.log,

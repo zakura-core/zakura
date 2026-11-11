@@ -1001,7 +1001,7 @@ pub(super) fn cooldown_end(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use zakura_chain::block;
     use zakura_network::zakura::{observe::ReactorEvent, ServicePeerDirection, SessionOrigin};
 
@@ -1518,6 +1518,15 @@ mod tests {
         recovery
     }
 
+    /// [`owing`]'s recovery with the node adopted at its baseline, so it
+    /// owes its successor, and the adoption and end evidence it reads.
+    pub(crate) fn owed() -> (RecoveryEvidence, AdoptionEvidence, EndEvidence) {
+        let ends = EndEvidence::default();
+        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        adopt(&adoption, 3);
+        (owing(&ends), adoption, ends)
+    }
+
     /// Progress is pending until the record, owed from the pick until the
     /// node adopts a header that meets the objective, either before the
     /// pick or after it, and concluded once the environment breaks an
@@ -1660,6 +1669,7 @@ mod tests {
             pick: &pick,
             enabled: &[],
             phase: Phase::Live,
+            budget: u64::MAX,
             now: at(2_000),
             status: zakura_scheduler::Status::Quiescent,
             log: &log,

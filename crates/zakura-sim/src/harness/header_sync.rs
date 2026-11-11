@@ -2846,6 +2846,81 @@ mod tests {
         );
     }
 
+    /// A harness whose view holds only a recovery and the adoption and end
+    /// evidence its progress reads, for driving
+    /// `bounded-adversary-progress`'s check directly.
+    struct RecoveryOnly {
+        recovery: RecoveryEvidence,
+        adoption: AdoptionEvidence,
+        ends: EndEvidence,
+    }
+
+    impl HasView for RecoveryOnly {
+        type View = StorageView;
+
+        /// [`FaultsOnly`]'s empty view, with the harness's recovery,
+        /// adoption and ends.
+        fn view(&self) -> StorageView {
+            StorageView {
+                recovery: self.recovery.clone(),
+                adoption: self.adoption.clone(),
+                ends: self.ends.clone(),
+                ..FaultsOnly(FaultEvidence::default()).view()
+            }
+        }
+    }
+
+    /// With the successor owed, a step at the run's budget fails the run as
+    /// missing evidence while the clock is at or before the deadline, and
+    /// not once it's past it, where the registry's expiry judges the
+    /// obligation. A step before the budget fails nothing.
+    #[test]
+    fn a_budget_end_is_missing_evidence_only_before_the_deadline() {
+        use crate::{
+            check::{Phase, StepCtx},
+            domain::header_sync_progress::{bounded_adversary_progress, recovery_deadline},
+            harness::header_node::recovery::{tests::owed, RecoveryProgress},
+        };
+        use std::time::Duration;
+        use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
+
+        let (recovery, adoption, ends) = owed();
+        let harness = RecoveryOnly {
+            recovery,
+            adoption,
+            ends,
+        };
+        let RecoveryProgress::Owed { since } =
+            harness.recovery.progress(&harness.adoption, &harness.ends)
+        else {
+            panic!("the recovery owes its successor");
+        };
+        let deadline = recovery_deadline(since);
+        let registered = [bounded_adversary_progress::<RecoveryOnly>()];
+        let log = ObservationLog::default();
+        let pick = crate::Identity::advance_time(SimInstant::ZERO);
+        let missing = |step: u64, now: SimInstant| {
+            let step = StepCtx {
+                step,
+                pick: &pick,
+                enabled: &[],
+                phase: Phase::Live,
+                budget: 10,
+                now,
+                status: SchedulerStatus::Quiescent,
+                log: &log,
+            };
+            let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
+            (registered[0].check)(&mut cx);
+            cx.into_parts().missing
+        };
+        let past = crate::harness::policy::after(deadline, Duration::from_millis(1));
+        assert!(missing(10, deadline).is_some());
+        assert!(missing(11, since).is_some());
+        assert_eq!(missing(10, past), None);
+        assert_eq!(missing(9, since), None);
+    }
+
     /// A harness whose view holds only its fault evidence, for driving
     /// [`HEADER_FAULT_PENALIZED`]'s check directly.
     struct FaultsOnly(FaultEvidence);
@@ -2908,6 +2983,7 @@ mod tests {
                 pick: &pick,
                 enabled: &[],
                 phase: Phase::Live,
+                budget: u64::MAX,
                 now: SimInstant::ZERO,
                 status: SchedulerStatus::Quiescent,
                 log: &log,

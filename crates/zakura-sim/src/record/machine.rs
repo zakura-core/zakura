@@ -1038,6 +1038,10 @@ pub struct CountsStep {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CountsView {
+    /// All connection owners charged to handler admission.
+    pub connections: usize,
+    /// Inbound connection owners charged to handler admission.
+    pub inbound_connections: usize,
     /// Registered owners per address group.
     pub registered: [usize; 8],
     /// Inbound control owners per address group.

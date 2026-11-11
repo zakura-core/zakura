@@ -114,7 +114,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         ),
         (
             "handshake/counts-match-permits",
-            "Admission machine charges equal the live pending semaphore permits.",
+            "Admission machine charges equal the live handshake and connection semaphore permits.",
         ),
     ] {
         properties.push(Property {
@@ -279,6 +279,10 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         let Observation::Transport {
             event:
                 TransportFact::HandshakeCounts {
+                    connections,
+                    inbound_connections,
+                    connection_permits,
+                    inbound_connection_permits,
                     pending,
                     inbound,
                     pending_permits,
@@ -299,12 +303,15 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         applies = true;
         match cx.id().as_str() {
             "handshake/counts-match-permits"
-                if pending != pending_permits || inbound != inbound_permits =>
+                if pending != pending_permits
+                    || inbound != inbound_permits
+                    || connections != connection_permits
+                    || inbound_connections != inbound_connection_permits =>
             {
                 return cx.violated(
-                    "machine charges equal pending permits",
+                    "machine charges equal handshake and connection permits",
                     format!(
-                        "machine {pending}/{inbound}; permits {pending_permits}/{inbound_permits}"
+                        "pending {pending}/{inbound}, permits {pending_permits}/{inbound_permits}; connections {connections}/{inbound_connections}, permits {connection_permits}/{inbound_connection_permits}"
                     ),
                 );
             }

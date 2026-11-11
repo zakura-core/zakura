@@ -24,6 +24,8 @@ pub struct HandshakeCounts {
     handshaking: HashMap<IpAddr, usize>,
     pending: usize,
     inbound_pending: usize,
+    connections: usize,
+    inbound_connections: usize,
 }
 
 impl HandshakeCounts {
@@ -43,6 +45,47 @@ impl HandshakeCounts {
             .map(|ip| (ip, self.registered(ip), self.handshaking(ip)))
             .collect()
     }
+    /// Counts connection slots from admission until the serving task exits.
+    pub fn connections(&self) -> usize {
+        self.connections
+    }
+
+    /// Counts the inbound share of connection slots.
+    pub fn inbound_connections(&self) -> usize {
+        self.inbound_connections
+    }
+
+    /// Checks whether the connection budget can admit this direction.
+    pub fn connections_full(&self, inbound: bool, cap: usize) -> bool {
+        self.connections >= cap || (inbound && self.inbound_connections >= inbound_share(cap))
+    }
+
+    /// Charges a connection slot while preserving the dial reserve.
+    pub fn claim_connection(&mut self, inbound: bool, cap: usize) -> bool {
+        if self.connections_full(inbound, cap) {
+            return false;
+        }
+        self.connections += 1;
+        if inbound {
+            self.inbound_connections += 1;
+        }
+        true
+    }
+
+    /// Releases the slot that `claim_connection` charged.
+    pub fn release_connection(&mut self, inbound: bool) {
+        self.connections = self
+            .connections
+            .checked_sub(1)
+            .expect("a live connection owns its charge");
+        if inbound {
+            self.inbound_connections = self
+                .inbound_connections
+                .checked_sub(1)
+                .expect("an inbound connection owns its inbound charge");
+        }
+    }
+
     /// Counts control-handshake permits, including this node's dials.
     pub fn pending(&self) -> usize {
         self.pending

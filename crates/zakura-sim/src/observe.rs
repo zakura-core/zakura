@@ -1985,6 +1985,16 @@ pub enum TransportFact {
     },
     /// Admission machine charges and independently read semaphore usage.
     HandshakeCounts {
+        /// Connection slots charged by the machine.
+        connections: usize,
+        /// Inbound connection slots charged by the machine.
+        inbound_connections: usize,
+        /// Live total connection permits.
+        connection_permits: usize,
+        /// Live inbound connection permits.
+        inbound_connection_permits: usize,
+        /// Total connection capacity.
+        connection_cap: usize,
         /// The configured registered-connection limit per address.
         address_cap: usize,
         /// Transfers during which QUIC and the handler may both charge one address.

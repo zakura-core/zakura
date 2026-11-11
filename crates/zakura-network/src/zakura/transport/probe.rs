@@ -21,11 +21,24 @@ pub struct HandshakeProbe {
     inbound: Weak<Semaphore>,
     cap: usize,
     address_cap: usize,
+    connections: Weak<Semaphore>,
+    inbound_connections: Weak<Semaphore>,
+    connection_cap: usize,
 }
 
 /// Admission charges and permits sampled at one scheduler boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandshakeSample {
+    /// Connection slots charged by the machine.
+    pub connections: usize,
+    /// Inbound connection slots charged by the machine.
+    pub inbound_connections: usize,
+    /// Live total connection permits.
+    pub connection_permits: usize,
+    /// Live inbound connection permits.
+    pub inbound_connection_permits: usize,
+    /// Total connection capacity.
+    pub connection_cap: usize,
     /// The configured registered-connection limit per address.
     pub address_cap: usize,
     /// The machine's total pending charge.
@@ -49,6 +62,8 @@ impl HandshakeProbe {
         inbound: &Arc<Semaphore>,
         cap: usize,
         address_cap: usize,
+        connections: (&Arc<Semaphore>, &Arc<Semaphore>),
+        connection_cap: usize,
     ) -> Self {
         Self {
             counts: Arc::downgrade(counts),
@@ -56,6 +71,9 @@ impl HandshakeProbe {
             inbound: Arc::downgrade(inbound),
             cap,
             address_cap,
+            connections: Arc::downgrade(connections.0),
+            inbound_connections: Arc::downgrade(connections.1),
+            connection_cap,
         }
     }
 
@@ -68,7 +86,15 @@ impl HandshakeProbe {
         let counts = self.counts.upgrade()?;
         let pending = self.pending.upgrade()?;
         let inbound = self.inbound.upgrade()?;
+        let connections = self.connections.upgrade()?;
+        let inbound_connections = self.inbound_connections.upgrade()?;
         match counts.peek(|counts| HandshakeSample {
+            connections: counts.connections(),
+            inbound_connections: counts.inbound_connections(),
+            connection_permits: self.connection_cap - connections.peek_available(),
+            inbound_connection_permits: super::inbound_share(self.connection_cap)
+                - inbound_connections.peek_available(),
+            connection_cap: self.connection_cap,
             address_cap: self.address_cap,
             pending: counts.pending(),
             inbound: counts.inbound_pending(),

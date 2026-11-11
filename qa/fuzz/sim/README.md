@@ -37,7 +37,8 @@ whose target has no harness or no campaign.
   bytes choose the schedule.
 - `handshake_counts` runs `handshake/counts` against production admission
   decisions. Its three-byte operations choose an action, owner slot, and
-  address. The harness checks charges against independent live owners.
+  address. Decoder v2 reads up to 1,536 bytes and tracks 128 owner slots.
+  The harness checks charges against independent live owners.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of

@@ -17,7 +17,9 @@ pub const RESERVE: &str = "handshake/dial-reserve-kept";
 pub const COUNTS: &str = "handshake/counts-match-permits";
 
 const HOSTS: usize = 8;
-const SLOTS: usize = 64;
+const SLOTS: usize = 128;
+const CONNECTION_CAP: usize = 92;
+const INBOUND_CONNECTION_CAP: usize = 69;
 const PENDING_CAP: usize = 32;
 const INBOUND_CAP: usize = 24;
 const ADDRESS_CAP: usize = 16;
@@ -36,14 +38,17 @@ const MACHINE: Machine = Machine {
             ADDRESS,
             "Registered connections stay within the per-address cap.",
         ),
-        (RESERVE, "Inbound handshakes preserve the dial reserve."),
+        (
+            RESERVE,
+            "Inbound connections and handshakes preserve the dial reserve.",
+        ),
         (
             COUNTS,
-            "Machine charges equal the live handshake and registration owners.",
+            "Machine charges equal the live connection, handshake, and registration owners.",
         ),
     ],
-    generator: 1,
-    budget: 172,
+    generator: 2,
+    budget: 513,
     history,
     reached: |steps, _| {
         steps
@@ -114,6 +119,12 @@ fn canonical_address(host: usize) -> IpAddr {
 fn expected(owners: &[Option<Owner>; SLOTS]) -> CountsView {
     let mut view = CountsView::default();
     for owner in owners.iter().flatten() {
+        if !owner.inbound || owner.phase != Phase::Quic {
+            view.connections += 1;
+            if owner.inbound {
+                view.inbound_connections += 1;
+            }
+        }
         match owner.phase {
             Phase::Quic => {}
             Phase::Control => {
@@ -131,6 +142,8 @@ fn expected(owners: &[Option<Owner>; SLOTS]) -> CountsView {
 
 fn actual(counts: &HandshakeCounts) -> CountsView {
     CountsView {
+        connections: counts.connections(),
+        inbound_connections: counts.inbound_connections(),
         registered: std::array::from_fn(|host| counts.registered(canonical_address(host))),
         handshaking: std::array::from_fn(|host| counts.handshaking(canonical_address(host))),
         pending: counts.pending(),
@@ -139,6 +152,13 @@ fn actual(counts: &HandshakeCounts) -> CountsView {
 }
 
 fn release(counts: &mut HandshakeCounts, owner: Owner) {
+    release_handshake(counts, owner);
+    if !owner.inbound || owner.phase != Phase::Quic {
+        counts.release_connection(owner.inbound);
+    }
+}
+
+fn release_handshake(counts: &mut HandshakeCounts, owner: Owner) {
     match owner.phase {
         Phase::Quic => {}
         Phase::Control => {
@@ -169,7 +189,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut active = false;
     for (index, bytes) in input
         .iter()
-        .take(512)
+        .take(1536)
         .copied()
         .collect::<Vec<_>>()
         .chunks(3)
@@ -197,15 +217,19 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     .flatten()
                     .filter(|owner| owner.inbound && owner.phase == Phase::Quic)
                     .count();
-                let admitted = !inbound
-                    || (counts.ip_admission(
-                        ip,
-                        quic_host,
-                        HOST_PENDING_CAP,
-                        ADDRESS_CAP,
-                        validated,
-                    ) == IpAdmission::Open
-                        && !counts.pending_full(quic_total, PENDING_CAP));
+                let admitted = if inbound {
+                    !counts.connections_full(true, CONNECTION_CAP)
+                        && (counts.ip_admission(
+                            ip,
+                            quic_host,
+                            HOST_PENDING_CAP,
+                            ADDRESS_CAP,
+                            validated,
+                        ) == IpAdmission::Open
+                            && !counts.pending_full(quic_total, PENDING_CAP))
+                } else {
+                    counts.claim_connection(false, CONNECTION_CAP)
+                };
                 // Count actual admitted owners. Bounds below judge the admission decision.
                 if admitted {
                     owners[slot] = Some(Owner {
@@ -218,7 +242,8 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 }
                 if !inbound
                     && !admitted
-                    && view.pending - view.inbound_pending < PENDING_CAP - INBOUND_CAP
+                    && view.connections - view.inbound_connections
+                        < CONNECTION_CAP - INBOUND_CONNECTION_CAP
                 {
                     failure(
                         &mut failures,
@@ -229,7 +254,10 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             }
             (2, Some(mut owner)) if owner.phase == Phase::Quic => {
                 let view = expected(&owners);
-                let claimed = counts.claim_pending(owner.inbound, PENDING_CAP);
+                let connection_claimed =
+                    !owner.inbound || counts.claim_connection(true, CONNECTION_CAP);
+                let claimed =
+                    connection_claimed && counts.claim_pending(owner.inbound, PENDING_CAP);
                 if !owner.inbound
                     && view.pending - view.inbound_pending < PENDING_CAP - INBOUND_CAP
                     && !claimed
@@ -247,17 +275,21 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     owner.phase = Phase::Control;
                     owners[slot] = Some(owner);
                 } else {
+                    if connection_claimed {
+                        counts.release_connection(owner.inbound);
+                    }
                     owners[slot] = None;
                 }
             }
             (3, Some(mut owner)) if owner.phase == Phase::Control => {
                 let registered = counts.can_register(owner.ip, ADDRESS_CAP, false);
-                release(&mut counts, owner);
+                release_handshake(&mut counts, owner);
                 if registered {
                     counts.add_registered(owner.ip);
                     owner.phase = Phase::Registered;
                     owners[slot] = Some(owner);
                 } else {
+                    counts.release_connection(owner.inbound);
                     owners[slot] = None;
                 }
             }
@@ -310,6 +342,15 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 &mut failures,
                 PENDING,
                 "live handshake owners exceed a pending bound",
+            );
+        }
+        if actual.connections > CONNECTION_CAP
+            || actual.inbound_connections > INBOUND_CONNECTION_CAP
+        {
+            failure(
+                &mut failures,
+                RESERVE,
+                "connection owners exceed the total or inbound share",
             );
         }
         if actual.registered.iter().any(|&count| count > ADDRESS_CAP) {
@@ -386,6 +427,23 @@ mod tests {
             input.extend([1, slot, 0, 2, slot, 0]);
         }
         holds(&input);
+    }
+
+    #[test]
+    fn registered_inbound_load_preserves_connection_reserve() {
+        let mut input = Vec::new();
+        for slot in 0..70u8 {
+            let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+            input.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
+        }
+        for slot in 70..94u8 {
+            input.extend([1, slot, 0]);
+        }
+        let steps = history(&input);
+        holds(&input);
+        assert!(steps.iter().any(|(_, step)| matches!(step,
+            MachineStep::Handshake(step) if step.actual.connections == CONNECTION_CAP
+                && step.actual.inbound_connections == INBOUND_CONNECTION_CAP)));
     }
 
     #[test]

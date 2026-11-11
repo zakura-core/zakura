@@ -1562,6 +1562,23 @@ impl Drop for PendingHandshakeGuard {
     }
 }
 
+/// Releases connection permits and their machine charge under the same lock.
+struct ConnectionAdmissionGuard {
+    slots: IpSlots,
+    shared: Option<OwnedSemaphorePermit>,
+    inbound: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ConnectionAdmissionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.slots.counts();
+        let inbound = self.inbound.is_some();
+        drop(self.shared.take());
+        drop(self.inbound.take());
+        counts.release_connection(inbound);
+    }
+}
+
 /// One exact authenticated connection generation published by the supervisor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ZakuraConnectionRegistration {
@@ -3023,6 +3040,8 @@ impl ZakuraProtocolHandler {
             &self.inbound_handshakes,
             self.limits.max_pending_handshakes,
             self.supervisor.max_connections_per_ip,
+            (&self.admission, &self.inbound_admission),
+            self.limits.max_connections,
         ));
         self.transport_observer = Some(observer);
         self
@@ -3195,8 +3214,7 @@ impl ZakuraProtocolHandler {
                 elapsed: None,
             }
         );
-        let inbound = self.inbound_admission.clone().try_acquire_owned().ok()?;
-        let admission = self.admission.clone().try_acquire_owned().ok()?;
+        let admission = self.claim_connection(true)?;
         let control_handshake = self
             .supervisor
             .enter_control_handshake(connection.admitted_ip());
@@ -3215,7 +3233,6 @@ impl ZakuraProtocolHandler {
             guard
         };
         Some(InboundClaim {
-            _inbound: inbound,
             _admission: admission,
             control_handshake,
         })
@@ -3224,7 +3241,6 @@ impl ZakuraProtocolHandler {
     async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
         let conn_id = trace_conn_id(&connection);
         let Some(InboundClaim {
-            _inbound,
             _admission,
             control_handshake,
         }) = claim
@@ -3330,6 +3346,25 @@ impl ZakuraProtocolHandler {
         if let Err(error) = result {
             debug!(?error, "inbound Zakura connection ended with an error");
         }
+    }
+
+    /// Claims connection permits and their machine charge as one transition.
+    fn claim_connection(&self, inbound: bool) -> Option<ConnectionAdmissionGuard> {
+        let mut counts = self.supervisor.ip_slots.counts();
+        let inbound_permit = if inbound {
+            Some(self.inbound_admission.clone().try_acquire_owned().ok()?)
+        } else {
+            None
+        };
+        let shared = self.admission.clone().try_acquire_owned().ok()?;
+        if !counts.claim_connection(inbound, self.limits.max_connections) {
+            return None;
+        }
+        Some(ConnectionAdmissionGuard {
+            slots: self.supervisor.ip_slots.clone(),
+            shared: Some(shared),
+            inbound: inbound_permit,
+        })
     }
 
     /// Charges the machine and semaphore together without an await.
@@ -4752,7 +4787,12 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
-        if self.admission.available_permits() == 0
+        if self
+            .supervisor
+            .ip_slots
+            .counts()
+            .connections_full(true, self.limits.max_connections)
+            || self.admission.available_permits() == 0
             || self.inbound_admission.available_permits() == 0
         {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
@@ -4781,10 +4821,7 @@ impl Acceptor for ZakuraProtocolHandler {
 /// An inbound connection's share of the connection cap and its per-IP control
 /// handshake slot, held from `Acceptor::handle` on.
 struct InboundClaim {
-    /// A slot within the inbound share (see
-    /// [`ZakuraLocalLimits::max_inbound_connections`]).
-    _inbound: OwnedSemaphorePermit,
-    _admission: OwnedSemaphorePermit,
+    _admission: ConnectionAdmissionGuard,
     control_handshake: ControlHandshakeGuard,
 }
 
@@ -5563,10 +5600,8 @@ pub(crate) async fn serve_reported_native_dial_connection(
 ) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
         .handler
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
+        .claim_connection(false)
+        .ok_or(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -14268,12 +14303,6 @@ mod tests {
             pending_total,
             pending_from_ip: 0,
         };
-        let take = |semaphore: &Arc<Semaphore>, count: usize| {
-            semaphore
-                .clone()
-                .try_acquire_many_owned(u32::try_from(count).expect("test counts are small"))
-                .expect("the test holds free permits")
-        };
 
         // Pending transport handshakes count against the inbound share, which
         // fills before the whole budget does.
@@ -14294,14 +14323,35 @@ mod tests {
         drop(inbound_handshakes);
 
         // Inbound connections stop at their share, and dials keep the rest.
-        let inbound = (
-            take(&handler.inbound_admission, 69),
-            take(&handler.admission, 69),
+        let inbound: Vec<_> = (0..69)
+            .map(|_| {
+                handler
+                    .claim_connection(true)
+                    .expect("inbound share has room")
+            })
+            .collect();
+        assert!(handler.claim_connection(true).is_none());
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().inbound_connections(),
+            69
         );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
-        let dials = take(&handler.admission, 23);
+        let dials: Vec<_> = (0..23)
+            .map(|_| {
+                handler
+                    .claim_connection(false)
+                    .expect("dial reserve has room")
+            })
+            .collect();
+        assert!(handler.claim_connection(false).is_none());
+        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 92);
         assert_eq!(handler.admission.available_permits(), 0);
         drop((inbound, dials));
+        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 0);
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().inbound_connections(),
+            0
+        );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
     }
 
@@ -14316,11 +14366,17 @@ mod tests {
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
         );
-        let _dials = handler
-            .admission
-            .clone()
-            .try_acquire_many_owned(u32::try_from(limits.max_connections).expect("92 fits"))
-            .expect("dials may take every slot");
+        let _dials: Vec<_> = (0..limits.max_connections)
+            .map(|_| {
+                handler
+                    .claim_connection(false)
+                    .expect("dials may take every slot")
+            })
+            .collect();
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().connections(),
+            limits.max_connections
+        );
         assert_eq!(
             handler.admit(&IncomingInfo {
                 remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),

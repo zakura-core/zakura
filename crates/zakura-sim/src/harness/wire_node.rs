@@ -698,6 +698,11 @@ impl TransportTap {
         if let Some(sample) = probe.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
         {
             let load = TransportFact::HandshakeCounts {
+                connections: sample.connections,
+                inbound_connections: sample.inbound_connections,
+                connection_permits: sample.connection_permits,
+                inbound_connection_permits: sample.inbound_connection_permits,
+                connection_cap: sample.connection_cap,
                 address_cap: sample.address_cap,
                 quic_handoffs: quic.handoffs,
                 quic_pending: quic.pending,

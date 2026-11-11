@@ -231,7 +231,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           # PR debug builds restore the cache populated by the main-branch
@@ -240,7 +240,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -292,12 +292,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -335,12 +335,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -366,7 +366,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
@@ -395,7 +395,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
@@ -418,13 +418,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -444,7 +444,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
@@ -453,7 +453,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -473,12 +473,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -506,7 +506,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           components: clippy
@@ -563,7 +563,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache-shared-key: zakura-sim-planted
@@ -642,7 +642,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: ${{ matrix.toolchain }}
           cache-shared-key: zakura-sim-${{ matrix.mode }}
@@ -690,7 +690,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           # The nightly `header-fuzz.yml` and `cargo xtask sim-feedback` pin.
           toolchain: nightly-2026-07-15
@@ -726,7 +726,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           # The nightly `header-fuzz.yml` and the simulator fuzz package pin.
           toolchain: nightly-2026-07-15
@@ -771,7 +771,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           # Packages crates with --no-verify; does not compile them.
@@ -811,11 +811,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-nextest
       - name: Run normal workspace unit tests

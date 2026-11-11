@@ -171,7 +171,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         id: toolchain
         with:
           toolchain: stable
@@ -197,7 +197,7 @@ jobs:
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-semver-checks
 
@@ -258,12 +258,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache: false
 
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-public-api
 
@@ -302,7 +302,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         id: toolchain
         with:
           toolchain: stable
@@ -318,7 +318,7 @@ jobs:
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 #v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b #v2.90.1
         with:
           tool: cargo-semver-checks
 

@@ -3,7 +3,7 @@
 //! Requests are parsed and responses are encoded exactly like `jsonrpsee` 0.26, which Zakura used
 //! before, so clients see the same bytes. `server/tests/wire.rs` checks this.
 
-use std::{borrow::Cow, fmt, io, marker::PhantomData};
+use std::{borrow::Cow, cell::Cell, fmt, io, marker::PhantomData};
 
 use serde::{
     de::{self, DeserializeOwned, Deserializer, Unexpected, Visitor},
@@ -14,6 +14,40 @@ use serde_json::value::RawValue;
 
 /// The result of an RPC method.
 pub type RpcResult<T> = Result<T, ErrorObject>;
+
+thread_local! {
+    /// Whether this thread is serializing a method's result into its response.
+    static IS_WRITING_RESULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the value being serialized on this thread is a method's result, going into its
+/// response.
+///
+/// Responses are written by `serde_json`'s own serializer, which copies a [`RawValue`] to the
+/// output as it is. Other serializers treat a `RawValue` as an ordinary struct, so a `Serialize`
+/// implementation can only hand over finished JSON while this returns true.
+pub(crate) fn is_writing_result() -> bool {
+    IS_WRITING_RESULT.get()
+}
+
+/// Marks this thread as serializing a method's result, until this guard is dropped.
+struct WritingResult {
+    was_writing_result: bool,
+}
+
+impl WritingResult {
+    fn start() -> Self {
+        Self {
+            was_writing_result: IS_WRITING_RESULT.replace(true),
+        }
+    }
+}
+
+impl Drop for WritingResult {
+    fn drop(&mut self) {
+        IS_WRITING_RESULT.set(self.was_writing_result);
+    }
+}
 
 /// A JSON-RPC 2.0 error object, serialized as `{"code": ..., "message": ...}`.
 ///
@@ -605,6 +639,7 @@ impl MethodResponse {
         // envelope and error handling in `encode_bounded`, which is compiled once.
         match result {
             Ok(result) => Self::encode_bounded(id, None, max_response_size, &mut |writer| {
+                let _writing_result = WritingResult::start();
                 serde_json::to_writer(writer, result)
             }),
             Err(error) => {

@@ -309,9 +309,20 @@ pub(super) fn convert_to_json_rpc_2(body: &[u8]) -> (JsonRpcVersion, Cow<'_, [u8
 /// Maps a JSON-RPC 2.0 response to the client's JSON-RPC `version`.
 pub(super) fn response_from_json_rpc_2(version: JsonRpcVersion, json: Box<RawValue>) -> String {
     let json = String::from(Box::<str>::from(json));
-    if version == JsonRpcVersion::TwoPointZero {
+    let jsonrpc_member = match version {
         // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
-        return json;
+        JsonRpcVersion::TwoPointZero => return json,
+        JsonRpcVersion::Bitcoind => Some(""),
+        JsonRpcVersion::Lightwalletd => Some(r#""jsonrpc":"1.0","#),
+        JsonRpcVersion::Unknown => None,
+    };
+
+    // A result can be megabytes long, such as a block template, so it is copied once here
+    // rather than parsed and written again.
+    if let Some(response) =
+        jsonrpc_member.and_then(|member| result_response_with_null_error(&json, member))
+    {
+        return response;
     }
 
     match serde_json::from_str::<'_, JsonRpcResponse>(&json) {
@@ -319,6 +330,54 @@ pub(super) fn response_from_json_rpc_2(version: JsonRpcVersion, json: Box<RawVal
             .expect("values parsed from JSON serialize back to JSON"),
         Err(_) => json,
     }
+}
+
+/// Returns the server's JSON-RPC 2.0 `response` to a successful call as older clients expect it:
+/// `jsonrpc_member` replaces its `"jsonrpc":"2.0",` member, and a null `error` follows its
+/// `result`. The ID and the result are copied as they are.
+///
+/// Returns `None` unless `response` starts the way [`MethodResponse`] writes a result:
+/// `{"jsonrpc":"2.0","id":`, the ID, then `,"result":`. Such a response ends with the result and
+/// the closing brace. Errors and batches are not written that way.
+///
+/// [`MethodResponse`]: super::jsonrpc::MethodResponse
+fn result_response_with_null_error(response: &str, jsonrpc_member: &str) -> Option<String> {
+    const NULL_ERROR: &str = r#","error":null}"#;
+
+    let after_jsonrpc = response.strip_prefix(r#"{"jsonrpc":"2.0","#)?;
+    let id_and_result = after_jsonrpc.strip_prefix(r#""id":"#)?;
+    let (_id, after_id) = id_and_result.split_at_checked(json_scalar_len(id_and_result)?)?;
+    if !after_id.starts_with(r#","result":"#) {
+        return None;
+    }
+    let members = after_jsonrpc.strip_suffix('}')?;
+
+    let mut mapped =
+        String::with_capacity(1 + jsonrpc_member.len() + members.len() + NULL_ERROR.len());
+    mapped.push('{');
+    mapped.push_str(jsonrpc_member);
+    mapped.push_str(members);
+    mapped.push_str(NULL_ERROR);
+    Some(mapped)
+}
+
+/// Returns the length of the JSON string, number or `null` that `json` starts with, if another
+/// object member follows it.
+fn json_scalar_len(json: &str) -> Option<usize> {
+    if !json.starts_with('"') {
+        return json.find(',');
+    }
+
+    let mut is_escaped = false;
+    for (index, byte) in json.bytes().enumerate().skip(1) {
+        match byte {
+            _ if is_escaped => is_escaped = false,
+            b'\\' => is_escaped = true,
+            b'"' => return index.checked_add(1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parses `body` if [`convert_to_json_rpc_2`] would only re-encode it without changing what

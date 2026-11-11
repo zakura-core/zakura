@@ -13,7 +13,10 @@
 use std::fmt;
 
 use hex::FromHexError;
-use serde::{de, Deserializer, Serializer};
+use serde::{de, ser, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
+
+use crate::server::jsonrpc::is_writing_result;
 
 #[cfg(test)]
 mod tests;
@@ -50,12 +53,30 @@ pub(crate) fn decode(hex: &[u8]) -> Result<Vec<u8>, FromHexError> {
 }
 
 /// Serializes bytes as a hex string, like `hex::serialize`.
+///
+/// In a method's response, the string is written as finished JSON. Hex has no characters that
+/// JSON escapes, and looking for them one byte at a time took as long as the rest of a full block
+/// template's encoding.
 pub(crate) fn serialize<S, T>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
     T: AsRef<[u8]>,
 {
-    serializer.serialize_str(&encode(bytes))
+    if !is_writing_result() {
+        return serializer.serialize_str(&encode(bytes));
+    }
+
+    let bytes = bytes.as_ref();
+    let mut json = vec![b'"'; bytes.len() * 2 + 2];
+    let hex = json
+        .get_mut(1..=bytes.len() * 2)
+        .expect("the buffer holds the hex between two quotes");
+    const_hex::encode_to_slice(bytes, hex).map_err(ser::Error::custom)?;
+
+    let json = std::str::from_utf8(&json).map_err(ser::Error::custom)?;
+    serde_json::from_str::<&RawValue>(json)
+        .map_err(ser::Error::custom)?
+        .serialize(serializer)
 }
 
 /// Deserializes a hex string into bytes, like `hex::deserialize`.

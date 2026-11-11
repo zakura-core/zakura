@@ -2,6 +2,7 @@ use hex::FromHex;
 use proptest::prelude::*;
 
 use super::{decode, encode, HexData};
+use crate::server::jsonrpc::{Id, MethodResponse};
 
 /// The `hex` crate's result, which `decode` must match exactly.
 fn reference(input: &[u8]) -> Result<Vec<u8>, hex::FromHexError> {
@@ -50,7 +51,29 @@ fn hex_data_round_trips_through_json() {
     assert!(serde_json::from_str::<HexData>("12").is_err());
 }
 
+/// Hex written into a response as finished JSON still counts toward the response size limit.
+#[test]
+fn response_hex_counts_toward_the_response_size_limit() {
+    let data = HexData(vec![0xab; 100]);
+    assert!(!MethodResponse::response(Id::Number(1), &Ok(&data), 300).is_error());
+    assert!(MethodResponse::response(Id::Number(1), &Ok(&data), 200).is_error());
+}
+
 proptest! {
+    /// A method's response carries the same hex string that other serializers write.
+    #[test]
+    fn response_hex_matches_the_plain_string(bytes in prop::collection::vec(any::<u8>(), 0..300)) {
+        let data = HexData(bytes);
+        let response = MethodResponse::response(Id::Number(1), &Ok(&data), usize::MAX);
+        let plain = serde_json::to_string(&data).expect("hex data serializes");
+
+        prop_assert_eq!(&plain, &format!("\"{}\"", hex::encode(&data.0)));
+        prop_assert_eq!(
+            response.as_json().get(),
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{plain}}}"#)
+        );
+    }
+
     #[test]
     fn decode_matches_hex_crate(input in prop::collection::vec(
         prop::sample::select(b"0123456789abcdefABCDEFgG \xff".to_vec()),

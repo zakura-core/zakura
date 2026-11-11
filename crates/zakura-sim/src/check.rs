@@ -440,20 +440,18 @@ where
         violation
     }
 
-    /// Calls `end`. A `Violated` report that retains no violations takes the ones
-    /// `after` found for its property, as step findings, so a harness
-    /// failure keeps them ([`PropertyReport::after_harness_failure`]).
+    /// Calls `end`. Each report takes the violations `after` found for its
+    /// property, ahead of its own and unless it already holds them, as step
+    /// findings, whatever it says about the end, so a harness failure keeps
+    /// them ([`PropertyReport::after_harness_failure`]).
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         let mut reports = (self.end)(end, log);
-        let bare = |r: &&mut PropertyReport| {
-            r.violations.is_empty() && matches!(r.outcome, PropertyOutcome::Violated { .. })
-        };
-        for report in reports.iter_mut().filter(bare) {
-            report.violations = (self.found.iter())
-                .filter(|v| v.property == report.property)
+        for report in &mut reports {
+            let found: Vec<Violation> = (self.found.iter())
+                .filter(|v| v.property == report.property && !report.violations.contains(v))
                 .cloned()
                 .collect();
-            report.end_found = 0;
+            report.violations.splice(0..0, found);
         }
         reports
     }

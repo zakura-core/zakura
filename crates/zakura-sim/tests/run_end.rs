@@ -188,49 +188,73 @@ fn violation_stops_at_once() {
 
 /// A closure checker's step violation is a step finding, so a harness
 /// failure found after it, here a report naming a step past the run's end,
-/// keeps it `Violated`.
+/// keeps it `Violated`, whatever the end closure reports for the property:
+/// a bare `Violated`, one with an end finding of its own (Terra 5, round
+/// 2), or `HarnessFailed` itself.
 #[test]
 fn a_closure_step_violation_survives_a_late_harness_failure() {
-    let mut checker = FnChecker::new(
-        |cx: &check::StepCtx<'_>| {
-            (cx.step == 5).then(|| Violation {
-                property: "test/stop".into(),
-                step: cx.step,
+    let end_finding = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![5],
+            expected: "an end".into(),
+            actual: "the end".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![5] })
+    };
+    for stop in [
+        PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::Violated {
                 witness: vec![2, 5],
-                expected: "fewer steps".into(),
-                actual: "step 5".into(),
-            })
-        },
-        |_: &RunEnd, _: &ObservationLog| {
-            let stop = PropertyOutcome::Violated {
-                witness: vec![2, 5],
-            };
-            let late = PropertyReport {
-                holds_since: Some(1_000),
-                ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
-            };
-            vec![PropertyReport::new("test/stop", stop), late]
-        },
-    );
-    let report = run(
-        config(2, 1_000),
-        Plan::from_fuzz(&[]),
-        |sim| {
-            sim.scheduler().spawn_root("a", yields(100));
-        },
-        &mut checker,
-    );
-    assert_eq!(report.end.outcome, Outcome::Harness);
-    assert!(matches!(
-        report.end.harness,
-        Some(HarnessFailure::HoldsSinceOutsideRun { .. })
-    ));
-    assert_eq!(
-        report.properties[0].outcome,
-        PropertyOutcome::Violated {
-            witness: vec![2, 5]
-        }
-    );
+            },
+        ),
+        end_finding,
+        PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::not_applicable(zakura_sim::NaReason::HarnessFailed),
+        ),
+    ] {
+        let mut checker = FnChecker::new(
+            |cx: &check::StepCtx<'_>| {
+                (cx.step == 5).then(|| Violation {
+                    property: "test/stop".into(),
+                    step: cx.step,
+                    witness: vec![2, 5],
+                    expected: "fewer steps".into(),
+                    actual: "step 5".into(),
+                })
+            },
+            move |_: &RunEnd, _: &ObservationLog| {
+                let late = PropertyReport {
+                    holds_since: Some(1_000),
+                    ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
+                };
+                vec![stop.clone(), late]
+            },
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        assert!(matches!(
+            report.end.harness,
+            Some(HarnessFailure::HoldsSinceOutsideRun { .. })
+        ));
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated {
+                witness: vec![2, 5]
+            }
+        );
+    }
 }
 
 /// Sol 2, round 2: a report's end finding that names a step outside the

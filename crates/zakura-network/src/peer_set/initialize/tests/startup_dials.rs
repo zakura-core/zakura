@@ -10,11 +10,11 @@ use crate::{
     config::CacheDir,
     meta_addr::MetaAddrChange,
     peer::{ClientTestHarness, OutboundConnectorRequest},
-    peer_set::{ActiveConnectionCounter, ConnectionTracker},
+    peer_set::ConnectionTracker,
     BoxError, Config, PeerSocketAddr,
 };
 
-use super::super::{add_initial_peers, DiscoveredPeer};
+use super::super::{add_initial_peers, DiscoveredPeer, InitialPeerConnections};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -88,7 +88,7 @@ fn spawn_initial(
     config: Config,
     connector: TestConnector,
 ) -> (
-    JoinHandle<Result<ActiveConnectionCounter, BoxError>>,
+    JoinHandle<Result<InitialPeerConnections, BoxError>>,
     mpsc::Receiver<DiscoveredPeer>,
     tokio_mpsc::Receiver<MetaAddrChange>,
 ) {
@@ -149,7 +149,7 @@ async fn startup_window_refills_on_success_and_failure() {
         attempt.finish.send(false).unwrap();
     }
     assert_eq!(tail, expected[52..].iter().copied().collect());
-    let mut counter = timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
+    let mut counter = timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap().active_connections;
     assert_eq!(counter.update_count(), 1, "only the successful connection remains reserved");
     live.lock().unwrap().clear();
     assert_eq!(counter.update_count(), 0);

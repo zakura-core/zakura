@@ -439,11 +439,15 @@ where
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
-        let mut active_outbound_connections = initial_peers_join
+        let initial_connections = initial_peers_join
             .await
             .panic_if_task_has_panicked()
             .expect("initial peer task is not cancelled")
             .expect("unexpected error connecting to initial peers");
+        if let Some(seed_task) = initial_connections.seed_task {
+            task_handles.push(seed_task);
+        }
+        let mut active_outbound_connections = initial_connections.active_connections;
         let active_initial_peer_count = active_outbound_connections.update_count();
 
         // We need to await candidates.update() here,
@@ -572,6 +576,19 @@ where
     ))
 }
 
+/// Initial connections and the optional seed resolver that outlives cache startup.
+#[derive(Debug)]
+struct InitialPeerConnections {
+    active_connections: ActiveConnectionCounter,
+    seed_task: Option<AbortOnDropHandle<Result<(), BoxError>>>,
+}
+
+/// Selected startup candidates and an owned, cancellable seed discovery task.
+struct InitialPeers {
+    addresses: IndexSet<PeerSocketAddr>,
+    seed_task: Option<AbortOnDropHandle<Result<(), BoxError>>>,
+}
+
 /// Use the provided `outbound_connector` to connect to the configured DNS seeder and
 /// disk cache initial peers, then send the resulting peer connections over `peerset_tx`.
 ///
@@ -580,9 +597,9 @@ where
 async fn add_initial_peers<S>(
     config: Config,
     outbound_connector: S,
-    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> Result<ActiveConnectionCounter, BoxError>
+) -> Result<InitialPeerConnections, BoxError>
 where
     S: Service<
             OutboundConnectorRequest,
@@ -594,6 +611,30 @@ where
     S::Future: Send + 'static,
 {
     let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+    connect_initial_peers(config, initial_peers, outbound_connector, peerset_tx).await
+}
+
+/// Dial a bounded set of candidates while retaining any pending seed resolver.
+async fn connect_initial_peers<S>(
+    config: Config,
+    initial_peers: InitialPeers,
+    outbound_connector: S,
+    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+) -> Result<InitialPeerConnections, BoxError>
+where
+    S: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let InitialPeers {
+        addresses: initial_peers,
+        seed_task,
+    } = initial_peers;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -712,26 +753,84 @@ where
         "finished connecting to initial seed and disk cache peers"
     );
 
-    Ok(active_outbound_connections)
+    Ok(InitialPeerConnections {
+        active_connections: active_outbound_connections,
+        seed_task,
+    })
 }
 
-/// Limit the number of `initial_peers` addresses entries to the configured
-/// `peerset_initial_target_size`.
+/// Load the cache while resolving seeds, then limit startup dials per IP and overall.
 ///
-/// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
-/// do not consume a startup slot; later candidates can fill it.
-///
-/// Also sends every initial peer to the `address_book_updater`.
+/// Ready seeds retain the alternating selection policy. A usable cache does not
+/// wait for DNS: late seeds are added to discovery by a supervised task instead.
+/// In particular, with one startup slot a cached peer may take it before DNS is
+/// ready; seed discovery cannot displace that live connection.
 async fn limit_initial_peers(
     config: &Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> IndexSet<PeerSocketAddr> {
-    let all_peers = config.initial_peers().await;
+) -> InitialPeers {
+    let seed_config = config.clone();
+    initial_peers_with_seed_resolution(
+        config,
+        async move { seed_config.initial_seed_peers().await },
+        address_book_updater,
+    )
+    .await
+}
+
+/// Start from usable cached peers without waiting for a pending seed lookup.
+///
+/// The seed future performs validation and retains the existing DNS retry policy.
+/// Ownership of a pending resolver follows startup into the peer-set supervisor,
+/// so cancellation aborts it and resolver panics are not silently detached.
+async fn initial_peers_with_seed_resolution<F>(
+    config: &Config,
+    seed_peers: F,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+) -> InitialPeers
+where
+    F: Future<Output = Vec<PeerSocketAddr>> + Send + 'static,
+{
+    let mut seed_peers = Box::pin(seed_peers);
+    let cached_peers = config.initial_cached_peers();
+    tokio::pin!(cached_peers);
+
+    let (all_peers, seed_task) = tokio::select! {
+        // Prefer the existing alternating policy when both sources are ready.
+        biased;
+        seeds = &mut seed_peers => {
+            (config.interleave_initial_peers(cached_peers.await, seeds), None)
+        }
+        cached = &mut cached_peers => {
+            if cached.is_empty() {
+                // Missing, unreadable, invalid, and Regtest caches still use seeds.
+                (config.interleave_initial_peers(cached, seed_peers.await), None)
+            } else {
+                let known_cached = cached.clone();
+                let updater = address_book_updater.clone();
+                let seed_task = tokio::spawn(erased(
+                    async move {
+                        for peer in seed_peers.await {
+                            // The cache path already published these addresses.
+                            if !known_cached.contains(&peer) {
+                                updater.send(MetaAddr::new_initial_peer(peer)).await?;
+                            }
+                        }
+                        // PeerSet treats a completed background task as shutdown.
+                        // Remain supervised until it drops us, without retaining data.
+                        drop(updater);
+                        drop(known_cached);
+                        future::pending::<Result<(), BoxError>>().await
+                    }
+                    .in_current_span(),
+                ));
+                (cached, Some(AbortOnDropHandle::new(seed_task)))
+            }
+        }
+    };
+
     let mut initial_peers = IndexSet::new();
     let mut selected_per_ip = HashMap::new();
-
-    // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
     for peer in all_peers {
         let _ = address_book_updater
@@ -746,7 +845,10 @@ async fn limit_initial_peers(
         }
     }
 
-    initial_peers
+    InitialPeers {
+        addresses: initial_peers,
+        seed_task,
+    }
 }
 
 /// Open a peer connection listener on `config.listen_addr`,

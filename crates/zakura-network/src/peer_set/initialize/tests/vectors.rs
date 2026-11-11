@@ -131,7 +131,9 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     let config: Config = toml::from_str(&saved_config).unwrap();
 
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
-    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    let selected = super::super::limit_initial_peers(&config, book_tx)
+        .await
+        .addresses;
     let assert_alternating = |peers: &[PeerSocketAddr]| {
         assert_eq!(peers.len(), 4);
         assert_eq!(peers[0], cached[0]);
@@ -221,7 +223,8 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
         super::super::limit_initial_peers(&config, book_tx),
     )
     .await
-    .expect("startup peer selection finishes within the test deadline");
+    .expect("startup peer selection finishes within the test deadline")
+        .addresses;
     assert_eq!(selected, IndexSet::from([seed]));
     let mut discovered = IndexSet::new();
     while let Some(change) = book_rx.recv().await {
@@ -274,7 +277,8 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
             super::super::limit_initial_peers(&config, book_tx),
         )
         .await
-        .expect("startup peer selection finishes within the test deadline");
+        .expect("startup peer selection finishes within the test deadline")
+        .addresses;
         let expected = if max_connections_per_ip == 1 {
             IndexSet::from([cached[0], cached[3], cached[4]])
         } else {
@@ -291,6 +295,173 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
             "all candidates still reach discovery"
         );
     }
+}
+
+/// Pending (or repeatedly failing) DNS must not delay cached dials, even at target one.
+#[tokio::test]
+async fn cached_startup_dials_before_seed_resolution_and_keeps_late_seeds() {
+    let _init_guard = zakura_test::init();
+    for target in [1, 4] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: target,
+            max_connections_per_ip: 1,
+            ..test_defaults()
+        };
+        let cached: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let same_ip: PeerSocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let other: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let seed: PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+        // Exercise a legacy/unfiltered cache: invalid entries, duplicate sockets,
+        // and several ports on the same IP must not use extra startup slots.
+        let path = config
+            .cache_dir
+            .peer_cache_file_path(&config.network)
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            "not-an-address\n0.0.0.0:0\n127.0.0.1:8233\n127.0.0.1:8233\n127.0.0.1:9000\n127.0.0.2:8233",
+        )
+        .unwrap();
+        let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+        let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+        let initial = tokio::time::timeout(
+            PEER_CACHE_TEST_TIMEOUT,
+            super::super::initial_peers_with_seed_resolution(
+                &config,
+                async move { seed_rx.await.unwrap() },
+                book_tx,
+            ),
+        )
+        .await
+        .expect("cached candidates must not wait for DNS");
+        let expected = if target == 1 {
+            IndexSet::from([cached])
+        } else {
+            IndexSet::from([cached, other])
+        };
+        assert_eq!(initial.addresses, expected);
+        assert!(initial.seed_task.is_some());
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector = service_fn(move |request: OutboundConnectorRequest| {
+            attempt_tx.send(request.addr).unwrap();
+            async { Err::<DiscoveredPeer, BoxError>("cached peer unavailable".into()) }
+        });
+        let (peerset_tx, _peerset_rx) = mpsc::channel(10);
+        let connections = tokio::time::timeout(
+            PEER_CACHE_TEST_TIMEOUT,
+            super::super::connect_initial_peers(config, initial, connector, peerset_tx),
+        )
+        .await
+        .expect("cached dials must finish while DNS is still pending")
+        .unwrap();
+        let mut attempted = IndexSet::new();
+        while let Some(addr) = attempt_rx.recv().await {
+            attempted.insert(addr);
+        }
+        assert_eq!(attempted, expected);
+        let mut published = IndexSet::new();
+        for _ in 0..3 {
+            published.insert(book_rx.recv().await.unwrap().addr());
+        }
+        assert_eq!(published, IndexSet::from([cached, same_ip, other]));
+        seed_tx.send(vec![cached, seed]).unwrap();
+        let late_seed = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, book_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            late_seed.addr(),
+            seed,
+            "cache/seed overlap is not published twice"
+        );
+        assert!(book_rx.try_recv().is_err());
+        drop(connections);
+    }
+}
+
+/// Empty, unreadable, and invalid caches retain the seed startup fallback.
+#[tokio::test]
+async fn unusable_cache_waits_for_seeds_without_losing_candidates() {
+    let _init_guard = zakura_test::init();
+    for contents in [
+        None,
+        Some(""),
+        Some("invalid\n0.0.0.0:0"),
+        Some("unreadable"),
+    ] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: 1,
+            ..test_defaults()
+        };
+        if let Some(contents) = contents {
+            let path = config
+                .cache_dir
+                .peer_cache_file_path(&config.network)
+                .unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if contents == "unreadable" {
+                std::fs::create_dir(path).unwrap();
+            } else {
+                std::fs::write(path, contents).unwrap();
+            }
+        }
+        let seed: PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+        let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
+        let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+        let startup = super::super::initial_peers_with_seed_resolution(
+            &config,
+            async move { seed_rx.await.unwrap() },
+            book_tx,
+        );
+        tokio::pin!(startup);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut startup)
+            .await
+            .is_err());
+        seed_tx.send(vec![seed]).unwrap();
+        let initial = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, startup)
+            .await
+            .unwrap();
+        assert_eq!(initial.addresses, IndexSet::from([seed]));
+        assert!(initial.seed_task.is_none());
+        assert_eq!(book_rx.recv().await.unwrap().addr(), seed);
+        assert!(book_rx.recv().await.is_none());
+    }
+}
+
+/// Startup cancellation owns and cancels a pending DNS retry future.
+#[tokio::test]
+async fn cached_startup_cancels_pending_seed_resolution_on_drop() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..test_defaults()
+    };
+    config
+        .update_peer_cache(IndexSet::from(["127.0.0.1:8233".parse().unwrap()]))
+        .await
+        .unwrap();
+    let (mut seed_tx, seed_rx) = tokio::sync::oneshot::channel::<Vec<PeerSocketAddr>>();
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let initial = tokio::time::timeout(
+        PEER_CACHE_TEST_TIMEOUT,
+        super::super::initial_peers_with_seed_resolution(
+            &config,
+            async move { seed_rx.await.unwrap() },
+            book_tx,
+        ),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+    tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, seed_tx.closed())
+        .await
+        .expect("dropping startup cancels DNS resolution");
 }
 
 /// A crawler peer limit large enough to exercise multi-peer behavior without
@@ -3353,7 +3524,7 @@ async fn spawn_add_initial_peers<C>(
     peer_count: usize,
     outbound_connector: C,
 ) -> (
-    JoinHandle<Result<ActiveConnectionCounter, BoxError>>,
+    JoinHandle<Result<super::super::InitialPeerConnections, BoxError>>,
     mpsc::Receiver<DiscoveredPeer>,
     JoinHandle<Result<(), BoxError>>,
 )

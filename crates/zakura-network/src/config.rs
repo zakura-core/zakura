@@ -526,18 +526,47 @@ impl Config {
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> IndexSet<PeerSocketAddr> {
-        // TODO: do DNS and disk in parallel if startup speed becomes important
+        let (disk_peers, dns_peers) =
+            tokio::join!(self.initial_cached_peers(), self.initial_seed_peers());
+        self.interleave_initial_peers(disk_peers, dns_peers)
+    }
+
+    /// Load valid cached candidates in saved preference order, excluding Regtest.
+    pub(crate) async fn initial_cached_peers(&self) -> IndexSet<PeerSocketAddr> {
+        if self.network.is_regtest() {
+            return IndexSet::new();
+        }
+
+        // The cache is optional; load_peer_cache already logs disk errors.
+        let mut peers = self.load_peer_cache().await.unwrap_or_default();
+        peers.retain(|addr| {
+            match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
+                Ok(()) => true,
+                Err(error) => {
+                    info!(
+                        peer = %addr.addr_label(self.expose_peer_addresses),
+                        ?error,
+                        "invalid initial peer from disk cache",
+                    );
+                    false
+                }
+            }
+        });
+        peers
+    }
+
+    /// Resolve and validate configured seeds, shuffling their dial order.
+    pub(crate) async fn initial_seed_peers(&self) -> Vec<PeerSocketAddr> {
         let dns_peers = Config::resolve_peers(
             &self.initial_peer_hostnames().iter().cloned().collect(),
             self.expose_peer_addresses,
         )
         .await;
-
-        // Validate seeds before shuffling, without preferring any listening port.
-        let mut valid_seeds = Vec::new();
+        let mut peers = Vec::new();
         for addr in dns_peers {
             match address_is_valid_for_outbound_connections(addr, self.network.clone()) {
-                Ok(()) => valid_seeds.push(addr),
+                Ok(()) if !self.network.is_regtest() || addr.is_localhost() => peers.push(addr),
+                Ok(()) => {}
                 Err(error) => info!(
                     peer = %addr.addr_label(self.expose_peer_addresses),
                     ?error,
@@ -545,57 +574,39 @@ impl Config {
                 ),
             }
         }
-        let mut dns_peers = valid_seeds;
-        dns_peers.shuffle(&mut rand_10::rng());
+        peers.shuffle(&mut rand_10::rng());
+        peers
+    }
 
-        if self.network.is_regtest() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest.
-            dns_peers
-                .into_iter()
-                .filter(PeerSocketAddr::is_localhost)
-                .collect()
-        } else {
-            // Ignore disk errors because the cache is optional and the method already logs them.
-            let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
-            disk_peers.retain(|addr| {
-                match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        info!(
-                            peer = %addr.addr_label(self.expose_peer_addresses),
-                            ?error,
-                            "invalid initial peer from disk cache",
-                        );
-                        false
-                    }
-                }
-            });
-
-            // With one slot, seed membership must survive even if a seed is cached.
-            // Otherwise remove overlap so a duplicate cannot consume a seed turn.
-            if self.peerset_initial_target_size != 1 {
-                dns_peers.retain(|addr| !disk_peers.contains(addr));
-            }
-            let mut cached = disk_peers.into_iter();
-            let mut seeds = dns_peers.into_iter();
-            let mut initial_peers = IndexSet::new();
-            loop {
-                match (cached.next(), seeds.next()) {
-                    (None, None) => break,
-                    (cached, seed) => {
-                        // A cached peer must not permanently own the only outbound slot.
-                        if self.peerset_initial_target_size == 1 {
-                            initial_peers.extend(seed);
-                            initial_peers.extend(cached);
-                        } else {
-                            initial_peers.extend(cached);
-                            initial_peers.extend(seed);
-                        }
-                    }
-                }
-            }
-            initial_peers
+    /// Alternate available cache and seed candidates, preserving cache preference.
+    pub(crate) fn interleave_initial_peers(
+        &self,
+        disk_peers: IndexSet<PeerSocketAddr>,
+        mut dns_peers: Vec<PeerSocketAddr>,
+    ) -> IndexSet<PeerSocketAddr> {
+        // With one slot, seed membership must survive even if a seed is cached.
+        // Otherwise remove overlap so a duplicate cannot consume a seed turn.
+        if self.peerset_initial_target_size != 1 {
+            dns_peers.retain(|addr| !disk_peers.contains(addr));
         }
+        let mut cached = disk_peers.into_iter();
+        let mut seeds = dns_peers.into_iter();
+        let mut initial_peers = IndexSet::new();
+        loop {
+            match (cached.next(), seeds.next()) {
+                (None, None) => break,
+                (cached, seed) => {
+                    if self.peerset_initial_target_size == 1 {
+                        initial_peers.extend(seed);
+                        initial_peers.extend(cached);
+                    } else {
+                        initial_peers.extend(cached);
+                        initial_peers.extend(seed);
+                    }
+                }
+            }
+        }
+        initial_peers
     }
 
     /// Concurrently resolves `peers` into zero or more IP addresses, with a

@@ -298,3 +298,123 @@ fn stuffed_addresses<'a>(
         .skip(1)
         .filter_map(|output| output.address(network))
 }
+
+/// Times the contextual spend check of a block whose inputs all spend outputs created by
+/// earlier non-finalized blocks, the inputs that look up the chain's own indexes.
+///
+/// Builds a chain of `blocks` blocks with one transaction of `outputs_per_block` outputs
+/// each, then checks a block with `spends` one-input transactions spending outputs spread
+/// over the chain. Returns the median of `samples` checks.
+pub fn benchmark_transparent_spend_check(
+    template: Arc<Block>,
+    blocks: usize,
+    outputs_per_block: usize,
+    spends: usize,
+    samples: usize,
+) -> u128 {
+    use zakura_chain::transaction::LockTime;
+
+    let network = Network::Mainnet;
+    let mut template = Block::clone(&template);
+    template.transactions.truncate(1);
+    let template = Arc::new(template);
+    let first_height = template
+        .coinbase_height()
+        .expect("the template has a coinbase height");
+    let finalized =
+        crate::service::finalized_state::FinalizedState::new(&crate::Config::ephemeral(), &network)
+            .expect("an ephemeral database opens");
+
+    let transaction = |inputs, outputs| {
+        Arc::new(Transaction::V4 {
+            inputs,
+            outputs,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            joinsplit_data: None,
+            sapling_shielded_data: None,
+        })
+    };
+    let output = |block: usize, index: usize| {
+        let mut script = vec![0xa9, 0x14];
+        script.extend_from_slice(&u32::try_from(block).expect("fits").to_le_bytes());
+        script.extend_from_slice(&u64::try_from(index).expect("fits").to_le_bytes());
+        script.extend_from_slice(&[0; 8]);
+        script.push(0x87);
+        transparent::Output {
+            value: Amount::zero(),
+            lock_script: transparent::Script::new(&script),
+        }
+    };
+
+    let mut chain = Chain::new(
+        &network,
+        (first_height - 1).expect("the template is above genesis"),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::zero(),
+    );
+    let mut parent = template.clone();
+    let mut funding = Vec::with_capacity(blocks);
+    for index in 0..blocks {
+        let mut block = if index == 0 {
+            Block::clone(&parent)
+        } else {
+            Block::clone(&child_of(&parent))
+        };
+        block.transactions.truncate(1);
+        let funds = transaction(
+            Vec::new(),
+            (0..outputs_per_block).map(|i| output(index, i)).collect(),
+        );
+        funding.push(funds.hash());
+        block.transactions.push(funds);
+        let block = Arc::new(block);
+        chain = chain
+            .push(contextual(&network, block.clone()))
+            .expect("funding blocks are valid chain updates");
+        parent = block;
+    }
+
+    let mut candidate = Block::clone(&child_of(&parent));
+    candidate.transactions.truncate(1);
+    candidate.transactions.extend((0..spends).map(|spend| {
+        let outpoint = transparent::OutPoint {
+            hash: funding[spend % blocks],
+            index: u32::try_from(spend / blocks % outputs_per_block).expect("fits"),
+        };
+        transaction(
+            vec![transparent::Input::PrevOut {
+                outpoint,
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            Vec::new(),
+        )
+    }));
+    let candidate = SemanticallyVerifiedBlock::from(Arc::new(candidate));
+
+    let mut timings: Vec<u128> = (0..samples)
+        .map(|_| {
+            let start = Instant::now();
+            let spent = black_box(spend_check(&candidate, &chain, &finalized.db));
+            let nanos = start.elapsed().as_nanos();
+            assert_eq!(spent.len(), spends, "every spend resolves in the chain");
+            nanos
+        })
+        .collect();
+    timings.sort_unstable();
+    timings[timings.len() / 2]
+}
+
+fn spend_check(
+    block: &SemanticallyVerifiedBlock,
+    chain: &Chain,
+    db: &crate::service::finalized_state::ZakuraDb,
+) -> std::collections::HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
+    crate::service::check::utxo::transparent_spend(block, Some(chain), db)
+        .expect("the candidate spends unspent outputs")
+}

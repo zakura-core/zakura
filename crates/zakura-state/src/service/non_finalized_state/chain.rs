@@ -64,8 +64,8 @@ mod index;
 mod transparent_index_benchmark;
 #[cfg(feature = "internal-bench")]
 pub use transparent_index_benchmark::{
-    benchmark_transparent_indexes, AllocationProbe, TransparentIndexBenchmarkConfig,
-    TransparentIndexBenchmarkSample,
+    benchmark_transparent_indexes, benchmark_transparent_spend_check, AllocationProbe,
+    TransparentIndexBenchmarkConfig, TransparentIndexBenchmarkSample,
 };
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
@@ -1740,17 +1740,14 @@ impl Chain {
     ///
     /// Snapshots share the block's immutable output map. The transaction index locates
     /// that map without maintaining another copy of every output in the chain.
-    #[allow(clippy::unwrap_in_result)] // A dangling transaction location is an internal invariant violation.
     pub(crate) fn created_ordered_utxo(
         &self,
         outpoint: &transparent::OutPoint,
     ) -> Option<&transparent::OrderedUtxo> {
-        let location = self.transaction_location(&outpoint.hash)?;
-        self.blocks
-            .get(&location.height)
-            .expect("transaction locations refer to retained blocks")
-            .new_outputs
-            .get(outpoint)
+        let location = self.tx_loc_by_hash.get(&outpoint.hash)?;
+        // A location without a block is a finalized entry waiting for a sweep, as in
+        // `transaction_location`. Reading the block checks that with the same lookup.
+        self.blocks.get(&location.height)?.new_outputs.get(outpoint)
     }
 
     /// Returns the [`Hash`](transaction::Hash) of the transaction that spent an output at

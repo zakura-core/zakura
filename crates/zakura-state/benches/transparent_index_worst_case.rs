@@ -83,6 +83,22 @@ fn main() {
         reset_peak: || PEAK_LIVE_BYTES.store(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed),
     };
 
+    if env::var("ZAKURA_TRANSPARENT_INDEX_BENCH_MODE").as_deref() == Ok("spend") {
+        let spends = env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_SPENDS", 26_645);
+        let nanos = zakura_state::benchmark_transparent_spend_check(
+            template,
+            config.stuffed_blocks,
+            config.outputs_per_block,
+            spends,
+            config.query_samples,
+        );
+        println!(
+            "spend check: {spends} in-window spends over {} blocks: median {nanos} ns ({:.1} ns/input)",
+            config.stuffed_blocks,
+            nanos as f64 / spends as f64,
+        );
+        return;
+    }
     println!("{config:?}");
     for sample in zakura_state::benchmark_transparent_indexes(template, config, probe) {
         println!(

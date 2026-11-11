@@ -1,6 +1,8 @@
 """The joint run's report diff: new survivors, new baseline failures and new property findings."""
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -104,6 +106,76 @@ class DiffTests(unittest.TestCase):
             ["cargo", "xtask", "planted", "loop", "--out", "out", "--generate-runs", "500",
              "--changed-since", "a" * 40, "--jobs", "8"],
         )
+        self.assertNotIn("--changed-since", joint.loop_command(None, Path("out"), 500, []))
+
+    def test_untriaged_lists_survivors_and_other_rule_kills_without_a_record(self):
+        triaged = case("one.patch", "survived", [(11, "killed-by-other-rule"), (23, "killed-by-named-rule")])
+        triaged["triage"] = {"stage": "observation", "reason": "why"}
+        new = {"cases": [triaged, case("two.patch", "killed-by-named-rule", [(11, "survived")])]}
+        found = joint.diff({}, new)["untriaged"]
+        self.assertEqual(
+            [(entry["lane"][0], entry["lane"][4:], entry["class"]) for entry in found],
+            [
+                ("one.patch", ["generator", "block-sync/storage", 11, "inproc"], "killed-by-other-rule"),
+                ("two.patch", ["generator", "block-sync/storage", 11, "inproc"], "survived"),
+            ],
+        )
+        self.assertFalse(joint.has_news({**joint.diff(new, new), "untriaged": found}))
+
+
+UNIT = Path(__file__).resolve().parents[2] / "deploy" / "mutation-joint"
+
+
+class RoutineTests(unittest.TestCase):
+    def dry_run(self, state, *flags):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = joint.main(["routine", "--checkout", "/c", "--state", str(state), "--dry-run", *flags])
+        self.assertEqual(status, 0)
+        return json.loads(out.getvalue())
+
+    def test_a_first_run_covers_every_case_and_skips_libfuzzer(self):
+        with tempfile.TemporaryDirectory() as state:
+            plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--harness-runs", "block-sync/storage=20")
+        self.assertIsNone(plan["latest"])
+        self.assertEqual([step["name"] for step in plan["steps"]], ["suite", "loop"])
+        suite, loop = plan["steps"]
+        self.assertEqual(suite["env"], {"RUSTFLAGS": "--cfg zakura_sim"})
+        self.assertIn("planted", suite["argv"])
+        self.assertNotIn("--changed-since", loop["argv"])
+        self.assertEqual(loop["argv"][loop["argv"].index("--generate-runs") + 1], "20000")
+        self.assertEqual(
+            loop["argv"][loop["argv"].index("--generate-harness-runs") + 1], "block-sync/storage=20"
+        )
+
+    def test_a_later_run_covers_what_changed_since_the_last_pin(self):
+        with tempfile.TemporaryDirectory() as state:
+            (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"report": "/r.json", "pinned": "a" * 40}))
+            plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--", "--jobs", "4")
+        names = [step["name"] for step in plan["steps"]]
+        self.assertEqual(names, ["suite", "loop", "libfuzzer"])
+        for step in plan["steps"][1:]:
+            self.assertEqual(step["argv"][step["argv"].index("--changed-since") + 1], "a" * 40)
+            self.assertEqual(step["argv"][-2:], ["--jobs", "4"])
+            self.assertEqual(step["cwd"], "/c")
+        self.assertIn("libfuzzer", plan["steps"][2]["argv"])
+
+    def test_the_units_command_and_example_budget_parse(self):
+        service = (UNIT / "zakura-mutation-joint.service").read_text()
+        start = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        env = dict(
+            line.split("=", 1)
+            for line in (UNIT / "zakura-mutation-joint.env.example").read_text().splitlines()
+            if line and not line.startswith("#")
+        )
+        argv = start.removeprefix("ExecStart=").split()
+        self.assertEqual(argv[1], "${ZAKURA_MUTATION_CHECKOUT}/scripts/mutation_joint_run.py")
+        self.assertEqual(argv[2], "routine")
+        self.assertEqual(argv[-1], "$ZAKURA_MUTATION_ARGS")
+        with tempfile.TemporaryDirectory() as state:
+            plan = self.dry_run(state, *env["ZAKURA_MUTATION_ARGS"].split())
+        loop = plan["steps"][1]["argv"]
+        self.assertEqual(loop.count("--generate-harness-runs"), 4)
 
 
 if __name__ == "__main__":

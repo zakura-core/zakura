@@ -22,13 +22,17 @@ host. `python3 scripts/mutation_inventory.py --loop` checks them.
 With `--generate-runs <n>`, the loop also gives each case generator lanes:
 `zakura-sim generate` searches `n` inputs drawn from each seed of
 `--generate-seeds` for a violation of the case's property, skipping every
-committed input here and under `qa/planted`. `--generate-harness` picks the
-harness, `auto` by default. `--generate-mode libfuzzer` runs one campaign
-per seed for `--generate-seconds` instead. A kill must confirm in a fresh
-process, and the loop shrinks its trace. One search per harness and seed
-runs on the unpatched build first. A search that stops there is a property
-finding in the report, and that lane is `baseline-fails`. A property that no
-generator harness reaches has a `[[no-generator]]` record in
+committed input here and under `qa/planted`. Each input starts with one of
+the harness's scenario families' tags, or none, picked uniformly.
+`--generate-harness` picks the harness, `auto` by default.
+`--generate-mode libfuzzer` runs one campaign per seed for
+`--generate-seconds` instead, from an empty corpus and with no exclusions.
+A kill must confirm in a fresh process, and the loop shrinks its trace. One
+search per harness and seed runs on the unpatched build first, and one that
+a run failure ended reruns alone. A confirmed violation there is a property
+finding in the report. Any other search that isn't clean is a generator
+baseline failure. Either way that lane is `baseline-fails`. A property that
+no generator harness reaches has a `[[no-generator]]` record in
 `work-list.toml` with the reason.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out

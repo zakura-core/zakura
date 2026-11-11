@@ -43,10 +43,12 @@ const MACHINE: Machine = Machine {
         (
             CADENCE,
             "Failed attempts consume only initial, refilled, and refunded tokens.",
+            Status::Active,
         ),
         (
             CONFORMANT,
             "An address with an available token is never refused by the cadence.",
+            Status::Active,
         ),
         (
             PENDING,

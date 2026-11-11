@@ -1,9 +1,17 @@
 //! Event-driven startup dialing and cancellation regressions.
 
-use std::{num::NonZeroUsize, sync::{Arc, Mutex}, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::{channel::mpsc, StreamExt};
-use tokio::{sync::{mpsc as tokio_mpsc, oneshot}, task::JoinHandle, time::{timeout, Instant}};
+use tokio::{
+    sync::{mpsc as tokio_mpsc, oneshot},
+    task::JoinHandle,
+    time::{timeout, Instant},
+};
 use tower::{service_fn, util::BoxCloneService};
 
 use crate::{
@@ -57,7 +65,11 @@ fn controlled_connector() -> (
             }
         }
     });
-    (BoxCloneService::new(connector), attempt_rx, live_connections)
+    (
+        BoxCloneService::new(connector),
+        attempt_rx,
+        live_connections,
+    )
 }
 
 /// Persist ordered candidates without DNS or a live network.
@@ -70,18 +82,27 @@ fn cached_config(peers: &[PeerSocketAddr], target: usize) -> (Config, tempfile::
         peerset_initial_target_size: target,
         ..Config::default()
     };
-    let file = config.cache_dir.peer_cache_file_path(&config.network).unwrap();
+    let file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .unwrap();
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(
         file,
-        peers.iter().map(|addr| addr.remove_socket_addr_privacy().to_string())
-            .collect::<Vec<_>>().join("\n"),
-    ).unwrap();
+        peers
+            .iter()
+            .map(|addr| addr.remove_socket_addr_privacy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
     (config, cache)
 }
 
 fn peers(count: u8) -> Vec<PeerSocketAddr> {
-    (1..=count).map(|ip| std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into()).collect()
+    (1..=count)
+        .map(|ip| std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into())
+        .collect()
 }
 
 fn spawn_initial(
@@ -94,11 +115,18 @@ fn spawn_initial(
 ) {
     let (peer_tx, peer_rx) = mpsc::channel(256);
     let (book_tx, book_rx) = tokio_mpsc::channel(256);
-    (tokio::spawn(add_initial_peers(config, connector, peer_tx, book_tx)), peer_rx, book_rx)
+    (
+        tokio::spawn(add_initial_peers(config, connector, peer_tx, book_tx)),
+        peer_rx,
+        book_rx,
+    )
 }
 
 async fn next_attempt(attempts: &mut tokio_mpsc::UnboundedReceiver<Attempt>) -> Attempt {
-    timeout(TEST_TIMEOUT, attempts.recv()).await.unwrap().unwrap()
+    timeout(TEST_TIMEOUT, attempts.recv())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 /// Fifty simultaneous attempts refill on either outcome, without waiting for the other peers.
@@ -123,7 +151,10 @@ async fn startup_window_refills_on_success_and_failure() {
     let initial: std::collections::HashSet<_> = pending.iter().map(|a| a.addr).collect();
     assert_eq!(initial, expected[..50].iter().copied().collect());
     tokio::task::yield_now().await;
-    assert!(attempts.try_recv().is_err(), "the fifty-first dial must wait");
+    assert!(
+        attempts.try_recv().is_err(),
+        "the fifty-first dial must wait"
+    );
 
     pending.pop().unwrap().finish.send(false).unwrap();
     let after_error = next_attempt(&mut attempts).await;
@@ -136,7 +167,10 @@ async fn startup_window_refills_on_success_and_failure() {
     assert_eq!(after_success.addr, expected[51]);
     assert_eq!(after_success.started_at, started_at);
     pending.push(after_success);
-    assert!(timeout(TEST_TIMEOUT, discovered.next()).await.unwrap().is_some());
+    assert!(timeout(TEST_TIMEOUT, discovered.next())
+        .await
+        .unwrap()
+        .is_some());
 
     for attempt in pending {
         attempt.finish.send(false).unwrap();
@@ -149,8 +183,17 @@ async fn startup_window_refills_on_success_and_failure() {
         attempt.finish.send(false).unwrap();
     }
     assert_eq!(tail, expected[52..].iter().copied().collect());
-    let mut counter = timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap().active_connections;
-    assert_eq!(counter.update_count(), 1, "only the successful connection remains reserved");
+    let mut counter = timeout(TEST_TIMEOUT, task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .active_connections;
+    assert_eq!(
+        counter.update_count(),
+        1,
+        "only the successful connection remains reserved"
+    );
     live.lock().unwrap().clear();
     assert_eq!(counter.update_count(), 0);
     assert!(attempts.recv().await.is_none());
@@ -176,8 +219,13 @@ async fn startup_window_preserves_target_and_ip_limits() {
             attempt.finish.send(false).unwrap();
         }
         timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
-        assert_eq!(dialed.iter().copied().collect::<std::collections::HashSet<_>>(),
-            expected[..3].iter().copied().collect());
+        assert_eq!(
+            dialed
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected[..3].iter().copied().collect()
+        );
         if concurrency == 1 {
             assert_eq!(dialed, expected[..3], "serial admission keeps cache order");
         }
@@ -206,9 +254,14 @@ async fn cancelling_startup_aborts_in_flight_dials() {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     for mut attempt in pending {
-        timeout(TEST_TIMEOUT, attempt.finish.closed()).await.unwrap();
+        timeout(TEST_TIMEOUT, attempt.finish.closed())
+            .await
+            .unwrap();
     }
-    assert!(timeout(TEST_TIMEOUT, attempts.recv()).await.unwrap().is_none());
+    assert!(timeout(TEST_TIMEOUT, attempts.recv())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// A closed peer-set receiver cancels the remaining connectors on the error path too.
@@ -227,8 +280,13 @@ async fn startup_delivery_failure_aborts_remaining_dials() {
     pending.pop().unwrap().finish.send(true).unwrap();
     assert!(timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().is_err());
     for mut attempt in pending {
-        timeout(TEST_TIMEOUT, attempt.finish.closed()).await.unwrap();
+        timeout(TEST_TIMEOUT, attempt.finish.closed())
+            .await
+            .unwrap();
     }
     live.lock().unwrap().clear();
-    assert!(timeout(TEST_TIMEOUT, attempts.recv()).await.unwrap().is_none());
+    assert!(timeout(TEST_TIMEOUT, attempts.recv())
+        .await
+        .unwrap()
+        .is_none());
 }

@@ -1111,3 +1111,42 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }
+
+/// Cancelling a connector also cancels its spawned handshake before the timeout.
+#[tokio::test]
+async fn dropping_handshake_future_releases_stream_and_tracker() {
+    use tokio::io::AsyncReadExt;
+
+    let _init_guard = zakura_test::init();
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let mut handshake =
+        test_handshake_without_zakura_connector(test_config(P2pStack::Legacy), book_tx);
+    let (local_stream, mut remote_stream) = duplex(16 * 1024);
+    let mut counter = ActiveConnectionCounter::new_counter();
+    tokio::time::pause();
+    let started_at = Instant::now();
+    let attempt = handshake.call(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(8233)),
+        connection_tracker: counter.track_connection(),
+    });
+
+    // Seeing the version bytes proves the inner task is running and blocked on its peer.
+    timeout(constants::HANDSHAKE_TIMEOUT / 2, remote_stream.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counter.update_count(), 1);
+    drop(attempt);
+
+    let mut remaining = Vec::new();
+    timeout(
+        constants::HANDSHAKE_TIMEOUT / 2,
+        remote_stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("cancellation closes the stream without waiting for handshake timeout")
+    .unwrap();
+    assert_eq!(counter.update_count(), 0);
+    assert_eq!(Instant::now(), started_at);
+}

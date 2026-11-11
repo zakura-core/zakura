@@ -2302,9 +2302,9 @@ fn initial_peer_dial_concurrency_configuration() {
     }
 
     for invalid in ["0", "-1", "'50'"] {
-        assert!(toml::from_str::<Config>(&format!(
-            "initial_peer_dial_concurrency = {invalid}"
-        ))
-        .is_err());
+        assert!(
+            toml::from_str::<Config>(&format!("initial_peer_dial_concurrency = {invalid}"))
+                .is_err()
+        );
     }
 }

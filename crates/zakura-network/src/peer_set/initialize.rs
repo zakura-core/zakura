@@ -26,7 +26,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, Instant},
+    time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;

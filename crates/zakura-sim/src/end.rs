@@ -266,14 +266,16 @@ impl RunEnd {
 }
 
 /// Whether a scheduler at `status` has come to rest, so a check may judge
-/// what the node left undone: every task finished, or waits outside the
-/// scheduler or on a timer. A worker-starved scheduler has a ready task
-/// with no worker, and a deadlocked one can hold a task parked partway
-/// through a call, so neither is: what that task would do next is still
-/// owed. Every check that judges rest asks this.
+/// what the node left undone: every task finished, waits outside the
+/// scheduler or on a timer, or is deadlocked. No worker count unsticks a
+/// deadlock, and a lost wake shows up as one, so it's a settled end the
+/// node owns. A worker-starved scheduler isn't at rest: it has a ready
+/// task that more workers would run, so what that task would do next is
+/// still owed. Work the harness holds is caught before either, as
+/// stranded source work. Every check that judges rest asks this.
 pub fn at_rest(status: Status) -> bool {
     matches!(
         status,
-        Status::Quiescent | Status::WaitingOnExternal | Status::WaitingOnTime
+        Status::Quiescent | Status::WaitingOnExternal | Status::WaitingOnTime | Status::Deadlock
     )
 }

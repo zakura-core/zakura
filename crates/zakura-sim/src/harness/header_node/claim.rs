@@ -188,8 +188,7 @@ impl SettlementEvidence {
 
     /// Notes how the run ended: at rest when it ran dry at rest
     /// ([`RunEnd::at_rest`]), and not at a violation, a harness failure, a
-    /// drain cut off at its bound included, or a dry end worker-starved or
-    /// deadlocked.
+    /// drain cut off at its bound included, or a worker-starved dry end.
     pub(crate) fn end(&self, end: &RunEnd) {
         let at_rest = end.at_rest();
         self.with(|store| store.at_rest = at_rest);

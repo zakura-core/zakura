@@ -1047,10 +1047,21 @@ impl crate::property::HasView for Probe {
     }
 }
 
+/// How [`lingering_outcome`]'s run leaves the scheduler at its end.
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+    /// Every task finishes.
+    Quiescent,
+    /// A ready task never gets the one worker.
+    Starved,
+    /// A task waits forever on nothing that can wake it.
+    Deadlocked,
+}
+
 /// `outstanding-work-bounded`'s outcome over a run with one worker, where
 /// a publisher whose session's token is cancelled is still running from
-/// the start, and the run's tasks are `starve`d of their worker or not.
-fn lingering_outcome(starve: bool) -> crate::PropertyOutcome {
+/// the start, and the run's tasks end as `ends` says.
+fn lingering_outcome(ends: Ends) -> crate::PropertyOutcome {
     use crate::property::{Assumptions, Registry, RegistryChecker, Source, Sources};
     let probe = Probe::default();
     let mut publisher = Outstanding::new(probe.outstanding.clone(), 8, DEPARTED, held());
@@ -1093,10 +1104,17 @@ fn lingering_outcome(starve: bool) -> crate::PropertyOutcome {
             zakura_rt::task::yield_now().await;
         }
     });
-    if starve {
-        sim.scheduler().spawn_root("waiter", async move {
-            drop(lock.lock().unwrap());
-        });
+    match ends {
+        Ends::Quiescent => {}
+        Ends::Starved => {
+            sim.scheduler().spawn_root("waiter", async move {
+                drop(lock.lock().unwrap());
+            });
+        }
+        Ends::Deadlocked => {
+            sim.scheduler()
+                .spawn_root("stuck", std::future::pending::<()>());
+        }
     }
     let report = sim.run(&mut checker, &mut crate::MemorySink::default());
     report.properties[0].outcome.clone()
@@ -1109,18 +1127,33 @@ fn lingering_outcome(starve: bool) -> crate::PropertyOutcome {
 fn a_worker_starved_step_does_not_judge_a_cancelled_publisher() {
     assert!(
         matches!(
-            lingering_outcome(false),
+            lingering_outcome(Ends::Quiescent),
             crate::PropertyOutcome::Violated { .. }
         ),
         "a run at rest judges it"
     );
     assert!(
         !matches!(
-            lingering_outcome(true),
+            lingering_outcome(Ends::Starved),
             crate::PropertyOutcome::Violated { .. }
         ),
         "{:?}",
-        lingering_outcome(true)
+        lingering_outcome(Ends::Starved)
+    );
+}
+
+/// Evan, #2283 review: a deadlocked dry end is at rest, since no worker
+/// count unsticks it and a lost wake shows up as one, so it judges a
+/// cancelled publisher still running, as a quiescent end does.
+#[test]
+fn a_deadlocked_end_judges_a_cancelled_publisher() {
+    assert!(
+        matches!(
+            lingering_outcome(Ends::Deadlocked),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "{:?}",
+        lingering_outcome(Ends::Deadlocked)
     );
 }
 

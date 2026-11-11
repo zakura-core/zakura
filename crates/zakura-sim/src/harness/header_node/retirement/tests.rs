@@ -926,9 +926,10 @@ fn run_end(outcome: crate::Outcome, drain: Option<bool>) -> crate::RunEnd {
 
 /// A departure whose unit never reached its boundary is judged when the
 /// run settles, as `adoption::settled` decides: a slot left with the
-/// departed session breaks at a quiescent end, or after a budget drain that
-/// ran dry. A deadlocked or worker-starved end, which can stop a task inside
-/// a unit, or a budget end whose drain hit its bound, leaves it unjudged.
+/// departed session breaks at a quiescent or deadlocked end, or after a
+/// budget drain that ran dry. A worker-starved end, which can stop a task
+/// inside a unit, or a budget end whose drain hit its bound, leaves it
+/// unjudged.
 #[test]
 fn a_settled_run_judges_an_unfinished_departure() {
     let left_with_slot = |end| {
@@ -956,7 +957,7 @@ fn a_settled_run_judges_an_unfinished_departure() {
         (run_end(idle(crate::IdleStatus::Quiescent), None), 1),
         (run_end(idle(crate::IdleStatus::WaitingOnExternal), None), 1),
         (run_end(crate::Outcome::Budget, Some(false)), 1),
-        (run_end(idle(crate::IdleStatus::Deadlock), None), 0),
+        (run_end(idle(crate::IdleStatus::Deadlock), None), 1),
         (run_end(idle(crate::IdleStatus::WorkerStarved), None), 0),
         (run_end(crate::Outcome::Budget, Some(true)), 0),
         (run_end(crate::Outcome::Budget, None), 0),

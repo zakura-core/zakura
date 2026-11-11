@@ -27,6 +27,93 @@ use super::{
 
 const VALUE: i64 = 1_000;
 
+#[test]
+fn balance_query_cancels_large_transfers_between_addresses() {
+    for receiver_first in [true, false] {
+        let (chain, template) = chain_and_template(false);
+        let addresses = HashSet::from([p2pkh(7).0, p2pkh(8).0]);
+        // Exercise both visit orders. Visiting the receiver first in the second block
+        // counts the same funds twice before subtracting the spend.
+        let mut order = addresses.iter().copied();
+        let first_address = order.next().unwrap();
+        let second_address = order.next().unwrap();
+        let (receiver, sender) = if receiver_first {
+            (first_address, second_address)
+        } else {
+            (second_address, first_address)
+        };
+        let script_for = |address| {
+            if p2pkh(7).0 == address {
+                p2pkh(7).1
+            } else {
+                p2pkh(8).1
+            }
+        };
+        let value = 11_000_000 * zakura_chain::amount::COIN;
+        let (funding, mut funding_output) = finalized_output(99);
+        funding_output.utxo.output =
+            transparent::Output::new(Amount::try_from(value).unwrap(), p2pkh(99).1);
+        let transfer = |parent: &Arc<Block>, outpoint, output: transparent::OrderedUtxo, script| {
+            let mut block = parent.make_fake_child();
+            let transactions = &mut Arc::make_mut(&mut block).transactions;
+            transactions.truncate(1);
+            transactions.push(Arc::new(Transaction::V4 {
+                inputs: vec![transparent::Input::PrevOut {
+                    outpoint,
+                    unlock_script: transparent::Script::new(&[]),
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![transparent::Output::new(output.utxo.output.value(), script)],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            }));
+            let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+                &Network::Mainnet,
+                block.clone().prepare(),
+                HashMap::from([(outpoint, output)]),
+            )
+            .expect("the transfer preserves value");
+            (block, contextual)
+        };
+        let (first, contextual) = transfer(&template, funding, funding_output, script_for(sender));
+        let first_height = contextual.height;
+        let outpoint = transparent::OutPoint {
+            hash: first.transactions[1].hash(),
+            index: 0,
+        };
+        let output = contextual.new_outputs[&outpoint].clone();
+        let chain = push(chain, contextual);
+        let (_, contextual) = transfer(&first, outpoint, output, script_for(receiver));
+        let second_height = contextual.height;
+        let chain = push(chain, contextual);
+
+        assert_eq!(
+            chain.partial_transparent_balance_change(&addresses, first_height),
+            (
+                Amount::try_from(value).unwrap(),
+                u64::try_from(2 * value).unwrap()
+            )
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&addresses, second_height),
+            (Amount::zero(), u64::try_from(value).unwrap())
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&HashSet::from([sender]), first_height),
+            (Amount::zero(), u64::try_from(value).unwrap())
+        );
+        assert_eq!(
+            chain.partial_transparent_balance_change(&HashSet::from([receiver]), first_height),
+            (
+                Amount::try_from(value).unwrap(),
+                u64::try_from(value).unwrap()
+            )
+        );
+    }
+}
+
 /// Returns a pay-to-public-key-hash address and its lock script.
 fn p2pkh(seed: u32) -> (transparent::Address, transparent::Script) {
     let mut hash = [0; 20];

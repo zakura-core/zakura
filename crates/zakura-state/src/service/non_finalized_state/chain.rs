@@ -1805,16 +1805,21 @@ impl Chain {
         from: Height,
     ) -> (Amount<NegativeAllowed>, u64) {
         let (balance, received) = self.address_transfers(addresses, from..).into_iter().fold(
-            (Ok(Amount::zero()), 0),
+            (0i128, 0),
             |(balance, received), (_, transfers)| {
                 (
-                    balance + transfers.balance(),
+                    balance + i128::from(transfers.balance().zatoshis()),
                     received + transfers.received(),
                 )
             },
         );
 
-        (balance.expect("unexpected amount overflow"), received)
+        // Transfers between queried addresses can temporarily count the same funds
+        // twice. Constrain only the final net change, after those transfers cancel.
+        (
+            Amount::try_from(balance).expect("the net balance change is within the money supply"),
+            received,
+        )
     }
 
     /// Returns the transparent UTXO changes for `addresses` in this non-finalized chain.

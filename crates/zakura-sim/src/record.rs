@@ -81,7 +81,8 @@ pub const FORMAT_VERSION: u32 = 43;
 /// actions beside the ready tasks, and `AdvanceTime` while an obligation is
 /// open, a recovery boundary is ahead, or a timer is due within the harness
 /// timer cap. It starts at a live end that still has work to resolve too,
-/// and picks by the recovery policy from its first step.
+/// runs the ready tasks to rest before it offers anything else, and picks
+/// by the recovery policy from its first step.
 pub const CONTRACT_VERSION: u32 = 4;
 
 /// One draw's identity, bound, answer, and what chose the answer.

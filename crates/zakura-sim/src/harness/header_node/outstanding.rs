@@ -229,6 +229,9 @@ struct Store {
     /// Whether the run came to rest: it ended idle, or at its budget after
     /// a drain that ran out of ready tasks.
     at_rest: bool,
+    /// The publishers a quiescent step already found running under a
+    /// cancelled token ([`OutstandingEvidence::lingering_cancelled`]).
+    reported: Vec<(ZakuraPeerId, u64)>,
 }
 
 impl OutstandingEvidence {
@@ -254,11 +257,40 @@ impl OutstandingEvidence {
         self.with(|store| store.at_rest = at_rest);
     }
 
+    /// The publisher tasks running now under a cancelled session token that
+    /// no earlier call returned, sorted, which this marks returned. A
+    /// publisher returns as soon as its session is cancelled, and the
+    /// cancellation wakes it, so after a step that leaves no task able to
+    /// run there's none. A checker reads it there: a drain that finishes
+    /// the work a publisher waits on can end one that ignored its
+    /// cancellation before the run comes to rest. The tokens are read with
+    /// no preemption point.
+    pub fn lingering_cancelled(&self) -> Vec<(ZakuraPeerId, u64)> {
+        self.with(|store| {
+            let mut lingering: Vec<(ZakuraPeerId, u64)> = store
+                .running
+                .iter()
+                .filter(|(peer, session_id, cancel)| {
+                    cancel
+                        .as_ref()
+                        .is_some_and(CancellationToken::peek_cancelled)
+                        && !store.reported.contains(&(peer.clone(), *session_id))
+                })
+                .map(|(peer, session_id, _)| (peer.clone(), *session_id))
+                .collect();
+            lingering
+                .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+            store.reported.extend(lingering.iter().cloned());
+            lingering
+        })
+    }
+
     /// The publisher tasks still running when the run came to rest, if it
     /// did, whose session's token is cancelled, or every one once the
-    /// reactor began its shutdown. A publisher returns as soon as its
-    /// session is cancelled, so a run at rest has none. The tokens are read
-    /// with no preemption point, after the run.
+    /// reactor began its shutdown, but for the ones a quiescent step
+    /// already found ([`Self::lingering_cancelled`]). A publisher returns as
+    /// soon as its session is cancelled, so a run at rest has none. The
+    /// tokens are read with no preemption point, after the run.
     pub fn lingering_at_rest(&self) -> Vec<(ZakuraPeerId, u64)> {
         self.with(|store| {
             if !store.at_rest {
@@ -267,11 +299,12 @@ impl OutstandingEvidence {
             let mut lingering: Vec<(ZakuraPeerId, u64)> = store
                 .running
                 .iter()
-                .filter(|(_, _, cancel)| {
-                    store.shut_down
+                .filter(|(peer, session_id, cancel)| {
+                    (store.shut_down
                         || cancel
                             .as_ref()
-                            .is_some_and(CancellationToken::peek_cancelled)
+                            .is_some_and(CancellationToken::peek_cancelled))
+                        && !store.reported.contains(&(peer.clone(), *session_id))
                 })
                 .map(|(peer, session_id, _)| (peer.clone(), *session_id))
                 .collect();

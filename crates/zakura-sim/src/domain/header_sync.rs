@@ -440,7 +440,9 @@ where
 
 /// Checks [`OUTSTANDING_WORK_BOUNDED`] at the boundary after a step: it's
 /// violated by an `OutstandingWork` claim break the tap found at this
-/// step, and holds once a drain judged a `Sizes`.
+/// step, or, after a step that leaves no task able to run, by a publisher
+/// still running under its session's cancelled token, and holds once a
+/// drain judged a `Sizes`.
 fn check_outstanding_work_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -450,15 +452,30 @@ where
     let step = cx.step;
     let expected = "the reactor's and the serving side's containers stay within their bounds \
                     and keep only live keys, and no publisher outlives its session";
-    let mut breaks = view
+    let mut breaks: Vec<String> = view
         .claims()
         .at(step, &[Claim::OutstandingWork])
-        .into_iter();
+        .into_iter()
+        .map(|record| record.detail)
+        .collect();
+    // Not quiescence: a source action, such as the drain finishing a read
+    // the publisher waits on, can still end a publisher that ignored its
+    // cancellation, and hide it.
+    if cx.status != zakura_scheduler::Status::Running {
+        let lingering = view.outstanding().lingering_cancelled();
+        if !lingering.is_empty() {
+            breaks.push(format!(
+                "OutstandingWork: nothing can run after step {step}, yet publishers still run \
+                 for the cancelled sessions {lingering:?}"
+            ));
+        }
+    }
+    let mut breaks = breaks.into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {
-            cx.record_violation(expected, other.detail);
+            cx.record_violation(expected, other);
         }
-        return cx.violated(expected, first.detail);
+        return cx.violated(expected, first);
     }
     if view.outstanding().applicable_by(step) {
         Verdict::Holds

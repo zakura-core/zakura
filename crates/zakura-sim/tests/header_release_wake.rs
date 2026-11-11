@@ -644,10 +644,10 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
     }
 }
 
-/// A fixture run without the wake declared opens no wake, so nothing can
-/// release `mirror-1`'s held prepare. The dry end fails the run as source
-/// evidence naming the fixture, never a verdict on the node, and the
-/// property is `HarnessFailed`.
+/// A fixture run without the wake declared opens no wake, so the property
+/// is not applicable there. Nothing then releases `mirror-1`'s held
+/// prepare, and the run still ends without a harness failure: a wake that
+/// never opens is the node's to answer.
 #[test]
 fn an_undeclared_fixture_opens_no_wake() {
     let scenario = WakeScenario::Release;
@@ -656,25 +656,14 @@ fn an_undeclared_fixture_opens_no_wake() {
         ..ReleaseWake::prepare(&scenario)
     };
     let wake = ports.wake.clone();
-    let error = run_prepared::<ReleaseWake>(
+    let report = run_prepared::<ReleaseWake>(
         &scenario,
         ports,
         plan(RELEASE_INPUT),
         &mut MemorySink::default(),
         None,
     )
-    .expect_err("the fixture strands its held prepare");
-    let zakura_sim::harness::HarnessError::Run { failure, report } = error else {
-        panic!("{error}");
-    };
-    assert!(
-        matches!(
-            &failure,
-            zakura_sim::HarnessFailure::SourceEvidence { detail, .. }
-                if detail.starts_with("release-wake fixture holds mirror-1's prepare")
-        ),
-        "{failure}"
-    );
+    .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(wake.facts(), []);
     let outcome = report
         .properties
@@ -685,7 +674,7 @@ fn an_undeclared_fixture_opens_no_wake() {
         matches!(
             outcome,
             Some(PropertyOutcome::NotApplicable {
-                reason: NaReason::HarnessFailed
+                reason: NaReason::NeverApplied
             })
         ),
         "{outcome:?}"

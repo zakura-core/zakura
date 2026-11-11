@@ -1914,7 +1914,8 @@ impl ActionSource for Control {
     }
 
     /// While a `Recover` establishes, its quiet `recovered` pick, under the
-    /// same condition as [`ActionSource::quiet`], but no relink or give-up.
+    /// same condition as [`ActionSource::quiet`], but no relink or give-up,
+    /// and the end of the source's cooldown as a boundary.
     /// Otherwise the next step, if it's the planned `Release` of an owned
     /// hold ([`Topology::own`]) and may be picked as it would be live, with
     /// its trigger's openings. No other script step runs in the drain.
@@ -1924,6 +1925,17 @@ impl ActionSource for Control {
             driver.quiet(now, &mut quiet);
             out.quiet
                 .extend(quiet.into_iter().filter(|(_, local)| *local == RECOVERED));
+            // The end of the source's cooldown, which `recovered` waits for.
+            let mut boundaries = Vec::new();
+            driver.boundaries(now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) if at > now => Some(at),
+                        Boundary::Opens(_) | Boundary::Deadline(_) => None,
+                    }),
+            );
         }
         let owned_release = |step: &ControlStep| match step.action {
             ControlAction::Release { hold } => self.topology.owns(hold),

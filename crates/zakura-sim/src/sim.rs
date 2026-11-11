@@ -7,12 +7,13 @@
 //!
 //! The drain finishes what the live phase started, so every property ends
 //! with an answer (#1840 rule 2). It starts at the budget, or at a live end
-//! that still has work to resolve. It offers the ready tasks and each
-//! source's recovery actions, never an adversary act, and moves the clock
-//! while an obligation is open, a recovery boundary is ahead, or a timer is
-//! due within [`RunConfig::harness_timer_cap`] of its start. It ends dry, with
-//! nothing left to run, or at its step bound with work left, which is a
-//! harness failure ([`HarnessFailure::DrainBound`]).
+//! that still has work to resolve. It first runs the ready tasks to rest,
+//! then offers them and each source's recovery actions, never an adversary
+//! act, and moves the clock while an obligation is open, a recovery
+//! boundary is ahead, or a timer is due within
+//! [`RunConfig::harness_timer_cap`] of its start. It ends dry, with nothing
+//! left to run, or at its step bound with work left, which is a harness
+//! failure ([`HarnessFailure::DrainBound`]).
 
 use std::{
     cell::RefCell,
@@ -532,6 +533,8 @@ impl Sim {
         // The offers the last step computed for its quiescence, which still
         // hold at the next pick if its phase is the same.
         let mut cached: Option<(Phase, Vec<Offer>)> = None;
+        // Set at the drain's start, until no task is ready. See below.
+        let mut settling = false;
         loop {
             let now = self.sched().now();
             let mut offers = match cached.take() {
@@ -551,6 +554,7 @@ impl Sim {
                 };
                 phase = Phase::Drain;
                 entered = Some(now);
+                settling = true;
                 offers = self.offers(phase, now, ready.is_empty());
             }
             // A source that drew while offering, here or in the step before,
@@ -558,6 +562,20 @@ impl Sim {
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }
+            // The drain first runs the ready tasks to rest, offering nothing
+            // else, so the run reaches the rest it would have reached
+            // without its held work, where a check can see what the node
+            // left undone, such as a publisher that ignored its
+            // cancellation. Then it offers the recovery actions that finish
+            // that work.
+            if settling && ready.is_empty() {
+                settling = false;
+            }
+            let offers = if settling {
+                vec![Offer::default(); offers.len()]
+            } else {
+                offers
+            };
             // Held tasks sit out, unless nothing else is enabled. With only
             // held tasks ready, the clock can move, as for a slow thread.
             let free: Option<Vec<(Identity, TaskId)>> = (!st.held.is_empty()).then(|| {
@@ -609,6 +627,7 @@ impl Sim {
                     };
                     phase = Phase::Drain;
                     entered = Some(now);
+                    settling = true;
                     continue;
                 }
                 // A dry end. Work a source still holds would leave a check

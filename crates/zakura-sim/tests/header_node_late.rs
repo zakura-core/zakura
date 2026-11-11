@@ -1608,12 +1608,26 @@ fn locator_permits_wait_for_accepted_work() {
             !waiting.is_empty(),
             "no offer waited before the first late completion"
         );
+        // A live claim, so the resumed locator is one the live phase both
+        // submitted and saw the call end with, not one the drain finished.
+        let live_submitted: BTreeSet<u64> = facts
+            .iter()
+            .filter_map(|(_, _, fact)| match fact {
+                StorageFact::Submitted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
         let resumed = history.calls().into_values().any(|call| match call {
             Call {
                 port: ReactorCall::Locator { peer, .. },
-                ended: Some((.., Some(op))),
+                ended: Some((ended, _, _, Some(op))),
                 ..
-            } => waiting.contains(peer.as_str()) && ops[&op].seq > first_late,
+            } => {
+                waiting.contains(peer.as_str())
+                    && ops[&op].seq > first_late
+                    && live_submitted.contains(&op)
+                    && history.lines[ended].step <= live
+            }
             _ => false,
         });
         assert!(

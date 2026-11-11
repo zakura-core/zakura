@@ -69,7 +69,7 @@ use zakura_chain::{
         BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
     subtree::NoteCommitmentSubtreeIndex,
-    transaction::{self, SerializedTransaction, Transaction, UnminedTx},
+    transaction::{self, SerializedTransaction, Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address, OutputIndex},
     value_balance::ValueBalance,
     work::{
@@ -82,7 +82,9 @@ use zakura_consensus::{
 };
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
-use zakura_node_services::mempool::{self, CreatedOrSpent, MempoolService};
+use zakura_node_services::mempool::{
+    self, CreatedOrSpent, MempoolService, TransactionDependencies,
+};
 use zakura_node_services::task::spawn_erased;
 use zakura_state::{
     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
@@ -119,7 +121,7 @@ use types::{
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MAX_TEMPLATE_REBUILDS, MEMPOOL_LONG_POLL_INTERVAL,
-            ZCASHD_FUNDING_STREAM_ORDER,
+            NEW_TIP_MEMPOOL_WAIT, ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
@@ -1639,12 +1641,53 @@ where
             .await
     }
 
-    /// Builds the coinbase-only template a long poll returns once it sees a new tip.
+    /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
+    /// the mempool has already processed that block and holds any.
     ///
-    /// Miners want work on the new tip before the mempool has caught up with it, so this
-    /// template has no mempool transactions and an ID that names none. The client's next long
-    /// poll then returns the full template as soon as the mempool has any. Returns `Ok(None)`
-    /// when the template was superseded, like [`Self::finish_mining_template`].
+    /// Returns `None` when the mempool is empty, is still on an older tip, takes longer than
+    /// [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the coinbase-only
+    /// template, so the mempool never delays work on a new tip by more than that wait.
+    async fn populated_mempool_on_new_tip(
+        &self,
+        tip_hash: block::Hash,
+    ) -> Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)> {
+        let mempool_fetch =
+            types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
+
+        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_fetch).await {
+            Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
+                Some((transactions, dependencies))
+            }
+            Ok(Ok(_empty_or_on_an_older_tip)) => None,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    ?error,
+                    "mempool request failed on a new tip; answering with the coinbase-only template"
+                );
+                None
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    ?NEW_TIP_MEMPOOL_WAIT,
+                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
+                );
+                None
+            }
+        }
+    }
+
+    /// Builds the coinbase-only template a long poll returns on a new tip when a full template
+    /// cannot be offered at once.
+    ///
+    /// That is the case when the mempool holds no transactions for the new tip or has not
+    /// caught up with it (see [`Self::populated_mempool_on_new_tip`]), when a shielded
+    /// coinbase built in advance saves the miner its proof time, or when as many long polls
+    /// as may build a full first answer at once are already doing so (see
+    /// [`GetBlockTemplateHandler::try_reserve_full_first_answer`]). Miners want work on the
+    /// new tip without delay, so this template has no mempool transactions and an ID that
+    /// names none. The client's next long poll then returns the full template as soon as the
+    /// mempool has any. Returns `Ok(None)` when the template was superseded, like
+    /// [`Self::finish_mining_template`].
     ///
     /// Traces the returned template under `request_id`.
     async fn new_tip_template(
@@ -3496,8 +3539,9 @@ where
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
-            check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            check_parameters, check_synced_to_tip, coinbase_needs_proof, fetch_chain_info,
+            fetch_mempool_transactions, validate_block_proposal,
+            zip317::select_mempool_transactions,
         };
 
         // Clone Services
@@ -3557,6 +3601,12 @@ where
             //
             // Set up the loop.
             // The loop returns the server long poll ID, which should be different to the client one.
+            // The coinbase a waiting long poll built before the tip changed, with the height it
+            // was built for. The next pass of the loop answers on the new tip and may use it.
+            let mut tip_wake_coinbase = None;
+            // This request's place among the long polls that may build a full first answer on
+            // a new tip at once, held from its mempool request until its template is built.
+            let mut full_first_answer = None;
             let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
                 // Check if we are synced to the tip.
                 // The result of this check can change during long polling.
@@ -3596,36 +3646,79 @@ where
                     continue;
                 };
 
-                // A long poll whose ID names an older tip has missed the tip change it waits for:
-                // the client sent it after the change, or this loop came back around after it.
-                // Answer the way the tip arm below does, instead of waiting for the mempool to
-                // process the new block and then building a full template.
-                if client_long_poll_id
-                    .as_ref()
-                    .is_some_and(|client_long_poll_id| {
-                        !LongPollInput::new(tip_height, tip_hash, max_time, vec![])
-                            .generate_id()
-                            .same_tip(client_long_poll_id)
-                    })
-                {
-                    self.gbt
-                        .trace
-                        .tip_woke(request_id, Some((tip_height, tip_hash)));
-                    if let Some(template) = self
-                        .new_tip_template(
-                            request_id,
-                            None,
-                            miner_params,
-                            &chain_info,
-                            &rejection_state,
-                            client_long_poll_id.as_ref(),
-                        )
-                        .await?
+                // A long poll whose ID names an older tip is answered on the new tip at once: the
+                // tip changed while it waited, the client sent it after the change, or this loop
+                // came back around after it.
+                //
+                // The first answer is the full template when the mempool already holds
+                // transactions for the new tip, so a miner that keeps its first answer does not
+                // mine an empty block while transactions wait. Otherwise it is the coinbase-only
+                // template, without waiting for the mempool to process the new block.
+                //
+                // A tip change wakes every waiting long poll at once. Only a few of them may
+                // build the full answer at the same time; the rest answer coinbase-only.
+                let carried_coinbase = tip_wake_coinbase.take();
+                let new_tip_mempool =
+                    if client_long_poll_id
+                        .as_ref()
+                        .is_some_and(|client_long_poll_id| {
+                            !LongPollInput::new(tip_height, tip_hash, max_time, vec![])
+                                .generate_id()
+                                .same_tip(client_long_poll_id)
+                        })
                     {
-                        return Ok(template);
-                    }
-                    continue 'rebuild;
-                }
+                        self.gbt
+                            .trace
+                            .tip_woke(request_id, Some((tip_height, tip_hash)));
+
+                        // A coinbase built in advance only fits the height it was built for. Discard
+                        // it after a multi-block advance, a reorg, or a spurious notification: its
+                        // BIP-34 height and subsidies wouldn't match the block.
+                        let next_height = tip_height.next().map_misc_error()?;
+                        let precomputed_coinbase = carried_coinbase
+                            .filter(|(coinbase_height, _)| *coinbase_height == next_height)
+                            .map(|(_, coinbase)| coinbase);
+
+                        // A shielded coinbase needs a proof that takes seconds. One built in advance
+                        // lets the miner start on the new tip at once, so that coinbase-only answer
+                        // is kept. A coinbase is only built in advance before ZIP 234 activates, so
+                        // its subsidy needs no issuance deficit.
+                        let coinbase_has_head_start = precomputed_coinbase.is_some()
+                            && coinbase_needs_proof(&self.network, next_height, miner_params, None)
+                                .map_misc_error()?;
+                        let populated_mempool = if coinbase_has_head_start {
+                            None
+                        } else if let Some(place) = self.gbt.try_reserve_full_first_answer() {
+                            let populated_mempool =
+                                self.populated_mempool_on_new_tip(tip_hash).await;
+                            if populated_mempool.is_some() {
+                                full_first_answer = Some(place);
+                            }
+                            populated_mempool
+                        } else {
+                            None
+                        };
+
+                        let Some(populated_mempool) = populated_mempool else {
+                            if let Some(template) = self
+                                .new_tip_template(
+                                    request_id,
+                                    precomputed_coinbase,
+                                    miner_params,
+                                    &chain_info,
+                                    &rejection_state,
+                                    client_long_poll_id.as_ref(),
+                                )
+                                .await?
+                            {
+                                return Ok(template);
+                            }
+                            continue 'rebuild;
+                        };
+                        Some(populated_mempool)
+                    } else {
+                        None
+                    };
 
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
@@ -3637,14 +3730,16 @@ where
                 //
                 // Optional TODO:
                 // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
-                let Some((mempool_txs, mempool_tx_deps)) =
-                    fetch_mempool_transactions(mempool.clone(), tip_hash)
+                let mempool_data = match new_tip_mempool {
+                    Some(populated_mempool) => Some(populated_mempool),
+                    None => fetch_mempool_transactions(mempool.clone(), tip_hash)
                         .await?
                         // If the mempool and state responses are out of sync:
                         // - if we are not long polling, omit mempool transactions from the template,
                         // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
-                        .or_else(|| client_long_poll_id.is_none().then(Default::default))
-                else {
+                        .or_else(|| client_long_poll_id.is_none().then(Default::default)),
+                };
+                let Some((mempool_txs, mempool_tx_deps)) = mempool_data else {
                     continue;
                 };
 
@@ -3808,39 +3903,11 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
-                        self.gbt
-                            .trace
-                            .tip_woke(request_id, self.latest_chain_tip.best_tip_height_and_hash());
-                        let precomputed_coinbase = precomputed_coinbase?;
-                        let chain_info = fetch_chain_info(read_state.clone()).await?;
-                        let Some(rejection_state) =
-                            self.track_template_parent(chain_info.tip_hash, &mut template_rejections)
-                        else {
-                            continue;
-                        };
-
-                        // Discard the precomputed coinbase if our `+2` guess was wrong
-                        // (multi-block advance, reorg, or spurious notification) — its
-                        // BIP-34 height and subsidies wouldn't match the block.
-                        let next_height = chain_info.tip_height.next().map_misc_error()?;
-                        let precomputed_coinbase = (next_height == precomputed_height)
-                            .then_some(precomputed_coinbase)
-                            .flatten();
-
-                        if let Some(template) = self
-                            .new_tip_template(
-                                request_id,
-                                precomputed_coinbase,
-                                miner_params,
-                                &chain_info,
-                                &rejection_state,
-                                client_long_poll_id.as_ref(),
-                            )
-                            .await?
-                        {
-                            return Ok(template);
-                        }
-                        continue 'rebuild;
+                        wait_reason = WaitReason::Tip;
+                        // The next pass of the loop sees that this request's long poll ID names
+                        // an older tip and answers it there, with this coinbase if it fits.
+                        tip_wake_coinbase = precomputed_coinbase?
+                            .map(|coinbase| (precomputed_height, coinbase));
                     }
 
                     // Testnet reaches this when minimum difficulty becomes valid.
@@ -3917,6 +3984,7 @@ where
                     submit_old,
                 )
                 .await?;
+            drop(full_first_answer);
             if let Some(response) = self
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?

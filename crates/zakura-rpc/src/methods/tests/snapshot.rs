@@ -471,7 +471,7 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         .expect_request_that(|request| matches!(request, mempool::Request::FullTransactions))
         .map(|responder| {
             responder.respond(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: blocks[blocks.len() - 1].hash(),
             });
@@ -1241,7 +1241,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                 .expect_request(mempool::Request::FullTransactions)
                 .await
                 .respond(mempool::Response::FullTransactions {
-                    transactions: vec![],
+                    transactions: vec![].into(),
                     transaction_dependencies: Default::default(),
                     // tip hash needs to match chain info for long poll requests
                     last_seen_tip_hash: fake_tip_hash,

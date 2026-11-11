@@ -22,9 +22,9 @@ use tower::{buffer::Buffer, BoxError};
 use zakura_chain::{block, chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_consensus::RouterError;
 use zakura_network::AddressBook;
-use zakura_node_services::mempool;
 #[cfg(feature = "indexer-rpc")]
 use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::mempool::{self, MempoolSnapshotReceiver};
 use zakura_state::{LatestChainTip, ReadStateService};
 
 #[cfg(feature = "indexer-rpc")]
@@ -86,6 +86,8 @@ impl ChainSyncStatus for NodeSyncStatus {
 pub struct NodeRpcServices {
     /// The buffered mempool service.
     pub mempool: NodeMempool,
+    /// The snapshots that mempool publishes.
+    pub mempool_snapshots: MempoolSnapshotReceiver,
     /// The buffered state service.
     pub state: NodeState,
     /// The read-only state service.
@@ -119,6 +121,7 @@ pub fn new_rpc_impl(
 ) -> (NodeRpcImpl, JoinHandle<()>) {
     let NodeRpcServices {
         mempool,
+        mempool_snapshots,
         state,
         read_state,
         block_verifier_router,
@@ -134,6 +137,7 @@ pub fn new_rpc_impl(
         build_version,
         user_agent,
         mempool,
+        mempool_snapshots,
         state,
         read_state,
         block_verifier_router,

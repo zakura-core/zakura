@@ -49,8 +49,9 @@ use zakura_consensus::{error::TransactionError, transaction};
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
-    Request, Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolSnapshot,
+    MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTxSubscriber, QueueSource, Request,
+    Response,
 };
 use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
@@ -640,6 +641,10 @@ pub struct Mempool {
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
 
+    /// Publishes the verified transactions and the block they were last checked against,
+    /// each time the mempool finishes processing.
+    snapshot_sender: MempoolSnapshotSender,
+
     /// Records how the mempool applies each best tip change.
     trace: MempoolTrace,
 }
@@ -685,6 +690,7 @@ impl Mempool {
                 .map(|ip| ip.to_canonical())
                 .collect(),
             verification_finished: Arc::new(Notify::new()),
+            snapshot_sender: MempoolSnapshotSender::new(),
             trace: MempoolTrace::default(),
         };
 
@@ -706,6 +712,42 @@ impl Mempool {
     /// A mempool request sent after this signal adds the verified transaction.
     pub(crate) fn verification_finished(&self) -> Arc<Notify> {
         self.verification_finished.clone()
+    }
+
+    /// Returns a reader of the snapshots this mempool publishes: its verified transactions
+    /// and the block they were last checked against.
+    ///
+    /// The mempool publishes one each time a request makes it process the chain tip and its
+    /// finished verifications. It is what [`Request::FullTransactions`] would answer at that
+    /// point, and is `None` while the mempool is not active.
+    pub(crate) fn snapshots(&self) -> MempoolSnapshotReceiver {
+        self.snapshot_sender.subscribe()
+    }
+
+    /// Publishes the verified transactions and the block they were last checked against, or
+    /// that the mempool is not active.
+    ///
+    /// Call this when the transactions and that block agree: after a new block's mined,
+    /// conflicting and expired transactions have been removed.
+    fn publish_snapshot(&mut self) {
+        let snapshot = match &mut self.active_state {
+            ActiveState::Disabled => None,
+            ActiveState::Enabled {
+                storage,
+                last_seen_tip_hash,
+                ..
+            } => {
+                let (transactions, transaction_dependencies) = storage.mining_snapshot();
+
+                Some(MempoolSnapshot {
+                    last_seen_tip_hash: *last_seen_tip_hash,
+                    transactions,
+                    transaction_dependencies,
+                })
+            }
+        };
+
+        self.snapshot_sender.publish(snapshot);
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -884,6 +926,7 @@ impl Service<Request> for Mempool {
         // When the mempool is disabled we still return that the service is ready.
         // Otherwise, callers could block waiting for the mempool to be enabled.
         if !self.is_enabled() {
+            self.publish_snapshot();
             return Poll::Ready(Ok(()));
         }
 
@@ -946,6 +989,7 @@ impl Service<Request> for Mempool {
                 );
             }
 
+            self.publish_snapshot();
             return Poll::Ready(Ok(()));
         }
 
@@ -1205,6 +1249,7 @@ impl Service<Request> for Mempool {
             }
         }
 
+        self.publish_snapshot();
         Poll::Ready(Ok(()))
     }
 
@@ -1312,8 +1357,7 @@ impl Service<Request> for Mempool {
                 Request::FullTransactions => {
                     trace!(?req, "got mempool request");
 
-                    let transactions: Vec<_> = storage.transactions().values().cloned().collect();
-                    let transaction_dependencies = storage.transaction_dependencies().clone();
+                    let (transactions, transaction_dependencies) = storage.mining_snapshot();
 
                     trace!(?req, transactions_count = ?transactions.len(), "answered mempool request");
 

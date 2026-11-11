@@ -920,10 +920,10 @@ where
     /// Reserves one of the [`MAX_FULL_FIRST_ANSWERS`] places for a long poll that answers on a
     /// new tip with the full template, or returns `None` when they are all taken.
     ///
-    /// The caller holds the place from before it asks the mempool until its template is built,
-    /// so a tip change that wakes many long polls starts a bounded amount of that work. This
-    /// never waits: a long poll that gets `None` answers with the coinbase-only template.
-    /// Dropping the place releases it.
+    /// The caller holds the place from before it reads the mempool's transactions until its
+    /// template is built, so a tip change that wakes many long polls starts a bounded amount
+    /// of that work. This never waits: a long poll that gets `None` answers with the
+    /// coinbase-only template. Dropping the place releases it.
     pub(crate) fn try_reserve_full_first_answer(&self) -> Option<OwnedSemaphorePermit> {
         self.full_first_answer_slots
             .clone()
@@ -1233,7 +1233,7 @@ pub(crate) fn coinbase_needs_proof(
 pub async fn fetch_mempool_transactions<Mempool>(
     mempool: Mempool,
     chain_tip_hash: block::Hash,
-) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
+) -> RpcResult<Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)>>
 where
     Mempool: Service<
             mempool::Request,

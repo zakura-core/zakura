@@ -1,6 +1,6 @@
 [package]
 name = "zakura-rpc"
-version = "17.0.0"
+version = "18.0.0"
 authors.workspace = true
 description = "The Zakura node's JSON Remote Procedure Call (JSON-RPC) interface. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -113,7 +113,7 @@ zakura-chain = { path = "../zakura-chain", version = "14.0.0", features = [
 zakura-consensus = { path = "../zakura-consensus", version = "17.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "16.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.1.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.5" }
 zakura-state = { path = "../zakura-state", version = "16.0.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }

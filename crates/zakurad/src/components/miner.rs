@@ -820,6 +820,7 @@ mod tests {
             "0.0.1",
             "miner test",
             mempool,
+            mempool::MempoolSnapshotSender::new().subscribe(),
             state,
             read_state,
             block_verifier,
@@ -874,7 +875,7 @@ mod tests {
             mempool_calls.send_modify(|calls| *calls += 1);
             async move {
                 Ok::<_, zakura_node_services::BoxError>(mempool::Response::FullTransactions {
-                    transactions: vec![],
+                    transactions: vec![].into(),
                     transaction_dependencies: Default::default(),
                     last_seen_tip_hash: parent,
                 })
@@ -919,6 +920,7 @@ mod tests {
             "0.0.1",
             "withdrawal test",
             Buffer::new(mempool, 1),
+            mempool::MempoolSnapshotSender::new().subscribe(),
             Buffer::new(state, 1),
             Buffer::new(read_state, 1),
             Buffer::new(verifier.clone(), 1),

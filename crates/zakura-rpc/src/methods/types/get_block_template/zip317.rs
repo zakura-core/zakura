@@ -6,7 +6,10 @@
 //! > when computing `size_target`, since there is no consensus requirement for this to be
 //! > exactly the same between implementations.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+};
 
 use rand_10::{
     distr::{Distribution, Open01},
@@ -85,12 +88,13 @@ pub fn select_mempool_transactions(
     height: Height,
     miner_params: &MinerParams,
     nsm_value_balance: Option<Amount<amount::NonNegative>>,
-    mempool_txs: Vec<VerifiedUnminedTx>,
-    mempool_tx_deps: TransactionDependencies,
+    mempool_txs: impl IntoIterator<Item = VerifiedUnminedTx>,
+    mempool_tx_deps: impl Borrow<TransactionDependencies>,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     let coinbase_resources =
         TransactionTemplate::coinbase_resource_usage(net, height, miner_params, nsm_value_balance)?;
 
+    let mempool_tx_deps = mempool_tx_deps.borrow();
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
         mempool_txs
@@ -116,7 +120,7 @@ pub fn select_mempool_transactions(
                 candidate_tx,
                 &mut dependent_mempool_txs,
                 &mut selected_txs,
-                &mempool_tx_deps,
+                mempool_tx_deps,
                 &mut limits,
             );
         }

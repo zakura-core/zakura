@@ -83,7 +83,7 @@ use zakura_consensus::{
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    self, CreatedOrSpent, MempoolService, TransactionDependencies,
+    self, CreatedOrSpent, MempoolService, MempoolSnapshotReceiver, TransactionDependencies,
 };
 use zakura_node_services::task::spawn_erased;
 use zakura_state::{
@@ -1067,6 +1067,10 @@ where
     /// A handle to the mempool service.
     mempool: Mempool,
 
+    /// The snapshots that mempool publishes: its verified transactions and the block they
+    /// were last checked against. Reading one sends the mempool no request.
+    mempool_snapshots: MempoolSnapshotReceiver,
+
     /// A handle to the state service.
     state: State,
 
@@ -1383,6 +1387,8 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Create a new instance of the RPC handler.
+    ///
+    /// `mempool_snapshots` must read the snapshots published by the mempool behind `mempool`.
     //
     // TODO:
     // - put some of the configs or services in their own struct?
@@ -1394,6 +1400,7 @@ where
         build_version: VersionString,
         user_agent: UserAgentString,
         mempool: Mempool,
+        mempool_snapshots: MempoolSnapshotReceiver,
         state: State,
         read_state: ReadState,
         block_verifier_router: BlockVerifierRouter,
@@ -1433,6 +1440,7 @@ where
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             mempool: mempool.clone(),
+            mempool_snapshots,
             state: state.clone(),
             read_state: read_state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
@@ -1642,19 +1650,46 @@ where
     }
 
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
-    /// the mempool has already processed that block and holds any.
+    /// the mempool has processed that block and holds any.
     ///
-    /// Returns `None` when the mempool is empty, is still on an older tip, takes longer than
-    /// [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the coinbase-only
-    /// template, so the mempool never delays work on a new tip by more than that wait.
+    /// Takes them from the snapshot the mempool publishes when that snapshot was checked
+    /// against `tip_hash`. The long poll then sends the mempool no request, so it does not
+    /// queue behind the mempool's other callers. A snapshot for any other block is never
+    /// used: while the published one is for another block, this asks the mempool, as it did
+    /// before snapshots, and takes the mempool's answer or a snapshot for `tip_hash`,
+    /// whichever comes first.
+    ///
+    /// Returns `None` when the mempool is empty, answers that it is still on an older tip,
+    /// takes longer than [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the
+    /// coinbase-only template, so the mempool never delays work on a new tip by more than
+    /// that wait.
     async fn populated_mempool_on_new_tip(
         &self,
         tip_hash: block::Hash,
-    ) -> Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)> {
-        let mempool_fetch =
+    ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
+        let mut mempool_snapshots = self.mempool_snapshots.clone();
+        let published = mempool_snapshots.on_tip(tip_hash);
+        let requested =
             types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
 
-        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_fetch).await {
+        let mempool_on_tip = async {
+            tokio::pin!(published, requested);
+
+            tokio::select! {
+                // The snapshot is checked first, and the request is only sent once it is
+                // polled: a snapshot that already names the tip costs the mempool nothing.
+                biased;
+
+                // A mempool that has shut down publishes nothing more. Its answer to the
+                // request, an error, then decides.
+                Some(snapshot) = &mut published => {
+                    Ok(Some((snapshot.transactions, snapshot.transaction_dependencies)))
+                }
+                answer = &mut requested => answer,
+            }
+        };
+
+        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_on_tip).await {
             Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
                 Some((transactions, dependencies))
             }
@@ -2923,7 +2958,7 @@ where
 
         match response {
             mempool::Response::FullTransactions {
-                mut transactions,
+                transactions,
                 transaction_dependencies,
                 last_seen_tip_hash: _,
             } => {
@@ -2951,6 +2986,7 @@ where
                     // hash in serialized byte order as a tie-breaker. Note that
                     // this is only done in not verbose because in verbose mode
                     // a dictionary is returned, where order does not matter.
+                    let mut transactions = Arc::unwrap_or_clone(transactions);
                     transactions.sort_by_cached_key(|tx| {
                         // zcashd uses modified fee here but Zebra doesn't currently
                         // support prioritizing transactions
@@ -3958,7 +3994,7 @@ where
                 } else {
                     None
                 },
-                mempool_txs,
+                mempool_txs.iter().cloned(),
                 mempool_tx_deps,
             )
             .map_misc_error()?;

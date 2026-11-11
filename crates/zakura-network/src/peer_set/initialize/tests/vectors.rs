@@ -189,8 +189,7 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     assert_alternating(&attempts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
     for pair in attempts.windows(2) {
         assert_eq!(
-            pair[1].1,
-            pair[0].1,
+            pair[1].1, pair[0].1,
             "serial startup attempts do not require a timer"
         );
     }

@@ -161,7 +161,7 @@ where
 
 impl<S> CandidateSet<S>
 where
-    S: Service<Request, Response = Response, Error = BoxError> + Send + 'static,
+    S: Service<Request, Response = Response, Error = BoxError> + Send,
     S::Future: Send + 'static,
 {
     /// Uses `address_book` and `peer_service` to manage a [`CandidateSet`] of peers.
@@ -186,7 +186,10 @@ where
     ///
     /// The returned future owns the crawl gate, not a borrow of this set, so
     /// callers can release their candidate-selection lock before awaiting it.
-    pub fn update(&mut self) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>> {
+    pub fn update(&mut self) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
+    where
+        S: 'static,
+    {
         self.update_timeout(None)
     }
 
@@ -227,7 +230,10 @@ where
     pub fn update_initial(
         &mut self,
         fanout_limit: usize,
-    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>> {
+    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
+    where
+        S: 'static,
+    {
         self.update_timeout(Some(fanout_limit))
     }
 
@@ -235,7 +241,10 @@ where
     fn update_timeout(
         &self,
         fanout_limit: Option<usize>,
-    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>> {
+    ) -> BoxFuture<'static, Result<Option<MorePeers>, BoxError>>
+    where
+        S: 'static,
+    {
         let crawler = self.crawler.clone();
         async move { crawler.lock().await.update_timeout(fanout_limit).await }.boxed()
     }

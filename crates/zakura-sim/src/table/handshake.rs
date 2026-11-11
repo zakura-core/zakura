@@ -939,25 +939,48 @@ fn check_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+// A deadline violation stops the trace before the handshake releases its claim.
 fn paced_control_reached(log: &crate::ObservationLog) -> bool {
     log.entries().iter().any(|entry| {
-        let Observation::Transport {
-            event:
-                TransportFact::Handshake {
-                    shared_id,
-                    stage,
-                    elapsed_ms: Some(elapsed),
-                    ..
-                },
+        let Observation::PeerHandshake {
+            shared_id,
+            row,
+            label,
             ..
         } = &entry.obs
         else {
             return false;
         };
-        stage == "released" && *elapsed >= 9_000 && log.entries().iter().any(|entry| {
-            matches!(&entry.obs, Observation::PeerHandshake { shared_id: sent_id, row, label, .. }
-                if sent_id == shared_id && row == "hello" && label == "paced")
-        })
+        if row != "hello" || label != "paced" {
+            return false;
+        }
+        let mut now = 0;
+        let mut started = None;
+        for entry in log.entries() {
+            match &entry.obs {
+                Observation::TimeAdvanced { to_ns, .. } => {
+                    now = *to_ns;
+                    if started.is_some_and(|start| now.saturating_sub(start) >= 9_000_000_000) {
+                        return true;
+                    }
+                }
+                Observation::Transport {
+                    event:
+                        TransportFact::Handshake {
+                            shared_id: observed,
+                            stage,
+                            ..
+                        },
+                    ..
+                } if observed == shared_id => match stage.as_str() {
+                    "started" => started = Some(now),
+                    "released" => started = None,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
     })
 }
 

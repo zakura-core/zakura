@@ -1187,7 +1187,8 @@ struct Deadlines {
     retirement: RetirementEvidence,
     ends: EndEvidence,
     recovery: RecoveryProgressInputs,
-    /// The finish, whose unpaid `Status` debts' deadlines it also offers.
+    /// The publication evidence the finish reads, whose unpaid `Status`
+    /// debts' deadlines it also offers.
     publication: PublicationEvidence,
 }
 

@@ -304,7 +304,7 @@ pub static NA_REASONS: &[NaProducer] = &[
         fingerprint: "d61ab900be190998",
         constructions: &[
             step(
-                "no commit, adoption, status debt or served page had applied by this step, or a corrupt engine state tainted the publication evidence",
+                "no commit publication, adoption or served page had applied by this step, or a corrupt engine state tainted the publication evidence",
                 RETURN,
             ),
         ],

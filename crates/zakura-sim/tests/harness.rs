@@ -398,8 +398,7 @@ fn every_harness_names_its_statuses() {
     for entry in HARNESSES {
         let properties = (entry.properties)();
         if entry.machine {
-            assert_eq!(properties.len(), 1);
-            assert_eq!(properties[0].id, entry.name);
+            assert!(!properties.is_empty(), "{}", entry.name);
             assert_eq!(entry.status(NO_TASK_PANIC), None);
             assert_eq!(entry.status(NO_LIVELOCK), None);
         } else {

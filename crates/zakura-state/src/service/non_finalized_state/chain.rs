@@ -50,6 +50,13 @@ mod height_map;
 #[cfg(feature = "internal-bench")]
 pub use height_map::benchmark::{benchmark_height_map, HeightMapBenchmarkSample};
 pub mod index;
+#[cfg(feature = "internal-bench")]
+mod transparent_index_benchmark;
+#[cfg(feature = "internal-bench")]
+pub use transparent_index_benchmark::{
+    benchmark_transparent_indexes, AllocationProbe, TransparentIndexBenchmarkConfig,
+    TransparentIndexBenchmarkSample,
+};
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
 /// to a non-finalized chain tip.

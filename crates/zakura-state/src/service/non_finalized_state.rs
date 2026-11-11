@@ -44,7 +44,10 @@ mod tests;
 pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 #[cfg(feature = "internal-bench")]
-pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
+pub use chain::{
+    benchmark_height_map, benchmark_transparent_indexes, AllocationProbe,
+    HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig, TransparentIndexBenchmarkSample,
+};
 pub(crate) use chain::{Chain, SpendingTransactionId};
 use proposal_results::{NotPrepared, PreparedProposal, ProposalResults};
 pub(crate) use shared_map::SharedMap;

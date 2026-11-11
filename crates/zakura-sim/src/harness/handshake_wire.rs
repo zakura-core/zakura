@@ -82,7 +82,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 5;
+    const GENERATOR: u32 = 6;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -361,8 +361,27 @@ impl Subsystem for Wire {
                     .parse()
                     .unwrap(),
                 );
-                script.open_delay_ms = u64::from(byte(2)) * 40;
-                scenario.peers = vec![PeerSpec::dialing(); usize::from(byte(3) % 32) + 1];
+                let stagger_ms = if byte(4) & 0x80 != 0 {
+                    u64::from(byte(4) & 0x7f).max(1) * 10
+                } else {
+                    0
+                };
+                script.open_delay_ms = if stagger_ms == 0 {
+                    u64::from(byte(2)) * 40
+                } else {
+                    0
+                };
+                scenario.peers = (0..=byte(3) % 32)
+                    .map(|index| {
+                        let mut peer = PeerSpec::dialing();
+                        peer.handshake = Some(HandshakeSpec {
+                            dial_delay_ms: u64::from(index) * stagger_ms,
+                            ..script.clone()
+                        });
+                        peer
+                    })
+                    .collect();
+                return scenario;
             }
             5 => {
                 script.control = if byte(3) == 0 {

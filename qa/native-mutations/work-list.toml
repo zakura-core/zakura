@@ -545,26 +545,26 @@ id = "handshake-admission"
 kind = "shared-definition"
 claim = "Production admission counts and live permits preserve pending, address, and outbound-reserve bounds."
 check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
-shared = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+shared = []
 
 [[entry.instance]]
 property = "handshake/pending-bounded"
-code = []
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
 witness = { test = "shared_addresses_hold_pending_and_permit_bounds", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/connections-per-address-bounded"
-code = []
-witness = { test = "inbound_connection_pressure_preserves_a_wire_dial", test_target = "handshake" }
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "shared_address_registrations_stop_at_the_cap", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/counts-match-permits"
-code = []
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
 witness = { test = "counts_trace_replays_with_each_named_rule", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/dial-reserve-kept"
-code = []
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
 witness = { test = "inbound_control_pressure_preserves_a_wire_dial", test_target = "handshake" }
 
 [[entry]]

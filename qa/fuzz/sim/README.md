@@ -32,14 +32,16 @@ whose target has no harness or no campaign.
 ## Targets
 
 - `handshake_wire` runs `handshake/wire` against the production QUIC endpoint
-  and protocol handler. Decoder v5's 32-byte prefix chooses control corruption,
+  and protocol handler. Decoder v6's 32-byte prefix chooses control corruption,
   prelude corruption, pacing, shared addresses, failed retries, capability flips,
   inbound pressure during node dials, invalid stream-open churn, or partial and complete session offers.
+  The shared-address family can stagger attempts to reach the registered cap.
   Remaining bytes choose the schedule.
 - `handshake_counts` runs `handshake/counts` against production admission
   decisions. Its three-byte operations choose an action, owner slot, and
-  address. Decoder v2 reads up to 1,536 bytes and tracks 128 owner slots.
-  The harness checks charges against independent live owners.
+  address. Decoder v3 reads up to 1,536 bytes and tracks 128 owner slots.
+  A high first bit selects an address, pending, or connection burst before
+  the remaining operations. The harness checks charges against independent live owners.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of

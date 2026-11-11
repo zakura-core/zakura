@@ -47,7 +47,7 @@ const MACHINE: Machine = Machine {
             "Machine charges equal the live connection, handshake, and registration owners.",
         ),
     ],
-    generator: 2,
+    generator: 3,
     budget: 513,
     history,
     reached: |steps, _| {
@@ -182,19 +182,51 @@ fn failure(failures: &mut Vec<(String, MachineFailure)>, id: &str, message: impl
     ));
 }
 
+/// Expands a tagged input into an admission burst followed by ordinary operations.
+/// The burst makes address, pending, and connection limits reachable in short searches.
+fn operations(input: &[u8]) -> Vec<u8> {
+    if !input.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return input.iter().take(1536).copied().collect();
+    }
+    let mode = input.get(1).copied().unwrap_or_default() % 3;
+    let host = input.get(2).copied().unwrap_or_default() & 0x7f;
+    let mut operations = Vec::new();
+    match mode {
+        0 => {
+            for slot in 0..18 {
+                operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
+            }
+        }
+        1 => {
+            for slot in 0..26 {
+                let host = slot % 4 + (slot / 12) * 8;
+                operations.extend([0, slot, host, 2, slot, 0]);
+            }
+            for slot in 26..34 {
+                operations.extend([1, slot, 0, 2, slot, 0]);
+            }
+        }
+        _ => {
+            for slot in 0..70u8 {
+                let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+                operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
+            }
+            for slot in 70..94 {
+                operations.extend([1, slot, 0]);
+            }
+        }
+    }
+    operations.extend([4, 0, 0]);
+    operations.extend(input.iter().skip(3).take(1536 - operations.len()));
+    operations
+}
+
 fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut counts = HandshakeCounts::default();
     let mut owners = [None; SLOTS];
     let mut history = Vec::new();
     let mut active = false;
-    for (index, bytes) in input
-        .iter()
-        .take(1536)
-        .copied()
-        .collect::<Vec<_>>()
-        .chunks(3)
-        .enumerate()
-    {
+    for (index, bytes) in operations(input).chunks(3).enumerate() {
         let op = bytes[0] % 7;
         let slot = usize::from(*bytes.get(1).unwrap_or(&0)) % SLOTS;
         let arg = *bytes.get(2).unwrap_or(&0);
@@ -454,5 +486,20 @@ mod tests {
         }
         input.extend([6, 0, 0]);
         holds(&input);
+    }
+
+    #[test]
+    fn generated_bursts_reach_each_admission_boundary() {
+        for mode in 0..3 {
+            let input = [0x80, mode, 0];
+            holds(&input);
+            assert!(history(&input).iter().any(|(_, step)| matches!(step,
+                MachineStep::Handshake(step) if match mode {
+                    0 => step.actual.registered[0] == ADDRESS_CAP,
+                    1 => step.actual.inbound_pending == INBOUND_CAP && step.actual.pending == PENDING_CAP,
+                    _ => step.actual.inbound_connections == INBOUND_CONNECTION_CAP && step.actual.connections == CONNECTION_CAP,
+                }
+            )), "burst {mode} must reach its admission boundary");
+        }
     }
 }

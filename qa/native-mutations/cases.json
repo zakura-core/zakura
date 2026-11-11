@@ -1086,5 +1086,15 @@
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-admission/allow-one-extra-registration/allow-one-extra-registration.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/connections-per-address-bounded",
+    "witness": {
+      "test": "shared_address_registrations_stop_at_the_cap",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
   }
 ]

@@ -102,6 +102,49 @@ fn shared_addresses_hold_pending_and_permit_bounds() {
     }
 }
 
+#[test]
+fn shared_address_registrations_stop_at_the_cap() {
+    use zakura_sim::{observe::TransportFact, Observation};
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[..5].copy_from_slice(&[4, 0, 0, 16, 0x80 | 10]);
+    let report = run(Wire::draw(&input));
+    assert_witness_holds(&report, "handshake/connections-per-address-bounded");
+    assert_held(&report, "handshake/counts-match-permits");
+    let accepted = report.log.entries().iter().filter(|entry| matches!(&entry.obs,
+        Observation::Transport { event: TransportFact::Handshake { stage, error: None, .. }, .. }
+            if stage == "hello"
+    )).count();
+    let registered = report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Transport {
+                    event: TransportFact::Registered,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        accepted, 17,
+        "all control exchanges must reach registration admission"
+    );
+    assert_eq!(
+        registered, 16,
+        "the address cap must refuse the seventeenth registration"
+    );
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(&entry.obs,
+            Observation::Transport { event: TransportFact::HandshakeCounts { hosts, .. }, .. }
+                if hosts.iter().any(|(_, registered, _)| *registered == 16)
+        )),
+        "one address must hold sixteen registrations at once"
+    );
+}
+
 fn assert_dial_under_load(report: &zakura_sim::RunReport, pending: usize, connections: usize) {
     use zakura_sim::{observe::TransportFact, Observation};
     assert_held(report, "handshake/dial-reserve-kept");

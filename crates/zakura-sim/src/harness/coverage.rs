@@ -294,6 +294,16 @@ const fn handshake_guard(
 
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
+    Coverage {
+        property: "handshake/connections-per-address-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "shared_address_registrations_stop_at_the_cap",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/allow-one-extra-registration/allow-one-extra-registration.patch",
+        ),
+    },
     handshake_guard(
         "handshake/prelude/bad-magic-resets",
         "handshake-table/skip-prelude-magic/skip-prelude-magic.patch",

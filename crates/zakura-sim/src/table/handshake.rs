@@ -154,7 +154,8 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_counts::<S>,
-            witness: None,
+            witness: (id == "handshake/connections-per-address-bounded")
+                .then_some(TriggerHistory::Log(registered_address_reached)),
         });
     }
     properties.push(Property {
@@ -330,6 +331,13 @@ fn capability_flip_reached(log: &crate::ObservationLog) -> bool {
         }
     }
     false
+}
+
+fn registered_address_reached(log: &crate::ObservationLog) -> bool {
+    log.entries().iter().any(|entry| matches!(&entry.obs,
+        Observation::Transport { event: TransportFact::HandshakeCounts { address_cap, hosts, .. }, .. }
+            if *address_cap > 0 && hosts.iter().any(|(_, registered, _)| registered >= address_cap)
+    ))
 }
 
 fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {

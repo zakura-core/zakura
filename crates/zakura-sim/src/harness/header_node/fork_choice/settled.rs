@@ -42,6 +42,13 @@
 //! short of it is idle with a heavier offer it never fetched. It's judged
 //! at the point, with no deadline, so no fairness or bounded-delivery
 //! assumption is needed.
+//!
+//! The same reason leaves one case out. A mirror whose streams are dropped
+//! before either reactor holds a session, with no connection or session
+//! token cancelled, reports no decision and ends no link, so it never
+//! resolves and no point is settled. A run at rest can't tell that mirror
+//! from one still connecting without assuming the connection completes, so
+//! a node that never connects is a progress defect, not this rule's.
 
 use std::collections::HashSet;
 

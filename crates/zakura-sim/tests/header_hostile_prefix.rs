@@ -14,7 +14,7 @@ use support::{
 use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
-    check::{after_step, PropertyOutcome},
+    check::{after_step, NaReason, PropertyOutcome},
     domain::{
         header_sync::PEER_RETIREMENT_PROGRESS,
         header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
@@ -35,7 +35,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
-    property::{CheckEvent, Inconclusive, Lifecycle},
+    property::{CheckEvent, Lifecycle},
     By, Checker, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanChoice, PlanInput,
     PropertyReport, Record, RunEnd, RunReport, StepCtx, Violation,
 };
@@ -115,6 +115,11 @@ impl Checker for Watch {
         Vec::new()
     }
 
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
+
     /// Keeps the property's lifecycle points until the step's `after_step`.
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.pending
@@ -166,10 +171,11 @@ fn run(class: &str, scenario: &StorageScenario, input: PlanInput) -> Run {
     for property in &report.properties {
         if property.property != BOUNDED_ADVERSARY_PROGRESS {
             assert!(
-                matches!(
-                    property.outcome,
-                    PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-                ),
+                match &property.outcome {
+                    PropertyOutcome::Held { .. } => true,
+                    PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                    PropertyOutcome::Violated { .. } => false,
+                },
                 "{class}: {}: {:?}",
                 property.property,
                 property.outcome
@@ -285,9 +291,11 @@ fn the_surviving_peer_completes_a_departed_target() {
 /// The loss path: the declared stall's recovery owes the node the grown
 /// tip, and the harness closes the source right after the `recovered`
 /// pick, a close only a typed scenario can take. That ends
-/// `StableMembership` and `HonestPeer` with the obligation open, so the
-/// property ends `Inconclusive` with `assumption-lost`, not violated, and
-/// the registry reports `Lifecycle::AssumptionLost` once, under 8 plans.
+/// `StableMembership` and `HonestPeer` with the obligation open, which
+/// withdraws it, so the property isn't violated: it ends `Held` on the one
+/// evaluation that opened the obligation, since a loss leaves
+/// `assumption-lost` only when nothing applied in the whole run (#1840 rule
+/// 4). The registry reports `Lifecycle::AssumptionLost` once, under 8 plans.
 #[test]
 fn closing_the_source_after_recovered_loses_the_assumptions() {
     let mut scenario = storage_witnesses::grown_source();
@@ -304,9 +312,7 @@ fn closing_the_source_after_recovered_loses_the_assumptions() {
         let run = run("loss", &scenario, input);
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
-            &PropertyOutcome::Inconclusive {
-                reason: Inconclusive::AssumptionLost.to_string()
-            }
+            &PropertyOutcome::Held { applicable: 1 }
         );
         let record = run.recovery.record().expect("the pick wrote its record");
         let close = run
@@ -349,8 +355,8 @@ fn closing_the_source_after_recovered_loses_the_assumptions() {
 /// declared stall's close of its source is gated to half a second, so after
 /// the pick the clock stops at exactly 500 ms rather than running to the
 /// grown tip's status floor at one second. The close then comes before the
-/// deadline with the obligation open, so the assumptions are lost, under 8
-/// plans. (Time advances are actions too, so the close may follow one.)
+/// deadline with the obligation open, so the assumptions are lost and it's
+/// withdrawn, leaving the property `Held`, under 8 plans. (Time advances are actions too, so the close may follow one.)
 #[test]
 fn a_delayed_close_after_recovered_keeps_its_time() {
     let mut scenario = storage_witnesses::grown_source();
@@ -363,9 +369,7 @@ fn a_delayed_close_after_recovered_keeps_its_time() {
         let run = run("delayed close", &scenario, input);
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
-            &PropertyOutcome::Inconclusive {
-                reason: Inconclusive::AssumptionLost.to_string()
-            }
+            &PropertyOutcome::Held { applicable: 1 }
         );
         let record = run.recovery.record().expect("the pick wrote its record");
         assert!(
@@ -881,7 +885,7 @@ fn a_source_cooling_down_on_the_node_isnt_unreached() {
         assert!(relinks >= 2, "the first relink is refused: {relinks}");
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
-            &PropertyOutcome::NotApplicable
+            &PropertyOutcome::not_applicable(NaReason::NeverApplied)
         );
     }
 }

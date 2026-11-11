@@ -55,7 +55,8 @@ pub enum Lifecycle {
     /// One of its obligations expired undischarged.
     Expired,
     /// One of its assumptions stopped holding while obligations were open,
-    /// which ended them all, `Inconclusive` with `assumption-lost`.
+    /// which withdrew them all. The property is `NotApplicable` with
+    /// `assumption-lost` only if no evaluation applied in the whole run.
     AssumptionLost,
 }
 

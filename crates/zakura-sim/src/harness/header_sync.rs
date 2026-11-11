@@ -2157,6 +2157,29 @@ impl ActionSource for RecoveryDeadline {
     fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
         unreachable!("the recovery deadline source offers no action")
     }
+
+    /// The same boundary, so the drain's clock reaches an owed recovery's
+    /// deadline too, and nothing else.
+    fn recovery(&self, now: SimInstant, out: &mut crate::RecoveryOffer) {
+        let mut boundaries = Vec::new();
+        self.boundaries(now, &mut boundaries);
+        out.boundaries.extend(
+            boundaries
+                .into_iter()
+                .filter_map(|boundary| match boundary {
+                    Boundary::Opens(at) => Some(at),
+                    Boundary::Deadline(_) => None,
+                }),
+        );
+    }
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The steps a `header-sync/storage` run with a `Recover` step may take.
@@ -2279,6 +2302,20 @@ impl ActionSource for RecoveryFinish {
             ));
         }
         Ok(())
+    }
+
+    /// Nothing: the finish begins the node's stop, new scenario work as a
+    /// `Shutdown` step is, so the drain doesn't offer it. An owed recovery
+    /// the drain reaches still expires at its deadline
+    /// ([`RecoveryDeadline`]).
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: a picked finish is carried out by a task the drain runs.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -2970,6 +3007,7 @@ mod tests {
                 budget: 10,
                 now,
                 status: SchedulerStatus::Quiescent,
+                quiescent: false,
                 log: &log,
             };
             let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);

@@ -478,7 +478,9 @@ fn a_spin_after_recovered_violates_no_livelock() {
         assert!(
             matches!(
                 progress.outcome,
-                zakura_sim::check::PropertyOutcome::Inconclusive { .. }
+                zakura_sim::check::PropertyOutcome::NotApplicable {
+                    reason: zakura_sim::check::NaReason::StoppedByViolation
+                }
             ),
             "the obligation was still open: {:?}",
             progress.outcome

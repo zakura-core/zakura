@@ -9,7 +9,7 @@ index 7aa1720809..16039012ce 100644
 -            self.consider_advertised_header_target(peer, target.session_id, target.status);
 +            // Mutation: the cached pass drops the waiting peer instead of
 +            // offering its target.
-+            self.handle_peer_disconnected(&peer, target.session_id, "planted");
++            self.drop_unproductive_peer(&peer, target.session_id, "planted");
          }
          self.state.finish_cached_pass(opportunity, Instant::now());
      }

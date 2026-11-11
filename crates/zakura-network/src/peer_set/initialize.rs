@@ -645,11 +645,12 @@ where
 /// Startup admits at most `peerset_initial_target_size` attempts, and at most
 /// `max_connections_per_ip` per IP. Every candidate reaches the address book.
 ///
-/// Startup waits for seeds only when cached peers cannot fill the startup target.
-/// Otherwise, seeds that are still resolving when every admitted attempt has finished
-/// are returned unresolved, and reach discovery after they resolve. With a startup
-/// target of one, a cached peer therefore takes the slot when seeds resolve later
-/// than the cache loads.
+/// Startup waits for seeds only when cached peers cannot fill the startup target
+/// and no connection remains live. A working cached connection must not depend on
+/// DNS before initialization can finish. Seeds still resolving when every admitted
+/// attempt has finished are returned unresolved, and reach discovery after they resolve.
+/// With a startup target of one, a cached peer therefore takes the slot when seeds
+/// resolve later than the cache loads.
 async fn dial_initial_peers<S>(
     config: Config,
     seed_peers: BoxFuture<'static, Vec<PeerSocketAddr>>,
@@ -734,9 +735,11 @@ where
             });
         }
 
-        // Cached peers alone cannot fill the target, so wait for seeds.
-        let must_wait_for_seeds =
-            admitted_total < config.peerset_initial_target_size && !seed_peers.is_terminated();
+        // Keep the seed fallback when an undersized cache has no live connection.
+        // A working cached connection must let initialization finish without DNS.
+        let must_wait_for_seeds = admitted_total < config.peerset_initial_target_size
+            && !seed_peers.is_terminated()
+            && active_outbound_connections.update_count() == 0;
         if handshakes.is_empty() && !must_wait_for_seeds {
             break;
         }

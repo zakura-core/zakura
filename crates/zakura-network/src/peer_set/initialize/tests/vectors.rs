@@ -421,7 +421,11 @@ async fn delayed_seeds_respect_a_full_cached_startup_window() {
     let window = constants::INITIAL_PEER_DIAL_CONCURRENCY;
     let target = window + 1;
     let cached: IndexSet<PeerSocketAddr> = (1..=target)
-        .map(|i| format!("127.0.{}.{}:8233", i / 256, i % 256).parse().unwrap())
+        .map(|i| {
+            format!("127.0.{}.{}:8233", i / 256, i % 256)
+                .parse()
+                .unwrap()
+        })
         .collect();
     let seed: PeerSocketAddr = "127.1.0.1:8233".parse().unwrap();
 
@@ -648,13 +652,14 @@ async fn failed_cached_attempt_with_pending_cleanup_waits_for_seeds() {
         let (seed_tx, seed_rx) = tokio::sync::oneshot::channel();
         let (peerset_tx, mut peerset_rx) = mpsc::channel(10);
         let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
-        let mut startup = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
-            config,
-            async move { seed_rx.await.unwrap() }.boxed(),
-            connector,
-            peerset_tx,
-            book_tx,
-        )));
+        let mut startup =
+            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(dial_initial_peers(
+                config,
+                async move { seed_rx.await.unwrap() }.boxed(),
+                connector,
+                peerset_tx,
+                book_tx,
+            )));
         let mut attempts = IndexSet::new();
         for _ in 0..cache.len() {
             attempts.insert(next_attempt(&mut attempt_rx).await);

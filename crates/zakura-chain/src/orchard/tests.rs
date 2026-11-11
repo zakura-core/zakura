@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_in_result)]
 
+mod batch_decode;
 mod preallocate;
 mod proof_size;
 mod prop;

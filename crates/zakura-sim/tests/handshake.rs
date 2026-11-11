@@ -851,7 +851,13 @@ fn pending_transport_load_bounds_outbound_control_handshakes() {
         reorder: false,
         loss_budget: 0,
     };
-    scenario.peers = (0..8).map(|_| PeerSpec::dialing()).collect();
+    scenario.peers = (0..8)
+        .map(|_| {
+            let mut peer = PeerSpec::dialing();
+            peer.handshake = Some(HandshakeSpec::default());
+            peer
+        })
+        .collect();
     for (index, peer) in scenario.peers.iter().enumerate() {
         scenario.net.links.push(LinkEntry {
             src: NODE_ADDR,
@@ -872,7 +878,10 @@ fn pending_transport_load_bounds_outbound_control_handshakes() {
         });
         peer
     }));
-    let report = run(scenario);
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[..7].copy_from_slice(&[7, 8, 31, 0, 2, 0, 0x80]);
+    assert_eq!(Wire::draw(&input), scenario);
+    let report = run(Wire::draw(&input));
     assert_held(&report, "handshake/pending-bounded");
     assert_held(&report, "handshake/counts-match-permits");
     assert!(

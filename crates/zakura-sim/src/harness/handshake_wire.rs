@@ -470,8 +470,9 @@ impl Subsystem for Wire {
                 script.dial_delay_ms = 1;
             }
             7 => {
-                let incoming = usize::from(byte(1) % 96);
-                let outgoing = usize::from(byte(2) % 8) + 1;
+                let transport_pressure = byte(6) & 0x80 != 0;
+                let incoming = usize::from(byte(1) % if transport_pressure { 9 } else { 96 });
+                let outgoing = usize::from(byte(2) % if transport_pressure { 32 } else { 8 }) + 1;
                 scenario.peers = (0..incoming)
                     .map(|index| {
                         let mut peer = PeerSpec::dialing();
@@ -487,11 +488,31 @@ impl Subsystem for Wire {
                         let mut peer = PeerSpec::listening();
                         peer.handshake = Some(HandshakeSpec {
                             dial_delay_ms: u64::from(byte(4)) * 10,
+                            length_delay_ms: if transport_pressure { 8_000 } else { 0 },
                             ..HandshakeSpec::default()
                         });
                         peer
                     }))
                     .collect();
+                if transport_pressure {
+                    scenario.net.default_link = super::LinkSpec {
+                        min_delay_ms: 0,
+                        max_delay_ms: 0,
+                        reorder: false,
+                        loss_budget: 0,
+                    };
+                    for (index, peer) in scenario.peers.iter().take(incoming).enumerate() {
+                        scenario.net.links.push(super::LinkEntry {
+                            src: NODE_ADDR,
+                            dst: peer.address(index, 0),
+                            model: super::LinkSpec {
+                                min_delay_ms: 9_000,
+                                max_delay_ms: 9_000,
+                                ..scenario.net.default_link
+                            },
+                        });
+                    }
+                }
                 return scenario;
             }
             8 => {

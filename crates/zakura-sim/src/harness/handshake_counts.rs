@@ -71,7 +71,7 @@ const MACHINE: Machine = Machine {
             Status::Active,
         ),
     ],
-    generator: 4,
+    generator: 5,
     budget: 513,
     history,
     reached: |steps, _| {
@@ -223,6 +223,15 @@ fn operations(input: &[u8]) -> Vec<u8> {
         0 => {
             for slot in 0..18 {
                 operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
+            }
+        }
+        1 if input.get(2).is_some_and(|byte| byte & 0x80 != 0) => {
+            for slot in 0..24u8 {
+                let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+                operations.extend([0, slot, host]);
+            }
+            for slot in 24..33 {
+                operations.extend([1, slot, 0, 2, slot, 0]);
             }
         }
         1 => {
@@ -639,20 +648,11 @@ mod tests {
 
     #[test]
     fn outbound_control_claims_include_pending_quic_owners() {
-        let mut input = Vec::new();
-        for slot in 0..24u8 {
-            let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
-            input.extend([0, slot, host]);
-        }
-        for slot in 24..33 {
-            input.extend([1, slot, 0, 2, slot, 0]);
-        }
+        let input = [0x80, 1, 0x80];
         let steps = history(&input);
-        let MachineStep::Handshake(last) = &steps[steps.len() - 2].1 else {
-            panic!("the admission harness records handshake steps");
-        };
-        assert_eq!(last.actual.pending, 8);
-        assert_eq!(last.actual.inbound_pending, 0);
+        assert!(steps.iter().any(|(_, step)| matches!(step,
+            MachineStep::Handshake(step) if step.actual.pending == 8 && step.actual.inbound_pending == 0
+        )));
         assert!(steps.iter().all(|(_, step)| step.failure().is_none()));
         (ENTRY.witness)(
             &(ENTRY.draw)(&input),

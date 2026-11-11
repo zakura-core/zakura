@@ -173,6 +173,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![128, 1, 128],
+        }),
         "handshake-counts-cadence" => value(zakura_sim::record::machine::MachineScenario {
             input: [8, 0, 0].repeat(32),
         }),

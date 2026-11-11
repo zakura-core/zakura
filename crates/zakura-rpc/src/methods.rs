@@ -738,7 +738,7 @@ pub trait RpcServer {
     ///
     /// Zebra verifies blocks in parallel, and keeps recent chains in parallel,
     /// so moving between chains and forking chains is very cheap.
-    #[method(name = "getblocktemplate")]
+    #[method(name = "getblocktemplate", response = crate::methods::types::get_block_template::json::encode_response)]
     async fn get_block_template(
         &self,
         parameters: Option<GetBlockTemplateParameters>,

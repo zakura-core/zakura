@@ -56,6 +56,10 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             if meta.path.is_ident("name") {
                 name = Some(meta.value()?.parse::<syn::LitStr>()?.value());
                 Ok(())
+            } else if meta.path.is_ident("response") {
+                // A JSON response adapter changes encoding, not the documented RPC contract.
+                let _: syn::Path = meta.value()?.parse()?;
+                Ok(())
             } else {
                 Err(meta.error("unsupported RPC method attribute"))
             }

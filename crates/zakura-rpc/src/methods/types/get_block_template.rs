@@ -1,5 +1,6 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
+pub(crate) mod json;
 mod miner_address;
 
 pub mod constants;
@@ -303,7 +304,7 @@ type InBlockTxDependenciesDepth = usize;
 /// This is the output of the `getblocktemplate` RPC in the default 'template' mode. See
 /// [`BlockProposalResponse`] for the output in 'proposal' mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new)]
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, Getters, CopyGetters, new)]
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
@@ -457,6 +458,12 @@ pub struct BlockTemplateResponse {
     #[serde(rename = "submitold")]
     #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
+}
+
+impl serde::Serialize for BlockTemplateResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&json::ordinary(self), serializer)
+    }
 }
 
 impl fmt::Debug for BlockTemplateResponse {

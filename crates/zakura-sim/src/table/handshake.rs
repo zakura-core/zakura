@@ -408,7 +408,7 @@ where
             match event {
                 TransportFact::Handshake { .. }
                 | TransportFact::QuicHandshakeFinished { error: None, .. }
-                | TransportFact::Registered { .. } => {
+                | TransportFact::Registered => {
                     return cx
                         .violated("TLS rejects the unsupported protocol or wrong key", address);
                 }
@@ -1308,12 +1308,12 @@ fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         else {
             continue;
         };
-        if (stage == row && error.is_none()) || stage == "registered" {
-            if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+        if ((stage == row && error.is_none()) || stage == "registered")
+            && cx.log.entries().iter().any(|entry| matches!(&entry.obs,
                 Observation::PeerHandshake { shared_id: sent_id, row: sent_row, label: sent_label, .. }
-                    if sent_id == shared_id && sent_row == row && sent_label == label)) {
-                return cx.violated("the node never accepts a malformed control exchange", shared_id);
-            }
+                    if sent_id == shared_id && sent_row == row && sent_label == label))
+        {
+            return cx.violated("the node never accepts a malformed control exchange", shared_id);
         }
     }
     for (at, obs) in cx.observations().enumerate() {

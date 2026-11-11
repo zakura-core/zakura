@@ -1811,18 +1811,153 @@ fn waiting_long_poll_builds_the_template_for_its_tip() {
             .unwrap()
             .try_into_template()
             .unwrap();
-        tokio::spawn(rpc.clone().run_template_builder());
         let mut waiting = long_poll(&rpc, initial.long_poll_id);
         assert!(futures::poll!(&mut waiting).is_pending());
 
+        let mut builder_rpc = rpc.clone();
+        let read_state = builder_rpc.read_state.clone();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let builder_reads = reads.clone();
+        builder_rpc.read_state =
+            tower::util::BoxCloneSyncService::new(tower::service_fn(move |request| {
+                builder_reads.fetch_add(1, Ordering::SeqCst);
+                read_state.clone().oneshot(request)
+            }));
+        // Keep the long poll from answering while the builder's backoff timer expires.
+        // A competing builder would read state and claim this tip's shared template.
+        let gate = TemplateBuildGate::new(&rpc).await;
+        tokio::time::pause();
+        let mut builder = Box::pin(builder_rpc.run_template_builder());
+        assert!(futures::poll!(&mut builder).is_pending());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
         let next = chain_info(3, 2, 400_000_000);
         move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        tokio::time::advance(WAITING_LONG_POLL_CHECK_INTERVAL).await;
+        assert!(futures::poll!(&mut builder).is_pending());
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the background builder must not fetch state while a long poll waits"
+        );
+        assert!(rpc
+            .gbt
+            .shared_template
+            .wait_for(next.tip_hash, &populated_template_id(&next))
+            .now_or_never()
+            .expect("no background build may hold the shared template")
+            .is_none());
+
+        tokio::time::resume();
+        gate.release().await;
         let answered = bounded(waiting).await.unwrap().try_into_template().unwrap();
         let stored = template_built_ahead(&rpc, &next).await;
 
         assert_eq!(answered.previous_block_hash, next.tip_hash);
         assert_eq!(answered.transactions.len(), 1);
         assert_eq!(answered.work_id(), stored.work_id());
+        assert!(!rpc.gbt.has_waiting_long_poll());
+    });
+}
+
+/// A reorg cancels the background build's claim even while construction is waiting for
+/// capacity. Once capacity returns, only work for the replacement parent is published.
+#[test]
+fn build_ahead_waiting_for_capacity_is_cancelled_on_a_reorg() {
+    mining_runtime(async {
+        let old = chain_info(3, 2, 400_000_000);
+        let (info_tx, info) = watch::channel(old.clone());
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &old);
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let mut builder = Box::pin(rpc.clone().run_template_builder());
+
+        assert!(futures::poll!(&mut builder).is_pending());
+        let old_id = populated_template_id(&old);
+        assert!(rpc
+            .gbt
+            .shared_template
+            .wait_for(old.tip_hash, &old_id)
+            .now_or_never()
+            .is_none());
+
+        // Replace the parent at the same height while its template owns the claim.
+        let mut replacement = chain_info(3, 3, 400_000_000);
+        // Repeated-byte hashes have the same long-poll checksum; give the replacement
+        // a distinct checksum so looking up the old ID also distinguishes the two builds.
+        replacement.tip_hash.0[0] ^= 1;
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &replacement);
+        assert!(futures::poll!(&mut builder).is_pending());
+        assert!(rpc
+            .gbt
+            .shared_template
+            .wait_for(old.tip_hash, &old_id)
+            .now_or_never()
+            .expect("the reorg must release the old build's claim")
+            .is_none());
+        assert!(rpc
+            .gbt
+            .shared_template
+            .wait_for(replacement.tip_hash, &populated_template_id(&replacement))
+            .now_or_never()
+            .is_none());
+
+        let builder = tokio::spawn(builder);
+        gate.release().await;
+        let stored = template_built_ahead(&rpc, &replacement).await;
+        assert_eq!(stored.previous_block_hash, replacement.tip_hash);
+        assert!(rpc.gbt.shared_template.ready(&old_id).is_none());
+        let answer = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(answer.previous_block_hash, replacement.tip_hash);
+        assert_eq!(answer.work_id(), stored.work_id());
+        builder.abort();
+        assert!(builder.await.unwrap_err().is_cancelled());
+    });
+}
+
+/// A rejection that arrives after the background build claims its template prevents
+/// that work from being served, even if construction subsequently publishes it.
+#[test]
+fn build_ahead_rejected_while_waiting_for_capacity_is_not_served() {
+    mining_runtime(async {
+        let next = chain_info(3, 2, 400_000_000);
+        let (info_tx, info) = watch::channel(next.clone());
+        let (rpc, tip, mempool_snapshots, _) = populated_mining_rpc(info);
+        move_populated_tip(&info_tx, &tip, &mempool_snapshots, &next);
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let mut builder = Box::pin(rpc.clone().run_template_builder());
+        assert!(futures::poll!(&mut builder).is_pending());
+        let id = populated_template_id(&next);
+        assert!(rpc
+            .gbt
+            .shared_template
+            .wait_for(next.tip_hash, &id)
+            .now_or_never()
+            .is_none());
+
+        rpc.gbt.template_rejections.send_modify(|state| {
+            state.reject(next.tip_hash, "rejected-before-publication");
+        });
+        let revision = rpc.gbt.template_rejections.borrow().revision;
+        assert_ne!(revision, id.revision);
+
+        let builder = tokio::spawn(builder);
+        gate.release().await;
+        template_built_ahead(&rpc, &next).await;
+        let shared = rpc.gbt.shared_template.ready(&id).unwrap();
+        assert!(bounded(rpc.reuse_shared_template(shared, None))
+            .await
+            .unwrap()
+            .is_none());
+        let state = rpc.gbt.template_rejections.borrow();
+        assert!(state.needs_fallback());
+        assert_eq!(state.revision, revision);
+        drop(state);
+        builder.abort();
+        assert!(builder.await.unwrap_err().is_cancelled());
     });
 }
 

@@ -1989,7 +1989,7 @@ pub enum TransportFact {
         retry_threshold: Option<u32>,
     },
     /// An admitted inbound TLS attempt started.
-    QuicHandshakeStarted {
+    QuicTlsStarted {
         /// The source socket address.
         remote: String,
         /// The configured TLS timeout, if enabled.

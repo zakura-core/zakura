@@ -812,7 +812,7 @@ impl TransportTap {
                         retry_threshold,
                     },
                     HandshakeEvent::Started { remote, deadline } => {
-                        TransportFact::QuicHandshakeStarted {
+                        TransportFact::QuicTlsStarted {
                             remote: remote.to_string(),
                             deadline_ms: deadline.map(|duration| {
                                 u64::try_from(duration.as_millis()).expect("QUIC timeouts fit u64")

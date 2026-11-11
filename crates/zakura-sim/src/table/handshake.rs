@@ -124,7 +124,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         assumes: &[], needs: &[Source::Closes], status: Status::Active,
         check: check_quic_deadline::<S>,
         witness: Some(TriggerHistory::Log(|log| log.entries().iter().any(|entry| matches!(
-            entry.obs, Observation::Transport { event: TransportFact::QuicHandshakeStarted { deadline_ms: Some(10_000), .. }, .. }
+            entry.obs, Observation::Transport { event: TransportFact::QuicTlsStarted { deadline_ms: Some(10_000), .. }, .. }
         )))),
     });
     for (id, claim) in [
@@ -361,7 +361,7 @@ fn check_quic_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     for (at, obs) in cx.observations().enumerate() {
         let Observation::Transport {
             event:
-                TransportFact::QuicHandshakeStarted {
+                TransportFact::QuicTlsStarted {
                     remote,
                     deadline_ms: Some(10_000),
                 },

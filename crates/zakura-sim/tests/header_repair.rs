@@ -386,10 +386,11 @@ fn charged(run: &Run) {
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     for property in &report.properties {
         assert!(
-            matches!(
-                property.outcome,
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-            ),
+            match &property.outcome {
+                PropertyOutcome::Held { .. } => true,
+                PropertyOutcome::NotApplicable { reason } => reason.is_benign(),
+                PropertyOutcome::Violated { .. } => false,
+            },
             "{property:?}"
         );
     }

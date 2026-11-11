@@ -199,6 +199,13 @@ trait Change: 'static {
     const VARIANT: Variant;
 }
 
+/// No change: the planted race itself, the control.
+struct Unchanged;
+
+impl Change for Unchanged {
+    const VARIANT: Variant = Variant::Base;
+}
+
 /// The fix.
 struct ToFixed;
 
@@ -365,7 +372,13 @@ fn first_difference(trace: &Trace, entry: &HarnessEntry) -> u64 {
 /// Where Exact replays of `trace` on `F` with each change left the
 /// schedule, by the change's variant. A replay on this build, which treats
 /// any differing record as nondeterminism, stops at or before that step.
+/// The wrapper without a change replays `trace` verified first, so only
+/// the change can be what diverges.
 fn replayed_on_changes<F: Fixture>(trace: &Trace) -> Vec<(Variant, Left)> {
+    let unchanged = harness::entry::<Changed<F, Unchanged>>();
+    let report = replay_with(trace, &unchanged, ReplayOptions::default())
+        .unwrap_or_else(|error| panic!("{}: {error}", F::NAME));
+    assert!(report.verified(), "{}: {report:?}", F::NAME);
     changes::<F>()
         .into_iter()
         .map(|(variant, entry)| {
@@ -383,9 +396,9 @@ fn replayed_on_changes<F: Fixture>(trace: &Trace) -> Vec<(Variant, Left)> {
 
 /// S4.5: an Exact replay of each saved schedule's trace on code with the
 /// fix, an unrelated task, or an extra point of either kind reports where
-/// it left the recorded schedule, never a verified replay. The unchanged
-/// harness replays the same trace verified, so the change is what
-/// diverges.
+/// it left the recorded schedule, never a verified replay. The registered
+/// harness and the wrapper without a change both replay the same trace
+/// verified, so the change is what diverges.
 #[test]
 fn changed_code_replay_reports_divergence() {
     use Left::{Options, Pick};

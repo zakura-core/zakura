@@ -140,14 +140,14 @@ fn witnessed<F: Fixture>(variant: Variant, input: &[u8]) -> WitnessScenario<Race
 }
 
 /// `F`'s saved schedule's Plan bytes: `tests/fixtures/race-schedules/`'s
-/// seed for `F` after its 2-byte scenario prefix, which `race_schedules.rs`
-/// checks encodes the planted race on 2 workers.
+/// seed for `F` after its scenario prefix, which `race_schedules.rs` checks
+/// encodes the planted race on 2 workers.
 fn saved_plan<F: Fixture>() -> Vec<u8> {
     let name = F::NAME.trim_start_matches("race/");
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("tests/fixtures/race-schedules/{name}.bin"));
     let input = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    input[2..].to_vec()
+    input[<Race<F> as Subsystem>::SCENARIO_BYTES..].to_vec()
 }
 
 /// `F`'s witness test (sched-4 S4.4): on its saved schedule's Plan bytes,

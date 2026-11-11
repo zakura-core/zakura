@@ -2066,6 +2066,12 @@ fn hand_written_rows() -> Vec<Row> {
     let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
     for (index, (name, harness, set, found)) in [
         (
+            "later-sessions-refused",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "offer-by-height",
             STORAGE,
             &[SELECTED] as &'static [&'static str],

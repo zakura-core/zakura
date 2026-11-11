@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use zakura_network::zakura::{observe::ReactorSizes, ServicePeerDirection};
+use zakura_network::zakura::observe::ReactorSizes;
 
 use super::*;
 use crate::harness::header_node::Fork;
@@ -23,21 +23,8 @@ fn fixture() -> (HeaderFixture, ForkFixture) {
     )
 }
 
-/// Mirror `index`'s peer ID.
-fn peer(index: u8) -> ZakuraPeerId {
-    ZakuraPeerId::new(vec![index; 32]).expect("32 bytes is a valid peer ID")
-}
-
-/// `peer`'s session admission.
-fn admitted(peer: ZakuraPeerId) -> ReactorEvent {
-    ReactorEvent::SessionAdmitted {
-        peer,
-        session_id: 1,
-        direction: ServicePeerDirection::Inbound,
-        replaced: None,
-        origin: None,
-    }
-}
+/// Both of [`fixture`]'s mirrors, admitted by their own reactors.
+const BOTH: usize = 2;
 
 /// Nothing outside the reactor busy, at `now`, with the host's clock,
 /// which admits every fixture header.
@@ -50,12 +37,10 @@ fn idle(now: SimInstant) -> Outside {
     }
 }
 
-/// A rule that has seen both mirrors admitted and quiet `Sizes`.
+/// A rule that has seen quiet `Sizes`.
 fn quiet() -> (Settled, block::Hash, block::Hash) {
     let (headers, fork) = fixture();
     let mut settled = Settled::new(&headers, &fork);
-    settled.observe(&admitted(peer(1)), SimInstant::ZERO);
-    settled.observe(&admitted(peer(2)), SimInstant::ZERO);
     settled.observe(
         &ReactorEvent::Sizes {
             sizes: ReactorSizes::default(),
@@ -72,30 +57,27 @@ fn quiet() -> (Settled, block::Hash, block::Hash) {
 #[test]
 fn a_settled_node_must_be_on_the_heaviest_tip() {
     let (mut settled, lighter, heavier) = quiet();
-    assert_eq!(settled.judge(heavier, idle(SimInstant::ZERO)), Some(None));
+    assert_eq!(
+        settled.judge(heavier, idle(SimInstant::ZERO), BOTH),
+        Some(None)
+    );
     let broke = settled
-        .judge(lighter, idle(SimInstant::ZERO))
+        .judge(lighter, idle(SimInstant::ZERO), BOTH)
         .expect("a settled point");
     assert!(broke.is_some_and(|detail| detail.contains("heaviest mirror tips")));
 }
 
 /// Each condition the tap reads keeps a point from being settled: a mirror
-/// not yet admitted, a slot, a pending call, a busy port, a harness close
-/// or relink, and a deferred pass whose refill hasn't come.
+/// whose own reactor hasn't admitted its session, a slot, a pending call, a
+/// busy port, a harness close or relink, and a deferred pass whose refill
+/// hasn't come.
 #[test]
 fn every_condition_must_hold() {
     let (headers, fork) = fixture();
     let (_, lighter, _) = quiet();
-    let mut one = Settled::new(&headers, &fork);
-    one.observe(&admitted(peer(1)), SimInstant::ZERO);
-    one.observe(
-        &ReactorEvent::Sizes {
-            sizes: ReactorSizes::default(),
-        },
-        SimInstant::ZERO,
-    );
+    let (mut one, ..) = quiet();
     assert_eq!(
-        one.judge(lighter, idle(SimInstant::ZERO)),
+        one.judge(lighter, idle(SimInstant::ZERO), 1),
         None,
         "one mirror"
     );
@@ -110,7 +92,11 @@ fn every_condition_must_hold() {
         },
         SimInstant::ZERO,
     );
-    assert_eq!(busy.judge(lighter, idle(SimInstant::ZERO)), None, "a call");
+    assert_eq!(
+        busy.judge(lighter, idle(SimInstant::ZERO), BOTH),
+        None,
+        "a call"
+    );
 
     let (mut settled, ..) = quiet();
     for outside in [
@@ -123,7 +109,7 @@ fn every_condition_must_hold() {
             ..idle(SimInstant::ZERO)
         },
     ] {
-        assert_eq!(settled.judge(lighter, outside), None, "{outside:?}");
+        assert_eq!(settled.judge(lighter, outside, BOTH), None, "{outside:?}");
     }
 
     let (mut deferred, ..) = quiet();
@@ -134,21 +120,22 @@ fn every_condition_must_hold() {
         SimInstant::ZERO,
     );
     assert_eq!(
-        deferred.judge(lighter, idle(SimInstant::ZERO)),
+        deferred.judge(lighter, idle(SimInstant::ZERO), BOTH),
         None,
         "deferred"
     );
     let later = SimInstant::ZERO
         .checked_add(Duration::from_secs(1))
         .expect("representable");
-    assert!(deferred.judge(lighter, idle(later)).is_some(), "refilled");
+    assert!(
+        deferred.judge(lighter, idle(later), BOTH).is_some(),
+        "refilled"
+    );
 
     // No `Sizes` yet means the calls are unknown, so nothing is settled.
     let mut fresh = Settled::new(&headers, &fork);
-    fresh.observe(&admitted(peer(1)), SimInstant::ZERO);
-    fresh.observe(&admitted(peer(2)), SimInstant::ZERO);
     assert_eq!(
-        fresh.judge(lighter, idle(SimInstant::ZERO)),
+        fresh.judge(lighter, idle(SimInstant::ZERO), BOTH),
         None,
         "no sizes"
     );
@@ -166,7 +153,7 @@ fn a_clock_that_defers_a_mirror_header_settles_nothing() {
         clock: genesis - chrono::Duration::hours(3),
         ..idle(SimInstant::ZERO)
     };
-    assert_eq!(settled.judge(lighter, early), None);
+    assert_eq!(settled.judge(lighter, early, BOTH), None);
     // The first judgment fixed it, whatever the clock later.
-    assert_eq!(settled.judge(heavier, idle(SimInstant::ZERO)), None);
+    assert_eq!(settled.judge(heavier, idle(SimInstant::ZERO), BOTH), None);
 }

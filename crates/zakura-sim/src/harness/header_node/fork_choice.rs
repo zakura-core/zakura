@@ -65,6 +65,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{DurableState, EngineSnapshot};
+use zakura_network::zakura::{
+    observe::{HeaderSyncObserver, ReactorEvent},
+    ZakuraPeerId,
+};
 use zakura_storage::header::{
     controlled::{EngineRun, RunKind},
     fixture::HeaderFixture,
@@ -88,6 +92,9 @@ struct Store {
     settled: Option<(u64, Option<String>)>,
     /// How many settled points the drains judged.
     settled_points: u64,
+    /// The mirrors whose own reactors admitted a session with the node
+    /// ([`MirrorAdmits`]).
+    mirrors_admitted: HashSet<String>,
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
@@ -136,6 +143,49 @@ impl ForkChoiceEvidence {
     /// whether or not a task could still run after their steps.
     pub fn settled_points(&self) -> u64 {
         self.with(|store| store.settled_points)
+    }
+
+    /// The observer for the mirror named `mirror`, which records its own
+    /// reactor admitting a session with `node`, the node under test
+    /// ([`MirrorAdmits`]).
+    pub fn mirror(&self, mirror: &str, node: ZakuraPeerId) -> Arc<dyn HeaderSyncObserver> {
+        Arc::new(MirrorAdmits {
+            mirror: mirror.to_owned(),
+            node,
+            evidence: self.clone(),
+        })
+    }
+
+    /// How many mirrors' own reactors have admitted a session with the
+    /// node.
+    fn mirrors_admitted(&self) -> usize {
+        self.with(|store| store.mirrors_admitted.len())
+    }
+}
+
+/// A mirror's observer, which records the mirror's reactor admitting a
+/// session with the node under test, so settled points count a mirror the
+/// node itself refused ([`settled`]). It ignores every other event and adds
+/// no scheduling point, so the mirror runs as it would unobserved.
+#[derive(Debug)]
+struct MirrorAdmits {
+    /// The mirror's harness name.
+    mirror: String,
+    /// The node under test.
+    node: ZakuraPeerId,
+    evidence: ForkChoiceEvidence,
+}
+
+impl HeaderSyncObserver for MirrorAdmits {
+    /// Records the mirror if `event` admits a session with the node.
+    fn observe(&self, event: ReactorEvent) {
+        if let ReactorEvent::SessionAdmitted { peer, .. } = event {
+            if peer == self.node {
+                self.evidence.with(|store| {
+                    store.mirrors_admitted.insert(self.mirror.clone());
+                });
+            }
+        }
     }
 }
 
@@ -230,7 +280,7 @@ impl ForkChoice {
     /// `on_reactor`, at `now`, for settled points.
     pub(super) fn observe(
         &mut self,
-        event: &zakura_network::zakura::observe::ReactorEvent,
+        event: &ReactorEvent,
         on_reactor: bool,
         now: zakura_scheduler::SimInstant,
     ) {
@@ -247,7 +297,9 @@ impl ForkChoice {
         // No property checks step 0, the setup observation's, which may
         // also run before the run's clock does.
         let verdict = match (&mut self.settled, self.tainted) {
-            (Some(settled), false) if step > 0 => settled.judge(self.selected, outside),
+            (Some(settled), false) if step > 0 => {
+                settled.judge(self.selected, outside, self.evidence.mirrors_admitted())
+            }
             _ => None,
         };
         self.evidence.with(|store| {

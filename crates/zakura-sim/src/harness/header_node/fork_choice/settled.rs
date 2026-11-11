@@ -18,15 +18,18 @@
 //! whenever the node fetches it. Admission is the model's own rule, from
 //! the fixture headers' times.
 //!
-//! A settled point is a step after which no task can run, once every mirror
-//! has a session admitted, with no work slot, no storage call the reactor
-//! counts as pending or any port future it polls, no operation pending or
-//! held at the port, and no cached-offer pass deferred to a refill that
-//! hasn't come yet. The slots come from the queue's `Slots`, the calls and
-//! futures from the reactor's `Sizes` at each unit of work's end, and the
-//! deferral from `CachedPassDeferred`. Links are in-memory, so by then every
-//! mirror's `Status` has reached the reactor. Whether no task can run is the
-//! scheduler's, which the property reads after the step.
+//! A settled point is a step after which no task can run, once every
+//! mirror's own reactor has admitted its session with the node, with no
+//! work slot, no storage call the reactor counts as pending or any port
+//! future it polls, no operation pending or held at the port, and no
+//! cached-offer pass deferred to a refill that hasn't come yet. The
+//! admissions come from each mirror's observer, not the node's, so a node
+//! that refuses a mirror's session still reaches settled points. The slots
+//! come from the queue's `Slots`, the calls and futures from the reactor's
+//! `Sizes` at each unit of work's end, and the deferral from
+//! `CachedPassDeferred`. Links are in-memory, so by then every session the
+//! node admitted has delivered its mirror's `Status`. Whether no task can
+//! run is the scheduler's, which the property reads after the step.
 //!
 //! At each settled point where the harness hasn't closed or relinked any
 //! mirror (Rule 13: a mirror the node dropped still counts), the engine's
@@ -39,7 +42,7 @@
 use std::collections::HashSet;
 
 use zakura_chain::{block, work::difficulty::U256};
-use zakura_network::zakura::{observe::ReactorEvent, ZakuraPeerId};
+use zakura_network::zakura::observe::ReactorEvent;
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -79,8 +82,6 @@ pub(super) struct Settled {
     admissible: Option<bool>,
     /// The max-work tips over the mirrors' chains.
     heaviest: HashSet<block::Hash>,
-    /// The peers the reactor has admitted a session from.
-    admitted: HashSet<ZakuraPeerId>,
     /// Whether the queue's newest `Slots` listed none.
     no_slots: bool,
     /// Whether the reactor's newest `Sizes` counted no pending storage call,
@@ -113,7 +114,6 @@ impl Settled {
                 .filter(|(_, work)| Some(*work) == best)
                 .map(|(tip, _)| tip)
                 .collect(),
-            admitted: HashSet::new(),
             no_slots: true,
             no_calls: false,
             deferred_until: None,
@@ -132,15 +132,13 @@ impl Settled {
             ReactorEvent::CachedPassDeferred { refill_in } => {
                 self.deferred_until = now.checked_add(*refill_in);
             }
-            ReactorEvent::SessionAdmitted { peer, .. } => {
-                self.admitted.insert(peer.clone());
-            }
             _ => {}
         }
     }
 
     /// Whether a step that leaves the run with no task able to run is a
-    /// settled point, given `outside`, and if so whether `selected`, the
+    /// settled point, given `outside` and `mirrors_admitted`, how many
+    /// mirrors' own reactors have admitted a session with the node, and if so whether `selected`, the
     /// engine's newest selected tip, breaks the rule: `Some(None)` if it
     /// holds, `Some(Some(detail))` if it breaks, `None` if it isn't one.
     /// The first call fixes whether the run's clock admits every mirror
@@ -149,6 +147,7 @@ impl Settled {
         &mut self,
         selected: block::Hash,
         outside: Outside,
+        mirrors_admitted: usize,
     ) -> Option<Option<String>> {
         let times = &self.times;
         let admissible = *self.admissible.get_or_insert_with(|| {
@@ -157,7 +156,7 @@ impl Settled {
                 .all(|time| !super::deferred_at(*time, outside.clock))
         });
         let settled = admissible
-            && self.admitted.len() >= self.mirrors
+            && mirrors_admitted >= self.mirrors
             && self.no_slots
             && self.no_calls
             && !outside.port_busy

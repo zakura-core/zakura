@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    spawn_header_sync_reactor, v9::RegtestMessage, FullStateFrontiers, HeaderSyncStartup,
-    ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
+    observe::{HeaderSyncObserver, ReactorEvent},
+    spawn_header_sync_reactor,
+    v9::RegtestMessage,
+    FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_scheduler::SchedulerConfig;
@@ -662,6 +664,30 @@ fn mirror(index: usize) -> String {
     format!("mirror-{index}")
 }
 
+/// A [`StorageScenario`] mirror's observer: the served-page rule's record of
+/// the mirror's `Open`s and the settled points' record of its own reactor
+/// admitting the node. Neither takes the session token or the resource
+/// probe, so only events and the capacity handle are forwarded.
+#[derive(Debug)]
+struct MirrorObserver {
+    opens: Arc<dyn HeaderSyncObserver>,
+    admits: Arc<dyn HeaderSyncObserver>,
+}
+
+impl HeaderSyncObserver for MirrorObserver {
+    /// Hands `event` to both records.
+    fn observe(&self, event: ReactorEvent) {
+        self.admits.observe(event.clone());
+        self.opens.observe(event);
+    }
+
+    /// The `Open` record's handle, which the subscriber's credit reports
+    /// go to.
+    fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+        self.opens.capacity_observer()
+    }
+}
+
 /// The scenario's storage, with each actor's chain committed before the
 /// run, and the node's session view. Cloning shares both, so a test can read
 /// them after a run. One prepared `Ports` serves one run.
@@ -1288,8 +1314,10 @@ impl Subsystem for Storage {
             .enumerate()
         {
             let name = format!("mirror-{index}");
-            // The served-page rule reads each mirror's `Open`s.
-            let observer = ports.publication.subscriber(&name);
+            let observer: Arc<dyn HeaderSyncObserver> = Arc::new(MirrorObserver {
+                opens: ports.publication.subscriber(&name),
+                admits: ports.fork_choice.mirror(&name, nodes[0].id.clone()),
+            });
             let mut config = ZakuraHeaderSyncConfig::default();
             if let Some(limit) = spec.max_headers_per_response {
                 config.max_headers_per_response = limit;

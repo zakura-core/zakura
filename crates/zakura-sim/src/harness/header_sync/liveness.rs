@@ -366,6 +366,7 @@ fn departure_recovery() -> StorageScenario {
     let mirror = |chain| MirrorSpec {
         chain,
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     };
     StorageScenario {
         node: Chain::main(3),

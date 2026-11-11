@@ -20,7 +20,9 @@ use zakura_chain::{
 };
 use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::address_book_peers::MockAddressBookPeers;
-use zakura_node_services::mempool::{self, MempoolService};
+use zakura_node_services::mempool::{
+    self, MempoolService, MempoolSnapshotReceiver, MempoolSnapshotSender,
+};
 use zakura_state::{LatestChainTip, ReadState as ReadStateService, State as StateService};
 
 use crate::{
@@ -55,8 +57,15 @@ pub(crate) type TestRpcImpl = RpcImpl<
     MockSyncStatus,
 >;
 
+/// Returns the snapshot reader of a mempool that never published a snapshot and has shut
+/// down, for tests that don't read the mempool's snapshots.
+pub(crate) fn no_mempool_snapshots() -> MempoolSnapshotReceiver {
+    MempoolSnapshotSender::new().subscribe()
+}
+
 impl TestRpcImpl {
-    /// Boxes the test's services and calls [`RpcImpl::new`].
+    /// Boxes the test's services and calls [`RpcImpl::new`], for a mempool that publishes no
+    /// snapshots.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_tests(
         network: Network,
@@ -74,6 +83,45 @@ impl TestRpcImpl {
         last_warn_error_log_rx: LoggedLastEvent,
         mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>) {
+        Self::new_for_tests_with_mempool_snapshots(
+            network,
+            mining_config,
+            debug_force_finished_sync,
+            build_version,
+            user_agent,
+            mempool,
+            no_mempool_snapshots(),
+            state,
+            read_state,
+            block_verifier_router,
+            sync_status,
+            latest_chain_tip,
+            address_book,
+            last_warn_error_log_rx,
+            mined_block_sender,
+        )
+    }
+
+    /// Boxes the test's services and calls [`RpcImpl::new`], reading the mempool's snapshots
+    /// from `mempool_snapshots`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_tests_with_mempool_snapshots(
+        network: Network,
+        mining_config: config::mining::Config,
+        debug_force_finished_sync: bool,
+        build_version: impl ToString,
+        user_agent: impl ToString,
+        mempool: impl MempoolService,
+        mempool_snapshots: MempoolSnapshotReceiver,
+        state: impl StateService,
+        read_state: impl ReadStateService,
+        block_verifier_router: impl BlockVerifierService,
+        sync_status: MockSyncStatus,
+        latest_chain_tip: impl Into<TestChainTip>,
+        address_book: MockAddressBookPeers,
+        last_warn_error_log_rx: LoggedLastEvent,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
+    ) -> (Self, JoinHandle<()>) {
         RpcImpl::new(
             network,
             mining_config,
@@ -81,6 +129,7 @@ impl TestRpcImpl {
             build_version.to_string(),
             user_agent.to_string(),
             BoxCloneSyncService::new(mempool),
+            mempool_snapshots,
             BoxCloneSyncService::new(state),
             BoxCloneSyncService::new(read_state),
             BoxCloneSyncService::new(block_verifier_router),

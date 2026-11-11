@@ -3201,6 +3201,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         "0.0.1",
         "Zakura tests",
         mempool.clone(),
+        mempool::MempoolSnapshotSender::new().subscribe(),
         state.clone(),
         read_state.clone(),
         block_verifier_router,

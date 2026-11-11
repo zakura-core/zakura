@@ -40,7 +40,8 @@ use crate::{
 pub const STATS_VAR: &str = "ZAKURA_SIM_STATS";
 
 /// The version of [`ProcessStats`]. Bump it when a field changes meaning.
-pub const STATS_VERSION: u32 = 1;
+/// Version 2 counts `not_applicable` by reason and drops `inconclusive`.
+pub const STATS_VERSION: u32 = 2;
 
 /// How often a recorder rewrites its file while its process runs.
 pub const CHECKPOINT: Duration = Duration::from_secs(10);
@@ -309,20 +310,27 @@ impl ProcessStats {
         (pid.to_string() == digits).then_some(pid)
     }
 
-    /// Reads the stats file at `path`, at [`STATS_VERSION`].
+    /// Reads the stats file at `path`, at [`STATS_VERSION`]. The version
+    /// is read first, so a file at another version, whose fields may not
+    /// parse here, is refused as unsupported rather than unreadable.
     pub fn read(path: &Path) -> Result<ProcessStats, String> {
+        /// Just the version, whatever the rest holds.
+        #[derive(Deserialize)]
+        struct Version {
+            version: u32,
+        }
         let bytes =
             fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
-        let stats: ProcessStats = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("parsing {}: {error}", path.display()))?;
-        if stats.version != STATS_VERSION {
+        let parsing = |error: serde_json::Error| format!("parsing {}: {error}", path.display());
+        let Version { version } = serde_json::from_slice(&bytes).map_err(parsing)?;
+        if version != STATS_VERSION {
             return Err(format!(
-                "{} is at stats version {}, and this build reads {STATS_VERSION}",
+                "{} is at stats version {version}, which is unsupported: this build reads \
+                 {STATS_VERSION}",
                 path.display(),
-                stats.version
             ));
         }
-        Ok(stats)
+        serde_json::from_slice(&bytes).map_err(parsing)
     }
 }
 

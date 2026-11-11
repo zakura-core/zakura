@@ -893,7 +893,25 @@ fn a_recorder_marks_its_file_complete_only_at_finish() {
     assert_eq!(last.counts.runs, 3);
 
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replace("\"version\": 1", "\"version\": 0")).unwrap();
+    let current = format!("\"version\": {STATS_VERSION}");
+    assert!(text.contains(&current), "{text}");
+    fs::write(&path, text.replace(&current, "\"version\": 0")).unwrap();
     let refused = ProcessStats::read(&path).unwrap_err();
     assert!(refused.contains("stats version 0"), "{refused}");
+
+    // Terra 2, round 7: a version 1 file, whose property counts had a
+    // number for `not_applicable` and an `inconclusive` count, is refused
+    // for its version, not left unreadable.
+    let old = r#"{"version": 1, "harness": "h", "pid": 7, "started_unix": 0,
+        "written_unix": 0, "complete": true, "counts": {"runs": 1, "outcomes": {},
+        "ends": {}, "drains_exhausted": 0, "cleanup": {"abandoned": 0,
+        "leaked_tasks": 0, "unwound": 0, "panicked": 0, "unwind_failures": 0},
+        "properties": {"p": {"status": "active", "held": 0, "evaluations": 0,
+        "not_applicable": 1, "inconclusive": 0, "violated": 0}}, "features": {}}}"#;
+    fs::write(&path, old).unwrap();
+    let refused = ProcessStats::read(&path).unwrap_err();
+    assert!(
+        refused.contains("stats version 1") && refused.contains("unsupported"),
+        "{refused}"
+    );
 }

@@ -1,6 +1,6 @@
 # Two nine-second steps share the ten-second control deadline.
 harness = "handshake/wire"
-generator = 4
+generator = 5
 sha256 = "9f73d30a4bb6f21af6f615490d9754889a0852a937c3402f13e3c2d820717cb1"
 scenario_sha256 = "8f00ad881f5df7555218c04b8ddc3ab5b54173bc659f8b83045a9863eb46575f"
 source = "crates/zakura-sim/tests/handshake.rs"

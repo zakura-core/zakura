@@ -156,6 +156,13 @@ pub static NOT_HEADER: &[NotHeader] = &[
         basis: Basis::NotNamedByHeader,
     },
     NotHeader {
+        file: "src/table/handshake.rs",
+        module: "handshake",
+        why: "the v2 handshake table's checks, which judge the prelude, QUIC admission and \
+              session capacity before any header sync starts",
+        basis: Basis::NotNamedByHeader,
+    },
+    NotHeader {
         file: "src/harness/fixtures.rs",
         module: "fixtures",
         why: "the race fixtures' checks",
@@ -338,7 +345,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/domain/session.rs",
         function: "check_honest_never_punished",
-        fingerprint: "e7fc75e475d7c45b",
+        fingerprint: "b20718257514667f",
         constructions: &[
             step("no honest peer's transport fact at this step", START),
             missing(RETURN),
@@ -388,7 +395,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/harness/machine.rs",
         function: "check",
-        fingerprint: "31897515d1375ad1",
+        fingerprint: "3b7b2ac1e6367c55",
         constructions: &[
             missing(RETURN),
             step(

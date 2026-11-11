@@ -4433,8 +4433,8 @@ fn the_source_scan_refuses_an_unlisted_producer() {
     refused(
         edited(&sources, "src/harness/machine.rs", &|t| {
             t.replacen(
-                "let Some(failure) = step.failure() else {",
-                "let Some(failure) = step.failure().filter(|failure| failure.property_failure) else {",
+                "let Some(failure) = step.failure_for(cx.id().as_str()) else {",
+                "let Some(failure) = step.failure_for(cx.id().as_str()).filter(|failure| failure.property_failure) else {",
                 1,
             )
         }),

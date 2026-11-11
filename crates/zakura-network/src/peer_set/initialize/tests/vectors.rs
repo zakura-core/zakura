@@ -2877,6 +2877,57 @@ async fn add_initial_peers_deadlock() {
         .expect("should not timeout");
 }
 
+/// `init` returns while a startup dial is still waiting for its handshake.
+///
+/// The only initial peer accepts TCP connections and never answers, so its
+/// handshake lasts until `HANDSHAKE_TIMEOUT`. The node's other services must not
+/// wait for it.
+#[tokio::test]
+async fn init_returns_before_startup_dials_finish() {
+    let _init_guard = zakura_test::init();
+
+    // This test requires an IPv4 network stack. Localhost should be enough.
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let silent_peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a localhost listener binds");
+    let silent_peer_addr = silent_peer
+        .local_addr()
+        .expect("the listener has an address");
+    let _silent_peer_task = tokio::spawn(async move {
+        let mut held_streams = Vec::new();
+        while let Ok((stream, _)) = silent_peer.accept().await {
+            held_streams.push(stream);
+        }
+    });
+
+    let mut config = Config {
+        initial_mainnet_peers: [silent_peer_addr.to_string()].into_iter().collect(),
+        peerset_initial_target_size: 1,
+        network: Network::Mainnet,
+        listen_addr: "127.0.0.1:0".parse().expect("valid test bind address"),
+        cache_dir: CacheDir::disabled(),
+        ..test_defaults()
+    };
+    config.zakura.listen_addr = Some("127.0.0.1:0".parse().expect("valid test bind address"));
+
+    let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
+    let init_future = init(
+        config,
+        tower::util::BoxCloneSyncService::new(nil_inbound_service),
+        NoChainTip,
+        "Test user agent".to_string(),
+        PeerServices::NODE_NETWORK,
+    );
+
+    tokio::time::timeout(constants::HANDSHAKE_TIMEOUT / 2, init_future)
+        .await
+        .expect("init returns before the pending startup handshake times out");
+}
+
 /// Open a local listener on `listen_addr` for `network`.
 /// Asserts that the local listener address works as expected.
 async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {

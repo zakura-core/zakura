@@ -94,10 +94,7 @@ pub(crate) struct TransactionDataCache(Arc<Mutex<Cache>>);
 
 impl std::fmt::Debug for TransactionDataCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cache = self
-            .0
-            .lock()
-            .expect("transaction payload cache lock is not poisoned");
+        let cache = self.0.lock().map_err(|_| std::fmt::Error)?;
         f.debug_struct("TransactionDataCache")
             .field("entries", &cache.entries.len())
             .field("accounted_bytes", &cache.bytes)
@@ -127,7 +124,9 @@ impl TransactionDataCache {
         // Reserve conservatively for hash buckets, control bytes, and the FIFO allocation.
         // Allocator bookkeeping is implementation-dependent and is measured separately.
         let bytes = entries.capacity() * 2 * (size_of::<(UnminedTxId, TransactionData)>() + 1)
-            + order.capacity() * size_of::<UnminedTxId>();
+            + order.capacity() * size_of::<UnminedTxId>()
+            + size_of::<Cache>()
+            + 2 * size_of::<usize>();
         Self(Arc::new(Mutex::new(Cache {
             entries,
             order,

@@ -123,6 +123,7 @@ fn measure(name: &str, iterations: usize, mut work: impl FnMut()) -> serde_json:
 
 #[test]
 #[ignore = "requires TEMPLATE_PAYLOAD_FIXTURE and an isolated release-mode benchmark host"]
+#[allow(clippy::print_stdout)] // This opt-in benchmark emits a machine-readable result.
 fn benchmark_transaction_payloads() {
     let path = std::env::var("TEMPLATE_PAYLOAD_FIXTURE").expect("set TEMPLATE_PAYLOAD_FIXTURE");
     let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

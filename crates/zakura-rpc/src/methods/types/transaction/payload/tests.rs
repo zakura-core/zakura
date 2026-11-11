@@ -73,9 +73,15 @@ fn cold_and_reused_payloads_preserve_json_and_fresh_metadata() {
         hex::encode(cold.data.as_ref())
     );
     warm.depends = vec![1, 2];
-    warm.fee = 20_000u64.try_into().unwrap();
+    let mut updated = tx.clone();
+    updated.miner_fee = 20_000u64.try_into().unwrap();
+    updated.p2sh_sigop_count = 3;
+    let fresh = TransactionTemplate::from_cached(&updated, &cache);
+    assert!(Arc::ptr_eq(&cold.data.0, &fresh.data.0));
+    assert_eq!(fresh.fee, updated.miner_fee);
+    assert_eq!(fresh.sigops, 3);
     assert!(cold.depends.is_empty());
-    assert_ne!(cold.fee, warm.fee);
+    assert_ne!(cold.fee, fresh.fee);
     assert_eq!(
         serde_json::to_value(&warm).unwrap()["depends"],
         serde_json::json!([1, 2])

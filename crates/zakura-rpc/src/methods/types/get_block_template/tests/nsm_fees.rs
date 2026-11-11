@@ -99,17 +99,33 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                     zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
                 ),
             };
+            let transaction_data = Default::default();
             let template = BlockTemplateResponse::new_internal(
                 &network,
                 None,
                 &miner,
                 &chain_info,
                 "0".repeat(46).parse().unwrap(),
-                mempool,
-                &Default::default(),
+                mempool.clone(),
+                &transaction_data,
                 None,
             )
             .unwrap();
+            let rebuilt = BlockTemplateResponse::new_internal(
+                &network,
+                Some(template.coinbase_txn.clone()),
+                &miner,
+                &chain_info,
+                "0".repeat(46).parse().unwrap(),
+                mempool,
+                &transaction_data,
+                None,
+            )
+            .unwrap();
+            assert_eq!(template.transactions, rebuilt.transactions);
+            for (original, reused) in template.transactions.iter().zip(&rebuilt.transactions) {
+                assert!(std::ptr::eq(original.data(), reused.data()));
+            }
             let coinbase: Transaction = template
                 .coinbase_txn
                 .data

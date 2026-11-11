@@ -510,8 +510,9 @@ impl ZakuraDb {
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
-                // Several instances can shut the database down. The next startup checks the
-                // whole database again, so one shutdown check is enough.
+                // Several instances shut the database down. The block write task shuts it down
+                // after its last commit, and the read service waits for that task first, so the
+                // first instance to claim the check sees the final database.
                 if disk_version >= self.db.format_version_in_code()
                     && self.db.claim_shutdown_format_check()
                 {
@@ -746,6 +747,28 @@ mod tests {
                 "read_only = {read_only} startup must refuse an unrepairable VCT database"
             );
         }
+    }
+
+    /// A database still waiting for a format upgrade is not checked at shutdown, so its
+    /// shutdown must not stop a later shutdown in the current format from running the check.
+    #[test]
+    fn shutdown_of_an_older_format_does_not_claim_the_format_check() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let db = open(&config, &network, false).expect("a new database opens");
+        let mut first_owner = db.clone();
+        // Any version below the code version means the upgrade has not finished.
+        let older = Version::new(state_database_format_version_in_code().major - 1, 0, 0);
+        db.update_format_version_on_disk(&older)
+            .expect("the test can write the version file");
+
+        first_owner.shutdown(true);
+
+        assert!(
+            db.db.claim_shutdown_format_check(),
+            "a skipped check leaves the claim for a later shutdown"
+        );
     }
 
     /// The guard is narrow: it must not reject databases that are not missing Sprout history.

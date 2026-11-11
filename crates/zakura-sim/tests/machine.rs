@@ -224,26 +224,35 @@ impl Checker for FailsAtEnd {
 
 /// A failure only the extra checker finds, at the machine run's end, fails
 /// the run, as in `Sim::run`: the run ends `Harness`, and neither the
-/// machine's property nor the extra checker's is held.
+/// machine's property nor the extra checker's is held. The end is a fresh
+/// harness end, after an idle end or a violation alike, so it keeps no
+/// rest and no run-level violation (Terra 4, round 3).
 #[test]
 fn an_extra_checkers_end_failure_fails_the_run() {
-    let mut extra = FailsAtEnd::default();
-    let run = (ENTRY.run_bytes)(&input(&[CHARGE]), &mut NullSink, Some(&mut extra));
-    let report = run.report().expect("the machine ran");
-    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
-    assert!(matches!(
-        report.end.harness,
-        Some(HarnessFailure::MissingEvidence { .. })
-    ));
-    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
-    assert!(
-        report
-            .properties
-            .iter()
-            .all(|property| property.outcome == harness_failed),
-        "{:?}",
-        report.properties
-    );
+    for operation in [CHARGE, BREAK] {
+        let mut extra = FailsAtEnd::default();
+        let run = (ENTRY.run_bytes)(&input(&[operation]), &mut NullSink, Some(&mut extra));
+        let report = run.report().expect("the machine ran");
+        assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        assert!(matches!(
+            report.end.harness,
+            Some(HarnessFailure::MissingEvidence { .. })
+        ));
+        assert_eq!(report.end.rest, None, "{:?}", report.end);
+        assert!(!report.end.at_rest());
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        if operation == CHARGE {
+            let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
+            assert!(
+                report
+                    .properties
+                    .iter()
+                    .all(|property| property.outcome == harness_failed),
+                "{:?}",
+                report.properties
+            );
+        }
+    }
 }
 
 #[test]

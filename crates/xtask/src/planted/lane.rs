@@ -153,22 +153,30 @@ impl Campaign {
     }
 }
 
-/// Builds `spec`'s fuzz target with `sim` in `fuzz_target`, and runs one
-/// campaign on it with `bounds` and `spec`'s seed, from `spec`'s corpus, in
-/// a fresh store under `dir`. Returns the records the run left.
+/// How long `campaign start` may run with `bounds`: its budget and a grace.
+pub(in crate::planted) fn start_deadline(bounds: &CampaignBounds) -> Duration {
+    Duration::from_secs(bounds.seconds_per_seed) + CAMPAIGN_GRACE
+}
+
+/// Builds `spec`'s fuzz target in `fuzz_target`, and runs one campaign on
+/// it with `bounds` and `spec`'s seed, from `spec`'s corpus, in a fresh
+/// store under `dir`, with `campaign start` under `deadline`. `sim` makes
+/// each child's `zakura-sim` command, such as one under a memory cap.
+/// Returns the records the run left.
 pub(in crate::planted) fn campaign_lane(
-    sim: &Path,
+    sim: &dyn Fn() -> Command,
     dir: &Path,
     fuzz_target: &Path,
     spec: &LaneSpec<'_>,
     bounds: &CampaignBounds,
+    deadline: Duration,
 ) -> Result<Result<Campaign, LaneError>, BoxError> {
     let store = dir.join("store");
     if store.exists() {
         return Err(format!("{} isn't a fresh store", store.display()).into());
     }
     fs::create_dir_all(dir)?;
-    let mut build = Command::new(sim);
+    let mut build = sim();
     build
         .args(["campaign", "build", "--store"])
         .arg(&store)
@@ -200,7 +208,7 @@ pub(in crate::planted) fn campaign_lane(
             "the store holds no single build".to_owned(),
         )));
     };
-    let mut start = Command::new(sim);
+    let mut start = sim();
     start.args(start_args(
         bounds,
         spec.name,
@@ -215,7 +223,6 @@ pub(in crate::planted) fn campaign_lane(
         start.env_remove(var);
     }
     let log = dir.join("start.log");
-    let deadline = Duration::from_secs(bounds.seconds_per_seed) + CAMPAIGN_GRACE;
     // `start` exits 1 for any run that isn't complete, as a run a finding
     // stopped, so the store's records decide. A run past the deadline, or
     // one a signal killed, may have left records, but it didn't finish.
@@ -259,7 +266,7 @@ pub(in crate::planted) fn campaign_lane(
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     let evidence_file = dir.join("evidence.json");
-    let mut evidence = Command::new(sim);
+    let mut evidence = sim();
     evidence
         .args(["campaign", "evidence", "--store"])
         .arg(&store)
@@ -339,8 +346,13 @@ pub(in crate::planted) struct CampaignFacts {
     pub(in crate::planted) status: String,
     /// Inputs in the run's initial snapshot.
     pub(in crate::planted) initial_inputs: usize,
-    /// The properties a saved input violates, in order, each once.
+    /// The properties a saved input violates, in order, each once, under
+    /// any of the `active`, `known` and `draft` buckets.
     pub(in crate::planted) violated: Vec<String>,
+    /// The properties of [`CampaignFacts::violated`] that a saved input
+    /// violates under the `active` bucket: the violations a fuzz target
+    /// stops on. A `known` or `draft` one is a note.
+    pub(in crate::planted) active: Vec<String>,
     /// Saved failures that aren't a property violation and that no worker
     /// death explains: a harness failure, crash, abandoned run,
     /// nondeterministic rerun or run without an end that the target saved,
@@ -417,6 +429,55 @@ pub(in crate::planted) fn failure_kind(path: &str) -> Failure {
     }
 }
 
+/// The bucket of a worker target's saved input at `path`, such as
+/// `active`, or `None` for another file.
+fn bucket(path: &str) -> Option<&str> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let at = segments
+        .windows(2)
+        .position(|pair| matches!(pair[0], "sim" | "compact-sim") && pair[1] == "inputs")?;
+    segments.get(at + 2).copied()
+}
+
+/// Why `campaign` isn't a complete, clean run from the empty corpus, other
+/// than a property violation, or `None` if it is: it pairs with its
+/// expected build, started from no inputs, left no failure, completed, and
+/// its evidence lists nothing incomplete.
+pub(in crate::planted) fn campaign_failure(campaign: &CampaignFacts) -> Option<String> {
+    if let Some(why) = &campaign.unpaired {
+        return Some(why.clone());
+    }
+    if campaign.initial_inputs > 0 {
+        return Some(format!(
+            "started from {} inputs, not the frozen empty corpus",
+            campaign.initial_inputs
+        ));
+    }
+    if let Some(why) = left_failures(campaign) {
+        return Some(why);
+    }
+    if campaign.status != "complete" || !campaign.incomplete.is_empty() {
+        return Some(format!(
+            "ended {} with incomplete evidence: {}",
+            campaign.status,
+            campaign.incomplete.join(", ")
+        ));
+    }
+    None
+}
+
+/// The saved failures and worker deaths `campaign` left, said in words, or
+/// `None` if it left none.
+pub(in crate::planted) fn left_failures(campaign: &CampaignFacts) -> Option<String> {
+    let left: Vec<&str> = campaign
+        .failures
+        .iter()
+        .chain(&campaign.killed)
+        .map(String::as_str)
+        .collect();
+    (!left.is_empty()).then(|| format!("left failures: {}", left.join(", ")))
+}
+
 /// What a campaign's end record `end` and `evidence` show about
 /// `property`, for a run whose initial snapshot held `initial_inputs`.
 pub(in crate::planted) fn campaign_facts(
@@ -426,6 +487,7 @@ pub(in crate::planted) fn campaign_facts(
     initial_inputs: usize,
 ) -> CampaignFacts {
     let mut violated = BTreeSet::new();
+    let mut active = BTreeSet::new();
     let (mut failures, mut killed, mut crashes, mut intended_input) =
         (Vec::new(), Vec::new(), Vec::new(), None);
     let records = end
@@ -440,6 +502,9 @@ pub(in crate::planted) fn campaign_facts(
             Failure::Violation(violation) => {
                 if violation == property && intended_input.is_none() {
                     intended_input = Some(path.to_owned());
+                }
+                if bucket(path) == Some("active") {
+                    active.insert(violation.clone());
                 }
                 violated.insert(violation);
             }
@@ -468,6 +533,7 @@ pub(in crate::planted) fn campaign_facts(
             .to_owned(),
         initial_inputs,
         violated: violated.into_iter().collect(),
+        active: active.into_iter().collect(),
         failures,
         killed,
         incomplete: evidence

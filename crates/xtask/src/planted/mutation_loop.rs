@@ -89,7 +89,10 @@ mod generate;
 mod tests;
 
 use classify::{Class, Classified, Ended, GenerateFacts, Observed, Reason, Trigger};
-use generate::{GenerateConfig, GenerateFlags, GeneratorReport, Lanes, PropertyFinding};
+use generate::{
+    GenerateConfig, GenerateFlags, GeneratorBaselineFailure, GeneratorReport, Lanes,
+    PropertyFinding,
+};
 
 /// The loop's retained cases, relative to the repository root.
 const CASES: &str = "qa/native-mutations/cases.json";
@@ -298,6 +301,10 @@ pub(super) struct Report {
     /// at.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) property_findings: Vec<PropertyFinding>,
+    /// The generator lanes' unpatched searches that weren't clean, other
+    /// than the property findings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) generator_baseline_failures: Vec<GeneratorBaselineFailure>,
     pub(super) cases: Vec<CaseReport>,
     pub(super) summary: BTreeMap<String, PropertySummary>,
 }
@@ -310,6 +317,7 @@ struct Outcome {
     cases: Vec<CaseReport>,
     generate: Option<GenerateConfig>,
     property_findings: Vec<PropertyFinding>,
+    generator_baseline_failures: Vec<GeneratorBaselineFailure>,
 }
 
 /// The per-property summary of `cases`.
@@ -467,6 +475,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         memory_max,
         generate: outcome.generate,
         property_findings: outcome.property_findings,
+        generator_baseline_failures: outcome.generator_baseline_failures,
         summary: summarize(&outcome.cases),
         cases: outcome.cases,
     };
@@ -490,6 +499,15 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         println!(
             "property finding: {} seed {}: {}",
             finding.harness, finding.seed, finding.detail
+        );
+    }
+    for failure in &report.generator_baseline_failures {
+        println!(
+            "generator baseline failure: {} seed {}: {}: {}",
+            failure.harness,
+            failure.seed,
+            failure.result.key(),
+            failure.result.detail
         );
     }
     println!(
@@ -841,12 +859,12 @@ impl Runner {
                 .set_modified(SystemTime::now())?;
         }
         let baselines = self.baselines(cases, runnables, &slots[0], &built, &source)?;
-        let (lanes, generate, property_findings) = if self.generate.on() {
-            let (lanes, config, findings) =
+        let (lanes, generate, found) = if self.generate.on() {
+            let (lanes, config, found) =
                 self.lanes(cases, runnables, &slots[0], &built, &source)?;
-            (Some(lanes), Some(config), findings)
+            (Some(lanes), Some(config), found)
         } else {
-            (None, None, Vec::new())
+            (None, None, generate::BaselineFound::default())
         };
         let mut mutants: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, case) in cases.iter().enumerate() {
@@ -935,7 +953,8 @@ impl Runner {
             source,
             cases: results.into_values().collect(),
             generate,
-            property_findings,
+            property_findings: found.findings,
+            generator_baseline_failures: found.failures,
         })
     }
 

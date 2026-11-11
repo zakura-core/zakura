@@ -84,6 +84,9 @@ pub(in crate::planted) enum Reason {
     /// Harness failure: a generator's kill didn't confirm, or didn't replay
     /// Exact, in a fresh process.
     Unconfirmed,
+    /// Harness failure: a campaign didn't complete from an empty corpus, or
+    /// its evidence falls short.
+    Incomplete,
 }
 
 /// One case's class, and what showed it.
@@ -677,7 +680,10 @@ impl GenerateFacts {
 
 /// The run failure, if any, that keeps a generator process that ended as
 /// `observed` says, with report `facts`, from giving a result.
-fn generator_failure(observed: &Observed, facts: Option<&GenerateFacts>) -> Option<Classified> {
+pub(in crate::planted) fn generator_failure(
+    observed: &Observed,
+    facts: Option<&GenerateFacts>,
+) -> Option<Classified> {
     let harness =
         |reason, detail: String| Some(Classified::new(Class::HarnessFailure, Some(reason), detail));
     if cap_killed(observed) {
@@ -697,20 +703,6 @@ fn generator_failure(observed: &Observed, facts: Option<&GenerateFacts>) -> Opti
             format!("the generator wrote no report: {ended:?}"),
         ),
     }
-}
-
-/// Why a generator's search on the unpatched build isn't clean, or `None`
-/// if it is: it must run every input with no `Active` violation, harness
-/// failure, abandonment limit or panic.
-pub(in crate::planted) fn generator_baseline(
-    observed: &Observed,
-    facts: Option<&GenerateFacts>,
-) -> Option<String> {
-    if let Some(failed) = generator_failure(observed, facts) {
-        return Some(failed.detail);
-    }
-    let facts = facts.expect("a search with no run failure wrote its report");
-    stop_detail(&facts.stop, facts.runs())
 }
 
 /// `stop` in words, after `runs` runs, or `None` for a clean search.
@@ -759,14 +751,7 @@ pub(in crate::planted) fn generated(
     match &facts.stop {
         GenerateStop::Clean => searched(property, facts),
         GenerateStop::Violation { property: id } => {
-            let Some(violated) = observed.records.iter().find_map(|record| match record {
-                Record::End {
-                    stopped_by: Some(stopped),
-                    violated,
-                    ..
-                } if stopped == id => Some(violated),
-                _ => None,
-            }) else {
+            let Some(violated) = kill_violations(id, &observed.records) else {
                 return Classified::new(
                     Class::HarnessFailure,
                     Some(Reason::NoEndRecord),
@@ -793,6 +778,22 @@ pub(in crate::planted) fn generated(
         GenerateStop::Abandoned { .. } => harness(Reason::Abandoned),
         GenerateStop::Panic { .. } => harness(Reason::Panic),
     }
+}
+
+/// Every ID violated by the run whose violation of `id` decides a kill, as
+/// the witness lane decides ([`deciding`]): the run that `id` stopped, or a
+/// run without a harness failure that ended with `id` violated. `None` if
+/// no end record shows it.
+pub(in crate::planted) fn kill_violations<'a>(
+    id: &str,
+    records: &'a [Record],
+) -> Option<&'a [String]> {
+    records.iter().find_map(|record| match record {
+        Record::End { violated, .. } if deciding(id, record) == Some(id) => {
+            Some(violated.as_slice())
+        }
+        _ => None,
+    })
 }
 
 /// A clean search's survivor reason for `property`, from its outcome

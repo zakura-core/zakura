@@ -19,14 +19,15 @@ use super::{
         Reason, Record, Trigger,
     },
     generate::{
-        campaign_class, confirmed, no_generator as no_generator_of, plan, write_exclusions,
-        FollowUp, GenBaseline, GenerateConfig, GenerateMode, GeneratorReport, Kill, Lanes,
-        PropertyFinding, Search, Searched,
+        baseline_lane, campaign_class, co_violations, confirmed, no_generator as no_generator_of,
+        plan, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
+        GeneratorBaselineFailure, GeneratorReport, Kill, Lanes, PropertyFinding, Search, Searched,
+        Unpatched,
     },
     parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
     GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
-use crate::planted::lane::CampaignFacts;
+use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
 const NAMED: &str = "block-sync/retained-byte-bound";
 const OTHER: &str = "block-sync/reserved-byte-bound";
@@ -742,6 +743,7 @@ fn the_report_round_trips_and_counts_by_property() {
         memory_max: Some(16 << 30),
         generate: None,
         property_findings: Vec::new(),
+        generator_baseline_failures: Vec::new(),
         summary: summarize(&cases),
         cases,
     };
@@ -999,6 +1001,44 @@ fn a_search_that_stops_at_a_violation_kills_by_its_rule() {
     );
 }
 
+/// An `Active` violation that stopped no step, found at the run's end,
+/// writes an end record with no `stopped_by`. It decides the kill as the
+/// witness lane's rule does.
+#[test]
+fn an_end_of_run_violation_kills_by_its_rule() {
+    let at_end = |id| observed(Ended::Exited(0), vec![end(None, &[(id, "violated", 0)])]);
+    assert_eq!(
+        generated(&[], &at_end(NAMED), Some(&search(violation(NAMED), None))),
+        (Class::KilledByNamedRule, None)
+    );
+    let other = classify::generated(
+        NAMED,
+        &[],
+        &at_end(OTHER),
+        Some(&search(violation(OTHER), None)),
+    );
+    assert_eq!(
+        (other.class, other.other.as_deref()),
+        (Class::KilledByOtherRule, Some(OTHER))
+    );
+    // A run that ended at a harness failure decides only by a violation
+    // that stopped it.
+    let harness_end = observed(
+        Ended::Exited(0),
+        vec![Record::End {
+            thread: "t1".to_owned(),
+            stopped_by: None,
+            violated: vec![NAMED.to_owned()],
+            harness: Some("schedule exhausted".to_owned()),
+            outcomes: BTreeMap::new(),
+        }],
+    );
+    assert_eq!(
+        generated(&[], &harness_end, Some(&search(violation(NAMED), None))),
+        (Class::HarnessFailure, Some(Reason::NoEndRecord))
+    );
+}
+
 #[test]
 fn a_clean_search_survives_by_its_outcome_counts() {
     let clean = observed(Ended::Exited(0), Vec::new());
@@ -1123,28 +1163,70 @@ fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
     assert_eq!(confirmed(result.clone(), &kept), result);
 }
 
+/// A search that ended at a run failure on the unpatched build is a
+/// failure to rerun alone, never a property finding. Only a confirmed
+/// `Active` violation is a finding.
 #[test]
-fn an_unpatched_search_that_stops_is_a_property_finding_and_fails_the_lane() {
-    // The baseline search names the violated ID only for a process that
-    // finished and reported it.
+fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
     let stopped = inproc(
         Ended::Exited(0),
         vec![end(Some(NAMED), &[(NAMED, "violated", 0)])],
         Some(search(violation(NAMED), None)),
     );
-    let (detail, violated) = stopped.baseline();
-    assert!(detail.unwrap().contains(NAMED));
-    assert_eq!(violated.as_deref(), Some(NAMED));
+    assert_eq!(stopped.unpatched(), Unpatched::Violation(NAMED.to_owned()));
     let clean = inproc(
         Ended::Exited(0),
         Vec::new(),
         Some(search(GenerateStop::Clean, None)),
     );
-    assert_eq!(clean.baseline(), (None, None));
-    let timed_out = inproc(Ended::TimedOut, Vec::new(), None);
-    let (detail, violated) = timed_out.baseline();
-    assert!(detail.is_some());
-    assert_eq!(violated, None);
+    assert_eq!(clean.unpatched(), Unpatched::Clean);
+    assert_eq!(baseline_lane(&Unpatched::Clean, None), (None, None));
+    for (ended, reason) in [
+        (Ended::Signaled(9), Reason::Oom),
+        (Ended::TimedOut, Reason::Timeout),
+        (Ended::Signaled(11), Reason::Panic),
+    ] {
+        let failed = inproc(ended, Vec::new(), Some(search(violation(NAMED), None)));
+        let unpatched = failed.unpatched();
+        assert!(
+            matches!(&unpatched, Unpatched::Failed { result, rerun: true }
+                if result.reason == Some(reason)),
+            "{ended:?}: {unpatched:?}"
+        );
+        let (lane, failure) = baseline_lane(&unpatched, None);
+        assert_eq!(lane.unwrap().class, Class::BaselineFails);
+        assert_eq!(failure.unwrap().reason, Some(reason));
+    }
+    // A harness failure on the pinned revision isn't a finding, and a run
+    // alone wouldn't change it.
+    let harness_end = inproc(
+        Ended::Exited(0),
+        Vec::new(),
+        Some(search(
+            GenerateStop::HarnessFailure {
+                reason: "x".to_owned(),
+            },
+            None,
+        )),
+    );
+    assert!(matches!(
+        harness_end.unpatched(),
+        Unpatched::Failed { rerun: false, .. }
+    ));
+
+    let violated = Unpatched::Violation(NAMED.to_owned());
+    let kept = FollowUp {
+        ok: true,
+        trace: Some("t".into()),
+        detail: None,
+    };
+    let (lane, failure) = baseline_lane(&violated, Some(&kept));
+    let lane = lane.unwrap();
+    assert_eq!((lane.class, lane.reason), (Class::BaselineFails, None));
+    assert_eq!(failure, None, "a confirmed violation is a finding");
+    let (lane, failure) = baseline_lane(&violated, Some(&FollowUp::failed("lost".to_owned())));
+    assert_eq!(lane.unwrap().reason, Some(Reason::Unconfirmed));
+    assert_eq!(failure.unwrap().reason, Some(Reason::Unconfirmed));
 
     // A failed baseline makes that harness and seed's lane `baseline-fails`
     // for every case on it, with nothing run.
@@ -1162,14 +1244,22 @@ fn an_unpatched_search_that_stops_is_a_property_finding_and_fails_the_lane() {
             (
                 ("block-sync/storage".to_owned(), 7),
                 GenBaseline {
-                    detail: Some("run 3 of the search violates x".to_owned()),
+                    failure: Some(classify::Classified::new(
+                        Class::BaselineFails,
+                        None,
+                        "the unpatched search violates x",
+                    )),
                     millis: 10,
                 },
             ),
             (
                 ("block-sync/storage".to_owned(), 8),
                 GenBaseline {
-                    detail: Some("the search passed its deadline".to_owned()),
+                    failure: Some(classify::Classified::new(
+                        Class::BaselineFails,
+                        Some(Reason::Timeout),
+                        "the search passed its deadline",
+                    )),
                     millis: 10,
                 },
             ),
@@ -1195,6 +1285,7 @@ fn an_unpatched_search_that_stops_is_a_property_finding_and_fails_the_lane() {
         .iter()
         .all(|lane| lane.result.class == Class::BaselineFails && lane.runs.is_none()));
     assert_eq!(lanes[1].seed, 8);
+    assert_eq!(lanes[1].result.reason, Some(Reason::Timeout));
     assert!(!out.path().join("generate").exists(), "nothing ran");
 }
 
@@ -1203,6 +1294,7 @@ fn a_campaign_lane_gets_the_same_classes() {
     let facts = |violated: &[&str], applied| CampaignFacts {
         status: "complete".to_owned(),
         violated: violated.iter().map(|id| (*id).to_owned()).collect(),
+        active: violated.iter().map(|id| (*id).to_owned()).collect(),
         applied,
         runs: 1000,
         applicable_runs: if applied { 10 } else { 0 },
@@ -1253,6 +1345,111 @@ fn a_campaign_lane_gets_the_same_classes() {
         class(&[], &saved),
         (Class::HarnessFailure, Some(Reason::HarnessEnd), None)
     );
+
+    // A campaign that didn't complete, or whose evidence falls short, gives
+    // no survivor.
+    for short in [
+        CampaignFacts {
+            status: "worker-stopped".to_owned(),
+            ..facts(&[], true)
+        },
+        CampaignFacts {
+            incomplete: vec!["\"runs\"".to_owned()],
+            ..facts(&[], false)
+        },
+        CampaignFacts {
+            initial_inputs: 3,
+            ..facts(&[], true)
+        },
+    ] {
+        assert_eq!(
+            class(&[], &short),
+            (Class::HarnessFailure, Some(Reason::Incomplete), None),
+            "{short:?}"
+        );
+    }
+}
+
+/// A `known` or `draft` input a campaign saved is a note, as in an
+/// `inproc` search: no kill, no baseline finding.
+#[test]
+fn a_campaign_counts_only_active_violations() {
+    let end = json!({"failures": [
+        {"path": "runs/r/workers/0/sim/inputs/known/x/y/aa.bin"},
+        {"path": "runs/r/workers/0/sim/inputs/draft/z/bb.bin"},
+    ]});
+    let evidence = json!({"status": "complete", "unapplied": [], "totals": {"runs": 9}});
+    let facts = campaign_facts(NAMED, Some(&end), &evidence, 0);
+    assert_eq!(
+        facts.violated,
+        ["x/y", "z"],
+        "the pilot's reading is unchanged"
+    );
+    assert!(facts.active.is_empty());
+    let result = campaign_class(NAMED, &[], &facts);
+    assert_eq!(
+        (result.class, result.reason),
+        (Class::Survived, Some(Reason::Held))
+    );
+    let campaign = |end: serde_json::Value, evidence: serde_json::Value| Search {
+        searched: Searched::Campaign(Ok(Campaign {
+            end: Some(end),
+            evidence,
+            initial_inputs: 0,
+            identity: serde_json::Value::Null,
+        })),
+        millis: 10,
+        dir: "/out/c".into(),
+    };
+    assert_eq!(
+        campaign(end.clone(), evidence.clone()).unpatched(),
+        Unpatched::Clean
+    );
+    let active = json!({"failures": [
+        {"path": "runs/r/workers/0/sim/inputs/active/x/y/aa.bin"},
+    ]});
+    assert_eq!(
+        campaign(active, evidence).unpatched(),
+        Unpatched::Violation("x/y".to_owned())
+    );
+    let stopped = json!({"status": "worker-stopped", "unapplied": []});
+    assert!(matches!(
+        campaign(end, stopped).unpatched(),
+        Unpatched::Failed { result, rerun: false } if result.reason == Some(Reason::Incomplete)
+    ));
+}
+
+/// A kill's confirmation allows the other IDs its run violated, from an
+/// end record that a violation stopped, from one that ended violated, or
+/// from a campaign's saved violations.
+#[test]
+fn a_kills_confirmation_allows_its_co_violations() {
+    let at_end = inproc(
+        Ended::Exited(0),
+        vec![end(None, &[(NAMED, "violated", 0), (OTHER, "violated", 0)])],
+        Some(search(violation(NAMED), None)),
+    );
+    assert_eq!(co_violations(&at_end.searched, NAMED), [OTHER]);
+    let stopped = inproc(
+        Ended::Exited(0),
+        vec![end(
+            Some(OTHER),
+            &[(OTHER, "violated", 0), (NAMED, "violated", 0)],
+        )],
+        Some(search(violation(OTHER), None)),
+    );
+    assert_eq!(co_violations(&stopped.searched, OTHER), [NAMED]);
+    let campaign = Searched::Campaign(Ok(Campaign {
+        end: Some(json!({"failures": [
+            {"path": "w/sim/inputs/active/a/x.bin"},
+            {"path": "w/sim/inputs/active/b/y.bin"},
+            {"path": "w/sim/inputs/known/c/z.bin"},
+        ]})),
+        evidence: json!({"status": "complete"}),
+        initial_inputs: 0,
+        identity: serde_json::Value::Null,
+    }));
+    assert_eq!(co_violations(&campaign, "a"), ["b"]);
 }
 
 #[test]
@@ -1490,9 +1687,25 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
             millis: 300,
             input: Some("baseline/generate/d/search/cd.bin".into()),
             family: Some("untagged".to_owned()),
-            confirmation: Some(FollowUp::failed("missing witness".to_owned())),
+            confirmation: Some(FollowUp {
+                ok: true,
+                trace: Some("baseline/generate/d/x/confirmation/confirm/trace".into()),
+                detail: None,
+            }),
             shrunk: None,
             log: "baseline/generate/d".into(),
+        }],
+        generator_baseline_failures: vec![GeneratorBaselineFailure {
+            harness: "block-sync/storage".to_owned(),
+            seed: 11,
+            mode: GenerateMode::Inproc,
+            result: classify::Classified::new(
+                Class::HarnessFailure,
+                Some(Reason::Oom),
+                "the memory cap killed the search",
+            ),
+            rerun_alone: true,
+            log: "baseline/generate/b-alone".into(),
         }],
         summary: summarize(&cases),
         cases,
@@ -1504,6 +1717,11 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
     assert_eq!(value["generate"]["mode"], "inproc");
     assert!(value["generate"].get("seconds").is_none());
     assert_eq!(value["property_findings"][0]["property"], OTHER);
+    assert_eq!(
+        value["generator_baseline_failures"][0]["result"]["reason"],
+        "oom"
+    );
+    assert_eq!(value["generator_baseline_failures"][0]["rerun_alone"], true);
     let lane = &value["cases"][0]["generator"][0];
     for key in [
         "harness",
@@ -1542,6 +1760,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
     let plain = serde_json::to_value(Report {
         generate: None,
         property_findings: Vec::new(),
+        generator_baseline_failures: Vec::new(),
         ..report
     })
     .unwrap();

@@ -1008,17 +1008,20 @@ fn campaign_lane(
         seed,
         corpus,
     };
-    Ok(
-        lane::campaign_lane(sim, dir, fuzz_target, &spec, &catalogue.discovery.campaign)?.map(
-            |campaign| {
-                let mut facts = campaign.facts(&case.property);
-                let expected = expected_fuzz_identity(catalogue, case);
-                facts.unpaired =
-                    paired_identity(&expected, &campaign.identity, FUZZ_FIELDS, mutated);
-                facts
-            },
-        ),
-    )
+    Ok(lane::campaign_lane(
+        &|| Command::new(sim),
+        dir,
+        fuzz_target,
+        &spec,
+        &catalogue.discovery.campaign,
+        lane::start_deadline(&catalogue.discovery.campaign),
+    )?
+    .map(|campaign| {
+        let mut facts = campaign.facts(&case.property);
+        let expected = expected_fuzz_identity(catalogue, case);
+        facts.unpaired = paired_identity(&expected, &campaign.identity, FUZZ_FIELDS, mutated);
+        facts
+    }))
 }
 
 /// The fuzz build identity the catalogue pins for `case`'s target, with

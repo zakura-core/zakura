@@ -13,7 +13,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::super::{
-    baseline_failure, classify as planted_verdict, lane::CampaignFacts, Run, Verdict,
+    baseline_failure, classify as planted_verdict,
+    lane::{campaign_failure, left_failures, CampaignFacts},
+    Run, Verdict,
 };
 
 /// A process that ran past its deadline or died from a signal is a harness
@@ -422,43 +424,6 @@ pub(super) fn discovery_baseline(
             format!("the baseline campaign {why}"),
         )
     })
-}
-
-/// Why `campaign` isn't a complete, clean, paired run from the empty
-/// corpus, other than a property violation, or `None` if it is.
-fn campaign_failure(campaign: &CampaignFacts) -> Option<String> {
-    if let Some(why) = &campaign.unpaired {
-        return Some(why.clone());
-    }
-    if campaign.initial_inputs > 0 {
-        return Some(format!(
-            "started from {} inputs, not the frozen empty corpus",
-            campaign.initial_inputs
-        ));
-    }
-    if let Some(why) = left_failures(campaign) {
-        return Some(why);
-    }
-    if campaign.status != "complete" || !campaign.incomplete.is_empty() {
-        return Some(format!(
-            "ended {} with incomplete evidence: {}",
-            campaign.status,
-            campaign.incomplete.join(", ")
-        ));
-    }
-    None
-}
-
-/// The saved failures and worker deaths `campaign` left, said in words, or
-/// `None` if it left none.
-fn left_failures(campaign: &CampaignFacts) -> Option<String> {
-    let left: Vec<&str> = campaign
-        .failures
-        .iter()
-        .chain(&campaign.killed)
-        .map(String::as_str)
-        .collect();
-    (!left.is_empty()).then(|| format!("left failures: {}", left.join(", ")))
 }
 
 /// The classes of a set of results, and the intended-detection rate's

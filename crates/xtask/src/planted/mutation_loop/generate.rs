@@ -17,13 +17,18 @@
 //!   `zakura-sim generators` lists them. `--generate-harness <name>` runs
 //!   every case on that harness.
 //! - **Baselines.** One search per harness and seed runs on the unpatched
-//!   build first. A search that stops there is a property finding: ordinary
-//!   property testing that found a bug on the pinned revision, or a
-//!   property defect. The report lists it under `property_findings`, and
-//!   that harness and seed's lane is `baseline-fails` for every case. The
+//!   build first. A search that a run failure ended, such as an OOM, a
+//!   timeout or a signal, reruns alone with the host's memory. A search
+//!   that stopped at an `Active` violation that a fresh process confirms is
+//!   a property finding: ordinary property testing that found a bug on the
+//!   pinned revision, or a property defect. The report lists it under
+//!   `property_findings`. Any other search that isn't clean is a generator
+//!   baseline failure, under `generator_baseline_failures`. Either way that
+//!   harness and seed's lane is `baseline-fails` for every case. The
 //!   witness lane doesn't depend on it.
-//! - **Exclusions.** Every search skips each committed input under
-//!   [`EXCLUDED_DIRS`], by SHA-256, so it can't rediscover a witness.
+//! - **Exclusions.** Every `inproc` search skips each committed input under
+//!   [`EXCLUDED_DIRS`], by SHA-256, so it can't rediscover a witness. A
+//!   `libfuzzer` campaign starts from an empty corpus and excludes nothing.
 //! - **Classes.** A lane gets the witness lane's classes
 //!   ([`classify::generated`]).
 //! - **Confirmation.** A kill's input must violate the same ID in a fresh
@@ -33,9 +38,11 @@
 //!   within [`SHRINK_CANDIDATES`] and [`SHRINK_WALL`].
 //!
 //! A mutant's search runs once per harness and seed, and the loop
-//! classifies each of the mutant's cases from it. A search runs under the
-//! witness lane's memory cap. Its deadline is its baseline's time times the
-//! witness lane's factor, and at least the witness lane's minimum.
+//! classifies each of the mutant's cases from it. A search, or each
+//! campaign child, runs under the witness lane's memory cap. Its deadline
+//! is its baseline's time times the witness lane's factor, and at least the
+//! witness lane's minimum. A campaign's `start` also gets at least its
+//! budget and the pilot's grace.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -52,10 +59,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     super::lane::{
-        self, confirm_and_replay, run_lane_child, BuildFailure, CampaignBounds, CampaignFacts,
-        LaneError, LaneSpec, EXPECT_VAR,
+        self, campaign_failure, confirm_and_replay, left_failures, run_lane_child, BuildFailure,
+        CampaignBounds, CampaignFacts, LaneError, LaneSpec, EXPECT_VAR,
     },
-    classify::{self, Class, Classified, Ended, GenerateFacts, GenerateStop, Reason, Record},
+    classify::{self, kill_violations, Class, Classified, GenerateFacts, GenerateStop, Reason},
     host_memory, key, scoped, Built, LoopCase, Ran, Runnable, Runner, Slot, BASELINE_DEADLINE,
     DEADLINE_FACTOR, MIN_DEADLINE, WORK_LIST,
 };
@@ -314,12 +321,44 @@ pub(in crate::planted) struct PropertyFinding {
 /// A harness and a seed: one search per build.
 pub(super) type Pair = (String, u64);
 
+/// A harness and seed's unpatched search that wasn't clean, other than a
+/// confirmed property finding: a run failure, a harness failure on the
+/// pinned revision, or a violation that didn't confirm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::planted) struct GeneratorBaselineFailure {
+    pub(in crate::planted) harness: String,
+    pub(in crate::planted) seed: u64,
+    pub(in crate::planted) mode: GenerateMode,
+    /// A harness failure, with its reason.
+    pub(in crate::planted) result: Classified,
+    /// True if a run failure ended the first search, and this result is
+    /// the rerun alone with the host's memory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(in crate::planted) rerun_alone: bool,
+    /// The search's evidence, relative to `--out`.
+    pub(in crate::planted) log: PathBuf,
+}
+
 /// A harness and seed's unpatched search.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GenBaseline {
-    /// Why the search isn't clean, or `None` if it is.
-    pub(super) detail: Option<String>,
+    /// The class every lane of the pair gets instead of searching, a
+    /// `baseline-fails` one, or `None` for a clean search.
+    pub(super) failure: Option<Classified>,
     pub(super) millis: u64,
+}
+
+/// What a search on the unpatched build showed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Unpatched {
+    /// It ran every input with no `Active` violation or failure.
+    Clean,
+    /// It stopped at a violation of this `Active` ID.
+    Violation(String),
+    /// It gave no result, or stopped at a harness failure, an abandonment
+    /// limit or a panic. `rerun` is true for a run failure, such as an
+    /// OOM, a timeout or a signal, that a run alone may not repeat.
+    Failed { result: Classified, rerun: bool },
 }
 
 /// What every generator lane shares once the baselines ran.
@@ -450,60 +489,97 @@ impl Search {
         }
     }
 
-    /// Why the search on the unpatched build isn't clean, or `None`, and
-    /// the ID whose violation stopped it, if one did.
-    pub(super) fn baseline(&self) -> (Option<String>, Option<String>) {
+    /// What the search showed on the unpatched build.
+    pub(super) fn unpatched(&self) -> Unpatched {
+        let failed = |reason, detail: String, rerun| Unpatched::Failed {
+            result: Classified::new(Class::HarnessFailure, Some(reason), detail),
+            rerun,
+        };
         match &self.searched {
             Searched::Inproc(ran) => {
                 let facts = ran.generated.as_ref();
-                let violated = match facts {
-                    Some(GenerateFacts {
-                        stop: GenerateStop::Violation { property },
-                        ..
-                    }) if ran.observed.ended == Ended::Exited(0) => Some(property.clone()),
-                    _ => None,
-                };
-                (classify::generator_baseline(&ran.observed, facts), violated)
+                if let Some(result) = classify::generator_failure(&ran.observed, facts) {
+                    return Unpatched::Failed {
+                        result,
+                        rerun: true,
+                    };
+                }
+                let facts = facts.expect("a search with no run failure wrote its report");
+                let detail = classify::stop_detail(&facts.stop, facts.runs()).unwrap_or_default();
+                match &facts.stop {
+                    GenerateStop::Clean => Unpatched::Clean,
+                    GenerateStop::Violation { property } => Unpatched::Violation(property.clone()),
+                    GenerateStop::HarnessFailure { .. } => {
+                        failed(Reason::HarnessEnd, detail, false)
+                    }
+                    GenerateStop::Abandoned { .. } => failed(Reason::Abandoned, detail, false),
+                    GenerateStop::Panic { .. } => failed(Reason::Panic, detail, false),
+                }
             }
+            Searched::Campaign(Err(result)) => Unpatched::Failed {
+                rerun: result.reason == Some(Reason::Timeout),
+                result: result.clone(),
+            },
             Searched::Campaign(Ok(campaign)) => {
                 let facts = campaign.facts("");
-                let detail = if let Some(id) = facts.violated.first() {
-                    Some(format!("the campaign violates {id}"))
-                } else if !facts.killed.is_empty() || !facts.failures.is_empty() {
-                    let failures: Vec<&str> = facts
-                        .killed
-                        .iter()
-                        .chain(&facts.failures)
-                        .map(String::as_str)
-                        .collect();
-                    Some(format!(
-                        "the campaign saved failures: {}",
-                        failures.join(", ")
-                    ))
-                } else {
-                    None
-                };
-                (detail, facts.violated.first().cloned())
+                if let Some(failure) = campaign_run_failure(&facts) {
+                    return Unpatched::Failed {
+                        rerun: !facts.killed.is_empty(),
+                        result: failure,
+                    };
+                }
+                if let Some(id) = facts.active.first() {
+                    return Unpatched::Violation(id.clone());
+                }
+                match campaign_failure(&facts) {
+                    Some(why) => failed(Reason::Incomplete, format!("the campaign {why}"), false),
+                    None => Unpatched::Clean,
+                }
             }
-            Searched::Campaign(Err(failure)) => (Some(failure.detail.clone()), None),
         }
     }
 }
 
+/// The run failure that keeps a campaign from giving any result, even
+/// beside a violation: it started from inputs, or a worker timed out or
+/// died, or it saved a failure that isn't a violation. As the pilot's
+/// discovery lane reads it.
+fn campaign_run_failure(facts: &CampaignFacts) -> Option<Classified> {
+    let harness =
+        |reason, detail| Some(Classified::new(Class::HarnessFailure, Some(reason), detail));
+    if facts.initial_inputs > 0 {
+        return harness(
+            Reason::Incomplete,
+            format!(
+                "the campaign started from {} inputs, not an empty corpus",
+                facts.initial_inputs
+            ),
+        );
+    }
+    let why = left_failures(facts)?;
+    if facts.killed.is_empty() {
+        harness(Reason::HarnessEnd, format!("the campaign {why}"))
+    } else {
+        harness(Reason::Timeout, format!("the campaign {why}"))
+    }
+}
+
 /// A `libfuzzer` lane's class for `property`, allowing `also_violates`, by
-/// the witness lane's rules. A worker that timed out or died, or a saved
-/// failure that isn't a violation, is a harness failure. A violation of an
-/// ID other than `property` and `also_violates` kills by another rule. A
-/// violation of `property` kills by the named rule. A violation of
-/// `also_violates` alone kills by another rule. A campaign without a
-/// violation survived: `held` if `property` applied in a complete
-/// process, else `not-applicable`.
+/// the witness lane's rules and the pilot's completeness checks. A run
+/// failure ([`campaign_run_failure`]) is a harness failure. Only the
+/// `active` bucket's violations count; a `known` or `draft` one is a note,
+/// as in an `inproc` search. A violation of an ID other than `property` and
+/// `also_violates` kills by another rule. A violation of `property` kills
+/// by the named rule. A violation of `also_violates` alone kills by another
+/// rule. Without a violation, a campaign that didn't complete, or whose
+/// evidence falls short, is a harness failure (`incomplete`). A complete one
+/// survived: `held` if `property` applied in a complete process, else
+/// `not-applicable`.
 pub(super) fn campaign_class(
     property: &str,
     also_violates: &[String],
     facts: &CampaignFacts,
 ) -> Classified {
-    let harness = |reason, detail| Classified::new(Class::HarnessFailure, Some(reason), detail);
     let other = |id: &String| Classified {
         other: Some(id.clone()),
         ..Classified::new(
@@ -512,37 +588,32 @@ pub(super) fn campaign_class(
             format!("the campaign violates {id} after {} runs", facts.runs),
         )
     };
-    if !facts.killed.is_empty() {
-        return harness(
-            Reason::Timeout,
-            format!(
-                "the campaign's workers timed out or died: {}",
-                facts.killed.join(", ")
-            ),
-        );
-    }
-    if !facts.failures.is_empty() {
-        return harness(
-            Reason::HarnessEnd,
-            format!("the campaign saved failures: {}", facts.failures.join(", ")),
-        );
+    if let Some(failure) = campaign_run_failure(facts) {
+        return failure;
     }
     if let Some(id) = facts
-        .violated
+        .active
         .iter()
         .find(|id| *id != property && !also_violates.contains(id))
     {
         return other(id);
     }
-    if facts.violated.iter().any(|id| id == property) {
+    if facts.active.iter().any(|id| id == property) {
         return Classified::new(
             Class::KilledByNamedRule,
             None,
             format!("the campaign violates {property} after {} runs", facts.runs),
         );
     }
-    if let Some(id) = facts.violated.first() {
+    if let Some(id) = facts.active.first() {
         return other(id);
+    }
+    if let Some(why) = campaign_failure(facts) {
+        return Classified::new(
+            Class::HarnessFailure,
+            Some(Reason::Incomplete),
+            format!("the campaign {why}"),
+        );
     }
     if facts.applied {
         Classified::new(
@@ -705,31 +776,19 @@ pub(super) fn write_exclusions(tree: &Path, file: &Path) -> Result<usize, BoxErr
     Ok(digests.len())
 }
 
-/// The other IDs that the run whose violation of `id` stopped `searched`
-/// also violated, as its end record shows. The fresh confirmation allows
-/// them.
-fn co_violations(searched: &Searched, id: &str) -> Vec<String> {
-    let Searched::Inproc(ran) = searched else {
-        return Vec::new();
+/// The other IDs that the input whose violation of `id` stopped `searched`
+/// may also violate, which its fresh confirmation allows: those the kill's
+/// end record shows ([`kill_violations`]), or, for a campaign, every other
+/// `active` ID it saved.
+pub(super) fn co_violations(searched: &Searched, id: &str) -> Vec<String> {
+    let violated: Vec<String> = match searched {
+        Searched::Inproc(ran) => kill_violations(id, &ran.observed.records)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default(),
+        Searched::Campaign(Ok(campaign)) => campaign.facts(id).active,
+        Searched::Campaign(Err(_)) => Vec::new(),
     };
-    ran.observed
-        .records
-        .iter()
-        .find_map(|record| match record {
-            Record::End {
-                stopped_by: Some(stopped),
-                violated,
-                ..
-            } if stopped == id => Some(
-                violated
-                    .iter()
-                    .filter(|other| *other != id)
-                    .cloned()
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default()
+    violated.into_iter().filter(|other| other != id).collect()
 }
 
 /// A kill's class once its fresh `confirmation` ran: `result` if it
@@ -749,10 +808,53 @@ pub(super) fn confirmed(result: Classified, confirmation: &FollowUp) -> Classifi
     )
 }
 
+/// What the generator baselines found besides clean searches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct BaselineFound {
+    /// Confirmed `Active` violations.
+    pub(super) findings: Vec<PropertyFinding>,
+    /// Every other search that wasn't clean.
+    pub(super) failures: Vec<GeneratorBaselineFailure>,
+}
+
+/// The class a pair's lanes get from its unpatched search, `None` for a
+/// clean one, and the baseline failure to report, if any. `confirmation` is
+/// a violation's fresh confirmation. A confirmed violation is a finding,
+/// and its lanes `baseline-fails` with no reason. A violation that didn't
+/// confirm, and any other failure, is a baseline failure, and its lanes
+/// `baseline-fails` with its reason.
+pub(super) fn baseline_lane(
+    unpatched: &Unpatched,
+    confirmation: Option<&FollowUp>,
+) -> (Option<Classified>, Option<Classified>) {
+    let failed = |result: Classified| {
+        let lane = Classified::new(Class::BaselineFails, result.reason, result.detail.clone());
+        (Some(lane), Some(result))
+    };
+    match unpatched {
+        Unpatched::Clean => (None, None),
+        Unpatched::Violation(id) => {
+            let violates = format!("the unpatched search violates {id}");
+            match confirmation {
+                Some(confirmation) if confirmation.ok => (
+                    Some(Classified::new(Class::BaselineFails, None, violates)),
+                    None,
+                ),
+                _ => failed(confirmed(
+                    Classified::new(Class::HarnessFailure, None, violates),
+                    confirmation.unwrap_or(&FollowUp::failed("no confirmation ran".to_owned())),
+                )),
+            }
+        }
+        Unpatched::Failed { result, .. } => failed(result.clone()),
+    }
+}
+
 impl Runner {
     /// Sets the generator lanes up on slot 0's unpatched `built`, and runs
     /// each harness and seed's baseline search. Returns the lanes, the
-    /// setup the report records, and the baselines' property findings.
+    /// setup the report records, and the baselines' property findings and
+    /// failures.
     pub(super) fn lanes(
         &self,
         cases: &[LoopCase],
@@ -760,7 +862,7 @@ impl Runner {
         slot: &Slot,
         built: &Built,
         source: &str,
-    ) -> Result<(Lanes, GenerateConfig, Vec<PropertyFinding>), BoxError> {
+    ) -> Result<(Lanes, GenerateConfig, BaselineFound), BoxError> {
         let flags = self.generate.clone();
         let sim = built
             .sim
@@ -817,10 +919,9 @@ impl Runner {
                     .map(|seed| (harness.clone(), *seed))
             })
             .collect();
-        let (baselines, findings) =
-            self.generator_baselines(slot, built, &lanes, &pairs, source)?;
+        let (baselines, found) = self.generator_baselines(slot, built, &lanes, &pairs, source)?;
         lanes.baselines = baselines;
-        Ok((lanes, config, findings))
+        Ok((lanes, config, found))
     }
 
     /// Runs `harness`'s search on `seed` with `slot`'s binaries `built`,
@@ -880,9 +981,18 @@ impl Runner {
                     feedback: "on".to_owned(),
                     sanitizer: "none".to_owned(),
                 };
+                let make = || scoped(cap, sim);
+                let deadline = deadline.max(lane::start_deadline(&bounds));
                 Searched::Campaign(
-                    lane::campaign_lane(sim, dir, &slot.target.join("fuzz"), &spec, &bounds)?
-                        .map_err(lane_failure),
+                    lane::campaign_lane(
+                        &make,
+                        dir,
+                        &slot.target.join("fuzz"),
+                        &spec,
+                        &bounds,
+                        deadline,
+                    )?
+                    .map_err(lane_failure),
                 )
             }
         };
@@ -972,8 +1082,9 @@ impl Runner {
     }
 
     /// Runs each `(harness, seed)` search of `pairs` once on slot 0's
-    /// unpatched `built`. Returns each pair's baseline and the property
-    /// findings among them, each violation confirmed and shrunk.
+    /// unpatched `built`, then reruns alone, with the host's memory, each
+    /// one a run failure ended. Returns each pair's baseline, and the
+    /// property findings and baseline failures among them.
     fn generator_baselines(
         &self,
         slot: &Slot,
@@ -981,9 +1092,15 @@ impl Runner {
         lanes: &Lanes,
         pairs: &BTreeSet<Pair>,
         source: &str,
-    ) -> Result<(BTreeMap<Pair, GenBaseline>, Vec<PropertyFinding>), BoxError> {
-        let pending: Mutex<Vec<(String, u64)>> = Mutex::new(pairs.iter().rev().cloned().collect());
-        let ran: Mutex<BTreeMap<(String, u64), Search>> = Mutex::new(BTreeMap::new());
+    ) -> Result<(BTreeMap<Pair, GenBaseline>, BaselineFound), BoxError> {
+        let pending: Mutex<Vec<Pair>> = Mutex::new(pairs.iter().rev().cloned().collect());
+        let ran: Mutex<BTreeMap<Pair, Search>> = Mutex::new(BTreeMap::new());
+        let dir = |harness: &str, seed: u64, suffix: &str| {
+            self.out
+                .join("baseline")
+                .join("generate")
+                .join(format!("{}-seed-{seed}{suffix}", key(harness)))
+        };
         // Campaigns build their fuzz target in the slot's one target
         // directory, so they run one at a time.
         let workers = match lanes.flags.mode {
@@ -1002,11 +1119,6 @@ impl Runner {
                             else {
                                 return Ok(());
                             };
-                            let dir = self
-                                .out
-                                .join("baseline")
-                                .join("generate")
-                                .join(format!("{}-seed-{seed}", key(&harness)));
                             let search = self
                                 .search(
                                     slot,
@@ -1014,7 +1126,7 @@ impl Runner {
                                     lanes,
                                     &harness,
                                     seed,
-                                    &dir,
+                                    &dir(&harness, seed, ""),
                                     source,
                                     BASELINE_DEADLINE,
                                     self.memory_max,
@@ -1037,78 +1149,89 @@ impl Runner {
                 .collect::<Result<Vec<()>, String>>()
         })?;
         let mut baselines = BTreeMap::new();
-        let mut findings = Vec::new();
-        for ((harness, seed), search) in ran.into_inner().expect("every worker joined") {
-            let (detail, violated) = search.baseline();
+        let mut found = BaselineFound::default();
+        for ((harness, seed), mut search) in ran.into_inner().expect("every worker joined") {
+            let mut unpatched = search.unpatched();
+            let rerun_alone = matches!(unpatched, Unpatched::Failed { rerun: true, .. });
+            if rerun_alone {
+                search = self.search(
+                    slot,
+                    built,
+                    lanes,
+                    &harness,
+                    seed,
+                    &dir(&harness, seed, "-alone"),
+                    source,
+                    BASELINE_DEADLINE,
+                    self.alone_cap(),
+                )?;
+                unpatched = search.unpatched();
+            }
+            let confirmation = match &unpatched {
+                Unpatched::Violation(id) => {
+                    let kill = Kill {
+                        input: search.input(id),
+                        id: id.clone(),
+                    };
+                    let also = co_violations(&search.searched, id);
+                    let done = self.follow_up(
+                        built,
+                        &harness,
+                        &kill,
+                        &also,
+                        &search.dir.join(key(id)),
+                        self.alone_cap(),
+                    )?;
+                    Some((kill, done))
+                }
+                _ => None,
+            };
+            let (failure, failed) =
+                baseline_lane(&unpatched, confirmation.as_ref().map(|(_, (done, _))| done));
             println!(
                 "generator baseline {harness} seed {seed}: {}",
-                detail.as_deref().unwrap_or("clean")
+                failure
+                    .as_ref()
+                    .map_or_else(|| "clean".to_owned(), |failure| failure.key())
             );
-            if let Some(detail) = &detail {
-                let kill = violated.map(|id| Kill {
-                    input: search.input(&id),
-                    id,
+            let log = self.relative(&search.dir);
+            if let Some(result) = failed {
+                found.failures.push(GeneratorBaselineFailure {
+                    harness: harness.clone(),
+                    seed,
+                    mode: lanes.flags.mode,
+                    result,
+                    rerun_alone,
+                    log,
                 });
-                findings.push(self.finding(built, lanes, &harness, seed, &search, detail, kill)?);
+            } else if let Some((kill, (confirmation, shrunk))) = confirmation {
+                found.findings.push(PropertyFinding {
+                    harness: harness.clone(),
+                    seed,
+                    mode: lanes.flags.mode,
+                    detail: failure
+                        .as_ref()
+                        .map(|failure| failure.detail.clone())
+                        .unwrap_or_default(),
+                    property: Some(kill.id),
+                    runs: search.runs(),
+                    millis: search.millis,
+                    input: kill.input.map(|input| self.relative(&input)),
+                    family: search.family(),
+                    confirmation: Some(confirmation),
+                    shrunk,
+                    log,
+                });
             }
             baselines.insert(
                 (harness, seed),
                 GenBaseline {
-                    detail,
+                    failure,
                     millis: search.millis,
                 },
             );
         }
-        Ok((baselines, findings))
-    }
-
-    /// The property finding of `harness`'s unpatched `search` on `seed`,
-    /// which stopped for `detail`, at `kill` if a violation stopped it. A
-    /// kill is confirmed and shrunk.
-    #[allow(clippy::too_many_arguments)]
-    fn finding(
-        &self,
-        built: &Built,
-        lanes: &Lanes,
-        harness: &str,
-        seed: u64,
-        search: &Search,
-        detail: &str,
-        kill: Option<Kill>,
-    ) -> Result<PropertyFinding, BoxError> {
-        let (confirmation, shrunk) = match &kill {
-            Some(kill) => {
-                let also = co_violations(&search.searched, &kill.id);
-                let (confirmation, shrunk) = self.follow_up(
-                    built,
-                    harness,
-                    kill,
-                    &also,
-                    &search.dir.join(key(&kill.id)),
-                    self.memory_max,
-                )?;
-                (Some(confirmation), shrunk)
-            }
-            None => (None, None),
-        };
-        let (property, input) = match kill {
-            Some(kill) => (Some(kill.id), kill.input),
-            None => (None, None),
-        };
-        Ok(PropertyFinding {
-            harness: harness.to_owned(),
-            seed,
-            mode: lanes.flags.mode,
-            property,
-            detail: detail.to_owned(),
-            runs: search.runs(),
-            millis: search.millis,
-            input: input.map(|input| self.relative(&input)),
-            family: search.family(),
-            confirmation,
-            shrunk,
-            log: self.relative(&search.dir),
-        })
+        Ok((baselines, found))
     }
 
     /// The generator lanes of `cases` on `slot`'s patched `built`, by case
@@ -1137,8 +1260,7 @@ impl Runner {
         for (harness, cases) in by_harness {
             for seed in &lanes.flags.seeds {
                 let baseline = &lanes.baselines[&(harness.to_owned(), *seed)];
-                if let Some(detail) = &baseline.detail {
-                    let result = Classified::new(Class::BaselineFails, None, detail.clone());
+                if let Some(result) = &baseline.failure {
                     for (index, _) in &cases {
                         reports
                             .entry(*index)

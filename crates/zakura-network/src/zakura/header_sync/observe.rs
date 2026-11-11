@@ -863,8 +863,25 @@ pub struct ReactorSizes {
     pub pruned_peers: Vec<ZakuraPeerId>,
     /// Each completed target, by generation and branch.
     pub completed_targets: Vec<(HeaderGeneration, BranchId)>,
-    /// The entries of the VCT repair requirement's source sets and maps.
-    pub repair_sources: usize,
+    /// The VCT repair requirement's source sets and maps.
+    pub repair_sources: RepairSources,
+}
+
+/// The current VCT repair requirement's source sets and maps, as
+/// [`ReactorSizes`] reports them, each as its sorted keys. All are empty
+/// while no repair is required.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RepairSources {
+    /// The suppliers tried in the current episode.
+    pub tried: Vec<SourceId>,
+    /// The suppliers whose input the current episode excludes.
+    pub excluded_input: Vec<SourceId>,
+    /// The suppliers waiting for a changed status after `TargetNotSelected`.
+    pub busy: Vec<SourceId>,
+    /// The suppliers with `TargetNotSelected` answers counted.
+    pub target_refusals: Vec<SourceId>,
+    /// The departed suppliers whose history the requirement holds.
+    pub departed: Vec<SourceId>,
 }
 
 /// One peer's slot in the work queue, as [`ReactorEvent::Slots`] lists it.

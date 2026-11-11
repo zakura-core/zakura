@@ -848,7 +848,7 @@ impl HeaderSyncReactor {
             },
             pruned_peers: sorted(state.pruned_peers.keys()),
             completed_targets: state.completed_targets.keys(),
-            repair_sources: state.vct_repair.source_entries(),
+            repair_sources: state.vct_repair.sources(),
         }
     }
 

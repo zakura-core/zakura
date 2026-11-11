@@ -244,6 +244,17 @@ impl TrustedPreallocate for Action {
     }
 }
 
+/// Compressed actions are the same size on the wire as [`Action`]s, so they share its limits.
+impl TrustedPreallocate for super::action::ActionEncoding {
+    fn min_serialized_size() -> u64 {
+        Action::min_serialized_size()
+    }
+
+    fn max_allocation() -> u64 {
+        Action::max_allocation()
+    }
+}
+
 impl TrustedPreallocate for Signature<SpendAuth> {
     fn min_serialized_size() -> u64 {
         SPEND_AUTH_SIG_SIZE

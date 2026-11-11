@@ -12,6 +12,7 @@ use zakura_chain::{
     block,
     chain_tip::ChainTip,
     serialization::{BytesInDisplayOrder, ZcashDeserialize},
+    transaction,
 };
 use zakura_node_services::mempool::MempoolChangeKind;
 use zakura_state::{
@@ -21,7 +22,7 @@ use zakura_state::{
 use super::{
     indexer_server::Indexer, server::IndexerRPC, BlockAndHash, BlockAndHeight, BlockHashAndHeight,
     BlockRangeRequest, BlockRequest, Empty, MempoolChangeMessage, NonFinalizedStateChangeRequest,
-    BLOCK_HASH_BYTE_LEN, BLOCK_HEIGHT_BYTE_LEN,
+    RawTransaction, TransactionRequest, BLOCK_HASH_BYTE_LEN, BLOCK_HEIGHT_BYTE_LEN,
 };
 
 /// The maximum number of messages that can be queued to be streamed to a client.
@@ -366,6 +367,43 @@ where
             Ok(_) => unreachable!("unexpected response type from ReadStateService"),
             Err(error) => Err(Status::unavailable(format!(
                 "failed to read block: {error}"
+            ))),
+        }
+    }
+
+    async fn get_transaction(
+        &self,
+        request: tonic::Request<TransactionRequest>,
+    ) -> Result<Response<RawTransaction>, Status> {
+        let txid: [u8; 32] = request
+            .into_inner()
+            .txid
+            .try_into()
+            .map_err(|txid: Vec<u8>| {
+                Status::invalid_argument(format!(
+                    "transaction ID must be 32 bytes, got {} bytes",
+                    txid.len()
+                ))
+            })?;
+        let txid = transaction::Hash::from_bytes_in_display_order(&txid);
+
+        match self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainRawTransaction(txid))
+            .await
+        {
+            Ok(ReadResponse::RawTransaction(Some(transaction))) => {
+                Ok(Response::new(RawTransaction {
+                    data: transaction.to_vec(),
+                }))
+            }
+            Ok(ReadResponse::RawTransaction(None)) => {
+                Err(Status::not_found("transaction not found"))
+            }
+            Ok(_) => unreachable!("unexpected response type from ReadStateService"),
+            Err(error) => Err(Status::unavailable(format!(
+                "failed to read transaction: {error}"
             ))),
         }
     }

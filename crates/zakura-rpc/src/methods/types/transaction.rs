@@ -823,7 +823,10 @@ pub struct JoinSplit {
     #[getset(get_copy = "pub")]
     new_public_value_zat: i64,
     /// Merkle root of the Sprout note commitment tree.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input notes.
@@ -842,12 +845,18 @@ pub struct JoinSplit {
     commitments: Vec<[u8; 32]>,
     /// The onetime public key used to encrypt the ciphertexts
     #[serde(rename = "onetimePubKey")]
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     one_time_pubkey: [u8; 32],
     /// The random seed
     #[serde(rename = "randomSeed")]
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     random_seed: [u8; 32],
     /// The input notes MACs.
@@ -858,7 +867,10 @@ pub struct JoinSplit {
     #[getset(get = "pub")]
     macs: Vec<[u8; 32]>,
     /// A zero-knowledge proof using the Sprout circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get = "pub")]
     proof: Vec<u8>,
     /// The output notes ciphertexts.
@@ -878,23 +890,39 @@ pub struct ShieldedSpend {
     #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized public key for spendAuthSig.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// A zero-knowledge proof using the Sapling Spend circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     proof: [u8; 192],
     /// A signature authorizing this Spend.
-    #[serde(rename = "spendAuthSig", with = "hex")]
+    #[serde(
+        rename = "spendAuthSig",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
 }
@@ -907,11 +935,19 @@ pub struct ShieldedOutput {
     #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
-    #[serde(rename = "cmu", with = "hex")]
+    #[serde(
+        rename = "cmu",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cm_u: [u8; 32],
     /// A Jubjub public key.
-    #[serde(rename = "ephemeralKey", with = "hex")]
+    #[serde(
+        rename = "ephemeralKey",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
@@ -919,11 +955,18 @@ pub struct ShieldedOutput {
     #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
-    #[serde(rename = "outCiphertext", with = "hex")]
+    #[serde(
+        rename = "outCiphertext",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
     /// A zero-knowledge proof using the Sapling Output circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     proof: [u8; 192],
 }
@@ -1015,23 +1058,40 @@ impl OrchardFlags {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct OrchardAction {
     /// A value commitment to the net value of the input note minus the output note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cv: [u8; 32],
     /// The nullifier of the input note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized validating key for spendAuthSig.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// The x-coordinate of the note commitment for the output note.
-    #[serde(rename = "cmx", with = "hex")]
+    #[serde(
+        rename = "cmx",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cm_x: [u8; 32],
     /// An encoding of an ephemeral Pallas public key.
-    #[serde(rename = "ephemeralKey", with = "hex")]
+    #[serde(
+        rename = "ephemeralKey",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
@@ -1039,11 +1099,19 @@ pub struct OrchardAction {
     #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
-    #[serde(rename = "spendAuthSig", with = "hex")]
+    #[serde(
+        rename = "spendAuthSig",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
     /// A signature authorizing the spend in this Action.
-    #[serde(rename = "outCiphertext", with = "hex")]
+    #[serde(
+        rename = "outCiphertext",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
 }

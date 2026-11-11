@@ -902,6 +902,7 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
             {
+                outstanding.at(zakura_scheduler::hooks::now().map(|now| now.since_start()));
                 outstanding.observe(&event);
             }
             if let Some(retirement) = state
@@ -1120,6 +1121,11 @@ impl TapState {
             }
         };
         let mut buffer = state.buffer();
+        if let ReactorEvent::Retired { request, .. } = &event {
+            buffer
+                .effects
+                .push((LinkEffect::Retired, request.peer.clone()));
+        }
         buffer.last = buffer
             .last
             .checked_add(1)
@@ -1560,9 +1566,15 @@ impl ReactorTap {
     /// Checks from now on that this reactor's growable containers stay
     /// within their bounds and keep only live keys, as
     /// [`super::outstanding`] describes, for a node that admits
-    /// `peer_limit` peers, keeping each row's peak in `evidence`. Call it
+    /// `peer_limit` peers and keeps history for `departed_limit` departed
+    /// VCT repair suppliers, keeping each row's peak in `evidence`. Call it
     /// before the run starts.
-    pub fn watch_outstanding(&self, evidence: OutstandingEvidence, peer_limit: usize) {
+    pub fn watch_outstanding(
+        &self,
+        evidence: OutstandingEvidence,
+        peer_limit: usize,
+        departed_limit: usize,
+    ) {
         let port = self.state.port.clone();
         *self
             .state
@@ -1571,6 +1583,7 @@ impl ReactorTap {
             .unwrap_or_else(PoisonError::into_inner) = Some(Outstanding::new(
             evidence,
             peer_limit,
+            departed_limit,
             HeldHeaders::new(move || {
                 let state = port.upgrade()?.engine().durable_state();
                 Some(state.graph.nodes.into_keys().collect())

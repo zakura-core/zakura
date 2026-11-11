@@ -395,6 +395,34 @@ fn json_rpc_2_responses_are_unchanged() {
     );
 }
 
+/// A successful response goes back to older clients with the ID and result bytes the server
+/// wrote, whatever the ID and result contain.
+#[test]
+fn result_responses_keep_their_id_and_result_bytes_for_older_clients() {
+    for (id, result) in [
+        ("3", "null"),
+        ("null", r#"{"transactions":[{"data":"00ff"}],"height":1}"#),
+        (r#""a,\"result\":b\\""#, r#"[1,"}",{"error":null}]"#),
+        (r#""""#, r#"",\"result\":""#),
+    ] {
+        let response = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#);
+        let mapped = |version| {
+            let json = serde_json::value::RawValue::from_string(response.clone())
+                .expect("the response is JSON");
+            response_from_json_rpc_2(version, json)
+        };
+
+        assert_eq!(
+            mapped(JsonRpcVersion::Bitcoind),
+            format!(r#"{{"id":{id},"result":{result},"error":null}}"#)
+        );
+        assert_eq!(
+            mapped(JsonRpcVersion::Lightwalletd),
+            format!(r#"{{"jsonrpc":"1.0","id":{id},"result":{result},"error":null}}"#)
+        );
+    }
+}
+
 /// A near-limit numeric array with a noncanonical final number keeps the conversion behavior.
 #[test]
 fn large_numeric_array_is_normalized() {

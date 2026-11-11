@@ -1243,7 +1243,11 @@ impl Subsystem for Storage {
             branches.clone(),
             [],
         );
-        tap.watch_outstanding(ports.outstanding.clone(), storage_peer_limit());
+        tap.watch_outstanding(
+            ports.outstanding.clone(),
+            storage_peer_limit(),
+            storage_departed_limit(),
+        );
         tap.watch_fork_choice(
             ports.fork_choice.clone(),
             ports.fixture.clone(),
@@ -2179,6 +2183,17 @@ fn storage_peer_limit() -> usize {
         limits.max_outbound_peers,
         zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     )
+}
+
+/// The departed VCT repair suppliers whose history the storage harness's
+/// node keeps, `max_inbound_peers + max_outbound_peers`, as the reactor's
+/// `prune_vct_supplier_history` passes them from the config
+/// [`HeaderNode::spawn`] gives it.
+fn storage_departed_limit() -> usize {
+    let limits = ZakuraHeaderSyncConfig::default().peer_limits;
+    limits
+        .max_inbound_peers
+        .saturating_add(limits.max_outbound_peers)
 }
 
 /// What [`storage_properties`] read: the node's storage facts and the

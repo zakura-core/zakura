@@ -357,7 +357,7 @@ const PUBLICATION_CASES: [&str; 13] = [
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
-const OUTSTANDING_CASES: [&str; 9] = [
+const OUTSTANDING_CASES: [&str; 10] = [
     "header-authority-forks-sharing-a-header",
     "header-authority-relinked-mid-round",
     "header-reset-held-apply",
@@ -367,6 +367,7 @@ const OUTSTANDING_CASES: [&str; 9] = [
     "header-outstanding-churn",
     "header-outstanding-serving-churn",
     "header-outstanding-serving-replaced",
+    "header-outstanding-capacity-waits",
 ];
 
 /// The committed reset witnesses, each holding and applying
@@ -433,6 +434,25 @@ const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_witnesses_hold_outstanding_work_bounded",
     ),
     case: "header-authority-forks-sharing-a-header",
+};
+
+/// Each committed repair input, as its witness test names its execution.
+const REPAIR_OUTSTANDING_CASES: [&str; 4] = [
+    "committed header-repair-applied input",
+    "committed header-repair-prepare-departs input",
+    "committed header-repair-apply-departs input",
+    "committed header-repair-supplier-pruned input",
+];
+
+/// The committed repair inputs, each holding and applying
+/// `outstanding-work-bounded` under its committed Plan.
+const REPAIR_OUTSTANDING: HistoryRef = HistoryRef {
+    harness: REPAIR,
+    witness: sim_test(
+        "tests/header_repair.rs",
+        "the_committed_repair_inputs_hold_outstanding_work_bounded",
+    ),
+    case: "committed header-repair-applied input",
 };
 
 /// Each committed hold-release fixture, by its fixture stem, which its
@@ -815,6 +835,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             HistoryRef {
                 case,
                 ..OUTSTANDING_WITNESSES
+            },
+            OUTSTANDING,
+        ));
+    }
+    for case in REPAIR_OUTSTANDING_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..REPAIR_OUTSTANDING
             },
             OUTSTANDING,
         ));
@@ -1857,6 +1886,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "departed-source-unpruned",
+            REPAIR,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "ended-kept",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
@@ -1948,6 +1983,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "unknown-as-known",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "waits-kept",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,

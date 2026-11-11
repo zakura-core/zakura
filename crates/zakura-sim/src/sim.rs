@@ -1312,8 +1312,14 @@ fn checked_reports(
             }
             witness.retain(in_run);
         }
-        // A violation at a step the run didn't take is dropped whole.
+        // A violation at a step the run didn't take is dropped whole. The
+        // end findings are the last `end_found`, so the count follows the
+        // ones that stay, and the trim never takes a step finding for one.
+        let first_end = report.violations.len().saturating_sub(report.end_found);
+        let mut at = 0;
         report.violations.retain_mut(|violation| {
+            let end_found = at >= first_end;
+            at += 1;
             let mut steps = std::iter::once(&violation.step).chain(&violation.witness);
             if let Some(&step) = steps.find(|step| !in_run(step)) {
                 failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
@@ -1322,7 +1328,11 @@ fn checked_reports(
                 });
             }
             violation.witness.retain(in_run);
-            in_run(&violation.step)
+            let kept = in_run(&violation.step);
+            if end_found && !kept {
+                report.end_found -= 1;
+            }
+            kept
         });
     }
     (reports, failure)

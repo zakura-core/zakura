@@ -233,6 +233,46 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
     );
 }
 
+/// Sol 2, round 2: a report's end finding that names a step outside the
+/// run is dropped as a harness failure, and the step finding before it
+/// stays, so the trim's count of end findings follows what's left.
+#[test]
+fn a_dropped_end_finding_leaves_the_step_finding() {
+    let finding = |step: u64, witness: Vec<u64>| Violation {
+        property: "test/two".into(),
+        step,
+        witness,
+        expected: "nothing".into(),
+        actual: "something".into(),
+    };
+    let mut checker = FnChecker::new(
+        |_: &check::StepCtx<'_>| None,
+        move |_: &RunEnd, _: &ObservationLog| {
+            vec![PropertyReport {
+                violations: vec![finding(2, vec![2]), finding(99_999, vec![99_999])],
+                end_found: 1,
+                ..PropertyReport::new("test/two", PropertyOutcome::Violated { witness: vec![2] })
+            }]
+        },
+    );
+    let report = run(
+        config(2, 1_000),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("a", yields(5));
+        },
+        &mut checker,
+    );
+    assert!(matches!(
+        report.end.harness,
+        Some(HarnessFailure::EvidenceOutsideRun { step: 99_999, .. })
+    ));
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Violated { witness: vec![2] }
+    );
+}
+
 #[test]
 fn livelock_limit_violates() {
     let config = RunConfig {

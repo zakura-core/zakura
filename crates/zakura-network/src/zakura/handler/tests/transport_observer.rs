@@ -771,6 +771,7 @@ async fn an_inbound_connection_without_a_permit_is_refused() -> Result<(), BoxEr
         recorder.events(),
         vec![TransportEvent::HandshakeRefused {
             remote: connection.admitted_addr(),
+            shared_id: connection.shared_id(),
             reason: "admission".to_owned(),
         }]
     );

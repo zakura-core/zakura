@@ -35,13 +35,24 @@ whose target has no harness or no campaign.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
-  isn't the harness's generator, 2, runs the default scenario. Pass
+  isn't the harness's generator, 3, runs the default scenario. Pass
   `-max_len=4096`, the input size the grammar is built for, and
   `-len_control=0`. A run takes tens to hundreds of milliseconds, so
   libFuzzer's default length control keeps mutations inside the prefix for
   hours. Its committed seeds,
   `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
   the grammar and carry Plan bytes past the prefix.
+- `sync_storage` runs `sync/storage`, header sync and block sync on one
+  node over one engine. Its two-byte prefix picks a saved scenario, or the
+  default one, so the target fuzzes each scenario's schedule. Its committed
+  seeds are `crates/zakura-sim/tests/fixtures/sync-storage-*.bin`.
+- `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
+  simulated QUIC behind real handlers, so header sync, block sync and
+  discovery share each connection. Its two-byte prefix picks a saved
+  scenario (`0xFC`), fuzz-13's combined actions (`0xFB`, then a byte of
+  actions: the mirrors' fork at one stage of the block pipeline, a
+  connection replacement, and a read stall), or the honest scenario. Its
+  committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
@@ -384,6 +395,14 @@ version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
 the test or plan the seed comes from, and the property witnesses it carries.
 A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
 scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+A seed carried to a new generator with its meaning kept names its source in
+a `[derived_from]` table: the source file's SHA-256 and the generator it was
+built for. The source is kept as `sources/<sha256>.bin` beside the seed, and
+the seed check migrates it again with the harness's own migration, which
+must give the seed's input. The `header-sync/storage` seeds were migrated
+from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
+another generator than its harness's is rejected, even when the harness
+would draw a fallback scenario for it.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one
@@ -543,13 +562,14 @@ only from a target with a collector.
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
 each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
-runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
-`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+splits `qa/planted/` into fourteen shards. Each night its two parts run the
+two shards the UTC weekday picks, with `cargo xtask planted --shard
+<index>/14`, so each case runs once a week. A
 case's shard follows from its position in path order. Adding or removing a
 case moves every later case to another shard, so across that change a case
 can run on two nights in a row or wait up to 13 nights. A shard that holds no
 case fails the run. Each shard has its own failure issue,
-`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
+`[nightly] zakura_sim planted shard <index>/14 failed`, and only a passing run
 of that shard closes it, so a pass of another shard can't close it. A remote
 host runs the rest, including `cargo xtask planted --targets`, and its results
 never block a pull request. No CI job runs `planted --targets`.

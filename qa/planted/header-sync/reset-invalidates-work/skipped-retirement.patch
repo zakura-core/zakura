@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index f6ba4a2e8c..4bed9fc309 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -611,11 +611,8 @@ impl PeerWorkQueue {
+         &mut self,
+         current: &EngineSnapshot,
+     ) -> Vec<ActiveHeaderRequest> {
+-        self.policy
+-            .obsolete_active(current)
+-            .iter()
+-            .filter_map(|peer| self.remove(peer))
+-            .collect()
++        let _ = current;
++        Vec::new()
+     }
+ 
+     /// Return the exact attempt identity structurally owned by one peer slot.

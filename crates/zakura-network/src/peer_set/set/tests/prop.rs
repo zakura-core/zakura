@@ -315,8 +315,7 @@ fn sidecar_peer_always_receives_block_gossip() {
     let config = Config {
         advert_window_full_block: 32,
         advert_window_small_block: 64,
-        advert_delay_min: std::time::Duration::from_millis(500),
-        advert_delay_max: std::time::Duration::from_millis(500),
+        advert_delay: std::time::Duration::from_millis(500),
         ..Config::default()
     };
     // The advertisement carries no size, so the broadcast uses the full-block window.

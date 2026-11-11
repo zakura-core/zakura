@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine/state/status.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine/state/status.rs
+index 07d0075696..0ac95a96e0 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine/state/status.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine/state/status.rs
+@@ -145,6 +145,8 @@ fn clamped_limits(status: BlockSyncStatus) -> (u32, u32, u32) {
+     (
+         clamp_advertised_blocks(status.max_blocks_per_response),
+         clamp_advertised_response_bytes(status.max_response_bytes),
+-        clamp_advertised_inflight(status.max_inflight_requests),
++        // Mutation: requests ignore the peer's advertised in-flight limit and
++        // take the protocol's.
++        clamp_advertised_inflight(u32::MAX),
+     )
+ }

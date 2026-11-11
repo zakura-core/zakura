@@ -188,7 +188,7 @@ jobs:
               crates/zakurad/src/components/sync/end_of_support.rs \
               | grep -oE '[0-9_]+$' | tr -d '_'
           )"
-          minimum_height=$((committed_height + 3456))
+          minimum_height="$(python3 scripts/release-readiness.py eos-floor --height "$committed_height")"
           if [ "$estimated_height" -gt "$minimum_height" ]; then
             minimum_height="$estimated_height"
           fi

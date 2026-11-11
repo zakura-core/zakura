@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/service.rs b/crates/zakura-network/src/zakura/header_sync/service.rs
+index 6994496496..128849e980 100644
+--- a/crates/zakura-network/src/zakura/header_sync/service.rs
++++ b/crates/zakura-network/src/zakura/header_sync/service.rs
+@@ -811,7 +811,8 @@ impl Service for HeaderSyncService {
+             &peer_id,
+             session_id,
+             send,
+-            service_cancel_token.clone(),
++            // Mutation: the publisher waits on a token no session end cancels.
++            CancellationToken::new(),
+         ); (
+             recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)),
+             self.header_sync.credit_tap(&peer_id, session_id),

@@ -1318,9 +1318,9 @@ async fn rpc_getblock_missing_error() {
 
     // Make the mock service respond with no block
     let response_handler = read_state
-        .expect_request(zakura_state::ReadRequest::Block(Height(0).into()))
+        .expect_request(zakura_state::ReadRequest::RawBlock(Height(0).into()))
         .await;
-    response_handler.respond(zakura_state::ReadResponse::Block(None));
+    response_handler.respond(zakura_state::ReadResponse::RawBlock(None));
 
     let block_response = block_future.await.expect("block future should not panic");
     let block_response =
@@ -3776,6 +3776,174 @@ async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
     );
     assert_eq!(new_template.submit_old, Some(false));
     drop(mempool_tip);
+}
+
+/// The `mining_template` trace records each returned template and each new tip a request sees,
+/// under that request's ID.
+#[tokio::test]
+async fn template_trace_records_the_tip_to_template_path() {
+    let _init_guard = zakura_test::init();
+    let old_tip = Hash([1; 32]);
+    let new_tip = Hash([2; 32]);
+    let old_height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    let new_height = old_height.next().unwrap();
+
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(old_height);
+    tip_sender.send_best_tip_hash(old_tip);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    // The mempool stays at the old tip, and counts its requests.
+    let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
+    let mempool = tower::service_fn(move |_| {
+        mempool_calls.send_modify(|calls| *calls += 1);
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: old_tip,
+            })
+        }
+    });
+    let old_chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: old_height,
+        tip_hash: old_tip,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let (chain_info, chain_info_rx) = tokio::sync::watch::channel(old_chain_info);
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info_rx.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(chain_info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    // Background preparation is not under test: answer it without rejecting the template.
+    let verifier = tower::service_fn(|_| async {
+        Err::<Hash, BoxError>("verifier unavailable in this test".into())
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "template trace test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier, 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
+    let rpc = rpc.with_template_trace(zakura_jsonl_trace::JsonlEventEmitter::new(
+        zakura_jsonl_trace::JsonlTracer::new(trace_tx),
+        "test",
+    ));
+    let long_poll_params = |template: &BlockTemplateResponse| {
+        Some(GetBlockTemplateParameters::new(
+            GetBlockTemplateRequestMode::Template,
+            None,
+            vec![],
+            Some(template.long_poll_id),
+            None,
+        ))
+    };
+
+    let initial = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    // A long poll waits on the old tip until a block lands.
+    let long_poll = tokio::spawn({
+        let rpc = rpc.clone();
+        let params = long_poll_params(&initial);
+        async move { rpc.get_block_template(params).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), calls.wait_for(|calls| *calls >= 2))
+        .await
+        .expect("the long poll fetches the mempool before it waits")
+        .unwrap();
+    chain_info.send_modify(|info| {
+        info.tip_height = new_height;
+        info.tip_hash = new_tip;
+    });
+    tip_sender.send_best_tip_height(new_height);
+    tip_sender.send_best_tip_hash(new_tip);
+    let woken = tokio::time::timeout(Duration::from_secs(2), long_poll)
+        .await
+        .expect("the new tip wakes the long poll")
+        .unwrap()
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    // A long poll that names the old tip answers at once.
+    let stale = rpc
+        .get_block_template(long_poll_params(&initial))
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Ok(written) = trace_rx.try_recv() {
+        assert_eq!(written.file_name, "mining_template.jsonl");
+        let row: serde_json::Value =
+            serde_json::from_slice(&written.line).expect("each trace row is JSON");
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 5, "{rows:#?}");
+
+    let full = &rows[0];
+    assert_eq!(full["event"], "gbt_full_returned");
+    assert_eq!(full["tip_hash"], old_tip.to_string());
+    assert_eq!(full["work_id"], initial.work_id.as_str());
+    assert_eq!(full["tx_count"], 0);
+    assert_eq!(full["wait_reason"], "immediate");
+    for field in ["selection_us", "permit_wait_us", "build_us", "total_us"] {
+        assert!(full[field].is_u64(), "{field}: {full}");
+    }
+
+    for (rows, template) in [(&rows[1..3], &woken), (&rows[3..5], &stale)] {
+        let (woke, empty) = (&rows[0], &rows[1]);
+        assert_eq!(woke["event"], "gbt_tip_woke");
+        assert_eq!(woke["tip_height"], new_height.0);
+        assert_eq!(woke["tip_hash"], new_tip.to_string());
+        assert_eq!(empty["event"], "gbt_empty_returned");
+        assert_eq!(empty["request_id"], woke["request_id"]);
+        assert_ne!(empty["request_id"], full["request_id"]);
+        assert_eq!(empty["tip_hash"], new_tip.to_string());
+        assert_eq!(empty["work_id"], template.work_id.as_str());
+        assert!(empty["permit_wait_us"].is_u64(), "{empty}");
+        assert!(empty["build_us"].is_u64(), "{empty}");
+        assert!(template.transactions.is_empty());
+    }
+    assert_ne!(rows[1]["request_id"], rows[3]["request_id"]);
 }
 
 #[tokio::test]

@@ -72,7 +72,7 @@ confirm)
   [ "$status" = confirmed ] || exit 1
   exit 0;;
 replay)
-  case "$1" in *bad*) echo "1 records differed" >&2; exit 1;; esac
+  case "$1" in */traces/bad) echo "1 records differed" >&2; exit 1;; esac
   exit 0;;
 esac
 exit 2
@@ -164,6 +164,7 @@ impl Fake {
             harness: "fixtures/all".to_owned(),
             input,
             property: "race/lost-update".to_owned(),
+            also_violates: Vec::new(),
             out: dir.path().join("out"),
             budget: Budget {
                 runs: 1,
@@ -866,7 +867,7 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
              block_decoded_retention, block_reactor_policy, block_work_funding, \
              block_work_ownership, discovery_record_book, discovery_session_installation, \
              discovery_verification_capacity, discovery_wait_complete, header_publisher_policy, \
-             header_reactor_policy, header_sync_storage, race_fixtures",
+             header_reactor_policy, header_sync_storage, race_fixtures, sync_storage, sync_wire",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (

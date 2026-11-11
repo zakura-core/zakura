@@ -150,21 +150,22 @@ pub fn record(
 }
 
 /// [`record`], judging the run as a witness test of `property` that
-/// expects `expect`, with the rule [`crate::witness::witness`] applies.
-/// Returns the trace and the test's result. A run the test fails still
-/// writes its trace, as evidence.
+/// expects `expect`, with the rule [`crate::witness::witness_into`] applies
+/// to `also_violates`. Returns the trace and the test's result. A run the
+/// test fails still writes its trace, as evidence.
 pub fn record_witness(
     harness: &HarnessEntry,
     what: RecordInput<'_>,
     out: &Path,
     property: &str,
     expect: Expect,
+    also_violates: &[String],
 ) -> Result<(Trace, Result<(), WitnessError>), RecordError> {
     if harness.status(property).is_none() {
         return Err(RecordError::Witness(WitnessError::Unregistered));
     }
     record_with(harness, what, out, |scenario, plan, sink| {
-        match (harness.witness)(scenario, plan, property, expect, sink) {
+        match (harness.witness)(scenario, plan, property, expect, also_violates, sink) {
             Err(error @ WitnessError::NoTriggerHistory) => Err(RecordError::Witness(error)),
             result => Ok(result),
         }

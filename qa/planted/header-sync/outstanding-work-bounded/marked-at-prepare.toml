@@ -1,0 +1,10 @@
+# A prepared target is marked completed before its apply runs, so the
+# preparation's unit of work ends holding a completed target no apply call
+# replied for. The reactor and the queue decide when the witness's calls
+# run, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

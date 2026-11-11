@@ -27,6 +27,7 @@ pub mod net;
 pub mod observe;
 pub mod peer;
 pub mod plan;
+pub mod planted;
 pub mod property;
 pub mod record;
 pub mod seed;

@@ -51,8 +51,9 @@ impl SavedPlan {
     /// category of the action table: a stateless fault on `status`, and
     /// for `bad-cursor` and `bad-content` the case M5-E1's guard test
     /// takes. M5-E1 marks no category unreachable. Then the progress
-    /// fixture, last so the earlier plans keep their tags.
-    pub const ALL: [SavedPlan; 15] = [
+    /// fixture and a lower-locator page, last so the earlier plans keep
+    /// their tags.
+    pub const ALL: [SavedPlan; 16] = [
         SavedPlan::HonestSync,
         SavedPlan::Act(Act::ShortPayload { row: Row::Status }),
         SavedPlan::Act(Act::LongPayload { row: Row::Status }),
@@ -75,13 +76,20 @@ impl SavedPlan {
             rule: ContentRule::Linkage,
         }),
         SavedPlan::HonestProgress,
+        SavedPlan::Act(Act::BadContent {
+            rule: ContentRule::LowerLocator,
+        }),
     ];
 
     /// The fixture's name, `header-wire-<name>.bin`: `honest-sync`, the
-    /// act's identity name, or `honest-progress`.
+    /// act's identity name, `lower-locator` for that content rule's act,
+    /// or `honest-progress`.
     pub fn name(self) -> &'static str {
         match self {
             SavedPlan::HonestSync => "honest-sync",
+            SavedPlan::Act(Act::BadContent {
+                rule: ContentRule::LowerLocator,
+            }) => "lower-locator",
             SavedPlan::Act(act) => act.name(),
             SavedPlan::HonestProgress => "honest-progress",
         }
@@ -94,7 +102,7 @@ impl SavedPlan {
             .iter()
             .position(|plan| *plan == self)
             .expect("every saved Plan is listed");
-        // 15 plans fit a byte.
+        // 16 plans fit a byte.
         [TAG, (index + 1) as u8]
     }
 

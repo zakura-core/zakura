@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..b9fb8e7250 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2352,7 +2352,9 @@ impl HeaderSyncReactor {
+             self.defer_ordinary_target(&peer);
+             return;
+         }
+-        let source = source_id_from_peer(&peer);
++        // Mutation: the round is built with another peer's source, and every
++        // later step copies it faithfully.
++        let source = zakura_header_chain::SourceId::from_digest([0x44; 32]);
+         let (sent, locator) = match resumed {
+             Some((id, _, accepted, _)) => {
+                 let accepted = zakura_header_chain::Frontier::new(accepted.height, accepted.hash);

@@ -1,0 +1,13 @@
+# Adopting a reset retires no active round: the queue's obsolete-active
+# retirement returns nothing. The witness's prepare is held across an
+# invalidation, so its round is still in the queue, under the generation it
+# started with, at the end of the unit that adopted the new one.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.plan"

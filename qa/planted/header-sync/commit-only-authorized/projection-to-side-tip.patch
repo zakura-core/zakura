@@ -1,0 +1,61 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..6191db8c0b 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,39 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: corrupts the selected projection.
++    pub fn planted_corrupt(&mut self) {
++        // Mutation: the selected projection becomes the whole path to a
++        // held side branch's tip, ancestry intact.
++        let selected: Vec<block::Hash> = self
++            .selected_projection
++            .iter()
++            .map(|entry| entry.hash)
++            .collect();
++        let side = self
++            .graph
++            .eligible_header_tips()
++            .into_iter()
++            .find(|tip| !selected.contains(&tip.hash));
++        if let Some(side) = side {
++            let finalized = self.metadata.frontiers.finalized;
++            let mut path = vec![side];
++            let mut at = side;
++            while at != finalized {
++                let Some(node) = self.graph.header_node(at.hash) else {
++                    break;
++                };
++                let Some(parent) = self.graph.header_node(node.parent_hash) else {
++                    break;
++                };
++                at = crate::Frontier::new(parent.height, parent.hash);
++                path.push(at);
++            }
++            path.reverse();
++            self.selected_projection = path;
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..ee3d06b5be 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,12 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: a node round's apply corrupts the engine after its
++        // install. The fixture's own preload, under its fixed source,
++        // applies faithfully.
++        if source != SourceId::from_digest([7; 32]) {
++            engine.planted_corrupt();
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);

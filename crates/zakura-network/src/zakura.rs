@@ -40,11 +40,13 @@ pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;
 pub use header_sync::*;
-pub(crate) use ip::canonical_ip;
+pub(crate) use ip::{admission_host, canonical_ip};
 pub use legacy_gossip::*;
 pub use peer_memory::*;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
+#[cfg(zakura_sim)]
+pub use regulation::{FreeSlots, SessionSlotsProbe};
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,

@@ -1,0 +1,53 @@
+{
+  "node": {
+    "main": 2,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [],
+    "reply_holds": [
+      {
+        "select": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        },
+        "until": {
+          "reset": "node"
+        }
+      }
+    ]
+  },
+  "controls": [
+    {
+      "peer": "node",
+      "action": {
+        "reset": {
+          "invalidate": {
+            "depth": 0
+          }
+        }
+      },
+      "when": {
+        "committed": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    }
+  ]
+}

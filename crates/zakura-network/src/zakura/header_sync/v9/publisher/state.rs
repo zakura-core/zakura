@@ -727,6 +727,31 @@ impl PublisherState {
         }
     }
 
+    /// The publication ledger's live and closing subscriptions, each with
+    /// its unacknowledged sent pages, sorted, its tombstones, whether a page
+    /// job is in progress, and the subscriptions this state tracks, sorted.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn serving(&self) -> (Vec<(u64, usize)>, usize, bool, Vec<u64>) {
+        let mut live: Vec<(u64, usize)> = self
+            .publications
+            .keys()
+            .map(|key| (*key, self.publications.unacknowledged(key).unwrap_or(0)))
+            .collect();
+        live.sort_unstable();
+        (
+            live,
+            self.publications.tombstones(),
+            self.in_progress.is_some(),
+            self.subscriptions.keys().copied().collect(),
+        )
+    }
+
+    /// The terminal outcomes queued and not yet taken to write.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn queued_terminals(&self) -> usize {
+        self.terminals.len()
+    }
+
     /// The capacity releases stalled subscriptions wait for.
     pub(super) fn capacity_waits(&self) -> Vec<CapacityWait> {
         self.subscriptions

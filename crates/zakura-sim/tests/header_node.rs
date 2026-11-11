@@ -77,7 +77,11 @@ fn requests(report: &RunReport) -> Vec<StorageRequest> {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// The hex peer identity of the actor whose key is `seed` repeated, as
@@ -302,6 +306,17 @@ impl HasView for Planted {
             rounds: Default::default(),
             stale_calls: Default::default(),
             wake: Default::default(),
+            hold_wake: Default::default(),
+            ends: Default::default(),
+            stamps: Default::default(),
+            round_life: Default::default(),
+            retirement: Default::default(),
+            chain_effect: Default::default(),
+            authority: Default::default(),
+            outstanding: Default::default(),
+            recovery: Default::default(),
+            fork_choice: Default::default(),
+            publication: Default::default(),
         }
     }
 }

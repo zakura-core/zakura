@@ -253,6 +253,7 @@ fn request_timeout() -> Duration {
         Some((anchor.height, anchor.hash)),
         zakura_network::zakura::ZakuraHeaderSyncConfig::default(),
         zakura_network::zakura::LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     )
     .request_timeout
 }
@@ -1336,6 +1337,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
             mirrors: vec![MirrorSpec {
                 chain: Chain::default(),
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             }],
             policy: Policy {
                 holds: vec![
@@ -1480,6 +1482,7 @@ fn locator_permits_wait_for_accepted_work() {
                         fork: Some(Fork { branch, len: 1 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 })
                 .collect(),
             policy: Policy {

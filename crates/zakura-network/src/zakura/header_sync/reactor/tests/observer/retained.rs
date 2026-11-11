@@ -3,7 +3,7 @@
 //! Each history also folds through [`observe::HeaderWorkLedger`], so a test that
 //! pins one call's ownership also holds the ledger to the real event order.
 
-use observe::{HeaderWorkEnd, HeaderWorkLedger};
+use observe::{ClaimRule, HeaderWorkEnd, HeaderWorkLedger};
 
 use super::*;
 use crate::zakura::header_sync::scheduler::peer_work::{RetainedHeaders, StorageCall};
@@ -316,13 +316,20 @@ async fn a_prepare_that_storage_never_sees_ends_its_headers() {
         vec![(1, None), (1, Some(HeaderWorkEnd::PrepareFailed))]
     );
     // The oversized prepare isn't the round's own payload, which the ledger
-    // also catches.
+    // also claims.
     let mut ledger = HeaderWorkLedger::default();
-    let broken = events
-        .iter()
-        .find_map(|event| ledger.observe(event).err())
-        .expect("the ledger refuses the hand-built prepare");
-    assert!(broken.starts_with("WrongPayload"), "{broken}");
+    for event in &events {
+        ledger
+            .observe(event)
+            .expect("a claim break doesn't refuse the history");
+    }
+    let claims = ledger.take_claims();
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.rule == ClaimRule::WrongPayload),
+        "{claims:?}"
+    );
 }
 
 /// A panic before or after submission ends the call's headers as panicked.

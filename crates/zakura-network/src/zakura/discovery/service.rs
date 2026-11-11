@@ -583,6 +583,9 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    // Before the queries attach their precheck, which lets the reader read.
+    #[cfg(any(test, zakura_sim))]
+    serving.observe(&recv);
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
@@ -898,6 +901,17 @@ fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     NodeId::from_bytes(&bytes).ok()
 }
 
+#[cfg(zakura_sim)]
+impl DiscoveryService {
+    /// Names the services whose sessions keep a connection open, as
+    /// zakurad's registry does, for a simulator node that builds its own
+    /// registry.
+    pub fn with_connection_owners(self, owners: Vec<Arc<dyn Service>>) -> Self {
+        self.set_connection_owners(owners);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1022,6 +1036,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         spawn_header_sync_reactor(startup).map_err(Into::into)
     }

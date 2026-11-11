@@ -1,0 +1,11 @@
+# A node round's apply installs its transition and then moves the
+# verified frontier to the selected header tip, though a header apply
+# verifies no body. The fixture's own preload applies faithfully. The
+# reactor, the queue, the storage adapter and the engine decide how the
+# witness's rounds apply, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

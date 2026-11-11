@@ -1,0 +1,11 @@
+# Each locator read first drops an eligible side tip from the engine,
+# leaving the selected path, and so the locator it gives, as they were.
+# The reactor, the queue, the storage adapter and the engine decide when
+# the witness's reads and applies run, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

@@ -1,0 +1,13 @@
+# The run loop drops its committed watch's arm and its top-of-turn check,
+# as `watch-ignored` does, on `header-sync/storage`'s invalidate-only
+# witness: the invalidation commits once the mirror's session is admitted,
+# so no new session reads the watch, and the reactor never adopts it
+# before quiescence. The storage harness obliges adoption outside its flood
+# and churn scenarios. The run loop's watch handling decides when a commit
+# is adopted, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-invalidate-only.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-invalidate-only.plan"

@@ -65,10 +65,9 @@ optimistic_block_inventory = true
 
 [network]
 # Announce to the initial group immediately, then everyone else after one delay.
-# The delay grows from min to max between the block-size thresholds below.
-# Zero delays announce to all peers immediately, regardless of block size.
-advert_delay_min = "0s"
-advert_delay_max = "0s"
+# The initial group shrinks from the small-block to the full-block window between
+# the block-size thresholds below. Zero delay announces to all peers immediately.
+advert_delay = "500ms"
 advert_window_full_block = 32
 advert_window_full_size_bytes = 1572864
 advert_window_small_block = 64
@@ -143,6 +142,10 @@ send_window_bytes = 33554432
 stream_receive_window_bytes = 16777216
 
 [rpc]
+# Takes effect when enable_cookie_auth = false. The administrator is expected
+# to have correctly configured firewall rules restricting access to trusted clients.
+# Requests from web browsers (with an Origin header) are rejected.
+allow_unauthenticated_admin = false
 cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false

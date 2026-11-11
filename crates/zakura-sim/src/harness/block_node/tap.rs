@@ -14,6 +14,13 @@
 //! the operations that didn't pair into the [`BlockSyncView`] the harness's
 //! checks read.
 //!
+//! Once the harness hands it the node's session slots probe through a
+//! [`TapSessions`], the reader also reads the service's free session slots
+//! at each observation, inside a
+//! [`boundary_read`](zakura_rt::sim::boundary_read), and folds them into
+//! the owner model. The reads stay out of the observation log, so pinned
+//! Plans and traces keep their format.
+//!
 //! A node's teardown ends its block sync on purpose. Once told of it through
 //! a [`TapTeardown`], the tap reports its observer's drop as unhealthy only
 //! until the reader has logged the sequencer's close.
@@ -25,7 +32,7 @@
 //! with the same tap.
 
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     collections::{BTreeMap, HashMap},
     mem,
     rc::Rc,
@@ -40,7 +47,7 @@ use zakura_network::zakura::{
         BlockEvent, BlockSyncObserver, BudgetChangeKind, HeldBody, Holder, HolderChange, LeaseStep,
         RequestStep, RequestWritePhase, RetainedBody, WorkItemPlace,
     },
-    ServicePeerDirection, ZakuraPeerId,
+    ServicePeerDirection, SessionSlotsProbe, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
 use zakura_scheduler::{hooks, SimInstant, TaskId};
@@ -85,6 +92,8 @@ pub struct BlockTap {
     /// Writes the generated-property observations, if the run labels its
     /// links.
     adapter: Option<Adapter>,
+    /// The node's session slots probe, once the harness hands it over.
+    sessions: Rc<OnceCell<SessionSlotsProbe>>,
 }
 
 /// What the observer and the reader share.
@@ -110,6 +119,11 @@ struct TapState {
     handoffs: Mutex<BTreeMap<TaskId, Vec<u32>>>,
     /// The task that recorded the sequencer's ownership snapshots.
     sequencer: Mutex<Option<TaskId>>,
+    /// The peer and generation of the live routine whose snapshots each
+    /// task recorded.
+    routines: Mutex<BTreeMap<TaskId, (ZakuraPeerId, u64)>>,
+    /// Each peer's newest admitted routine generation.
+    admitted: Mutex<HashMap<ZakuraPeerId, u64>>,
 }
 
 /// Events recorded and not yet drained.
@@ -143,6 +157,38 @@ impl TapTeardown {
     /// Marks the teardown begun. Call it before the node drops anything.
     pub(crate) fn begin(&self) {
         self.0.teardown.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the teardown began.
+    pub(crate) fn begun(&self) -> bool {
+        self.0.teardown.load(Ordering::Relaxed)
+    }
+}
+
+/// Hands a tap its node's session slots probe.
+pub struct TapSessions {
+    probe: Rc<OnceCell<SessionSlotsProbe>>,
+    view: Rc<RefCell<BlockSyncView>>,
+}
+
+impl TapSessions {
+    /// Folds `probe`'s reading now into the owner model as the baseline,
+    /// then has the tap read it at each observation. Call it before the
+    /// harness makes any link to the node.
+    ///
+    /// # Panics
+    ///
+    /// If the tap already has a probe.
+    pub(crate) fn watch(&self, probe: SessionSlotsProbe) {
+        let free = zakura_rt::sim::boundary_read(|| probe.read());
+        self.view
+            .borrow_mut()
+            .owners
+            .apply(OwnerInput::SessionSlots { free });
+        assert!(
+            self.probe.set(probe).is_ok(),
+            "a tap watches one node's session slots"
+        );
     }
 }
 
@@ -211,6 +257,33 @@ impl TapHandoffs {
     }
 }
 
+/// Which routine runs on which task, by the routine snapshots each task
+/// recorded, and each peer's newest admitted routine generation.
+#[derive(Clone)]
+pub struct TapRoutines(Arc<TapState>);
+
+impl TapRoutines {
+    /// The peer and generation of the live routine that `task` runs.
+    pub fn routine(&self, task: TaskId) -> Option<(ZakuraPeerId, u64)> {
+        self.0
+            .routines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&task)
+            .cloned()
+    }
+
+    /// The newest routine generation block sync admitted for `peer`.
+    pub fn admitted(&self, peer: &ZakuraPeerId) -> Option<u64> {
+        self.0
+            .admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .copied()
+    }
+}
+
 /// The observer block sync holds.
 struct TapObserver(Arc<TapState>);
 
@@ -237,7 +310,29 @@ impl BlockSyncObserver for TapObserver {
                 0
             }
         };
+        if let BlockEvent::SessionAdmitted {
+            peer, generation, ..
+        } = &event
+        {
+            let mut admitted = state
+                .admitted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let newest = admitted.entry(peer.clone()).or_default();
+            *newest = (*newest).max(*generation);
+        }
         if let Some(task) = hooks::current_task() {
+            if let BlockEvent::Routine(snapshot) = &event {
+                let mut routines = state
+                    .routines
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if snapshot.ended {
+                    routines.remove(&task);
+                } else {
+                    routines.insert(task, (snapshot.peer.clone(), snapshot.generation));
+                }
+            }
             if matches!(event, BlockEvent::Sequencer(_)) {
                 *state
                     .sequencer
@@ -304,6 +399,8 @@ impl BlockTap {
                 buffer: Mutex::default(),
                 handoffs: Mutex::default(),
                 sequencer: Mutex::default(),
+                routines: Mutex::default(),
+                admitted: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -326,8 +423,17 @@ impl BlockTap {
             allocations: Allocations::default(),
             view,
             adapter: None,
+            sessions: Rc::default(),
         };
         (observer, tap)
+    }
+
+    /// The handle the harness gives the node's session slots probe to.
+    pub(crate) fn sessions(&self) -> TapSessions {
+        TapSessions {
+            probe: self.sessions.clone(),
+            view: self.view.clone(),
+        }
     }
 
     /// Writes `wire`'s labels, and the node's identities and effects, as the
@@ -350,6 +456,11 @@ impl BlockTap {
     /// them there.
     pub fn handoffs(&self) -> TapHandoffs {
         TapHandoffs(self.state.clone())
+    }
+
+    /// Which routine runs on which task, for a hold that pauses a routine.
+    pub fn routines(&self) -> TapRoutines {
+        TapRoutines(self.state.clone())
     }
 
     /// The notice the harness gives this tap when it tears the node down.
@@ -383,6 +494,19 @@ impl BlockTap {
                 session_id: *session_id,
                 generation: *generation,
                 direction: direction(*way).to_owned(),
+            },
+            BlockEvent::StaleRegistryWrite {
+                peer: written,
+                writer,
+                generation,
+                entry_generation,
+                landed,
+            } => BlockSyncFact::StaleRegistryWrite {
+                peer: peer(written),
+                writer: writer.name().to_owned(),
+                generation: *generation,
+                entry_generation: *entry_generation,
+                landed: *landed,
             },
             BlockEvent::FrameJudged {
                 peer: sender,
@@ -465,6 +589,13 @@ impl BlockTap {
             } => BlockSyncFact::StaleScope {
                 body: body(held),
                 scope_epoch: scope_epoch.map(|epoch| epoch.get()),
+            },
+            BlockEvent::EpochApplied {
+                epoch,
+                verified_tip,
+            } => BlockSyncFact::EpochApplied {
+                epoch: epoch.get(),
+                verified_tip: verified_tip.0,
             },
             BlockEvent::ServingLease {
                 peer: requesting,
@@ -797,6 +928,10 @@ impl ActionSource for BlockTap {
             if let Observation::BlockSync { event, .. } = obs {
                 view.owners.observe(event);
             }
+        }
+        if let Some(probe) = self.sessions.get() {
+            let free = zakura_rt::sim::boundary_read(|| probe.read());
+            view.owners.apply(OwnerInput::SessionSlots { free });
         }
         view.step = Some(log.step());
         match paired {

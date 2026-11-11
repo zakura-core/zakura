@@ -370,6 +370,10 @@ pub struct QuicBindConfig {
     /// Slots of `max_connections` that only dials may take, so inbound
     /// attempts can't block this node's own dials (ADM-12).
     pub dial_reserve: usize,
+    /// Live inbound connections the endpoint holds, counted from accept until
+    /// each one closes (ADM-12). `None` leaves inbound attempts limited only
+    /// by the dial reserve.
+    pub max_inbound_connections: Option<usize>,
     /// Closed connections the endpoint keeps, with their stream buffers
     /// released, until `quinn-proto` drains them (ADM-13).
     pub max_closing_connections: usize,

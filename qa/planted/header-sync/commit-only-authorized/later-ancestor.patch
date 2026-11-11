@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..c0bad0789a 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1494,7 +1494,10 @@ impl HeaderSyncReactor {
+         if !page_matches
+             || !sim_arg!(self.peer_work_queue.stage_page(
+                 &peer,
+-                returned_ancestor,
++                self.peer_work_queue
++                    .active(&peer)
++                    .and_then(|active| active.common_ancestor)
++                    .unwrap_or(returned_ancestor),
+                 response.entries,
+                 admitted.cursor,
+             ); observe::PageArrival {

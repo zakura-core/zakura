@@ -1,0 +1,56 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..dc666d9d7a 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,27 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: every header that's already ineligible by a direct reason
++    /// gains a permanent checkpoint conflict too, so it stays excluded after
++    /// its reconsideration.
++    pub fn planted_corrupt(&mut self) {
++        let held: Vec<(block::Hash, block::Height)> = self
++            .graph
++            .header_nodes()
++            .filter(|node| !node.eligibility.direct_reasons.is_empty())
++            .map(|node| (node.hash, node.height))
++            .collect();
++        for (hash, height) in held {
++            let _ = self.graph.add_eligibility_reason(
++                hash,
++                crate::EligibilityReason::CheckpointConflict {
++                    height,
++                    expected: block::Hash([0x5c; 32]),
++                },
++            );
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter/full_state.rs b/crates/zakura-storage/src/header/adapter/full_state.rs
+index 203b713b5a..e853202e9b 100644
+--- a/crates/zakura-storage/src/header/adapter/full_state.rs
++++ b/crates/zakura-storage/src/header/adapter/full_state.rs
+@@ -217,14 +217,17 @@ impl EnginePort {
+         let mut authority = PreparedAuthority::for_event(&request.event)?;
+         authority.retention_references = tips.clone();
+         authority.verified_tip = Some(verified);
+-        self.apply_locked(
++        let applied = self.apply_locked(
+             &mut engine,
+             request,
+             &authority,
+             &tips,
+             Some(verified),
+             || {},
+-        )
++        );
++        // Mutation: an operator reset corrupts the engine after it commits.
++        engine.planted_corrupt();
++        applied
+     }
+ 
+     /// Whether an operator invalidation of `target` is in force. See

@@ -25,7 +25,10 @@ use super::super::{
 use super::{state::in_window, *};
 use crate::zakura::{
     framed_channel,
-    header_sync::config::REGTEST_HEADER_BYTES,
+    header_sync::{
+        config::REGTEST_HEADER_BYTES,
+        observe::{HeaderSyncObserver, PublisherSite, ReactorEvent},
+    },
     regulation::{ServeCapacity, ServeLimits, SubscriptionLimits, Subscriptions},
     wire_codec::decode_frame,
     Credit, Frame, FramedRecv, ZakuraPeerId,
@@ -743,7 +746,7 @@ fn session_advertising(
         },
         pages,
         cancel.clone(),
-        None,
+        (None, None),
     );
     (publisher, recv, cancel, task)
 }
@@ -918,6 +921,210 @@ async fn path_pages_carry_one_marker_then_follow_the_tip() {
     // reuse state's continuation.
     assert_eq!(port.store().walks, 2);
     harness.check_quiet().await;
+}
+
+/// Records the pages a publisher reports queued.
+#[derive(Debug, Default)]
+struct Queued(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Queued {
+    /// Keeps each `PageQueued`, and leaves the task's other reports out.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(event, ReactorEvent::PageQueued { .. }) {
+            self.0
+                .lock()
+                .expect("no test panics holding it")
+                .push(event);
+        }
+    }
+}
+
+/// An observed publisher reports each page it hands to its writer, with its
+/// session, the lease its read used, its subscription, the ancestor it
+/// declares, every entry's header hash, the subscription's initial target
+/// and its marker, as the subscriber then receives it. Each page's job
+/// leases its own path, so the two pages name leases 1 and 2.
+#[tokio::test(start_paused = true)]
+async fn each_queued_page_reports_its_entries() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let recorded = Arc::new(Queued::default());
+    let observer: Arc<dyn HeaderSyncObserver> = recorded.clone();
+    let (send, recv) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel.clone(),
+        (
+            None,
+            Some(super::super::CreditTap {
+                observer,
+                peer: peer(7),
+                session_id: 1,
+            }),
+        ),
+    );
+    let mut harness = Harness {
+        port,
+        capacity,
+        publisher,
+        recv,
+        cancel,
+        inbox: VecDeque::new(),
+        subscriber: Subscriber::new(),
+    };
+    let id = harness
+        .open(chain[5].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    let received = harness.deliver_all().await;
+    let h = block::Height;
+    assert_eq!(
+        pages(&received),
+        [(h(2), h(5), false), (h(5), h(6), true)],
+        "{received:?}"
+    );
+    let hashes = |frontiers: &[Frontier]| -> Vec<block::Hash> {
+        frontiers.iter().map(|frontier| frontier.hash).collect()
+    };
+    let queued: Vec<_> = recorded
+        .0
+        .lock()
+        .expect("no test panics holding it")
+        .iter()
+        .map(|event| match event {
+            ReactorEvent::PageQueued {
+                peer,
+                session_id,
+                lease,
+                subscription_id,
+                common_ancestor,
+                headers,
+                initial_target,
+                reaches_target,
+            } => (
+                peer.clone(),
+                *session_id,
+                *lease,
+                *subscription_id,
+                *common_ancestor,
+                headers.clone(),
+                *initial_target,
+                *reaches_target,
+            ),
+            _ => unreachable!("the recorder keeps only queued pages"),
+        })
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (
+                peer(7),
+                1,
+                1,
+                id,
+                chain[1],
+                hashes(&chain[2..5]),
+                chain[5].hash,
+                false
+            ),
+            (
+                peer(7),
+                1,
+                2,
+                id,
+                chain[4],
+                hashes(&chain[5..6]),
+                chain[5].hash,
+                true
+            ),
+        ]
+    );
+    harness.check_quiet().await;
+}
+
+/// Counts the pages a publisher commits and the ones it reports queued.
+#[derive(Debug, Default)]
+struct Handoffs {
+    committed: std::sync::atomic::AtomicUsize,
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+impl HeaderSyncObserver for Handoffs {
+    /// Counts each commit's container report and each `PageQueued`.
+    fn observe(&self, event: ReactorEvent) {
+        let counter = match event {
+            ReactorEvent::PublisherServing {
+                site: PublisherSite::Commit,
+                ..
+            } => &self.committed,
+            ReactorEvent::PageQueued { .. } => &self.queued,
+            _ => return,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A page committed after its writer's queue closed isn't queued, so the
+/// publisher reports no `PageQueued` for it. A following page reserves its
+/// slot before the recheck's query, so the queue closes while that query
+/// waits in state.
+#[tokio::test(start_paused = true)]
+async fn a_page_sent_to_a_closed_queue_isnt_reported_queued() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let recorded = Arc::new(Handoffs::default());
+    let observer: Arc<dyn HeaderSyncObserver> = recorded.clone();
+    let (send, recv) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel,
+        (
+            None,
+            Some(super::super::CreditTap {
+                observer,
+                peer: peer(7),
+                session_id: 1,
+            }),
+        ),
+    );
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    // The page for heights 4 and 5 waits in its read, then the chain grows
+    // past it, so its recheck queries state, which blocks.
+    let main = port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    let grown = port.store().tree.extend(main[1], 1);
+    port.select(grown[0]);
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    drop(recv);
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(recorded.committed.load(Relaxed), 1, "the page commits");
+    assert_eq!(recorded.queued.load(Relaxed), 0, "but isn't queued");
 }
 
 /// An `Open` whose locator is the target sends no path page and no marker.
@@ -1388,7 +1595,7 @@ async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
         },
         limits(),
         CancellationToken::new(),
-        None,
+        (None, None),
     );
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
@@ -1440,7 +1647,7 @@ async fn a_terminal_wait_keeps_the_other_page_moving() {
         },
         limits(),
         CancellationToken::new(),
-        None,
+        (None, None),
     );
     // The first subscription's page waits in its read, holding the slot.
     let mut first = Subscriber::new();

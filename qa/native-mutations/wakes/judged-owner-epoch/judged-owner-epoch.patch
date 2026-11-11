@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor.rs b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+index d627fd5af7..03ed5e738a 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+@@ -1476,7 +1476,10 @@ impl ReactorIO {
+                 .increment(1);
+             })
+             .ok();
+-        (semantic_completion, Some(current.body_work_epoch))
++        // The epoch that judged the completion is the judged owner's.
++        let committed_epoch =
++            semantic_completion.map(|(owner, _)| owner.authority.body_work_epoch);
++        (semantic_completion, committed_epoch)
+     }
+ 
+     fn local_body_work_blocks(&self) -> usize {

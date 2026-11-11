@@ -5,7 +5,9 @@
 //! option (b)), so `bad-content-closes` owes a consequence from then on and
 //! `conformant-never-closes` accepts the node's punishment. The penalty rule
 //! then wants a `Misbehavior` against the work's session, also when the peer
-//! disconnected while the node was preparing the page.
+//! disconnected while the node was preparing the page. That disconnect
+//! retires the round, so the failed prepare ends stale, and
+//! `header-sync/stale-completion-inert` holds through its penalty.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -18,8 +20,12 @@ use support::{
     steer::steer,
 };
 use zakura_sim::{
+    domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
-        header_node::adoption::Acceptance,
+        header_node::{
+            fault::FaultEnd,
+            stale::{StaleWindow, Staleness},
+        },
         header_sync::{StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
         run_prepared, HarnessError, Subsystem,
     },
@@ -27,7 +33,7 @@ use zakura_sim::{
     observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
     peer::{honest::HonestChain, PeerAction},
     property::HasView,
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, RunReport,
+    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -169,7 +175,7 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
     );
     assert_eq!(
         view.faults.penalized(report.log.entries()),
-        Acceptance::Holds,
+        FaultEnd::default(),
         "{label}"
     );
     let shape = shape(report);
@@ -215,7 +221,8 @@ fn an_invalid_page_is_judged_at_prepare_and_penalized() {
 
 /// The peer disconnects while the node prepares its invalid tip. The prepare
 /// fails after the session ended, and the node still penalizes the session
-/// that sent the page.
+/// that sent the page. That prepare is a stale peer fault, and
+/// [`assert_stale_fault_inert`] checks it.
 #[test]
 fn a_disconnect_mid_prepare_is_still_penalized() {
     for (index, plan) in plans().into_iter().enumerate() {
@@ -233,7 +240,73 @@ fn a_disconnect_mid_prepare_is_still_penalized() {
             shape.misbehavior.contains(&(Some(session), None)),
             "plan {index}: the penalty came after the session ended: {shape:?}"
         );
+        assert_stale_fault_inert(index, &report, &view, &shape);
     }
+}
+
+/// Checks the stale peer fault in a [`disconnect_mid_prepare`] run, end
+/// to end: the disconnect retired the round, so the prepare that failed
+/// `invalid_header` ended stale, the only stale call. Its handler reported
+/// the `Misbehavior`, between the call's `CallEnded` and its `Handled`,
+/// which `header-sync/stale-completion-inert` allows, and the property
+/// applied and held.
+fn assert_stale_fault_inert(index: usize, report: &RunReport, view: &StorageView, shape: &Shape) {
+    let outcome = report
+        .properties
+        .iter()
+        .find(|property| property.property == STALE_COMPLETION_INERT)
+        .map(|property| property.outcome.clone());
+    assert!(
+        matches!(outcome, Some(PropertyOutcome::Held { .. })),
+        "plan {index}: {outcome:?}"
+    );
+
+    let (op, _, _) = shape.prepare.expect("checked above");
+    let facts: Vec<&ReactorFact> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect();
+    let call = facts
+        .iter()
+        .find_map(|fact| match fact {
+            ReactorFact::CallEnded {
+                call,
+                op: Some(ended),
+                ..
+            } if *ended == op => Some(*call),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("plan {index}: the invalid tip's prepare ends"));
+    let windows = view.stale_calls.windows();
+    let [StaleWindow {
+        call: stale,
+        apply: false,
+        why: Staleness::RoundRetired,
+        handled: true,
+        ..
+    }] = windows[..]
+    else {
+        panic!("plan {index}: only the invalid tip's prepare ends stale: {windows:?}");
+    };
+    assert_eq!(stale, call, "plan {index}");
+    let at = |found: &dyn Fn(&ReactorFact) -> bool| {
+        facts
+            .iter()
+            .position(|fact| found(fact))
+            .unwrap_or_else(|| panic!("plan {index}: {facts:?}"))
+    };
+    let ended = at(&|fact| matches!(fact, ReactorFact::CallEnded { call: c, .. } if *c == call));
+    let handled = at(&|fact| matches!(fact, ReactorFact::Handled { call: c, .. } if *c == call));
+    let penalty = at(&|fact| matches!(fact, ReactorFact::Misbehavior { .. }));
+    assert!(
+        ended < penalty && penalty < handled,
+        "plan {index}: the stale handler reports the penalty: {ended} {penalty} {handled}"
+    );
 }
 
 /// The penalty rule's planted bypass: the same disconnect, judged by a view

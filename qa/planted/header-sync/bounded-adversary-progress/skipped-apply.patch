@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index fda0a9c4a4..b6cd0bb677 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1970,6 +1970,11 @@ impl HeaderSyncReactor {
+                         return;
+                     }
+                 }
++                // Planted: take the prepared target and skip its apply.
++                if !is_repair {
++                    end_retained(&mut retained, HeaderWorkEnd::Stale);
++                    return;
++                }
+                 self.state.arm_request_deadline(
+                     peer.clone(),
+                     Instant::now(),

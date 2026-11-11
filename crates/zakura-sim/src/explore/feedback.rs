@@ -62,7 +62,9 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 /// - 1: [`Probe`]'s features (E2a).
 /// - 2: adds the protocol-state features at [`super::state`]'s index layout
 ///   (E2b).
-pub const FEEDBACK_VERSION: u32 = 2;
+/// - 3: adds fuzz-12's hold, header lease level, fork work and recovery
+///   conditions features.
+pub const FEEDBACK_VERSION: u32 = 3;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;

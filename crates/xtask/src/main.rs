@@ -7,6 +7,7 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod header_acceptance;
 mod header_conformance;
 mod header_fuzz;
 mod planted;
@@ -104,6 +105,10 @@ fn try_main() -> Result<(), BoxError> {
                 args.next();
                 return planted::pilot(&repo_root()?, args);
             }
+            if args.peek().map(String::as_str) == Some("loop") {
+                args.next();
+                return planted::mutation_loop(&repo_root()?, args);
+            }
             let mut changed_since = None;
             let mut property = None;
             let mut shard = None;
@@ -148,6 +153,7 @@ fn try_main() -> Result<(), BoxError> {
                 targets,
             )
         }
+        Some("header-acceptance") => header_acceptance::run(&repo_root()?, args),
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
@@ -379,6 +385,18 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask planted pilot (sensitivity|discovery) --out <dir> [--work <dir>]"
     )?;
+    writeln!(
+        output,
+        "  cargo xtask planted loop --out <dir> [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
+    )?;
+    writeln!(
+        output,
+        "      [--only <property-id>]... [--changed-since <rev>] [--jobs <n>] [--memory-max <bytes>|off]"
+    )?;
+    writeln!(
+        output,
+        "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
+    )?;
     writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(
         output,
@@ -479,12 +497,17 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "With --targets, it runs only the cases whose harness a simulator fuzz target runs, and"
+        "With --targets, it runs only the fuzz-input cases whose harness a simulator fuzz target"
     )?;
     writeln!(
         output,
-        "also confirms each patched input through that target in fresh processes."
+        "runs, and also confirms each patched input through that target in fresh processes."
     )?;
+    writeln!(
+        output,
+        "A typed case has no fuzz input, so --targets skips it, and every run replays its"
+    )?;
+    writeln!(output, "patched trace Exact in a fresh process instead.")?;
     writeln!(
         output,
         "`planted pilot` runs the mutation pilot's paired experiments on the cases of"
@@ -498,6 +521,15 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         "writes sensitivity.json or discovery.json to --out. Discovery runs only on a"
     )?;
     writeln!(output, "remote campaign host.")?;
+    writeln!(
+        output,
+        "`planted loop` runs the mutation loop's cases (qa/native-mutations/PROMPT.md) on a"
+    )?;
+    writeln!(
+        output,
+        "remote host: each mutant's named witness, classified from zakura-sim's end records,"
+    )?;
+    writeln!(output, "into --out/report.json.")?;
     writeln!(output)?;
     writeln!(
         output,

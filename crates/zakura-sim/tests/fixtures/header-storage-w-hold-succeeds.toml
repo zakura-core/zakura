@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-hold-succeeds.bin`, a fuzz-12 item 7 witness whose run
+# shows SucceededAfterHold. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "7b0b496147c15bdd6e23af55081742f3a6ad1e229327f8cc68359005596b3ef0"
+scenario_sha256 = "f3f0ba2201ce8db9cc207ade1f1dc8b4b1d08bbd2a3f8c9585e2ea97715df5b7"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

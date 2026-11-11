@@ -615,6 +615,8 @@ impl<S: UdpIo> ConnTask<S> {
             alpn: tls::negotiated_alpn(session),
         };
         self.remote_id = handshake.remote_id;
+        #[cfg(any(test, zakura_sim, feature = "test-support"))]
+        let _ = self.shared.shared_id.set(tls::shared_id(session));
         metrics::gauge!("zakura.quic.connections").increment(1.0);
         if let Some(reply) = self.handshake.take() {
             let _ = reply.send(Ok(handshake));
@@ -1303,7 +1305,7 @@ mod tests {
             recv_ends: HashMap::new(),
             recv_payload: HashSet::new(),
             send_payload: HashSet::new(),
-            slot: crate::endpoint::ConnectionSlots::new(1, 0, 1)
+            slot: crate::endpoint::ConnectionSlots::new(1, 0, None, 1)
                 .claim_dial()
                 .unwrap(),
             send_buf: Vec::new(),

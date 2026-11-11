@@ -85,6 +85,7 @@ pub fn witness() -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(300),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         controls: vec![
             step(
@@ -203,6 +204,7 @@ fn the_close_relink_input_holds_chunk_budget_bound() {
         Plan::from_fuzz(plan),
         CHUNK_BUDGET_BOUND,
         Expect::Holds,
+        &[],
         &mut MemorySink::default(),
     );
     assert_eq!(result, Ok(()));
@@ -353,6 +355,7 @@ fn probe_failure(
         CapacityEvidence::default(),
         SettlementEvidence::default(),
         StaleEvidence::default(),
+        Default::default(),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

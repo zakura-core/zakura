@@ -37,8 +37,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::policy::OpKind;
 use crate::observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, WorkOwner};
 
-/// What a call and its operation must share: the kind, the owner of a VCT
-/// context, prepare or apply, and the source of a prepare or apply.
+/// What a call and its operation name: the kind, the owner of a VCT
+/// context, prepare or apply, and the source of a prepare or apply. The
+/// kind, and a VCT context's owner, must match here. A prepare's or
+/// apply's other fields are commit-only-authorized's submission rule's
+/// ([`super::authority`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Work {
     kind: OpKind,
@@ -47,6 +50,12 @@ struct Work {
 }
 
 impl Work {
+    /// Whether an operation doing `self` can pair with a call doing `call`:
+    /// the same kind, and for a VCT context the same owner.
+    fn pairs_with(&self, call: &Work) -> bool {
+        self.kind == call.kind && (self.kind != OpKind::VctContext || self.owner == call.owner)
+    }
+
     /// The work `request` asks storage for.
     fn of_request(request: &StorageRequest) -> Self {
         let (owner, source) = match request {
@@ -260,10 +269,10 @@ impl Pairer {
                          at storage fact {at}"
                     ));
                 }
-                if self.ops.get(&id) != Some(work) {
+                if !self.ops.get(&id).is_some_and(|op| op.pairs_with(work)) {
                     return Err(format!(
-                        "Mispaired: call {call}, a {:?} call, submitted operation {id}, whose \
-                         kind, owner or source differs",
+                        "Mispaired: call {call}, a {:?} call, submitted operation {id}, which \
+                         is another kind or another VCT context's",
                         work.kind
                     ));
                 }
@@ -286,10 +295,10 @@ impl Pairer {
                  {id}'s {receipt:?}"
             ));
         }
-        if self.ops.get(&id) != Some(work) {
+        if !self.ops.get(&id).is_some_and(|op| op.pairs_with(work)) {
             return Err(format!(
-                "Mispaired: call {call}, a {:?} call, ended at operation {id}'s receipt, whose \
-                 kind, owner or source differs",
+                "Mispaired: call {call}, a {:?} call, ended at operation {id}'s receipt, which \
+                 is another kind or another VCT context's",
                 work.kind
             ));
         }
@@ -385,6 +394,7 @@ mod tests {
                 source: source.to_owned(),
                 parent: None,
                 target: "11".to_owned(),
+                hashes: None,
             },
             digest: String::new(),
             call: Some(id),
@@ -583,22 +593,60 @@ mod tests {
         assert_eq!(ops, [None]);
     }
 
+    /// A VCT context for `session`'s owner, as operation and call `id`.
+    fn vct(id: u64, session: u64) -> (StorageFact, ReactorFact) {
+        (
+            StorageFact::Submitted {
+                id,
+                request: StorageRequest::VctRepairContext {
+                    owner: owner(session),
+                    height: 3,
+                },
+                digest: String::new(),
+                call: Some(id),
+            },
+            ReactorFact::Dispatched {
+                call: id,
+                port: ReactorCall::VctContext {
+                    owner: owner(session),
+                    height: 3,
+                },
+            },
+        )
+    }
+
+    /// A call whose operation is another kind, or a VCT context for
+    /// another owner, is mispaired. A prepare or apply with another owner
+    /// or source pairs, since commit-only-authorized's submission rule
+    /// judges those fields.
     #[test]
-    fn a_mismatched_kind_owner_or_source_is_mispaired() {
-        let cases: [(StorageFact, ReactorFact); 3] = [
-            (locator_op(1), apply_call(1, 1, "aa")),
-            (apply_op(1, 2, "aa"), apply_call(1, 1, "aa")),
-            (apply_op(1, 1, "bb"), apply_call(1, 1, "aa")),
-        ];
-        for (op, call) in cases {
+    fn a_mismatched_kind_is_mispaired_and_other_fields_pair() {
+        let (_, call) = vct(1, 1);
+        let (op, _) = vct(1, 2);
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[(1, op), (2, StorageFact::ReplyTaken { id: 1 })],
+            vec![(0, call), (2, ended(1, "replied"))],
+        );
+        assert!(evidence(result).starts_with("Mispaired"));
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, locator_op(1)), (2, StorageFact::ReplyTaken { id: 1 })],
+            vec![(0, apply_call(1, 1, "aa")), (2, ended(1, "replied"))],
+        );
+        assert!(evidence(result).starts_with("Mispaired"));
+        assert_eq!(ops, [None]);
+        for op in [apply_op(1, 2, "aa"), apply_op(1, 1, "bb")] {
             let mut pairer = Pairer::default();
             let (result, ops) = drain(
                 &mut pairer,
                 &[(1, op), (2, StorageFact::ReplyTaken { id: 1 })],
-                vec![(0, call), (2, ended(1, "replied"))],
+                vec![(0, apply_call(1, 1, "aa")), (2, ended(1, "replied"))],
             );
-            assert!(evidence(result).starts_with("Mispaired"));
-            assert_eq!(ops, [None]);
+            assert_eq!(result, Ok(()));
+            assert_eq!(ops, [Some(1)]);
         }
     }
 

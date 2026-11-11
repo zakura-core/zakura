@@ -76,6 +76,10 @@ fn prepare_for(call: u64, owner: HeaderSyncWorkOwner, incarnation: u64) -> [Reac
                 peer: mirror(),
                 source: SourceId::from_digest([2; 32]),
                 owner,
+                common_ancestor: Frontier {
+                    height: block::Height(0),
+                    hash: block::Hash([0; 32]),
+                },
                 target: Frontier {
                     height: block::Height(1),
                     hash: block::Hash([1; 32]),
@@ -109,6 +113,30 @@ fn ended(call: u64) -> ReactorEvent {
     ReactorEvent::CallEnded {
         call,
         end: CallEnd::Replied,
+    }
+}
+
+/// A `Grant` on `subscription` adding `objects` headers and `bytes`.
+fn grant(
+    subscription: u64,
+    objects: u32,
+    bytes: u32,
+) -> zakura_network::zakura::v9::SubscribeHeaders {
+    use zakura_network::zakura::v9::{Cursor, Operation, SubscribeHeaders};
+    SubscribeHeaders {
+        operation: Operation::Grant,
+        subscription_id: subscription,
+        update_sequence: 1,
+        initial_target_tip_hash: block::Hash([1; 32]),
+        acknowledged: Cursor {
+            height: block::Height(0),
+            hash: block::Hash([0; 32]),
+            headers: 0,
+            bytes: 0,
+        },
+        locator_hashes: Vec::new(),
+        added_credit: zakura_network::zakura::Credit { objects, bytes },
+        tree_aux_schema: zakura_network::zakura::AuxSchema::None,
     }
 }
 
@@ -191,8 +219,9 @@ fn a_retired_round_makes_its_call_stale_and_keeps_its_own_returns() {
 
 /// Under a stale handler, every effect on other work breaks the claim: a
 /// charge, a return of another round's lease or of an unbound reservation,
-/// credit, another round's retirement or release, a start, a reservation
-/// and a prepare's dispatch. A locator dispatch isn't one.
+/// credit, a cursor acceptance, a built close, another round's retirement
+/// or release, a start, a reservation and a prepare's dispatch. A locator
+/// dispatch isn't one.
 #[test]
 fn a_stale_handler_breaks_on_each_effect_on_other_work() {
     let mut events = retired_window();
@@ -219,6 +248,30 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
             subscription: 3,
             objects: 10,
             bytes: 1_000,
+            update: Box::new(grant(3, 10, 1_000)),
+            target_height: block::Height(1),
+            totals: Default::default(),
+        },
+        ReactorEvent::CursorsAccepted {
+            peer: mirror(),
+            session_id: 2,
+            subscription: 3,
+            through: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            headers: 1,
+            bytes: 263,
+            stored: (
+                zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+                1,
+                263,
+            ),
+            totals: Default::default(),
+        },
+        ReactorEvent::CloseBuilt {
+            peer: mirror(),
+            session_id: 2,
+            subscription: 3,
+            update: Box::new(grant(3, 0, 0)),
+            totals: Default::default(),
         },
         retired(round(2, 2)),
         ReactorEvent::RoundReleased {
@@ -229,6 +282,7 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
         ReactorEvent::Started {
             request: round(2, 3),
             purpose: HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
         },
         ReactorEvent::ReservationOpened {
             reservation: 5,
@@ -376,7 +430,8 @@ fn other_causes_tasks_and_dropped_calls_are_not_judged() {
 
 /// A stale fault's penalty isn't an effect on other work: a `Misbehavior`
 /// under a stale handler breaks nothing, so a stale prepare that fails with
-/// a peer fault may still penalize its peer.
+/// a peer fault may still penalize its peer. The wire harness's
+/// `a_disconnect_mid_prepare_is_still_penalized` runs one end to end.
 #[test]
 fn a_stale_faults_penalty_is_allowed() {
     let mut events = retired_window();

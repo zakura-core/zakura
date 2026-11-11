@@ -208,6 +208,74 @@ const OUTCOME: &str = "headers_outcome_faults_apply_in_their_witnesses";
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
                         so the models label an overrun over-credit, never over-owed";
 
+/// The file of `discovery/wire`'s witness tests (disc-3.1).
+const DISCOVERY_WITNESSES: &str = "tests/discovery_wire_witness.rs";
+
+/// The scripted bypass that violates each discovery ID no scenario reaches,
+/// `discovery_service::SCRIPTED`.
+const DISCOVERY_BYPASS: Bypass = Bypass::Test(sim_test(
+    DISCOVERY_WITNESSES,
+    "scripted_bypasses_violate_the_unplanted_discovery_ids",
+));
+
+/// The planted cases of the discovery IDs whose guard is the shared frame
+/// reader's (disc-3.3). Each patch makes the reader skip one check for one
+/// row of discovery's table, and discovery drop that frame instead of
+/// closing. For most of the 16 inputs, skipping the reader's check alone
+/// would leave discovery's codec to close the connection.
+const DROP_UNDECLARED_TYPE: Bypass = Bypass::Planted("drop-undeclared-type");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_RESERVED_FLAGS: Bypass = Bypass::Planted("drop-reserved-flags");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_SHORT_PAYLOAD: Bypass = Bypass::Planted("drop-short-payload");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_LONG_PAYLOAD: Bypass = Bypass::Planted("drop-long-payload");
+
+/// A discovery generated property's row: its witness test in
+/// [`DISCOVERY_WITNESSES`], and its bypass: its planted case or the scripted
+/// bypass test.
+const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(DISCOVERY_WITNESSES, passing),
+        bypass,
+    }
+}
+
+/// A row for a generated discovery ID that no witness can reach, for
+/// `reason`. `witness` shows the act's other IDs apply, and
+/// [`DISCOVERY_BYPASS`] violates it.
+const fn discovery_unreachable(
+    property: &'static str,
+    reason: &'static str,
+    witness: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(DISCOVERY_WITNESSES, witness),
+        },
+        bypass: DISCOVERY_BYPASS,
+    }
+}
+
+/// The honest exchange, with the node's own sender IDs, and the check that
+/// the witnesses list every ID.
+const DISCOVERY_EVERY: &str = "every_discovery_property_applies_in_its_witness";
+/// The `undeclared-type` and `hello` act witnesses.
+const HELLO_ACTS: &str = "hello_acts_apply_in_their_witnesses";
+/// The `get-peers` act witnesses, and the node's `peers` answers.
+const GET_PEERS_ACTS: &str = "get_peers_acts_apply_in_their_witnesses";
+/// The `peers` act witnesses.
+const PEERS_ACTS: &str = "peers_acts_apply_in_their_witnesses";
+/// The `get-services` act witnesses, and the node's `services` answers.
+const GET_SERVICES_ACTS: &str = "get_services_acts_apply_in_their_witnesses";
+/// The node's answers to requests that ask for less than everything.
+const OWED_ANSWERS: &str = "answers_within_their_requests_hold_sender_within_owed";
+/// The `services` act witnesses.
+const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
@@ -315,6 +383,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("lost-wakeup"),
     },
     Coverage {
+        property: crate::domain::discovery::LATE_RESPONSE_ADMITTED,
+        passing: passes(
+            DISCOVERY_WITNESSES,
+            "late_response_admitted_applies_in_its_saved_plan",
+        ),
+        bypass: Bypass::Planted("revoke-on-timeout"),
+    },
+    Coverage {
         property: super::header_sync::OPERATION_IDS,
         passing: passes(
             "tests/header_node.rs",
@@ -361,12 +437,92 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("stale-release"),
     },
     Coverage {
+        property: super::super::domain::header_sync::RESET_INVALIDATES_WORK,
+        passing: passes(
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("skipped-retirement"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::STALE_CHAIN_EFFECT_INERT,
+        passing: passes(
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("stale-adoption"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::OUTSTANDING_WORK_BOUNDED,
+        passing: passes(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
+        bypass: Bypass::Planted("call-kept"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::COMMIT_ONLY_AUTHORIZED,
+        passing: passes(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("wrong-request"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::STATE_PUBLICATION_CONSISTENT,
+        passing: passes(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("publication-skipped"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::EXPECTED_CHAIN_SELECTED,
+        passing: passes(
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("score-corrupted"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
+        passing: passes(
+            "tests/header_flood_watch.rs",
+            "the_committed_flood_inputs_hold_their_watch_rules",
+        ),
+        bypass: Bypass::Planted("watch-check-revert"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+        passing: passes(
+            "tests/header_flood_watch.rs",
+            "the_committed_flood_inputs_hold_their_watch_rules",
+        ),
+        bypass: Bypass::Planted("watch-check-revert"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::CAPACITY_RELEASE_WAKES,
         passing: passes(
             "tests/header_release_wake.rs",
             "the_release_wake_input_holds_capacity_release_wakes",
         ),
         bypass: Bypass::Planted("missed-release-wake"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::HOLD_RELEASE_WAKES,
+        passing: passes(
+            "tests/header_hold_release.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("completion-arm-removed"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::PEER_RETIREMENT_PROGRESS,
+        passing: passes(
+            "tests/header_peer_retirement.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("retained-owner"),
     },
     Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
@@ -577,6 +733,211 @@ pub static COVERAGE: &[Coverage] = &[
         NOT_OWED,
         OUTCOME,
     ),
+    discovery(
+        "discovery/s4v2/conformant-never-closes",
+        DISCOVERY_EVERY,
+        Bypass::Planted("close-on-expired-hello"),
+    ),
+    discovery(
+        "discovery/s4v2/undeclared-type-closes",
+        HELLO_ACTS,
+        DROP_UNDECLARED_TYPE,
+    ),
+    discovery(
+        "discovery/s4v2/hello/reserved-flags-closes",
+        HELLO_ACTS,
+        DROP_RESERVED_FLAGS,
+    ),
+    discovery(
+        "discovery/s4v2/hello/short-payload-closes",
+        HELLO_ACTS,
+        DROP_SHORT_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/long-payload-closes",
+        HELLO_ACTS,
+        DROP_LONG_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/bad-content-closes",
+        HELLO_ACTS,
+        Bypass::Planted("drop-forged-hello"),
+    ),
+    discovery(
+        "discovery/s4v2/hello/cadence-never-closes",
+        HELLO_ACTS,
+        Bypass::Planted("close-on-empty-hello-bucket"),
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/reserved-flags-closes",
+        GET_PEERS_ACTS,
+        DROP_RESERVED_FLAGS,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/short-payload-closes",
+        GET_PEERS_ACTS,
+        DROP_SHORT_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/long-payload-closes",
+        GET_PEERS_ACTS,
+        DROP_LONG_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/over-margin-closes",
+        GET_PEERS_ACTS,
+        Bypass::Planted("admit-past-margin"),
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/bad-content-closes",
+        GET_PEERS_ACTS,
+        Bypass::Planted("drop-refused-get-peers"),
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/cadence-never-closes",
+        GET_PEERS_ACTS,
+        Bypass::Planted("close-on-empty-get-peers-bucket"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/reserved-flags-closes",
+        PEERS_ACTS,
+        DROP_RESERVED_FLAGS,
+    ),
+    discovery(
+        "discovery/s4v2/peers/short-payload-closes",
+        PEERS_ACTS,
+        DROP_SHORT_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/long-payload-closes",
+        PEERS_ACTS,
+        DROP_LONG_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/unsolicited-closes",
+        PEERS_ACTS,
+        Bypass::Planted("admit-unreserved-peers"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/over-owed-closes",
+        PEERS_ACTS,
+        Bypass::Planted("reserve-largest-peers"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/bad-content-closes",
+        PEERS_ACTS,
+        Bypass::Planted("drop-forged-relay"),
+    ),
+    discovery(
+        "discovery/s4v2/get-services/reserved-flags-closes",
+        GET_SERVICES_ACTS,
+        DROP_RESERVED_FLAGS,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/short-payload-closes",
+        GET_SERVICES_ACTS,
+        DROP_SHORT_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/long-payload-closes",
+        GET_SERVICES_ACTS,
+        DROP_LONG_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/over-margin-closes",
+        GET_SERVICES_ACTS,
+        Bypass::Planted("admit-past-margin"),
+    ),
+    discovery(
+        "discovery/s4v2/get-services/bad-content-closes",
+        GET_SERVICES_ACTS,
+        Bypass::Planted("drop-refused-get-services"),
+    ),
+    discovery(
+        "discovery/s4v2/get-services/cadence-never-closes",
+        GET_SERVICES_ACTS,
+        Bypass::Planted("close-on-empty-get-services-bucket"),
+    ),
+    discovery(
+        "discovery/s4v2/services/reserved-flags-closes",
+        SERVICES_ACTS,
+        DROP_RESERVED_FLAGS,
+    ),
+    discovery(
+        "discovery/s4v2/services/short-payload-closes",
+        SERVICES_ACTS,
+        DROP_SHORT_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/services/long-payload-closes",
+        SERVICES_ACTS,
+        DROP_LONG_PAYLOAD,
+    ),
+    discovery(
+        "discovery/s4v2/services/unsolicited-closes",
+        SERVICES_ACTS,
+        Bypass::Planted("admit-unreserved-services"),
+    ),
+    discovery(
+        "discovery/s4v2/services/bad-content-closes",
+        SERVICES_ACTS,
+        Bypass::Planted("skip-services-node-id"),
+    ),
+    discovery(
+        "discovery/s4v2/hello/sender-cadence",
+        DISCOVERY_EVERY,
+        Bypass::Planted("repeat-hello"),
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/sender-within-limit",
+        DISCOVERY_EVERY,
+        Bypass::Planted("ask-peers-twice"),
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/sender-cadence",
+        DISCOVERY_EVERY,
+        Bypass::Planted("re-ask-peers"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/sender-ends-once",
+        GET_PEERS_ACTS,
+        Bypass::Planted("answer-peers-twice"),
+    ),
+    discovery(
+        "discovery/s4v2/get-services/sender-within-limit",
+        DISCOVERY_EVERY,
+        Bypass::Planted("ask-services-twice"),
+    ),
+    discovery(
+        "discovery/s4v2/get-services/sender-cadence",
+        DISCOVERY_EVERY,
+        Bypass::Planted("re-ask-services"),
+    ),
+    discovery(
+        "discovery/s4v2/services/sender-ends-once",
+        GET_SERVICES_ACTS,
+        Bypass::Planted("answer-services-twice"),
+    ),
+    discovery(
+        "discovery/s4v2/peers/sender-within-owed",
+        OWED_ANSWERS,
+        Bypass::Pending(
+            "every simulated peer binds an RFC 1918 address, which `is_sample_eligible` refuses, \
+             so the node answers every GetPeers with no records and no limit bug can reach this \
+             check yet",
+        ),
+    ),
+    discovery(
+        "discovery/s4v2/services/sender-within-owed",
+        OWED_ANSWERS,
+        Bypass::Planted("ignore-wanted-services"),
+    ),
+    discovery_unreachable(
+        "discovery/s4v2/services/over-owed-closes",
+        "the node asks for every service, so its GetServices owes the row's largest Services, \
+         and a larger one is long-payload",
+        SERVICES_ACTS,
+    ),
     // Any production change that punishes an honest header-sync peer also
     // violates `conformant-never-closes`, and a planted case's input must
     // violate its property alone. The scripted bypass punishes an honest
@@ -588,6 +949,14 @@ pub static COVERAGE: &[Coverage] = &[
             HEADER_WITNESSES,
             "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
         )),
+    },
+    Coverage {
+        property: crate::domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
+        passing: passes(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("skipped-apply"),
     },
     Coverage {
         property: crate::domain::header_sync_progress::HONEST_PROGRESS,
@@ -688,6 +1057,98 @@ pub static COVERAGE: &[Coverage] = &[
             "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),
         bypass: Bypass::Planted("no-room-check"),
+    },
+    Coverage {
+        property: crate::domain::session::REPLACEMENT_PRESERVES_AUTHORIZATION,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_replaced_connection_reopens_every_service_under_fresh_ids",
+        ),
+        bypass: Bypass::Planted("stream-scoped-session-ids"),
+    },
+    Coverage {
+        property: crate::domain::cross::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "teardown_across_held_work_returns_baseline",
+        ),
+        bypass: Bypass::Planted("leaked-reservation-entry"),
+    },
+    Coverage {
+        property: crate::domain::session::STALLED_SERVICE_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_stalled_block_session_starves_no_other_service",
+        ),
+        bypass: Bypass::Planted("close-on-block-stall"),
+    },
+    Coverage {
+        property: crate::domain::connection::CREDIT_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("handshake-window-only"),
+    },
+    Coverage {
+        property: crate::domain::connection::SEND_ISOLATED,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Pending(
+            "raising block sync's send priority keeps the bound: QUIC buffers one send window \
+             per stream and each worker writes one frame at a time, so no single production \
+             site blocks other streams across several frames",
+        ),
+    },
+    Coverage {
+        property: crate::domain::connection::CONNECTION_SHARES_BOUND,
+        passing: passes(
+            "tests/sync_wire.rs",
+            "a_saturating_service_starves_no_other_on_its_connection",
+        ),
+        bypass: Bypass::Planted("one-raw-gate"),
+    },
+    Coverage {
+        property: crate::domain::cross::TIPS_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_replaced_selection_starts_a_new_body_work_epoch",
+        ),
+        bypass: Bypass::Planted("keep-epoch-on-replaced-selection"),
+    },
+    Coverage {
+        property: crate::domain::cross::BLOCK_REQUESTS_FOLLOW_HEADERS,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
+        ),
+        bypass: Bypass::Planted("keep-work-queue-authority"),
+    },
+    Coverage {
+        property: crate::domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reorg_at_each_pipeline_stage_retires_old_epoch_work",
+        ),
+        bypass: Bypass::Planted("accept-stale-scope-bodies"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::QUERY_WORK_AUTHORIZED,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_reply_under_a_retired_authority_installs_nothing",
+        ),
+        bypass: Bypass::Planted("accept-retired-authority"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::FRONTIER_WORK_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "an_epoch_change_retires_the_old_epochs_work",
+        ),
+        bypass: Bypass::Planted("omit-work-reset"),
     },
     Coverage {
         property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,

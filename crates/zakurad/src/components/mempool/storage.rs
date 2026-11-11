@@ -830,7 +830,6 @@ impl Storage {
     }
 
     /// Returns the number of transactions in the mempool.
-    #[allow(dead_code)]
     pub fn transaction_count(&self) -> usize {
         self.verified.transaction_count()
     }

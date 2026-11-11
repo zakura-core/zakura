@@ -1,0 +1,70 @@
+{
+  "node": {
+    "main": 3,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "locator",
+          "nth": 1,
+          "session": null,
+          "held": false
+        },
+        "until": {
+          "reset": "node"
+        },
+        "then": [
+          "engine"
+        ],
+        "deadline_ms": null
+      }
+    ]
+  },
+  "controls": [
+    {
+      "peer": "node",
+      "action": {
+        "reset": {
+          "invalidate": {
+            "depth": 0
+          }
+        }
+      },
+      "when": {
+        "submitted": {
+          "kind": "locator",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    },
+    {
+      "peer": "node",
+      "action": {
+        "reset": "reconsider"
+      },
+      "when": {
+        "completed": {
+          "kind": "locator",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    }
+  ]
+}

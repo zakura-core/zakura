@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 380293f644..e6d51c5dd5 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -183,8 +183,16 @@ impl SubscriberState {
+     /// in bytes.
+     pub(super) fn window(&self, staging: u32, schema: AuxSchema) -> Credit {
+         let headers = Self::window_headers(staging);
++        // Mutation: a V1 window counts each header's auxiliary record twice.
++        let page = match schema {
++            AuxSchema::V1 => {
++                smallest_page(self.header_bytes, schema)
++                    + crate::zakura::header_sync::wire::TREE_AUX_SCHEMA_V1_BYTES
++            }
++            AuxSchema::None => smallest_page(self.header_bytes, schema),
++        };
+         // Widening usize to u64 is lossless on supported targets.
+-        let bytes = (u64::from(headers) * smallest_page(self.header_bytes, schema) as u64)
++        let bytes = (u64::from(headers) * page as u64)
+             .min(u64::from(MAX_HS_PUSH_CREDIT_BYTES));
+         Credit {
+             objects: headers,

@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+index 2a6e606b45..0ebcf560fd 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -894,7 +894,9 @@ impl WorkQueueState {
+                 .expect("reserved item exists because it was just checked");
+             let charge = item.budget.release_reserved();
+             self.settle_in_flight(Some(owner), charge);
+-            outcome.released_bytes = self.add_to_total(outcome.released_bytes, charge);
++            // Mutation: a returned height's charge leaves the ledger but not
++            // the transition's released bytes, so its funding stays pooled.
++            self.settle_ledger(charge);
+             item.owner = None;
+             if let Some(estimate) = item.retry_estimated_bytes.take() {
+                 item.estimated_bytes = estimate.max(item.observed_bytes);

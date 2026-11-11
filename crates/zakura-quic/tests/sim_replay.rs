@@ -277,6 +277,7 @@ fn bind_config(addr: SocketAddr) -> QuicBindConfig {
         max_bidi_streams: 16,
         max_connections: 16,
         dial_reserve: 0,
+        max_inbound_connections: None,
         max_closing_connections: 16,
     }
 }

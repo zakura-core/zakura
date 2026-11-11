@@ -1,0 +1,9 @@
+# The subscription primitive's credit guard admits every spend, so an
+# adversary's page with more headers than its credit is claimed, charged
+# and counted, its cursor and totals agreeing with each other. The input is
+# the saved over-credit-objects Plan, whose act is that page.
+input = "crates/zakura-sim/tests/fixtures/header-wire-over-credit-objects.bin"
+# The subscriber, the subscription primitive, the reactor and the queue
+# decide whether the act's page is refused or claimed, so a change there
+# can move the input off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]

@@ -28,7 +28,7 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
-    model::{consequence, is_fault_cause, Consequence, Label},
+    model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
@@ -71,6 +71,9 @@ pub enum Template {
     /// Per response row that ends its exchange: the node ends only an open
     /// exchange, so it ends each at most once.
     SenderEndsOnce,
+    /// Per response row that answers a request: the node's answer carries
+    /// only what the peer's request asked for.
+    SenderWithinOwed,
     /// Per subscription row: the node's live subscriptions stay within
     /// `max_live`.
     SenderWithinLive,
@@ -96,6 +99,7 @@ impl Template {
             Template::SenderWithinLimit => "sender-within-limit".to_owned(),
             Template::SenderAnswersOpen => "sender-answers-open".to_owned(),
             Template::SenderEndsOnce => "sender-ends-once".to_owned(),
+            Template::SenderWithinOwed => "sender-within-owed".to_owned(),
             Template::SenderWithinLive => "sender-within-live".to_owned(),
             Template::SenderWithinCredit => "sender-within-credit".to_owned(),
             Template::SenderCadence => "sender-cadence".to_owned(),
@@ -114,6 +118,7 @@ impl Template {
             "sender-within-limit" => Some(Template::SenderWithinLimit),
             "sender-answers-open" => Some(Template::SenderAnswersOpen),
             "sender-ends-once" => Some(Template::SenderEndsOnce),
+            "sender-within-owed" => Some(Template::SenderWithinOwed),
             "sender-within-live" => Some(Template::SenderWithinLive),
             "sender-within-credit" => Some(Template::SenderWithinCredit),
             "sender-cadence" => Some(Template::SenderCadence),
@@ -153,6 +158,9 @@ impl Template {
                 "the node responds only within an exchange the peer opened"
             }
             Template::SenderEndsOnce => "the node ends only an open exchange, so each at most once",
+            Template::SenderWithinOwed => {
+                "the node's answer carries only what the peer's request asked for"
+            }
             Template::SenderWithinLive => "the node's live subscriptions stay within max_live",
             Template::SenderWithinCredit => {
                 "the node's pages stay within the credit the peer granted"
@@ -169,6 +177,7 @@ impl Template {
             Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => &[Source::Frames],
@@ -196,6 +205,7 @@ impl Template {
             | Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => Kind::Safety,
@@ -409,6 +419,40 @@ pub fn sender_properties<S: HasView>(family: &'static str, streams: &[Stream]) -
     properties
 }
 
+/// The `sender-within-owed` property of each response row in `streams` that
+/// answers a request, not a subscription. Only a family whose sender adapter
+/// knows what each of the peer's requests asked for, and labels an answer
+/// past it `OverOwed`, registers these: discovery's.
+pub fn sender_owed_properties<S: HasView>(
+    family: &'static str,
+    streams: &[Stream],
+) -> Vec<Property<S>> {
+    let mut properties = Vec::new();
+    for stream in streams {
+        let Some(rules) = stream.messages else {
+            continue;
+        };
+        for rule in rules {
+            let MessageRole::Response { request, .. } = rule.role else {
+                continue;
+            };
+            if !answers_request(streams, request) {
+                continue;
+            }
+            properties.push(generated(GeneratedId {
+                family,
+                stream: StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                },
+                row: Some(rule.name),
+                template: Template::SenderWithinOwed,
+            }));
+        }
+    }
+    properties
+}
+
 /// True if `rule` declares a cadence.
 fn has_cadence(rule: &MessageRule) -> bool {
     match rule.role {
@@ -522,6 +566,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         Template::SenderWithinLimit
         | Template::SenderAnswersOpen
         | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
         | Template::SenderWithinLive
         | Template::SenderWithinCredit
         | Template::SenderCadence => {
@@ -601,6 +646,15 @@ fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
             _ => None,
         })
         .collect()
+}
+
+/// True if the node judged a frame on `connection` in `entries` whose label
+/// isn't `Conformant`, which justifies a punishment after it, or the first
+/// judged frame's missing evidence.
+pub(crate) fn judged_nonconformant(entries: &[Entry], connection: u64) -> Result<bool, String> {
+    Ok(judged(entries, connection)?
+        .iter()
+        .any(|frame| frame.label != Label::Conformant))
 }
 
 /// True if `entries` hold a close of `connection`, with any cause.
@@ -723,12 +777,17 @@ fn check_closes<S: HasView>(
 /// `conformant-never-closes` and `cadence-never-closes`. The property
 /// applies at each step where the node judges a frame on the ID's stream
 /// for which `applies` holds. At each fault close or `Misbehavior` on a
-/// connection with such a frame, if every frame the node judged on that
+/// connection with such a frame, and for `cadence-never-closes` at each
+/// rate-limit close too, if every frame the node judged on that
 /// connection before the punishment, on any stream, is `Conformant`, the
 /// punishment is a violation. A fault on a sibling stream justifies it, but
 /// only one judged before it. For `conformant-never-closes`, a punishment
 /// before the node judged any frame on the connection is a violation too.
 /// Every unjustified punishment at the step is a violation of its own.
+///
+/// A rate-limit close names no stream, so this assumes the connection
+/// carries no stream without a table, whose own message bucket can justify
+/// that close ([`crate::model::RATE_LIMIT_CAUSES`]).
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -759,7 +818,11 @@ fn check_never_closes<S: HasView>(
                 }
                 continue;
             }
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause }
+                if is_fault_cause(cause)
+                    || (id.template == Template::CadenceNeverCloses
+                        && is_rate_limit_cause(cause)) =>
+            {
                 (*connection, format!("a close with cause {cause}"))
             }
             Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),

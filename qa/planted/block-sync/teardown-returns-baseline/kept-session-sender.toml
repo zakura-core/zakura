@@ -1,0 +1,18 @@
+# Serving forgets one clone of its session's sender, the one it takes to
+# serve height 1. The sender holds the session's reservation, as the
+# transport's application senders do, so that session's slot never
+# returns. The scenario's probe asks the node for heights 1 and 2, its
+# links reserve session slots, and every link closes once the node has
+# asked storage to admit eight bodies.
+# Besides serving.rs, which the patch changes, the rest of block sync and
+# the session slots it reserves decide when the node serves and when its
+# routines end. A change there can move the run off its teardown.
+checks = [
+    "crates/zakura-network/src/zakura/block_sync",
+    "crates/zakura-network/src/zakura/regulation/session_capacity.rs",
+]
+
+[typed]
+harness = "block-sync/storage"
+scenario = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.scenario.json"
+plan = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.plan.bin"

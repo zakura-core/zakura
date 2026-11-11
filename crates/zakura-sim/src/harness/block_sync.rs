@@ -41,12 +41,12 @@ use super::{
     block_node::{
         control::{Control, ControlAction, ControlStep, Fork},
         default_limits, policy, preload,
-        probe::ProbeLog,
+        probe::{ProbeFrame, ProbeLog},
         relay::Wire,
         tap::{BlockTap, TapHandoffs},
         view::BlockSyncView,
         BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
-        NodeStorage, Policy, PolicySource, Topology,
+        NodeStorage, Policy, PolicySource, Topology, PROBE,
     },
     header_sync::{check_service_operation_ids, Dialer},
     Subsystem,
@@ -164,6 +164,12 @@ pub struct BlockScenario {
     /// If set, the run pauses the node's sequencer task.
     #[serde(default)]
     pub sequencer_pause: Option<SequencerPause>,
+    /// Whether each of the node's links reserves a session slot on its
+    /// service, as the transport does ([`Topology::reserving_sessions`]).
+    /// Left out of the scenario's JSON when false, so earlier scenarios
+    /// keep their digests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sessions: bool,
 }
 
 /// Pauses each routine that hands a body to the sequencer, after the send
@@ -219,6 +225,7 @@ impl Default for BlockScenario {
             control: Vec::new(),
             handoff_pause: None,
             sequencer_pause: None,
+            sessions: false,
         }
     }
 }
@@ -402,6 +409,56 @@ impl BlockScenario {
                     when: after_eight.clone(),
                 })
                 .collect(),
+            ..BlockScenario::default()
+        }
+    }
+
+    /// [`peers_leave`](Self::peers_leave), with links that reserve the
+    /// node's session slots and a probe that asks the node for the two
+    /// bodies it holds. The node holds heights 1 and 2, so it serves both
+    /// requests, each under one serving lease, while it fetches heights 3
+    /// to 10 from the mirrors, which withhold every height from 11. The
+    /// probe sends at once. Every link closes once the node has asked
+    /// storage to admit eight bodies, so each routine but the probe's ends
+    /// owing requests.
+    pub fn peers_leave_served() -> Self {
+        let after_eight = Some(policy::Trigger::Count(
+            8,
+            Box::new(policy::Trigger::Submitted(policy::Select {
+                kind: Some(policy::BlockKind::Admit),
+                ..policy::Select::default()
+            })),
+        ));
+        let send = ControlStep {
+            action: ControlAction::ProbeSend {
+                frames: (1..=2)
+                    .map(|start_height| ProbeFrame::GetBlocks {
+                        start_height,
+                        count: 1,
+                    })
+                    .collect(),
+            },
+            when: None,
+        };
+        let closes = ["mirror-0", "mirror-1", PROBE].map(|peer| ControlStep {
+            action: ControlAction::Close {
+                peer: peer.to_owned(),
+            },
+            when: after_eight.clone(),
+        });
+        BlockScenario {
+            blocks: 18,
+            node_bodies: 2,
+            mirrors: [Dialer::Mirror, Dialer::Node]
+                .into_iter()
+                .map(|dialer| MirrorSpec {
+                    dialer,
+                    withheld: (11..=18).collect(),
+                })
+                .collect(),
+            probe: true,
+            control: [send].into_iter().chain(closes).collect(),
+            sessions: true,
             ..BlockScenario::default()
         }
     }
@@ -618,9 +675,9 @@ impl Subsystem for Storage {
     }
 
     /// Spawns the node on its controlled service under the scenario's
-    /// policy, with its block sync tapped, then each mirror, links each
-    /// mirror to the node once, then the probe if the scenario has one, and
-    /// offers the scenario's control steps.
+    /// policy, with its block sync and its session slots tapped, then each
+    /// mirror, links each mirror to the node once, then the probe if the
+    /// scenario has one, and offers the scenario's control steps.
     fn build(sim: &mut Sim, scenario: &BlockScenario, ports: Ports) -> Self {
         let storage = PolicySource::new(
             sim,
@@ -664,6 +721,7 @@ impl Subsystem for Storage {
         let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());
         let teardown = tap.teardown();
+        let sessions = tap.sessions();
         if let Some(pause) = scenario.handoff_pause {
             sim.hold_tasks(Box::new(PausedHandoffs {
                 handoffs: tap.handoffs(),
@@ -702,6 +760,11 @@ impl Subsystem for Storage {
             config,
             Some(observer),
         )];
+        sessions.watch(
+            nodes[0]
+                .session_slots()
+                .expect("a node just spawned holds its service"),
+        );
         for ((index, engine), seed) in ports.mirrors.iter().enumerate().zip(2..) {
             let name = format!("mirror-{index}");
             nodes.push(BlockNode::spawn(
@@ -717,11 +780,13 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(
-            Topology::new(nodes, ports.effects, ports.live)
-                .with_wire(wire)
-                .with_tap(teardown),
-        );
+        let mut topology = Topology::new(nodes, ports.effects, ports.live)
+            .with_wire(wire)
+            .with_tap(teardown);
+        if scenario.sessions {
+            topology = topology.reserving_sessions();
+        }
+        let topology = Rc::new(topology);
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),

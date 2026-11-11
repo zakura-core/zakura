@@ -7,7 +7,7 @@ use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, Semaphore},
-    task::JoinHandle,
+    task::{coop, JoinHandle},
     time::{self, Instant},
 };
 
@@ -33,7 +33,7 @@ use crate::zakura::{
         header_sync_trace as hs_trace, peer_label as trace_peer_label,
         queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
     },
-    transport::sim_arg,
+    transport::{sim_arg, sim_chain},
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
@@ -76,14 +76,15 @@ macro_rules! observe {
 }
 
 /// Evaluates `$body` as the reactor's unit of work `$cause`: reports
-/// `$cause` as the body starts and the cause before it as the body ends,
-/// through [`HeaderSyncReactor::set_cause`]. The body must not leave early.
+/// `$cause` as the body starts, through [`HeaderSyncReactor::set_cause`],
+/// and the reactor's sizes and the cause before it as the body ends,
+/// through [`HeaderSyncReactor::end_cause`]. The body must not leave early.
 #[cfg(any(test, zakura_sim))]
 macro_rules! caused {
     ($reactor:expr, $cause:expr, $body:expr) => {{
         let outer = $reactor.set_cause($cause);
         let result = $body;
-        $reactor.set_cause(outer);
+        $reactor.end_cause(outer);
         result
     }};
 }
@@ -100,13 +101,18 @@ mod dispatch;
 mod repair;
 mod trace;
 
-use dispatch::{end_retained, PendingPortOperation, StorageCompletion, StorageOutcome};
+use dispatch::{end_retained, PortOperations, StorageCompletion, StorageOutcome};
 use repair::vct_repair_predecessor;
 use trace::{header_direction_label, ordered_send_error_label};
 
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The fewest peer identities whose state outlives a session that the reactor
+/// keeps, so a node with very few connection slots still remembers its last
+/// few offenders.
+const MIN_PEER_IDENTITY_STATE: usize = 8;
 
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
 ///
@@ -213,13 +219,10 @@ fn build_header_sync_reactor(
     }
 
     let (events_tx, events_rx) = mpsc::channel(128);
-    let (lifecycle_tx, lifecycle_rx) = super::events::LifecycleSender::channel(
-        startup
-            .config
-            .peer_limits
-            .max_inbound_peers
-            .saturating_add(startup.config.peer_limits.max_outbound_peers),
-    );
+    // Both are sized for the header-sync peers this node can actually admit,
+    // not the configured limits alone or the default connection count.
+    let header_peers = startup.config.serving_sessions(startup.max_connections);
+    let (lifecycle_tx, lifecycle_rx) = super::events::LifecycleSender::channel(header_peers);
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let initial_tip = startup.best_header_tip.unwrap_or(startup.anchor);
     let (tip_tx, tip_rx) = watch::channel(initial_tip);
@@ -259,12 +262,34 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: v9::serving_capacity(
-            startup
-                .config
-                .serving_sessions(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS),
+        serving: sim_chain!(v9::serving_capacity(
+            header_peers,
             startup.config.node_serve_output_bytes,
-        ),
+        ) => with_reports(
+            startup
+                .observer
+                .0
+                .as_ref()
+                .and_then(|observer| observer.capacity_observer())
+                .map(|observer| {
+                    let acquired = observer.clone();
+                    crate::zakura::regulation::ServeReports::new(
+                        move |expired, removed, removed_live| {
+                            observer.observe(super::observe::ReactorEvent::ServingPeers {
+                                expired,
+                                removed,
+                                removed_live,
+                            });
+                        },
+                        move |peer, in_use| {
+                            acquired.observe(super::observe::ReactorEvent::ServingAcquired {
+                                peer: peer.clone(),
+                                in_use,
+                            });
+                        },
+                    )
+                })
+        )),
         page_limits,
         #[cfg(any(test, zakura_sim))]
         credit_observer: startup
@@ -279,7 +304,7 @@ fn build_header_sync_reactor(
         events: events_rx,
         lifecycle: lifecycle_rx,
         actions: actions_tx,
-        pending_port_operations: FuturesUnordered::new(),
+        pending_port_operations: PortOperations::default(),
         locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
@@ -305,6 +330,8 @@ fn build_header_sync_reactor(
     caused!(reactor, ReactorCause::Startup, {
         if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
             observe!(reactor, ReactorEvent::adopted(snapshot));
+            // The startup adoption is the stored copy itself.
+            observe!(reactor, ReactorEvent::stored(Some(snapshot)));
             reactor.emit_snapshot_observed(None, snapshot);
         }
         // The returned handle holds the watch's only receiver, so it sees this value.
@@ -335,7 +362,7 @@ struct HeaderSyncReactor {
     lifecycle: mpsc::Receiver<super::events::LifecycleEvent>,
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
-    pending_port_operations: FuturesUnordered<PendingPortOperation>,
+    pending_port_operations: PortOperations,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
@@ -495,6 +522,7 @@ impl HeaderSyncReactor {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
+        let mut maintenance = self.next_maintenance_deadline();
         let terminal_outcome = loop {
             if self
                 .state
@@ -508,53 +536,8 @@ impl HeaderSyncReactor {
             if self.startup.shutdown.is_cancelled() {
                 break HeaderRequestTerminal::Shutdown;
             }
-            // Retire already-ready state operations before any event can enforce
-            // their hard deadlines. Bound this pass to the current operation set.
-            for _ in 0..self.pending_port_operations.len() {
-                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
-                else {
-                    break;
-                };
-                self.handle_port_completion(completion);
-            }
             // Inspect watches on every turn, even when peer queues never become empty.
-            // `changed` delivers a final unseen value before reporting channel closure.
-            if let Some(snapshots) = committed_snapshots.as_mut() {
-                match snapshots.changed().now_or_never() {
-                    Some(Ok(())) => {
-                        let snapshot = snapshots.borrow_and_update().clone();
-                        if let Some(snapshot) = snapshot {
-                            observe!(
-                                self,
-                                ReactorEvent::WatchObserved {
-                                    state_version: snapshot.state_version,
-                                }
-                            );
-                            caused!(
-                                self,
-                                ReactorCause::Watch,
-                                self.observe_latest_committed_snapshot(snapshot)
-                            );
-                        }
-                    }
-                    Some(Err(_)) => committed_snapshots = None,
-                    None => {}
-                }
-            }
-            if let Some(repairs) = vct_root_repairs.as_mut() {
-                match repairs.changed().now_or_never() {
-                    Some(Ok(())) => {
-                        let status = *repairs.borrow_and_update();
-                        caused!(
-                            self,
-                            ReactorCause::Watch,
-                            self.observe_vct_root_repair(status)
-                        );
-                    }
-                    Some(Err(_)) => vct_root_repairs = None,
-                    None => {}
-                }
-            }
+            self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
             // One item from each queue per turn prevents either queue monopolizing the loop.
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
@@ -582,7 +565,8 @@ impl HeaderSyncReactor {
                 caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
-            let maintenance = self.next_maintenance_deadline();
+            self.run_due_maintenance(&mut vct_root_repairs, maintenance);
+            maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
             zakura_rt::select! {
@@ -606,9 +590,8 @@ impl HeaderSyncReactor {
                     });
                 },
                 _ = capacity_releases.changed() => {},
-                _ = time::sleep_until(maintenance) => {
-                    caused!(self, ReactorCause::Maintenance, self.refresh_statuses());
-                },
+                // Wakes the loop. The next turn runs the due maintenance.
+                _ = time::sleep_until(maintenance) => {},
                 event = self.lifecycle.recv() => match event {
                     Some(event) => {
                         observe!(
@@ -695,6 +678,86 @@ impl HeaderSyncReactor {
         );
     }
 
+    /// Handles the storage completions that are ready now, then reads both
+    /// watches, so a deadline checked afterward can't win over a result that
+    /// was ready when the turn started. Of the inputs that become ready while
+    /// the turn handles its events, only the VCT local operation and the
+    /// repair watch are checked again before deadlines, by
+    /// [`Self::run_due_maintenance`]. The rest wait for the next turn.
+    ///
+    /// The VCT local operation, whose deadline is fatal, is polled directly,
+    /// so its result never waits on the shared ready queue. See
+    /// [`PortOperations`]. It's polled before each other completion and once
+    /// at the end, since a handler can start its successor. Only the other
+    /// calls count toward the drain's bound, so that successor can't take an
+    /// older completion's turn.
+    fn settle_ready_inputs(
+        &mut self,
+        committed_snapshots: &mut Option<
+            watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    ) {
+        for _ in 0..self.pending_port_operations.others_len() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            let Some(completion) = self.pending_port_operations.ready_other() else {
+                break;
+            };
+            self.handle_port_completion(completion);
+        }
+        if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+            self.handle_port_completion(completion);
+        }
+        // `changed` delivers a final unseen value before reporting channel closure.
+        // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
+        if let Some(snapshots) = committed_snapshots.as_mut() {
+            match coop::unconstrained(snapshots.changed()).now_or_never() {
+                Some(Ok(())) => {
+                    let snapshot = snapshots.borrow_and_update().clone();
+                    if let Some(snapshot) = snapshot {
+                        observe!(
+                            self,
+                            ReactorEvent::WatchObserved {
+                                state_version: snapshot.state_version,
+                            }
+                        );
+                        caused!(
+                            self,
+                            ReactorCause::Watch,
+                            self.observe_latest_committed_snapshot(snapshot)
+                        );
+                    }
+                }
+                Some(Err(_)) => *committed_snapshots = None,
+                None => {}
+            }
+        }
+        self.probe_vct_root_repairs(vct_root_repairs);
+    }
+
+    /// Reads the VCT root repair watch if it changed.
+    fn probe_vct_root_repairs(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    ) {
+        if let Some(repairs) = vct_root_repairs.as_mut() {
+            match coop::unconstrained(repairs.changed()).now_or_never() {
+                Some(Ok(())) => {
+                    let status = *repairs.borrow_and_update();
+                    caused!(
+                        self,
+                        ReactorCause::Watch,
+                        self.observe_vct_root_repair(status)
+                    );
+                }
+                Some(Err(_)) => *vct_root_repairs = None,
+                None => {}
+            }
+        }
+    }
+
     /// Makes `cause` the reactor's unit of work, reports it, and returns the
     /// one before. Only `caused!` calls it.
     #[cfg(any(test, zakura_sim))]
@@ -702,6 +765,91 @@ impl HeaderSyncReactor {
         let outer = std::mem::replace(&mut self.cause, cause);
         observe!(self, ReactorEvent::CauseSet { cause });
         outer
+    }
+
+    /// Ends the unit of work in progress: reports the reactor's growable
+    /// containers ([`ReactorEvent::Sizes`]), then makes `outer` its unit of
+    /// work again. Only `caused!` calls it.
+    #[cfg(any(test, zakura_sim))]
+    fn end_cause(&mut self, outer: ReactorCause) {
+        if self.startup.observer.0.is_some() {
+            observe!(
+                self,
+                ReactorEvent::Sizes {
+                    sizes: self.sizes()
+                }
+            );
+        }
+        self.set_cause(outer);
+    }
+
+    /// The reactor's growable containers, as [`ReactorEvent::Sizes`]
+    /// reports them.
+    #[cfg(any(test, zakura_sim))]
+    fn sizes(&self) -> super::observe::ReactorSizes {
+        fn sorted<'p>(peers: impl Iterator<Item = &'p ZakuraPeerId>) -> Vec<ZakuraPeerId> {
+            let mut peers: Vec<ZakuraPeerId> = peers.cloned().collect();
+            peers.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            peers
+        }
+        fn sessions<'p>(
+            closes: impl Iterator<Item = (&'p ZakuraPeerId, &'p (u64, Instant))>,
+        ) -> Vec<(ZakuraPeerId, u64)> {
+            let mut closes: Vec<(ZakuraPeerId, u64)> = closes
+                .map(|(peer, (session_id, _))| (peer.clone(), *session_id))
+                .collect();
+            closes.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            closes
+        }
+        let state = &self.state;
+        let now = Instant::now();
+        let (reservations, staged_capacity, staged_entries, repair_episodes) =
+            self.peer_work_queue.sizes();
+        super::observe::ReactorSizes {
+            sessions: sorted(self.sessions.keys()),
+            scheduled: sorted(state.peers.keys()),
+            cached_offers: sorted(
+                state
+                    .peers
+                    .iter()
+                    .filter(|(_, schedule)| schedule.last_status.is_some())
+                    .map(|(peer, _)| peer),
+            ),
+            reservations,
+            staged_capacity,
+            staged_entries,
+            repair_episodes,
+            request_deadlines: sorted(state.request_deadlines.keys()),
+            close_deadlines: sessions(state.close_deadlines.iter()),
+            pending_closes: sessions(state.pending_closes.iter()),
+            locator_reads: state.locators.pending_calls(),
+            storage_calls: state.calls.pending_numbers(),
+            port_futures: self.pending_port_operations.len(),
+            supplier_order: state.vct_supplier_order.iter().cloned().collect(),
+            departed_strikes: {
+                let mut strikes: Vec<(ZakuraPeerId, u32, std::time::Duration)> = state
+                    .departed_strikes
+                    .iter()
+                    .map(|(peer, (strikes, until))| {
+                        (peer.clone(), *strikes, until.saturating_duration_since(now))
+                    })
+                    .collect();
+                strikes.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                strikes
+            },
+            cooldowns: {
+                let mut cooldowns: Vec<(ZakuraPeerId, std::time::Duration)> = state
+                    .unproductive_peer_cooldowns
+                    .iter()
+                    .map(|(peer, until)| (peer.clone(), until.saturating_duration_since(now)))
+                    .collect();
+                cooldowns.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                cooldowns
+            },
+            pruned_peers: sorted(state.pruned_peers.keys()),
+            completed_targets: state.completed_targets.keys(),
+            repair_sources: state.vct_repair.sources(),
+        }
     }
 
     /// Acknowledge admission only after the reactor has installed or refused the session.
@@ -935,6 +1083,13 @@ impl HeaderSyncReactor {
                     }
                 };
         if at_capacity {
+            observe!(
+                self,
+                ReactorEvent::SessionAtCapacity {
+                    peer: peer.clone(),
+                    session_id: session.session_id(),
+                }
+            );
             session.cancel_token().cancel();
             return;
         }
@@ -947,10 +1102,24 @@ impl HeaderSyncReactor {
             )
         });
         let replaces_existing_peer = self.sessions.contains_key(&peer);
+        let mut unanswered_budget = None;
         if replaces_existing_peer && !owns_local_repair_operation {
+            // A receiving request's deadline is reset by each page, so it
+            // still measures how long the peer has left the request unanswered.
+            let now = Instant::now();
+            unanswered_budget = self
+                .peer_work_queue
+                .active(&peer)
+                .is_some_and(|active| active.phase == HeaderTargetPhase::Receiving)
+                .then(|| self.state.request_deadlines.get(&peer).copied())
+                .flatten()
+                .map(|deadline| deadline.saturating_duration_since(now));
             self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
         }
         let replaced_schedule = self.state.admit_session(&peer, Instant::now());
+        if let Some(budget) = unanswered_budget {
+            self.state.carry_replaced_request_budget(&peer, budget);
+        }
         let previous = self.sessions.insert(
             peer.clone(),
             SessionHandles {
@@ -1057,14 +1226,11 @@ impl HeaderSyncReactor {
                 reason,
             }
         );
-        let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
-            limits
-                .max_inbound_peers
-                .saturating_add(limits.max_outbound_peers),
+            self.admitted_peer_limit(),
         );
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
@@ -1407,9 +1573,10 @@ impl HeaderSyncReactor {
             .committed_snapshot
             .as_ref()
             .map(|snapshot| snapshot.frontiers.header_best);
+        let max_pruned_peers = self.admitted_peer_limit();
         if self
             .state
-            .note_history_pruned(peer, schema, tip, Instant::now())
+            .note_history_pruned(peer, schema, tip, Instant::now(), max_pruned_peers)
         {
             metrics::counter!("sync.header.target.aux_fallback").increment(1);
         }
@@ -2038,6 +2205,14 @@ impl HeaderSyncReactor {
                     completion_authority.header_generation,
                     completion_authority.branch,
                 );
+                observe!(
+                    self,
+                    ReactorEvent::TargetCompleted {
+                        header_generation: completion_authority.header_generation,
+                        branch: completion_authority.branch,
+                        already_known: false,
+                    }
+                );
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
@@ -2284,6 +2459,14 @@ impl HeaderSyncReactor {
             self.state
                 .completed_targets
                 .mark(target.scope.header_generation, target.scope.branch);
+            observe!(
+                self,
+                ReactorEvent::TargetCompleted {
+                    header_generation: target.scope.header_generation,
+                    branch: target.scope.branch,
+                    already_known: true,
+                }
+            );
             self.peer_work_queue.remove_unstarted(&peer);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;
@@ -2419,7 +2602,7 @@ impl HeaderSyncReactor {
                                 .expect("the request was just started")
                         )
                     );
-                    self.state.arm_request_deadline(
+                    self.state.arm_started_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,
@@ -2540,6 +2723,7 @@ impl HeaderSyncReactor {
         let status = Status::from_snapshot(&snapshot, self.page_limits);
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
+        observe!(self, ReactorEvent::stored(self.committed_snapshot.as_ref()));
         self.schedule_current_vct_repair();
         self.request_vct_repair_context();
         for handles in self.sessions.values_mut() {
@@ -2662,6 +2846,44 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Runs maintenance if `maintenance`, the deadline the last turn computed,
+    /// has passed.
+    ///
+    /// Each turn calls this after it settles the ready inputs and takes its
+    /// queued events, rather than from the maintenance `select!` arm, so
+    /// inputs that keep winning the biased `select!` can't starve it. The VCT
+    /// local operation and the repair watch can become ready while the turn
+    /// handles its events, so both are checked again first.
+    fn run_due_maintenance(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+        maintenance: Instant,
+    ) {
+        if maintenance <= Instant::now() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            self.probe_vct_root_repairs(vct_root_repairs);
+            caused!(self, ReactorCause::Maintenance, self.run_maintenance());
+        }
+    }
+
+    /// Enforces the deadlines that a ready completion or repair status could
+    /// retire for free, then refreshes statuses.
+    ///
+    /// Only [`Self::run_due_maintenance`] calls this.
+    fn run_maintenance(&mut self) {
+        let now = Instant::now();
+        if !self.report_fatal_vct_local_operation(now) {
+            self.refresh_vct_repair_stall(now);
+            self.retire_timed_out_requests(now);
+        }
+        self.refresh_statuses();
+    }
+
+    /// Refreshes statuses and the other work that no ready input can retire.
+    ///
+    /// Request and local-operation deadlines are left to `run_maintenance`.
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         // Pruned before the fatal check, since the cooldowns are maintenance
@@ -2669,11 +2891,9 @@ impl HeaderSyncReactor {
         if self.state.prune_readmission_cooldowns(now) {
             self.publish_peer_state();
         }
-        if self.report_fatal_vct_local_operation(now) {
+        if self.state.local_operation_fatal() {
             return;
         }
-        self.refresh_vct_repair_stall(now);
-        self.retire_timed_out_requests(now);
         self.state.prune_pruned_peers(now);
         self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);
@@ -2741,10 +2961,12 @@ impl HeaderSyncReactor {
                             .peer_work_queue
                             .active(&peer)
                             .map(|active| active.owner.session_id());
-                        self.retry_vct_repair(
-                            owner,
-                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut),
-                        );
+                        let retry = if self.state.request_deadline_is_carried(&peer) {
+                            VctRepairRetry::carried_timeout(source)
+                        } else {
+                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut)
+                        };
+                        self.retry_vct_repair(owner, retry);
                         // A repair reserves aggregate header budget that ordinary staging cannot
                         // use, so a supplier that withholds its response until the deadline must
                         // be charged like any other unresponsive peer.
@@ -2794,9 +3016,14 @@ impl HeaderSyncReactor {
                     }
                 }
             } else {
+                // A peer whose answer our own prepare or apply is still
+                // handling already answered, so the timeout isn't its fault.
+                // Charging it would also let a finished apply that the drain
+                // hasn't seen yet cost its peer a strike.
                 let session_id = self
                     .peer_work_queue
                     .active(&peer)
+                    .filter(|active| active.phase == HeaderTargetPhase::Receiving)
                     .map(|active| active.owner.session_id());
                 self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);
@@ -2812,6 +3039,17 @@ impl HeaderSyncReactor {
             .values()
             .filter(|handles| handles.session.direction() == direction)
             .count()
+    }
+
+    /// How many header-sync peers this node can hold at once: the inbound
+    /// plus outbound `peer_limits`, clamped to the node's admitted
+    /// connections, and at least [`MIN_PEER_IDENTITY_STATE`]. It bounds the
+    /// per-identity state that outlives a session.
+    fn admitted_peer_limit(&self) -> usize {
+        self.startup
+            .config
+            .serving_sessions(self.startup.max_connections)
+            .max(MIN_PEER_IDENTITY_STATE)
     }
 
     fn publish_peer_state(&self) {
@@ -2989,6 +3227,7 @@ impl HeaderSyncReactor {
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
+            self.admitted_peer_limit(),
         );
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         let _ = self.dispatch_action(HeaderPortOperation::DropPeer {
@@ -3265,6 +3504,7 @@ impl HeaderSyncReactor {
                 &peer,
                 now,
                 self.startup.config.unproductive_peer_cooldown,
+                self.admitted_peer_limit(),
             );
             #[cfg(any(test, zakura_sim))]
             if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {

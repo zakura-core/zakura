@@ -1,0 +1,10 @@
+# The node closes on an expired `Hello`, which a conformant peer may send, since
+# expiry is local policy. The scenario's peer sends an expired `Hello`.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.scenario.json"
+plan = "qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.plan.bin"

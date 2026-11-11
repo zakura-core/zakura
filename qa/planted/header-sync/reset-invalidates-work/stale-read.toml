@@ -1,0 +1,11 @@
+# Storage answers every locator read with the first one it served, and its
+# generation, so a read after the first fork's commit returns the locator
+# and generation from before it.
+# The reactor, the subscriber and the queue decide how the witness's rounds
+# start and stage, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

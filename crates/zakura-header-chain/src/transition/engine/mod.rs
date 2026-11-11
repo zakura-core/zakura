@@ -76,6 +76,48 @@ pub struct HeaderChainEngine {
     aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
 }
 
+/// A header-chain engine's durable state: every field except the
+/// process-local transition identity (`instance_capability`,
+/// `source_revision`) and the auxiliary deliveries, which the simulator
+/// judges by hash on their own. For a test or the simulator to compare two
+/// states whole.
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct DurableState {
+    pub graph: crate::GraphState,
+    pub metadata: EngineMetadata,
+    pub selected_projection: Vec<crate::Frontier>,
+    pub verified_projection: Vec<crate::Frontier>,
+    pub aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
+}
+
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+impl HeaderChainEngine {
+    /// The engine's [`DurableState`]. The engine is destructured with no
+    /// `..`, so a field added later fails to compile here until it's
+    /// classified.
+    pub fn durable_state(&self) -> DurableState {
+        let HeaderChainEngine {
+            instance_capability: _,
+            source_revision: _,
+            graph,
+            metadata,
+            selected_projection,
+            verified_projection,
+            aux_deliveries: _,
+            aux_delivery_index,
+        } = self;
+        DurableState {
+            graph: graph.state(),
+            metadata: metadata.clone(),
+            selected_projection: selected_projection.clone(),
+            verified_projection: verified_projection.clone(),
+            aux_delivery_index: aux_delivery_index.clone(),
+        }
+    }
+}
+
 /// Private identity of one exact in-memory transition source.
 #[derive(Clone, Debug)]
 pub(crate) struct EngineTransitionSource {

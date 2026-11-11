@@ -168,6 +168,44 @@ impl fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
+/// What an [`EngineRun`] ran.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunKind {
+    /// An apply operation, with what it returned.
+    Apply(OpId, ResultIdentity),
+    /// A selected-path locator read, with every entry of the locator the
+    /// engine returned, or `None` if it returned none.
+    Locator(OpId, Option<Vec<zakura_header_chain::Frontier>>),
+    /// An operator reset.
+    Reset,
+    /// A harness commit straight into the engine, outside any operation,
+    /// with the hashes of the headers it committed, in order. See
+    /// [`ControlledPort::harness_commit`].
+    HarnessCommit(Vec<block::Hash>),
+}
+
+/// An engine run's durable state just before and just after it, for the
+/// simulator's commit-contents, durable-state and locator-result checks,
+/// and the engine's own snapshot just after it, for its fork-choice check.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineRun {
+    /// What ran.
+    pub kind: RunKind,
+    /// The scenario clock when the run started. Virtual time doesn't advance
+    /// within a run, so it's the time the engine's clock read.
+    pub clock: chrono::DateTime<chrono::Utc>,
+    /// Before the run.
+    pub before: zakura_header_chain::DurableState,
+    /// After the run.
+    pub after: zakura_header_chain::DurableState,
+    /// The snapshot the engine itself gives after the run, read from it
+    /// whatever the run's result. It's the engine's own projection of
+    /// `after`'s metadata, the one a publication would carry.
+    pub snapshot: EngineSnapshot,
+}
+
 /// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
@@ -196,6 +234,9 @@ pub struct Completion {
     pub generation: HeaderGeneration,
     /// [`EnginePort::state_digest`] once the completion finished.
     pub state_digest: [u8; 32],
+    /// The apply's engine run, if this completion ran one.
+    #[cfg(zakura_sim)]
+    pub executed: Option<std::sync::Arc<EngineRun>>,
 }
 
 /// One published change.
@@ -268,6 +309,9 @@ pub enum FactKind {
         generation: HeaderGeneration,
         /// [`EnginePort::state_digest`] once the commit finished.
         state_digest: [u8; 32],
+        /// The apply's engine run.
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc<EngineRun>,
     },
     /// Head: the run reset the engine's header selection with an operator
     /// event.
@@ -278,6 +322,9 @@ pub enum FactKind {
         target: block::Hash,
         /// The engine's header generation once it committed.
         generation: HeaderGeneration,
+        /// The operator event's engine run.
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc<EngineRun>,
     },
     /// Head: the run completed an operation, or delivered a committed
     /// apply's reply.
@@ -405,6 +452,9 @@ struct Ops {
     /// The run it's bound to.
     #[cfg(zakura_sim)]
     run: Option<zakura_rt::sim::RunId>,
+    /// The harness commits' engine runs not yet taken.
+    #[cfg(zakura_sim)]
+    harness_runs: Vec<std::sync::Arc<EngineRun>>,
     /// Set when something used the port outside that run.
     #[cfg(zakura_sim)]
     refused: bool,
@@ -859,6 +909,9 @@ impl ControlledPort {
             lease_ends,
             generation: self.engine.snapshot().header_generation,
             state_digest: self.engine.state_digest(),
+            // The engine ran at the commit, whose fact carries the run.
+            #[cfg(zakura_sim)]
+            executed: None,
         };
         kinds.push(FactKind::Completed(Box::new(completion.clone())));
         let published = self.ops().publish(now, kinds);
@@ -936,6 +989,18 @@ impl ControlledPort {
         // Only a commit reads the snapshot around its run, to tell whether
         // the apply installed one.
         let before = hold.then(|| self.engine.snapshot());
+        #[cfg(zakura_sim)]
+        let durable_before = (early.is_none()
+            && matches!(
+                op,
+                HeaderOp::ApplyHeaderTarget | HeaderOp::ContinuationLocator
+            ))
+        .then(|| {
+            (
+                zakura_rt::time::utc_now().into(),
+                self.engine.durable_state(),
+            )
+        });
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
         let (reply, effects, result) = match early {
@@ -964,8 +1029,37 @@ impl ControlledPort {
             kinds.push(FactKind::PermitDropped { id });
         }
         kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
+        #[cfg(zakura_sim)]
+        let executed = durable_before.map(|(clock, before)| {
+            std::sync::Arc::new(EngineRun {
+                kind: match op {
+                    HeaderOp::ApplyHeaderTarget => RunKind::Apply(id, result.clone()),
+                    _ => RunKind::Locator(
+                        id,
+                        match &reply {
+                            HeaderReply::ContinuationLocator(Ok(Some(locator))) => {
+                                Some(locator.entries().to_vec())
+                            }
+                            _ => None,
+                        },
+                    ),
+                },
+                clock,
+                before,
+                after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
+            })
+        });
         if before.is_some_and(|before| before != self.engine.snapshot()) {
-            return Ok(self.hold_reply(id, now, txn, reply, result, kinds));
+            return Ok(self.hold_reply(
+                id,
+                now,
+                txn,
+                (reply, result),
+                kinds,
+                #[cfg(zakura_sim)]
+                executed.expect("a commit runs an apply's engine"),
+            ));
         }
         let (caller, abandoned, identity, request_digest) = {
             let mut ops = self.ops();
@@ -1017,6 +1111,8 @@ impl ControlledPort {
                 lease_ends,
                 generation,
                 state_digest,
+                #[cfg(zakura_sim)]
+                executed,
             };
             kinds.push(FactKind::Completed(Box::new(completion.clone())));
             let published = ops.publish(now, kinds);
@@ -1041,9 +1137,9 @@ impl ControlledPort {
         id: OpId,
         now: Instant,
         txn: u64,
-        reply: HeaderReply,
-        result: ResultIdentity,
+        (reply, result): (HeaderReply, ResultIdentity),
         mut kinds: Vec<FactKind>,
+        #[cfg(zakura_sim)] executed: std::sync::Arc<EngineRun>,
     ) -> Commit {
         let generation = self.engine.snapshot().header_generation;
         let state_digest = self.engine.state_digest();
@@ -1060,6 +1156,8 @@ impl ControlledPort {
             id,
             generation,
             state_digest,
+            #[cfg(zakura_sim)]
+            executed,
         });
         let published = ops.publish(now, kinds);
         assert_eq!(
@@ -1141,6 +1239,11 @@ impl ControlledPort {
                 }
             }
         };
+        #[cfg(zakura_sim)]
+        let (clock, durable_before) = (
+            zakura_rt::time::utc_now().into(),
+            self.engine.durable_state(),
+        );
         let applied = self
             .engine
             .operator(target, kind == ResetKind::Invalidate)
@@ -1152,6 +1255,14 @@ impl ControlledPort {
             kind,
             target,
             generation: self.engine.snapshot().header_generation,
+            #[cfg(zakura_sim)]
+            executed: std::sync::Arc::new(EngineRun {
+                kind: RunKind::Reset,
+                clock,
+                before: durable_before,
+                after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
+            }),
         };
         let mut ops = self.ops();
         match kind {
@@ -1191,6 +1302,39 @@ impl ControlledPort {
     /// The facts published since the last call, in order.
     pub fn take_facts(&self) -> Vec<Fact> {
         mem::take(&mut self.ops().facts)
+    }
+
+    /// Runs `commit`, a harness's commit of the headers `hashes` straight
+    /// into the engine, outside any operation, and, if it succeeds, records
+    /// its engine run, as every apply and reset records one, for
+    /// [`take_harness_runs`](Self::take_harness_runs). It publishes no fact,
+    /// since no operation ran. A commit that fails records nothing: its
+    /// harness fails the run.
+    #[cfg(zakura_sim)]
+    pub fn harness_commit<E>(
+        &self,
+        hashes: Vec<block::Hash>,
+        commit: impl FnOnce(&EnginePort) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let clock = zakura_rt::time::utc_now().into();
+        let before = self.engine.durable_state();
+        commit(&self.engine)?;
+        let run = EngineRun {
+            kind: RunKind::HarnessCommit(hashes),
+            clock,
+            before,
+            after: self.engine.durable_state(),
+            snapshot: self.engine.snapshot(),
+        };
+        self.ops().harness_runs.push(std::sync::Arc::new(run));
+        Ok(())
+    }
+
+    /// The engine runs of the harness commits since the last call, oldest
+    /// first.
+    #[cfg(zakura_sim)]
+    pub fn take_harness_runs(&self) -> Vec<std::sync::Arc<EngineRun>> {
+        mem::take(&mut self.ops().harness_runs)
     }
 
     /// Shuts the service down, as the end of a run does. Drops every pending
@@ -1481,10 +1625,16 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v2");
     hasher.update(format!("{request:?}").as_bytes());
-    let (request, rejected, apply_parent) = match request {
+    let (request, rejected, sealed) = match request {
         HeaderRequest::ApplyHeaderTarget { target } => match target.into_insert(key) {
             Ok(insert) => {
                 let parent = insert.parent_hash;
+                let hashes = insert
+                    .batch
+                    .headers()
+                    .iter()
+                    .map(|header| header.hash)
+                    .collect();
                 hasher.update(insert.source.digest());
                 hasher.update(insert.parent_hash.0);
                 hasher.update(insert.target_tip_hash.0);
@@ -1499,7 +1649,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
                 (
                     HeaderRequest::ApplyHeaderTarget { target },
                     false,
-                    Some(parent),
+                    Some((parent, hashes)),
                 )
             }
             Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true, None),
@@ -1516,7 +1666,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
         }
     };
     Inspected {
-        identity: RequestIdentity::of(&request, key, apply_parent),
+        identity: RequestIdentity::of(&request, key, sealed),
         request,
         request_digest: hasher.finalize().into(),
         rejected,

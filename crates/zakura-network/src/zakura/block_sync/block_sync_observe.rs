@@ -1,10 +1,11 @@
 //! Synchronous block-sync effects and owner snapshots for simulator tests.
 //!
 //! Block sync's tasks report what they do to an installed
-//! [`BlockSyncObserver`]: session admission, judged frames, request write
+//! [`BlockSyncObserver`]: session admission, peer-registry writes that land
+//! on another generation's entry, judged frames, request write
 //! steps, byte-budget changes, the body handoff to the sequencer, sequencer
-//! holder changes, serving leases and frames, and each owning task's snapshot
-//! after an input. This module exists only in test and `zakura_sim` builds.
+//! holder changes and epoch changes, serving leases and frames, and each
+//! owning task's snapshot after an input. This module exists only in test and `zakura_sim` builds.
 //! Production builds compile none of it, and every hook that reports to it is
 //! behind the same `cfg`.
 //!
@@ -71,6 +72,24 @@ pub enum BlockEvent {
         generation: u64,
         /// The connection's direction.
         direction: ServicePeerDirection,
+    },
+    /// A generation-gated peer-registry write met an entry that another
+    /// routine generation owns. Each gated writer reports the attempt before
+    /// its gate, and, if the write lands, again from inside the write, under
+    /// the registry lock, so the second report follows the write and not its
+    /// gate.
+    StaleRegistryWrite {
+        /// The entry's peer.
+        peer: ZakuraPeerId,
+        /// The writer.
+        writer: RegistryWriter,
+        /// The generation the write came from.
+        generation: u64,
+        /// The generation that owns the entry.
+        entry_generation: u64,
+        /// Whether the write landed: false for the attempt's report, true
+        /// for the write's.
+        landed: bool,
     },
     /// A routine took a frame from its stream and is about to judge it. Every
     /// check the routine, its regulated session and the sequencer run on the
@@ -154,6 +173,17 @@ pub enum BlockEvent {
         /// body, or `None` before it had one.
         scope_epoch: Option<BodyWorkEpoch>,
     },
+    /// The sequencer took a new body-work epoch. It reports this after it
+    /// runs the transition's operations, which reset the work queue above
+    /// `verified_tip` and reauthorize its queued work, and before it submits
+    /// any body, so every request or submission reported after this one
+    /// follows them.
+    EpochApplied {
+        /// The new epoch.
+        epoch: BodyWorkEpoch,
+        /// The verified tip the transition resets body work above.
+        verified_tip: block::Height,
+    },
     /// A serving read received its execution lease, or dropped it.
     ServingLease {
         /// The requesting peer.
@@ -214,6 +244,40 @@ pub enum BlockEvent {
     /// body released after this has no next holder: the task's drop
     /// releases the bodies left in its input, and a routine's send fails.
     SequencerClosed,
+}
+
+/// A generation-gated peer-registry writer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RegistryWriter {
+    /// Records a routine's outbound queue probe.
+    AttachOutbound,
+    /// Marks a session closed.
+    CloseSession,
+    /// Applies a peer's status.
+    UpsertStatus,
+    /// Publishes a request's claims.
+    InsertOutstanding,
+    /// Withdraws a request's claims.
+    RemoveOutstanding,
+    /// Detaches every claim.
+    TakeOutstanding,
+    /// Publishes slot diagnostics.
+    PublishSlots,
+}
+
+impl RegistryWriter {
+    /// The writer's name, as the peer registry's method names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RegistryWriter::AttachOutbound => "attach_outbound",
+            RegistryWriter::CloseSession => "close_session",
+            RegistryWriter::UpsertStatus => "upsert_status",
+            RegistryWriter::InsertOutstanding => "insert_outstanding",
+            RegistryWriter::RemoveOutstanding => "remove_outstanding_for_owner",
+            RegistryWriter::TakeOutstanding => "take_outstanding",
+            RegistryWriter::PublishSlots => "publish_slots",
+        }
+    }
 }
 
 /// One step of a request's frame write.

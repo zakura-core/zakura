@@ -1,6 +1,6 @@
 [package]
 name = "zakura-quic"
-version = "0.4.0"
+version = "0.5.0"
 authors.workspace = true
 description = "Direct QUIC transport for Zakura's native P2P stack, built on quinn-proto. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -12,12 +12,14 @@ categories = ["cryptography::cryptocurrencies", "network-programming"]
 
 [features]
 default = []
+# `Conn::shared_id`, for other crates' unit tests. A simulator build gets it
+# from `--cfg zakura_sim`.
+test-support = []
 
 [dependencies]
 # SPEC DEP-2 lists every allowed direct dependency. Adding one needs a spec change.
 bytes = { workspace = true }
 curve25519-dalek = { workspace = true }
-ed25519-zebra = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }

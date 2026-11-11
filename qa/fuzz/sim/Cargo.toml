@@ -22,6 +22,8 @@ block_decoded_retention = "block/decoded-retention"
 header_reactor_policy = "header/reactor-policy"
 block_reactor_policy = "block/reactor-policy"
 header_publisher_policy = "header/publisher-policy"
+sync_storage = "sync/storage"
+sync_wire = "sync/wire"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -128,6 +130,20 @@ bench = false
 [[bin]]
 name = "discovery_session_installation"
 path = "fuzz_targets/discovery_session_installation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_storage"
+path = "fuzz_targets/sync_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_wire"
+path = "fuzz_targets/sync_wire.rs"
 test = false
 doc = false
 bench = false

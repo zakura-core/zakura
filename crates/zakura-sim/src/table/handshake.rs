@@ -192,7 +192,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
                 needs: &[Source::Closes],
                 status: Status::Active,
                 check: check_refused::<S>,
-                witness: None,
+                witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
             });
         }
         properties.push(Property {
@@ -245,7 +245,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_prelude::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
         });
     }
     properties
@@ -657,6 +657,57 @@ fn paced_control_reached(log: &crate::ObservationLog) -> bool {
     })
 }
 
+/// A generated rejection witness reaches the labelled exchange and its production judgement.
+fn handshake_label_reached(property: &str, log: &crate::ObservationLog) -> bool {
+    let mut parts = property.split('/');
+    let (Some("handshake"), Some(row), Some(claim)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some(label) = claim
+        .strip_suffix("-refused")
+        .or_else(|| claim.strip_suffix("-resets"))
+        .or_else(|| claim.strip_suffix("-closes"))
+    else {
+        return false;
+    };
+    log.entries().iter().any(|entry| {
+        let Observation::PeerHandshake {
+            shared_id,
+            quic_stream,
+            row: sent_row,
+            label: sent_label,
+            ..
+        } = &entry.obs
+        else {
+            return false;
+        };
+        sent_row == row
+            && sent_label == label
+            && log.entries().iter().any(|entry| match &entry.obs {
+                Observation::Transport {
+                    event:
+                        TransportFact::Handshake {
+                            shared_id: judged,
+                            stage,
+                            ..
+                        },
+                    ..
+                } => judged == shared_id && stage == row,
+                Observation::Transport {
+                    event:
+                        TransportFact::PreludeJudged {
+                            shared_id: judged,
+                            quic_stream: judged_stream,
+                            ..
+                        },
+                    ..
+                } => row == "prelude" && judged == shared_id && judged_stream == quic_stream,
+                _ => false,
+            })
+    })
+}
+
 fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let id = cx.id().to_string();
     let mut pieces = id.split('/');
@@ -665,6 +716,28 @@ fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let label = pieces.next().unwrap().strip_suffix("-refused").unwrap();
     let mut pending = Vec::new();
     let mut applies = false;
+    for obs in cx.observations() {
+        let Observation::Transport {
+            event:
+                TransportFact::Handshake {
+                    shared_id,
+                    stage,
+                    error,
+                    ..
+                },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        if (stage == row && error.is_none()) || stage == "registered" {
+            if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::PeerHandshake { shared_id: sent_id, row: sent_row, label: sent_label, .. }
+                    if sent_id == shared_id && sent_row == row && sent_label == label)) {
+                return cx.violated("the node never accepts a malformed control exchange", shared_id);
+            }
+        }
+    }
     for (at, obs) in cx.observations().enumerate() {
         let Observation::PeerHandshake {
             shared_id,
@@ -680,9 +753,9 @@ fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
         applies = true;
         if cx.log.entries().iter().any(|entry| matches!(&entry.obs,
-            Observation::Transport { event: TransportFact::Handshake { shared_id: registered, stage, .. }, .. }
-                if registered == shared_id && stage == "registered")) {
-            return cx.violated("a malformed control exchange never registers", shared_id);
+            Observation::Transport { event: TransportFact::Handshake { shared_id: accepted, stage, error, .. }, .. }
+                if accepted == shared_id && ((stage == row && error.is_none()) || stage == "registered"))) {
+            return cx.violated("the node never accepts a malformed control exchange", shared_id);
         }
         if let Some(code) = cx.log.entries().iter().find_map(|entry| match &entry.obs {
             Observation::PeerConnectionClosed {

@@ -51,6 +51,8 @@ pub struct Property<S: HasView> {
 pub enum TriggerHistory<S: HasView> {
     /// Reads the observation log.
     Log(fn(&ObservationLog) -> bool),
+    /// Reads the generated property's ID and the observation log.
+    PropertyLog(fn(&str, &ObservationLog) -> bool),
     /// Reads the harness's view at the run's end and the log, for a trigger
     /// made of view-side facts.
     View(fn(&S::View, &ObservationLog) -> bool),

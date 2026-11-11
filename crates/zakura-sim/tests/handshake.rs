@@ -291,6 +291,11 @@ fn assert_held(report: &zakura_sim::RunReport, id: &str) {
     );
 }
 
+fn assert_witness_holds(report: &zakura_sim::RunReport, id: &str) {
+    zakura_sim::witness::judge_report::<Wire>(report, id, zakura_sim::witness::Expect::Holds)
+        .unwrap_or_else(|error| panic!("{id}: {error}"));
+}
+
 #[test]
 fn hello_guards_refuse_each_corrupt_field() {
     for &fault in &zakura_sim::harness::handshake_wire::HELLO_FAULTS[1..] {
@@ -300,7 +305,7 @@ fn hello_guards_refuse_each_corrupt_field() {
             ..HandshakeSpec::default()
         });
         let report = run(scenario);
-        assert_held(
+        assert_witness_holds(
             &report,
             &format!("handshake/hello/{}-refused", fault.label()),
         );
@@ -318,7 +323,7 @@ fn ack_guards_refuse_each_corrupt_field() {
             ..HandshakeSpec::default()
         });
         let report = run(scenario);
-        assert_held(&report, &format!("handshake/ack/{}-refused", fault.label()));
+        assert_witness_holds(&report, &format!("handshake/ack/{}-refused", fault.label()));
         assert_held(&report, "handshake/ack/refusal-releases-slot");
     }
 }
@@ -348,7 +353,7 @@ fn prelude_guards_apply_each_declared_consequence() {
             .find(|(name, _)| *name == label)
             .unwrap()
             .1;
-        assert_held(&report, &format!("handshake/prelude/{label}-{effect}"));
+        assert_witness_holds(&report, &format!("handshake/prelude/{label}-{effect}"));
     }
 }
 

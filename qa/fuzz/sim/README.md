@@ -32,7 +32,7 @@ whose target has no harness or no campaign.
 ## Targets
 
 - `handshake_wire` runs `handshake/wire` against the production QUIC endpoint
-  and protocol handler. Decoder v6's 32-byte prefix chooses control corruption,
+  and protocol handler. Decoder v7's 32-byte prefix chooses control corruption,
   prelude corruption, pacing, shared addresses, failed retries, capability flips,
   inbound pressure during node dials, invalid stream-open churn, or partial and complete session offers.
   The shared-address family can stagger attempts to reach the registered cap.
@@ -40,7 +40,7 @@ whose target has no harness or no campaign.
   attempts at one second. Remaining bytes choose the schedule.
 - `handshake_counts` runs `handshake/counts` against production admission
   decisions. Its three-byte operations choose an action, owner slot, and
-  address. Decoder v3 reads up to 1,536 bytes and tracks 128 owner slots.
+  address. Decoder v4 reads up to 1,536 bytes and tracks 128 owner slots.
   A high first bit selects an address, pending, or connection burst before
   the remaining operations. It also draws immediate failures, time advances,
   and transport cancellations. The harness checks charges against independent

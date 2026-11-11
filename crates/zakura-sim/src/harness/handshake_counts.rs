@@ -69,7 +69,7 @@ const MACHINE: Machine = Machine {
             Status::Active,
         ),
     ],
-    generator: 3,
+    generator: 4,
     budget: 513,
     history,
     reached: |steps, _| {

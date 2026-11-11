@@ -1699,12 +1699,14 @@ where
     /// cannot be offered at once.
     ///
     /// That is the case when the mempool holds no transactions for the new tip or has not
-    /// caught up with it (see [`Self::populated_mempool_on_new_tip`]), or when a shielded
-    /// coinbase built in advance saves the miner its proof time. Miners want work on the new tip
-    /// without delay,
-    /// so this template has no mempool transactions and an ID that names none. The client's
-    /// next long poll then returns the full template as soon as the mempool has any. Returns
-    /// `Ok(None)` when the template was superseded, like [`Self::finish_mining_template`].
+    /// caught up with it (see [`Self::populated_mempool_on_new_tip`]), when a shielded
+    /// coinbase built in advance saves the miner its proof time, or when as many long polls
+    /// as may build a full first answer at once are already doing so (see
+    /// [`GetBlockTemplateHandler::try_reserve_full_first_answer`]). Miners want work on the
+    /// new tip without delay, so this template has no mempool transactions and an ID that
+    /// names none. The client's next long poll then returns the full template as soon as the
+    /// mempool has any. Returns `Ok(None)` when the template was superseded, like
+    /// [`Self::finish_mining_template`].
     ///
     /// Traces the returned template under `request_id`.
     async fn new_tip_template(
@@ -3621,6 +3623,9 @@ where
             // The coinbase a waiting long poll built before the tip changed, with the height it
             // was built for. The next pass of the loop answers on the new tip and may use it.
             let mut tip_wake_coinbase = None;
+            // This request's place among the long polls that may build a full first answer on
+            // a new tip at once, held from its mempool request until its template is built.
+            let mut full_first_answer = None;
             let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
                 // Check if we are synced to the tip.
                 // The result of this check can change during long polling.
@@ -3668,6 +3673,9 @@ where
                 // transactions for the new tip, so a miner that keeps its first answer does not
                 // mine an empty block while transactions wait. Otherwise it is the coinbase-only
                 // template, without waiting for the mempool to process the new block.
+                //
+                // A tip change wakes every waiting long poll at once. Only a few of them may
+                // build the full answer at the same time; the rest answer coinbase-only.
                 let carried_coinbase = tip_wake_coinbase.take();
                 let new_tip_mempool =
                     if client_long_poll_id
@@ -3706,9 +3714,23 @@ where
                                 Duration::ZERO,
                             );
                             None
+                        } else if let Some(place) = self.gbt.try_reserve_full_first_answer() {
+                            let populated_mempool = self
+                                .populated_mempool_on_new_tip(request_id, tip_hash)
+                                .await;
+                            if populated_mempool.is_some() {
+                                full_first_answer = Some(place);
+                            }
+                            populated_mempool
                         } else {
-                            self.populated_mempool_on_new_tip(request_id, tip_hash)
-                                .await
+                            self.gbt.trace.new_tip_mempool(
+                                request_id,
+                                tip_hash,
+                                NewTipMempool::OverLimit,
+                                0,
+                                Duration::ZERO,
+                            );
+                            None
                         };
 
                         let Some(populated_mempool) = populated_mempool else {
@@ -3915,6 +3937,7 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
+                        wait_reason = WaitReason::Tip;
                         // The next pass of the loop sees that this request's long poll ID names
                         // an older tip and answers it there, with this coinbase if it fits.
                         tip_wake_coinbase = precomputed_coinbase?
@@ -3995,6 +4018,7 @@ where
                     submit_old,
                 )
                 .await?;
+            drop(full_first_answer);
             if let Some(response) = self
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?

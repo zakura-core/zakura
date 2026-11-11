@@ -21,8 +21,10 @@ use zakura_state::GetBlockTemplateChainInfo;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 use zcash_address::{ToAddress, ZcashAddress};
 
+use super::super::types::get_block_template::constants::MAX_FULL_FIRST_ANSWERS;
 use super::super::*;
 use super::utils::fake_history_tree;
+use super::vectors::fake_verified_mempool_tx;
 use crate::tests::test_rpc::TestRpcImpl;
 
 type Mock<Req, Resp> = MockService<Req, Resp, PanicAssertion, BoxError>;
@@ -320,6 +322,45 @@ fn counting_mining_rpc(
     });
     let (rpc, _) = rpc(network(), mempool, read, tip);
     (rpc, sender, read_count, slow_mempool)
+}
+
+/// Returns a mining RPC whose mempool holds one transaction and has processed the tip `info`
+/// names, with its tip sender and a count of mempool requests.
+fn populated_mining_rpc(
+    info: watch::Receiver<GetBlockTemplateChainInfo>,
+) -> (
+    TestRpcImpl,
+    zakura_chain::chain_tip::mock::MockChainTipSender,
+    Arc<AtomicUsize>,
+) {
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(info.borrow().tip_height);
+    sender.send_best_tip_hash(info.borrow().tip_hash);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let requests = request_count.clone();
+    let mempool_info = info.clone();
+    let mempool = tower::service_fn(move |_| {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let hash = mempool_info.borrow().tip_hash;
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![fake_verified_mempool_tx()],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: hash,
+            })
+        }
+    });
+    let read = tower::service_fn(move |request| {
+        let info = info.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let (rpc, _) = rpc(network(), mempool, read, tip);
+    (rpc, sender, request_count)
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -1148,6 +1189,80 @@ fn simultaneous_long_polls_remain_responsive() {
             assert_eq!(template.previous_block_hash, next.tip_hash);
             assert_reward(&template, 400_000_000);
         }
+    });
+}
+
+/// Long polls answered together on a new tip must not each copy the mempool and queue a full
+/// template build. Up to [`MAX_FULL_FIRST_ANSWERS`] of them build the full first answer, and
+/// the rest answer coinbase-only without asking the mempool.
+#[test]
+fn simultaneous_long_polls_build_a_bounded_number_of_full_first_answers() {
+    const LONG_POLLS: usize = 8;
+
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mempool_requests) = populated_mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let old_tip_long_poll = || {
+            Box::pin(rpc.get_block_template(Some(GetBlockTemplateParameters {
+                long_poll_id: Some(initial.long_poll_id),
+                ..Default::default()
+            })))
+        };
+
+        // A block lands, and the mempool has already processed it.
+        let next = chain_info(3, 2, 400_000_000);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_height(next.tip_height);
+        tip.send_best_tip_hash(next.tip_hash);
+
+        // No template build can finish while the blocking pool is held, so every long poll
+        // that starts a full first answer is still working on it when the others arrive.
+        let gate = BlockingPoolGate::new().await;
+        let requests_before = mempool_requests.load(Ordering::SeqCst);
+        let mut requests: Vec<_> = (0..LONG_POLLS).map(|_| old_tip_long_poll()).collect();
+        for request in &mut requests {
+            assert!(futures::poll!(request).is_pending());
+        }
+        assert_eq!(
+            mempool_requests.load(Ordering::SeqCst) - requests_before,
+            MAX_FULL_FIRST_ANSWERS,
+            "only the long polls building a full first answer copy the mempool"
+        );
+
+        gate.release().await;
+        let templates: Vec<_> = bounded(futures::future::join_all(requests))
+            .await
+            .into_iter()
+            .map(|response| response.unwrap().try_into_template().unwrap())
+            .collect();
+        for template in &templates {
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+        }
+        let full_answers = templates
+            .iter()
+            .filter(|template| !template.transactions.is_empty())
+            .count();
+        assert_eq!(
+            full_answers, MAX_FULL_FIRST_ANSWERS,
+            "the long polls over the limit answer coinbase-only"
+        );
+
+        // The finished long polls no longer count towards the limit.
+        let later = bounded(old_tip_long_poll())
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(later.previous_block_hash, next.tip_hash);
+        assert!(
+            !later.transactions.is_empty(),
+            "a long poll answered after the others finished gets the full template"
+        );
     });
 }
 

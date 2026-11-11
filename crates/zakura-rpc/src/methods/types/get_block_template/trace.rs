@@ -1,9 +1,9 @@
 //! The `mining_template` JSONL trace table.
 //!
 //! Each `getblocktemplate` call gets a process-wide `request_id`. A long poll that sees a new
-//! tip writes `gbt_tip_woke`, then `gbt_new_tip_mempool` for the one mempool request it makes
-//! there, and then either `gbt_empty_returned` for the coinbase-only template or
-//! `gbt_full_returned`. Every other template a call returns writes `gbt_full_returned`.
+//! tip writes `gbt_tip_woke`, then `gbt_new_tip_mempool` for the mempool request it makes there,
+//! followed by `gbt_empty_returned` for a coinbase-only answer or `gbt_full_returned` for an
+//! answer built from the mempool. Other returned templates also write `gbt_full_returned`.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -33,6 +33,8 @@ pub(crate) enum WaitReason {
     /// The call returned without waiting.
     #[default]
     Immediate,
+    /// A chain tip notification woke the call.
+    Tip,
     /// The periodic mempool check timer fired.
     Timer,
     /// A template rejection changed the rejection state.
@@ -57,6 +59,9 @@ pub(crate) enum NewTipMempool {
     Failed,
     /// The mempool was not asked, because a shielded coinbase was built in advance.
     Skipped,
+    /// The mempool was not asked, because as many long polls as are allowed were already
+    /// building a full first answer.
+    OverLimit,
 }
 
 /// How long one template build waited to start, and how long it ran.

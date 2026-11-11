@@ -3670,7 +3670,7 @@ struct MockMempoolView {
 }
 
 /// Returns a verified mempool transaction with no inputs or outputs.
-fn fake_verified_mempool_tx() -> VerifiedUnminedTx {
+pub(super) fn fake_verified_mempool_tx() -> VerifiedUnminedTx {
     let transaction: UnminedTx = Arc::new(Transaction::V1 {
         inputs: vec![],
         outputs: vec![],
@@ -3943,6 +3943,16 @@ async fn long_poll_from_old_tip_is_coinbase_only_when_the_mempool_does_not_answe
 /// under that request's ID.
 #[tokio::test]
 async fn template_trace_records_the_tip_to_template_path() {
+    check_template_trace_on_new_tip(false).await;
+}
+
+/// A full answer after a tip notification records that notification as its wake reason.
+#[tokio::test]
+async fn template_trace_records_the_tip_wake_for_a_full_template() {
+    check_template_trace_on_new_tip(true).await;
+}
+
+async fn check_template_trace_on_new_tip(populated: bool) {
     let _init_guard = zakura_test::init();
     let old_tip = Hash([1; 32]);
     let new_tip = Hash([2; 32]);
@@ -3957,15 +3967,17 @@ async fn template_trace_records_the_tip_to_template_path() {
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
 
-    // The mempool stays at the old tip, and counts its requests.
-    let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
+    let (mempool_view, mempool_view_rx) = tokio::sync::watch::channel(MockMempoolView {
+        last_seen_tip_hash: old_tip,
+        transactions: vec![],
+    });
     let mempool = tower::service_fn(move |_| {
-        mempool_calls.send_modify(|calls| *calls += 1);
+        let view = mempool_view_rx.borrow().clone();
         async move {
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: view.transactions,
                 transaction_dependencies: Default::default(),
-                last_seen_tip_hash: old_tip,
+                last_seen_tip_hash: view.last_seen_tip_hash,
             })
         }
     });
@@ -4040,15 +4052,20 @@ async fn template_trace_records_the_tip_to_template_path() {
         .unwrap();
 
     // A long poll waits on the old tip until a block lands.
-    let long_poll = tokio::spawn({
-        let rpc = rpc.clone();
-        let params = long_poll_params(&initial);
-        async move { rpc.get_block_template(params).await }
-    });
-    tokio::time::timeout(Duration::from_secs(1), calls.wait_for(|calls| *calls >= 2))
-        .await
-        .expect("the long poll fetches the mempool before it waits")
-        .unwrap();
+    let long_poll = rpc.get_block_template(long_poll_params(&initial));
+    tokio::pin!(long_poll);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut long_poll)
+            .await
+            .is_err(),
+        "the long poll waits while the tip and mempool are unchanged"
+    );
+    if populated {
+        mempool_view.send_replace(MockMempoolView {
+            last_seen_tip_hash: new_tip,
+            transactions: vec![fake_verified_mempool_tx()],
+        });
+    }
     chain_info.send_modify(|info| {
         info.tip_height = new_height;
         info.tip_hash = new_tip;
@@ -4058,7 +4075,6 @@ async fn template_trace_records_the_tip_to_template_path() {
     let woken = tokio::time::timeout(Duration::from_secs(2), long_poll)
         .await
         .expect("the new tip wakes the long poll")
-        .unwrap()
         .unwrap()
         .try_into_template()
         .unwrap();
@@ -4090,25 +4106,38 @@ async fn template_trace_records_the_tip_to_template_path() {
         assert!(full[field].is_u64(), "{field}: {full}");
     }
 
-    for (rows, template) in [(&rows[1..4], &woken), (&rows[4..7], &stale)] {
-        let (woke, mempool, empty) = (&rows[0], &rows[1], &rows[2]);
+    for (rows, template, wait_reason) in [
+        (&rows[1..4], &woken, "tip"),
+        (&rows[4..7], &stale, "immediate"),
+    ] {
+        let (woke, mempool, returned) = (&rows[0], &rows[1], &rows[2]);
         assert_eq!(woke["event"], "gbt_tip_woke");
         assert_eq!(woke["tip_height"], new_height.0);
         assert_eq!(woke["tip_hash"], new_tip.to_string());
         assert_eq!(mempool["event"], "gbt_new_tip_mempool");
         assert_eq!(mempool["request_id"], woke["request_id"]);
         assert_eq!(mempool["tip_hash"], new_tip.to_string());
-        assert_eq!(mempool["outcome"], "older_tip");
-        assert_eq!(mempool["tx_count"], 0);
+        assert_eq!(
+            mempool["outcome"],
+            if populated { "populated" } else { "older_tip" }
+        );
+        assert_eq!(mempool["tx_count"], u64::from(populated));
         assert!(mempool["wait_us"].is_u64(), "{mempool}");
-        assert_eq!(empty["event"], "gbt_empty_returned");
-        assert_eq!(empty["request_id"], woke["request_id"]);
-        assert_ne!(empty["request_id"], full["request_id"]);
-        assert_eq!(empty["tip_hash"], new_tip.to_string());
-        assert_eq!(empty["work_id"], template.work_id.as_str());
-        assert!(empty["permit_wait_us"].is_u64(), "{empty}");
-        assert!(empty["build_us"].is_u64(), "{empty}");
-        assert!(template.transactions.is_empty());
+        assert_eq!(returned["request_id"], woke["request_id"]);
+        assert_ne!(returned["request_id"], full["request_id"]);
+        assert_eq!(returned["tip_hash"], new_tip.to_string());
+        assert_eq!(returned["work_id"], template.work_id.as_str());
+        assert!(returned["permit_wait_us"].is_u64(), "{returned}");
+        assert!(returned["build_us"].is_u64(), "{returned}");
+        if populated {
+            assert_eq!(returned["event"], "gbt_full_returned");
+            assert_eq!(returned["wait_reason"], wait_reason);
+            assert_eq!(returned["tx_count"], 1);
+            assert_eq!(template.transactions.len(), 1);
+        } else {
+            assert_eq!(returned["event"], "gbt_empty_returned");
+            assert!(template.transactions.is_empty());
+        }
     }
     assert_ne!(rows[1]["request_id"], rows[4]["request_id"]);
 }

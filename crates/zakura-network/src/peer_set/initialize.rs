@@ -17,12 +17,11 @@ use std::{
 };
 
 use futures::{
-    future::{self, FutureExt},
+    future::{self, BoxFuture, Fuse, FusedFuture, FutureExt},
     sink::SinkExt,
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
@@ -46,6 +45,7 @@ use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
+    config::InitialPeerOrder,
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
@@ -439,15 +439,14 @@ where
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
-        let initial_connections = initial_peers_join
+        let InitialPeerConnections {
+            active_connections: mut active_outbound_connections,
+            pending_seed_peers,
+        } = initial_peers_join
             .await
             .panic_if_task_has_panicked()
             .expect("initial peer task is not cancelled")
             .expect("unexpected error connecting to initial peers");
-        if let Some(seed_task) = initial_connections.seed_task {
-            task_handles.push(seed_task);
-        }
-        let mut active_outbound_connections = initial_connections.active_connections;
         let active_initial_peer_count = active_outbound_connections.update_count();
 
         // We need to await candidates.update() here,
@@ -475,7 +474,9 @@ where
             let _ = demand_tx.try_send(MorePeers);
         }
 
-        // Start the peer crawler
+        // Start the peer crawler. Seeds that resolve later still reach discovery.
+        let late_seed_peers =
+            send_late_seed_peers(pending_seed_peers, address_book_updater.clone());
         let crawl_fut = crawl_and_dial(
             config.clone(),
             demand_tx,
@@ -487,6 +488,12 @@ where
             address_book_updater,
             Arc::new(AtomicBool::new(false)),
         );
+        let crawl_fut = async move {
+            tokio::select! {
+                crawl_result = crawl_fut => crawl_result,
+                never = late_seed_peers => match never {},
+            }
+        };
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             crawl_fut.in_current_span(),
         ))));
@@ -576,17 +583,24 @@ where
     ))
 }
 
-/// Initial connections and the optional seed resolver that outlives cache startup.
-#[derive(Debug)]
+/// Seed peers whose DNS resolution is still pending.
+type PendingSeedPeers = Fuse<BoxFuture<'static, Vec<PeerSocketAddr>>>;
+
+/// The result of startup dials.
 struct InitialPeerConnections {
+    /// The connections to initial peers.
     active_connections: ActiveConnectionCounter,
-    seed_task: Option<AbortOnDropHandle<Result<(), BoxError>>>,
+    /// Seed peers that had not resolved when startup dials finished.
+    pending_seed_peers: Option<PendingSeedPeers>,
 }
 
-/// Selected startup candidates and an owned, cancellable seed discovery task.
-struct InitialPeers {
-    addresses: IndexSet<PeerSocketAddr>,
-    seed_task: Option<AbortOnDropHandle<Result<(), BoxError>>>,
+impl std::fmt::Debug for InitialPeerConnections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialPeerConnections")
+            .field("active_connections", &self.active_connections)
+            .field("seed_peers_pending", &self.pending_seed_peers.is_some())
+            .finish()
+    }
 }
 
 /// Use the provided `outbound_connector` to connect to the configured DNS seeder and
@@ -610,16 +624,38 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
-    connect_initial_peers(config, initial_peers, outbound_connector, peerset_tx).await
+    let seed_config = config.clone();
+    let seed_peers = async move { seed_config.initial_seed_peers().await }.boxed();
+    dial_initial_peers(
+        config,
+        seed_peers,
+        outbound_connector,
+        peerset_tx,
+        address_book_updater,
+    )
+    .await
 }
 
-/// Dial a bounded set of candidates while retaining any pending seed resolver.
-async fn connect_initial_peers<S>(
+/// Dial cached peers without waiting for `seed_peers`, then add seeds to the same
+/// startup dials when they resolve.
+///
+/// Candidates follow [`InitialPeerOrder`]. At most
+/// [`INITIAL_PEER_DIAL_CONCURRENCY`](constants::INITIAL_PEER_DIAL_CONCURRENCY)
+/// attempts run at once, and each completed attempt admits the next candidate.
+/// Startup admits at most `peerset_initial_target_size` attempts, and at most
+/// `max_connections_per_ip` per IP. Every candidate reaches the address book.
+///
+/// Startup waits for seeds only when cached peers cannot fill the startup target.
+/// Otherwise, seeds that are still resolving when every admitted attempt has finished
+/// are returned unresolved, and reach discovery after they resolve. With a startup
+/// target of one, a cached peer therefore takes the slot when seeds resolve later
+/// than the cache loads.
+async fn dial_initial_peers<S>(
     config: Config,
-    initial_peers: InitialPeers,
+    seed_peers: BoxFuture<'static, Vec<PeerSocketAddr>>,
     outbound_connector: S,
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> Result<InitialPeerConnections, BoxError>
 where
     S: Service<
@@ -631,10 +667,16 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let InitialPeers {
-        addresses: initial_peers,
-        seed_task,
-    } = initial_peers;
+    let mut seed_peers = seed_peers.fuse();
+    let cached_peers = config.initial_cached_peers().await;
+    send_initial_peers(cached_peers.iter().copied(), &address_book_updater).await;
+    let cached_peer_count = cached_peers.len();
+    let mut order = InitialPeerOrder::new(cached_peers, config.peerset_initial_target_size);
+    // Seeds that are already resolved alternate with cached peers from the first dial.
+    if let Some(seed_peers) = (&mut seed_peers).now_or_never() {
+        send_initial_peers(seed_peers.iter().copied(), &address_book_updater).await;
+        order.add_seed_peers(seed_peers);
+    }
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -644,26 +686,30 @@ where
         "Outbound Connections",
     );
 
-    // TODO: update when we add Tor peers or other kinds of addresses.
-    let ipv4_peer_count = initial_peers.iter().filter(|ip| ip.is_ipv4()).count();
-    let ipv6_peer_count = initial_peers.iter().filter(|ip| ip.is_ipv6()).count();
     info!(
-        ?ipv4_peer_count,
-        ?ipv6_peer_count,
+        ?cached_peer_count,
+        seed_peers_resolved = seed_peers.is_terminated(),
         "connecting to initial peer set"
     );
 
-    // Admit only a bounded window of attempts. The selected prefix still obeys
-    // the total target, per-IP limit, and cached/seed preference order.
-    // Completed attempts refill the window without delaying unrelated peers.
-    let mut remaining_peers = initial_peers.into_iter();
+    let mut admitted_total: usize = 0;
+    let mut admitted_per_ip = HashMap::new();
     let mut handshakes = FuturesUnordered::new();
 
     loop {
-        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY {
-            let Some(addr) = remaining_peers.next() else {
+        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY
+            && admitted_total < config.peerset_initial_target_size
+        {
+            let Some(addr) = order.next_available() else {
                 break;
             };
+            let admitted_for_ip = admitted_per_ip.entry(addr.ip()).or_insert(0);
+            if *admitted_for_ip >= config.max_connections_per_ip {
+                continue;
+            }
+            *admitted_for_ip += 1;
+            admitted_total += 1;
+
             let req = OutboundConnectorRequest {
                 addr,
                 connection_tracker: active_outbound_connections.track_connection(),
@@ -688,8 +734,20 @@ where
             });
         }
 
-        let Some(handshake_result) = handshakes.next().await else {
+        // Cached peers alone cannot fill the target, so wait for seeds.
+        let must_wait_for_seeds =
+            admitted_total < config.peerset_initial_target_size && !seed_peers.is_terminated();
+        if handshakes.is_empty() && !must_wait_for_seeds {
             break;
+        }
+
+        let handshake_result = tokio::select! {
+            seed_peers = &mut seed_peers, if !seed_peers.is_terminated() => {
+                send_initial_peers(seed_peers.iter().copied(), &address_book_updater).await;
+                order.add_seed_peers(seed_peers);
+                continue;
+            }
+            Some(handshake_result) = handshakes.next() => handshake_result,
         };
         match handshake_result {
             Ok(change) => {
@@ -747,108 +805,44 @@ where
 
     let outbound_connections = active_outbound_connections.update_count();
     info!(
+        ?admitted_total,
         ?handshake_success_total,
         ?handshake_error_total,
         ?outbound_connections,
+        seed_peers_resolved = seed_peers.is_terminated(),
         "finished connecting to initial seed and disk cache peers"
     );
 
     Ok(InitialPeerConnections {
         active_connections: active_outbound_connections,
-        seed_task,
+        pending_seed_peers: (!seed_peers.is_terminated()).then_some(seed_peers),
     })
 }
 
-/// Load the cache while resolving seeds, then limit startup dials per IP and overall.
-///
-/// Ready seeds retain the alternating selection policy. A usable cache does not
-/// wait for DNS: late seeds are added to discovery by a supervised task instead.
-/// In particular, with one startup slot a cached peer may take it before DNS is
-/// ready; seed discovery cannot displace that live connection.
-async fn limit_initial_peers(
-    config: &Config,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> InitialPeers {
-    let seed_config = config.clone();
-    initial_peers_with_seed_resolution(
-        config,
-        async move { seed_config.initial_seed_peers().await },
-        address_book_updater,
-    )
-    .await
-}
-
-/// Start from usable cached peers without waiting for a pending seed lookup.
-///
-/// The seed future performs validation and retains the existing DNS retry policy.
-/// Ownership of a pending resolver follows startup into the peer-set supervisor,
-/// so cancellation aborts it and resolver panics are not silently detached.
-async fn initial_peers_with_seed_resolution<F>(
-    config: &Config,
-    seed_peers: F,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> InitialPeers
-where
-    F: Future<Output = Vec<PeerSocketAddr>> + Send + 'static,
-{
-    let mut seed_peers = Box::pin(seed_peers);
-    let cached_peers = config.initial_cached_peers();
-    tokio::pin!(cached_peers);
-
-    let (all_peers, seed_task) = tokio::select! {
-        // Prefer the existing alternating policy when both sources are ready.
-        biased;
-        seeds = &mut seed_peers => {
-            (config.interleave_initial_peers(cached_peers.await, seeds), None)
-        }
-        cached = &mut cached_peers => {
-            if cached.is_empty() {
-                // Missing, unreadable, invalid, and Regtest caches still use seeds.
-                (config.interleave_initial_peers(cached, seed_peers.await), None)
-            } else {
-                let known_cached = cached.clone();
-                let updater = address_book_updater.clone();
-                let seed_task = tokio::spawn(erased(
-                    async move {
-                        for peer in seed_peers.await {
-                            // The cache path already published these addresses.
-                            if !known_cached.contains(&peer) {
-                                updater.send(MetaAddr::new_initial_peer(peer)).await?;
-                            }
-                        }
-                        // PeerSet treats a completed background task as shutdown.
-                        // Remain supervised until it drops us, without retaining data.
-                        drop(updater);
-                        drop(known_cached);
-                        future::pending::<Result<(), BoxError>>().await
-                    }
-                    .in_current_span(),
-                ));
-                (cached, Some(AbortOnDropHandle::new(seed_task)))
-            }
-        }
-    };
-
-    let mut initial_peers = IndexSet::new();
-    let mut selected_per_ip = HashMap::new();
-    // Feed every candidate to discovery, even beyond the startup dial limit.
-    for peer in all_peers {
+/// Send initial `peers` to the address book, so discovery can use them.
+async fn send_initial_peers(
+    peers: impl IntoIterator<Item = PeerSocketAddr>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) {
+    for peer in peers {
+        // `send` only waits when the channel is full, and the updater runs on its own thread.
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
-        if initial_peers.len() < config.peerset_initial_target_size {
-            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
-            if *count < config.max_connections_per_ip {
-                initial_peers.insert(peer);
-                *count += 1;
-            }
-        }
     }
+}
 
-    InitialPeers {
-        addresses: initial_peers,
-        seed_task,
+/// Send seed peers that resolve after startup dials finish to the address book.
+///
+/// Never returns, so it can run alongside the crawler for the crawler's lifetime.
+async fn send_late_seed_peers(
+    pending_seed_peers: Option<PendingSeedPeers>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+) -> Infallible {
+    if let Some(seed_peers) = pending_seed_peers {
+        send_initial_peers(seed_peers.await, &address_book_updater).await;
     }
+    future::pending().await
 }
 
 /// Open a peer connection listener on `config.listen_addr`,

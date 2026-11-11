@@ -505,19 +505,18 @@ impl Config {
 
     /// Resolve initial seed peer IP addresses, based on the configured network,
     /// and load cached peers from disk, if available.
-    /// Alternates cached peers in saved RTT order with shuffled seed peers,
-    /// starting with a cached peer unless the startup budget is one, in which case
-    /// a seed gets the sole slot when available, even if it is also cached.
-    /// With larger budgets, shared addresses keep their cache position.
-    /// An exhausted list yields the rest of the other list.
+    ///
+    /// Returns every candidate in [`InitialPeerOrder`].
     ///
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> IndexSet<PeerSocketAddr> {
-        let (disk_peers, dns_peers) =
+        let (cached_peers, seed_peers) =
             tokio::join!(self.initial_cached_peers(), self.initial_seed_peers());
-        self.interleave_initial_peers(disk_peers, dns_peers)
+        let mut order = InitialPeerOrder::new(cached_peers, self.peerset_initial_target_size);
+        order.add_seed_peers(seed_peers);
+        std::iter::from_fn(|| order.next_available()).collect()
     }
 
     /// Load valid cached candidates in saved preference order, excluding Regtest.
@@ -565,37 +564,6 @@ impl Config {
         }
         peers.shuffle(&mut rand_10::rng());
         peers
-    }
-
-    /// Alternate available cache and seed candidates, preserving cache preference.
-    pub(crate) fn interleave_initial_peers(
-        &self,
-        disk_peers: IndexSet<PeerSocketAddr>,
-        mut dns_peers: Vec<PeerSocketAddr>,
-    ) -> IndexSet<PeerSocketAddr> {
-        // With one slot, seed membership must survive even if a seed is cached.
-        // Otherwise remove overlap so a duplicate cannot consume a seed turn.
-        if self.peerset_initial_target_size != 1 {
-            dns_peers.retain(|addr| !disk_peers.contains(addr));
-        }
-        let mut cached = disk_peers.into_iter();
-        let mut seeds = dns_peers.into_iter();
-        let mut initial_peers = IndexSet::new();
-        loop {
-            match (cached.next(), seeds.next()) {
-                (None, None) => break,
-                (cached, seed) => {
-                    if self.peerset_initial_target_size == 1 {
-                        initial_peers.extend(seed);
-                        initial_peers.extend(cached);
-                    } else {
-                        initial_peers.extend(cached);
-                        initial_peers.extend(seed);
-                    }
-                }
-            }
-        }
-        initial_peers
     }
 
     /// Concurrently resolves `peers` into zero or more IP addresses, with a
@@ -1068,6 +1036,87 @@ fn restrict_secret_key_file_permissions(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn restrict_secret_key_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// The order of legacy startup dial candidates.
+///
+/// Cached peers keep their saved preference order and alternate with shuffled
+/// seed peers. A cached peer goes first, unless the startup target is one: then a
+/// seed takes the sole slot, even if it is also cached. With larger targets, a
+/// seed that is also cached keeps its cache position. When one source runs out,
+/// the other continues.
+///
+/// Seed DNS can resolve after startup begins. Until then, cached peers fill every
+/// turn. The next turn after the seeds arrive goes to a seed.
+#[derive(Debug)]
+pub(crate) struct InitialPeerOrder {
+    /// Cached peers in saved preference order.
+    cached_peers: IndexSet<PeerSocketAddr>,
+    /// The index of the next cached peer in `cached_peers`.
+    next_cached_peer: usize,
+    /// Resolved seed peers that have not been returned yet.
+    seed_peers: std::vec::IntoIter<PeerSocketAddr>,
+    /// Whether the startup target is one, so seeds go first and keep cached duplicates.
+    single_slot: bool,
+    /// Whether the next turn goes to a seed peer.
+    seed_turn: bool,
+    /// Every returned candidate, so no address is returned twice.
+    returned: HashSet<PeerSocketAddr>,
+}
+
+impl InitialPeerOrder {
+    /// Order `cached_peers` for a startup target of `target_size`, before seeds resolve.
+    pub(crate) fn new(cached_peers: IndexSet<PeerSocketAddr>, target_size: usize) -> Self {
+        let single_slot = target_size == 1;
+        Self {
+            cached_peers,
+            next_cached_peer: 0,
+            seed_peers: Vec::new().into_iter(),
+            single_slot,
+            seed_turn: single_slot,
+            returned: HashSet::new(),
+        }
+    }
+
+    /// Add the resolved seed peers, which take every other turn from now on.
+    pub(crate) fn add_seed_peers(&mut self, mut seed_peers: Vec<PeerSocketAddr>) {
+        if !self.single_slot {
+            seed_peers.retain(|addr| !self.cached_peers.contains(addr));
+        }
+        self.seed_peers = seed_peers.into_iter();
+    }
+
+    /// Returns the next candidate, or `None` if no candidate is available now.
+    pub(crate) fn next_available(&mut self) -> Option<PeerSocketAddr> {
+        loop {
+            let (addr, from_seed) = if self.seed_turn {
+                self.next_seed_peer()
+                    .map(|addr| (addr, true))
+                    .or_else(|| self.next_cached_peer().map(|addr| (addr, false)))?
+            } else {
+                self.next_cached_peer()
+                    .map(|addr| (addr, false))
+                    .or_else(|| self.next_seed_peer().map(|addr| (addr, true)))?
+            };
+            self.seed_turn = !from_seed;
+            if self.returned.insert(addr) {
+                return Some(addr);
+            }
+        }
+    }
+
+    fn next_seed_peer(&mut self) -> Option<PeerSocketAddr> {
+        self.seed_peers.next()
+    }
+
+    fn next_cached_peer(&mut self) -> Option<PeerSocketAddr> {
+        let addr = self
+            .cached_peers
+            .get_index(self.next_cached_peer)
+            .copied()?;
+        self.next_cached_peer += 1;
+        Some(addr)
+    }
 }
 
 impl Default for Config {

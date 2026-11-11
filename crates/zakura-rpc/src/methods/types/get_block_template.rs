@@ -11,8 +11,10 @@ pub mod zip317;
 mod tests;
 
 pub(crate) mod prepared_candidates;
+pub(crate) mod shared_template;
 pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
+use shared_template::SharedTemplate;
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -107,6 +109,10 @@ pub(crate) enum TemplateBuildWork {
     /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
     /// on a blocking thread.
     Proof,
+
+    /// Parses and retains a shared template's block content. Use the same admission bound as
+    /// construction and a blocking thread because the template may contain a full block.
+    RetainedContent,
 }
 
 impl TemplateBuildWork {
@@ -881,6 +887,9 @@ where
 
     /// Records the stages of each template this handler returns.
     pub(crate) trace: trace::MiningTemplateTrace,
+
+    /// The newest full template, shared by long polls that ask for the same work.
+    pub(crate) shared_template: SharedTemplate,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -915,6 +924,7 @@ where
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
             trace: trace::MiningTemplateTrace::default(),
+            shared_template: SharedTemplate::default(),
         }
     }
 
@@ -961,13 +971,15 @@ where
                     })
                     .map_misc_error()
             }
-            TemplateBuildWork::Proof => tokio::task::spawn_blocking(move || {
-                // Dropping the RPC future cannot release capacity while this job still owns work.
-                let _permit = permit;
-                build()
-            })
-            .await
-            .map_misc_error(),
+            TemplateBuildWork::Proof | TemplateBuildWork::RetainedContent => {
+                tokio::task::spawn_blocking(move || {
+                    // Dropping the RPC future cannot release capacity while this job still owns work.
+                    let _permit = permit;
+                    build()
+                })
+                .await
+                .map_misc_error()
+            }
         }
     }
 
@@ -1041,11 +1053,15 @@ where
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
+    ///
+    /// The handler gets its own shared template slot, so a clone with the old miner parameters
+    /// cannot hand it a template with their coinbase.
     pub fn randomize_coinbase_data(&mut self) {
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
         }
+        self.shared_template = SharedTemplate::default();
     }
 }
 

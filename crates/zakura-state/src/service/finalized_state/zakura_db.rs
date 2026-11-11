@@ -510,7 +510,11 @@ impl ZakuraDb {
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
-                if disk_version >= self.db.format_version_in_code() {
+                // Several instances can shut the database down. The next startup checks the
+                // whole database again, so one shutdown check is enough.
+                if disk_version >= self.db.format_version_in_code()
+                    && self.db.claim_shutdown_format_check()
+                {
                     DbFormatChange::check_new_blocks(self)
                         .run_format_change_or_check(
                             self,
@@ -703,6 +707,24 @@ mod tests {
 
         db.update_format_version_on_disk(&disk_version)
             .expect("fixture version write succeeds");
+    }
+
+    /// Every instance that shuts the database down used to rerun the full format check,
+    /// so a node shutdown ran it up to three times. Only the first shutdown runs it now.
+    #[test]
+    fn shutdown_format_check_runs_once_per_database() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let db = open(&config, &network, false).expect("a new database opens");
+        let mut first_owner = db.clone();
+
+        first_owner.shutdown(true);
+
+        assert!(
+            !db.db.claim_shutdown_format_check(),
+            "the first shutdown claims the format check for every clone of the database"
+        );
     }
 
     /// A Mainnet database written by the original VCT fast path is missing historical Sprout

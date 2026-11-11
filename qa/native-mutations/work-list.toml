@@ -422,7 +422,7 @@ witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "hand
 
 [[entry.instance]]
 property = "handshake/hello/oversize-refused"
-code = ["crates/zakura-network/src/zakura/handshake.rs"]
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
@@ -487,7 +487,7 @@ witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handsh
 
 [[entry.instance]]
 property = "handshake/ack/oversize-refused"
-code = ["crates/zakura-network/src/zakura/handshake.rs"]
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]

@@ -986,5 +986,105 @@
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-prelude-magic/skip-prelude-magic.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/bad-magic-resets",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/fallback-for-unknown-stream/fallback-for-unknown-stream.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/unknown-kind-resets",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-prelude-capability/skip-prelude-capability.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/unnegotiated-capability-resets",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-selected-stream-version/skip-selected-stream-version.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/unselected-version-resets",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/allow-unexpected-request-id/allow-unexpected-request-id.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/unexpected-request-id-closes",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/allow-missing-request-id/allow-missing-request-id.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/request-without-id-closes",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-prelude-frame-cap/skip-prelude-frame-cap.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/undersized-cap-closes",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch",
+    "entry": "handshake-table",
+    "property": "handshake/prelude/ineligible-opener-closes",
+    "witness": {
+      "test": "prelude_guards_apply_each_declared_consequence",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/oversize-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/oversize-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
   }
 ]

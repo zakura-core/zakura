@@ -294,6 +294,56 @@ const fn handshake_guard(
 
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
+    handshake_guard(
+        "handshake/prelude/bad-magic-resets",
+        "handshake-table/skip-prelude-magic/skip-prelude-magic.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unknown-kind-resets",
+        "handshake-table/fallback-for-unknown-stream/fallback-for-unknown-stream.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unnegotiated-capability-resets",
+        "handshake-table/skip-prelude-capability/skip-prelude-capability.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unselected-version-resets",
+        "handshake-table/skip-selected-stream-version/skip-selected-stream-version.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unexpected-request-id-closes",
+        "handshake-table/allow-unexpected-request-id/allow-unexpected-request-id.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/request-without-id-closes",
+        "handshake-table/allow-missing-request-id/allow-missing-request-id.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/undersized-cap-closes",
+        "handshake-table/skip-prelude-frame-cap/skip-prelude-frame-cap.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/ineligible-opener-closes",
+        "handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/hello/oversize-refused",
+        "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/oversize-refused",
+        "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
     Coverage {
         property: "handshake/finishes-in-time",
         passing: passes("tests/handshake.rs", "honest_control_handshake_holds"),

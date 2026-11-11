@@ -1,3 +1,5 @@
+# Pin the CI image while Ubuntu 26.04 package setup has DNS failures.
+# Keep archive builders and test runners on the same Ubuntu release.
 # Gate PRs on cargo-semver-checks against the latest STABLE crates.io release
 # of each changed publishable workspace crate and its publishable reverse
 # dependencies. A PR that changes a published API must carry the corresponding
@@ -70,7 +72,7 @@ concurrency:
 jobs:
   select-packages:
     name: Select semver packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       baseline_tag: ${{ steps.affected.outputs.baseline_tag }}
@@ -160,7 +162,7 @@ jobs:
       (github.event_name == 'pull_request' || github.event_name == 'merge_group')
       && needs.select-packages.outputs.has_packages == 'true'
     needs: select-packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -238,7 +240,7 @@ jobs:
       && startsWith(github.head_ref, 'release/v')
       && needs.select-packages.outputs.has_public_api_packages == 'true'
     needs: select-packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # rustdoc on nightly 2026-09-07 and later hits a next-trait-solver ICE
@@ -294,7 +296,7 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && needs.select-packages.outputs.has_packages == 'true'
     needs: select-packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -411,7 +413,7 @@ jobs:
     # See "Cancelled runs" in .github/workflows/README.md.
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs: [select-packages, check-package, public-api-diff, warm-baselines]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check semver job results

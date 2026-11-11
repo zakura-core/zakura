@@ -1,3 +1,5 @@
+# Pin the CI image while Ubuntu 26.04 package setup has DNS failures.
+# Keep archive builders and test runners on the same Ubuntu release.
 name: Lint
 
 on:
@@ -90,7 +92,7 @@ jobs:
       contents: read
       id-token: write
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -161,7 +163,7 @@ jobs:
       contents: read
       id-token: write
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -184,7 +186,7 @@ jobs:
     permissions:
       contents: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -308,7 +310,7 @@ jobs:
     permissions:
       contents: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -331,7 +333,7 @@ jobs:
       contents: read
       id-token: write
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -356,7 +358,7 @@ jobs:
     permissions:
       contents: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -443,7 +445,7 @@ jobs:
 
   lint-success:
     name: lint success
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Skip, rather than fail, when a superseding run cancelled this one.
     # See "Cancelled runs" in .github/workflows/README.md.
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}

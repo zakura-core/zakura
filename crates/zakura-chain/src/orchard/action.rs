@@ -85,17 +85,19 @@ impl ActionEncoding {
                 .flat_map(|encoding| [encoding.cv, encoding.ephemeral_key]),
         );
 
+        let (point_pairs, _) = points.as_chunks::<2>();
+
         encodings
             .into_iter()
-            .zip(points.chunks_exact(2))
-            .map(|(encoding, points)| {
+            .zip(point_pairs)
+            .map(|(encoding, [cv, ephemeral_key])| {
                 Ok(Action {
-                    cv: ValueCommitment::from_decoded(points[0].into())
+                    cv: ValueCommitment::from_decoded((*cv).into())
                         .map_err(SerializationError::Parse)?,
                     nullifier: encoding.nullifier,
                     rk: encoding.rk,
                     cm_x: encoding.cm_x,
-                    ephemeral_key: keys::EphemeralPublicKey::from_decoded(points[1].into())
+                    ephemeral_key: keys::EphemeralPublicKey::from_decoded((*ephemeral_key).into())
                         .map_err(SerializationError::Parse)?,
                     enc_ciphertext: encoding.enc_ciphertext,
                     out_ciphertext: encoding.out_ciphertext,

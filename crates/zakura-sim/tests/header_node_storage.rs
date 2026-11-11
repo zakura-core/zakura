@@ -115,6 +115,7 @@ fn any() -> Policy {
         bound_ms: None,
         holds: Vec::new(),
         reply_holds: Vec::new(),
+        disruptions: Vec::new(),
     }
 }
 
@@ -1236,6 +1237,7 @@ fn a_deferring_clock_keeps_the_fork_fixture_unsettled() {
                 bound_ms: Some(10),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: Vec::new(),
         },

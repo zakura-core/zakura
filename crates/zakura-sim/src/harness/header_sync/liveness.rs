@@ -2,13 +2,13 @@
 //! liveness fixtures ([`LivenessScenario`]). Its one scenario byte picks the
 //! fixture, and the rest of an input is Plan bytes. It checks
 //! `header-sync/hold-release-wakes` besides `header-sync/storage`'s
-//! properties, since only it arms the node's hold-wake evidence, and
-//! `header-sync/bounded-adversary-progress`, since only its recovery
-//! fixtures declare `BoundedAdversary` beside the recovery assumptions. It
-//! also arms the node's publication evidence, so
-//! `header-sync/state-publication-consistent` obliges each commit's
-//! adoption here, and in hdr-12b's status fixtures each changed `Status` in
-//! time.
+//! properties, since only it arms the node's hold-wake evidence. Its
+//! recovery fixtures declare `BoundedAdversary` beside the recovery
+//! assumptions, so `header-sync/bounded-adversary-progress`'s deadline
+//! there ends idle rather than at a budget. It also arms the node's
+//! publication evidence, so `header-sync/state-publication-consistent`
+//! obliges each commit's adoption here, and in hdr-12b's status fixtures
+//! each changed `Status` in time.
 //!
 //! Its fixtures declare `BoundedAdversary` (Rule 13 of the hdr-9 to hdr-13
 //! plan). Every peer is an honest mirror or a scripted control, so the
@@ -214,11 +214,30 @@ pub enum RecoveryFixture {
     /// the objective is the node's own branch, which it reselects without
     /// adopting the source's fork.
     Reconsideration,
+    /// hdr-13's close class: the node at A3 and its source at A6, which the
+    /// harness closes before the `Recover`, so recovery relinks it. The
+    /// objective is A4 to A6.
+    Closes,
+    /// hdr-13's fault class: the node at A3 and its source at A6, with
+    /// every prepare failing `local-resource` until the `Recover`, which
+    /// comes once the first has. The objective is A4 to A6.
+    Faults,
+    /// hdr-13's close class as the departure's completion, hdr-10's
+    /// departure fixture with a recover: mirrors A ([`OWNER`]) and B
+    /// ([`TAKER`]) on one chain, A closed while its round holds the target,
+    /// then a recover of B. The node is at A3. B starts at A3 and grows to
+    /// A6 once A's locator read is submitted, then is relinked, so its new
+    /// session's first `Status` carries the target at once. A's first
+    /// locator read is held until that admission, so A owns the target
+    /// before B offers it, and A's round reserves its first request only
+    /// after it. A is closed once it has. Only B, the one member left, can
+    /// then supply the target.
+    Departure,
 }
 
 impl RecoveryFixture {
-    /// Every recovery fixture, in order.
-    pub const ALL: [RecoveryFixture; 7] = [
+    /// hdr-11's recovery control fixtures, in order.
+    pub const CONTROLS: [RecoveryFixture; 7] = [
         RecoveryFixture::Successor,
         RecoveryFixture::SyncedFirst,
         RecoveryFixture::Fork,
@@ -228,8 +247,24 @@ impl RecoveryFixture {
         RecoveryFixture::Reconsideration,
     ];
 
+    /// hdr-13's hostile-prefix class fixtures, in order. They come after
+    /// hdr-12b's publication fixtures in [`LivenessScenario::all`].
+    pub const CLASSES: [RecoveryFixture; 3] = [
+        RecoveryFixture::Closes,
+        RecoveryFixture::Faults,
+        RecoveryFixture::Departure,
+    ];
+
+    /// Every recovery fixture: [`Self::CONTROLS`], then [`Self::CLASSES`].
+    pub fn all() -> impl Iterator<Item = RecoveryFixture> {
+        Self::CONTROLS.into_iter().chain(Self::CLASSES)
+    }
+
     /// The storage scenario this fixture runs.
     pub fn storage(self) -> StorageScenario {
+        if self == RecoveryFixture::Departure {
+            return departure_recovery();
+        }
         let mirror = |chain| MirrorSpec {
             chain,
             dialer: Dialer::Mirror,
@@ -273,9 +308,36 @@ impl RecoveryFixture {
                 vec![mirror(Chain::main(4))],
                 vec![invalidate(2)],
             ),
+            RecoveryFixture::Closes => (
+                Chain::main(3),
+                vec![mirror(Chain::main(6))],
+                vec![ControlStep {
+                    peer: RECOVERY_SOURCE.to_owned(),
+                    action: ControlAction::Close,
+                    when: None,
+                }],
+            ),
+            RecoveryFixture::Faults => (Chain::main(3), vec![mirror(Chain::main(6))], Vec::new()),
+            RecoveryFixture::Departure => unreachable!("handled above"),
         };
-        let when = (self == RecoveryFixture::SyncedFirst)
-            .then(|| Trigger::Completed(Select::nth(OpKind::Apply, 1)));
+        let when = match self {
+            RecoveryFixture::SyncedFirst => Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+            RecoveryFixture::Faults => Some(Trigger::Completed(Select::nth(OpKind::Prepare, 1))),
+            _ => None,
+        };
+        let holds = if self == RecoveryFixture::Faults {
+            vec![Hold {
+                select: Select {
+                    kind: Some(OpKind::Prepare),
+                    ..Select::default()
+                },
+                until: Trigger::VirtualTime(0),
+                then: vec![Allow::LocalResource],
+                deadline_ms: None,
+            }]
+        } else {
+            Vec::new()
+        };
         controls.push(ControlStep {
             peer: RECOVERY_SOURCE.to_owned(),
             action: ControlAction::Recover,
@@ -284,10 +346,59 @@ impl RecoveryFixture {
         StorageScenario {
             node,
             mirrors,
-            policy: Policy::converging(),
+            policy: Policy {
+                holds,
+                ..Policy::converging()
+            },
             controls,
             weights: Default::default(),
         }
+    }
+}
+
+/// [`RecoveryFixture::Departure`]'s storage scenario.
+fn departure_recovery() -> StorageScenario {
+    let step = |peer: &str, action, when| ControlStep {
+        peer: peer.to_owned(),
+        action,
+        when,
+    };
+    let mirror = |chain| MirrorSpec {
+        chain,
+        dialer: Dialer::Mirror,
+        max_headers_per_response: None,
+    };
+    StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![mirror(Chain::main(6)), mirror(Chain::main(3))],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 1),
+                until: Trigger::Count(2, Box::new(Trigger::SessionAdmitted(TAKER.to_owned()))),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![
+            step(
+                TAKER,
+                ControlAction::Grow { len: 3 },
+                Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
+            ),
+            step(
+                TAKER,
+                ControlAction::Relink,
+                Some(Trigger::Grown(TAKER.to_owned())),
+            ),
+            step(
+                OWNER,
+                ControlAction::Close,
+                Some(Trigger::ReservationOpened(OWNER.to_owned())),
+            ),
+            step(TAKER, ControlAction::Recover, None),
+        ],
+        weights: Default::default(),
     }
 }
 
@@ -434,13 +545,14 @@ pub const STATUS_CHANGES: u64 = 5;
 
 impl LivenessScenario {
     /// The departure and timeout fixtures' mirrors, for the hand-off rule,
-    /// or `None` for a hold fixture.
+    /// the recovery departure fixture's included, or `None` for any other.
     pub fn roles(self) -> Option<Roles> {
         matches!(
             self,
             LivenessScenario::Departure { .. }
                 | LivenessScenario::Timeout { .. }
                 | LivenessScenario::LatePage
+                | LivenessScenario::Recovery(RecoveryFixture::Departure)
         )
         .then(|| Roles {
             owner: OWNER.to_owned(),
@@ -468,8 +580,9 @@ impl LivenessScenario {
         all.extend([false, true].map(|late_apply| LivenessScenario::Timeout { late_apply }));
         all.push(LivenessScenario::LatePage);
         all.extend(LivenessScenario::serving());
-        all.extend(RecoveryFixture::ALL.map(LivenessScenario::Recovery));
+        all.extend(RecoveryFixture::CONTROLS.map(LivenessScenario::Recovery));
         all.extend(LivenessScenario::publication());
+        all.extend(RecoveryFixture::CLASSES.map(LivenessScenario::Recovery));
         all
     }
 
@@ -940,11 +1053,17 @@ fn held(kind: OpKind) -> StorageScenario {
 /// relink of [`OWNER`] with the clock past it, and a timeout fixture's the
 /// clock past its horizon ([`LivenessScenario::horizon`]), and a recovery
 /// fixture's `header-sync/bounded-adversary-progress` concluding or the
-/// clock passing its deadline ([`RecoveryEvidence::progress`]). A departure
-/// fixture whose departure never came, and a recovery fixture still
-/// establishing, also end at the horizon. A `BeforeQuiescence` obligation concludes
+/// clock passing its deadline ([`RecoveryEvidence::progress`]). A hold
+/// fixture whose held reply never reached the reactor, a departure fixture
+/// whose departure never came, and a recovery fixture whose recover never
+/// came also end at the horizon, so a node that never gets that far, such
+/// as a planted one that never prepares, still ends idle. So does a fixture
+/// whose own `Shutdown` step was never offered. A recovery that started
+/// always ends recovered or unreached, so the horizon never cuts its
+/// relinks short. A `BeforeQuiescence` obligation concludes
 /// by the first quiescence after its trigger, and the clock moves only then.
-/// The fixture's own `Shutdown` step, if it has one, must be picked first.
+/// The fixture's own `Shutdown` step, if it has one, must be picked first,
+/// unless the horizon has passed.
 /// Its pick begins the node under test's stop, as a `Shutdown` step's does,
 /// and its task then stops every node ([`Topology::finish`]). It offers no
 /// time boundary of its own, so it never changes when the clock moves before
@@ -975,7 +1094,10 @@ impl Finish {
     /// Whether the run's obligations have concluded at `now`, as
     /// [`Finish`] says.
     fn due(&self, now: SimInstant) -> bool {
-        if self.done || (self.waits_for_shutdown && !self.topology.shutdown_picked()) {
+        let horizon = now > SimInstant::from_start(self.horizon);
+        // A planted defect can keep the fixture's own shutdown from ever
+        // being offered, so the horizon still ends it.
+        if self.done || (self.waits_for_shutdown && !self.topology.shutdown_picked() && !horizon) {
             return false;
         }
         match self.kind {
@@ -1005,14 +1127,15 @@ impl Finish {
             })
         };
         let replies_concluded = opened.iter().all(|(op, at)| now > *at || answered(*op));
-        let horizon = now > SimInstant::from_start(self.horizon);
         let key_event = match self.kind {
-            FixtureKind::Hold => !opened.is_empty(),
+            FixtureKind::Hold => !opened.is_empty() || horizon,
             FixtureKind::Serving => !opened.is_empty() || horizon,
             FixtureKind::Departure => self.departed_at.is_some_and(|at| now > at) || horizon,
             FixtureKind::Timeout => horizon,
             FixtureKind::Recovery => match self.recovery.progress(&self.ends) {
-                RecoveryProgress::Pending => horizon,
+                // A started recovery always ends recovered or unreached,
+                // so only one whose recover never came ends at the horizon.
+                RecoveryProgress::Pending => horizon && self.recovery.recovery.started().is_none(),
                 RecoveryProgress::Concluded => true,
                 RecoveryProgress::Owed { since } => now > recovery_deadline(since),
             },
@@ -1177,16 +1300,15 @@ impl RecoveryProgressInputs {
 }
 
 /// Offers a time boundary one millisecond past each open request-deadline
-/// arm's deadline ([`open_retirement`]), past an owed recovery's
-/// ([`RecoveryEvidence::progress`]) and past each unpaid `Status` debt's
-/// ([`status_deadlines`]), so the clock reaches it even when no other timer
-/// would, and the registry can expire the obligation before the finish
-/// could answer it (plan's acceptance: deadlines reach the clock). It
-/// offers no action.
+/// arm's deadline ([`open_retirement`]) and past each unpaid `Status`
+/// debt's ([`status_deadlines`]), so the clock reaches it even when no
+/// other timer would, and the registry can expire the obligation before
+/// the finish could answer it (plan's acceptance: deadlines reach the
+/// clock). It offers no action. The storage harness offers an owed
+/// recovery's.
 struct Deadlines {
     retirement: RetirementEvidence,
     ends: EndEvidence,
-    recovery: RecoveryProgressInputs,
     /// The finish, whose unpaid `Status` debts' deadlines it also offers.
     publication: PublicationEvidence,
 }
@@ -1197,16 +1319,11 @@ impl ActionSource for Deadlines {
 
     /// One millisecond past each open deadline still ahead of `now`.
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
-        let owed = match self.recovery.progress(&self.ends) {
-            RecoveryProgress::Owed { since } => Some(recovery_deadline(since)),
-            RecoveryProgress::Pending | RecoveryProgress::Concluded => None,
-        };
         out.extend(
             open_retirement(&self.retirement, &self.ends)
                 .into_iter()
                 .filter(|open| open.timed)
                 .map(|open| open.deadline)
-                .chain(owed)
                 .filter_map(|deadline| deadline.checked_add(std::time::Duration::from_millis(1)))
                 .filter(|at| *at > now)
                 .map(Boundary::Opens),
@@ -1315,10 +1432,11 @@ impl HasView for Liveness {
 
 impl Subsystem for Liveness {
     const NAME: &'static str = "header-sync/liveness";
-    // 2: hdr-11's recovery fixtures, and 3: hdr-12b's publication
-    // fixtures after them, each of which grew [`LivenessScenario::all`] and
-    // so moved what each scenario byte picks.
-    const GENERATOR: u32 = 3;
+    // 2: hdr-11's recovery fixtures, 3: hdr-12b's publication fixtures
+    // after them, and 4: hdr-13's close, fault and departure fixtures after
+    // those, each of which grew [`LivenessScenario::all`] and so moved what
+    // each scenario byte picks.
+    const GENERATOR: u32 = 4;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = LivenessScenario;
     type Prepared = Ports;
@@ -1334,8 +1452,9 @@ impl Subsystem for Liveness {
     /// The storage harness's ports for the fixture, with the hold-wake
     /// evidence armed, the publication evidence armed as the fixture says
     /// ([`LivenessScenario::arming`]), a departure or timeout fixture's
-    /// hand-off rule for its mirrors ([`LivenessScenario::roles`]), and the
-    /// late-page fixture's page delay on [`OWNER`].
+    /// hand-off rule for its mirrors ([`LivenessScenario::roles`]), the
+    /// late-page fixture's page delay on [`OWNER`], and the storage
+    /// harness's recovery finish off, since [`Finish`] ends every fixture.
     fn prepare(scenario: &LivenessScenario) -> Ports {
         let retirement = scenario
             .roles()
@@ -1349,6 +1468,7 @@ impl Subsystem for Liveness {
             publication: PublicationEvidence::armed(scenario.arming()),
             retirement,
             delayed_page,
+            finishes: false,
             ..Storage::prepare(&scenario.storage())
         }
     }
@@ -1391,7 +1511,6 @@ impl Subsystem for Liveness {
         sim.add_source(Box::new(Deadlines {
             retirement: retirement.clone(),
             ends: ends.clone(),
-            recovery: recovery.clone(),
             publication: publication.clone(),
         }));
         sim.add_source(Box::new(Finish {
@@ -1415,8 +1534,9 @@ impl Subsystem for Liveness {
     }
 
     /// The storage harness's properties, then
-    /// `header-sync/hold-release-wakes` and
-    /// `header-sync/bounded-adversary-progress`, which apply only here.
+    /// `header-sync/hold-release-wakes`, which applies only here, and
+    /// `header-sync/bounded-adversary-progress`, as `header-sync/storage`
+    /// registers it.
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
         properties.push(hold_release_wakes());
@@ -1439,8 +1559,7 @@ impl Subsystem for Liveness {
         let mut declared = vec![bounded_adversary()];
         declared.extend(recovery_assumptions(&source));
         Assumptions::declare(declared).holds_when(|liveness, assume| {
-            assume == Assume::BoundedAdversary
-                || liveness.0.recovery.holds(&liveness.0.ends, assume)
+            assume == Assume::BoundedAdversary || liveness.0.recovery_holds(assume)
         })
     }
 

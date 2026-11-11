@@ -87,6 +87,8 @@ struct Seen {
     enabled: Vec<String>,
     now: SimInstant,
     node_tip: u32,
+    /// How many session facts the node's view held after the step.
+    facts: usize,
 }
 
 /// A run and what it left.
@@ -108,7 +110,7 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
         ports.node.clone(),
     );
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let (into, port) = (seen.clone(), node.clone());
+    let (into, port, view) = (seen.clone(), node.clone(), sessions.clone());
     let mut checker = after_step(move |cx| {
         into.borrow_mut().push(Seen {
             step: cx.step,
@@ -116,6 +118,7 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
             enabled: cx.enabled.iter().map(|e| e.identity.to_string()).collect(),
             now: cx.now,
             node_tip: port.engine().snapshot().frontiers.header_best.height.0,
+            facts: view.facts().len(),
         });
         None
     });
@@ -178,9 +181,11 @@ impl Run {
                 );
             }
             if seen.step > started.step && seen.pick.starts_with("peer:") {
-                // No control step after the recover, only recovery's own.
+                // No control step after the recover, only recovery's own and
+                // the harness's finish once it concludes.
                 assert!(
                     seen.pick == "peer:node:recovered"
+                        || seen.pick == "peer:node:finish"
                         || seen.pick == format!("peer:{SOURCE}:recovery-relink"),
                     "step {}: {}",
                     seen.step,
@@ -226,13 +231,22 @@ impl Run {
         // The barrier opens only once no task is ready, so a node with a
         // live source has finished syncing from it: it's at the source's
         // tip at the record already, and still there at the end. Nothing
-        // changes the membership or ends the source's session after it.
+        // changes the membership or ends the source's session after it,
+        // until the harness's finish stops every node at the run's end.
         assert_eq!(record.node_tip.0, record.source_tip.0);
         assert_eq!(
             self.node.engine().snapshot().frontiers.header_best,
             record.source_tip.0
         );
-        let facts = self.sessions.facts();
+        let mut facts = self.sessions.facts();
+        if let Some(finish) = self
+            .seen
+            .iter()
+            .position(|seen| seen.pick == "peer:node:finish")
+        {
+            let before = finish.checked_sub(1).map_or(0, |at| self.seen[at].facts);
+            facts.truncate(before);
+        }
         assert!(!membership_changed(&facts, record.facts), "{facts:?}");
         assert!(session_lasts(&facts, record.facts, &record.source));
         let reached = self
@@ -390,11 +404,13 @@ fn the_recover_waits_for_earlier_steps() {
     }
 }
 
-/// A recover must come last, after no shutdown, churn or flood.
+/// A recover follows no shutdown, churn or flood, and only a close may
+/// follow it.
 #[test]
 fn a_recover_out_of_place_is_refused() {
+    // Only a close may follow a recover, hdr-13's loss path.
     let cases = [
-        vec![recover(None), step(SOURCE, ControlAction::Close, None)],
+        vec![recover(None), step(SOURCE, ControlAction::Relink, None)],
         vec![step(NODE, ControlAction::Shutdown, None), recover(None)],
         vec![step(SOURCE, ControlAction::Churn, None), recover(None)],
         vec![step(SOURCE, ControlAction::Flood, None), recover(None)],
@@ -423,9 +439,10 @@ fn a_recover_of_the_node_fails_the_run() {
 }
 
 /// With a second mirror that the prefix relinks and then closes, the
-/// relinked session's admission is still queued when its link closes. In
-/// every plan the reactor then admits it and ends it, and all of that comes
-/// before `recovered`, which never counts it as live.
+/// relinked session's admission can still be queued when its link closes.
+/// In every plan the reactor admits it and ends it, and all of that comes
+/// before `recovered`, which never counts it as live. Some plan shows the
+/// queued admission.
 #[test]
 fn recovered_waits_for_other_links_to_settle() {
     let mut scenario = scenario(vec![
@@ -438,6 +455,7 @@ fn recovered_waits_for_other_links_to_settle() {
         dialer: Dialer::Mirror,
         max_headers_per_response: None,
     });
+    let mut queued = 0;
     for input in inputs(16, 256) {
         let run = run(&scenario, input);
         let record = run.recovered();
@@ -471,11 +489,18 @@ fn recovered_waits_for_other_links_to_settle() {
         let ended = at(
             &|fact| matches!(fact, SessionFact::SessionEnded { session_id, .. } if *session_id == session),
         );
-        assert!(closed < admitted && admitted < ended, "{facts:?}");
+        assert!(closed < ended && admitted < ended, "{facts:?}");
+        if closed < admitted {
+            queued += 1;
+        }
         assert!(ended < record.facts, "{facts:?}");
         assert_eq!(record.membership, live_sessions(&facts[..record.facts]));
         assert!(!record.membership.iter().any(|m| m.session_id == session));
     }
+    assert!(
+        queued > 0,
+        "no plan closed the link with the admission queued"
+    );
 }
 
 /// A scenario with a recover declares hdr-13's five assumptions, and one

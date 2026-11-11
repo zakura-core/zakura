@@ -143,6 +143,9 @@ pub struct StepCtx<'a> {
     pub enabled: &'a [Enabled],
     /// The step's phase.
     pub phase: Phase,
+    /// The run's live step budget. The step numbered `budget` is the last
+    /// live one, and every later step is a drain step.
+    pub budget: u64,
     /// Virtual time after the step.
     pub now: SimInstant,
     /// The scheduler's status after the step.

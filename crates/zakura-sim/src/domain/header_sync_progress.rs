@@ -217,17 +217,18 @@ pub fn recovery_deadline(recovered: SimInstant) -> SimInstant {
 /// [`BOUNDED_ADVERSARY_PROGRESS`]'s one obligation's subject.
 const RECOVERY_SUBJECT: &str = "recovery";
 
-/// [`BOUNDED_ADVERSARY_PROGRESS`], as `Draft` until hdr-13's hostile
-/// prefixes and Evan's agreement promote it (ask 7). hdr-11 runs it only on
-/// `header-sync/liveness`'s recovery fixtures, after a `Recover` with no
-/// hostile prefix.
+/// [`BOUNDED_ADVERSARY_PROGRESS`], `Active`, so a violation fails the run.
+/// `header-sync/storage` registers it, so it applies to every scenario with
+/// a `Recover`, hostile prefix and all, and `header-sync/liveness` to its
+/// recovery fixtures.
 ///
 /// A scenario without a `Recover` doesn't declare its assumptions, so it's
 /// `NotApplicable` there. Its assumptions hold from the `recovered` pick
 /// until the environment ends a member ([`RecoveryEvidence::holds`]), so a
 /// node that drops its honest source still owes the successor. A recovery
-/// that ends unreached never holds them, which leaves the run
-/// `Inconclusive`. hdr-13 decides how that counts.
+/// that ends unreached holds them too, since only the node, or a mirror
+/// running the same code, can keep an honest source away, so it's violated
+/// at that pick.
 ///
 /// [`RecoveryEvidence::holds`]: crate::harness::header_node::recovery::RecoveryEvidence::holds
 pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<S> {
@@ -248,14 +249,19 @@ pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<
             Assume::FairScheduling,
         ],
         needs: &[Source::View],
-        status: Status::Draft,
+        status: Status::Active,
         check: check_bounded_adversary_progress::<S>,
         witness: Some(TriggerHistory::View(recovered_owing)),
     }
 }
 
-/// Checks [`BOUNDED_ADVERSARY_PROGRESS`]. At the `recovered` pick, with a
-/// successor owed ([`RecoveryObjective`]), it applies. If the reactor's
+/// Checks [`BOUNDED_ADVERSARY_PROGRESS`]. A recovery that ended unreached
+/// is violated at that pick. The run's last live step, or any drain step,
+/// with the successor still owed and its deadline not yet passed fails the
+/// run as missing evidence: the step budget ran out before the deadline
+/// could judge the obligation, which proves nothing either way (Rule 13).
+/// A step past the deadline is left to the registry's expiry. At the `recovered` pick, with a successor
+/// owed ([`RecoveryObjective`]), it applies. If the reactor's
 /// adopted tip already meets the objective, the pick discharges it at once.
 /// Otherwise it opens one obligation, which the first later
 /// `SnapshotAdopted` that meets it discharges ([`recovery_answer`]). Both
@@ -268,13 +274,31 @@ fn check_bounded_adversary_progress<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {
     let view = cx.view();
+    if view.recovery.unreached_at() == Some(cx.step) {
+        return cx.violated(
+            "the node admits its honest source within recovery's relinks".to_owned(),
+            "every relink settled without a live session for the source".to_owned(),
+        );
+    }
+    let progress = view.recovery.progress(&view.adoption, &view.ends);
+    if let RecoveryProgress::Owed { since } = progress {
+        let deadline = recovery_deadline(since);
+        // Past the deadline, the registry's expiry judges it a violation.
+        if cx.step >= cx.budget && cx.now <= deadline {
+            cx.missing_evidence(format!(
+                "the step budget ran out at {:?} with the recovery's successor owed since \
+                 {:?}, before its deadline at {:?} judged it",
+                cx.now, since, deadline,
+            ));
+        }
+    }
     let Some((record, Some(_))) = view.recovery.objective() else {
         return Verdict::NotApplicable;
     };
     if record.step != cx.step {
         return Verdict::NotApplicable;
     }
-    if let RecoveryProgress::Owed { .. } = view.recovery.progress(&view.adoption, &view.ends) {
+    if let RecoveryProgress::Owed { .. } = progress {
         let obligation = cx.fact_obligation(
             None,
             Subject::Owner(RECOVERY_SUBJECT.to_owned()),
@@ -303,7 +327,8 @@ fn recovery_answer(key: &ObligationKey, view: &StorageView, stamp: u64) -> FactA
 }
 
 /// [`BOUNDED_ADVERSARY_PROGRESS`]'s trigger history: the run reached the
-/// `recovered` pick owing a successor.
+/// `recovered` pick owing a successor, or ended recovery unreached, which
+/// the check judges at that pick.
 fn recovered_owing(view: &StorageView, _: &ObservationLog) -> bool {
-    matches!(view.recovery.objective(), Some((_, Some(_))))
+    view.recovery.unreached() || matches!(view.recovery.objective(), Some((_, Some(_))))
 }

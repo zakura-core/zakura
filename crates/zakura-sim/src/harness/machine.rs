@@ -339,6 +339,7 @@ fn run_checked(
             pick: &identity,
             enabled: &enabled,
             phase: Phase::Live,
+            budget: u64::MAX,
             now: SimInstant::ZERO,
             status: SchedulerStatus::Quiescent,
             log: &log,

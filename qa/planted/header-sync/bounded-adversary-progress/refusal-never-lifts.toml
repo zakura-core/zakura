@@ -1,0 +1,27 @@
+# hdr-13's stand-in for the plan's "unproductive pause never lifts", which
+# no prefix class in the storage harness can pin, since none makes the node
+# drop its source as unproductive: a departed peer's readmission pause
+# never lifts. The reactor keeps every peer whose session ever ended and
+# refuses each one's readmission for good. A long deadline wouldn't do,
+# since an otherwise idle run moves the clock straight to it. In the close
+# fixture the harness closes the source before the recover, and recovery
+# relinks it. The node refuses every relink, and recovery waits a
+# configured cooldown after each before the next. After its third relink settles
+# without a live source, recovery ends unreached, which only the node
+# refusing an honest source can cause, so the property is violated at
+# that pick. The fixture's finish then ends the run idle.
+# Besides reactor.rs, which the patch changes, the reactor's state decides
+# when a pause lifts, and the service decides how a refused session ends.
+# A change there can move the input off its refusals.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# A node that never readmits a departed peer also never takes a departure
+# fixture's target up from mirror B, which the fixture relinks before A
+# departs: B's replaced session leaves a pause behind, so a campaign input
+# that draws a departure fixture breaks `peer-retirement-progress`'s
+# hand-off too.
+also_violates = ["header-sync/peer-retirement-progress"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-closes.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-closes.plan"

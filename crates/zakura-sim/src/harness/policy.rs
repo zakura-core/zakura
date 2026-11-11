@@ -380,6 +380,9 @@ pub struct Predicates<F: Family> {
     links: Vec<(LinkEffect, String)>,
     /// The holds a `Release` step opened.
     released: BTreeSet<usize>,
+    /// False once [`Predicates::stop_catching`] was called, so no hold or
+    /// reply hold picks a later submission.
+    catching: bool,
 }
 
 impl<F: Family> Predicates<F> {
@@ -395,7 +398,15 @@ impl<F: Family> Predicates<F> {
             handled: Vec::new(),
             links: Vec::new(),
             released: BTreeSet::new(),
+            catching: true,
         }
+    }
+
+    /// Stops every hold and reply hold from picking an operation submitted
+    /// from now on, so it completes and replies as the base offers.
+    /// Operations already picked stay held.
+    pub fn stop_catching(&mut self) {
+        self.catching = false;
     }
 
     /// These predicates with `reply_holds` too. Call before anything is
@@ -425,8 +436,8 @@ impl<F: Family> Predicates<F> {
         op.hold = self
             .holds
             .iter()
-            .position(|hold| !hold.select.held && op.matches(&hold.select));
-        if F::commits(kind) {
+            .position(|hold| self.catching && !hold.select.held && op.matches(&hold.select));
+        if self.catching && F::commits(kind) {
             op.reply_hold = self
                 .reply_holds
                 .iter()

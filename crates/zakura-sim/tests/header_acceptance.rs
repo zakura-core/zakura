@@ -1377,7 +1377,12 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             "tests/header_recovery_progress.rs",
             "the_committed_fixtures_match_their_names",
             Some("header-sync/bounded-adversary-progress"),
-            owned(&["header-recovery-successor"]),
+            owned(&[
+                "header-recovery-successor",
+                "header-recovery-closes",
+                "header-recovery-faults",
+                "header-recovery-departure",
+            ]),
         ),
         (
             "header-sync/liveness",

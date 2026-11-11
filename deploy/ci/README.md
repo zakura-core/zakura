@@ -4,6 +4,8 @@ The temporary runner keeps formatting and script checks, Rust lint/build checks,
 header conformance, changelog validation, and the normal workspace unit-test
 profile. Extended tests and the workflows listed in `set-temporary-mode.sh` are
 paused. The existing `test success` check still requires unit tests to pass.
+A newer commit cancels the previous lint, unit-test, and runner-smoke runs for
+the same PR, including their queued jobs. Different PRs retain separate runs.
 Each workflow summary records the reduced coverage. This mode also reduces
 push, manual, and scheduled coverage until it is turned off.
 

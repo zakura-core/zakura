@@ -417,11 +417,12 @@ async fn small_healthy_cache_finishes_startup_with_unresolved_seeds() {
     let cached: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     write_peer_cache_file(&config, &["127.0.0.1:8233"]);
 
-    // Keep the successful connection's reservation alive after its connector returns.
+    // Keep an established connection alive after its connector returns.
     let live_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
     let connector = {
         let live_connections = live_connections.clone();
-        service_fn(move |request: OutboundConnectorRequest| {
+        service_fn(move |mut request: OutboundConnectorRequest| {
+            request.connection_tracker.mark_open();
             live_connections
                 .lock()
                 .unwrap()
@@ -462,7 +463,7 @@ async fn small_healthy_cache_finishes_startup_with_unresolved_seeds() {
     let late_seeds = tokio::spawn(send_late_seed_peers(
         connections.pending_seed_peers.take(),
         book_tx,
-    )));
+    ));
     seed_tx.send(vec![seed]).unwrap();
     let late_seed = tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, book_rx.recv())
         .await

@@ -420,7 +420,6 @@ pub struct TransportTap {
     /// The last load it logged for each connection it samples.
     loads: BTreeMap<u64, TransportFact>,
     handshake_load: Option<TransportFact>,
-    handshake_sampling: bool,
 }
 
 /// The end of its connections a [`TransportTap`] reads.
@@ -452,6 +451,8 @@ struct TapState {
     /// Each registered connection's resource probe, in registration order.
     probes: Mutex<Vec<(u64, ConnectionProbe)>>,
     handshakes: Mutex<Option<HandshakeProbe>>,
+    handshake_slots: Mutex<Vec<(SocketAddr, [u8; 16], zakura_quic::SlotProbe)>>,
+    handshake_sampling: AtomicBool,
     quic_admission: Mutex<Option<zakura_quic::AdmissionProbe>>,
 }
 
@@ -470,6 +471,11 @@ enum Reported {
     HandshakeLoad(TransportFact),
     /// What the transport reported.
     Event(TransportEvent),
+    /// One unregistered or registered connection finished its QUIC shutdown drain.
+    HandshakeSlotReleased {
+        remote: SocketAddr,
+        shared_id: [u8; 16],
+    },
     /// The handshake harness started one of its node dials.
     DialStarted { remote: SocketAddr },
     /// A dial to `remote` failed with `error`.
@@ -561,6 +567,21 @@ impl std::fmt::Debug for TapObserver {
 }
 
 impl TransportObserver for TapObserver {
+    fn handshake_slot(
+        &self,
+        remote: SocketAddr,
+        shared_id: [u8; 16],
+        probe: zakura_quic::SlotProbe,
+    ) {
+        if !self.0.handshake_sampling.load(Ordering::Relaxed) {
+            return;
+        }
+        self.0
+            .handshake_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((remote, shared_id, probe));
+    }
     fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
         *self
             .0
@@ -674,6 +695,8 @@ impl TransportTap {
                 sampling,
                 probes: Mutex::default(),
                 handshakes: Mutex::default(),
+                handshake_slots: Mutex::default(),
+                handshake_sampling: AtomicBool::new(false),
                 quic_admission: Mutex::default(),
             }))
         });
@@ -708,18 +731,32 @@ impl TransportTap {
             role,
             loads: BTreeMap::new(),
             handshake_load: None,
-            handshake_sampling: false,
         };
         (observer, tap)
     }
 
     /// Enables admission samples for the handshake harness.
-    pub(crate) fn with_handshake_counts(mut self) -> Self {
-        self.handshake_sampling = true;
+    pub(crate) fn with_handshake_counts(self) -> Self {
+        self.state.handshake_sampling.store(true, Ordering::Relaxed);
         self
     }
 
     fn sample_handshakes(&mut self) {
+        self.state
+            .handshake_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(remote, shared_id, probe)| {
+                if zakura_rt::sim::boundary_read(|| probe.released()) {
+                    self.state.push(Reported::HandshakeSlotReleased {
+                        remote: *remote,
+                        shared_id: *shared_id,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
         let quic = self
             .state
             .quic_admission
@@ -778,7 +815,7 @@ impl TransportTap {
 
     /// Buffers changed resource samples without taking scheduling points.
     fn sample(&mut self) {
-        if self.handshake_sampling {
+        if self.state.handshake_sampling.load(Ordering::Relaxed) {
             self.sample_handshakes();
         }
         let probes = self
@@ -832,6 +869,19 @@ impl TransportTap {
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
         let event = match event {
             Reported::HandshakeLoad(load) => return Ok((None, NODE_ADDR, load)),
+            Reported::HandshakeSlotReleased { remote, shared_id } => {
+                return Ok((
+                    None,
+                    remote,
+                    TransportFact::Handshake {
+                        shared_id: crate::storage::hex(&shared_id),
+                        stage: "quic-released".into(),
+                        validation: None,
+                        error: None,
+                        elapsed_ms: None,
+                    },
+                ))
+            }
             Reported::Event(event) => event,
             Reported::DialStarted { remote } => {
                 return Ok((None, remote, TransportFact::DialStarted));

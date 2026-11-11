@@ -1518,7 +1518,7 @@ struct ControlHandshakeGuard {
 }
 
 #[cfg(any(test, zakura_sim))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HandshakeObservation {
     observer: Arc<dyn super::TransportObserver>,
     remote: SocketAddr,
@@ -1526,21 +1526,26 @@ struct HandshakeObservation {
     started: Instant,
 }
 
+#[cfg(any(test, zakura_sim))]
+impl HandshakeObservation {
+    fn released(&self, stage: &'static str, elapsed: Option<Duration>) {
+        self.observer.observe(super::TransportEvent::Handshake {
+            remote: self.remote,
+            shared_id: self.shared_id,
+            stage,
+            validation: None,
+            error: None,
+            elapsed,
+        });
+    }
+}
+
 impl Drop for ControlHandshakeGuard {
     fn drop(&mut self) {
         self.slots.counts().leave_handshake(self.ip);
         #[cfg(any(test, zakura_sim))]
         if let Some(observation) = &self.observation {
-            observation
-                .observer
-                .observe(super::TransportEvent::Handshake {
-                    remote: observation.remote,
-                    shared_id: observation.shared_id,
-                    stage: "released",
-                    validation: None,
-                    error: None,
-                    elapsed: Some(observation.started.elapsed()),
-                });
+            observation.released("released", Some(observation.started.elapsed()));
         }
     }
 }
@@ -1550,6 +1555,8 @@ struct PendingHandshakeGuard {
     slots: IpSlots,
     shared: Option<OwnedSemaphorePermit>,
     inbound: Option<OwnedSemaphorePermit>,
+    #[cfg(any(test, zakura_sim))]
+    observation: Option<HandshakeObservation>,
 }
 
 impl Drop for PendingHandshakeGuard {
@@ -1559,6 +1566,10 @@ impl Drop for PendingHandshakeGuard {
         drop(self.shared.take());
         drop(self.inbound.take());
         counts.release_pending(inbound);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observation) = &self.observation {
+            observation.released("pending-released", None);
+        }
     }
 }
 
@@ -1567,6 +1578,8 @@ struct ConnectionAdmissionGuard {
     slots: IpSlots,
     shared: Option<OwnedSemaphorePermit>,
     inbound: Option<OwnedSemaphorePermit>,
+    #[cfg(any(test, zakura_sim))]
+    observation: Option<HandshakeObservation>,
 }
 
 impl Drop for ConnectionAdmissionGuard {
@@ -1576,6 +1589,10 @@ impl Drop for ConnectionAdmissionGuard {
         drop(self.shared.take());
         drop(self.inbound.take());
         counts.release_connection(inbound);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observation) = &self.observation {
+            observation.released("connection-released", None);
+        }
     }
 }
 
@@ -3104,6 +3121,29 @@ impl ZakuraProtocolHandler {
         );
     }
 
+    #[cfg(any(test, zakura_sim))]
+    fn handshake_observation(&self, connection: &Connection) -> Option<HandshakeObservation> {
+        self.transport_observer
+            .as_ref()
+            .map(|observer| HandshakeObservation {
+                observer: observer.clone(),
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                started: Instant::now(),
+            })
+    }
+
+    #[cfg(zakura_sim)]
+    fn observe_handshake_slot(&self, connection: &Connection) {
+        if let Some(observer) = &self.transport_observer {
+            observer.handshake_slot(
+                connection.admitted_addr(),
+                connection.shared_id(),
+                connection.slot_probe(),
+            );
+        }
+    }
+
     /// Report that `connection` was refused before registration, for
     /// `reason`: its handshake error or the refusal's trace label.
     #[cfg(any(test, zakura_sim))]
@@ -3203,6 +3243,8 @@ impl ZakuraProtocolHandler {
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
     fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
+        #[cfg(zakura_sim)]
+        self.observe_handshake_slot(connection);
         transport_observe!(
             self.transport_observer,
             super::TransportEvent::Handshake {
@@ -3219,18 +3261,13 @@ impl ZakuraProtocolHandler {
             .supervisor
             .enter_control_handshake(connection.admitted_ip());
         #[cfg(any(test, zakura_sim))]
-        let control_handshake = {
-            let mut guard = control_handshake;
-            guard.observation =
-                self.transport_observer
-                    .as_ref()
-                    .map(|observer| HandshakeObservation {
-                        observer: observer.clone(),
-                        remote: connection.admitted_addr(),
-                        shared_id: connection.shared_id(),
-                        started: Instant::now(),
-                    });
-            guard
+        let (admission, control_handshake) = {
+            let mut admission = admission;
+            let mut control_handshake = control_handshake;
+            let observation = self.handshake_observation(connection);
+            admission.observation = observation.clone();
+            control_handshake.observation = observation;
+            (admission, control_handshake)
         };
         Some(InboundClaim {
             _admission: admission,
@@ -3361,6 +3398,8 @@ impl ZakuraProtocolHandler {
             return None;
         }
         Some(ConnectionAdmissionGuard {
+            #[cfg(any(test, zakura_sim))]
+            observation: None,
             slots: self.supervisor.ip_slots.clone(),
             shared: Some(shared),
             inbound: inbound_permit,
@@ -3381,6 +3420,8 @@ impl ZakuraProtocolHandler {
             return None;
         }
         Some(PendingHandshakeGuard {
+            #[cfg(any(test, zakura_sim))]
+            observation: None,
             slots: self.supervisor.ip_slots.clone(),
             shared: Some(shared),
             inbound: inbound_permit,
@@ -3409,6 +3450,12 @@ impl ZakuraProtocolHandler {
                 b"pending handshake",
             );
             return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
+        };
+        #[cfg(any(test, zakura_sim))]
+        let _handshake = {
+            let mut guard = _handshake;
+            guard.observation = self.handshake_observation(connection);
+            guard
         };
         let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
@@ -5629,6 +5676,14 @@ pub(crate) async fn serve_reported_native_dial_connection(
         }
         Err(error) => return Err(error.into()),
     };
+    #[cfg(zakura_sim)]
+    endpoint.handler.observe_handshake_slot(&connection);
+    #[cfg(any(test, zakura_sim))]
+    let _admission = {
+        let mut guard = _admission;
+        guard.observation = endpoint.handler.handshake_observation(&connection);
+        guard
+    };
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = report.admitted_addr.send(connection.admitted_addr());
@@ -5648,6 +5703,12 @@ pub(crate) async fn serve_reported_native_dial_connection(
             .claim_pending_handshake(false)
             .ok_or(ZakuraHandlerError::ResourceLimit("pending handshake"))
             => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?;
+        #[cfg(any(test, zakura_sim))]
+        let _handshake = {
+            let mut guard = _handshake;
+            guard.observation = endpoint.handler.handshake_observation(&connection);
+            guard
+        };
         let _owner = endpoint
             .handler
             .resources

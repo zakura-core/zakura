@@ -43,6 +43,7 @@ fn run(scenario: Scenario) -> zakura_sim::RunReport {
 fn honest_control_handshake_holds() {
     let report = run(Scenario::default());
     assert_held(&report, "handshake/hello/conformant-never-refused");
+    assert_held(&report, "handshake/prelude/conformant-never-refused");
     assert_held(&report, "handshake/finishes-in-time");
     for id in [
         "handshake/pending-bounded",
@@ -302,6 +303,7 @@ fn hello_guards_refuse_each_corrupt_field() {
             &report,
             &format!("handshake/hello/{}-refused", fault.label()),
         );
+        assert_held(&report, "handshake/hello/refusal-releases-slot");
     }
 }
 
@@ -316,6 +318,7 @@ fn ack_guards_refuse_each_corrupt_field() {
         });
         let report = run(scenario);
         assert_held(&report, &format!("handshake/ack/{}-refused", fault.label()));
+        assert_held(&report, "handshake/ack/refusal-releases-slot");
     }
 }
 

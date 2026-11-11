@@ -1,4 +1,4 @@
-//! A sim-only read of one connection's latest load snapshot (API-9).
+//! Sim-only reads of a connection's load snapshot and completed slot release.
 //!
 //! It holds the connection's shared state through std's `Weak`, so it never
 //! keeps the connection open, and it reads the snapshot through the watch's
@@ -39,5 +39,22 @@ impl LoadProbe {
         let shared = self.0.upgrade()?;
         let load = shared.load.peek(|load| *load);
         Some(load)
+    }
+}
+
+/// Reports completion of the connection slot's release without retaining the slot.
+/// The slot marks this probe only after it refunds its live or closing charge.
+#[derive(Clone, Debug, Default)]
+pub struct SlotProbe(Arc<zakura_rt::sync::counter::AtomicUsize>);
+
+impl SlotProbe {
+    pub(crate) fn finish(&self) {
+        self.0.store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reads the completed slot release without adding a scheduling point.
+    pub fn released(&self) -> bool {
+        assert!(in_boundary_read(), "slot probes require a boundary read");
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 1
     }
 }

@@ -179,16 +179,28 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             witness: None,
         });
     }
+    for row in ["hello", "ack"] {
+        properties.push(Property {
+            id: PropertyId::generated(format!("handshake/{row}/refusal-releases-slot")).expect("handshake rows follow the ID grammar"),
+            claim: "A refused control handshake releases its IP charge, handler permits, and QUIC slot within the shutdown drain.",
+            kind: Kind::Liveness {
+                bound: LivenessBound::VirtualTime(std::time::Duration::from_secs(3)),
+            },
+            assumes: &[],
+            needs: &[Source::Closes],
+            status: Status::Active,
+            check: check_released::<S>,
+            witness: None,
+        });
+    }
     properties.push(Property {
-        id: PropertyId::new("handshake/hello/refusal-releases-slot"),
-        claim: "A refused inbound handshake releases its admission charge before quiescence.",
-        kind: Kind::Liveness {
-            bound: LivenessBound::BeforeQuiescence,
-        },
+        id: PropertyId::new("handshake/prelude/conformant-never-refused"),
+        claim: "The prelude guards accept a conformant negotiated stream without a fault or protocol reset.",
+        kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::Closes],
         status: Status::Active,
-        check: check_released::<S>,
+        check: check_conformant_prelude::<S>,
         witness: None,
     });
     for &(label, consequence) in PRELUDE {
@@ -684,7 +696,15 @@ fn check_refused<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+fn resource_released(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::Transport {
+        event: TransportFact::Handshake { shared_id, stage, .. }, ..
+    } if key.subject == Subject::Owner(format!("{shared_id}/{stage}")))
+}
+
 fn check_released<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let id = cx.id().to_string();
+    let row = id.split('/').nth(1).unwrap();
     let mut pending = Vec::new();
     let mut applies = false;
     for (at, obs) in cx.observations().enumerate() {
@@ -701,18 +721,33 @@ fn check_released<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         else {
             continue;
         };
-        if stage != "hello" {
+        if stage != row {
             continue;
         }
         applies = true;
-        let obligation = cx.obligation(Some(at), Subject::Session(shared_id.clone()), released);
-        if !cx
-            .log
-            .entries()
-            .iter()
-            .any(|entry| released(&obligation.key, &entry.obs))
-        {
-            pending.push(obligation);
+        for stage in [
+            "released",
+            "pending-released",
+            "connection-released",
+            "quic-released",
+        ] {
+            // The handler charges an IP only for inbound control work.
+            if row == "ack" && stage == "released" {
+                continue;
+            }
+            let obligation = cx.obligation(
+                Some(at),
+                Subject::Owner(format!("{shared_id}/{stage}")),
+                resource_released,
+            );
+            if !cx
+                .log
+                .entries()
+                .iter()
+                .any(|entry| resource_released(&obligation.key, &entry.obs))
+            {
+                pending.push(obligation);
+            }
         }
     }
     for obligation in pending {
@@ -759,6 +794,38 @@ fn check_conformant<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             if !error.starts_with("Zakura resource limit exceeded:") {
                 return cx.violated("a conformant control exchange succeeds", error);
             }
+        }
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn check_conformant_prelude<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut applies = false;
+    for obs in cx.observations() {
+        let Observation::Transport {
+            event:
+                TransportFact::PreludeJudged {
+                    shared_id,
+                    quic_stream,
+                    rejection,
+                },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        if !cx.log.entries().iter().any(|entry| matches!(&entry.obs,
+            Observation::PeerHandshake { shared_id: sent_id, quic_stream: sent_stream, row, label, .. }
+                if sent_id == shared_id && sent_stream == quic_stream && row == "prelude" && label == "conformant")) {
+            continue;
+        }
+        applies = true;
+        if let Some(rejection) = rejection {
+            return cx.violated("a conformant prelude passes the protocol guards", rejection);
         }
     }
     if applies {

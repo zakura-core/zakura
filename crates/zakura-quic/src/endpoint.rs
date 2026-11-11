@@ -1278,6 +1278,8 @@ impl ConnectionSlots {
             max_closing: self.max_closing,
             inbound,
             closing: AtomicBool::new(false),
+            #[cfg(zakura_sim)]
+            release: crate::SlotProbe::default(),
         })
     }
 }
@@ -1306,6 +1308,8 @@ pub(crate) struct ConnectionSlot {
     max_closing: usize,
     inbound: bool,
     closing: AtomicBool,
+    #[cfg(zakura_sim)]
+    pub(crate) release: crate::SlotProbe,
 }
 
 impl ConnectionSlot {
@@ -1359,6 +1363,8 @@ impl Drop for ConnectionSlot {
             self.release_live();
             metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         }
+        #[cfg(zakura_sim)]
+        self.release.finish();
     }
 }
 

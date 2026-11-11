@@ -447,6 +447,14 @@ impl zakura_network::zakura::TransportObserver for CapabilityObserver {
     fn handshakes(&self, probe: zakura_network::zakura::HandshakeProbe) {
         self.inner.handshakes(probe);
     }
+    fn handshake_slot(
+        &self,
+        remote: std::net::SocketAddr,
+        shared_id: [u8; 16],
+        probe: zakura_quic::SlotProbe,
+    ) {
+        self.inner.handshake_slot(remote, shared_id, probe);
+    }
     fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
         self.inner.quic_admission(probe);
     }

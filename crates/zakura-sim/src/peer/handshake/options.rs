@@ -233,6 +233,17 @@ pub struct HandshakeSpec {
     pub retry_delay_ms: u64,
 }
 
+impl HandshakeSpec {
+    /// Labels deliberate byte pacing separately from a timely conformant prelude.
+    pub(crate) fn prelude_label(&self) -> &'static str {
+        if self.prelude == PreludeFault::None && self.prelude_byte_delay_ms != 0 {
+            "paced"
+        } else {
+            self.prelude.label()
+        }
+    }
+}
+
 pub(crate) async fn delay(ms: u64) {
     if ms != 0 {
         zakura_rt::time::sleep(Duration::from_millis(ms)).await;

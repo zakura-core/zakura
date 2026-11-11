@@ -284,6 +284,11 @@ impl<F: SocketFactory> EndpointTask<F> {
         let (control_tx, control) = mpsc::unbounded_channel();
         let (handshake_tx, handshake) = oneshot::channel();
         let shared = ConnShared::new(canonical_addr(admitted), self.queued_total.clone());
+        #[cfg(zakura_sim)]
+        shared
+            .slot_release
+            .set(slot.release.clone())
+            .expect("a new connection has no slot probe");
         self.conns.insert(
             handle,
             ConnEntry {

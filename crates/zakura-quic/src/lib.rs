@@ -53,7 +53,7 @@ pub use error::{
 };
 pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
 #[cfg(zakura_sim)]
-pub use probe::LoadProbe;
+pub use probe::{LoadProbe, SlotProbe};
 pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
 pub use stream::{CreditHold, RecvStream, SendStream};
 

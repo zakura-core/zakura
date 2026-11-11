@@ -1566,7 +1566,7 @@ impl PeerTask {
                         .spec
                         .handshake
                         .as_ref()
-                        .map_or("conformant", |script| script.prelude.label()),
+                        .map_or("conformant", |script| script.prelude_label()),
                 },
             );
             let opened = handshake::write_prelude_with(
@@ -1613,7 +1613,7 @@ impl PeerTask {
                         .spec
                         .handshake
                         .as_ref()
-                        .map_or("conformant", |script| script.prelude.label()),
+                        .map_or("conformant", |script| script.prelude_label()),
                 },
             );
             if handshake::write_prelude_with(

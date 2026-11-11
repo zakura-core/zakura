@@ -43,6 +43,16 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
     #[cfg(zakura_sim)]
     fn handshakes(&self, _probe: super::HandshakeProbe) {}
 
+    /// Receives the QUIC slot probe before a connection can fail its control handshake.
+    #[cfg(zakura_sim)]
+    fn handshake_slot(
+        &self,
+        _remote: std::net::SocketAddr,
+        _shared_id: [u8; 16],
+        _probe: zakura_quic::SlotProbe,
+    ) {
+    }
+
     /// Receives the endpoint's independent admission counters.
     #[cfg(zakura_sim)]
     fn quic_admission(&self, _probe: zakura_quic::AdmissionProbe) {}

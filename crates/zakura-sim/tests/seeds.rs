@@ -173,6 +173,17 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-capability-before" => {
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.capability_flip =
+                Some(zakura_sim::harness::handshake_wire::CapabilityFlip::BeforeRegistration);
+            scenario.peers[0].handshake =
+                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                    dial_delay_ms: 1,
+                    ..Default::default()
+                });
+            value(scenario)
+        }
         "handshake-slow-control" => {
             let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
             scenario.peers[0].handshake =

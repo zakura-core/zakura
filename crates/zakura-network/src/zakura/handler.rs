@@ -2338,6 +2338,7 @@ struct StreamAdmission<'a> {
 struct ConnectionServeContext {
     limits: ZakuraConnectionLimits,
     accepted_capabilities: u64,
+    capability_epoch: u64,
     role: &'static str,
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
@@ -2911,6 +2912,7 @@ pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
     handshake_config: ZakuraHandshakeConfig,
     supported_capabilities: Arc<AtomicU64>,
+    capability_epoch: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
@@ -3027,6 +3029,7 @@ impl ZakuraProtocolHandler {
             supervisor,
             handshake_config,
             supported_capabilities,
+            capability_epoch: Arc::new(AtomicU64::new(0)),
             registry,
             trace,
             // Stream session IDs are local correlation generations, not wire
@@ -3191,20 +3194,30 @@ impl ZakuraProtocolHandler {
 
     fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
         let mut config = self.handshake_config;
-        config.supported_capabilities = self.supported_capabilities.load(Ordering::Relaxed);
+        config.supported_capabilities = self.supported_capabilities.load(Ordering::SeqCst);
         config
+    }
+
+    fn handshake_snapshot(&self) -> (ZakuraHandshakeConfig, u64) {
+        // Read the generation first: an overlapping change makes this snapshot stale.
+        let epoch = self.capability_epoch.load(Ordering::SeqCst);
+        (self.current_handshake_config(), epoch)
     }
 
     fn set_header_sync_enabled(&self, enabled: bool) {
         let _supported = if enabled {
             self.supported_capabilities
-                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed)
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
                 | ZAKURA_CAP_HEADER_SYNC
         } else {
             self.supported_capabilities
-                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed)
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
                 & !ZAKURA_CAP_HEADER_SYNC
         };
+        // Publish the generation before the caller snapshots registered peers.
+        // Registrations before this change enter that snapshot; later ones reject
+        // the old generation before installing services.
+        self.capability_epoch.fetch_add(1, Ordering::SeqCst);
         transport_observe!(
             self.transport_observer,
             super::TransportEvent::CapabilitiesChanged {
@@ -3318,7 +3331,7 @@ impl ZakuraProtocolHandler {
         };
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
-        let negotiated = match self
+        let (negotiated, capability_epoch) = match self
             .run_native_responder_handshake_with_permit(&connection, &remote_peer_id, &conn)
             .await
         {
@@ -3363,6 +3376,7 @@ impl ZakuraProtocolHandler {
                 ConnectionServeContext {
                     limits: conn_limits,
                     accepted_capabilities: negotiated.accepted_capabilities,
+                    capability_epoch,
                     role: "responder",
                     direction,
                     transcript_hash: native_connection_transcript_hash(
@@ -3433,7 +3447,7 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
-    ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+    ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
         // The shared permit is taken only once the inbound one is held, so a
         // refused inbound handshake never holds a slot a dial needs.
         let permits = self.claim_pending_handshake(true);
@@ -3479,8 +3493,8 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
-    ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        let handshake_config = self.current_handshake_config();
+    ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
+        let (handshake_config, capability_epoch) = self.handshake_snapshot();
         transport_observe!(
             self.transport_observer,
             super::TransportEvent::HandshakeCapabilities {
@@ -3541,14 +3555,17 @@ impl ZakuraProtocolHandler {
             Some(ack.selected_zakura_protocol),
             handshake_config.network_label(),
         );
-        Ok(NativeHandshakeNegotiated {
-            limits: accepted_limits,
-            accepted_capabilities: ack.accepted_capabilities,
-            #[cfg(any(test, zakura_sim))]
-            local_capabilities: handshake_config.supported_capabilities,
-            #[cfg(any(test, zakura_sim))]
-            offered_capabilities: hello.capabilities,
-        })
+        Ok((
+            NativeHandshakeNegotiated {
+                limits: accepted_limits,
+                accepted_capabilities: ack.accepted_capabilities,
+                #[cfg(any(test, zakura_sim))]
+                local_capabilities: handshake_config.supported_capabilities,
+                #[cfg(any(test, zakura_sim))]
+                offered_capabilities: hello.capabilities,
+            },
+            capability_epoch,
+        ))
     }
 
     fn accepted_limits_for(&self, remote_limits: &ZakuraInitialLimits) -> ZakuraAcceptedLimits {
@@ -4715,6 +4732,46 @@ impl ZakuraProtocolHandler {
         }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
+        if let ZakuraRegistration::Registered {
+            conn_id,
+            peer_id,
+            disconnect_token,
+            ..
+        } = &registration
+        {
+            if self.capability_epoch.load(Ordering::SeqCst) != context.capability_epoch {
+                #[cfg(any(test, zakura_sim))]
+                self.registration_refused(&close_cause, &connection, "capabilities_changed");
+                connection.close(
+                    VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL),
+                    b"capabilities changed",
+                );
+                RegisteredPeerCleanupGuard::new(
+                    self.supervisor.clone(),
+                    self.registry.clone(),
+                    peer_id.clone(),
+                    *conn_id,
+                    disconnect_token.clone(),
+                )
+                .cleanup_registered_peer()
+                .await;
+                transport_observe!(
+                    self.transport_observer,
+                    super::TransportEvent::Handshake {
+                        remote: connection.admitted_addr(),
+                        shared_id: connection.shared_id(),
+                        stage: "registration-released",
+                        validation: None,
+                        error: None,
+                        elapsed: None,
+                    }
+                );
+                if let Some(report) = context.registration_report {
+                    let _ = report.send(DialRegistration::LocalLimit);
+                }
+                return Ok(());
+            }
+        }
         if let Some(report) = context.registration_report {
             let reported = match &registration {
                 ZakuraRegistration::Registered { .. } => Some(DialRegistration::Registered),
@@ -5716,7 +5773,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     );
     let local_node_id = endpoint.local_node_id();
     let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
-    let negotiated = {
+    let (negotiated, capability_epoch) = {
         let _handshake = sim_chain!(endpoint.handler
             .claim_pending_handshake(false)
             .ok_or(ZakuraHandlerError::ResourceLimit("pending handshake"))
@@ -5732,7 +5789,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             .resources
             .owners()
             .enter(OwnerPhase::Handshake);
-        let handshake_config = endpoint.handler.current_handshake_config();
+        let (handshake_config, capability_epoch) = endpoint.handler.handshake_snapshot();
         transport_observe!(
             endpoint.handler.transport_observer,
             super::TransportEvent::HandshakeCapabilities {
@@ -5759,7 +5816,10 @@ pub(crate) async fn serve_reported_native_dial_connection(
         endpoint
             .handler
             .observe_control_result(&connection, "ack", &result);
-        sim_chain!(result => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?
+        (
+            sim_chain!(result => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?,
+            capability_epoch,
+        )
     };
     transport_observe!(
         endpoint.handler.transport_observer,
@@ -5786,6 +5846,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             ConnectionServeContext {
                 limits: conn_limits,
                 accepted_capabilities: negotiated.accepted_capabilities,
+                capability_epoch,
                 role: "initiator",
                 direction,
                 transcript_hash: native_connection_transcript_hash(

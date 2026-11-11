@@ -626,6 +626,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("install-unnegotiated-service"),
     },
     Coverage {
+        property: "session/renegotiation-covers-inflight-handshakes",
+        passing: passes(
+            "tests/handshake.rs",
+            "capability_flip_covers_inflight_handshake",
+        ),
+        bypass: Bypass::Planted("stale-capability-snapshot"),
+    },
+    Coverage {
         property: "handshake/finishes-in-time",
         passing: passes(
             "tests/handshake.rs",

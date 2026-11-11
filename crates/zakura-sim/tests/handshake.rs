@@ -345,18 +345,26 @@ fn capability_flip_covers_inflight_handshake() {
         });
         let report = run(scenario);
         use zakura_sim::{observe::TransportFact, Observation};
-        let expected = if order == CapabilityFlip::AfterRegistration {
-            zakura_sim::witness::Expect::Holds
-        } else {
-            zakura_sim::witness::Expect::Violated
-        };
         zakura_sim::witness::judge_report::<Wire>(
             &report,
             "session/renegotiation-covers-inflight-handshakes",
-            expected,
+            zakura_sim::witness::Expect::Holds,
         )
         .unwrap();
         let entries = report.log.entries();
+        assert!(
+            entries.iter().any(|entry| matches!(&entry.obs,
+                Observation::Transport { event: TransportFact::Handshake { stage, .. }, .. }
+                    if stage == "registration-released"
+            )),
+            "the stale registration must finish deregistering"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(&entry.obs, Observation::Session { .. })),
+            "a stale snapshot must install no service session"
+        );
         let registered = entries.iter().position(|entry| matches!(&entry.obs,
             Observation::Transport { event: TransportFact::Handshake { stage, .. }, .. } if stage == "registered"
         )).unwrap();

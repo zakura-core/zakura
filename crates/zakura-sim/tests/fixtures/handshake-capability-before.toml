@@ -1,0 +1,10 @@
+# Enable header sync after the handshake snapshot and before registration.
+harness = "handshake/wire"
+generator = 2
+sha256 = "df4b0ca013d2dba865b5a214a7aaa982e77cf35e9e21e3ce0ccd372c35401b02"
+scenario_sha256 = "4097e8ef5d3e236cff8b89ecfba01ae6604ef8fbe0a7af8bc486daf83ec9fdb9"
+source = "crates/zakura-sim/tests/handshake.rs"
+
+[[witness]]
+property = "session/renegotiation-covers-inflight-handshakes"
+expect = "holds"

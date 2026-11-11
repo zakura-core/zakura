@@ -158,9 +158,9 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
     });
     properties.push(Property {
         id: PropertyId::new("session/renegotiation-covers-inflight-handshakes"),
-        claim: "Capability enablement closes every connection whose handshake captured the old capability mask.",
+        claim: "Capability enablement removes every registration whose handshake captured the old capability mask.",
         kind: Kind::Liveness { bound: LivenessBound::BeforeQuiescence },
-        assumes: &[], needs: &[Source::Closes], status: Status::Known { issue: 2334 },
+        assumes: &[], needs: &[Source::Closes], status: Status::Active,
         check: check_epoch::<S>, witness: Some(TriggerHistory::Log(capability_flip_reached)),
     });
     for (id, claim) in [
@@ -512,8 +512,19 @@ fn check_quic_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 }
 
 fn epoch_closed(key: &ObligationKey, obs: &Observation) -> bool {
-    matches!(obs, Observation::PeerConnectionClosed { shared_id, .. }
-        if key.subject == Subject::Session(shared_id.clone()))
+    // Local deregistration completes before the peer receives the neutral close.
+    match obs {
+        Observation::PeerConnectionClosed { shared_id, .. } => {
+            key.subject == Subject::Session(shared_id.clone())
+        }
+        Observation::Transport {
+            event: TransportFact::Handshake {
+                shared_id, stage, ..
+            },
+            ..
+        } => stage == "registration-released" && key.subject == Subject::Session(shared_id.clone()),
+        _ => false,
+    }
 }
 
 fn check_epoch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {

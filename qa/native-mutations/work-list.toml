@@ -662,9 +662,9 @@ witness = { test = "honest_peer_never_punished", test_target = "header_wire_witn
 [[entry]]
 id = "handshake-quic"
 kind = "shared-definition"
-claim = "QUIC enforces source limits, Retry, TLS deadlines, supported ALPNs, and the dialed identity."
+claim = "QUIC enforces source limits, Retry, TLS deadlines, bounded closing state, supported ALPNs, and the dialed identity."
 check = ["crates/zakura-sim/src/table/handshake.rs"]
-shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/driver/connection.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
 
 [[entry.instance]]
 property = "handshake/quic/pending-per-address-bounded"
@@ -690,6 +690,11 @@ witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_targe
 property = "handshake/quic/identity-required"
 code = []
 witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/refusal-releases-slot"
+code = []
+witness = { test = "slow_link_refusal_releases_the_quic_slot", test_target = "handshake" }
 
 [[entry]]
 id = "handshake-deadline"

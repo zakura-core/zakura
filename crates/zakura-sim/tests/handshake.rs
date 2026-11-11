@@ -837,6 +837,36 @@ fn sixteen_conformant_dialers_share_an_address_cadence() {
 }
 
 #[test]
+fn slow_link_refusal_releases_the_quic_slot() {
+    use zakura_sim::{
+        harness::{LinkEntry, LinkSpec},
+        peer::NODE_ADDR,
+    };
+    let mut scenario = Scenario::default();
+    scenario.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        loss_budget: 0,
+    };
+    scenario.peers[0].handshake = Some(HandshakeSpec {
+        open_delay_ms: 10_160,
+        ..HandshakeSpec::default()
+    });
+    scenario.net.links.push(LinkEntry {
+        src: NODE_ADDR,
+        dst: scenario.peers[0].address(0, 0),
+        model: LinkSpec {
+            min_delay_ms: 9_000,
+            max_delay_ms: 9_000,
+            ..scenario.net.default_link
+        },
+    });
+    let report = run(scenario);
+    assert_held(&report, "handshake/hello/refusal-releases-slot");
+}
+
+#[test]
 fn pending_transport_load_bounds_outbound_control_handshakes() {
     use zakura_sim::{
         harness::{LinkEntry, LinkSpec},

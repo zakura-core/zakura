@@ -629,9 +629,13 @@ fn committed_input_records_and_classifies() {
     assert_eq!(fast.report().unwrap().properties, report.properties);
 }
 
-#[test]
-fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
-    let mut extra = zakura_sim::check::after_step(|cx: &StepCtx<'_>| {
+/// A checker whose step finds `test/extra` violated and whose end reports
+/// nothing, so only `end.violation` names the property. A closure checker
+/// can't stand in, since it reports every property its step found violated.
+struct ViolatesUnreported;
+
+impl Checker for ViolatesUnreported {
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         Some(Violation {
             property: "test/extra".to_owned(),
             step: cx.step,
@@ -639,7 +643,22 @@ fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
             expected: "nothing".to_owned(),
             actual: "a step".to_owned(),
         })
-    });
+    }
+
+    /// Nothing, so no report names the step's finding.
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
+}
+
+#[test]
+fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
+    let mut extra = ViolatesUnreported;
     let run = (PENDING.run_bytes)(&[], &mut NullSink, Some(&mut extra));
     let report = run.report().expect("the harness ran the scenario");
     assert_eq!(

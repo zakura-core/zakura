@@ -319,8 +319,9 @@ fn at_end(outcome: PropertyOutcome, holds_since: Option<u64>) -> PropertyReport 
 
 #[test]
 fn reports_outside_the_run_are_a_harness_failure() {
-    // Evidence past the run ends it as a harness failure. The bad step is
-    // left out of the report, so the trace still reads.
+    // Evidence past the run ends it as a harness failure. The violation
+    // was found only at the end, with no step behind it, so the harness end
+    // drops it, and the trace still reads.
     let (run, end) = run_and_read(&mut reports_at_end(|_| {
         at_end(
             PropertyOutcome::Violated {
@@ -336,10 +337,13 @@ fn reports_outside_the_run_are_a_harness_failure() {
             step: 99_999,
         })
     );
-    let kept = at_end(PropertyOutcome::Violated { witness: vec![2] }, None);
+    let dropped = at_end(
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed),
+        None,
+    );
     assert_eq!(
         (&run.properties[..], &end.properties[..]),
-        (&[kept.clone()][..], &[kept][..])
+        (&[dropped.clone()][..], &[dropped][..])
     );
 
     // So does a holds_since past the last step, and like any harness

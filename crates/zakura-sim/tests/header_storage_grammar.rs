@@ -77,10 +77,12 @@ fn two_mirrors() -> Vec<MirrorSpec> {
         MirrorSpec {
             chain: Chain::main(5),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         },
         MirrorSpec {
             chain: Chain::main(3),
             dialer: Dialer::Node,
+            max_headers_per_response: None,
         },
     ]
 }
@@ -241,10 +243,12 @@ fn hand_built_scenarios_round_trip() {
                         fork: Some(Fork { branch: 1, len: 4 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::default(),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {

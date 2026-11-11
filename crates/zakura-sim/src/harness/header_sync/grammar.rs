@@ -335,6 +335,7 @@ fn decode_as(
                 } else {
                     Dialer::Node
                 },
+                max_headers_per_response: None,
             })
             .collect(),
         policy: Policy {

@@ -650,6 +650,33 @@ impl HeaderNode {
         dispatch: DispatchFlag,
         observer: Option<Arc<dyn HeaderSyncObserver>>,
     ) -> Self {
+        Self::spawn_configured(
+            sim,
+            name,
+            seed,
+            port,
+            fixture,
+            tip,
+            dispatch,
+            observer,
+            ZakuraHeaderSyncConfig::default(),
+        )
+    }
+
+    /// [`HeaderNode::spawn`] under `config` instead of production's default
+    /// config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_configured(
+        sim: &mut Sim,
+        name: &str,
+        seed: u8,
+        port: Arc<dyn Port>,
+        fixture: &HeaderFixture,
+        tip: Frontier,
+        dispatch: DispatchFlag,
+        observer: Option<Arc<dyn HeaderSyncObserver>>,
+        config: ZakuraHeaderSyncConfig,
+    ) -> Self {
         let anchor = fixture.anchor();
         let mut startup = HeaderSyncStartup::new(
             fixture.network().clone(),
@@ -660,7 +687,7 @@ impl HeaderNode {
                 verified_block_hash: anchor.hash,
             },
             Some((tip.height, tip.hash)),
-            ZakuraHeaderSyncConfig::default(),
+            config,
             LOCAL_MAX_MESSAGE_BYTES,
             zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );

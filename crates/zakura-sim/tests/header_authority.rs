@@ -33,6 +33,7 @@ fn mirror(chain: Chain) -> MirrorSpec {
     MirrorSpec {
         chain,
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     }
 }
 

@@ -27,7 +27,11 @@ pub fn step(peer: &str, action: ControlAction, when: Option<Trigger>) -> Control
 
 /// A mirror on `chain` that `dialer` links.
 pub fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// A hold of `select` until `until`, offering `then`.
@@ -77,6 +81,7 @@ pub fn competing_mirrors() -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(5),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
             MirrorSpec {
                 chain: Chain {
@@ -84,6 +89,7 @@ pub fn competing_mirrors() -> StorageScenario {
                     fork: Some(Fork { branch: 1, len: 6 }),
                 },
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             },
         ],
         ..StorageScenario::default()

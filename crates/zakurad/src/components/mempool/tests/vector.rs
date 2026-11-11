@@ -2014,6 +2014,142 @@ async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
     Ok(())
 }
 
+/// The mempool publishes its transactions with the block they were last checked
+/// against each time it finishes processing: when it is enabled, after a tip
+/// reset, after new transactions, after a block that removes some, and when it
+/// is disabled. A snapshot holds what a `FullTransactions` request is answered
+/// with at that point, and a poll that changes nothing publishes nothing new.
+#[tokio::test]
+async fn mempool_publishes_a_snapshot_each_time_it_finishes_processing() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _changes,
+    ) = setup(&network, u64::MAX, true).await;
+    let snapshots = mempool.snapshots();
+    let published = || {
+        snapshots
+            .latest()
+            .expect("an active mempool has published a snapshot")
+    };
+    let tx_ids = |snapshot: &zakura_node_services::mempool::MempoolSnapshot| {
+        snapshot
+            .transactions
+            .iter()
+            .map(|tx| tx.transaction.id())
+            .collect::<HashSet<_>>()
+    };
+
+    mempool.dummy_call().await;
+    assert!(
+        snapshots.latest().is_none(),
+        "a mempool that is not active publishes no snapshot"
+    );
+
+    mempool.enable(&mut recent_syncs).await;
+    let genesis_hash = network.genesis_hash();
+    assert_eq!(published().last_seen_tip_hash, genesis_hash);
+    assert!(published().transactions.is_empty());
+
+    // Block 1 resets the tip at the first network-upgrade boundary.
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block1.clone(),
+        ),
+    )
+    .await?;
+    assert_eq!(
+        published().last_seen_tip_hash,
+        genesis_hash,
+        "the snapshot stays on the older block until the mempool processes the new one"
+    );
+    mempool.dummy_call().await;
+    assert_eq!(published().last_seen_tip_hash, block1.hash());
+    assert!(published().transactions.is_empty());
+
+    // Newly added transactions are published on the same block.
+    let expiring = expiry_fixture_transaction(1, Height(2), None);
+    let staying = expiry_fixture_transaction(2, Height(0), None);
+    let expiring_id = expiring.transaction.id();
+    let staying_id = staying.transaction.id();
+    mempool
+        .storage()
+        .insert(expiring, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(staying, Vec::new(), Some(Height(1)))?;
+    mempool.dummy_call().await;
+    let on_block1 = published();
+    assert_eq!(on_block1.last_seen_tip_hash, block1.hash());
+    assert_eq!(tx_ids(&on_block1), HashSet::from([expiring_id, staying_id]));
+
+    // The snapshot is what a request for the mempool's transactions is answered with.
+    let Response::FullTransactions {
+        transactions,
+        transaction_dependencies,
+        last_seen_tip_hash,
+    } = (&mut mempool)
+        .oneshot(Request::FullTransactions)
+        .await
+        .expect("an active mempool answers")
+    else {
+        panic!("the mempool answers a full transactions request with full transactions");
+    };
+    assert_eq!(last_seen_tip_hash, on_block1.last_seen_tip_hash);
+    assert!(Arc::ptr_eq(&transactions, &on_block1.transactions));
+    assert!(Arc::ptr_eq(
+        &transaction_dependencies,
+        &on_block1.transaction_dependencies
+    ));
+
+    // A poll that changes nothing keeps the published lists.
+    mempool.dummy_call().await;
+    assert!(Arc::ptr_eq(
+        &published().transactions,
+        &on_block1.transactions
+    ));
+
+    // Block 2 grows the tip and expires one transaction. The snapshot names
+    // block 2 only once that transaction is gone.
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block2.clone(),
+        ),
+    )
+    .await?;
+    mempool.dummy_call().await;
+    let on_block2 = published();
+    assert_eq!(on_block2.last_seen_tip_hash, block2.hash());
+    assert_eq!(tx_ids(&on_block2), HashSet::from([staying_id]));
+
+    // These old blocks are far behind the network tip, so the mempool is
+    // disabled once it is no longer forced on.
+    mempool.debug_enable_at_height = None;
+    mempool.dummy_call().await;
+    assert!(!mempool.is_enabled());
+    assert!(
+        snapshots.latest().is_none(),
+        "a disabled mempool withdraws its snapshot"
+    );
+
+    Ok(())
+}
+
 /// Measures actual service polling with an unchanged tip. Run the same harness
 /// on the control and candidate revisions; fixture setup is outside timings.
 #[tokio::test]

@@ -83,7 +83,7 @@ use zakura_consensus::{
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    self, CreatedOrSpent, MempoolService, TransactionDependencies,
+    self, CreatedOrSpent, MempoolService, MempoolSnapshotReceiver, TransactionDependencies,
 };
 use zakura_node_services::task::spawn_erased;
 use zakura_state::{
@@ -1067,6 +1067,10 @@ where
     /// A handle to the mempool service.
     mempool: Mempool,
 
+    /// The snapshots that mempool publishes: its verified transactions and the block they
+    /// were last checked against. Read without sending the mempool a request.
+    mempool_snapshots: MempoolSnapshotReceiver,
+
     /// A handle to the state service.
     state: State,
 
@@ -1383,6 +1387,8 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Create a new instance of the RPC handler.
+    ///
+    /// `mempool_snapshots` must read the snapshots published by the mempool behind `mempool`.
     //
     // TODO:
     // - put some of the configs or services in their own struct?
@@ -1394,6 +1400,7 @@ where
         build_version: VersionString,
         user_agent: UserAgentString,
         mempool: Mempool,
+        mempool_snapshots: MempoolSnapshotReceiver,
         state: State,
         read_state: ReadState,
         block_verifier_router: BlockVerifierRouter,
@@ -1433,6 +1440,7 @@ where
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             mempool: mempool.clone(),
+            mempool_snapshots,
             state: state.clone(),
             read_state: read_state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
@@ -1642,38 +1650,41 @@ where
     }
 
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
-    /// the mempool has already processed that block and holds any.
+    /// the mempool has processed that block and holds any.
     ///
-    /// Returns `None` when the mempool is empty, is still on an older tip, takes longer than
-    /// [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the coinbase-only
+    /// Reads the snapshot the mempool publishes instead of sending it a request, so the long
+    /// poll does not queue behind the mempool's other callers. Waits at most
+    /// [`NEW_TIP_MEMPOOL_WAIT`] for the snapshot checked against `tip_hash`.
+    ///
+    /// Returns `None` when the mempool is empty, is not active, has not processed the block
+    /// within that wait, or has shut down. The caller then answers with the coinbase-only
     /// template, so the mempool never delays work on a new tip by more than that wait.
     async fn populated_mempool_on_new_tip(
         &self,
         tip_hash: block::Hash,
     ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
-        let mempool_fetch =
-            types::get_block_template::fetch_mempool_transactions(self.mempool.clone(), tip_hash);
+        let mut mempool_snapshots = self.mempool_snapshots.clone();
+        let snapshot_on_tip = mempool_snapshots.on_tip(tip_hash);
 
-        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, mempool_fetch).await {
-            Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
-                Some((transactions, dependencies))
-            }
-            Ok(Ok(_empty_or_on_an_older_tip)) => None,
-            Ok(Err(error)) => {
+        let snapshot = match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, snapshot_on_tip).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
                 tracing::debug!(
-                    ?error,
-                    "mempool request failed on a new tip; answering with the coinbase-only template"
+                    "mempool shut down before processing a new tip; answering with the coinbase-only template"
                 );
-                None
+                return None;
             }
             Err(_elapsed) => {
                 tracing::debug!(
                     ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
+                    "mempool did not process a new tip in time; answering with the coinbase-only template"
                 );
-                None
+                return None;
             }
-        }
+        };
+
+        (!snapshot.transactions.is_empty())
+            .then_some((snapshot.transactions, snapshot.transaction_dependencies))
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template

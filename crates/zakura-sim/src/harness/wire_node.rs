@@ -1054,7 +1054,11 @@ impl TransportTap {
                     action: action.into(),
                     fresh,
                     capacity,
-                    refill_ns: u64::try_from(refill_interval.as_nanos()).unwrap(),
+                    refill_ns: u64::try_from(refill_interval.as_nanos()).map_err(|_| {
+                        format!(
+                            "cadence refill interval {refill_interval:?} overflows u64 nanoseconds"
+                        )
+                    })?,
                     hosts,
                     host_limit,
                 },

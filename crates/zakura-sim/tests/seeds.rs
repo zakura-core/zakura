@@ -202,9 +202,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             value(scenario)
         }
         "handshake-capability-before" => {
-            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
-            scenario.capability_flip =
-                Some(zakura_sim::harness::handshake_wire::CapabilityFlip::BeforeRegistration);
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario {
+                capability_flip: Some(
+                    zakura_sim::harness::handshake_wire::CapabilityFlip::BeforeRegistration,
+                ),
+                ..Default::default()
+            };
             scenario.peers[0].handshake =
                 Some(zakura_sim::peer::handshake::options::HandshakeSpec {
                     dial_delay_ms: 1,

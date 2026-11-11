@@ -30,6 +30,10 @@ impl TransportObserver for Refusals {
 /// it bounds server cost from above rather than isolating server CPU.
 #[tokio::test]
 #[ignore = "measures failed-handshake CPU on the droplet"]
+#[allow(
+    clippy::print_stdout,
+    reason = "the droplet measurement reads the attempt and refusal counts"
+)]
 async fn measure_failed_control_handshake_cpu() -> Result<(), BoxError> {
     const ATTEMPTS: usize = 256;
     let limits = ZakuraLocalLimits::from_config(&Config::default());

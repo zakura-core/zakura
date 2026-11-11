@@ -1014,6 +1014,26 @@ impl TransportTap {
                 self.remote(conn_id)?,
                 TransportFact::StreamSetupStarted { quic_stream, rate },
             ),
+            TransportEvent::HandshakeCadence {
+                remote,
+                action,
+                fresh,
+                capacity,
+                refill_interval,
+                hosts,
+                host_limit,
+            } => (
+                None,
+                remote,
+                TransportFact::HandshakeCadence {
+                    action: action.into(),
+                    fresh,
+                    capacity,
+                    refill_ns: u64::try_from(refill_interval.as_nanos()).unwrap(),
+                    hosts,
+                    host_limit,
+                },
+            ),
             TransportEvent::HandshakeCapabilities {
                 remote,
                 shared_id,

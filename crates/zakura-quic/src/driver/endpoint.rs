@@ -501,6 +501,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                 // ADM-12: a live slot. Closed connections draining hold their
                 // own allowance, so they don't count here (ADM-13).
                 let Some(slot) = self.shared.connections.claim_inbound() else {
+                    acceptor.cancel_admission(&info);
                     metrics::counter!("zakura.quic.incoming.refused").increment(1);
                     tracing::trace!(target: "zakura_quic", remote = %info.remote, "connection cap full");
                     let transmit = self.endpoint.refuse(incoming, &mut self.response_buf);

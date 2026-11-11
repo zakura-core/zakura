@@ -31,7 +31,7 @@ fn counts_trace_replays_with_each_named_rule() {
         dir.path(),
     )
     .unwrap();
-    assert_eq!(trace.meta.properties.len(), 4);
+    assert_eq!(trace.meta.properties.len(), 6);
     replay_with(&trace, &handshake_counts::ENTRY, ReplayOptions::default()).unwrap();
 }
 
@@ -794,4 +794,67 @@ fn pending_transport_load_exposes_outbound_control_overcommit() {
         &mut NullSink,
     )
     .unwrap();
+}
+
+#[test]
+fn fast_fail_handshakes_exhaust_the_address_cadence() {
+    let report = run(Wire::draw(include_bytes!(
+        "fixtures/handshake-cadence-burst.bin"
+    )));
+    for id in [
+        "handshake/attempts-within-cadence",
+        "handshake/cadence-never-refuses-conformant",
+    ] {
+        assert_held(&report, id);
+        zakura_sim::witness::judge_report::<Wire>(&report, id, zakura_sim::witness::Expect::Holds)
+            .unwrap();
+    }
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport { event: zakura_sim::observe::TransportFact::HandshakeCadence { action, .. }, .. }
+            if action == "exhausted"
+    )), "fast failures must reach the cadence refusal");
+}
+
+#[test]
+fn sixteen_conformant_dialers_share_an_address_cadence() {
+    let report = run(Wire::draw(include_bytes!(
+        "fixtures/handshake-cadence-conformant.bin"
+    )));
+    assert_held(&report, "handshake/cadence-never-refuses-conformant");
+    zakura_sim::witness::judge_report::<Wire>(
+        &report,
+        "handshake/cadence-never-refuses-conformant",
+        zakura_sim::witness::Expect::Holds,
+    )
+    .unwrap();
+    let mut admitted = 0;
+    let mut now = 0;
+    let mut last_admitted = 0;
+    for entry in report.log.entries() {
+        if let zakura_sim::Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+        }
+        if let zakura_sim::Observation::Transport {
+            event: zakura_sim::observe::TransportFact::HandshakeCadence { action, .. },
+            ..
+        } = &entry.obs
+        {
+            assert_ne!(
+                action, "exhausted",
+                "sixteen one-second dialers keep to the cadence"
+            );
+            admitted += usize::from(action == "admitted");
+            if action == "admitted" {
+                last_admitted = now;
+            }
+        }
+    }
+    assert!(
+        last_admitted <= 3_000_000_000,
+        "the retry loop must not wait for shutdown drains between attempts"
+    );
+    assert!(
+        admitted >= 32,
+        "all sixteen dialers must reach TLS twice; observed {admitted}"
+    );
 }

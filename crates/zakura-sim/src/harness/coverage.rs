@@ -626,6 +626,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("install-unnegotiated-service"),
     },
     Coverage {
+        property: "handshake/attempts-within-cadence",
+        passing: passes(
+            "tests/handshake.rs",
+            "fast_fail_handshakes_exhaust_the_address_cadence",
+        ),
+        bypass: Bypass::Planted("no-attempt-charge"),
+    },
+    Coverage {
+        property: "handshake/cadence-never-refuses-conformant",
+        passing: passes(
+            "tests/handshake.rs",
+            "sixteen_conformant_dialers_share_an_address_cadence",
+        ),
+        bypass: Bypass::Planted("refuse-funded-attempt"),
+    },
+    Coverage {
         property: "session/renegotiation-covers-inflight-handshakes",
         passing: passes(
             "tests/handshake.rs",

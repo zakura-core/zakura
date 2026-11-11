@@ -1390,8 +1390,19 @@ impl PeerTask {
                 .as_ref()
                 .and_then(|spec| spec.alpn.as_deref())
                 .unwrap_or(P2P_V2_ALPN);
-            let Ok(conn) = quic.connect(self.node.clone(), &[alpn]).await else {
-                return;
+            let conn = match quic.connect(self.node.clone(), &[alpn]).await {
+                Ok(conn) => conn,
+                Err(_) => {
+                    drop(quic);
+                    if let Some(script) = &self.spec.handshake {
+                        if dial < usize::from(script.retries) {
+                            handshake::options::delay(script.retry_delay_ms).await;
+                            dial += 1;
+                            continue;
+                        }
+                    }
+                    return;
+                }
             };
             let Ok(negotiated) = handshake::initiate(
                 &conn,
@@ -1414,7 +1425,9 @@ impl PeerTask {
                 );
                 if let Some(script) = &self.spec.handshake {
                     if dial < usize::from(script.retries) {
-                        quic.shutdown().await;
+                        // Dropping starts the drain without delaying the next hostile attempt.
+                        drop(conn);
+                        drop(quic);
                         handshake::options::delay(script.retry_delay_ms).await;
                         dial += 1;
                         continue;

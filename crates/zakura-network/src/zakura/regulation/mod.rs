@@ -50,7 +50,9 @@
 //! response cap that covers every frame, and a guard held through the write.
 
 mod cadence;
-pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend};
+pub(crate) use cadence::{
+    Bucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend,
+};
 
 mod serve;
 #[cfg(any(test, zakura_sim))]

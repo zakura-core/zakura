@@ -81,6 +81,11 @@ pub trait Acceptor: Send + Sync + 'static {
     /// crypto work and must not block (ADM-4).
     fn admit(&self, incoming: &IncomingInfo) -> Admit;
 
+    /// Returns any application admission charge when a transport limit or
+    /// stateless Retry prevents an accepted attempt from starting TLS.
+    /// Runs synchronously on the endpoint task, after `admit` returned `Accept`.
+    fn cancel_admission(&self, _incoming: &IncomingInfo) {}
+
     /// ALPNs to offer, in preference order (WIRE-2).
     fn alpns(&self) -> Vec<Vec<u8>>;
 
@@ -844,6 +849,7 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
         .max_pending_per_ip
         .is_some_and(|limit| info.pending_from_ip >= limit as usize)
     {
+        acceptor.cancel_admission(info);
         return Admit::Refuse;
     }
     // Rule 5.
@@ -852,6 +858,7 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
             .retry_threshold
             .is_some_and(|threshold| info.pending_total >= threshold as usize)
     {
+        acceptor.cancel_admission(info);
         return Admit::Retry;
     }
     Admit::Accept
@@ -1433,6 +1440,82 @@ impl Drop for ConnectionSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_rejections_cancel_only_accepted_application_admission() {
+        struct ChargedAcceptor {
+            decision: Admit,
+            cancelled: std::sync::atomic::AtomicUsize,
+        }
+        impl Acceptor for ChargedAcceptor {
+            fn admit(&self, _: &IncomingInfo) -> Admit {
+                self.decision
+            }
+            fn cancel_admission(&self, _: &IncomingInfo) {
+                self.cancelled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+            fn handle(&self, _: Conn) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+        let mut acceptor = ChargedAcceptor {
+            decision: Admit::Accept,
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let info = IncomingInfo {
+            remote: "192.0.2.1:8234".parse().unwrap(),
+            validated: false,
+            pending_total: 1,
+            pending_from_ip: 1,
+        };
+        let config = QuicConfig {
+            retry_threshold: Some(0),
+            ..QuicConfig::default()
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Retry);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let config = QuicConfig {
+            max_pending_per_ip: Some(1),
+            ..config
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Refuse);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        acceptor.decision = Admit::Refuse;
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Refuse);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        acceptor.decision = Admit::Accept;
+        let config = QuicConfig {
+            max_pending_per_ip: None,
+            retry_threshold: None,
+            ..config
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Accept);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 
     /// Concurrent address batches cannot cross the discovery ceiling, and a
     /// refused batch leaves no partial claim. Inbound and maintained dials

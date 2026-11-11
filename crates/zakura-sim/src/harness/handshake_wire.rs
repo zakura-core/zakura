@@ -97,11 +97,16 @@ impl Subsystem for Wire {
 
     fn config(scenario: &Scenario) -> RunConfig {
         let mut config = wire_config();
-        config.budget = config.budget.max(
-            u64::try_from(scenario.peers.len())
-                .expect("peer count fits u64")
-                .saturating_mul(2_000),
-        );
+        let attempts: u64 = scenario
+            .peers
+            .iter()
+            .map(|peer| {
+                peer.handshake
+                    .as_ref()
+                    .map_or(1, |script| u64::from(script.retries) + 1)
+            })
+            .sum();
+        config.budget = config.budget.max(attempts.saturating_mul(2_000));
         config.budget = config.budget.max(
             scenario
                 .peers
@@ -445,6 +450,15 @@ impl Subsystem for Wire {
                 script.bind_ip = Some("192.0.2.1".parse().unwrap());
                 script.retries = byte(1) % 32;
                 script.retry_delay_ms = u64::from(byte(2));
+                if byte(4) & 1 != 0 {
+                    scenario.net.default_link.min_delay_ms = 0;
+                    scenario.net.default_link.max_delay_ms = 0;
+                    scenario.net.default_link.reorder = false;
+                }
+                if byte(4) & 2 != 0 {
+                    script.retry_delay_ms = 1_000;
+                }
+                scenario.peers = vec![PeerSpec::dialing(); usize::from(byte(5) % 16) + 1];
             }
             6 => {
                 scenario.capability_flip = match byte(1) % 4 {
@@ -517,8 +531,13 @@ impl Subsystem for Wire {
             }
             _ => unreachable!("ten families"),
         }
-        for peer in &mut scenario.peers {
-            peer.handshake = Some(script.clone());
+        for (index, peer) in scenario.peers.iter_mut().enumerate() {
+            let mut script = script.clone();
+            if byte(0) % 8 == 5 {
+                script.dial_delay_ms =
+                    u64::try_from(index).expect("peer index fits u64") * u64::from(byte(6)) * 4;
+            }
+            peer.handshake = Some(script);
         }
         scenario
     }

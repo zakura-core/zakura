@@ -3192,6 +3192,26 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    #[cfg(any(test, zakura_sim))]
+    fn observe_handshake_cadence(&self, remote: SocketAddr, action: &'static str, fresh: bool) {
+        let cadence = super::handshake_cadence(self.supervisor.max_connections_per_ip);
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::HandshakeCadence {
+                remote,
+                action,
+                fresh,
+                capacity: cadence.capacity,
+                refill_interval: cadence.refill_interval,
+                hosts: self.supervisor.ip_slots.counts().cadence_hosts(),
+                host_limit: self
+                    .limits
+                    .max_connections
+                    .saturating_add(self.limits.max_pending_handshakes),
+            }
+        );
+    }
+
     fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
         let mut config = self.handshake_config;
         config.supported_capabilities = self.supported_capabilities.load(Ordering::SeqCst);
@@ -4793,6 +4813,14 @@ impl ZakuraProtocolHandler {
                 remote_ip,
                 disconnect_token,
             } => {
+                if context.direction == ServicePeerDirection::Inbound {
+                    self.supervisor
+                        .ip_slots
+                        .counts()
+                        .refund_cadence(connection.admitted_ip(), Instant::now());
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe_handshake_cadence(connection.admitted_addr(), "refunded", false);
+                }
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
                 context.conn.trace_connection(
                     "accepted",
@@ -4920,7 +4948,48 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
-        Admit::Accept
+        let mut counts = self.supervisor.ip_slots.counts();
+        #[cfg(any(test, zakura_sim))]
+        let fresh = !counts.has_cadence_host(incoming.remote.ip());
+        let cadence = counts.admit_cadence(
+            incoming.remote.ip(),
+            self.supervisor.max_connections_per_ip,
+            self.limits
+                .max_connections
+                .saturating_add(self.limits.max_pending_handshakes),
+            Instant::now(),
+        );
+        drop(counts);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(
+            incoming.remote,
+            match cadence {
+                super::HandshakeCadenceAdmission::Admit => "admitted",
+                super::HandshakeCadenceAdmission::Exhausted => "exhausted",
+                super::HandshakeCadenceAdmission::Capacity => "capacity",
+            },
+            fresh && cadence == super::HandshakeCadenceAdmission::Admit,
+        );
+        match cadence {
+            super::HandshakeCadenceAdmission::Admit => Admit::Accept,
+            super::HandshakeCadenceAdmission::Exhausted
+            | super::HandshakeCadenceAdmission::Capacity => {
+                if incoming.validated {
+                    Admit::Refuse
+                } else {
+                    Admit::Retry
+                }
+            }
+        }
+    }
+
+    fn cancel_admission(&self, incoming: &IncomingInfo) {
+        self.supervisor
+            .ip_slots
+            .counts()
+            .refund_cadence(incoming.remote.ip(), Instant::now());
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(incoming.remote, "refunded", false);
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {

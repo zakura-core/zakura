@@ -66,7 +66,7 @@ struct CadenceKey {
 }
 
 #[derive(Clone, Debug)]
-struct Bucket {
+pub(crate) struct Bucket {
     cadence: Cadence,
     tokens: u32,
     last_refill: Instant,
@@ -75,7 +75,7 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new(cadence: Cadence, now: Instant) -> Self {
+    pub(crate) fn new(cadence: Cadence, now: Instant) -> Self {
         Self {
             cadence,
             tokens: cadence.capacity,
@@ -88,7 +88,7 @@ impl Bucket {
     ///
     /// `last_refill` advances by whole intervals, so the remainder carries
     /// over and a sender at exactly the refill rate never drifts.
-    fn refill(&mut self, now: Instant) {
+    pub(crate) fn refill(&mut self, now: Instant) {
         let interval = self.cadence.refill_interval;
         let elapsed = now.saturating_duration_since(self.last_refill);
         let earned = elapsed.as_nanos() / interval.as_nanos();
@@ -103,6 +103,25 @@ impl Bucket {
         );
         // `earned` intervals fit in `elapsed`, so the product fits a Duration.
         self.last_refill += interval.saturating_mul(earned);
+    }
+
+    /// Takes one token after the caller refills the bucket.
+    pub(crate) fn take(&mut self) -> bool {
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    /// Returns one token without exceeding the declared capacity.
+    pub(crate) fn refund(&mut self) {
+        self.tokens = self.tokens.saturating_add(1).min(self.cadence.capacity);
+    }
+
+    /// Whether the bucket retains no debt after its latest refill.
+    pub(crate) fn is_full(&self) -> bool {
+        self.tokens >= self.cadence.capacity
     }
 
     /// Credit a local read pause: tokens accrue above `capacity` for it.
@@ -142,10 +161,9 @@ impl CadenceLedger {
     /// Charge one frame of a row with `cadence` at `now`.
     fn charge(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> Charged {
         let bucket = self.bucket(key, cadence, now);
-        if bucket.tokens == 0 {
+        if !bucket.take() {
             return Charged::Exhausted;
         }
-        bucket.tokens -= 1;
         Charged::Admit {
             low: bucket.tokens < cadence.capacity / 4,
         }

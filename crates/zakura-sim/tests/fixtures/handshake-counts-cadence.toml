@@ -1,0 +1,14 @@
+# Thirty-two immediate failures exhaust one address's sixteen-token burst.
+harness = "handshake/counts"
+generator = 3
+sha256 = "ca946c8becfebc40212ff763bbd09ac051ae3f26e2e6754a3d4456c55b234127"
+scenario_sha256 = "f5d2a90a4e410740173ee67dff61f47aef620b94622c174ccb4ef254cbd791a2"
+source = "crates/zakura-sim/src/harness/handshake_counts.rs"
+
+[[witness]]
+property = "handshake/attempts-within-cadence"
+expect = "holds"
+
+[[witness]]
+property = "handshake/cadence-never-refuses-conformant"
+expect = "holds"

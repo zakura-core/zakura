@@ -114,6 +114,23 @@ pub enum TransportEvent {
         /// The configured burst and refill per second.
         rate: u32,
     },
+    /// Admission charged or refunded the source address's handshake cadence.
+    HandshakeCadence {
+        /// The source address, including its connection's port.
+        remote: SocketAddr,
+        /// Admitted, exhausted, capacity, or refunded.
+        action: &'static str,
+        /// This charge created a new full bucket.
+        fresh: bool,
+        /// Tokens in a full bucket.
+        capacity: u32,
+        /// Time needed to refill one token.
+        refill_interval: std::time::Duration,
+        /// Current address entries.
+        hosts: usize,
+        /// Maximum address entries.
+        host_limit: usize,
+    },
     /// The handshake captured its local capability mask.
     HandshakeCapabilities {
         /// The remote endpoint.

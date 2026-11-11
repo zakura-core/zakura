@@ -2035,6 +2035,21 @@ pub enum TransportFact {
         /// Configured stream-open burst and refill per second.
         rate: u32,
     },
+    /// The receiver charged or refunded a handshake attempt before TLS.
+    HandshakeCadence {
+        /// Admitted, exhausted, capacity, or refunded.
+        action: String,
+        /// The production ledger created this address bucket for the charge.
+        fresh: bool,
+        /// Full bucket capacity.
+        capacity: u32,
+        /// Nanoseconds per replenished token.
+        refill_ns: u64,
+        /// Addresses retained in the ledger.
+        hosts: usize,
+        /// Address ledger capacity.
+        host_limit: usize,
+    },
     /// The control exchange captured the node's capability mask.
     HandshakeCapabilities {
         /// The TLS connection identity.

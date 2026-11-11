@@ -1,9 +1,32 @@
 //! Pure admission decisions and charges shared by QUIC and control handshakes.
 
-use std::net::IpAddr;
-use zakura_rt::collections::HashMap;
+use std::{net::IpAddr, time::Duration};
+use zakura_rt::{collections::HashMap, time::Instant};
 
-use crate::zakura::admission_host;
+use crate::zakura::regulation::Bucket;
+use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
+
+/// The result of charging one address for a TLS attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandshakeCadenceAdmission {
+    /// The attempt took a token.
+    Admit,
+    /// The address must wait for its bucket to refill.
+    Exhausted,
+    /// The bounded address ledger has no entry for this address.
+    Capacity,
+}
+
+/// Lets every permitted node behind one address retry at the dialer's minimum interval.
+pub fn handshake_cadence(max_connections_per_ip: usize) -> Cadence {
+    let capacity = u32::try_from(max_connections_per_ip.max(1)).unwrap_or(u32::MAX);
+    Cadence {
+        capacity,
+        refill_interval: (DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF / capacity)
+            .max(Duration::from_nanos(1)),
+        send_interval: DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
+    }
+}
 
 /// Whether an address may start another handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,9 +49,60 @@ pub struct HandshakeCounts {
     inbound_pending: usize,
     connections: usize,
     inbound_connections: usize,
+    cadence: HashMap<IpAddr, Bucket>,
 }
 
 impl HandshakeCounts {
+    /// Charges an attempt while retaining every depleted address bucket.
+    /// Full buckets can be discarded because a new bucket starts full.
+    pub fn admit_cadence(
+        &mut self,
+        ip: IpAddr,
+        max_connections_per_ip: usize,
+        max_hosts: usize,
+        now: Instant,
+    ) -> HandshakeCadenceAdmission {
+        let host = admission_host(ip);
+        if !self.cadence.contains_key(&host) && self.cadence.len() >= max_hosts {
+            self.cadence.retain(|_, bucket| {
+                bucket.refill(now);
+                !bucket.is_full()
+            });
+            if self.cadence.len() >= max_hosts {
+                return HandshakeCadenceAdmission::Capacity;
+            }
+        }
+        let bucket = self
+            .cadence
+            .entry(host)
+            .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
+        bucket.refill(now);
+        if bucket.take() {
+            HandshakeCadenceAdmission::Admit
+        } else {
+            HandshakeCadenceAdmission::Exhausted
+        }
+    }
+
+    /// Refunds a registered connection or an attempt QUIC never started.
+    pub fn refund_cadence(&mut self, ip: IpAddr, now: Instant) {
+        if let Some(bucket) = self.cadence.get_mut(&admission_host(ip)) {
+            bucket.refill(now);
+            bucket.refund();
+        }
+    }
+
+    /// Reports bucket creation to the simulator without exposing its token balance.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn has_cadence_host(&self, ip: IpAddr) -> bool {
+        self.cadence.contains_key(&admission_host(ip))
+    }
+
+    /// Counts the bounded address ledger, including depleted idle buckets.
+    pub fn cadence_hosts(&self) -> usize {
+        self.cadence.len()
+    }
+
     /// Reads both address ledgers for a simulator boundary sample.
     #[cfg(zakura_sim)]
     pub(crate) fn hosts(&self) -> Vec<(IpAddr, usize, usize)> {
@@ -226,4 +300,75 @@ fn decrement(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
 pub fn inbound_share(cap: usize) -> usize {
     let reserve = if cap >= 2 { (cap / 4).max(1) } else { 0 };
     cap - reserve
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_cadence_charges_refills_and_refunds_one_address() {
+        let mut counts = HandshakeCounts::default();
+        let now = Instant::now();
+        let ip = "192.0.2.1".parse().unwrap();
+        let alias = "::ffff:192.0.2.1".parse().unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                counts.admit_cadence(ip, 16, 124, now),
+                HandshakeCadenceAdmission::Admit
+            );
+        }
+        assert_eq!(
+            counts.admit_cadence(alias, 16, 124, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        let now = now + Duration::from_micros(62_500);
+        assert_eq!(
+            counts.admit_cadence(alias, 16, 124, now),
+            HandshakeCadenceAdmission::Admit
+        );
+        assert_eq!(
+            counts.admit_cadence(ip, 16, 124, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        counts.refund_cadence(ip, now);
+        assert_eq!(
+            counts.admit_cadence(alias, 16, 124, now),
+            HandshakeCadenceAdmission::Admit
+        );
+        assert_eq!(
+            counts.admit_cadence(ip, 16, 124, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        assert_eq!(counts.cadence_hosts(), 1);
+    }
+
+    #[test]
+    fn handshake_cadence_retains_debt_when_its_address_ledger_is_full() {
+        let mut counts = HandshakeCounts::default();
+        let now = Instant::now();
+        let first = "2001:db8:1::1".parse().unwrap();
+        let alias = "2001:db8:1::2".parse().unwrap();
+        let other = "2001:db8:2::1".parse().unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                counts.admit_cadence(first, 16, 1, now),
+                HandshakeCadenceAdmission::Admit
+            );
+        }
+        assert_eq!(
+            counts.admit_cadence(other, 16, 1, now),
+            HandshakeCadenceAdmission::Capacity
+        );
+        assert_eq!(
+            counts.admit_cadence(alias, 16, 1, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        assert_eq!(counts.cadence_hosts(), 1);
+        assert_eq!(
+            counts.admit_cadence(other, 16, 1, now + Duration::from_secs(1)),
+            HandshakeCadenceAdmission::Admit
+        );
+        assert_eq!(counts.cadence_hosts(), 1);
+    }
 }

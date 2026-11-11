@@ -204,6 +204,24 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
         end_found: 1,
         ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![5] })
     };
+    // The end closure reports the step's own violation again, as an end
+    // finding (Sol 2 and Terra 2, round 3).
+    let same_at_end = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![2, 5],
+            expected: "fewer steps".into(),
+            actual: "step 5".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::Violated {
+                witness: vec![2, 5],
+            },
+        )
+    };
     for stop in [
         PropertyReport::new(
             "test/stop",
@@ -212,6 +230,7 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
             },
         ),
         end_finding,
+        same_at_end,
         PropertyReport::new(
             "test/stop",
             PropertyOutcome::not_applicable(zakura_sim::NaReason::HarnessFailed),

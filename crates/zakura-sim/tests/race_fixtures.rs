@@ -1,11 +1,13 @@
 //! The six race fixtures from `scheduler.md`, run through `Sim` (S4.4).
 //! Every planted variant fails on some input, the fixes never do, and one
 //! worker hides the races inside a poll, as on the bare scheduler. Each
-//! fixture's witness test runs one input that reaches the race's trigger
-//! history, on the race and on the fix.
+//! fixture's witness test runs its saved schedule's Plan bytes, which reach
+//! the race's trigger history, on the race and on the fix.
 #![cfg(zakura_sim)]
 
 mod support;
+
+use std::path::Path;
 
 use support::inputs;
 use zakura_sim::{
@@ -137,55 +139,65 @@ fn witnessed<F: Fixture>(variant: Variant, input: &[u8]) -> WitnessScenario<Race
     }
 }
 
-/// `F`'s witness test: on `input`, the planted race reaches its trigger
-/// history and violates the property, and the fix reaches it too and holds.
-fn witness_test<F: Fixture>(input: &[u8]) {
+/// `F`'s saved schedule's Plan bytes: `tests/fixtures/race-schedules/`'s
+/// seed for `F` after its 2-byte scenario prefix, which `race_schedules.rs`
+/// checks encodes the planted race on 2 workers.
+fn saved_plan<F: Fixture>() -> Vec<u8> {
+    let name = F::NAME.trim_start_matches("race/");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/fixtures/race-schedules/{name}.bin"));
+    let input = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    input[2..].to_vec()
+}
+
+/// `F`'s witness test (sched-4 S4.4): on its saved schedule's Plan bytes,
+/// the planted race reaches its trigger history and violates the property,
+/// and the fix reaches it too and holds.
+fn witness_test<F: Fixture>() {
+    let input = saved_plan::<F>();
     check_witness(
-        witnessed::<F>(Variant::Base, input),
+        witnessed::<F>(Variant::Base, &input),
         F::NAME,
         Expect::Violated,
     );
     check_witness(
-        witnessed::<F>(Variant::Fixed, input),
+        witnessed::<F>(Variant::Fixed, &input),
         F::NAME,
         Expect::Holds,
     );
 }
 
-// The empty input runs the tasks in round-robin order, which interleaves
-// the first three fixtures' tasks.
+// The first three fixtures' saved Plans are empty, which runs the tasks in
+// round-robin order and interleaves them.
 
 #[test]
 fn lost_update_witness() {
-    witness_test::<LostUpdate>(&[]);
+    witness_test::<LostUpdate>();
 }
 
 #[test]
 fn snapshot_reserve_witness() {
-    witness_test::<SnapshotReserve>(&[]);
+    witness_test::<SnapshotReserve>();
 }
 
 #[test]
 fn ab_ba_witness() {
-    witness_test::<AbBa>(&[]);
+    witness_test::<AbBa>();
 }
 
 #[test]
 fn missed_notify_witness() {
-    witness_test::<MissedNotify>(&[
-        0x14, 0xb1, 0x51, 0x74, 0xfe, 0x95, 0x35, 0x0a, 0xef, 0xac, 0xa9, 0x97, 0xb5, 0xca, 0xa1,
-        0xc9, 0x18,
-    ]);
+    witness_test::<MissedNotify>();
 }
 
 #[test]
 fn timer_cancel_witness() {
-    witness_test::<TimerCancel>(&[0x38, 0x44, 0x6a, 0x3e, 0x1c, 0x9d, 0xd9, 0x80, 0x20]);
+    witness_test::<TimerCancel>();
 }
 
 #[test]
 fn abort_without_join_witness() {
-    witness_test::<AbortWithoutJoin>(&[0xbd, 0xe4, 0xe8, 0xf2, 0xe1]);
+    witness_test::<AbortWithoutJoin>();
 }
 
 /// An input that runs one incrementer's add before the other reaches its

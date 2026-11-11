@@ -60,7 +60,7 @@ use crate::{
     observe::{
         HeaderCheckFact, KindLoad, SessionStepFact, TransitionFact, TransportFact, TransportLimits,
     },
-    peer::{key_index, peer_addr, peer_of, SharedIds, NODE_ADDR},
+    peer::{key_index, peer_addr, peer_of, PeerSpec, SharedIds, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -151,6 +151,28 @@ impl WireNode {
     /// [`WireEndpoint::dial`].
     pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
         self.endpoint.dial(sim, index, listening);
+    }
+
+    /// Dials a scripted handshake peer after its configured admission delay.
+    pub(crate) fn dial_handshake(
+        &self,
+        sim: &mut Sim,
+        index: usize,
+        spec: &PeerSpec,
+        listening: watch::Receiver<bool>,
+    ) {
+        let script = spec.handshake.clone().unwrap_or_default();
+        let remote = spec.address(index, 0);
+        let target = NodeAddr::with_addrs(
+            SeededInputs::node_key(
+                self.endpoint.seed,
+                key_index(script.identity.unwrap_or(index)),
+            )
+            .public(),
+            [remote],
+        );
+        self.endpoint
+            .spawn_dial(sim, remote, target, listening, Some(script.dial_delay_ms));
     }
 }
 
@@ -316,13 +338,24 @@ impl WireEndpoint {
     /// `listening` says the peer does too, and serves the connection until
     /// it ends. A dial that fails is reported as `dial-failed` on the
     /// peer's address.
-    pub fn dial(&self, sim: &mut Sim, index: usize, mut listening: watch::Receiver<bool>) {
-        let mut endpoint = self.endpoint.clone();
+    pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
         let remote = peer_addr(index, 0);
         let target = NodeAddr::with_addrs(
             SeededInputs::node_key(self.seed, key_index(index)).public(),
             [remote],
         );
+        self.spawn_dial(sim, remote, target, listening, None);
+    }
+
+    fn spawn_dial(
+        &self,
+        sim: &mut Sim,
+        remote: SocketAddr,
+        target: NodeAddr,
+        mut listening: watch::Receiver<bool>,
+        handshake_delay_ms: Option<u64>,
+    ) {
+        let mut endpoint = self.endpoint.clone();
         let dials = self.dials.clone();
         sim.scheduler().spawn_root("dial", async move {
             if listening.wait_for(|up| *up).await.is_err() {
@@ -333,6 +366,12 @@ impl WireEndpoint {
                 Err(_) => return,
             };
             let (endpoint, limits) = bound.expect("the wait returns a bound node");
+            if let Some(delay_ms) = handshake_delay_ms {
+                crate::peer::handshake::options::delay(delay_ms).await;
+                if let Some(dials) = &dials {
+                    dials.0.push(Reported::DialStarted { remote });
+                }
+            }
             // A connection's own events show how it went once it registers.
             if let Err(error) = endpoint.dial(target, &limits).await {
                 if let Some(dials) = dials {
@@ -431,6 +470,8 @@ enum Reported {
     HandshakeLoad(TransportFact),
     /// What the transport reported.
     Event(TransportEvent),
+    /// The handshake harness started one of its node dials.
+    DialStarted { remote: SocketAddr },
     /// A dial to `remote` failed with `error`.
     DialFailed { remote: SocketAddr, error: String },
     /// Connection `conn_id`'s shared ID, right after its registration.
@@ -792,6 +833,9 @@ impl TransportTap {
         let event = match event {
             Reported::HandshakeLoad(load) => return Ok((None, NODE_ADDR, load)),
             Reported::Event(event) => event,
+            Reported::DialStarted { remote } => {
+                return Ok((None, remote, TransportFact::DialStarted));
+            }
             Reported::DialFailed { remote, error } => {
                 return Ok((None, remote, TransportFact::DialFailed { error }));
             }

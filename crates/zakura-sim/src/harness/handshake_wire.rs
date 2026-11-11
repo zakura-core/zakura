@@ -78,13 +78,19 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
 
-    fn config(_: &Scenario) -> RunConfig {
-        wire_config()
+    fn config(scenario: &Scenario) -> RunConfig {
+        let mut config = wire_config();
+        config.budget = config.budget.max(
+            u64::try_from(scenario.peers.len())
+                .expect("peer count fits u64")
+                .saturating_mul(2_000),
+        );
+        config
     }
 
     fn prepare(_: &Scenario) -> Prepared {
@@ -241,7 +247,7 @@ impl Subsystem for Wire {
             };
             sim.scheduler().spawn_root("peer", task.run());
             if spec.dialer == Dialer::Node {
-                node.dial(sim, index, listened);
+                node.dial_handshake(sim, index, spec, listened);
             }
         }
         sim.add_source(Box::new(control));
@@ -265,7 +271,7 @@ impl Subsystem for Wire {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
         let mut scenario = Scenario::default();
         let mut script = HandshakeSpec::default();
-        match byte(0) % 7 {
+        match byte(0) % 8 {
             0 => script.control = HELLO_FAULTS[usize::from(byte(1)) % HELLO_FAULTS.len()],
             1 => {
                 scenario.peers[0] = PeerSpec::listening();
@@ -322,7 +328,32 @@ impl Subsystem for Wire {
                 };
                 script.dial_delay_ms = 1;
             }
-            _ => unreachable!("seven families"),
+            7 => {
+                let incoming = usize::from(byte(1) % 96);
+                let outgoing = usize::from(byte(2) % 8) + 1;
+                scenario.peers = (0..incoming)
+                    .map(|index| {
+                        let mut peer = PeerSpec::dialing();
+                        peer.handshake = Some(HandshakeSpec {
+                            dial_delay_ms: u64::try_from(index).expect("peer index fits u64")
+                                * u64::from(byte(5)),
+                            open_delay_ms: u64::from(byte(3)) * 40,
+                            ..HandshakeSpec::default()
+                        });
+                        peer
+                    })
+                    .chain((0..outgoing).map(|_| {
+                        let mut peer = PeerSpec::listening();
+                        peer.handshake = Some(HandshakeSpec {
+                            dial_delay_ms: u64::from(byte(4)) * 10,
+                            ..HandshakeSpec::default()
+                        });
+                        peer
+                    }))
+                    .collect();
+                return scenario;
+            }
+            _ => unreachable!("eight families"),
         }
         for peer in &mut scenario.peers {
             peer.handshake = Some(script.clone());
@@ -388,7 +419,7 @@ mod tests {
 
     #[test]
     fn draws_round_trip_millisecond_timing_and_address_families() {
-        for family in 0..7 {
+        for family in 0..8 {
             let mut bytes = [179; Wire::SCENARIO_BYTES];
             bytes[0] = family;
             let scenario = Wire::draw(&bytes);

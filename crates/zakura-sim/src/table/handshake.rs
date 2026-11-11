@@ -129,6 +129,16 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         });
     }
     properties.push(Property {
+        id: PropertyId::new("handshake/dial-reserve-kept"),
+        claim: "Inbound load preserves each dial reserve and cannot refuse a dial within that reserve.",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Closes],
+        status: Status::Active,
+        check: check_reserve::<S>,
+        witness: None,
+    });
+    properties.push(Property {
         id: PropertyId::new("handshake/finishes-in-time"),
         claim: "An inbound control handshake releases its claim within ten seconds plus the shutdown drain.",
         kind: Kind::Liveness {
@@ -211,6 +221,8 @@ fn check_epoch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let mut applies = false;
     for (at, obs) in cx.observations().enumerate() {
         let Observation::Transport {
+            instance,
+            seq,
             event: TransportFact::CapabilitiesChanged { supported },
             ..
         } = obs
@@ -222,13 +234,19 @@ fn check_epoch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
         for entry in cx.log.entries() {
             let Observation::Transport {
-                event: TransportFact::HandshakeCapabilities { shared_id, .. },
+                instance: source,
+                seq: captured,
+                event:
+                    TransportFact::HandshakeCapabilities {
+                        shared_id,
+                        supported: snapshot,
+                    },
                 ..
             } = &entry.obs
             else {
                 continue;
             };
-            if entry.step > cx.step {
+            if source != instance || captured >= seq || snapshot & ZAKURA_CAP_HEADER_SYNC != 0 {
                 continue;
             }
             applies = true;
@@ -364,15 +382,169 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+fn reserve(cap: usize) -> usize {
+    if cap >= 2 {
+        (cap / 4).max(1)
+    } else {
+        0
+    }
+}
+
+fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut applies = false;
+    for obs in cx.observations() {
+        let Observation::Transport {
+            instance,
+            seq,
+            remote,
+            event,
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        match event {
+            TransportFact::HandshakeCounts {
+                inbound_connections,
+                connection_cap,
+                inbound,
+                cap,
+                quic_inbound,
+                quic_max_inbound,
+                quic_below_reserve,
+                ..
+            } => {
+                applies = true;
+                if *inbound_connections > connection_cap - reserve(*connection_cap)
+                    || *inbound > cap - reserve(*cap)
+                    || *quic_inbound
+                        > connection_cap + cap - reserve(*connection_cap) - reserve(*cap)
+                    || quic_inbound > quic_max_inbound
+                    || quic_inbound > quic_below_reserve
+                {
+                    return cx.violated("inbound charges leave the connection, QUIC, and handshake reserves",
+                        format!("connections {inbound_connections}/{connection_cap}; pending {inbound}/{cap}; QUIC {quic_inbound}/{quic_max_inbound}, inbound ceiling {quic_below_reserve}"));
+                }
+            }
+            TransportFact::DialFailed { error } => {
+                let mut started = 0;
+                let mut own_dial = false;
+                let mut capacities = None;
+                for entry in cx.log.entries() {
+                    let Observation::Transport {
+                        instance: source,
+                        seq: before,
+                        remote: target,
+                        event,
+                        ..
+                    } = &entry.obs
+                    else {
+                        continue;
+                    };
+                    if source != instance || before > seq {
+                        continue;
+                    }
+                    match event {
+                        TransportFact::DialStarted => {
+                            started += 1;
+                            own_dial |= target == remote;
+                        }
+                        TransportFact::HandshakeCounts {
+                            connection_cap,
+                            cap,
+                            ..
+                        } => {
+                            capacities = Some((
+                                reserve(*connection_cap),
+                                reserve(*cap),
+                                reserve(*connection_cap) + reserve(*cap),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let Some((connections, pending, quic)) = capacities else {
+                    continue;
+                };
+                let protected = match error.as_str() {
+                    "Zakura resource limit exceeded: admission" => connections,
+                    "Zakura resource limit exceeded: pending handshake" => pending,
+                    "Zakura resource limit exceeded: transport connections" => quic,
+                    _ => continue,
+                };
+                // Every scripted node dial makes one attempt. Counting even finished attempts
+                // bounds its own load without mistaking a delayed teardown for inbound load.
+                if own_dial && started <= protected {
+                    return cx.violated(
+                        "a dial within the reserved share is admitted",
+                        format!("{remote}: {error}; {started} attempts within reserve {protected}"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
 fn refused(key: &ObligationKey, obs: &Observation) -> bool {
     if let Subject::Owner(shared_id) = &key.subject {
         return matches!(obs, Observation::PeerConnectionClosed { shared_id: closed, code: 0 }
             if closed == shared_id);
     }
-    matches!(obs, Observation::Transport {
-        event: TransportFact::Handshake { shared_id, stage, error: Some(_), .. }, ..
-    } if key.subject == Subject::Session(shared_id.clone())
-        && key.property.as_str().split('/').nth(1) == Some(stage.as_str()))
+    let Observation::Transport {
+        event:
+            TransportFact::Handshake {
+                shared_id,
+                stage,
+                validation,
+                error: Some(error),
+                ..
+            },
+        ..
+    } = obs
+    else {
+        return false;
+    };
+    if key.subject != Subject::Session(shared_id.clone()) {
+        return false;
+    }
+    let mut parts = key.property.as_str().split('/');
+    let _ = parts.next();
+    let Some(row) = parts.next() else {
+        return false;
+    };
+    let Some(label) = parts
+        .next()
+        .and_then(|claim| claim.strip_suffix("-refused"))
+    else {
+        return false;
+    };
+    if stage != row {
+        return false;
+    }
+    let expected = match (row, label) {
+        (_, "oversize") => {
+            return validation.is_none() && error == "Zakura payload exceeded its cap"
+        }
+        (_, "bad-magic" | "bad-path" | "bad-role") | ("ack", "bad-version") => "malformed-control",
+        (
+            _,
+            "bad-frame-limit"
+            | "bad-message-limit"
+            | "bad-stream-limit"
+            | "bad-queue-limit"
+            | "bad-idle-limit"
+            | "limits-above-request",
+        ) => "bad-limits",
+        (_, "nonzero-initiator-nonce" | "nonzero-responder-nonce") => "nonzero-native-nonce",
+        _ => label,
+    };
+    validation.as_deref() == Some(expected)
 }
 
 fn released(key: &ObligationKey, obs: &Observation) -> bool {

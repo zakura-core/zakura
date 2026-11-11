@@ -55,13 +55,13 @@ fn honest_control_handshake_holds() {
 
 #[test]
 fn every_family_draws_a_conformant_control_exchange() {
-    for family in 0..7 {
+    for family in 0..8 {
         let mut input = [0; Wire::SCENARIO_BYTES];
         input[0] = family;
         let report = run(Wire::draw(&input));
         assert_held(
             &report,
-            if family == 1 {
+            if family == 1 || family == 7 {
                 "handshake/ack/conformant-never-refused"
             } else {
                 "handshake/hello/conformant-never-refused"
@@ -98,6 +98,74 @@ fn shared_addresses_hold_pending_and_permit_bounds() {
                 if hosts.iter().any(|(_, _, pending)| *pending >= 3) || quic_hosts.iter().any(|(_, pending)| *pending >= 3)
         )), "family {family}: shared-address load must reach the address bound; counts: {:?}", report.log.entries().iter().filter_map(|entry| match &entry.obs { zakura_sim::Observation::Transport { event: event @ zakura_sim::observe::TransportFact::HandshakeCounts { .. }, .. } => Some(event), _ => None }).collect::<Vec<_>>());
     }
+}
+
+fn assert_dial_under_load(report: &zakura_sim::RunReport, pending: usize, connections: usize) {
+    use zakura_sim::{observe::TransportFact, Observation};
+    assert_held(report, "handshake/dial-reserve-kept");
+    let (dial_seq, dial) = report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Transport {
+                seq,
+                remote,
+                event: TransportFact::DialStarted,
+                ..
+            } => Some((*seq, remote)),
+            _ => None,
+        })
+        .expect("the node attempts its dial");
+    let held = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Transport {
+                seq,
+                event:
+                    TransportFact::HandshakeCounts {
+                        inbound,
+                        inbound_connections,
+                        ..
+                    },
+                ..
+            } if *seq < dial_seq => Some((*inbound, *inbound_connections)),
+            _ => None,
+        })
+        .last();
+    assert_eq!(
+        held,
+        Some((pending, connections)),
+        "inbound pressure must hold when the node dials; {:?}",
+        report.end
+    );
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        Observation::Transport { seq, remote, event: TransportFact::Registered, .. } if remote == dial && *seq > dial_seq
+    )), "the reserved dial must register");
+}
+
+#[test]
+fn inbound_control_pressure_preserves_a_wire_dial() {
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[0] = 7;
+    input[1] = 24;
+    input[3] = 225;
+    input[4] = 100;
+    let report = run(Wire::draw(&input));
+    assert_dial_under_load(&report, 24, 24);
+}
+
+#[test]
+fn inbound_connection_pressure_preserves_a_wire_dial() {
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[0] = 7;
+    input[1] = 69;
+    input[4] = 100;
+    input[5] = 10;
+    let report = run(Wire::draw(&input));
+    assert_dial_under_load(&report, 0, 69);
 }
 
 #[test]

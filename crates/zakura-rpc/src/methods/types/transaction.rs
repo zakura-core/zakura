@@ -43,6 +43,8 @@ use zcash_transparent::{
 };
 
 mod no_sapling;
+#[cfg(test)]
+mod serialization_experiment;
 
 use super::zec::Zec;
 use super::{

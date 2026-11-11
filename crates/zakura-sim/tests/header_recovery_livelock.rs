@@ -3,6 +3,9 @@
 //! with `header-sync/bounded-adversary-progress` owed violates
 //! `sim/no-livelock` rather than running out its step budget (Rule 13 of
 //! the hdr-9 to hdr-13 plan). Honest recoveries stay well under the limit.
+//! A node that never stops being ready after the `Recover` pick keeps the
+//! `recovered` pick away, and its run fails as a harness failure at its
+//! budget.
 //! A node that keeps the clock moving but runs out the budget first, with
 //! the successor still owed, fails the run as a harness failure, so a
 //! campaign never counts it clean.
@@ -179,10 +182,21 @@ fn honest_recoveries_stay_under_half_the_livelock_limit() {
     }
 }
 
-/// `header-sync/storage` on a scenario, with one more task: it waits, a
-/// millisecond at a time, for the `recovered` pick, then spins at that
-/// instant from then on. It stands in for a reactor that keeps the clock
-/// still with an obligation open.
+/// Where a [`Spinning`] run's extra task starts spinning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum SpinFrom {
+    /// The `Recover` pick, before recovery has written its record.
+    Recover,
+    /// The `recovered` pick, with the successor owed.
+    Recovered,
+}
+
+/// `header-sync/storage` on a scenario, with one more task that waits for
+/// the pick the scenario names ([`SpinFrom`]), then spins at that instant
+/// from then on. It waits for the `recovered` pick a millisecond at a time,
+/// and for the `Recover` pick by staying ready, so it spins from that pick
+/// on. It stands in for a reactor that keeps the clock still and never
+/// stops being ready.
 struct Spinning(Storage);
 
 impl Wraps for Spinning {
@@ -219,26 +233,39 @@ impl Subsystem for Spinning {
     const NAME: &'static str = "test/recovery-spinning";
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
-    type Scenario = StorageScenario;
+    /// The scenario, and where the spin starts.
+    type Scenario = (StorageScenario, SpinFrom);
     type Prepared = Ports;
 
     /// [`Storage`]'s.
-    fn config(scenario: &StorageScenario) -> RunConfig {
+    fn config((scenario, _): &(StorageScenario, SpinFrom)) -> RunConfig {
         Storage::config(scenario)
     }
 
     /// [`Storage`]'s.
-    fn prepare(scenario: &StorageScenario) -> Ports {
+    fn prepare((scenario, _): &(StorageScenario, SpinFrom)) -> Ports {
         Storage::prepare(scenario)
     }
 
     /// The storage harness, then the spinning task.
-    fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
+    fn build(sim: &mut Sim, (scenario, from): &(StorageScenario, SpinFrom), ports: Ports) -> Self {
         let recovery: RecoveryEvidence = ports.recovery.clone();
         let storage = Storage::build(sim, scenario, ports);
+        let from = *from;
         sim.scheduler().spawn_root("spin", async move {
-            while recovery.record().is_none() {
-                zakura_rt::time::sleep(Duration::from_millis(1)).await;
+            let reached = |recovery: &RecoveryEvidence| match from {
+                SpinFrom::Recover => recovery.started().is_some(),
+                SpinFrom::Recovered => recovery.record().is_some(),
+            };
+            while !reached(&recovery) {
+                // Ready throughout, so the spin is already on at a
+                // `Recover` pick, which an ordinary enabled step can still
+                // take, before any quiet transition after it.
+                if from == SpinFrom::Recover {
+                    zakura_rt::task::yield_now().await;
+                } else {
+                    zakura_rt::time::sleep(Duration::from_millis(1)).await;
+                }
             }
             loop {
                 zakura_rt::task::yield_now().await;
@@ -260,12 +287,12 @@ impl Subsystem for Spinning {
     }
 
     /// [`Storage`]'s.
-    fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
+    fn assumptions((scenario, _): &(StorageScenario, SpinFrom)) -> Assumptions<Self> {
         recovering_assumptions(scenario)
     }
 
     /// Never drawn: spinning runs are typed.
-    fn draw(_: &[u8]) -> StorageScenario {
+    fn draw(_: &[u8]) -> (StorageScenario, SpinFrom) {
         unreachable!("spinning runs are typed")
     }
 }
@@ -371,10 +398,7 @@ impl Subsystem for Ticking {
 /// clean run either.
 #[test]
 fn a_budget_end_with_the_successor_owed_is_a_harness_failure() {
-    let (_, scenario) = storage_witnesses::owed_recovery_witnesses()
-        .into_iter()
-        .find(|(class, _)| *class == "reply holds")
-        .expect("hdr-13 has an owed reply-hold witness");
+    let scenario = owed_reply_holds();
     for input in inputs(8, 256) {
         let error = run_prepared::<Ticking>(
             &scenario,
@@ -404,8 +428,18 @@ fn a_budget_end_with_the_successor_owed_is_a_harness_failure() {
     }
 }
 
-/// hdr-13's owed reply-hold witness grows its source just before the
-/// recover, so its recovery owes the grown tip at the `recovered` pick,
+/// hdr-13's owed reply-hold witness: it grows its source just before the
+/// recover, so its recovery owes the grown tip at the `recovered` pick.
+fn owed_reply_holds() -> StorageScenario {
+    storage_witnesses::owed_recovery_witnesses()
+        .into_iter()
+        .find(|(class, _)| *class == "reply holds")
+        .map(|(_, scenario)| scenario)
+        .expect("hdr-13 has an owed reply-hold witness")
+}
+
+/// The owed reply-hold witness ([`owed_reply_holds`]) owes the grown tip at
+/// the `recovered` pick,
 /// which reaches the node only behind the source's status floor. The
 /// spinning task keeps the clock a millisecond after the pick, so that never
 /// comes. Under 8 plans the spin violates `sim/no-livelock` without a panic,
@@ -413,10 +447,7 @@ fn a_budget_end_with_the_successor_owed_is_a_harness_failure() {
 /// its budget.
 #[test]
 fn a_spin_after_recovered_violates_no_livelock() {
-    let (_, scenario) = storage_witnesses::owed_recovery_witnesses()
-        .into_iter()
-        .find(|(class, _)| *class == "reply holds")
-        .expect("hdr-13 has an owed reply-hold witness");
+    let scenario = (owed_reply_holds(), SpinFrom::Recovered);
     for input in inputs(8, 256) {
         let report = run_prepared::<Spinning>(
             &scenario,
@@ -451,6 +482,46 @@ fn a_spin_after_recovered_violates_no_livelock() {
             ),
             "the obligation was still open: {:?}",
             progress.outcome
+        );
+    }
+}
+
+/// A spin that starts at the `Recover` pick keeps a task ready from then
+/// on, so recovery's quiet transitions are never offered and the
+/// `recovered` pick never comes: no record, no recovery assumption, no
+/// `BoundedAdversary` and no obligation, so nothing judges the run. Under
+/// 8 plans it then fails as a harness failure when it reaches its budget,
+/// rather than ending there as a clean run.
+#[test]
+fn a_spin_before_recovered_fails_at_the_budget() {
+    let scenario = (owed_reply_holds(), SpinFrom::Recover);
+    for input in inputs(8, 256) {
+        let ports = Spinning::prepare(&scenario);
+        let recovery = ports.recovery.clone();
+        let error =
+            run_prepared::<Spinning>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .expect_err("the budget end before the recovered pick fails the run");
+        let HarnessError::Run { failure, report } = error else {
+            panic!("the run itself fails: {error}");
+        };
+        assert!(
+            matches!(
+                &failure,
+                HarnessFailure::SourceEvidence { detail, .. }
+                    if detail.contains("before the `recovered` pick")
+            ),
+            "{failure}"
+        );
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            report.end.steps >= Spinning::config(&scenario).budget,
+            "it ran out its budget: {:?}",
+            report.end
+        );
+        assert!(recovery.started().is_some(), "the recover was picked");
+        assert!(
+            recovery.record().is_none(),
+            "the spin kept the recovered pick away"
         );
     }
 }

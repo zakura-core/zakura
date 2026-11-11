@@ -2189,6 +2189,17 @@ impl Storage {
 /// prefix whose recover never comes ran to before. Its pick begins the node
 /// under test's stop, as a `Shutdown` step's does, and a harness task then
 /// stops every node ([`Topology::finish`]). It offers no time boundary.
+///
+/// A run that reaches [`RECOVERY_BUDGET`] after its `Recover` pick with no
+/// `recovered` pick yet fails as a harness failure instead. Recovery's
+/// transitions are quiet actions, offered only once no task is ready, so a
+/// reactor that never stops being ready keeps the pick, and with it every
+/// recovery assumption and `BoundedAdversary`, from ever coming. Nothing
+/// would judge that run, and a budget end alone proves no missed deadline,
+/// but it mustn't count as clean (Rule 13). Honest recoveries reach their
+/// pick far sooner, though they can be busy for thousands of steps at one
+/// instant first, which is why `BoundedAdversary` waits for the pick
+/// ([`recovered_bound`]).
 struct RecoveryFinish {
     recovery: RecoveryEvidence,
     adoption: AdoptionEvidence,
@@ -2237,9 +2248,22 @@ impl ActionSource for RecoveryFinish {
         self.to_task.send_replace(true);
     }
 
-    /// Notes the step, for the prefix's budget.
+    /// Notes the step, for the prefix's budget, and fails the run at
+    /// [`RECOVERY_BUDGET`] with the `recovered` pick still to come, as
+    /// [`RecoveryFinish`] says.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         self.step = log.step();
+        let waiting = self.recovery.started().is_some()
+            && self.recovery.progress(&self.adoption, &self.ends) == RecoveryProgress::Pending;
+        if waiting && self.step >= RECOVERY_BUDGET {
+            return Err(format!(
+                "the step budget ran out at step {} before the `recovered` pick, after the \
+                 `Recover` pick at {:?}: a task never stopped being ready, so recovery's \
+                 quiet transitions were never offered",
+                self.step,
+                self.recovery.started(),
+            ));
+        }
         Ok(())
     }
 }

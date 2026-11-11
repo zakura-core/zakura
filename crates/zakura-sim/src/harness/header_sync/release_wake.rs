@@ -4,7 +4,7 @@
 //! Plan bytes. It checks that property besides `header-sync/storage`'s,
 //! since no other harness declares the fixture.
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SimInstant;
@@ -24,7 +24,7 @@ use crate::{
         Subsystem,
     },
     property::{EndViolation, HasView, Property, Sources},
-    ActionSource, Boundary, Identity, ObservationLog, RunConfig, RunEnd, Sim,
+    ActionSource, Boundary, Identity, ObservationLog, RecoveryOffer, RunConfig, RunEnd, Sim,
 };
 
 /// The headers of room the fixture's body lag leaves: the node's verified
@@ -153,13 +153,19 @@ fn release() -> StorageScenario {
             ),
             control(
                 "node",
-                ControlAction::Release { hold: 0 },
+                ControlAction::Release {
+                    hold: MIRROR_0_HOLD,
+                },
                 Trigger::HeadroomWait("mirror-2".to_owned()),
             ),
         ],
         weights: Weights::default(),
     }
 }
+
+/// The policy hold [`release`]'s `Release` step opens: `mirror-0`'s, the
+/// first of its holds.
+const MIRROR_0_HOLD: usize = 0;
 
 /// The policy hold [`Settle`] opens: `mirror-1`'s, the second of
 /// [`release`]'s holds.
@@ -174,9 +180,10 @@ const MIRROR_1_HOLD: usize = 1;
 /// one expires once the clock passes its deadline, which is never more
 /// than [`CACHED_PASS_REFILL`] after the wake opened. So the release comes
 /// after the measured boundary, including when a bypass stopped the wake,
-/// and a run is the same as one without it up to that boundary. It offers
-/// no time boundary of its own, since one could change when the clock
-/// moves before that.
+/// and a run is the same as one without it up to that boundary. Live, it
+/// offers no time boundary of its own, since one could change when the
+/// clock moves before that. The drain's recovery boundary comes only after
+/// the deadline, so it can't.
 struct Settle {
     wake: WakeEvidence,
     topology: Rc<Topology>,
@@ -210,6 +217,37 @@ impl ActionSource for Settle {
     fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
         self.done = true;
         self.topology.release(MIRROR_1_HOLD);
+    }
+
+    /// `settle` while [`Settle::due`], as live. Once a wake opened and
+    /// before the release, the first instant `due` holds, which is the
+    /// wake's deadline plus 1 ns, whether or not the wake is still open.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        if self.done {
+            return;
+        }
+        self.enabled(now, &mut out.actions);
+        if let Some(due) = self
+            .wake
+            .last_opened()
+            .and_then(|at| at.checked_add(CACHED_PASS_REFILL + Duration::from_nanos(1)))
+            .filter(|due| *due > now)
+        {
+            out.boundaries.push(due);
+        }
+    }
+
+    /// Nothing: its hold is owned, so the drain keeps it.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// While the release hasn't run, `mirror-1`'s held prepare, which only a
+    /// wake's opening can release.
+    fn holds_work(&self) -> Option<String> {
+        (!self.done).then(|| {
+            "release-wake fixture holds mirror-1's prepare until a wake opens and its \
+             cached-pass refill passes"
+                .to_owned()
+        })
     }
 }
 
@@ -271,6 +309,9 @@ impl Subsystem for ReleaseWake {
     fn build(sim: &mut Sim, scenario: &WakeScenario, ports: Ports) -> Self {
         let wake = ports.wake.clone();
         let storage = Storage::build(sim, &scenario.storage(), ports);
+        // Both holds release as the fixture plans, in the drain too.
+        storage.topology.own(MIRROR_0_HOLD);
+        storage.topology.own(MIRROR_1_HOLD);
         sim.add_source(Box::new(Settle {
             wake,
             topology: storage.topology.clone(),

@@ -491,6 +491,11 @@ impl Checker for Measured {
                 _ => None,
             }));
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// `scenario`'s run through harness `S` under `input`, measured.

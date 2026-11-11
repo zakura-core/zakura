@@ -154,6 +154,21 @@ impl<S: ActionSource> ActionSource for SkipAt<S> {
         }
         self.inner.observe(log)
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A reader that forwards everything to `inner`, but at step `at` observes
@@ -190,6 +205,21 @@ impl<S: ActionSource> ActionSource for Divert<S> {
             log.push(last.obs.clone());
         }
         Ok(())
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 
@@ -231,6 +261,21 @@ impl<S: ActionSource> ActionSource for Rewrite<S> {
         }
         Ok(())
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A reader that forwards everything to `inner`, then drops it right after
@@ -269,6 +314,25 @@ impl<S: ActionSource> ActionSource for DropAfter<S> {
             self.inner = None;
         }
         Ok(())
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &self.inner {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut self.inner {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|inner| inner.holds_work())
     }
 }
 
@@ -545,6 +609,17 @@ impl ActionSource for SharedSource {
             None => Ok(()),
         }
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What [`AtEnd`] does in `at_end`.
@@ -584,6 +659,11 @@ impl zakura_sim::Checker for AtEnd {
             Late::EmitOutside => emit_outside_the_run(&self.observer),
         }
         Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
     }
 }
 
@@ -669,6 +749,21 @@ impl<S: ActionSource> ActionSource for RefuseBefore<S> {
             emit_outside_the_run(&self.observer);
         }
         self.inner.observe(log)
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 

@@ -325,6 +325,17 @@ impl ActionSource for DrawsOnOffer {
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         self.runs.set(self.runs.get() + 1);
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Runs `budget` live steps with a [`DrawsOnOffer`] that draws on call `at`

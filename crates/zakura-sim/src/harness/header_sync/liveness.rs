@@ -831,6 +831,17 @@ impl ActionSource for Finish {
         }
         Ok(())
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Which kind of liveness fixture a run is, for [`Finish`].
@@ -899,6 +910,17 @@ impl ActionSource for Deadlines {
     /// Never called: it offers no action.
     fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
         unreachable!("the deadline source offers no action")
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

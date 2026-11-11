@@ -166,6 +166,55 @@ impl StepCtx<'_> {
     }
 }
 
+/// The checks a checker still has open: each would need more of the run to
+/// conclude.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unfinished {
+    /// Each open check, in the checker's order.
+    pub open: Vec<OpenCheck>,
+}
+
+impl Unfinished {
+    /// The earliest deadline among the open checks, or `None` if none has
+    /// one.
+    pub fn earliest_deadline(&self) -> Option<SimInstant> {
+        self.open.iter().filter_map(|check| check.deadline).min()
+    }
+
+    /// Whether nothing is open.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+}
+
+/// One open check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCheck {
+    /// The property's ID.
+    pub property: String,
+    /// What the check waits on, in the form its violation would name it.
+    pub subject: String,
+    /// What kind of check it is.
+    pub kind: OpenKind,
+    /// The instant it expires after, if it has one.
+    pub deadline: Option<SimInstant>,
+}
+
+/// What kind of check is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenKind {
+    /// An obligation with a virtual-time bound.
+    Timed,
+    /// An obligation bounded by a task's operations.
+    Ops,
+    /// An obligation that must be discharged before quiescence.
+    BeforeQuiescence,
+    /// An obligation a view-side fact deferred to a deadline.
+    Deferred,
+    /// An evaluation that couldn't yet judge its trigger.
+    Pending,
+}
+
 /// Checks properties as a run goes.
 pub trait Checker {
     /// Called after every step. A violation ends the run at once.
@@ -214,6 +263,9 @@ pub trait Checker {
     fn stops(&mut self, _property: &str) -> bool {
         true
     }
+
+    /// The checks still open now, which the drain keeps running for.
+    fn unfinished(&self) -> Unfinished;
 }
 
 /// A checker that checks nothing.
@@ -227,6 +279,11 @@ impl Checker for NoChecks {
 
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         Vec::new()
+    }
+
+    /// Nothing, since it checks nothing.
+    fn unfinished(&self) -> Unfinished {
+        Unfinished::default()
     }
 }
 
@@ -269,6 +326,11 @@ where
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         (self.end)(end, log)
     }
+
+    /// Nothing, since closures keep no obligations.
+    fn unfinished(&self) -> Unfinished {
+        Unfinished::default()
+    }
 }
 
 impl<C: Checker + ?Sized> Checker for Box<C> {
@@ -310,5 +372,10 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
     /// Forwards to the checker.
     fn stops(&mut self, property: &str) -> bool {
         (**self).stops(property)
+    }
+
+    /// Forwards to the checker.
+    fn unfinished(&self) -> Unfinished {
+        (**self).unfinished()
     }
 }

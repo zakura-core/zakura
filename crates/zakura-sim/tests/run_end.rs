@@ -98,6 +98,17 @@ impl ActionSource for Always {
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         self.0.set(self.0.get() + 1);
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 #[test]
@@ -393,6 +404,17 @@ impl ActionSource for WaitsOnDrop {
     fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
     fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {}
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Drop for WaitsOnDrop {

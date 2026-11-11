@@ -502,6 +502,11 @@ impl Checker for Points {
             _ => None,
         }));
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// If the deferred timer is lost and nothing else is armed, the run ends

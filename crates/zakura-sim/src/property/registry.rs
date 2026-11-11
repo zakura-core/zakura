@@ -14,7 +14,10 @@ use super::{
     TriggerHistory, Verdict,
 };
 use crate::{
-    check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
+    check::{
+        Checker, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx, Unfinished,
+        Violation,
+    },
     end::{HarnessFailure, Outcome, RunEnd},
     model::LabelledFrame,
     Observation, ObservationLog,
@@ -111,6 +114,13 @@ impl<A: Checker, B: Checker> Checker for Tee<A, B> {
     fn stops(&mut self, property: &str) -> bool {
         let first = self.0.stops(property);
         self.1.stops(property) && first
+    }
+
+    /// `.0`'s open checks, then `.1`'s.
+    fn unfinished(&self) -> Unfinished {
+        let mut open = self.0.unfinished().open;
+        open.extend(self.1.unfinished().open);
+        Unfinished { open }
     }
 }
 
@@ -675,6 +685,38 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 state.violations.push(violation.clone());
             }
         }
+    }
+
+    /// Every property's open obligations, each with its deadline as expiry
+    /// computes it, then its pending mark, if any, which has no deadline.
+    fn unfinished(&self) -> Unfinished {
+        let mut open = Vec::new();
+        for (property, state) in self.properties.iter().zip(&self.state) {
+            let floor = state.holds_since.map(|(_, at)| at);
+            for obligation in &state.open {
+                let kind = match (obligation.deferred, obligation.obligation.bound) {
+                    (Some(_), _) => OpenKind::Deferred,
+                    (None, LivenessBound::VirtualTime(_)) => OpenKind::Timed,
+                    (None, LivenessBound::Ops { .. }) => OpenKind::Ops,
+                    (None, LivenessBound::BeforeQuiescence) => OpenKind::BeforeQuiescence,
+                };
+                open.push(OpenCheck {
+                    property: property.id.to_string(),
+                    subject: format!("{:?}", obligation.obligation.key.subject),
+                    kind,
+                    deadline: obligation.deadline(floor),
+                });
+            }
+            if let Some(reason) = state.unsettled {
+                open.push(OpenCheck {
+                    property: property.id.to_string(),
+                    subject: reason.to_string(),
+                    kind: OpenKind::Pending,
+                    deadline: None,
+                });
+            }
+        }
+        Unfinished { open }
     }
 }
 

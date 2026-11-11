@@ -1794,6 +1794,17 @@ mod tests {
             }
             Ok(())
         }
+
+        /// Nothing: it finishes no submitted work.
+        fn recovery(&self, _now: zakura_scheduler::SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+        /// Nothing: it has no holds.
+        fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+        /// None: it holds no submitted work.
+        fn holds_work(&self) -> Option<String> {
+            None
+        }
     }
 
     /// The outcome of each of `discovery/wire`'s properties over `log`, by

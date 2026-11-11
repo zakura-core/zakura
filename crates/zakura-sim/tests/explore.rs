@@ -504,6 +504,11 @@ impl Checker for ViolatesAtEnd {
             },
         )]
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 #[test]

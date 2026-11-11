@@ -90,6 +90,11 @@ impl Checker for Steering<'_> {
     fn step_loop_violation(&mut self, violation: &Violation) {
         self.also.get_or_insert_with(|| violation.clone());
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// Every real choice `lines` recorded before step `upto`, as a script:
@@ -228,5 +233,12 @@ impl Checker for Pair<'_> {
     fn stops(&mut self, property: &str) -> bool {
         let first = self.0.stops(property);
         self.1.stops(property) && first
+    }
+
+    /// The first's open checks, then the second's.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        let mut open = self.0.unfinished().open;
+        open.extend(self.1.unfinished().open);
+        zakura_sim::Unfinished { open }
     }
 }

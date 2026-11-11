@@ -39,8 +39,11 @@ pub mod table;
 pub mod trace;
 pub mod witness;
 
-pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
-pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};
+pub use action::{Action, ActionSource, Boundary, Enabled, RecoveryOffer, SourceId};
+pub use check::{
+    Checker, NoChecks, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx, Unfinished,
+    Violation,
+};
 pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};

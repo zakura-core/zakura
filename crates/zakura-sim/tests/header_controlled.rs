@@ -999,6 +999,21 @@ impl<S: ActionSource> ActionSource for SkipAt<S> {
         }
         self.inner.observe(log)
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A run where one task reads membership through a controlled port, with
@@ -1067,6 +1082,21 @@ impl<S: ActionSource> ActionSource for Divert<S> {
             log.push(last.obs.clone());
         }
         Ok(())
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 
@@ -1229,6 +1259,21 @@ impl<S: ActionSource> ActionSource for Rewrite<S> {
             log.push(obs);
         }
         Ok(())
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 
@@ -1439,6 +1484,25 @@ impl<S: ActionSource> ActionSource for DropAfter<S> {
             self.inner = None;
         }
         Ok(())
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &self.inner {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut self.inner {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|inner| inner.holds_work())
     }
 }
 
@@ -1865,6 +1929,28 @@ impl ActionSource for SharedSource {
             None => Ok(()),
         }
     }
+
+    /// Forwards to the shared source while it's there.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &*self.0.borrow() {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to the shared source while it's there.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut *self.0.borrow_mut() {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to the shared source while it's there.
+    fn holds_work(&self) -> Option<String> {
+        self.0
+            .borrow()
+            .as_ref()
+            .and_then(|inner| inner.holds_work())
+    }
 }
 
 /// A checker that drops the shared storage at `when`, and records the
@@ -1897,6 +1983,11 @@ impl zakura_sim::Checker for Dropper {
             let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
         }
         Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
     }
 }
 
@@ -2068,6 +2159,11 @@ impl zakura_sim::Checker for DrawsAtEnd {
         let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
         Vec::new()
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// D2 covers any harness failure, not only storage's: with no storage at
@@ -2164,6 +2260,21 @@ impl<S: ActionSource> ActionSource for RefuseBefore<S> {
         }
         self.inner.observe(log)
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A checker that uses the port in `at_end` as `poke` says.
@@ -2188,6 +2299,11 @@ impl zakura_sim::Checker for PokeAtEnd {
             Poke::Nothing | Poke::RefuseBefore(_) => {}
         }
         Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
     }
 }
 

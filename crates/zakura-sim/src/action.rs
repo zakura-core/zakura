@@ -48,10 +48,29 @@ pub enum Boundary {
     Deadline(SimInstant),
 }
 
+/// What a source offers the drain: the actions that finish work already
+/// submitted to it.
+///
+/// Each index is in the source's own index space, the one `enabled` uses,
+/// and [`ActionSource::execute`] accepts it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryOffer {
+    /// Actions that finish submitted work. They aren't limited to what
+    /// `enabled` lists: a policy lists completions its holds filter out.
+    pub actions: Vec<(Identity, u64)>,
+    /// Actions eligible only at a step with no ready task, as
+    /// [`ActionSource::quiet`]'s are.
+    pub quiet: Vec<(Identity, u64)>,
+    /// Future instants where a recovery action becomes available.
+    pub boundaries: Vec<SimInstant>,
+}
+
 /// Actions outside the scheduler, such as datagrams or storage completions.
 ///
-/// `enabled` and `boundaries` must be pure functions of the source's state, so
-/// a run replays. Only `execute` and `observe` change it.
+/// `enabled`, `boundaries`, `quiet` and `recovery` must be pure functions of
+/// the source's state, so a run replays. Only `execute`, `observe` and
+/// `enter_drain` change it. `execute` accepts every index any of them
+/// offers.
 pub trait ActionSource {
     /// Appends each action enabled at `now`, with the index `execute` takes.
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>);
@@ -88,6 +107,23 @@ pub trait ActionSource {
     fn recovering(&self) -> bool {
         false
     }
+
+    /// Appends what the drain may run at `now` to finish work already
+    /// submitted to this source, ignoring the source's holds, as
+    /// [`RecoveryOffer`] describes. It offers no adversary act. Like
+    /// `enabled`, it must be pure.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer);
+
+    /// Runs once, when the run enters its drain, before the first
+    /// `recovery` call. It retires the source's policy and task holds, and
+    /// may append what it did to `log`.
+    fn enter_drain(&mut self, log: &mut ObservationLog);
+
+    /// Names submitted work this source still holds that no recovery action
+    /// or boundary will finish, or `None` if there's none. The run asks only
+    /// once nothing else can move, so the source may assume no task runs
+    /// first.
+    fn holds_work(&self) -> Option<String>;
 }
 
 /// What one source offers at one step.

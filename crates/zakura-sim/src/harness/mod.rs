@@ -42,7 +42,7 @@ pub(crate) use record::write_trace;
 pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE};
 
 use crate::{
-    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
+    check::{Checker, Phase, PropertyReport, StepCtx, Unfinished, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
     explore::{self, ExploreRun},
     net::Net,
@@ -765,5 +765,10 @@ impl Checker for Dyn<'_> {
     /// Forwards to the checker.
     fn stops(&mut self, property: &str) -> bool {
         self.0.stops(property)
+    }
+
+    /// Forwards to the checker.
+    fn unfinished(&self) -> Unfinished {
+        self.0.unfinished()
     }
 }

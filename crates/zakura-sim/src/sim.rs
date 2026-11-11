@@ -8,10 +8,12 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use zakura_rt::sync::CancellationToken;
 use zakura_scheduler::{
     At, CleanupReport, ObjectId, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
 };
@@ -139,6 +141,66 @@ pub struct Sim {
     on_end: Vec<EndHook>,
     /// The tasks stopped mid-poll at the boundary the sources observe now.
     mid_poll: MidPoll,
+    /// The harness tasks that can produce work forever.
+    generators: Rc<Generators>,
+}
+
+/// The run's generators: harness tasks that can produce work forever, such
+/// as flood's sender. Each is spawned with a cancellation token of its own,
+/// never a connection's, so retiring it stops only its work. Cloning the
+/// [`Rc`] shares the list, so a task can register one.
+#[derive(Debug, Default)]
+pub struct Generators(RefCell<GeneratorList>);
+
+#[derive(Debug, Default)]
+struct GeneratorList {
+    /// Each generator's token, in registration order.
+    tokens: Vec<CancellationToken>,
+    /// Set once [`Generators::retire`] ran.
+    retired: bool,
+}
+
+impl Generators {
+    /// Records `token` as a generator's, so retirement cancels it. Once
+    /// the generators are retired, it cancels `token` at once instead, so
+    /// a generator started in the drain never produces work.
+    fn register(&self, token: &CancellationToken) {
+        let retired = {
+            let mut list = self.0.borrow_mut();
+            list.tokens.push(token.clone());
+            list.retired
+        };
+        if retired {
+            token.cancel();
+        }
+    }
+
+    /// Spawns `task` from inside a run's task as a generator labelled
+    /// `label`, which stops once `token` is cancelled. See
+    /// [`Generators::register`].
+    #[track_caller]
+    pub fn spawn(
+        &self,
+        label: &'static str,
+        token: CancellationToken,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.register(&token);
+        zakura_rt::task::spawn_named(label, task);
+    }
+
+    /// Cancels every generator's token, and every later one's at its
+    /// registration.
+    fn retire(&self) {
+        let tokens = {
+            let mut list = self.0.borrow_mut();
+            list.retired = true;
+            list.tokens.clone()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+    }
 }
 
 /// A [`Sim::on_end`] hook.
@@ -185,7 +247,33 @@ impl Sim {
             on_frozen: Vec::new(),
             on_end: Vec::new(),
             mid_poll: MidPoll::default(),
+            generators: Rc::default(),
         }
+    }
+
+    /// The run's generator list, for a task that spawns one
+    /// ([`Generators::spawn`]).
+    pub fn generators(&self) -> Rc<Generators> {
+        self.generators.clone()
+    }
+
+    /// Spawns `task` at setup as a generator labelled `label`, which stops
+    /// once `token` is cancelled. `token` must be the generator's own, not a
+    /// connection's, since [`Sim::retire_generators`] cancels it.
+    pub fn spawn_generator(
+        &mut self,
+        label: &'static str,
+        token: CancellationToken,
+        task: impl Future<Output = ()> + 'static,
+    ) {
+        self.generators.register(&token);
+        self.scheduler().spawn_root(label, task);
+    }
+
+    /// Cancels every generator's token, so none produces more work. A
+    /// generator registered later is cancelled at once.
+    pub fn retire_generators(&mut self) {
+        self.generators.retire();
     }
 
     /// The tasks stopped mid-poll at each boundary the sources observe, as

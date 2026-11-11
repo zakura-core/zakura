@@ -579,6 +579,17 @@ impl ActionSource for PeerControl {
         }
         observed.map(drop)
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Drop for PeerControl {
@@ -1860,6 +1871,11 @@ mod tests {
         fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
             self.0.borrow_mut().push_back(written(1));
             Vec::new()
+        }
+
+        /// Nothing: it keeps no obligations.
+        fn unfinished(&self) -> crate::Unfinished {
+            crate::Unfinished::default()
         }
     }
 

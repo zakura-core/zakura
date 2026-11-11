@@ -143,6 +143,17 @@ impl ActionSource for FakeNet {
         };
         event(log, "net", format!("{what} {}:{}", d.link, d.seq));
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A fake storage service. A submitted operation completes with `success` or
@@ -267,6 +278,25 @@ impl ActionSource for FakeStorage {
         let service = self.0.borrow().service.clone();
         event(log, "storage", format!("{service}:{seq}:{outcome}"));
     }
+
+    /// `success` for each pending operation, which is always legal.
+    fn recovery(&self, _: SimInstant, out: &mut crate::RecoveryOffer) {
+        let storage = self.0.borrow();
+        for (seq, _) in storage.ops.iter().filter(|(_, op)| op.result.is_none()) {
+            out.actions.push((
+                Identity::storage(&storage.service, *seq, OUTCOMES[0]),
+                2 * seq,
+            ));
+        }
+    }
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: every pending operation can complete with `success`.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A fake peer that takes scripted actions in order, at most `per_instant`
@@ -354,6 +384,17 @@ impl ActionSource for FakePeer {
         let name = peer.name.clone();
         drop(peer);
         event(log, "peer", format!("{name}:{action}"));
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

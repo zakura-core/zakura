@@ -2,6 +2,7 @@
 
 use std::{
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -10,7 +11,7 @@ use tokio::{
     sync::{mpsc as tokio_mpsc, oneshot},
     time::{self, timeout},
 };
-use tower::service_fn;
+use tower::{service_fn, Service};
 use tracing::Span;
 
 use crate::{
@@ -178,4 +179,59 @@ async fn cancelled_crawl_releases_gate() {
         .unwrap();
     next.abort();
     assert!(next.await.unwrap_err().is_cancelled());
+}
+
+struct UnreadyPeerService {
+    ready_polled: Option<oneshot::Sender<()>>,
+}
+
+impl Service<Request> for UnreadyPeerService {
+    type Response = Response;
+    type Error = BoxError;
+    type Future = futures::future::Ready<Result<Response, BoxError>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        if let Some(ready_polled) = self.ready_polled.take() {
+            ready_polled.send(()).unwrap();
+        }
+        Poll::Pending
+    }
+
+    fn call(&mut self, _request: Request) -> Self::Future {
+        panic!("a service that never becomes ready must not be called")
+    }
+}
+
+/// A crawl waiting for a usable peer must not block selection of the next dial.
+#[tokio::test]
+async fn crawl_waiting_for_readiness_does_not_block_candidate_selection() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let candidate = "127.0.0.11:8233".parse().unwrap();
+    book.update(MetaAddr::new_initial_peer(candidate)).unwrap();
+    let (ready_polled, readiness) = oneshot::channel();
+    let candidates = Arc::new(futures::lock::Mutex::new(CandidateSet::new(
+        Arc::new(Mutex::new(book)),
+        UnreadyPeerService {
+            ready_polled: Some(ready_polled),
+        },
+    )));
+    let (demand, _demand_rx) = mpsc::channel(10);
+
+    time::pause();
+    let task = tokio::spawn(crawl(candidates.clone(), demand));
+    timeout(TEST_TIMEOUT, readiness).await.unwrap().unwrap();
+    let selected = timeout(TEST_TIMEOUT, async { candidates.lock().await.next().await })
+        .await
+        .expect("known candidates must not wait for peer-set readiness")
+        .unwrap();
+    assert_eq!(selected.addr, candidate);
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
 }

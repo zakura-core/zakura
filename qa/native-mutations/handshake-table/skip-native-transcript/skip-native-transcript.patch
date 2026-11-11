@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1086,9 +1086,6 @@
+                     || self.responder_upgrade_nonce != [0; 32]
+                 {
+                     return Err(ZakuraValidationError::UpgradeNonceMismatch);
+-                }
+-                if self.legacy_upgrade_transcript != [0; 32] {
+-                    return Err(ZakuraValidationError::TranscriptMismatch);
+                 }
+             }
+         }

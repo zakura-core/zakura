@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -6587,9 +6587,6 @@
+     let mut fixed_reader = &fixed[..];
+     let mut magic = [0; 4];
+     fixed_reader.read_exact(&mut magic)?;
+-    if magic != STREAM_PRELUDE_MAGIC {
+-        return Err(ZakuraProtocolError::InvalidMagic.into());
+-    }
+     let stream_kind = fixed_reader.read_u16::<LittleEndian>()?;
+     let stream_version = fixed_reader.read_u16::<LittleEndian>()?;
+     let request_id = match fixed[STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET] {

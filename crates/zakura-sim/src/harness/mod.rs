@@ -19,6 +19,8 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
+pub mod handshake_counts;
+pub mod handshake_wire;
 pub mod header_acceptance;
 pub mod header_node;
 pub mod header_sync;
@@ -136,6 +138,15 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// fuzz input.
     fn draw(prefix: &[u8]) -> Self::Scenario;
 
+    /// The scenario families `draw` picks by a tag at the prefix's start,
+    /// such as a saved scenario's two bytes. A uniform draw almost never
+    /// writes a tag, so `zakura-sim generate` writes each family's tag on a
+    /// share of its runs. Every tag `draw` matches must be listed, and a
+    /// draw that matches none lists none, the default.
+    fn families() -> Vec<ScenarioFamily> {
+        Vec::new()
+    }
+
     /// Whether this generator reads `prefix`, exactly
     /// [`Subsystem::SCENARIO_BYTES`] long, as its own rather than drawing a
     /// fallback scenario for it, as `draw` does for another generator's
@@ -153,6 +164,26 @@ pub trait Subsystem: HasView + Sized + 'static {
             "{} migrates no generator-{generator} input",
             Self::NAME
         ))
+    }
+}
+
+/// One scenario family a harness's draw picks by a tag
+/// ([`Subsystem::families`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioFamily {
+    /// The family's name, as `zakura-sim generate` reports it.
+    pub name: &'static str,
+    /// The bytes at the prefix's start that pick it.
+    pub tag: Vec<u8>,
+}
+
+impl ScenarioFamily {
+    /// The family `tag` picks, named `name`.
+    pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
+        ScenarioFamily {
+            name,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -430,6 +461,8 @@ pub struct HarnessEntry {
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
     /// [`Subsystem::accepts`].
     pub accepts: fn(&[u8]) -> bool,
+    /// [`Subsystem::families`]. A machine has none.
+    pub families: fn() -> Vec<ScenarioFamily>,
     /// [`Subsystem::migrate`].
     pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
 }
@@ -500,6 +533,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
         accepts: S::accepts,
+        families: S::families,
         migrate: S::migrate,
     }
 }
@@ -512,6 +546,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     header_work::REACTOR_ENTRY,
     header_work::PUBLISHER_ENTRY,
     block_work::REACTOR_ENTRY,
+    handshake_counts::ENTRY,
+    entry::<handshake_wire::Wire>(),
     discovery_machine::BOOK_ENTRY,
     discovery_machine::STATE_ENTRY,
     entry::<discovery::VerificationCapacity>(),

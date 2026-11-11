@@ -1233,6 +1233,43 @@ impl ZakuraControlAck {
     }
 }
 
+/// A stream-setup refusal before the handler installs a service session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreludeRejection {
+    /// The prelude codec or read deadline rejected the stream.
+    BadPrelude,
+    /// The registry has no matching kind and version.
+    UnknownKind,
+    /// The connection did not negotiate the stream's capability.
+    UnnegotiatedCapability,
+    /// A newer negotiated layout supersedes this version.
+    UnselectedVersion,
+    /// A persistent stream carried a request ID.
+    UnexpectedRequestId,
+    /// A request stream omitted its request ID.
+    RequestWithoutId,
+    /// The opener's frame cap cannot carry the declared message table.
+    UndersizedFrameCap,
+    /// The service's session policy excludes this opener.
+    IneligibleOpener,
+}
+
+impl PreludeRejection {
+    /// The existing trace and close-cause label for this refusal.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::BadPrelude => "bad_prelude",
+            Self::UnknownKind => "unknown_kind",
+            Self::UnnegotiatedCapability => "unnegotiated_capability",
+            Self::UnselectedVersion => "unselected_version",
+            Self::UnexpectedRequestId => "unexpected_request_id",
+            Self::RequestWithoutId => "request_without_id",
+            Self::UndersizedFrameCap => "undersized_frame_cap",
+            Self::IneligibleOpener => "unexpected_stream",
+        }
+    }
+}
+
 /// Prelude written immediately after opening each Zakura stream.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct StreamPrelude {

@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1062,9 +1062,6 @@
+         if self.capabilities & expected.local.required_capabilities
+             != expected.local.required_capabilities
+         {
+-            return Err(ZakuraValidationError::MissingRequiredCapability);
+-        }
+-        if self.required_channels & !expected.local.supported_channels != 0 {
+             return Err(ZakuraValidationError::MissingRequiredCapability);
+         }
+         validate_initial_limits(self.initial_limits, expected.local)

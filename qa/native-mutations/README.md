@@ -27,3 +27,31 @@ its exact selector with `--list`, require one executed test, and compare the
 unchanged, patched, and restored runs. Only the declared assertion counts as
 detection. Native assertions do not acquire simulator property IDs through
 this mapping.
+
+## Generator lanes
+
+The handshake PR includes the shared mut-4 generator and mutation-runner
+infrastructure. It keeps the existing harness decoders and registers their
+scenario-family selectors. `handshake/wire` lists fifteen families;
+`handshake/counts` draws machine operations directly.
+
+Run searches and mutation campaigns on the droplet. For example:
+
+```sh
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generators
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generate \
+  --sim handshake/counts --seed 11 --runs 1000 --out results/handshake-counts
+cargo xtask planted loop --only session/capacity-conserved \
+  --generate-runs 100 --generate-seeds 11 --generate-harness handshake/wire \
+  --out results/handshake-capacity-loop
+```
+
+The loop checks its unpatched baseline first. It excludes committed inputs from
+in-process generator searches, confirms a discovered failure in a fresh process,
+and requires exact replay before classifying the mutation. The report records
+which family found the failure and whether the property applied. A baseline
+failure remains a separate finding; it never counts as a killed mutation.
+
+`scripts/mutation_joint_run.py` compares reports and reruns lanes affected by
+changes since the previous report's pinned commit. A newly surviving mutation,
+failing baseline, or property finding makes the comparison fail.

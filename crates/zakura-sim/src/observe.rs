@@ -12,6 +12,35 @@ use crate::model::Label;
 #[serde(tag = "obs", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Observation {
+    /// The peer received the node's application close before or after registration.
+    PeerConnectionClosed {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The application close code received on the wire.
+        code: u64,
+    },
+    /// The peer received a reset on a stream that may never become a session.
+    PeerStreamReset {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The stream reset by the node.
+        quic_stream: u64,
+        /// The wire reset code.
+        code: u64,
+    },
+    /// A scripted control payload or prelude, labelled before its write.
+    PeerHandshake {
+        /// The peer endpoint's address.
+        remote: String,
+        /// The connection identity derived from TLS.
+        shared_id: String,
+        /// The QUIC stream, including streams that never install a session.
+        quic_stream: u64,
+        /// Hello, ack, or prelude.
+        row: String,
+        /// The deliberate deviation, or conformant.
+        label: String,
+    },
     /// A task the run hadn't seen before became ready. A task spawned while
     /// every worker is busy shows up at the step that first offers it.
     TaskSpawned {
@@ -1942,6 +1971,149 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// QUIC admission after the acceptor and endpoint guards.
+    QuicAdmission {
+        /// The source socket address.
+        remote: String,
+        /// Whether Retry or another mechanism validated the address.
+        validated: bool,
+        /// Pending TLS attempts on the endpoint.
+        pending_total: usize,
+        /// Pending TLS attempts in this source's admission group.
+        pending_from_ip: usize,
+        /// The production action: accept, refuse, retry, or ignore.
+        decision: String,
+        /// The configured per-address pending limit.
+        max_pending_per_ip: Option<u32>,
+        /// The configured Retry threshold.
+        retry_threshold: Option<u32>,
+    },
+    /// An admitted inbound TLS attempt started.
+    QuicTlsStarted {
+        /// The source socket address.
+        remote: String,
+        /// The configured TLS timeout, if enabled.
+        deadline_ms: Option<u64>,
+    },
+    /// An inbound TLS attempt completed or failed.
+    QuicHandshakeFinished {
+        /// The source socket address.
+        remote: String,
+        /// The production error, if any.
+        error: Option<String>,
+    },
+    /// Production session permits and their actual reservation owners.
+    SessionCapacity {
+        /// Live inbound reservations that still hold setup permits.
+        inbound_setups: Vec<usize>,
+        /// Free inbound, outbound, setup, and inbound-setup permits.
+        free: [usize; 4],
+        /// Reservations holding each kind of permit, in the same order.
+        held: [usize; 4],
+        /// Configured capacity of each permit pool, in the same order.
+        capacity: [usize; 4],
+    },
+    /// The handler created a peer's stream setup.
+    StreamSetupStarted {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// Configured burst and refill per second.
+        rate: u32,
+    },
+    /// Actual per-connection stream owners and semaphore capacity.
+    StreamLoad {
+        /// Owners waiting for setup.
+        setup: usize,
+        /// Owners running a worker.
+        installed: usize,
+        /// Owners retained after their worker stopped.
+        retiring: usize,
+        /// Free stream permits.
+        available: usize,
+        /// Negotiated stream limit.
+        capacity: usize,
+        /// Configured stream-open burst and refill per second.
+        rate: u32,
+    },
+    /// The control exchange captured the node's capability mask.
+    HandshakeCapabilities {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The captured capability mask.
+        supported: u64,
+    },
+    /// Runtime service demand changed the node's enabled capabilities.
+    CapabilitiesChanged {
+        /// The enabled mask after the change.
+        supported: u64,
+    },
+    /// Admission machine charges and independently read semaphore usage.
+    HandshakeCounts {
+        /// Connection slots charged by the machine.
+        connections: usize,
+        /// Inbound connection slots charged by the machine.
+        inbound_connections: usize,
+        /// Live total connection permits.
+        connection_permits: usize,
+        /// Live inbound connection permits.
+        inbound_connection_permits: usize,
+        /// Total connection capacity.
+        connection_cap: usize,
+        /// The configured registered-connection limit per address.
+        address_cap: usize,
+        /// Transfers during which QUIC and the handler may both charge one address.
+        quic_handoffs: usize,
+        /// Inbound TLS handshakes still held by QUIC.
+        quic_pending: usize,
+        /// QUIC pending counts by canonical admission address.
+        quic_hosts: Vec<(String, usize)>,
+        /// QUIC live connection slots.
+        quic_live: usize,
+        /// QUIC inbound connection slots.
+        quic_inbound: usize,
+        /// QUIC slots held during shutdown drain.
+        quic_closing: usize,
+        /// QUIC total live-slot capacity.
+        quic_max_live: usize,
+        /// QUIC inbound live-slot capacity.
+        quic_max_inbound: usize,
+        /// The live-slot ceiling for inbound admission.
+        quic_below_reserve: usize,
+        /// Total control handshakes charged by the machine.
+        pending: usize,
+        /// Inbound control handshakes charged by the machine.
+        inbound: usize,
+        /// Total pending semaphore permits held.
+        pending_permits: usize,
+        /// Inbound pending semaphore permits held.
+        inbound_permits: usize,
+        /// Configured total pending limit.
+        cap: usize,
+        /// Canonical address, registered count, and control-handshake count.
+        hosts: Vec<(String, usize, usize)>,
+    },
+    /// A prelude judgement before session installation.
+    PreludeJudged {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The mapped production refusal, or `None` on acceptance.
+        rejection: Option<String>,
+    },
+    /// A control-handshake boundary before registration.
+    Handshake {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The production boundary.
+        stage: String,
+        /// The label mapped exhaustively from the production validation error.
+        validation: Option<String>,
+        /// Any control-handshake failure.
+        error: Option<String>,
+        /// Elapsed control-handshake time, in milliseconds, at release.
+        elapsed_ms: Option<u64>,
+    },
     /// The control handshake succeeded.
     Negotiated {
         /// The capability mask the node sent: its hello's, or, as the
@@ -1957,6 +2129,8 @@ pub enum TransportFact {
         /// The handshake error, or the refusal's trace label.
         reason: String,
     },
+    /// The handshake harness started a node dial to this address.
+    DialStarted,
     /// The node's dial to the remote address failed, as the wire node's
     /// call to `ZakuraEndpoint::dial` returned. No connection was
     /// registered for it, so the address alone keys it.

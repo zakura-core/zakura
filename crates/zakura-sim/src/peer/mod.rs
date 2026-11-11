@@ -38,7 +38,7 @@ pub mod adversary;
 mod content;
 pub mod discovery;
 mod evidence;
-pub(crate) mod handshake;
+pub mod handshake;
 pub mod honest;
 pub mod limit;
 mod stage;
@@ -125,6 +125,9 @@ pub fn peer_addr(index: usize, dial: usize) -> SocketAddr {
 
 /// The peer that binds `addr`, by index, if [`peer_addr`] gives it.
 pub fn peer_of(addr: SocketAddr) -> Option<usize> {
+    if addr.port() >= 4001 {
+        return Some(usize::from((addr.port() - 4001) % 256));
+    }
     let SocketAddr::V4(v4) = addr else {
         return None;
     };
@@ -169,6 +172,9 @@ pub struct PeerSpec {
     /// Whether, as the responder, it echoes the node's nonce wrongly.
     #[serde(default)]
     pub bad_nonce_echo: bool,
+    /// Per-connection control, prelude, address and timing inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake: Option<handshake::options::HandshakeSpec>,
     /// Its actions, in order.
     #[serde(default)]
     pub script: Vec<PeerAction>,
@@ -195,12 +201,26 @@ pub struct PeerSpec {
 }
 
 impl PeerSpec {
+    /// The endpoint address, with a distinct port when peers share an IP.
+    /// Mapped IPv4 aliases bind the IPv4 socket that production dialing selects.
+    pub fn address(&self, index: usize, dial: usize) -> SocketAddr {
+        match self.handshake.as_ref().and_then(|spec| spec.bind_ip) {
+            Some(ip) => SocketAddr::new(
+                ip.to_canonical(),
+                u16::try_from(4001 + index + 256 * dial)
+                    .expect("a handshake scenario has bounded peers and retries"),
+            ),
+            None => peer_addr(index, dial),
+        }
+    }
+
     /// A peer that dials and offers header sync alone.
     pub fn dialing() -> Self {
         PeerSpec {
             dialer: Dialer::Peer,
             capabilities: ZAKURA_CAP_HEADER_SYNC,
             bad_nonce_echo: false,
+            handshake: None,
             script: Vec::new(),
             honest: None,
             adversary: None,
@@ -233,10 +253,15 @@ impl PeerSpec {
             && self.adversary.is_none()
             && !self.invalid_tip
             && !self.bad_nonce_echo
+            && self.handshake.as_ref().is_none_or(|spec| {
+                spec.control == handshake::options::ControlFault::None
+                    && spec.prelude == handshake::options::PreludeFault::None
+                    && spec.abandon_after.is_none()
+            })
             && !self
                 .script
                 .iter()
-                .any(|action| matches!(action, PeerAction::Open { .. }))
+                .any(|action| matches!(action, PeerAction::Open { .. } | PeerAction::Offer { .. }))
     }
 }
 
@@ -252,6 +277,15 @@ pub enum PeerAction {
         kind: u16,
         /// The stream version.
         version: u16,
+    },
+    /// Offers one member of a multi-stream session and waits for refusal or expiry.
+    Offer {
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The generation identifier shared by the layout's members.
+        wire_id: u64,
     },
     /// Finishes the peer's side of its header stream. As the responder it
     /// then waits for the node to open the next one.
@@ -291,6 +325,7 @@ impl PeerAction {
     pub fn name(self) -> &'static str {
         match self {
             PeerAction::Open { .. } => "open",
+            PeerAction::Offer { .. } => "offer",
             PeerAction::FinishHeader => "finish-header",
             PeerAction::Close => "close",
             PeerAction::Disconnect => "disconnect",
@@ -569,6 +604,8 @@ enum Ended {
 
 /// What a stream task tells its peer.
 enum StreamEvent {
+    /// The node reset a stream, including one it refused before session installation.
+    Reset { id: u64, code: u64 },
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
     /// The node opened a discovery stream: the peer's half to write on.
@@ -1043,6 +1080,7 @@ fn bind_config(addr: SocketAddr) -> QuicBindConfig {
 /// Hands each connection the node opens to the peer's task, and holds it
 /// until it closes. It holds one at a time.
 struct Forward {
+    alpn: Vec<u8>,
     to_task: mpsc::Sender<Conn>,
     /// Connections handed over and not closed yet.
     live: Arc<AtomicUsize>,
@@ -1068,9 +1106,9 @@ impl Acceptor for Forward {
         Admit::Accept
     }
 
-    /// Zakura's ALPN.
+    /// The scripted peer's configured ALPN.
     fn alpns(&self) -> Vec<Vec<u8>> {
-        vec![P2P_V2_ALPN.to_vec()]
+        vec![self.alpn.clone()]
     }
 
     /// Counts the connection live before the endpoint drops its pending
@@ -1100,7 +1138,15 @@ async fn read_frames(
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     loop {
         let mut header = [0; 8];
-        if recv.read_exact(&mut header).await.is_err() {
+        if let Err(error) = recv.read_exact(&mut header).await {
+            if let zakura_quic::ReadExactError::ReadError(zakura_quic::ReadError::Reset(code)) =
+                error
+            {
+                let _ = events.send(StreamEvent::Reset {
+                    id,
+                    code: code.into_inner(),
+                });
+            }
             return;
         }
         let len = usize::try_from(u32::from_le_bytes([
@@ -1230,7 +1276,7 @@ impl PeerTask {
     /// Runs the peer until the run ends, with `discovery`'s stream, the one
     /// `DiscoveryService::streams()` declares, for its discovery script.
     pub(crate) async fn run_with(mut self, discovery: Option<Stream>) {
-        let local = Local::regtest();
+        let local = Local::regtest(self.spec.handshake.as_ref(), self.records.clone());
         let adversary = self.spec.adversary.clone().map(Adversary::new);
         let (announce, serve) = adversary.as_ref().map_or((true, true), |adversary| {
             (adversary.announces(), adversary.serves())
@@ -1290,17 +1336,39 @@ impl PeerTask {
         Ended::Failed
     }
 
+    fn address(&self, dial: usize) -> SocketAddr {
+        self.spec.address(self.index, dial)
+    }
+
     /// Binds the endpoint for the `dial`-th connection.
     fn bind(&self, dial: usize) -> QuicEndpoint {
+        let mut quic = QuicConfig::default();
+        if let Some(timeout) = self
+            .spec
+            .handshake
+            .as_ref()
+            .and_then(|spec| spec.tls_timeout_secs)
+        {
+            quic.handshake_timeout_secs = Some(timeout);
+        }
         let inputs = u32::try_from(dial)
             .ok()
             .and_then(|dial| dial.checked_mul(256))
             .and_then(|base| base.checked_add(key_index(self.index)))
             .expect("a peer dials fewer than 2^24 times");
         QuicEndpoint::bind_with(
-            SeededInputs::node_key(self.seed, key_index(self.index)),
-            &bind_config(peer_addr(self.index, dial)),
-            &QuicConfig::default(),
+            SeededInputs::node_key(
+                self.seed,
+                key_index(
+                    self.spec
+                        .handshake
+                        .as_ref()
+                        .and_then(|spec| spec.identity)
+                        .unwrap_or(self.index),
+                ),
+            ),
+            &bind_config(self.address(dial)),
+            &quic,
             self.net.clone(),
             SeededInputs::new(self.seed, inputs).endpoint_inputs(),
         )
@@ -1310,19 +1378,52 @@ impl PeerTask {
     /// Dials the node, from a fresh address each time, until a connection
     /// ends without a [`PeerAction::Redial`] after it.
     async fn dial(&mut self, local: &Local, scripts: &mut Scripts) {
+        if let Some(script) = &self.spec.handshake {
+            handshake::options::delay(script.dial_delay_ms).await;
+        }
         let mut dial = 0;
         loop {
             let quic = self.bind(dial);
-            let Ok(conn) = quic.connect(self.node.clone(), &[P2P_V2_ALPN]).await else {
+            let alpn = self
+                .spec
+                .handshake
+                .as_ref()
+                .and_then(|spec| spec.alpn.as_deref())
+                .unwrap_or(P2P_V2_ALPN);
+            let Ok(conn) = quic.connect(self.node.clone(), &[alpn]).await else {
                 return;
             };
-            let Ok(negotiated) =
-                handshake::initiate(&conn, quic.local_id(), self.spec.capabilities, local).await
+            let Ok(negotiated) = handshake::initiate(
+                &conn,
+                quic.local_id(),
+                self.spec.capabilities,
+                local,
+                Remote {
+                    addr: self.address(dial),
+                    shared_id: conn.shared_id(),
+                },
+            )
+            .await
             else {
+                self.record_connection_close(
+                    &conn,
+                    Remote {
+                        addr: self.address(dial),
+                        shared_id: conn.shared_id(),
+                    },
+                );
+                if let Some(script) = &self.spec.handshake {
+                    if dial < usize::from(script.retries) {
+                        quic.shutdown().await;
+                        handshake::options::delay(script.retry_delay_ms).await;
+                        dial += 1;
+                        continue;
+                    }
+                }
                 return;
             };
             let remote = Remote {
-                addr: peer_addr(self.index, dial),
+                addr: self.address(dial),
                 shared_id: conn.shared_id(),
             };
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
@@ -1355,6 +1456,12 @@ impl PeerTask {
         let quic = self.bind(0);
         let (to_task, mut incoming) = mpsc::channel(4);
         quic.serve(Forward {
+            alpn: self
+                .spec
+                .handshake
+                .as_ref()
+                .and_then(|spec| spec.alpn.clone())
+                .unwrap_or_else(|| P2P_V2_ALPN.to_vec()),
             to_task,
             live: Arc::default(),
         })
@@ -1367,16 +1474,23 @@ impl PeerTask {
         };
         while let Some(conn) = incoming.recv().await {
             let remote = Remote {
-                addr: peer_addr(self.index, 0),
+                addr: self.address(0),
                 shared_id: conn.shared_id(),
             };
-            let answered =
-                handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
-                    .await;
+            let answered = handshake::respond(
+                &conn,
+                conn.remote_id(),
+                self.spec.capabilities,
+                echo,
+                local,
+                remote,
+            )
+            .await;
             let ended = match answered {
                 Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {
                     conn.closed().await;
+                    self.record_connection_close(&conn, remote);
                     Ended::Closed
                 }
             };
@@ -1394,6 +1508,18 @@ impl PeerTask {
             quic_stream,
             body,
         });
+    }
+
+    fn record_connection_close(&self, conn: &Conn, remote: Remote) {
+        if let Some(zakura_quic::ConnectionError::ApplicationClosed(close)) = conn.close_reason() {
+            self.record(
+                remote,
+                0,
+                RecordBody::ConnectionClosed {
+                    code: close.error_code.into_inner(),
+                },
+            );
+        }
     }
 
     /// Writes `frames` on `stream` in order, recording the `PeerFrame` of
@@ -1454,14 +1580,32 @@ impl PeerTask {
         // Frames read so far on each header stream, the next one's `seq`.
         let mut reads = BTreeMap::new();
         let mut settled = !header_sync;
-        if header_sync && self.spec.dialer == Dialer::Peer {
+        if header_sync
+            && (self.spec.dialer == Dialer::Peer
+                || self.spec.handshake.as_ref().is_some_and(|script| {
+                    script.prelude == handshake::options::PreludeFault::IneligibleOpener
+                }))
+        {
             let Ok((mut send, recv)) = conn.open_bi().await else {
                 return Ended::Closed;
             };
-            let opened = handshake::write_prelude(
+            self.record(
+                remote,
+                send.id(),
+                RecordBody::Handshake {
+                    row: "prelude",
+                    label: self
+                        .spec
+                        .handshake
+                        .as_ref()
+                        .map_or("conformant", |script| script.prelude_label()),
+                },
+            );
+            let opened = handshake::write_prelude_with(
                 &mut send,
                 ZAKURA_STREAM_HEADER_SYNC,
                 ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                self.spec.handshake.as_ref(),
             )
             .await;
             if opened.is_err() {
@@ -1492,9 +1636,26 @@ impl PeerTask {
             let Ok((mut send, recv)) = conn.open_bi().await else {
                 return Ended::Closed;
             };
-            if handshake::write_prelude(&mut send, layout.kind, layout.version)
-                .await
-                .is_err()
+            self.record(
+                remote,
+                send.id(),
+                RecordBody::Handshake {
+                    row: "prelude",
+                    label: self
+                        .spec
+                        .handshake
+                        .as_ref()
+                        .map_or("conformant", |script| script.prelude_label()),
+                },
+            );
+            if handshake::write_prelude_with(
+                &mut send,
+                layout.kind,
+                layout.version,
+                self.spec.handshake.as_ref(),
+            )
+            .await
+            .is_err()
             {
                 return Ended::Closed;
             }
@@ -1550,6 +1711,9 @@ impl PeerTask {
             let mut answers = Vec::new();
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
+                    StreamEvent::Reset { id, code } => {
+                        self.record(remote, id, RecordBody::Reset { code });
+                    }
                     StreamEvent::Header { id, send } => {
                         reads.insert(id, 0);
                         header = Some(HeaderStream { id, send });
@@ -1627,7 +1791,18 @@ impl PeerTask {
                     self.readiness.taken();
                     self.taken += 1;
                     match action {
-                        PeerAction::Open { kind, version } => open(conn, kind, version).await,
+                        PeerAction::Open { kind, version } => {
+                            if let Some((id, code)) = open(conn, kind, version, None).await {
+                                if self.spec.handshake.is_some() {
+                                    self.record(remote, id, RecordBody::Reset { code });
+                                }
+                            }
+                        }
+                        PeerAction::Offer { kind, version, wire_id } => {
+                            if let Some((id, code)) = open(conn, kind, version, Some(wire_id)).await {
+                                self.record(remote, id, RecordBody::Reset { code });
+                            }
+                        }
                         PeerAction::FinishHeader => {
                             let Some(mut stream) = header.take() else {
                                 return self.fail("can't finish-header without a header stream");
@@ -1722,6 +1897,7 @@ impl PeerTask {
                     }
                 }
                 _ = conn.closed() => {
+                    self.record_connection_close(conn, remote);
                     self.readiness.set(false);
                     return Ended::Closed;
                 }
@@ -1748,18 +1924,28 @@ impl PeerTask {
 /// Opens a `kind` stream at `version` on `conn` and waits, for at most
 /// [`REFUSAL_WAIT`], for the node to reset it, finish it, or close the
 /// connection.
-async fn open(conn: &Conn, kind: u16, version: u16) {
-    let Ok((mut send, mut recv)) = conn.open_bi().await else {
-        return;
-    };
-    if handshake::write_prelude(&mut send, kind, version)
+async fn open(conn: &Conn, kind: u16, version: u16, wire_id: Option<u64>) -> Option<(u64, u64)> {
+    let (mut send, mut recv) = conn.open_bi().await.ok()?;
+    handshake::write_prelude(&mut send, kind, version)
         .await
-        .is_err()
-    {
-        return;
+        .ok()?;
+    if let Some(wire_id) = wire_id {
+        send.write_all(&wire_id.to_le_bytes()).await.ok()?;
     }
-    let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
-    let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
+    let id = recv.id();
+    let refused = async {
+        loop {
+            match recv.read_chunk(64 * 1024).await {
+                Ok(Some(_)) => {}
+                Err(zakura_quic::ReadError::Reset(code)) => return Some((id, code.into_inner())),
+                _ => return None,
+            }
+        }
+    };
+    zakura_rt::time::timeout(REFUSAL_WAIT, refused)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -1773,6 +1959,7 @@ mod tests {
     fn a_listening_peer_admits_one_connection_at_a_time() {
         let (to_task, _incoming) = mpsc::channel(1);
         let forward = Forward {
+            alpn: P2P_V2_ALPN.to_vec(),
             to_task,
             live: Arc::default(),
         };

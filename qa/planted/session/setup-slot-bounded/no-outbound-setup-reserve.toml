@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/handshake-partial-session.bin"
+checks = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs"]

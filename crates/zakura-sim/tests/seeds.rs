@@ -71,6 +71,59 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
     }
+    if stem == "handshake-partial-session" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction, PeerSpec},
+        };
+        let mut peer = PeerSpec::dialing();
+        peer.capabilities |= 1 << 59;
+        peer.handshake = Some(HandshakeSpec::default());
+        peer.script = vec![
+            PeerAction::Offer {
+                kind: 902,
+                version: 1,
+                wire_id: 1,
+            },
+            PeerAction::Close,
+        ];
+        return value(Scenario {
+            peers: vec![peer; 3],
+            ..Scenario::default()
+        });
+    }
+    if stem == "handshake-stream-churn" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction},
+        };
+        let mut scenario = Scenario::default();
+        scenario.net.default_link.min_delay_ms = 0;
+        scenario.net.default_link.max_delay_ms = 0;
+        scenario.peers[0].handshake = Some(HandshakeSpec::default());
+        scenario.peers[0].script = vec![
+            PeerAction::Open {
+                kind: u16::MAX,
+                version: 1
+            };
+            64
+        ];
+        scenario.peers[0].script.push(PeerAction::Close);
+        return value(scenario);
+    }
+    if stem == "handshake-installed-services" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerSpec},
+        };
+        return value(Scenario {
+            peers: vec![PeerSpec {
+                handshake: Some(HandshakeSpec::default()),
+                ..PeerSpec::listening()
+            }],
+            ..Scenario::default()
+        });
+    }
     if let Some(plan) = SavedPlan::ALL
         .into_iter()
         .find(|plan| stem == format!("header-wire-{}", plan.name()))

@@ -7,6 +7,7 @@ use crate::{
 };
 
 const OWNERSHIP: Machine = Machine {
+    rules: &[],
     name: "block/work-ownership",
     identity: "block-work",
     claim: "The block work owner agrees with the independent ownership model after every input.",
@@ -33,6 +34,7 @@ const OWNERSHIP: Machine = Machine {
 };
 
 const REACTOR: Machine = Machine {
+    rules: &[],
     name: "block/reactor-policy",
     identity: "block-reactor",
     claim: "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, authority, epochs, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
@@ -61,6 +63,7 @@ const REACTOR: Machine = Machine {
 };
 
 const FUNDING: Machine = Machine {
+    rules: &[],
     name: "block/work-funding",
     identity: "block-work-funding",
     claim: "At each completed driver operation and before queue destruction, actual queue funding and retained request/receipt reservations agree with the independent model.",
@@ -90,6 +93,7 @@ const FUNDING: Machine = Machine {
 };
 
 const DECODED_RETENTION: Machine = Machine {
+    rules: &[],
     name: "block/decoded-retention",
     identity: "block-decoded-retention",
     claim: "At each completed owner operation and before pool destruction, independently read block/header/transaction allocations and exact pool charges agree with the model's handle graph. A closed generation preserves final-holder settlement. This target excludes asynchronous backend-worker coverage.",

@@ -398,8 +398,7 @@ fn every_harness_names_its_statuses() {
     for entry in HARNESSES {
         let properties = (entry.properties)();
         if entry.machine {
-            assert_eq!(properties.len(), 1);
-            assert_eq!(properties[0].id, entry.name);
+            assert!(!properties.is_empty(), "{}", entry.name);
             assert_eq!(entry.status(NO_TASK_PANIC), None);
             assert_eq!(entry.status(NO_LIVELOCK), None);
         } else {
@@ -494,6 +493,26 @@ fn every_coverage_witness_exists_and_runs_where_it_says() {
                 assert!(
                     workflow.contains("cargo xtask planted"),
                     "{}: CI never runs `cargo xtask planted`",
+                    row.property
+                );
+                vec![row.passing.witness()]
+            }
+            Bypass::Native(name) => {
+                let directory = crate_dir.join("../../qa/native-mutations");
+                assert!(
+                    directory.join(name).is_file(),
+                    "{}: no {name}",
+                    row.property
+                );
+                let cases: Vec<serde_json::Value> = serde_json::from_str(
+                    &std::fs::read_to_string(directory.join("cases.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    cases
+                        .iter()
+                        .any(|case| case["patch"] == name && case["property"] == row.property),
+                    "{}: {name} has no native mutation binding",
                     row.property
                 );
                 vec![row.passing.witness()]

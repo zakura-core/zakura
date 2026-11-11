@@ -324,3 +324,369 @@ witness = { planted = "qa/planted/discovery/late-response-admitted/revoke-on-tim
 [[excluded]]
 property = "block-sync/reactor-query-lifecycle"
 reason = "Draft: the claim itself is under test, so its violation doesn't end a run."
+
+# One entry covers all control and prelude rows. A production guard gets one
+# patch even when several labels reach it; cases name every affected rule.
+
+[[entry]]
+id = "handshake-table"
+kind = "shared-definition"
+claim = "Control and prelude guards apply their declared consequence without registering or installing an invalid exchange."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/hello/bad-magic-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-version-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-protocol-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-path-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-role-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/wrong-network-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/wrong-chain-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/identity-mismatch-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/missing-capability-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-frame-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-message-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-stream-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-queue-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-idle-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-initiator-nonce-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-responder-nonce-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-native-transcript-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/oversize-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-magic-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-version-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-protocol-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-nonce-echo-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/unoffered-capability-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-frame-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-message-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-stream-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-queue-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-idle-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/limits-above-request-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/oversize-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/bad-magic-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unknown-kind-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unnegotiated-capability-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unselected-version-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/undersized-cap-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unexpected-request-id-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/request-without-id-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/ineligible-opener-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "conformant_ack_is_accepted", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-admission"
+kind = "shared-definition"
+claim = "Production admission counts and live permits preserve pending, address, and outbound-reserve bounds."
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/pending-bounded"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "inbound_control_pressure_preserves_a_wire_dial", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/connections-per-address-bounded"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "shared_address_registrations_stop_at_the_cap", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/counts-match-permits"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "counts_trace_replays_with_each_named_rule", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/dial-reserve-kept"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "inbound_connection_pressure_preserves_a_wire_dial", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-release"
+kind = "shared-definition"
+claim = "A refused handshake returns every claim, permit, address charge and QUIC slot within shutdown drain."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs"]
+
+[[entry.instance]]
+property = "handshake/hello/refusal-releases-slot"
+code = []
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/refusal-releases-slot"
+code = []
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry]]
+id = "session-installation"
+kind = "single"
+claim = "Installed sessions belong to the negotiated and enabled layout."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/installed-services-authorized"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/registry.rs", "crates/zakura-network/src/zakura/regulation/session_table.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-installed-services.bin" }
+
+[[entry]]
+id = "session-capacity"
+kind = "single"
+claim = "Every live session reservation accounts for its actual permits through the last owner."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/capacity-conserved"
+code = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs", "crates/zakura-network/src/zakura/regulation/session_table.rs", "crates/zakura-network/src/zakura/handler/service_session.rs"]
+witness = { test = "complete_session_transfers_setup_to_installed_owners", test_target = "handshake" }
+
+[[entry]]
+id = "session-setup"
+kind = "single"
+claim = "Partial offers preserve outbound setup capacity and expire within their deadline."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/setup-slot-bounded"
+code = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs", "crates/zakura-network/src/zakura/handler/service_session.rs", "crates/zakura-network/src/zakura/handler/service_session/state.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-partial-session.bin" }
+
+[[entry]]
+id = "session-stream-opens"
+kind = "single"
+claim = "Stream setup obeys concurrency and cadence bounds and releases refused permits."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/stream-opens-bounded"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/lifetime.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-stream-churn.bin" }
+
+[[entry]]
+id = "handshake-honest"
+kind = "single"
+claim = "Control validation and session setup never punish an honest peer."
+check = ["crates/zakura-sim/src/domain/session.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/honest-never-punished"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "honest_peer_never_punished", test_target = "header_wire_witness" }
+
+[[entry]]
+id = "handshake-quic"
+kind = "shared-definition"
+claim = "QUIC enforces source limits, Retry, TLS deadlines, supported ALPNs, and the dialed identity."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+
+[[entry.instance]]
+property = "handshake/quic/pending-per-address-bounded"
+code = []
+witness = { test = "quic_pending_limit_refuses_another_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/retry-before-unvalidated-accept"
+code = []
+witness = { test = "quic_retry_validates_sources_before_tls", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/finishes-in-time"
+code = []
+witness = { test = "quic_deadline_ends_a_stalled_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/alpn-required"
+code = []
+witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/identity-required"
+code = []
+witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }

@@ -284,6 +284,11 @@ impl<F: SocketFactory> EndpointTask<F> {
         let (control_tx, control) = mpsc::unbounded_channel();
         let (handshake_tx, handshake) = oneshot::channel();
         let shared = ConnShared::new(canonical_addr(admitted), self.queued_total.clone());
+        #[cfg(zakura_sim)]
+        shared
+            .slot_release
+            .set(slot.release.clone())
+            .expect("a new connection has no slot probe");
         self.conns.insert(
             handle,
             ConnEntry {
@@ -480,6 +485,15 @@ impl<F: SocketFactory> EndpointTask<F> {
             pending_from_ip: self.shared.pending.for_ip(pending_group),
         };
         let decision = decide(&self.shared.config, acceptor.as_ref(), &info);
+        #[cfg(zakura_sim)]
+        self.shared
+            .pending
+            .record(crate::HandshakeEvent::Admission {
+                incoming: info,
+                decision,
+                max_pending_per_ip: self.shared.config.max_pending_per_ip,
+                retry_threshold: self.shared.config.retry_threshold,
+            });
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
         self.response_buf.clear();
         match decision {
@@ -508,6 +522,11 @@ impl<F: SocketFactory> EndpointTask<F> {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Started {
+                            remote: raw_remote,
+                            deadline: self.shared.config.handshake_timeout(),
+                        });
                         self.tasks.spawn_named(
                             "quic.inbound_handshake",
                             inbound_handshake(
@@ -519,6 +538,11 @@ impl<F: SocketFactory> EndpointTask<F> {
                         );
                     }
                     Err(error) => {
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Finished {
+                            remote: raw_remote,
+                            error: Some(error.cause.to_string()),
+                        });
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);
                         tracing::trace!(target: "zakura_quic", cause = %error.cause, "accept failed");
                         if let Some(transmit) = error.response {

@@ -368,6 +368,17 @@ impl Conn {
         crate::LoadProbe::of(&self.inner.shared)
     }
 
+    /// Observes the release of this connection's admission slot after shutdown drain.
+    #[cfg(zakura_sim)]
+    pub fn slot_probe(&self) -> crate::SlotProbe {
+        self.inner
+            .shared
+            .slot_release
+            .get()
+            .expect("the endpoint installs the slot probe before spawning the connection")
+            .clone()
+    }
+
     /// Changes this connection's runtime limits (API-9). Returns the close
     /// reason if the connection has closed.
     pub fn set_limits(&self, limits: ConnLimits) -> Result<(), ConnectionError> {

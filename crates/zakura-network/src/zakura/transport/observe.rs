@@ -34,6 +34,28 @@ use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 /// implementation must not block, yield, take a `zakura_rt` lock, or call
 /// into the transport.
 pub trait TransportObserver: Send + Sync + fmt::Debug {
+    /// Supplies explicit pauses for a handshake race witness.
+    #[cfg(zakura_sim)]
+    fn handshake_pause(&self) -> Option<HandshakePause> {
+        None
+    }
+    /// Receives the admission probe before the handler starts serving connections.
+    #[cfg(zakura_sim)]
+    fn handshakes(&self, _probe: super::HandshakeProbe) {}
+
+    /// Receives the QUIC slot probe before a connection can fail its control handshake.
+    #[cfg(zakura_sim)]
+    fn handshake_slot(
+        &self,
+        _remote: std::net::SocketAddr,
+        _shared_id: [u8; 16],
+        _probe: zakura_quic::SlotProbe,
+    ) {
+    }
+
+    /// Receives the endpoint's independent admission counters.
+    #[cfg(zakura_sim)]
+    fn quic_admission(&self, _probe: zakura_quic::AdmissionProbe) {}
     /// Records one event.
     fn observe(&self, event: TransportEvent);
 
@@ -41,6 +63,37 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
     /// its gates exist, right after its registration. The default drops it.
     #[cfg(zakura_sim)]
     fn connection(&self, _conn_id: ZakuraConnId, _probe: super::ConnectionProbe) {}
+}
+
+/// A handshake boundary a simulator witness can hold.
+#[cfg(zakura_sim)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HandshakePhase {
+    /// No boundary has been reached.
+    #[default]
+    Waiting,
+    /// The handler captured its control-handshake configuration.
+    Snapshot,
+    /// The supervisor accepted the connection's registration.
+    Registered,
+}
+
+/// A witness publishes each reached boundary and explicitly releases it.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug)]
+pub struct HandshakePause {
+    /// The phase reached by the production handler.
+    pub reached: zakura_rt::sync::watch::Sender<HandshakePhase>,
+    /// The last phase the witness permits to continue.
+    pub resume: zakura_rt::sync::watch::Receiver<HandshakePhase>,
+}
+
+#[cfg(zakura_sim)]
+impl HandshakePause {
+    pub(crate) async fn at(mut self, phase: HandshakePhase) {
+        self.reached.send_replace(phase);
+        let _ = self.resume.wait_for(|released| *released >= phase).await;
+    }
 }
 
 /// One transport event.
@@ -52,6 +105,53 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TransportEvent {
+    /// The handler created an inbound stream setup after concurrency and rate admission.
+    StreamSetupStarted {
+        /// The registered connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream being read.
+        quic_stream: u64,
+        /// The configured burst and refill per second.
+        rate: u32,
+    },
+    /// The handshake captured its local capability mask.
+    HandshakeCapabilities {
+        /// The remote endpoint.
+        remote: SocketAddr,
+        /// The TLS connection identity.
+        shared_id: [u8; 16],
+        /// The supported capabilities at the snapshot.
+        supported: u64,
+    },
+    /// Runtime service demand changed the local capability mask.
+    CapabilitiesChanged {
+        /// The enabled capabilities after the change.
+        supported: u64,
+    },
+    /// The production stream setup path judged a prelude.
+    PreludeJudged {
+        /// The registered connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream, whether or not it becomes a session.
+        quic_stream: u64,
+        /// The refusal, or `None` after every prelude check passed.
+        rejection: Option<crate::zakura::handshake::PreludeRejection>,
+    },
+    /// A control-handshake boundary, including connections that never register.
+    Handshake {
+        /// The address charged by admission.
+        remote: SocketAddr,
+        /// The TLS-derived connection identity.
+        shared_id: [u8; 16],
+        /// Started, hello, ack, registered, or released.
+        stage: &'static str,
+        /// The production validation error, if validation rejected the payload.
+        validation: Option<crate::zakura::ZakuraValidationError>,
+        /// A read, write, codec, or capacity failure.
+        error: Option<String>,
+        /// Time since inbound handling began, on release.
+        elapsed: Option<std::time::Duration>,
+    },
     /// The control handshake succeeded.
     Negotiated {
         /// The remote address the connection was admitted from.

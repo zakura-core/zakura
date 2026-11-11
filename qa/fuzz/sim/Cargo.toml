@@ -24,6 +24,8 @@ block_reactor_policy = "block/reactor-policy"
 header_publisher_policy = "header/publisher-policy"
 sync_storage = "sync/storage"
 sync_wire = "sync/wire"
+handshake_wire = "handshake/wire"
+handshake_counts = "handshake/counts"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -70,6 +72,20 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "handshake_wire"
+path = "fuzz_targets/handshake_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_counts"
+path = "fuzz_targets/handshake_counts.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "block_work_ownership"

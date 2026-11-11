@@ -32,3 +32,10 @@ cargo xtask planted loop --cases <dir> --only block-sync/teardown-returns-baseli
 ```
 
 Required failure: the run ends at `block-sync/teardown-returns-baseline`.
+
+The handshake wire witness `complete_session_transfers_setup_to_installed_owners`
+installs a production two-member outbound session. The session ownership probe
+observes the live reservation after admission and compares it with the free
+setup permits. The same patch must fail this check before teardown.
+
+Required failure: the run ends at `session/capacity-conserved`.

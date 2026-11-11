@@ -73,6 +73,7 @@ fn reached(steps: &[MachineStep], _: Expect) -> bool {
 }
 
 const FIXTURE: Machine = Machine {
+    rules: &[],
     name: "fixtures/machine",
     identity: "fixture",
     claim: "The fixture machine's history reports no failure.",

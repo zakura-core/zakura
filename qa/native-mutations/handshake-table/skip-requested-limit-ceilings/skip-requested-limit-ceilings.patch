@@ -1,0 +1,18 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1220,15 +1220,6 @@
+         }
+         validate_initial_limits(self.accepted_limits, local)
+             .map_err(ZakuraValidationError::from_wire_reject)?;
+-        if self.accepted_limits.max_frame_bytes > requested_limits.max_frame_bytes
+-            || self.accepted_limits.max_message_bytes > requested_limits.max_message_bytes
+-            || self.accepted_limits.max_open_streams > requested_limits.max_open_streams
+-            || self.accepted_limits.max_inbound_queue_depth
+-                > requested_limits.max_inbound_queue_depth
+-            || self.accepted_limits.idle_timeout_millis > requested_limits.idle_timeout_millis
+-        {
+-            return Err(ZakuraValidationError::ResourceLimit);
+-        }
+         Ok(())
+     }
+ }

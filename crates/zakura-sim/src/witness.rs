@@ -13,7 +13,7 @@ use std::{fmt, str::FromStr};
 
 use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
-    property::{HasView, Status, TriggerHistory},
+    property::{HasView, PropertyId, Status, TriggerHistory},
     record::Record,
     trace::end_records::{self, TriggerState, WitnessRecord},
     MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
@@ -382,6 +382,7 @@ pub fn judge_report<S: Subsystem>(
 
 /// What a witness test reads from a property's registration.
 struct Registered<S: HasView> {
+    id: PropertyId,
     status: Status,
     trigger_history: Option<TriggerHistory<S>>,
 }
@@ -399,6 +400,7 @@ impl<S: Subsystem> Registered<S> {
             return Err(WitnessError::NoTriggerHistory);
         }
         Ok(Registered {
+            id: registered.id.clone(),
             status: registered.status,
             trigger_history: registered.witness,
         })
@@ -445,6 +447,7 @@ impl<S: Subsystem> Registered<S> {
         match self.trigger_history {
             None => TriggerState::None,
             Some(TriggerHistory::Log(history)) => reached(history(log)),
+            Some(TriggerHistory::PropertyLog(history)) => reached(history(self.id.as_str(), log)),
             Some(TriggerHistory::View(history)) => match harness {
                 Some(harness)
                     if end.outcome != Outcome::Harness

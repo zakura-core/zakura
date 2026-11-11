@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/regulation/session_table.rs
++++ b/crates/zakura-network/src/zakura/regulation/session_table.rs
+@@ -108,6 +108,7 @@
+                     return Replacement::Refused;
+                 }
+                 old.cancel.cancel();
++                std::mem::forget(old.session.clone());
+                 Replacement::Replaced(old)
+             }
+         };

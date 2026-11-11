@@ -54,6 +54,8 @@ pub(crate) struct SessionCapacity {
     /// outbound sessions are enabled.
     inbound_setup: Arc<Semaphore>,
     changed: watch::Sender<()>,
+    #[cfg(zakura_sim)]
+    owners: Arc<ReservationOwners>,
 }
 
 impl SessionCapacity {
@@ -69,6 +71,8 @@ impl SessionCapacity {
             setup: pool(setup),
             inbound_setup: pool(inbound_setup),
             changed: watch::channel(()).0,
+            #[cfg(zakura_sim)]
+            owners: Arc::default(),
         }
     }
 
@@ -117,6 +121,8 @@ impl SessionCapacity {
         &self,
         direction: ServicePeerDirection,
     ) -> Result<Arc<dyn SessionResources>, SessionFull> {
+        #[cfg(zakura_sim)]
+        let _transition = self.owners.transition();
         let inbound_setup = match direction {
             ServicePeerDirection::Inbound => Some(
                 self.inbound_setup
@@ -154,13 +160,29 @@ impl SessionCapacity {
         let setting_up = metrics::gauge!("zakura.p2p.sessions.setup", "service" => self.service);
         reserved.increment(1.0);
         setting_up.increment(1.0);
-        Ok(Arc::new(SessionReservation {
+        let reservation = Arc::new(SessionReservation {
             reserved,
             setting_up,
             session: Some(session),
             setup: Mutex::new(Some(setup)),
             changed: self.changed.clone(),
-        }))
+            #[cfg(zakura_sim)]
+            owners: self.owners.clone(),
+            #[cfg(zakura_sim)]
+            direction,
+            #[cfg(zakura_sim)]
+            observation_id: self
+                .owners
+                .next
+                .fetch_add(1, zakura_rt::sync::counter::Ordering::Relaxed),
+        });
+        #[cfg(zakura_sim)]
+        {
+            let mut owners = self.owners.reservations.lock().unwrap();
+            owners.retain(|owner| owner.strong_count() > 0);
+            owners.push(Arc::downgrade(&reservation));
+        }
+        Ok(reservation)
     }
 
     /// Free slots of each kind.
@@ -194,12 +216,20 @@ struct SessionReservation {
     session: Option<OwnedSemaphorePermit>,
     setup: Mutex<Option<SetupSlots>>,
     changed: watch::Sender<()>,
+    #[cfg(zakura_sim)]
+    owners: Arc<ReservationOwners>,
+    #[cfg(zakura_sim)]
+    direction: ServicePeerDirection,
+    #[cfg(zakura_sim)]
+    observation_id: usize,
 }
 
 impl SessionResources for SessionReservation {
     /// Release the setup slots once every member is ready. Later calls
     /// release nothing.
     fn admitted(&self) {
+        #[cfg(zakura_sim)]
+        let _transition = self.owners.transition();
         if self
             .setup
             .lock()
@@ -217,6 +247,8 @@ impl Drop for SessionReservation {
     /// Return the direction slot and any setup slots an incomplete layout
     /// left, then wake waiting callers.
     fn drop(&mut self) {
+        #[cfg(zakura_sim)]
+        let _transition = self.owners.transition();
         if self
             .setup
             .get_mut()
@@ -249,13 +281,14 @@ pub struct FreeSlots {
 /// A read of a [`SessionCapacity`]'s free slots for the simulator's
 /// harness, which keeps it past the capacity.
 ///
-/// It holds the capacity's semaphores and nothing else, so it keeps no
+/// It holds the semaphores and weak reservation references, so it keeps no
 /// service or waiter alive. Every reservation holds the same semaphores, so
 /// a read once the service is gone still sees a slot a stray reservation
 /// holds.
 #[cfg(zakura_sim)]
 #[derive(Clone, Debug)]
 pub struct SessionSlotsProbe {
+    owners: Arc<ReservationOwners>,
     inbound: Arc<Semaphore>,
     outbound: Arc<Semaphore>,
     setup: Arc<Semaphore>,
@@ -289,10 +322,100 @@ impl SessionCapacity {
     /// A probe of these slots for the simulator's harness.
     pub(crate) fn probe(&self) -> SessionSlotsProbe {
         SessionSlotsProbe {
+            owners: self.owners.clone(),
             inbound: self.inbound.clone(),
             outbound: self.outbound.clone(),
             setup: self.setup.clone(),
             inbound_setup: self.inbound_setup.clone(),
         }
+    }
+}
+
+/// A stable comparison of live reservations with the actual free permits.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionOwnership {
+    /// Permits currently available to new sessions.
+    pub free: FreeSlots,
+    /// Permits required by reservations that still have at least one owner.
+    pub held: FreeSlots,
+    /// Inbound reservations that still hold setup permits. IDs never repeat within this capacity.
+    pub inbound_setups: Vec<usize>,
+}
+
+#[cfg(zakura_sim)]
+impl SessionSlotsProbe {
+    /// Count actual reservations, including reservations retained after retirement.
+    /// Return `None` while a reservation changes its permits.
+    pub fn ownership(&self) -> Option<SessionOwnership> {
+        use zakura_rt::{sim::Peek, sync::counter::Ordering};
+        let free = self.read();
+        if self.owners.transitions.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let mut inbound_setups = Vec::new();
+        let mut held = FreeSlots {
+            inbound: 0,
+            outbound: 0,
+            setup: 0,
+            inbound_setup: 0,
+        };
+        for owner in self.owners.reservations.lock().unwrap().iter() {
+            let Some(owner) = owner.upgrade() else {
+                continue;
+            };
+            let inbound = owner.direction == ServicePeerDirection::Inbound;
+            if inbound {
+                held.inbound += 1;
+            } else {
+                held.outbound += 1;
+            }
+            let setting_up = match owner.setup.peek(Option::is_some) {
+                Peek::Current(value) | Peek::Poisoned(value) => value,
+                Peek::Held { .. } => return None,
+            };
+            if setting_up {
+                held.setup += 1;
+                held.inbound_setup += usize::from(inbound);
+                if inbound {
+                    inbound_setups.push(owner.observation_id);
+                }
+            }
+        }
+        Some(SessionOwnership {
+            free,
+            held,
+            inbound_setups,
+        })
+    }
+}
+
+// This registry observes ownership without adding simulator scheduling points.
+#[cfg(zakura_sim)]
+#[derive(Debug, Default)]
+struct ReservationOwners {
+    reservations: std::sync::Mutex<Vec<std::sync::Weak<SessionReservation>>>,
+    transitions: zakura_rt::sync::counter::AtomicUsize,
+    next: zakura_rt::sync::counter::AtomicUsize,
+}
+
+#[cfg(zakura_sim)]
+impl ReservationOwners {
+    fn transition(self: &Arc<Self>) -> ReservationTransition {
+        self.transitions
+            .fetch_add(1, zakura_rt::sync::counter::Ordering::Relaxed);
+        ReservationTransition(self.clone())
+    }
+}
+
+#[cfg(zakura_sim)]
+struct ReservationTransition(Arc<ReservationOwners>);
+
+#[cfg(zakura_sim)]
+impl Drop for ReservationTransition {
+    fn drop(&mut self) {
+        self.0
+            .transitions
+            .fetch_sub(1, zakura_rt::sync::counter::Ordering::Relaxed);
     }
 }

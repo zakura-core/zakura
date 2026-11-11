@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1083,7 +1083,6 @@
+             }
+             ZakuraHandshakePath::Native => {
+                 if self.initiator_upgrade_nonce != [0; 32]
+-                    || self.responder_upgrade_nonce != [0; 32]
+                 {
+                     return Err(ZakuraValidationError::UpgradeNonceMismatch);
+                 }

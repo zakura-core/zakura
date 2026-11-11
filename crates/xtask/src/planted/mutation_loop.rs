@@ -40,6 +40,12 @@
 //! five times its baseline's time, and at least 60 s. A timeout is a
 //! harness failure, never a kill or a survivor.
 //!
+//! With `--generate-runs <n>`, each case also gets generator lanes: a
+//! search from scratch for an input that violates the case's property, on
+//! the unpatched build first and then on each mutant ([`generate`]). The
+//! report keeps each case's generator lanes beside its witness lane, and
+//! counts their kills apart.
+//!
 //! `--changed-since <rev>` keeps only the cases a change since `rev` can
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
@@ -64,11 +70,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, changed_since_rev, git, is_affected, patched_files,
-    pilot::{
-        add_worktree, file_sha256, fresh_dir, head, hex, sim_build_failure, BuildFailure,
-        INTERRUPTED_ERROR,
-    },
+    apply, changed_since_rev, git, is_affected,
+    lane::{sim_build_failure, BuildFailure},
+    patched_files,
+    pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
     planted_layout, provenance, remove_worktree, CaseFile, TypedFile, PLANTED_DIR, PROFILE, SHARED,
 };
 use crate::{
@@ -79,10 +84,15 @@ use crate::{
 };
 
 mod classify;
+mod generate;
 #[cfg(test)]
 mod tests;
 
-use classify::{Class, Classified, Ended, Observed, Reason, Trigger};
+use classify::{Class, Classified, Ended, GenerateFacts, Observed, Reason, Trigger};
+use generate::{
+    GenerateConfig, GenerateFlags, GeneratorBaselineFailure, GeneratorReport, Lanes,
+    PropertyFinding,
+};
 
 /// The loop's retained cases, relative to the repository root.
 const CASES: &str = "qa/native-mutations/cases.json";
@@ -94,7 +104,7 @@ const PROMPT: &str = "qa/native-mutations/PROMPT.md";
 const REPORT_FILE: &str = "report.json";
 
 /// The report's schema version.
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// The variable that names `zakura-sim`'s end-record directory. It is
 /// `zakura_sim::trace::end_records::END_RECORDS_VAR`, which xtask can't
@@ -183,6 +193,14 @@ enum Runnable {
     },
     /// One test in one test binary.
     Test { target: String, test: String },
+    /// `zakura-sim generate`'s search on a harness: `runs` inputs drawn
+    /// from `seed`, skipping the digests in `exclude`.
+    Generate {
+        harness: String,
+        seed: u64,
+        runs: u64,
+        exclude: PathBuf,
+    },
 }
 
 /// What a report records about one case.
@@ -218,6 +236,12 @@ pub(super) struct CaseReport {
     /// rerun alone with the host's memory.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) rerun_alone: bool,
+    /// The case's generator lanes, one per seed ([`generate`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) generator: Vec<GeneratorReport>,
+    /// Why the case has no generator lane, with the lanes on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) no_generator: Option<String>,
 }
 
 /// The unpatched witness's run for a case's property.
@@ -245,11 +269,17 @@ pub(super) struct BuildIdentity {
 }
 
 /// One property's cases, counted by class: mutant results apart from run
-/// failures. The report computes no score.
+/// failures, and witness lanes apart from generator lanes. A case without
+/// a generator lane counts once as the `no-generator` generator run
+/// failure. The report computes no score.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PropertySummary {
     pub(super) results: BTreeMap<String, usize>,
     pub(super) run_failures: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) generator_results: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) generator_run_failures: BTreeMap<String, usize>,
 }
 
 /// One run's report.
@@ -264,8 +294,30 @@ pub(super) struct Report {
     pub(super) jobs: usize,
     /// Each witness process's memory cap, in bytes, if any.
     pub(super) memory_max: Option<u64>,
+    /// The generator lanes' setup, if they ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) generate: Option<GenerateConfig>,
+    /// What the generator lanes' searches on the unpatched build stopped
+    /// at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) property_findings: Vec<PropertyFinding>,
+    /// The generator lanes' unpatched searches that weren't clean, other
+    /// than the property findings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) generator_baseline_failures: Vec<GeneratorBaselineFailure>,
     pub(super) cases: Vec<CaseReport>,
     pub(super) summary: BTreeMap<String, PropertySummary>,
+}
+
+/// What [`Runner::run_all`] found.
+struct Outcome {
+    /// The unpatched source digest.
+    source: String,
+    /// Each case's report, in case order.
+    cases: Vec<CaseReport>,
+    generate: Option<GenerateConfig>,
+    property_findings: Vec<PropertyFinding>,
+    generator_baseline_failures: Vec<GeneratorBaselineFailure>,
 }
 
 /// The per-property summary of `cases`.
@@ -273,12 +325,26 @@ pub(super) fn summarize(cases: &[CaseReport]) -> BTreeMap<String, PropertySummar
     let mut summary: BTreeMap<String, PropertySummary> = BTreeMap::new();
     for case in cases {
         let counts = summary.entry(case.property.clone()).or_default();
-        let counts = if case.result.class.is_result() {
+        let lane = if case.result.class.is_result() {
             &mut counts.results
         } else {
             &mut counts.run_failures
         };
-        *counts.entry(case.result.key()).or_default() += 1;
+        *lane.entry(case.result.key()).or_default() += 1;
+        for generator in &case.generator {
+            let lane = if generator.result.class.is_result() {
+                &mut counts.generator_results
+            } else {
+                &mut counts.generator_run_failures
+            };
+            *lane.entry(generator.result.key()).or_default() += 1;
+        }
+        if case.no_generator.is_some() {
+            *counts
+                .generator_run_failures
+                .entry("no-generator".to_owned())
+                .or_default() += 1;
+        }
     }
     summary
 }
@@ -295,6 +361,7 @@ pub(super) struct Flags {
     pub(super) jobs: usize,
     /// `Some(None)` for `--memory-max off`.
     pub(super) memory_max: Option<Option<u64>>,
+    pub(super) generate: GenerateFlags,
 }
 
 /// Reads the flags after `planted loop`. `--out` and `--work` become
@@ -307,6 +374,9 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
     let mut out = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        if flags.generate.parse(&flag, &value)? {
+            continue;
+        }
         match flag.as_str() {
             "--out" if out.is_none() => out = Some(std::path::absolute(value)?),
             "--work" if flags.work.is_none() => flags.work = Some(std::path::absolute(value)?),
@@ -378,6 +448,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         pinned: pinned.clone(),
         memory_max,
         build_jobs: (thread::available_parallelism().map_or(1, usize::from) / flags.jobs).max(1),
+        generate: flags.generate.clone(),
     };
     let slots: Vec<Slot> = (0..flags.jobs).map(|index| runner.slot(index)).collect();
     for slot in &slots {
@@ -388,13 +459,13 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let _ = remove_worktree(repo_root, &slot.tree);
         let _ = fs::remove_dir_all(&slot.target);
     }
-    let (source, results) = outcome?;
+    let outcome = outcome?;
     let report = Report {
         schema: SCHEMA,
         pinned,
         prompt_sha256: file_sha256(&repo_root.join(PROMPT)).unwrap_or_default(),
         build: BuildIdentity {
-            source,
+            source: outcome.source,
             rustc: command_line(Command::new("rustc").arg("--version")),
             profile: PROFILE.to_owned(),
             rustflags: SIM_RUSTFLAGS.to_owned(),
@@ -402,8 +473,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         host: command_line(&mut Command::new("hostname")),
         jobs: flags.jobs,
         memory_max,
-        summary: summarize(&results),
-        cases: results,
+        generate: outcome.generate,
+        property_findings: outcome.property_findings,
+        generator_baseline_failures: outcome.generator_baseline_failures,
+        summary: summarize(&outcome.cases),
+        cases: outcome.cases,
     };
     fs::write(
         flags.out.join(REPORT_FILE),
@@ -413,6 +487,27 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         println!(
             "{property}: {:?} {:?}",
             summary.results, summary.run_failures
+        );
+        if flags.generate.on() {
+            println!(
+                "{property} generator: {:?} {:?}",
+                summary.generator_results, summary.generator_run_failures
+            );
+        }
+    }
+    for finding in &report.property_findings {
+        println!(
+            "property finding: {} seed {}: {}",
+            finding.harness, finding.seed, finding.detail
+        );
+    }
+    for failure in &report.generator_baseline_failures {
+        println!(
+            "generator baseline failure: {} seed {}: {}: {}",
+            failure.harness,
+            failure.seed,
+            failure.result.key(),
+            failure.result.detail
         );
     }
     println!(
@@ -668,6 +763,7 @@ struct Runner {
     pinned: String,
     memory_max: Option<u64>,
     build_jobs: usize,
+    generate: GenerateFlags,
 }
 
 /// One worker's worktree and target directory.
@@ -689,6 +785,8 @@ struct Ran {
     millis: u64,
     peak_rss_kib: Option<u64>,
     log: PathBuf,
+    /// A generator search's report, if it wrote one.
+    generated: Option<GenerateFacts>,
 }
 
 /// A mutant: one patch and its cases, by index into the case list.
@@ -710,13 +808,8 @@ impl Runner {
     }
 
     /// Runs every case: the baselines on slot 0, then each mutant on the
-    /// next free slot, then each case the memory cap killed alone. Returns
-    /// the unpatched source digest and each case's report, in case order.
-    fn run_all(
-        &self,
-        cases: &[LoopCase],
-        slots: &[Slot],
-    ) -> Result<(String, Vec<CaseReport>), BoxError> {
+    /// next free slot, then each case the memory cap killed alone.
+    fn run_all(&self, cases: &[LoopCase], slots: &[Slot]) -> Result<Outcome, BoxError> {
         // Each slot reads its witnesses' inputs from its own tree, which no
         // other slot resets.
         let slot_runnables = slots
@@ -733,7 +826,14 @@ impl Runner {
         let all: Vec<usize> = (0..cases.len()).collect();
         let host_jobs = thread::available_parallelism().map_or(1, usize::from);
         let baseline_dir = self.out.join("baseline");
-        let built = match self.build(&slots[0], runnables, &all, &baseline_dir, host_jobs)? {
+        let built = match self.build(
+            &slots[0],
+            runnables,
+            &all,
+            self.generate.on(),
+            &baseline_dir,
+            host_jobs,
+        )? {
             Ok(built) => built,
             Err(failure) => return Err(format!("the unpatched build fails: {failure}").into()),
         };
@@ -759,6 +859,13 @@ impl Runner {
                 .set_modified(SystemTime::now())?;
         }
         let baselines = self.baselines(cases, runnables, &slots[0], &built, &source)?;
+        let (lanes, generate, found) = if self.generate.on() {
+            let (lanes, config, found) =
+                self.lanes(cases, runnables, &slots[0], &built, &source)?;
+            (Some(lanes), Some(config), found)
+        } else {
+            (None, None, generate::BaselineFound::default())
+        };
         let mut mutants: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, case) in cases.iter().enumerate() {
             mutants.entry(case.patch.clone()).or_default().push(index);
@@ -779,7 +886,8 @@ impl Runner {
                 .iter()
                 .zip(&slot_runnables)
                 .map(|(slot, runnables)| {
-                    let (queue, results, baselines) = (&queue, &results, &baselines);
+                    let (queue, results, baselines, lanes) =
+                        (&queue, &results, &baselines, lanes.as_ref());
                     scope.spawn(move || -> Result<(), String> {
                         loop {
                             let Some(mutant) = queue.lock().expect("no worker panics").pop_front()
@@ -787,7 +895,15 @@ impl Runner {
                                 return Ok(());
                             };
                             let reports = self
-                                .mutant(slot, &mutant, cases, runnables, baselines, self.memory_max)
+                                .mutant(
+                                    slot,
+                                    &mutant,
+                                    cases,
+                                    runnables,
+                                    baselines,
+                                    lanes,
+                                    self.memory_max,
+                                )
                                 .map_err(|error| error.to_string())?;
                             results.lock().expect("no worker panics").extend(reports);
                         }
@@ -804,7 +920,8 @@ impl Runner {
                 .collect::<Result<Vec<()>, String>>()
         })?;
         let mut results = results.into_inner().expect("every worker joined");
-        // A case the memory cap killed reruns alone with the host's memory.
+        // A case whose witness the memory cap killed reruns alone with the
+        // host's memory. Its generator lanes keep their first results.
         let killed: Vec<usize> = results
             .iter()
             .filter(|(_, report)| report.result.reason == Some(Reason::Oom))
@@ -822,13 +939,23 @@ impl Runner {
                 cases,
                 runnables,
                 &baselines,
+                None,
                 self.alone_cap(),
             )? {
+                let first = &results[&index];
+                report.generator = first.generator.clone();
+                report.no_generator = first.no_generator.clone();
                 report.rerun_alone = true;
                 results.insert(index, report);
             }
         }
-        Ok((source, results.into_values().collect()))
+        Ok(Outcome {
+            source,
+            cases: results.into_values().collect(),
+            generate,
+            property_findings: found.findings,
+            generator_baseline_failures: found.failures,
+        })
     }
 
     /// The memory cap of a run alone: the host's memory, or none if the
@@ -938,7 +1065,8 @@ impl Runner {
     }
 
     /// Applies `mutant`'s patch in `slot`, builds what its cases need, and
-    /// runs each case's witness under `cap`.
+    /// runs each case's witness under `cap`, then each case's generator
+    /// lanes, with `lanes`.
     #[allow(clippy::too_many_arguments)]
     fn mutant(
         &self,
@@ -947,6 +1075,7 @@ impl Runner {
         cases: &[LoopCase],
         runnables: &[Runnable],
         baselines: &[BaselineReport],
+        lanes: Option<&Lanes>,
         cap: Option<u64>,
     ) -> Result<Vec<(usize, CaseReport)>, BoxError> {
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -979,19 +1108,35 @@ impl Runner {
                 log: ran
                     .and_then(|ran| ran.log.strip_prefix(&self.out).ok().map(Path::to_path_buf)),
                 rerun_alone: false,
+                generator: Vec::new(),
+                no_generator: lanes.and_then(|lanes| lanes.plans[index].clone().err()),
             }
         };
-        let all = |result: Classified| -> Vec<(usize, CaseReport)> {
-            mutant
-                .cases
-                .iter()
-                .map(|index| (*index, report(*index, result.clone(), None)))
-                .collect()
+        // Gives each case's generator lanes, which didn't search, `result`.
+        let unsearched = |reports: &mut [(usize, CaseReport)], result: &Classified| {
+            if let Some(lanes) = lanes {
+                for (index, report) in reports {
+                    report.generator = lanes.unsearched(*index, result);
+                }
+            }
         };
         reset(&slot.tree, &self.pinned)?;
         if let Err(why) = apply(&slot.tree, &mutant.patch) {
-            return Ok(all(Classified::new(Class::PatchDoesNotApply, None, why)));
+            let result = Classified::new(Class::PatchDoesNotApply, None, why);
+            let mut reports: Vec<(usize, CaseReport)> = mutant
+                .cases
+                .iter()
+                .map(|index| (*index, report(*index, result.clone(), None)))
+                .collect();
+            unsearched(&mut reports, &result);
+            return Ok(reports);
         }
+        let generated: Vec<usize> = mutant
+            .cases
+            .iter()
+            .copied()
+            .filter(|index| lanes.is_some_and(|lanes| lanes.plans[*index].is_ok()))
+            .collect();
         let live: Vec<usize> = mutant
             .cases
             .iter()
@@ -1014,30 +1159,24 @@ impl Runner {
                 )
             })
             .collect();
-        if live.is_empty() {
+        if live.is_empty() && generated.is_empty() {
             return Ok(reports);
         }
-        let built = match self.build(slot, runnables, &live, &dir, self.build_jobs)? {
+        let needs_sim = !generated.is_empty();
+        let built = match self.build(slot, runnables, &live, needs_sim, &dir, self.build_jobs)? {
             Ok(built) => built,
-            Err(BuildFailure::Rejected(why)) => {
-                reports.extend(live.iter().map(|index| {
-                    (
-                        *index,
-                        report(
-                            *index,
-                            Classified::new(Class::DidNotCompile, None, why.clone()),
-                            None,
-                        ),
-                    )
-                }));
-                return Ok(reports);
-            }
-            Err(BuildFailure::Broken(why)) => {
-                reports.extend(live.iter().map(|index| {
-                    let result =
-                        Classified::new(Class::HarnessFailure, Some(Reason::Build), why.clone());
-                    (*index, report(*index, result, None))
-                }));
+            Err(failure) => {
+                let result = match failure {
+                    BuildFailure::Rejected(why) => Classified::new(Class::DidNotCompile, None, why),
+                    BuildFailure::Broken(why) => {
+                        Classified::new(Class::HarnessFailure, Some(Reason::Build), why)
+                    }
+                };
+                reports.extend(
+                    live.iter()
+                        .map(|index| (*index, report(*index, result.clone(), None))),
+                );
+                unsearched(&mut reports, &result);
                 return Ok(reports);
             }
         };
@@ -1065,29 +1204,42 @@ impl Runner {
             );
             reports.push((index, report(index, result, Some(&ran))));
         }
+        if let Some(lanes) = lanes.filter(|_| !generated.is_empty()) {
+            let searched: Vec<(usize, &LoopCase)> = generated
+                .iter()
+                .map(|index| (*index, &cases[*index]))
+                .collect();
+            let mut lanes =
+                self.generator_lanes(slot, &built, lanes, &searched, &dir, &source, cap)?;
+            for (index, report) in &mut reports {
+                report.generator = lanes.remove(index).unwrap_or_default();
+            }
+        }
         Ok(reports)
     }
 
     /// Builds in `slot`, with `jobs` compiler jobs, the `zakura-sim` binary
-    /// if a case in `cases` runs a recorded witness, and each test binary
-    /// they name. The binaries, or why the build failed.
+    /// if `generate` or a case in `cases` runs a recorded witness, and each
+    /// test binary they name. The binaries, or why the build failed.
     fn build(
         &self,
         slot: &Slot,
         runnables: &[Runnable],
         cases: &[usize],
+        generate: bool,
         dir: &Path,
         jobs: usize,
     ) -> Result<Result<Built, BuildFailure>, BoxError> {
         fs::create_dir_all(dir)?;
-        let needs_sim = cases
-            .iter()
-            .any(|index| matches!(runnables[*index], Runnable::Record { .. }));
+        let needs_sim = generate
+            || cases
+                .iter()
+                .any(|index| !matches!(runnables[*index], Runnable::Test { .. }));
         let targets: BTreeSet<&str> = cases
             .iter()
             .filter_map(|index| match &runnables[*index] {
                 Runnable::Test { target, .. } => Some(target.as_str()),
-                Runnable::Record { .. } => None,
+                Runnable::Record { .. } | Runnable::Generate { .. } => None,
             })
             .collect();
         let mut built = Built::default();
@@ -1182,6 +1334,26 @@ impl Runner {
                     .args(["--witness", property, "--expect", "holds"]);
                 (command, None)
             }
+            Runnable::Generate {
+                harness,
+                seed,
+                runs,
+                exclude,
+            } => {
+                let sim = built
+                    .sim
+                    .as_ref()
+                    .ok_or("the build made no zakura-sim binary")?;
+                let mut command = scoped(cap, sim);
+                command
+                    .args(["generate", "--sim", harness])
+                    .args(["--seed", &seed.to_string(), "--runs", &runs.to_string()])
+                    .arg("--exclude")
+                    .arg(exclude)
+                    .arg("--out")
+                    .arg(dir.join(generate::SEARCH_DIR));
+                (command, None)
+            }
             Runnable::Test { target, test } => {
                 let binary = built
                     .tests
@@ -1212,6 +1384,14 @@ impl Runner {
         };
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (records, unpaired) = read_records(&records, source)?;
+        let generated = match runnable {
+            Runnable::Generate { .. } => {
+                fs::read(dir.join(generate::SEARCH_DIR).join(generate::REPORT_FILE))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            }
+            _ => None,
+        };
         Ok(Ran {
             observed: Observed {
                 ended,
@@ -1222,6 +1402,7 @@ impl Runner {
             millis,
             peak_rss_kib,
             log,
+            generated,
         })
     }
 }

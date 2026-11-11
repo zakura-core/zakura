@@ -1,0 +1,9 @@
+harness = "handshake/wire"
+generator = 8
+sha256 = "893991fe0e40cd1634aa5b02fde42e010f4ffef4ea6caa63b5a088558ebc6f37"
+scenario_sha256 = "368b2e11989838a088ba18cdf93c2112cdaddfbc06e5102b13b1a9724d163ecb"
+source = "crates/zakura-sim/tests/handshake.rs"
+
+[[witness]]
+property = "session/stream-opens-bounded"
+expect = "holds"

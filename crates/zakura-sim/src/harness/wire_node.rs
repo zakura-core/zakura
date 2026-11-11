@@ -39,7 +39,7 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        ConnectionProbe, ConnectionSample, HeaderCheck, HeaderSyncService, Service,
+        ConnectionProbe, ConnectionSample, HandshakeProbe, HeaderCheck, HeaderSyncService, Service,
         ServiceRegistry, SessionStep, Transition, TransportEvent, TransportObserver, ZakuraConnId,
         ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
         ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
@@ -60,7 +60,7 @@ use crate::{
     observe::{
         HeaderCheckFact, KindLoad, SessionStepFact, TransitionFact, TransportFact, TransportLimits,
     },
-    peer::{key_index, peer_addr, peer_of, SharedIds, NODE_ADDR},
+    peer::{key_index, peer_addr, peer_of, PeerSpec, SharedIds, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -98,16 +98,52 @@ impl WireNode {
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
     ) -> Self {
-        let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
-        let endpoint = WireEndpoint::spawn(
+        Self::spawn_with_services(
             sim,
-            network,
+            header,
+            config(network),
             net,
             seed,
             observer,
             dials,
-            move |_, _| (vec![service], ()),
-            |_, _, ()| async {},
+            vec![NODE_ADDR],
+            |_, _| Vec::new(),
+            |_| async {},
+        )
+    }
+
+    /// Builds the same wire node with additional production services in its registry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_services<F: Future<Output = ()> + Send + 'static>(
+        sim: &mut Sim,
+        header: HeaderNode,
+        network_config: Config,
+        net: SimNet,
+        seed: [u8; 32],
+        observer: Arc<dyn TransportObserver>,
+        dials: DialReporter,
+        listen_addrs: Vec<SocketAddr>,
+        additional: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> Vec<Arc<dyn Service>>
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint) -> F + Send + 'static,
+    ) -> Self {
+        let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
+        let endpoint = WireEndpoint::spawn_configured(
+            sim,
+            network_config,
+            net,
+            seed,
+            None,
+            Some(listen_addrs),
+            observer,
+            Some(dials),
+            move |supervisor, limits| {
+                let mut services = vec![service];
+                services.extend(additional(supervisor, limits));
+                (services, ())
+            },
+            |endpoint, _, ()| started(endpoint),
         );
         WireNode { header, endpoint }
     }
@@ -115,6 +151,33 @@ impl WireNode {
     /// [`WireEndpoint::dial`].
     pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
         self.endpoint.dial(sim, index, listening);
+    }
+
+    /// Dials a scripted handshake peer after its configured admission delay.
+    pub(crate) fn dial_handshake(
+        &self,
+        sim: &mut Sim,
+        index: usize,
+        spec: &PeerSpec,
+        listening: watch::Receiver<bool>,
+    ) {
+        let script = spec.handshake.clone().unwrap_or_default();
+        let remote = spec.address(index, 0);
+        let target = NodeAddr::with_addrs(
+            SeededInputs::node_key(
+                self.endpoint.seed,
+                key_index(
+                    script
+                        .advertised_identity
+                        .or(script.identity)
+                        .unwrap_or(index),
+                ),
+            )
+            .public(),
+            [remote],
+        );
+        self.endpoint
+            .spawn_dial(sim, remote, target, listening, Some(script.dial_delay_ms));
     }
 }
 
@@ -198,6 +261,7 @@ impl WireEndpoint {
             net,
             seed,
             index,
+            None,
             observer,
             dials,
             services,
@@ -214,6 +278,7 @@ impl WireEndpoint {
         net: SimNet,
         seed: [u8; 32],
         index: Option<usize>,
+        listen_addrs: Option<Vec<SocketAddr>>,
         observer: Arc<dyn TransportObserver>,
         dials: Option<DialReporter>,
         services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
@@ -234,12 +299,13 @@ impl WireEndpoint {
             let limits = ZakuraLocalLimits::from_config(&config);
             let quic = QuicEndpoint::bind_with(
                 SeededInputs::node_key(seed, key),
-                &limits.quic_bind_config(vec![addr]),
+                &limits.quic_bind_config(listen_addrs.unwrap_or_else(|| vec![addr])),
                 &limits.quic,
                 net,
                 SeededInputs::new(seed, key).endpoint_inputs(),
             )
             .expect("the node binds its address");
+            observer.quic_admission(quic.admission_probe());
             let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
             let (services, handed) = services(&supervisor, &limits);
             let registry = ServiceRegistry::new(services).expect("the node's services register");
@@ -277,13 +343,24 @@ impl WireEndpoint {
     /// `listening` says the peer does too, and serves the connection until
     /// it ends. A dial that fails is reported as `dial-failed` on the
     /// peer's address.
-    pub fn dial(&self, sim: &mut Sim, index: usize, mut listening: watch::Receiver<bool>) {
-        let mut endpoint = self.endpoint.clone();
+    pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
         let remote = peer_addr(index, 0);
         let target = NodeAddr::with_addrs(
             SeededInputs::node_key(self.seed, key_index(index)).public(),
             [remote],
         );
+        self.spawn_dial(sim, remote, target, listening, None);
+    }
+
+    fn spawn_dial(
+        &self,
+        sim: &mut Sim,
+        remote: SocketAddr,
+        target: NodeAddr,
+        mut listening: watch::Receiver<bool>,
+        handshake_delay_ms: Option<u64>,
+    ) {
+        let mut endpoint = self.endpoint.clone();
         let dials = self.dials.clone();
         sim.scheduler().spawn_root("dial", async move {
             if listening.wait_for(|up| *up).await.is_err() {
@@ -294,6 +371,12 @@ impl WireEndpoint {
                 Err(_) => return,
             };
             let (endpoint, limits) = bound.expect("the wait returns a bound node");
+            if let Some(delay_ms) = handshake_delay_ms {
+                crate::peer::handshake::options::delay(delay_ms).await;
+                if let Some(dials) = &dials {
+                    dials.0.push(Reported::DialStarted { remote });
+                }
+            }
             // A connection's own events show how it went once it registers.
             if let Err(error) = endpoint.dial(target, &limits).await {
                 if let Some(dials) = dials {
@@ -333,6 +416,7 @@ pub struct TransportTap {
     peers: Vec<String>,
     /// Each registered connection's remote address.
     remotes: BTreeMap<u64, SocketAddr>,
+    connection_ids: BTreeMap<u64, String>,
     /// Where it hands over the shared ID of each `registered` and
     /// `handshake-refused` event it logs.
     shared_ids: SharedIds,
@@ -340,6 +424,10 @@ pub struct TransportTap {
     role: TapRole,
     /// The last load it logged for each connection it samples.
     loads: BTreeMap<u64, TransportFact>,
+    stream_loads: BTreeMap<u64, TransportFact>,
+    handshake_load: Option<TransportFact>,
+    session_capacity: Option<(zakura_network::zakura::SessionSlotsProbe, [usize; 4])>,
+    session_load: Option<TransportFact>,
 }
 
 /// The end of its connections a [`TransportTap`] reads.
@@ -370,6 +458,10 @@ struct TapState {
     sampling: bool,
     /// Each registered connection's resource probe, in registration order.
     probes: Mutex<Vec<(u64, ConnectionProbe)>>,
+    handshakes: Mutex<Option<HandshakeProbe>>,
+    handshake_slots: Mutex<Vec<(SocketAddr, [u8; 16], zakura_quic::SlotProbe)>>,
+    handshake_sampling: AtomicBool,
+    quic_admission: Mutex<Option<zakura_quic::AdmissionProbe>>,
 }
 
 /// Events reported and not yet drained.
@@ -383,8 +475,17 @@ struct Buffer {
 
 /// One event in the tap's buffer: the transport's, or the wire node's own.
 enum Reported {
+    /// Node-wide admission counts changed.
+    HandshakeLoad(TransportFact),
     /// What the transport reported.
     Event(TransportEvent),
+    /// One unregistered or registered connection finished its QUIC shutdown drain.
+    HandshakeSlotReleased {
+        remote: SocketAddr,
+        shared_id: [u8; 16],
+    },
+    /// The handshake harness started one of its node dials.
+    DialStarted { remote: SocketAddr },
     /// A dial to `remote` failed with `error`.
     DialFailed { remote: SocketAddr, error: String },
     /// Connection `conn_id`'s shared ID, right after its registration.
@@ -474,8 +575,42 @@ impl std::fmt::Debug for TapObserver {
 }
 
 impl TransportObserver for TapObserver {
+    fn handshake_slot(
+        &self,
+        remote: SocketAddr,
+        shared_id: [u8; 16],
+        probe: zakura_quic::SlotProbe,
+    ) {
+        if !self.0.handshake_sampling.load(Ordering::Relaxed) {
+            return;
+        }
+        self.0
+            .handshake_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((remote, shared_id, probe));
+    }
+    fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
+        *self
+            .0
+            .quic_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
+    fn handshakes(&self, probe: HandshakeProbe) {
+        *self
+            .0
+            .handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
     /// Buffers `event`, as [`TapState::push`] does.
     fn observe(&self, event: TransportEvent) {
+        if matches!(event, TransportEvent::StreamSetupStarted { .. })
+            && !self.0.handshake_sampling.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.0.push(Reported::Event(event));
     }
 
@@ -572,6 +707,10 @@ impl TransportTap {
                 sessions,
                 sampling,
                 probes: Mutex::default(),
+                handshakes: Mutex::default(),
+                handshake_slots: Mutex::default(),
+                handshake_sampling: AtomicBool::new(false),
+                quic_admission: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -600,17 +739,172 @@ impl TransportTap {
             net,
             peers,
             remotes: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
             shared_ids: SharedIds::default(),
             role,
             loads: BTreeMap::new(),
+            stream_loads: BTreeMap::new(),
+            handshake_load: None,
+            session_capacity: None,
+            session_load: None,
         };
         (observer, tap)
     }
 
-    /// Buffers a `load` row for each probed connection whose resources
-    /// changed since the row last logged for it, read inside a boundary
-    /// read.
+    /// Enables admission samples for the handshake harness.
+    pub(crate) fn with_handshake_counts(self) -> Self {
+        self.state.handshake_sampling.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Samples the handshake fixture's production session capacity.
+    pub(crate) fn with_session_capacity(
+        mut self,
+        probe: zakura_network::zakura::SessionSlotsProbe,
+    ) -> Self {
+        let free = zakura_rt::sim::boundary_read(|| probe.read());
+        self.session_capacity = Some((
+            probe,
+            [free.inbound, free.outbound, free.setup, free.inbound_setup],
+        ));
+        self
+    }
+
+    fn sample_handshakes(&mut self) {
+        self.state
+            .handshake_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(remote, shared_id, probe)| {
+                if zakura_rt::sim::boundary_read(|| probe.released()) {
+                    self.state.push(Reported::HandshakeSlotReleased {
+                        remote: *remote,
+                        shared_id: *shared_id,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+        let quic = self
+            .state
+            .quic_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(probe) = &quic {
+            for event in zakura_rt::sim::boundary_read(|| probe.take_events()) {
+                use zakura_quic::{Admit, HandshakeEvent};
+                let fact = match event {
+                    HandshakeEvent::Admission {
+                        incoming,
+                        decision,
+                        max_pending_per_ip,
+                        retry_threshold,
+                    } => TransportFact::QuicAdmission {
+                        remote: incoming.remote.to_string(),
+                        validated: incoming.validated,
+                        pending_total: incoming.pending_total,
+                        pending_from_ip: incoming.pending_from_ip,
+                        decision: match decision {
+                            Admit::Accept => "accept",
+                            Admit::Refuse => "refuse",
+                            Admit::Retry => "retry",
+                            Admit::Ignore => "ignore",
+                        }
+                        .into(),
+                        max_pending_per_ip,
+                        retry_threshold,
+                    },
+                    HandshakeEvent::Started { remote, deadline } => TransportFact::QuicTlsStarted {
+                        remote: remote.to_string(),
+                        deadline_ms: deadline.map(|duration| {
+                            u64::try_from(duration.as_millis()).expect("QUIC timeouts fit u64")
+                        }),
+                    },
+                    HandshakeEvent::Finished { remote, error } => {
+                        TransportFact::QuicHandshakeFinished {
+                            remote: remote.to_string(),
+                            error,
+                        }
+                    }
+                };
+                self.state.push(Reported::HandshakeLoad(fact));
+            }
+        }
+        let Some(quic) = quic.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
+        else {
+            return;
+        };
+        let probe = self
+            .state
+            .handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(sample) = probe.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
+        {
+            let load = TransportFact::HandshakeCounts {
+                connections: sample.connections,
+                inbound_connections: sample.inbound_connections,
+                connection_permits: sample.connection_permits,
+                inbound_connection_permits: sample.inbound_connection_permits,
+                connection_cap: sample.connection_cap,
+                address_cap: sample.address_cap,
+                quic_handoffs: quic.handoffs,
+                quic_pending: quic.pending,
+                quic_hosts: quic
+                    .hosts
+                    .into_iter()
+                    .map(|(ip, count)| (ip.to_string(), count))
+                    .collect(),
+                quic_live: quic.live,
+                quic_inbound: quic.inbound,
+                quic_closing: quic.closing,
+                quic_max_live: quic.max_live,
+                quic_max_inbound: quic.max_inbound,
+                quic_below_reserve: quic.below_reserve,
+                pending: sample.pending,
+                inbound: sample.inbound,
+                pending_permits: sample.pending_permits,
+                inbound_permits: sample.inbound_permits,
+                cap: sample.cap,
+                hosts: sample
+                    .hosts
+                    .into_iter()
+                    .map(|(ip, registered, handshaking)| (ip.to_string(), registered, handshaking))
+                    .collect(),
+            };
+            if self.handshake_load.as_ref() != Some(&load) {
+                self.handshake_load = Some(load.clone());
+                self.state.push(Reported::HandshakeLoad(load));
+            }
+        }
+    }
+
+    /// Buffers changed resource samples without taking scheduling points.
     fn sample(&mut self) {
+        if let Some((probe, capacity)) = &self.session_capacity {
+            if let Some(sample) = zakura_rt::sim::boundary_read(|| probe.ownership()) {
+                let slots = |s: zakura_network::zakura::FreeSlots| {
+                    [s.inbound, s.outbound, s.setup, s.inbound_setup]
+                };
+                let load = TransportFact::SessionCapacity {
+                    inbound_setups: sample.inbound_setups,
+                    free: slots(sample.free),
+                    held: slots(sample.held),
+                    capacity: *capacity,
+                };
+                if self.session_load.as_ref() != Some(&load) {
+                    self.session_load = Some(load.clone());
+                    self.state.push(Reported::HandshakeLoad(load));
+                }
+            }
+        }
+
+        if self.state.handshake_sampling.load(Ordering::Relaxed) {
+            self.sample_handshakes();
+        }
         let probes = self
             .state
             .probes
@@ -618,7 +912,23 @@ impl TransportTap {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         for (conn_id, probe) in probes {
-            let load = load(&zakura_rt::sim::boundary_read(|| probe.read()));
+            let sample = zakura_rt::sim::boundary_read(|| probe.read());
+            if self.state.handshake_sampling.load(Ordering::Relaxed) {
+                let streams = sample.streams;
+                let load = TransportFact::StreamLoad {
+                    setup: streams.setup,
+                    installed: streams.installed,
+                    retiring: streams.retiring,
+                    available: streams.available,
+                    capacity: streams.capacity,
+                    rate: streams.rate,
+                };
+                if self.stream_loads.get(&conn_id) != Some(&load) {
+                    self.stream_loads.insert(conn_id, load.clone());
+                    self.state.push(Reported::Load { conn_id, load });
+                }
+            }
+            let load = load(&sample);
             if self.loads.get(&conn_id) != Some(&load) {
                 self.loads.insert(conn_id, load.clone());
                 self.state.push(Reported::Load { conn_id, load });
@@ -661,7 +971,24 @@ impl TransportTap {
         event: Reported,
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
         let event = match event {
+            Reported::HandshakeLoad(load) => return Ok((None, NODE_ADDR, load)),
+            Reported::HandshakeSlotReleased { remote, shared_id } => {
+                return Ok((
+                    None,
+                    remote,
+                    TransportFact::Handshake {
+                        shared_id: crate::storage::hex(&shared_id),
+                        stage: "quic-released".into(),
+                        validation: None,
+                        error: None,
+                        elapsed_ms: None,
+                    },
+                ))
+            }
             Reported::Event(event) => event,
+            Reported::DialStarted { remote } => {
+                return Ok((None, remote, TransportFact::DialStarted));
+            }
             Reported::DialFailed { remote, error } => {
                 return Ok((None, remote, TransportFact::DialFailed { error }));
             }
@@ -678,6 +1005,72 @@ impl TransportTap {
             }
         };
         Ok(match event {
+            TransportEvent::StreamSetupStarted {
+                conn_id,
+                quic_stream,
+                rate,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::StreamSetupStarted { quic_stream, rate },
+            ),
+            TransportEvent::HandshakeCapabilities {
+                remote,
+                shared_id,
+                supported,
+            } => (
+                None,
+                remote,
+                TransportFact::HandshakeCapabilities {
+                    shared_id: shared_id.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    supported,
+                },
+            ),
+            TransportEvent::CapabilitiesChanged { supported } => (
+                None,
+                NODE_ADDR,
+                TransportFact::CapabilitiesChanged { supported },
+            ),
+            TransportEvent::PreludeJudged {
+                conn_id,
+                quic_stream,
+                rejection,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::PreludeJudged {
+                    shared_id: self
+                        .connection_ids
+                        .get(&conn_id)
+                        .cloned()
+                        .ok_or_else(|| "prelude has no registered TLS identity".to_owned())?,
+                    quic_stream,
+                    rejection: rejection
+                        .map(|rejection| crate::table::handshake::prelude_label(rejection).into()),
+                },
+            ),
+            TransportEvent::Handshake {
+                remote,
+                shared_id,
+                stage,
+                validation,
+                error,
+                elapsed,
+            } => (
+                None,
+                remote,
+                TransportFact::Handshake {
+                    shared_id: crate::storage::hex(&shared_id),
+                    stage: stage.into(),
+                    validation: validation
+                        .map(|error| crate::table::handshake::validation_label(error).into()),
+                    error,
+                    elapsed_ms: elapsed.map(|elapsed| {
+                        u64::try_from(elapsed.as_millis())
+                            .expect("a simulation fits u64 milliseconds")
+                    }),
+                },
+            ),
             TransportEvent::Negotiated {
                 remote,
                 local,
@@ -711,6 +1104,8 @@ impl TransportTap {
                     ));
                 }
                 self.shared_ids.borrow_mut().insert(seq, shared_id);
+                self.connection_ids
+                    .insert(conn_id, crate::storage::hex(&shared_id));
                 (Some(conn_id), remote, TransportFact::Registered)
             }
             TransportEvent::Admitted {

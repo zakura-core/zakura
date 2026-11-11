@@ -6,6 +6,7 @@
 mod clock;
 mod frame;
 mod guard;
+mod handshake_counts;
 mod io;
 mod lifetime;
 mod message_rule;
@@ -22,6 +23,7 @@ mod sim_reader;
 
 pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
+pub use handshake_counts::{inbound_share, HandshakeCounts, IpAdmission};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.
@@ -62,6 +64,8 @@ pub use message_rule::{
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
+#[cfg(zakura_sim)]
+pub use observe::{HandshakePause, HandshakePhase};
 #[cfg(any(test, zakura_sim))]
 pub use observe::{HeaderCheck, Transition, TransportEvent, TransportObserver};
 #[cfg(feature = "internal-bench")]
@@ -71,7 +75,9 @@ pub(crate) use pipe::{
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 #[cfg(zakura_sim)]
-pub use probe::{ConnectionProbe, ConnectionSample, KindSample};
+pub use probe::{
+    ConnectionProbe, ConnectionSample, HandshakeProbe, HandshakeSample, KindSample, StreamSample,
+};
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
 pub(crate) use service::ServiceStream;
 pub use service::{

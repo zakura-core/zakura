@@ -78,6 +78,7 @@ impl Reached {
 }
 
 const BOOK: Machine = Machine {
+    rules: &[],
     name: "discovery/record-book",
     identity: "discovery-book",
     claim: "After each operation, the book's entries, relay attribution and exact install, replacement and eviction facts agree with the independent model, and each signed sample stays inside its requester's disclosure window.",
@@ -101,6 +102,7 @@ const BOOK: Machine = Machine {
 };
 
 const STATE: Machine = Machine {
+    rules: &[],
     name: "discovery/session-installation",
     identity: "discovery-state",
     claim: "After each operation, admitted sessions, retained service hints and each verification result's installation agree with the independent model.",

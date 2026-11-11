@@ -50,6 +50,9 @@ pub enum Bypass {
     /// planted` applies to a scratch checkout. The name is without
     /// `.patch`.
     Planted(&'static str),
+    /// A production patch relative to `qa/native-mutations`, bound to this
+    /// property in `cases.json`. The droplet mutation campaign runs it.
+    Native(&'static str),
     /// No bug can violate the property yet: its check is missing what the
     /// reason names. Only a `Draft` property names one.
     Pending(&'static str),
@@ -276,8 +279,352 @@ const OWED_ANSWERS: &str = "answers_within_their_requests_hold_sender_within_owe
 /// The `services` act witnesses.
 const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
 
+/// A control-field witness paired with its production guard mutation.
+const fn handshake_guard(
+    property: &'static str,
+    patch: &'static str,
+    test: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: passes("tests/handshake.rs", test),
+        bypass: Bypass::Native(patch),
+    }
+}
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
+    handshake_guard(
+        "handshake/quic/alpn-required",
+        "handshake-quic/accept-unsupported-alpn/accept-unsupported-alpn.patch",
+        "quic_rejects_an_unsupported_alpn_before_control",
+    ),
+    handshake_guard(
+        "handshake/quic/identity-required",
+        "handshake-quic/accept-wrong-dialed-key/accept-wrong-dialed-key.patch",
+        "quic_rejects_a_key_different_from_the_dialed_identity",
+    ),
+    handshake_guard(
+        "handshake/quic/pending-per-address-bounded",
+        "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch",
+        "quic_pending_limit_refuses_another_tls_attempt",
+    ),
+    handshake_guard(
+        "handshake/quic/retry-before-unvalidated-accept",
+        "handshake-quic/skip-retry-threshold/skip-retry-threshold.patch",
+        "quic_retry_validates_sources_before_tls",
+    ),
+    handshake_guard(
+        "handshake/quic/finishes-in-time",
+        "handshake-quic/skip-inbound-tls-deadline/skip-inbound-tls-deadline.patch",
+        "quic_deadline_ends_a_stalled_tls_attempt",
+    ),
+    handshake_guard(
+        "handshake/hello/refusal-releases-slot",
+        "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/refusal-releases-slot",
+        "handshake-release/retain-quic-slot/retain-quic-slot.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/conformant-never-refused",
+        "handshake-table/refuse-conformant-hello/refuse-conformant-hello.patch",
+        "conformant_control_and_prelude_are_accepted",
+    ),
+    handshake_guard(
+        "handshake/ack/conformant-never-refused",
+        "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch",
+        "conformant_ack_is_accepted",
+    ),
+    handshake_guard(
+        "handshake/prelude/conformant-never-refused",
+        "handshake-table/refuse-conformant-prelude/refuse-conformant-prelude.patch",
+        "conformant_control_and_prelude_are_accepted",
+    ),
+    Coverage {
+        property: "handshake/counts-match-permits",
+        passing: passes(
+            "tests/handshake.rs",
+            "counts_trace_replays_with_each_named_rule",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/retain-pending-charge/retain-pending-charge.patch",
+        ),
+    },
+    Coverage {
+        property: "handshake/pending-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "inbound_control_pressure_preserves_a_wire_dial",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+        ),
+    },
+    Coverage {
+        property: "handshake/dial-reserve-kept",
+        passing: passes(
+            "tests/handshake.rs",
+            "inbound_connection_pressure_preserves_a_wire_dial",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch",
+        ),
+    },
+    Coverage {
+        property: "handshake/connections-per-address-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "shared_address_registrations_stop_at_the_cap",
+        ),
+        bypass: Bypass::Native(
+            "handshake-admission/allow-one-extra-registration/allow-one-extra-registration.patch",
+        ),
+    },
+    handshake_guard(
+        "handshake/prelude/bad-magic-resets",
+        "handshake-table/skip-prelude-magic/skip-prelude-magic.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unknown-kind-resets",
+        "handshake-table/fallback-for-unknown-stream/fallback-for-unknown-stream.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unnegotiated-capability-resets",
+        "handshake-table/skip-prelude-capability/skip-prelude-capability.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unselected-version-resets",
+        "handshake-table/skip-selected-stream-version/skip-selected-stream-version.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/unexpected-request-id-closes",
+        "handshake-table/allow-unexpected-request-id/allow-unexpected-request-id.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/request-without-id-closes",
+        "handshake-table/allow-missing-request-id/allow-missing-request-id.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/undersized-cap-closes",
+        "handshake-table/skip-prelude-frame-cap/skip-prelude-frame-cap.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/prelude/ineligible-opener-closes",
+        "handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch",
+        "prelude_guards_apply_each_declared_consequence",
+    ),
+    handshake_guard(
+        "handshake/hello/oversize-refused",
+        "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/oversize-refused",
+        "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    Coverage {
+        property: "handshake/finishes-in-time",
+        passing: passes("tests/handshake.rs", "honest_control_handshake_holds"),
+        bypass: Bypass::Test(sim_test(
+            "tests/handshake.rs",
+            "slow_control_steps_exceed_the_overall_deadline",
+        )),
+    },
+    Coverage {
+        property: "session/renegotiation-covers-inflight-handshakes",
+        passing: passes(
+            "tests/handshake.rs",
+            "capability_flip_covers_inflight_handshake",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/handshake.rs",
+            "capability_flip_covers_inflight_handshake",
+        )),
+    },
+    handshake_guard(
+        "handshake/hello/wrong-network-refused",
+        "handshake-table/skip-network-binding/skip-network-binding.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/identity-mismatch-refused",
+        "handshake-table/skip-authenticated-identity/skip-authenticated-identity.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/unoffered-capability-refused",
+        "handshake-table/accept-unoffered-capability/accept-unoffered-capability.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-nonce-echo-refused",
+        "handshake-table/skip-nonce-echo/skip-nonce-echo.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-magic-refused",
+        "handshake-table/skip-hello-magic/skip-hello-magic.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-version-refused",
+        "handshake-table/skip-hello-version/skip-hello-version.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-protocol-refused",
+        "handshake-table/skip-hello-protocol/skip-hello-protocol.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-path-refused",
+        "handshake-table/skip-handshake-path/skip-handshake-path.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-role-refused",
+        "handshake-table/skip-remote-role/skip-remote-role.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/wrong-chain-refused",
+        "handshake-table/skip-chain-binding/skip-chain-binding.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/missing-capability-refused",
+        "handshake-table/skip-required-channel/skip-required-channel.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-protocol-refused",
+        "handshake-table/skip-ack-protocol/skip-ack-protocol.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-magic-refused",
+        "handshake-table/skip-ack-magic/skip-ack-magic.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-version-refused",
+        "handshake-table/skip-ack-version/skip-ack-version.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/nonzero-initiator-nonce-refused",
+        "handshake-table/skip-native-initiator-nonce/skip-native-initiator-nonce.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/nonzero-responder-nonce-refused",
+        "handshake-table/skip-native-responder-nonce/skip-native-responder-nonce.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/nonzero-native-transcript-refused",
+        "handshake-table/skip-native-transcript/skip-native-transcript.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-frame-limit-refused",
+        "handshake-table/skip-frame-limits/skip-frame-limits.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-frame-limit-refused",
+        "handshake-table/skip-frame-limits/skip-frame-limits.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-message-limit-refused",
+        "handshake-table/skip-message-limits/skip-message-limits.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-message-limit-refused",
+        "handshake-table/skip-message-limits/skip-message-limits.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-stream-limit-refused",
+        "handshake-table/skip-stream-limits/skip-stream-limits.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-stream-limit-refused",
+        "handshake-table/skip-stream-limits/skip-stream-limits.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-queue-limit-refused",
+        "handshake-table/skip-queue-limits/skip-queue-limits.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-queue-limit-refused",
+        "handshake-table/skip-queue-limits/skip-queue-limits.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/hello/bad-idle-limit-refused",
+        "handshake-table/skip-idle-limits/skip-idle-limits.patch",
+        "hello_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/bad-idle-limit-refused",
+        "handshake-table/skip-idle-limits/skip-idle-limits.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    handshake_guard(
+        "handshake/ack/limits-above-request-refused",
+        "handshake-table/skip-requested-limit-ceilings/skip-requested-limit-ceilings.patch",
+        "ack_guards_refuse_each_corrupt_field",
+    ),
+    Coverage {
+        property: "session/capacity-conserved",
+        passing: passes(
+            "tests/handshake.rs",
+            "partial_session_offers_release_setup_capacity",
+        ),
+        bypass: Bypass::Planted("leak-setup-permits"),
+    },
+    Coverage {
+        property: "session/setup-slot-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "partial_session_offers_release_setup_capacity",
+        ),
+        bypass: Bypass::Planted("no-outbound-setup-reserve"),
+    },
+    Coverage {
+        property: "session/stream-opens-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "invalid_stream_churn_obeys_the_open_rate",
+        ),
+        bypass: Bypass::Planted("no-stream-open-charge"),
+    },
+    Coverage {
+        property: "session/installed-services-authorized",
+        passing: passes(
+            "tests/handshake.rs",
+            "installed_services_follow_each_peers_negotiation",
+        ),
+        bypass: Bypass::Planted("install-unnegotiated-service"),
+    },
     Coverage {
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
         passing: passes(

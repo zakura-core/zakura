@@ -68,8 +68,6 @@ pub(in crate::planted) struct LaneSpec<'a> {
     pub(in crate::planted) harness: &'a str,
     /// The campaign's name in its store.
     pub(in crate::planted) name: &'a str,
-    /// The property whose finding the lane looks for.
-    pub(in crate::planted) property: &'a str,
     pub(in crate::planted) seed: u32,
     /// The directory the campaign's initial inputs come from.
     pub(in crate::planted) corpus: &'a Path,
@@ -130,18 +128,41 @@ impl std::fmt::Display for LaneError {
     }
 }
 
+/// The records one campaign left in its store.
+#[derive(Clone, Debug)]
+pub(in crate::planted) struct Campaign {
+    /// The run's end record, if it wrote one.
+    pub(in crate::planted) end: Option<Value>,
+    /// What `zakura-sim campaign evidence` summed for the run.
+    pub(in crate::planted) evidence: Value,
+    /// Inputs in the run's initial snapshot.
+    pub(in crate::planted) initial_inputs: usize,
+    /// The build identity the run's manifest records.
+    pub(in crate::planted) identity: Value,
+}
+
+impl Campaign {
+    /// What the records show about `property` ([`campaign_facts`]).
+    pub(in crate::planted) fn facts(&self, property: &str) -> CampaignFacts {
+        campaign_facts(
+            property,
+            self.end.as_ref(),
+            &self.evidence,
+            self.initial_inputs,
+        )
+    }
+}
+
 /// Builds `spec`'s fuzz target with `sim` in `fuzz_target`, and runs one
 /// campaign on it with `bounds` and `spec`'s seed, from `spec`'s corpus, in
-/// a fresh store under `dir`. Reads what the store's records show about
-/// `spec`'s property, and returns them with the build identity the run's
-/// manifest records.
+/// a fresh store under `dir`. Returns the records the run left.
 pub(in crate::planted) fn campaign_lane(
     sim: &Path,
     dir: &Path,
     fuzz_target: &Path,
     spec: &LaneSpec<'_>,
     bounds: &CampaignBounds,
-) -> Result<Result<(CampaignFacts, Value), LaneError>, BoxError> {
+) -> Result<Result<Campaign, LaneError>, BoxError> {
     let store = dir.join("store");
     if store.exists() {
         return Err(format!("{} isn't a fresh store", store.display()).into());
@@ -260,12 +281,15 @@ pub(in crate::planted) fn campaign_lane(
             ))))
         }
     };
-    let facts = campaign_facts(spec.property, end.as_ref(), &evidence, initial_inputs);
-    let identity = manifest
-        .pointer("/build/identity")
-        .cloned()
-        .unwrap_or(Value::Null);
-    Ok(Ok((facts, identity)))
+    Ok(Ok(Campaign {
+        end,
+        evidence,
+        initial_inputs,
+        identity: manifest
+            .pointer("/build/identity")
+            .cloned()
+            .unwrap_or(Value::Null),
+    }))
 }
 
 /// `campaign start`'s arguments for one lane: every bound comes from

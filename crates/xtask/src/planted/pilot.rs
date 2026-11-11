@@ -1005,15 +1005,16 @@ fn campaign_lane(
         target: &case.target,
         harness: &case.harness,
         name: &name,
-        property: &case.property,
         seed,
         corpus,
     };
     Ok(
         lane::campaign_lane(sim, dir, fuzz_target, &spec, &catalogue.discovery.campaign)?.map(
-            |(mut facts, identity)| {
+            |campaign| {
+                let mut facts = campaign.facts(&case.property);
                 let expected = expected_fuzz_identity(catalogue, case);
-                facts.unpaired = paired_identity(&expected, &identity, FUZZ_FIELDS, mutated);
+                facts.unpaired =
+                    paired_identity(&expected, &campaign.identity, FUZZ_FIELDS, mutated);
                 facts
             },
         ),

@@ -25,7 +25,7 @@ use zakura_sim::{
             Policy,
         },
         header_sync::{
-            liveness::{self, HeldKind, LivenessScenario, LIVENESS_BUDGET},
+            liveness::{self, HeldKind, LivenessScenario, RecoveryFixture, LIVENESS_BUDGET},
             storage_config, storage_properties, storage_sources, Liveness, Ports, Storage,
             StorageScenario, StorageView,
         },
@@ -795,10 +795,14 @@ fn the_scenario_byte_picks_each_fixture() {
     // generator, which corpus carry checks.
     assert_eq!(
         (Liveness::GENERATOR, all.len()),
-        (3, 39),
+        (4, 42),
         "a new fixture list needs a new generator"
     );
     assert_eq!(Liveness::draw(&[30]), LivenessScenario::QuietReset);
+    assert_eq!(
+        Liveness::draw(&[39]),
+        LivenessScenario::Recovery(RecoveryFixture::Closes)
+    );
 }
 
 /// The serving-read fixture holds the property and applies, with the

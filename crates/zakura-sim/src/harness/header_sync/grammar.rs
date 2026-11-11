@@ -347,6 +347,7 @@ fn decode_as(
             bound_ms: (header[BOUND] != 0).then(|| u64::from(header[BOUND]) * BOUND_UNIT_MS),
             holds: Vec::new(),
             reply_holds: Vec::new(),
+            disruptions: Vec::new(),
         },
         controls: Vec::new(),
         weights: Weights {
@@ -473,6 +474,12 @@ impl Order {
 /// reply holds', then its control steps'. Fails if the grammar can't
 /// express some part of it.
 pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
+    if !scenario.policy.disruptions.is_empty() {
+        return Err(Unencodable(format!(
+            "the grammar has no disruption, but it declares {:?}",
+            scenario.policy.disruptions
+        )));
+    }
     let mirrors = scenario.mirrors.len();
     if !(1..=MAX_MIRRORS).contains(&mirrors) {
         return Err(Unencodable(format!(

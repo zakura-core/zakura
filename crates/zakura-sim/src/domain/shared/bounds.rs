@@ -177,6 +177,7 @@ mod tests {
             pick: &pick,
             enabled: &[],
             phase: Phase::Live,
+            budget: u64::MAX,
             now: SimInstant::ZERO,
             status: SchedulerStatus::Quiescent,
             quiescent: true,

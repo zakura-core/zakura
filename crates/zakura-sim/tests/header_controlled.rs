@@ -27,6 +27,7 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_scheduler::{SchedulerConfig, SimInstant, Status};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::after_step,
     observe::{StorageFact, StorageRequest, StorageResult, StorageState},
@@ -1556,7 +1557,7 @@ fn always(_: &mut CheckCtx<'_, Calm>) -> Verdict {
 /// failure, and the property reports `harness-failed`, not `held`, both in
 /// the report and in the serialized end record.
 #[test]
-fn a_property_is_inconclusive_after_an_evidence_failure() {
+fn a_property_is_harness_failed_after_an_evidence_failure() {
     const CALM: PropertyId = PropertyId::new("test/always");
     let property = Property {
         id: CALM,
@@ -1605,13 +1606,11 @@ fn a_property_is_inconclusive_after_an_evidence_failure() {
     };
     // The stolen facts are the last ones, so the state is ahead of them.
     assert!(detail.starts_with("Stale"), "{detail}");
-    let inconclusive = PropertyOutcome::Inconclusive {
-        reason: "harness-failed".to_owned(),
-    };
-    assert_eq!(report.properties[0].outcome, inconclusive);
+    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
+    assert_eq!(report.properties[0].outcome, harness_failed);
     let end = lines.last().expect("the run ends with an end record");
     assert!(
-        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
         "{end}"
     );
 }
@@ -2097,14 +2096,12 @@ fn storage_dropped_after_the_last_step_fails_the_run() {
         assert!(detail.starts_with("Dropped"), "{when:?}: {detail}");
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "harness-failed".to_owned()
-            },
+            PropertyOutcome::not_applicable(NaReason::HarnessFailed),
             "{when:?}"
         );
         let end = lines.last().expect("the run ends with an end record");
         assert!(
-            end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+            end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
             "{when:?}: {end}"
         );
     }
@@ -2115,13 +2112,11 @@ fn storage_dropped_after_the_last_step_fails_the_run() {
 fn assert_harness_failed(report: &RunReport, lines: &[String]) {
     assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Inconclusive {
-            reason: "harness-failed".to_owned()
-        }
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
     );
     let end = lines.last().expect("the run ends with an end record");
     assert!(
-        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
         "{end}"
     );
 }
@@ -2130,7 +2125,7 @@ fn assert_harness_failed(report: &RunReport, lines: &[String]) {
 /// outranks the drop, and the property still reports `harness-failed`,
 /// though `at_end` reported it held.
 #[test]
-fn a_dropping_at_end_that_draws_is_still_inconclusive() {
+fn a_dropping_at_end_that_draws_is_still_harness_failed() {
     let (report, lines, saw) = late_drop_run(LateDrop::AtEndDrawing);
     assert_eq!(
         saw,
@@ -2167,9 +2162,9 @@ impl zakura_sim::Checker for DrawsAtEnd {
 }
 
 /// D2 covers any harness failure, not only storage's: with no storage at
-/// all, a draw in `at_end` leaves a property that held inconclusive.
+/// all, a draw in `at_end` leaves a property that held `HarnessFailed`.
 #[test]
-fn a_drawing_at_end_without_storage_is_inconclusive() {
+fn a_drawing_at_end_without_storage_is_harness_failed() {
     let property = Property {
         id: PropertyId::new("test/always"),
         claim: "always holds",

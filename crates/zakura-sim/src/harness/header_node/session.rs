@@ -47,7 +47,7 @@
 //!   its generation's `generation-exited`, or its connection's `torn-down`.
 //!   [`SessionEvidence::end_check`] judges it once the run ends. A run that
 //!   ends idle with one open never will retire it, which is a leak. A run
-//!   that stopped first, at its budget included, is inconclusive. That rule
+//!   that stopped first, at its budget included, stays open. That rule
 //!   never breaks the run itself.
 //!
 //! The view freezes with the run's log, before the scheduler's shutdown
@@ -161,7 +161,7 @@ pub enum EndCheck {
     Unretired(Vec<(String, u64)>),
     /// The run stopped, or hasn't ended, before own-9 retired these
     /// sessions.
-    Inconclusive(Vec<(String, u64)>),
+    Open(Vec<(String, u64)>),
 }
 
 /// A run's session view, shared by the node's tap and the topology's links.
@@ -360,7 +360,7 @@ impl SessionEvidence {
 
     /// Whether own-9 retired every session that left the reactor's view:
     /// [`EndCheck::Unretired`] if the run ended idle with one open, and
-    /// [`EndCheck::Inconclusive`] if it stopped first or hasn't ended.
+    /// [`EndCheck::Open`] if it stopped first or hasn't ended.
     pub fn end_check(&self) -> EndCheck {
         let ledger = self.ledger();
         let open: Vec<(String, u64)> = ledger
@@ -374,7 +374,7 @@ impl SessionEvidence {
         } else if ledger.idle == Some(true) {
             EndCheck::Unretired(open)
         } else {
-            EndCheck::Inconclusive(open)
+            EndCheck::Open(open)
         }
     }
 

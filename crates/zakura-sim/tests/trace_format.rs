@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use support::{config, inputs};
 use tempfile::TempDir;
 use zakura_rt::{sync::Mutex, task, time};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::{self, PropertyOutcome, PropertyReport, StepCtx},
     end::{Drain, HarnessFailure, IdleStatus},
@@ -342,10 +343,13 @@ fn reports_outside_the_run_are_a_harness_failure() {
     );
 
     // So does a holds_since past the last step, and like any harness
-    // failure it leaves a property that didn't apply inconclusive, in the
+    // failure it leaves a property that didn't apply `HarnessFailed`, in the
     // report and in the end record alike.
     let (run, end) = run_and_read(&mut reports_at_end(|steps| {
-        at_end(PropertyOutcome::NotApplicable, Some(steps + 1))
+        at_end(
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
+            Some(steps + 1),
+        )
     }));
     assert_eq!(
         run.end.harness,
@@ -355,15 +359,13 @@ fn reports_outside_the_run_are_a_harness_failure() {
         })
     );
     assert_eq!(end.outcome, OutcomeKind::Harness);
-    let inconclusive = at_end(
-        PropertyOutcome::Inconclusive {
-            reason: "harness-failed".into(),
-        },
+    let harness_failed = at_end(
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed),
         None,
     );
     assert_eq!(
         (&run.properties[..], &end.properties[..]),
-        (&[inconclusive.clone()][..], &[inconclusive][..])
+        (&[harness_failed.clone()][..], &[harness_failed][..])
     );
 
     // References to the run's own steps, including holds_since 0 and the
@@ -1512,9 +1514,37 @@ fn step() -> impl Strategy<Value = StepRecord> {
 fn property_outcome() -> impl Strategy<Value = PropertyOutcome> {
     prop_oneof![
         any::<u32>().prop_map(|applicable| PropertyOutcome::Held { applicable }),
-        Just(PropertyOutcome::NotApplicable),
-        text().prop_map(|reason| PropertyOutcome::Inconclusive { reason }),
+        na_reason().prop_map(PropertyOutcome::not_applicable),
         u64s().prop_map(|witness| PropertyOutcome::Violated { witness }),
+    ]
+}
+
+/// A `NotApplicable` reason: each unit reason, and an `Unsettled` mark at
+/// each site.
+fn na_reason() -> impl Strategy<Value = NaReason> {
+    use zakura_sim::property::Pending;
+    prop_oneof![
+        prop::sample::select(vec![
+            NaReason::NeverApplied,
+            NaReason::Undeclared,
+            NaReason::Excluded,
+            NaReason::AssumptionsNeverHeld,
+            NaReason::AssumptionLost,
+            NaReason::StoppedByViolation,
+            NaReason::HarnessFailed,
+            NaReason::NodeStopped,
+            NaReason::ObligationOpen,
+        ]),
+        prop::sample::select(vec![
+            Pending::FaultOpen,
+            Pending::UnreadBoundary,
+            Pending::TeardownOpen,
+            Pending::BlockTeardownOpen,
+            Pending::WatchOpen,
+            Pending::UnreadTrigger,
+            Pending::UnjudgedDeparture,
+        ])
+        .prop_map(|site| NaReason::Unsettled { site }),
     ]
 }
 

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
-    reasons::{NaKind, NaProducer},
+    reasons::NaEntry,
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
     Tier, PLAN, TIERS,
 };
@@ -60,8 +60,8 @@ pub struct Inventories<'a> {
     pub requirements: &'a [GateObligation],
     /// The composition checks.
     pub composition: &'a [&'a str],
-    /// The `NotApplicable` producers.
-    pub reasons: &'a [NaProducer],
+    /// The `NotApplicable` reasons a header ID can carry.
+    pub reasons: &'a [NaEntry],
     /// The manifest's expected results, read only for the planted runs they
     /// count, each of which owes a replay and, when it completes, a cleanup
     /// comparison.
@@ -707,19 +707,13 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
             }
         }
     }
-    for producer in inv.reasons {
-        for (index, construction) in producer.constructions.iter().enumerate() {
-            if construction.kind != NaKind::MissingEvidence {
-                keys.insert(
-                    Key::NaReason {
-                        file: producer.file.to_owned(),
-                        function: producer.function.to_owned(),
-                        index,
-                    },
-                    BTreeSet::from([Gate::G6]),
-                );
-            }
-        }
+    for entry in inv.reasons {
+        keys.insert(
+            Key::NaReason {
+                reason: entry.reason,
+            },
+            BTreeSet::from([Gate::G6]),
+        );
     }
     for registration in inv.registered {
         let own = if registration.machine {

@@ -1,4 +1,4 @@
-//! M1.5: a budget leaves an open liveness claim inconclusive, the drain
+//! M1.5: a budget leaves an open liveness claim open, the drain
 //! admits nothing external, and a violation ends the run at once.
 #![cfg(zakura_sim)]
 
@@ -12,8 +12,8 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::{self, FnChecker, Phase},
     sim::NO_LIVELOCK,
-    ActionSource, Boundary, Identity, NoChecks, Observation, ObservationLog, Outcome, Plan,
-    PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
+    ActionSource, Boundary, Identity, NaReason, NoChecks, Observation, ObservationLog, Outcome,
+    Plan, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
 };
 
 /// A task that yields `n` times, then finishes.
@@ -24,8 +24,8 @@ async fn yields(n: u32) {
 }
 
 /// A checker for a liveness claim, "`done.1` finishes". It reports the claim
-/// held if the task exited, and inconclusive if the run ended at its budget
-/// first.
+/// held if the task exited, and `NotApplicable` with the obligation open if
+/// the run ended at its budget first.
 fn finishes() -> impl check::Checker {
     FnChecker::new(
         |_: &check::StepCtx<'_>| None,
@@ -35,9 +35,9 @@ fn finishes() -> impl check::Checker {
             );
             let outcome = match (exited, end.outcome) {
                 (true, _) => PropertyOutcome::Held { applicable: 1 },
-                (false, Outcome::Budget) => PropertyOutcome::Inconclusive {
-                    reason: "open at the budget".into(),
-                },
+                (false, Outcome::Budget) => {
+                    PropertyOutcome::not_applicable(NaReason::ObligationOpen)
+                }
                 (false, _) => PropertyOutcome::Violated { witness: vec![] },
             };
             vec![PropertyReport::new("test/done-finishes", outcome)]
@@ -46,7 +46,7 @@ fn finishes() -> impl check::Checker {
 }
 
 #[test]
-fn budget_open_obligation_inconclusive() {
+fn budget_open_obligation_not_applicable() {
     let config = RunConfig {
         drain_bound: 20,
         ..config(2, 10)
@@ -65,7 +65,9 @@ fn budget_open_obligation_inconclusive() {
     assert_eq!(report.end.steps, 30);
     assert!(matches!(
         report.properties[0].outcome,
-        PropertyOutcome::Inconclusive { .. }
+        PropertyOutcome::NotApplicable {
+            reason: NaReason::ObligationOpen
+        }
     ));
 
     // A task that finishes during the drain discharges the claim.

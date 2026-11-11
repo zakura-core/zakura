@@ -2,6 +2,7 @@
 
 use std::{fmt, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use zakura_scheduler::{Op, SimInstant};
 
 use super::PropertyId;
@@ -74,7 +75,7 @@ pub struct FactDischarge<V> {
 /// reactor ends, refuses or retires, or a run loop that stops taking work.
 /// A node-side end answers nothing, so its obligation runs to its deadline
 /// or to the run's settled end and is violated there. Otherwise a node that
-/// drops the peer it owes, or wedges, would read as inconclusive, and
+/// drops the peer it owes, or wedges, would read as not applicable, and
 /// that's the denial of service these properties exist to catch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndedBy {
@@ -178,41 +179,51 @@ pub enum LivenessBound {
     },
 }
 
-/// Why a property's run didn't finish its check. Its `Display` form fills
-/// [`crate::PropertyOutcome::Inconclusive`]'s reason.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Inconclusive {
-    /// The scenario declares the property's assumptions, but they never all
-    /// held.
-    AssumptionsNeverHeld,
-    /// An assumption stopped holding while an obligation was open.
-    AssumptionLost,
-    /// An obligation was still open at run end, within its bound.
-    ObligationOpen,
-    /// The run ended at a harness failure, so its evidence may be
-    /// incomplete.
-    HarnessFailed,
-    /// Every peer left, but the run ended before teardown settled.
-    TeardownOpen,
-    /// The run ended at a boundary whose state the check couldn't read.
+/// Where a check left a pending mark ([`CheckCtx::pending`](super::CheckCtx::pending)):
+/// its trigger fired, but the run hasn't yet shown what the check needs to
+/// judge it. A mark left at the run's end, which no end judgment resolved,
+/// makes the property `NotApplicable { Unsettled { site } }`
+/// ([`crate::NaReason::Unsettled`]). The variants' order is the order the
+/// registry picks a property's reason in when it left several.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Pending {
+    /// `header-sync/header-fault-penalized`: a penalty whose call is still being
+    /// handled, or a failed reply the reactor hasn't taken yet.
+    FaultOpen,
+    /// `header-sync/chunk-budget-bound`: the boundary's budget read found
+    /// the lock held with the reactor stopped mid-poll.
     UnreadBoundary,
-    /// A trigger came before any read of the state the check needed to
-    /// judge it, which no later read can supply, so the run stays
-    /// unsettled wherever it ends.
+    /// `header-sync/teardown-returns-baseline`: a released round is
+    /// unsettled, or the node's stop has begun and it hasn't settled.
+    TeardownOpen,
+    /// `block-sync/teardown-returns-baseline`: every peer left, but a
+    /// routine, queued body or serving lease is still open, or the
+    /// scheduler isn't at rest.
+    BlockTeardownOpen,
+    /// A watch property: a published state still waits for its read or its
+    /// third event.
+    WatchOpen,
+    /// `header-sync/peer-retirement-progress`: a trigger came before any
+    /// read of the fixture state the check needed to judge it, which no
+    /// later read can supply.
     UnreadTrigger,
+    /// `header-sync/peer-retirement-progress`: a departure the slot rule
+    /// hasn't judged at a unit boundary yet.
+    UnjudgedDeparture,
 }
 
-impl fmt::Display for Inconclusive {
-    /// Writes the reason's fixed name, such as `obligation-open`.
+impl fmt::Display for Pending {
+    /// Writes the site's kebab-case name, such as `watch-open`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Inconclusive::AssumptionsNeverHeld => "assumptions-never-held",
-            Inconclusive::AssumptionLost => "assumption-lost",
-            Inconclusive::ObligationOpen => "obligation-open",
-            Inconclusive::HarnessFailed => "harness-failed",
-            Inconclusive::TeardownOpen => "teardown-open",
-            Inconclusive::UnreadBoundary => "unread-boundary",
-            Inconclusive::UnreadTrigger => "unread-trigger",
+            Pending::FaultOpen => "fault-open",
+            Pending::UnreadBoundary => "unread-boundary",
+            Pending::TeardownOpen => "teardown-open",
+            Pending::BlockTeardownOpen => "block-teardown-open",
+            Pending::WatchOpen => "watch-open",
+            Pending::UnreadTrigger => "unread-trigger",
+            Pending::UnjudgedDeparture => "unjudged-departure",
         })
     }
 }

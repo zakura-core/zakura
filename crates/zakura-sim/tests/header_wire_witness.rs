@@ -16,6 +16,7 @@ use support::{
     script::{run_scripted, run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::v9::RegtestMessage;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::{
         header_sync::OUTSTANDING_WORK_BOUNDED,
@@ -290,7 +291,7 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
     for suffix in UNREACHED {
         assert_eq!(
             *outcome(report, &id(suffix)),
-            PropertyOutcome::NotApplicable,
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
             "{witness:?}: {suffix}"
         );
     }
@@ -868,7 +869,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
         let unmarked = run_marked(false, true, script);
         assert_eq!(
             *outcome(&unmarked, HONEST_NEVER_PUNISHED),
-            PropertyOutcome::NotApplicable,
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
             "{name}"
         );
     }
@@ -884,7 +885,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
     );
     assert_eq!(
         *outcome(&report, &id("conformant-never-closes")),
-        PropertyOutcome::NotApplicable
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
     let report = run_marked(true, false, vec![vec![closed("ordered_read_rejected")]]);
     assert!(

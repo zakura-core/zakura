@@ -2695,9 +2695,8 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
-    "the_not_applicable_inventory_equals_a_source_scan",
+    "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
-    "the_source_scan_refuses_an_unlisted_producer",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -2811,33 +2810,27 @@ pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> 
         .collect()
 }
 
-/// The `NotApplicable` reasons' expected results. On `main` a report
-/// doesn't name its reason, so no test can tell two reasons apart until E1
-/// (C1) makes `NotApplicable` carry one.
+/// The `NotApplicable` reasons' expected results, one per reason a header
+/// ID can carry ([`super::reasons::NA_REASONS`]).
 pub fn reason_results() -> Vec<ExpectedResult> {
-    let mut results = Vec::new();
-    for producer in super::reasons::NA_REASONS {
-        for (index, construction) in producer.constructions.iter().enumerate() {
-            if construction.kind != super::reasons::NaKind::MissingEvidence {
-                results.push(result(
-                    vec![Key::NaReason {
-                        file: producer.file.to_owned(),
-                        function: producer.function.to_owned(),
-                        index,
-                    }],
-                    &[Gate::G6],
-                    REASON_TEST,
-                ));
-            }
-        }
-    }
-    results
+    super::reasons::NA_REASONS
+        .iter()
+        .map(|entry| {
+            result(
+                vec![Key::NaReason {
+                    reason: entry.reason,
+                }],
+                &[Gate::G6],
+                REASON_TEST,
+            )
+        })
+        .collect()
 }
 
-/// A `NotApplicable` reason's test, until a report names its reason (E1).
+/// A `NotApplicable` reason's test, until E1's tests show each at its
+/// trigger.
 pub const REASON_TEST: Expected = Expected::Open {
-    reason: "a test that shows this reason at its trigger, once a report names its \
-             NotApplicable reason",
+    reason: "a test that shows this reason at its trigger",
     owner: "Adam's side",
     approval: Approval::Pending,
     until: Some("E1"),

@@ -412,7 +412,7 @@ fn judge(
             | WitnessError::MissingReport
             | WitnessError::Outcome(_)
             | WitnessError::Unrelated { .. }
-            | WitnessError::UnrelatedInconclusive { .. }
+            | WitnessError::UnrelatedIncomplete { .. }
             | WitnessError::SetMember { .. }
             | WitnessError::Unjoined { .. }
             | WitnessError::Fixed { .. }

@@ -800,7 +800,7 @@ impl FaultEvidence {
     /// ends, one finding each: every penalty whose call's handling never
     /// ended, and every failure whose reply reached the reactor and was
     /// never taken ([`untaken`]). Open at any other end, or before the run
-    /// has ended, each is inconclusive. Every break comes first, in the
+    /// has ended, each stays open. Every break comes first, in the
     /// order the judge read them (every cooldown fact, then the log), then
     /// the evidence error that stopped its reading of the log, if one did.
     /// After an error it reads no more of the log, so what the log left
@@ -814,7 +814,7 @@ impl FaultEvidence {
         if judge.error.is_some() {
             return FaultEnd {
                 violated,
-                inconclusive: Vec::new(),
+                open_findings: Vec::new(),
             };
         }
         let open = judge.open_at_end();
@@ -823,12 +823,12 @@ impl FaultEvidence {
                 violated.extend(open);
                 FaultEnd {
                     violated,
-                    inconclusive: Vec::new(),
+                    open_findings: Vec::new(),
                 }
             }
             settled => FaultEnd {
                 violated,
-                inconclusive: open
+                open_findings: open
                     .into_iter()
                     .map(|what| match settled {
                         Some(_) => format!(
@@ -851,14 +851,14 @@ pub struct FaultEnd {
     pub violated: Vec<String>,
     /// Each finding that only a settled end makes a break, when the run
     /// didn't settle or hasn't ended.
-    pub inconclusive: Vec<String>,
+    pub open_findings: Vec<String>,
 }
 
 impl FaultEnd {
     /// Whether the rule held over the whole run: nothing violated or
-    /// inconclusive.
+    /// open.
     pub fn holds(&self) -> bool {
-        self.violated.is_empty() && self.inconclusive.is_empty()
+        self.violated.is_empty() && self.open_findings.is_empty()
     }
 }
 
@@ -868,18 +868,18 @@ mod tests {
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
     /// The one violation in `end`, if it holds exactly one and nothing
-    /// inconclusive.
+    /// open.
     fn violated(end: FaultEnd) -> Option<String> {
-        match (end.violated.as_slice(), end.inconclusive.as_slice()) {
+        match (end.violated.as_slice(), end.open_findings.as_slice()) {
             ([why], []) => Some(why.clone()),
             _ => None,
         }
     }
 
-    /// The one inconclusive finding in `end`, if it holds exactly one and
+    /// The one open finding in `end`, if it holds exactly one and
     /// nothing violated.
-    fn inconclusive(end: FaultEnd) -> Option<String> {
-        match (end.violated.as_slice(), end.inconclusive.as_slice()) {
+    fn open_finding(end: FaultEnd) -> Option<String> {
+        match (end.violated.as_slice(), end.open_findings.as_slice()) {
             ([], [why]) => Some(why.clone()),
             _ => None,
         }
@@ -1125,18 +1125,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unpenalized_fault_is_inconclusive_until_a_settled_end() {
+    fn an_unpenalized_fault_stays_open_until_a_settled_end() {
         let attributed = evidence(&[(1, blame("aa"))]);
         let log = failed_prepare(1, "aa", 3, "invalid_header");
         attributed.settled.set(None);
-        assert!(inconclusive(attributed.penalized(&log)).is_some());
+        assert!(open_finding(attributed.penalized(&log)).is_some());
         attributed.settled.set(Some(false));
-        assert!(inconclusive(attributed.penalized(&log)).is_some());
+        assert!(open_finding(attributed.penalized(&log)).is_some());
     }
 
     /// A fault whose reply reached the reactor but was never taken owes no
     /// penalty. It breaks the rule once a settled run ends, since the
-    /// reactor lost it, and leaves it inconclusive at any other end.
+    /// reactor lost it, and leaves it open at any other end.
     #[test]
     fn an_untaken_fault_breaks_only_a_settled_run() {
         let attributed = evidence(&[(1, blame("aa"))]);
@@ -1151,7 +1151,7 @@ mod tests {
         for settled in [Some(false), None] {
             attributed.settled.set(settled);
             assert!(
-                matches!(inconclusive(attributed.penalized(&log)), Some(why) if why.contains("UntakenFault")
+                matches!(open_finding(attributed.penalized(&log)), Some(why) if why.contains("UntakenFault")
                 )
             );
         }
@@ -1205,7 +1205,7 @@ mod tests {
     /// A settled run's end reports every open finding, not just the
     /// first: two replies that reached the reactor and were never taken,
     /// and two penalties whose calls' handling never ended, one finding
-    /// each, which stay inconclusive at an unsettled end.
+    /// each, which stay open at an unsettled end.
     #[test]
     fn the_end_reports_every_open_fault() {
         let attributed = evidence(&[(1, blame("aa")), (2, blame("aa")), (3, blame("aa"))]);
@@ -1230,7 +1230,7 @@ mod tests {
         third.pop();
         mixed.extend(third);
         let end = attributed.penalized(&mixed);
-        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert!(end.open_findings.is_empty(), "{end:?}");
         assert_eq!(
             end.violated,
             [
@@ -1263,7 +1263,7 @@ mod tests {
             attributed.settled.set(settled);
             let end = attributed.penalized(&mixed);
             assert!(end.violated.is_empty(), "{end:?}");
-            assert_eq!(end.inconclusive.len(), 3, "{end:?}");
+            assert_eq!(end.open_findings.len(), 3, "{end:?}");
         }
     }
 
@@ -1314,7 +1314,7 @@ mod tests {
         assert!(breaks[2].starts_with("UncooledFault: prepare operation 2 failed with a header-peer fault of aa in session 3,"));
         assert_eq!(evidence.check(&log), FaultCheck::Holds);
         let end = evidence.penalized(&log);
-        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert!(end.open_findings.is_empty(), "{end:?}");
         assert_eq!(kinds(&end.violated), expected);
     }
 
@@ -1335,7 +1335,7 @@ mod tests {
                     && open.starts_with("UntakenFault: operation 2 ")
         ));
         let end = attributed.penalized(&log);
-        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert!(end.open_findings.is_empty(), "{end:?}");
         assert!(
             matches!(end.violated.as_slice(), [first, second]
                 if first.starts_with("UnpenalizedFault: prepare operation 1 ")
@@ -1400,7 +1400,7 @@ mod tests {
             end.violated,
             [readmitted, breaks[0].as_str(), missing].map(str::to_owned)
         );
-        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert!(end.open_findings.is_empty(), "{end:?}");
     }
 
     #[test]
@@ -1575,7 +1575,7 @@ mod tests {
             matches!(end.violated.as_slice(), [why] if why.contains("operation 1")),
             "{end:?}"
         );
-        assert_eq!(end.inconclusive.len(), 2, "{end:?}");
+        assert_eq!(end.open_findings.len(), 2, "{end:?}");
         let owed: Vec<u64> = owed(&log, evidence.attributions())
             .unwrap()
             .iter()

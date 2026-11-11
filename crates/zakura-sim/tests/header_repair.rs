@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use zakura_chain::block;
 use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{COMMIT_ONLY_AUTHORIZED, STALE_COMPLETION_INERT},
     explore::{classify, ExploreOutcome},
@@ -204,7 +205,10 @@ fn repaired(run: &Run) {
         assert!(
             matches!(
                 property.outcome,
-                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                PropertyOutcome::Held { .. }
+                    | PropertyOutcome::NotApplicable {
+                        reason: NaReason::NeverApplied
+                    }
             ),
             "{property:?}"
         );

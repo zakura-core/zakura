@@ -87,7 +87,7 @@ use crate::{
         NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
+        Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Kind, Pending,
         Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
@@ -906,6 +906,11 @@ impl HasView for Storage {
         found.extend(outstanding_end_violations(&self.outstanding));
         found.extend(retirement_end_violations(&self.retirement));
         found
+    }
+
+    /// Whether a `Shutdown` step was picked, which begins the node's stop.
+    fn stopping(&self) -> bool {
+        self.topology.shutdown_picked()
     }
 
     /// The node's stamps after `after` ([`Stamps::after`]), from every
@@ -2093,12 +2098,12 @@ const FAULT_PENALIZED_EXPECTED: &str = "each header-peer fault the reactor took 
 
 /// Checks [`HEADER_FAULT_PENALIZED`] after each step, from the node's fault
 /// evidence ([`FaultEvidence::check`]). Each break the step's entries show
-/// is its own violation at this step. Something still open is unsettled,
-/// beside a break too: a penalty whose call is still being handled, or a
-/// failed reply the reactor hasn't taken yet. A failure whose reply never
+/// is its own violation at this step. Something still open is pending
+/// ([`Pending::FaultOpen`]), beside a break too: a penalty whose call is
+/// still being handled, or a failed reply the reactor hasn't taken yet. A failure whose reply never
 /// reached the reactor opens nothing. What's still open when a settled run
 /// ends breaks the rule through [`fault_end_violations`], and at any other
-/// end it's inconclusive.
+/// end it's unsettled.
 fn check_header_fault_penalized<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {
@@ -2106,12 +2111,12 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
         FaultCheck::Nothing => Verdict::NotApplicable,
         FaultCheck::Holds => Verdict::Holds,
         FaultCheck::Open(_) => {
-            cx.unsettled(Inconclusive::ObligationOpen);
+            cx.pending(Pending::FaultOpen);
             Verdict::Holds
         }
         FaultCheck::Broken { breaks, open } => {
             if open.is_some() {
-                cx.unsettled(Inconclusive::ObligationOpen);
+                cx.pending(Pending::FaultOpen);
             }
             let mut breaks = breaks.into_iter();
             let first = breaks
@@ -2468,9 +2473,9 @@ mod tests {
                 _ => Vec::new(),
             };
             actual.extend(parts.recorded.into_iter().map(|violation| violation.actual));
-            (actual, parts.unsettled)
+            (actual, parts.pending)
         };
-        let (stepped, unsettled) = check(0);
+        let (stepped, pending) = check(0);
         starts_with_each(
             &stepped,
             &[
@@ -2478,10 +2483,10 @@ mod tests {
                 "UnpenalizedFault: prepare operation 2 ",
             ],
         );
-        assert_eq!(unsettled, Some(Inconclusive::ObligationOpen));
-        let (actual, unsettled) = check(1);
+        assert_eq!(pending, [Pending::FaultOpen].into());
+        let (actual, pending) = check(1);
         assert!(actual.is_empty(), "{actual:?}");
-        assert_eq!(unsettled, Some(Inconclusive::ObligationOpen));
+        assert_eq!(pending, [Pending::FaultOpen].into());
 
         let replayed = harness.0.penalized(log.entries()).violated;
         starts_with_each(

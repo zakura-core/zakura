@@ -25,7 +25,7 @@ use crate::{
 /// block-sync events. Version 6 added the block-sync serving admission.
 /// Version 7 added the byte budget's maximum to its changes, a routine's
 /// last snapshot, and each property's peaks. Version 8 added the
-/// `teardown-open` inconclusive outcome, and the block-sync scenario's
+/// `teardown-open` reason for an open teardown, and the block-sync scenario's
 /// workers, handoff pause and submitted-apply limit. Version 9 added the
 /// body a peer's block frame carries. Version 10 added datagram
 /// observations. Version 11 added the reactor's misbehavior event.

@@ -28,10 +28,10 @@ use super::{
     Classified, ExploreOutcome, ExploreRun,
 };
 use crate::{
-    check::PropertyOutcome,
+    check::{NaReason, PropertyOutcome},
     end::Outcome,
     harness::HarnessEntry,
-    property::{Inconclusive, Status},
+    property::Status,
     record::OutcomeKind,
 };
 
@@ -104,10 +104,9 @@ pub struct PropertyCounts {
     pub held: u64,
     /// The evaluations that applied in those runs.
     pub evaluations: u64,
-    /// Runs where no evaluation applied.
-    pub not_applicable: u64,
-    /// Runs where it was inconclusive, by reason.
-    pub inconclusive: BTreeMap<String, u64>,
+    /// Runs where it ended `NotApplicable`, by reason, as the reason's
+    /// [`NaReason`] `Display` form names it, such as `never-applied`.
+    pub not_applicable: BTreeMap<String, u64>,
     /// Runs where it was violated.
     pub violated: u64,
 }
@@ -119,8 +118,7 @@ impl PropertyCounts {
             status,
             held: 0,
             evaluations: 0,
-            not_applicable: 0,
-            inconclusive: BTreeMap::new(),
+            not_applicable: BTreeMap::new(),
             violated: 0,
         }
     }
@@ -132,28 +130,29 @@ impl PropertyCounts {
     }
 
     /// Runs where its assumptions failed: they never all held, or one
-    /// stopped holding while an obligation was open.
+    /// stopped holding while an obligation was open and nothing applied.
     pub fn assumption_losses(&self) -> u64 {
-        [
-            Inconclusive::AssumptionsNeverHeld,
-            Inconclusive::AssumptionLost,
-        ]
-        .iter()
-        .map(|reason| {
-            self.inconclusive
-                .get(&reason.to_string())
-                .copied()
-                .unwrap_or(0)
-        })
-        .sum()
+        [NaReason::AssumptionsNeverHeld, NaReason::AssumptionLost]
+            .iter()
+            .map(|reason| {
+                self.not_applicable
+                    .get(reason.name().as_ref())
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Runs where it ended `NotApplicable`, for any reason.
+    pub fn not_applicable_runs(&self) -> u64 {
+        self.not_applicable.values().sum()
     }
 
     /// Adds `other`'s counts. Keeps this status.
     fn add(&mut self, other: &PropertyCounts) {
         self.held += other.held;
         self.evaluations += other.evaluations;
-        self.not_applicable += other.not_applicable;
-        add_map(&mut self.inconclusive, &other.inconclusive);
+        add_map(&mut self.not_applicable, &other.not_applicable);
         self.violated += other.violated;
     }
 }
@@ -220,8 +219,9 @@ impl Counts {
                     counts.held += 1;
                     counts.evaluations += u64::from(*applicable);
                 }
-                PropertyOutcome::NotApplicable => counts.not_applicable += 1,
-                PropertyOutcome::Inconclusive { reason } => bump(&mut counts.inconclusive, reason),
+                PropertyOutcome::NotApplicable { reason } => {
+                    bump(&mut counts.not_applicable, &reason.name());
+                }
                 PropertyOutcome::Violated { .. } => counts.violated += 1,
             }
         }

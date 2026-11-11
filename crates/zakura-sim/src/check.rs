@@ -3,7 +3,7 @@
 //! The property registry, [`crate::property::RegistryChecker`], builds on
 //! these hooks. M1 ships [`NoChecks`] and [`FnChecker`] for tests.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
@@ -11,7 +11,7 @@ use zakura_scheduler::{SimInstant, Status};
 use crate::{
     end::{HarnessFailure, RunEnd},
     observe::Observation,
-    property::CheckEvent,
+    property::{CheckEvent, Pending},
     Enabled, Identity, ObservationLog,
 };
 
@@ -36,20 +36,17 @@ pub struct Violation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PropertyOutcome {
-    /// `applicable` evaluations applied, none failed, and no obligation is
-    /// open.
+    /// `applicable` evaluations applied, none failed, and nothing is open.
     Held {
         /// How many evaluations applied.
         applicable: u32,
     },
-    /// No evaluation applied.
-    NotApplicable,
-    /// An obligation was still open at run end, within its bound, the
-    /// property's assumptions never held, or a harness failure ended the
-    /// run.
-    Inconclusive {
-        /// Which of the two.
-        reason: String,
+    /// The run gave no answer about the property, for `reason`. A benign
+    /// reason ([`NaReason::is_benign`]) means there was nothing to judge.
+    /// Any other means the run's observations were incomplete.
+    NotApplicable {
+        /// Why.
+        reason: NaReason,
     },
     /// Some evaluation failed, or an obligation's bound expired.
     Violated {
@@ -59,18 +56,91 @@ pub enum PropertyOutcome {
 }
 
 impl PropertyOutcome {
-    /// This outcome once a harness failure ended the run: one that held or
-    /// never applied is inconclusive, since the run's evidence may be
-    /// incomplete. A violation found before the failure stands.
-    pub(crate) fn after_harness_failure(self) -> Self {
-        match self {
-            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable => {
-                PropertyOutcome::Inconclusive {
-                    reason: crate::property::Inconclusive::HarnessFailed.to_string(),
-                }
-            }
-            outcome => outcome,
-        }
+    /// `NotApplicable` for `reason`.
+    pub fn not_applicable(reason: NaReason) -> Self {
+        PropertyOutcome::NotApplicable { reason }
+    }
+}
+
+/// Why a property ended [`PropertyOutcome::NotApplicable`]. The registry
+/// picks the first that applies, in the order `registry::outcome` gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum NaReason {
+    /// Benign: the check ran, but no evaluation applied.
+    NeverApplied,
+    /// Benign: the scenario doesn't declare every assumption the property
+    /// needs, so it never ran.
+    Undeclared,
+    /// Benign: the property needs a source the harness's tier excludes, so
+    /// it never ran. The report's `excluded` names the source.
+    Excluded,
+    /// Incomplete: the scenario declares the property's assumptions, but
+    /// they never all held.
+    AssumptionsNeverHeld,
+    /// Incomplete: an assumption stopped holding while an obligation was
+    /// open, which withdrew the obligation, and no evaluation applied in
+    /// the whole run (#1840 rule 4).
+    AssumptionLost,
+    /// Incomplete: an `Active` property's violation stopped the run while
+    /// this property had an obligation, a deferred obligation or a pending
+    /// mark open.
+    StoppedByViolation,
+    /// Incomplete: the run ended at a harness failure, so its evidence may
+    /// be incomplete.
+    HarnessFailed,
+    /// Incomplete: a watch read was still open when the run ended, and the
+    /// harness had begun to stop the node, which may leave it unread
+    /// ([`crate::domain::header_sync::watch_end_violations`]).
+    NodeStopped,
+    /// Incomplete: a pending mark at `site` was left at the run's end, and
+    /// no end judgment resolved it.
+    Unsettled {
+        /// The mark's site.
+        site: Pending,
+    },
+    /// Incomplete: an obligation was still open at run end, within its
+    /// bound. Phase B removes it: an obligation open at a dry end becomes
+    /// `Violated`, and one open at the drain's bound a `DrainBound` harness
+    /// failure.
+    #[doc(hidden)]
+    ObligationOpen,
+}
+
+impl NaReason {
+    /// Whether the reason means there was nothing to judge, rather than
+    /// that the run's observations were incomplete: `NeverApplied`,
+    /// `Undeclared` and `Excluded`.
+    pub fn is_benign(&self) -> bool {
+        matches!(
+            self,
+            NaReason::NeverApplied | NaReason::Undeclared | NaReason::Excluded
+        )
+    }
+
+    /// The reason's kebab-case name, such as `never-applied`, with an
+    /// `Unsettled` mark's site after a colon, such as `unsettled:watch-open`.
+    /// Only `Unsettled` allocates.
+    pub fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
+            NaReason::NeverApplied => "never-applied",
+            NaReason::Undeclared => "undeclared",
+            NaReason::Excluded => "excluded",
+            NaReason::AssumptionsNeverHeld => "assumptions-never-held",
+            NaReason::AssumptionLost => "assumption-lost",
+            NaReason::StoppedByViolation => "stopped-by-violation",
+            NaReason::HarnessFailed => "harness-failed",
+            NaReason::NodeStopped => "node-stopped",
+            NaReason::Unsettled { site } => return Cow::Owned(format!("unsettled:{site}")),
+            NaReason::ObligationOpen => "obligation-open",
+        })
+    }
+}
+
+impl fmt::Display for NaReason {
+    /// Writes [`NaReason::name`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name())
     }
 }
 
@@ -87,7 +157,8 @@ pub struct PropertyReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holds_since: Option<u64>,
     /// Why the harness doesn't run the property: the excluded source it
-    /// needs and the exclusion's reason. Set only with `NotApplicable`.
+    /// needs and the exclusion's reason. Set only with `NotApplicable`
+    /// `Excluded`, unless an end finding violated it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excluded: Option<String>,
     /// Each quantity's largest value over the run, as the property's check
@@ -112,6 +183,13 @@ pub struct PropertyReport {
     /// reports. 0 from a checker with no end findings.
     #[serde(skip)]
     pub end_found: usize,
+    /// True if the scenario doesn't declare every assumption the property
+    /// needs, so it never ran. Its outcome says so unless an end finding
+    /// violated it, and the harness-end trim reads it so that dropping the
+    /// finding gives `Undeclared` back ([`Self::after_harness_failure`]).
+    /// False from a checker that doesn't track declarations.
+    #[serde(skip)]
+    pub undeclared: bool,
 }
 
 impl PropertyReport {
@@ -126,7 +204,37 @@ impl PropertyReport {
             peaks: BTreeMap::new(),
             violations: Vec::new(),
             end_found: 0,
+            undeclared: false,
         }
+    }
+
+    /// This report once the run ended at a harness failure (the trim): its
+    /// end findings, the last `end_found` violations, are dropped, since the
+    /// run's end may have judged incomplete evidence, and its outcome is
+    /// recomputed over what's left by `registry::outcome`'s rules for a
+    /// harness end ([`crate::property::leading_outcome`]). A step violation
+    /// stays `Violated`, `Undeclared` and `Excluded` stay, and every other
+    /// outcome becomes `NotApplicable { HarnessFailed }`.
+    pub(crate) fn after_harness_failure(mut self) -> Self {
+        // A checker that retains no violations, such as a closure's, says
+        // `Violated` only through the outcome, and has no end findings to
+        // drop, so its violation stands.
+        if self.violations.is_empty() && matches!(self.outcome, PropertyOutcome::Violated { .. }) {
+            return self;
+        }
+        let kept = self.violations.len().saturating_sub(self.end_found);
+        self.violations.truncate(kept);
+        self.end_found = 0;
+        // A checker that builds its own reports may say so only through the
+        // outcome.
+        let undeclared = self.undeclared
+            || self.outcome == PropertyOutcome::not_applicable(NaReason::Undeclared);
+        let excluded = self.excluded.is_some()
+            || self.outcome == PropertyOutcome::not_applicable(NaReason::Excluded);
+        self.outcome =
+            crate::property::leading_outcome(&self.violations, (undeclared, excluded), true)
+                .expect("a harness end decides every outcome by its first three rules");
+        self
     }
 }
 

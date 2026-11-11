@@ -23,6 +23,7 @@ use std::{
 
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL, CAPACITY_RELEASE_WAKES},
     explore::{classify, ExploreOutcome},
@@ -355,6 +356,11 @@ impl HasView for Unsettled {
         self.0.end_violations(log)
     }
 
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
     /// The storage harness's wake facts' stamps.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
@@ -657,7 +663,12 @@ fn an_undeclared_fixture_opens_no_wake() {
         .find(|property| property.property == CAPACITY_RELEASE_WAKES)
         .map(|property| property.outcome.clone());
     assert!(
-        matches!(outcome, Some(PropertyOutcome::NotApplicable)),
+        matches!(
+            outcome,
+            Some(PropertyOutcome::NotApplicable {
+                reason: NaReason::NeverApplied
+            })
+        ),
         "{outcome:?}"
     );
 }

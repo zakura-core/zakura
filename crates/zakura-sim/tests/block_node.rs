@@ -8,6 +8,7 @@ mod support;
 use serde::{Deserialize, Serialize};
 use support::{config, inputs};
 use zakura_scheduler::SimInstant;
+use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
         block_node::{
@@ -499,6 +500,6 @@ fn header_facts_leave_the_block_property_inapplicable() {
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(
         *outcome(&report, OPERATION_IDS),
-        PropertyOutcome::NotApplicable
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
 }

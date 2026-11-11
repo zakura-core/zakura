@@ -77,6 +77,11 @@ impl HasView for Adopting {
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.storage.end_violations(log)
     }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.storage.stopping()
+    }
 }
 
 impl Subsystem for Adopting {
@@ -276,7 +281,7 @@ fn nth(
 #[derive(Debug, Default)]
 struct Tally {
     held: usize,
-    inconclusive: usize,
+    open: usize,
 }
 
 impl Tally {
@@ -284,7 +289,7 @@ impl Tally {
     fn count(&mut self, rule: &str, outcome: Acceptance) {
         match outcome {
             Acceptance::Holds => self.held += 1,
-            Acceptance::Inconclusive(_) => self.inconclusive += 1,
+            Acceptance::Open(_) => self.open += 1,
             Acceptance::Violated(why) => panic!("the {rule} rule broke: {why}"),
         }
     }
@@ -450,8 +455,8 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
 }
 
 /// Runs cut off early break no rule: whatever they owe when the budget ends
-/// is inconclusive, not a violation. The checks' own tests cover which
-/// endings are inconclusive.
+/// stays open, not a violation. The checks' own tests cover which
+/// endings are open.
 #[test]
 fn a_run_that_ends_early_breaks_no_rule() {
     let scenario = grow_witness();

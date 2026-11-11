@@ -18,6 +18,7 @@ use support::{
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
+use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
         block_node::{
@@ -608,7 +609,7 @@ fn ids_no_scenario_reaches_stay_not_applicable() {
             ] {
                 assert_eq!(
                     *outcome(&report, &id(suffix)),
-                    PropertyOutcome::NotApplicable,
+                    PropertyOutcome::not_applicable(NaReason::NeverApplied),
                     "{suffix}"
                 );
             }

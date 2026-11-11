@@ -41,8 +41,8 @@ pub mod witness;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, RecoveryOffer, SourceId};
 pub use check::{
-    Checker, NoChecks, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx, Unfinished,
-    Violation,
+    Checker, NaReason, NoChecks, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx,
+    Unfinished, Violation,
 };
 pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};

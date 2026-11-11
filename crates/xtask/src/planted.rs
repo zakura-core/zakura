@@ -112,6 +112,7 @@ use crate::{
 };
 
 mod mutation_loop;
+mod outcome;
 mod pilot;
 
 #[allow(dead_code)]
@@ -124,6 +125,7 @@ pub(super) mod provenance;
 mod planted_layout;
 
 pub(super) use mutation_loop::run as mutation_loop;
+use outcome::EndOutcome;
 pub(super) use pilot::run as pilot;
 use planted_layout::PLANTED_DIR;
 
@@ -365,9 +367,9 @@ enum Run {
         /// Every property other than the case's whose report is
         /// `violated`, in report order.
         others_violated: Vec<String>,
-        /// The case's property's outcome, such as `held`, or `None` if the
-        /// run doesn't report it.
-        outcome: Option<String>,
+        /// The case's property's outcome, or `None` if the run doesn't
+        /// report it.
+        outcome: Option<EndOutcome>,
         /// The harness failure, for a run that ended at one.
         harness: Option<String>,
         /// Why the witness test failed, or `None` if it passed.
@@ -389,7 +391,7 @@ struct Campaign {
     /// Inputs whose run violated the case's property.
     caught: usize,
     /// How many of the other inputs' runs ended with each outcome of the
-    /// case's property, such as `held` or `not-applicable`.
+    /// case's property, such as `held` or `not-applicable/never-applied`.
     missed: BTreeMap<String, usize>,
 }
 
@@ -1434,28 +1436,31 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
         .get("properties")
         .and_then(Value::as_array)
         .ok_or("the end record has no properties")?;
-    // An outcome is a string such as `"held"`, or an object keyed by its
-    // name, such as `{"violated":{...}}`.
-    let outcome_name = |report: &Value| {
-        let outcome = report.get("outcome")?;
-        outcome
-            .as_str()
-            .or_else(|| outcome.as_object()?.keys().next().map(String::as_str))
-            .map(str::to_owned)
-    };
-    let id = |report: &Value| text(report.get("property")).unwrap_or_default();
+    // Each report's outcome, typed, so an unknown outcome or reason fails
+    // the read.
+    let reports = properties
+        .iter()
+        .map(|report| {
+            let outcome = report
+                .get("outcome")
+                .ok_or("an end record's report has no outcome")?;
+            Ok((
+                text(report.get("property")).unwrap_or_default(),
+                EndOutcome::parse(outcome)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(Run::Ended {
         violation: text(end.get("violation").and_then(|v| v.get("property"))),
-        others_violated: properties
+        others_violated: reports
             .iter()
-            .filter(|report| id(report) != property)
-            .filter(|report| outcome_name(report).as_deref() == Some("violated"))
-            .map(id)
+            .filter(|(id, outcome)| id != property && matches!(outcome, EndOutcome::Violated {}))
+            .map(|(id, _)| id.clone())
             .collect(),
-        outcome: properties
-            .iter()
-            .find(|report| id(report) == property)
-            .and_then(outcome_name),
+        outcome: reports
+            .into_iter()
+            .find(|(id, _)| id == property)
+            .map(|(_, outcome)| outcome),
         harness: text(end.get("harness")),
         witness: None,
     })
@@ -1476,10 +1481,14 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
         Run::Ended {
             others_violated, ..
         } if !others_violated.is_empty() => Some(format!("{} is violated", others_violated[0])),
-        Run::Ended { outcome, .. } if outcome.as_deref() != Some("held") => Some(format!(
-            "{property} is {}",
-            outcome.as_deref().unwrap_or("not reported")
-        )),
+        Run::Ended { outcome, .. } if !matches!(outcome, Some(EndOutcome::Held { .. })) => {
+            Some(format!(
+                "{property} is {}",
+                outcome
+                    .as_ref()
+                    .map_or_else(|| "not reported".to_owned(), ToString::to_string)
+            ))
+        }
         Run::Ended {
             witness: Some(why), ..
         } => Some(format!("its witness test fails: {why}")),
@@ -1525,13 +1534,13 @@ fn classify_set(
     if let Some(unrelated) = violated().find(|id| !expected(id)) {
         return Verdict::Unrelated(unrelated.clone());
     }
-    if violation.as_deref() != Some(property) && outcome.as_deref() != Some("violated") {
+    if violation.as_deref() != Some(property) && !matches!(outcome, Some(EndOutcome::Violated {})) {
         // A listed property's violation alone misses the patch.
         return match violated().find(|id| *id != property) {
             Some(listed) => Verdict::NotCaught(format!("violated {listed}")),
-            None => outcome
-                .clone()
-                .map_or(Verdict::Unreported, Verdict::NotCaught),
+            None => outcome.as_ref().map_or(Verdict::Unreported, |outcome| {
+                Verdict::NotCaught(outcome.to_string())
+            }),
         };
     }
     if let Some(missing) = set
@@ -1776,8 +1785,14 @@ mod tests {
             Some("other/known is violated".to_owned())
         );
         assert_eq!(
-            baseline_failure(ID, &run(None, &[(ID, r#""not-applicable""#)])),
-            Some(format!("{ID} is not-applicable"))
+            baseline_failure(
+                ID,
+                &run(
+                    None,
+                    &[(ID, r#"{"not-applicable":{"reason":"never-applied"}}"#)]
+                )
+            ),
+            Some(format!("{ID} is not-applicable/never-applied"))
         );
         assert!(baseline_failure(ID, &Run::Failed("build".to_owned())).is_some());
     }
@@ -1861,11 +1876,12 @@ mod tests {
                 caught: 5,
                 missed: BTreeMap::from([
                     ("held".to_owned(), 25),
-                    ("not-applicable".to_owned(), 2)
+                    ("not-applicable/never-applied".to_owned(), 2)
                 ]),
             }))
             .to_string(),
-            "caught; the campaign caught it on 5 of 32 inputs; the others: 25 held, 2 not-applicable"
+            "caught; the campaign caught it on 5 of 32 inputs; the others: 25 held, 2 \
+             not-applicable/never-applied"
         );
     }
 

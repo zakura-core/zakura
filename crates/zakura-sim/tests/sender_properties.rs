@@ -10,6 +10,7 @@ use support::{
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{testkit::regulation::TEST_FAMILY, Stream};
+use zakura_sim::NaReason;
 use zakura_sim::{
     model::Label,
     observe::StreamId,
@@ -103,7 +104,12 @@ fn held(report: &RunReport, id: &str) -> bool {
 }
 
 fn not_applicable(report: &RunReport, id: &str) -> bool {
-    matches!(outcome(report, id), PropertyOutcome::NotApplicable)
+    matches!(
+        outcome(report, id),
+        PropertyOutcome::NotApplicable {
+            reason: NaReason::NeverApplied
+        }
+    )
 }
 
 /// The property that stopped the run, if any.

@@ -22,9 +22,9 @@ use crate::{
         wake::{WakeEvidence, WakeFact},
     },
     property::{
-        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind,
-        LivenessBound, ObligationKey, Property, PropertyId, Source, Status, Subject,
-        TriggerHistory, Unit, Verdict,
+        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Kind, LivenessBound,
+        ObligationKey, Pending, Property, PropertyId, Source, Status, Subject, TriggerHistory,
+        Unit, Verdict,
     },
     ObservationLog,
 };
@@ -81,9 +81,9 @@ where
 /// claim break the tap found at this step: `BudgetOverCapacity` on a read,
 /// or `OverBudget` on a reported reservation. A boundary whose read found
 /// the budget's lock held judges nothing. With the reactor stopped
-/// mid-poll, as it is inside a release, that's allowed, and a run that ends
-/// there is inconclusive. Otherwise no task should hold the lock, so the
-/// missing read is missing evidence.
+/// mid-poll, as it is inside a release, that's allowed, and the boundary
+/// stays pending ([`Pending::UnreadBoundary`]). Otherwise no task should
+/// hold the lock, so the missing read is missing evidence.
 fn check_chunk_budget_bound<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -97,7 +97,7 @@ where
             "the header budget's lock was held at the boundary after step {step}, with the \
              reactor not stopped mid-poll"
         )),
-        Some(BoundaryRead::UnreadMidPoll) => cx.unsettled(Inconclusive::UnreadBoundary),
+        Some(BoundaryRead::UnreadMidPoll) => cx.pending(Pending::UnreadBoundary),
         Some(BoundaryRead::Read) | None => {}
     }
     let records = view
@@ -206,12 +206,12 @@ where
 ///
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a
-/// released round unsettled is inconclusive while storage still holds a
+/// released round unsettled stays pending while storage still holds a
 /// call with that round's headers or the drain was cut off at its bound,
 /// since that call could still settle it. A run that ends at rest, idle or
 /// with its drain run dry, with no such call pending can never settle it,
 /// so [`teardown_end_violations`] violates it then. A run that ends with a
-/// stop begun and the node unsettled is inconclusive only when its drain
+/// stop begun and the node unsettled stays pending only when its drain
 /// was cut off at its bound. Otherwise the tap fails it as
 /// `ShutdownIncomplete`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
@@ -227,7 +227,7 @@ where
     let step = cx.step;
     let row = view.rounds().at(step);
     if row.is_some_and(|row| row.unsettled > 0 || (row.shutdown && !row.settled)) {
-        cx.unsettled(Inconclusive::TeardownOpen);
+        cx.pending(Pending::TeardownOpen);
     }
     let expected = "a released round, and a stopped node, keeps no reservation, lease or held \
                     headers once settled, and no locator permit a pending storage read doesn't \
@@ -1037,14 +1037,14 @@ where
         }
     }
     // A departure the slot rule hasn't judged at a unit boundary yet
-    // leaves the run inconclusive if it ends here (Rule 2), and a trigger
-    // the check couldn't read the fixture for leaves it so wherever it
-    // ends (Rule 3).
+    // leaves the run unsettled if it ends here (Rule 2), and a trigger the
+    // check couldn't read the fixture for leaves it so wherever it ends
+    // (Rule 3).
     if view.retirement().unjudged() {
-        cx.unsettled(Inconclusive::UnreadBoundary);
+        cx.pending(Pending::UnjudgedDeparture);
     }
     if view.retirement().unread() {
-        cx.unsettled(Inconclusive::UnreadTrigger);
+        cx.pending(Pending::UnreadTrigger);
     }
     let expected = "no work outlives its departed session";
     let mut breaks = view
@@ -1348,7 +1348,7 @@ where
 /// Checks the watch rule for `queue` over the view's adoption evidence
 /// ([`AdoptionEvidence::watch_read`]). It applies once a state is
 /// published. A publication still waiting for its read or its third event
-/// leaves the run inconclusive if it ends there, unless
+/// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
 /// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
 where
@@ -1359,7 +1359,7 @@ where
         WatchRead::Nothing => Verdict::NotApplicable,
         WatchRead::Holds => Verdict::Holds,
         WatchRead::Open => {
-            cx.unsettled(Inconclusive::ObligationOpen);
+            cx.pending(Pending::WatchOpen);
             Verdict::Holds
         }
         WatchRead::Broken(why) => cx.violated(
@@ -1504,9 +1504,9 @@ mod tests {
             stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
-        property::{Property, Status},
-        ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
+        property::{Pending, Property, Status},
+        ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NaReason, ObservationLog,
+        Outcome, PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
 
     /// The model's capacity and refill interval are production's.
@@ -1751,18 +1751,18 @@ mod tests {
         );
     }
 
-    /// A run that ends at an unread boundary mid-poll is inconclusive.
+    /// A run that ends at an unread boundary mid-poll is unsettled there.
     #[test]
-    fn a_run_ending_unread_mid_poll_is_inconclusive() {
+    fn a_run_ending_unread_mid_poll_is_unsettled() {
         let report = run(&[
             Scripted::Read(10),
             Scripted::Unread(BoundaryRead::UnreadMidPoll),
         ]);
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "unread-boundary".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::Unsettled {
+                site: Pending::UnreadBoundary
+            })
         );
     }
 
@@ -1852,7 +1852,7 @@ mod tests {
         );
     }
 
-    /// A run that ends with a released round unsettled is inconclusive
+    /// A run that ends with a released round unsettled stays unsettled
     /// while storage still holds a call with its headers, and violated once
     /// it came to rest with a round that has none, since nothing can settle
     /// that round then, whatever another round still waits on.
@@ -1869,9 +1869,9 @@ mod tests {
         assert!(matches!(report.end.outcome, Outcome::Idle { .. }));
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "teardown-open".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::Unsettled {
+                site: Pending::TeardownOpen
+            })
         );
         let report = run_property(
             teardown_returns_baseline(),
@@ -1941,7 +1941,7 @@ mod tests {
     }
 
     /// A stop holds the property unsettled until the node settles, and then
-    /// it applies and holds. A run cut off before is inconclusive.
+    /// it applies and holds. A run cut off before is unsettled.
     #[test]
     fn node_settlement_settles_teardown() {
         let report = run_property(
@@ -1961,9 +1961,9 @@ mod tests {
         );
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "teardown-open".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::Unsettled {
+                site: Pending::TeardownOpen
+            })
         );
     }
 

@@ -8,6 +8,7 @@ use std::{cell::Cell, collections::BTreeSet, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zakura_rt::{task::yield_now, time::sleep};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::{self, StepCtx, Violation},
     harness::{
@@ -296,9 +297,7 @@ fn livelock_waits_for_its_assumption() {
     assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
     assert_eq!(
         *outcome(&report, NO_LIVELOCK),
-        PropertyOutcome::Inconclusive {
-            reason: "assumptions-never-held".to_owned()
-        }
+        PropertyOutcome::not_applicable(NaReason::AssumptionsNeverHeld)
     );
 }
 

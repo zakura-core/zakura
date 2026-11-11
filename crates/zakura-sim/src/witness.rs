@@ -16,8 +16,8 @@ use crate::{
     property::{HasView, PropertyId, Status, TriggerHistory},
     record::{FullReport, Record},
     trace::end_records::{self, TriggerState, WitnessRecord},
-    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
-    RunEnd, RunReport,
+    MemorySink, NaReason, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport,
+    RecordSink, RunEnd, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -103,13 +103,14 @@ pub enum WitnessError {
         /// The registered property with no report.
         property: String,
     },
-    /// Another property is inconclusive under [`Expect::Holds`]: the run
-    /// left it unjudged, so the run can't show that nothing else broke.
-    UnrelatedInconclusive {
-        /// The inconclusive property.
+    /// Another property ended `NotApplicable` with a reason that isn't
+    /// benign ([`NaReason::is_benign`]): the run's observations of it were
+    /// incomplete, so the run can't show that nothing else broke.
+    UnrelatedIncomplete {
+        /// The property.
         property: String,
-        /// Its reason, such as `obligation-open`.
-        reason: String,
+        /// Its reason, such as `assumptions-never-held`.
+        reason: NaReason,
     },
     /// A violation of a property of an [`Expect::ViolatedSet`] test's set
     /// isn't joined to the case's own break: its witness's first step isn't
@@ -184,8 +185,8 @@ impl fmt::Display for WitnessError {
             WitnessError::Unreported { property } => {
                 write!(f, "the run doesn't report {property}")
             }
-            WitnessError::UnrelatedInconclusive { property, reason } => {
-                write!(f, "{property} is inconclusive: {reason}")
+            WitnessError::UnrelatedIncomplete { property, reason } => {
+                write!(f, "{property}'s observations are incomplete: {reason}")
             }
             WitnessError::Unjoined {
                 property,
@@ -241,12 +242,16 @@ impl WitnessError {
             WitnessError::NoEnd => "no-end",
             WitnessError::MissingReport => "missing-report",
             WitnessError::Unreported { .. } => "unreported",
-            WitnessError::UnrelatedInconclusive { .. } => "unrelated-inconclusive",
+            WitnessError::UnrelatedIncomplete { .. } => "unrelated-incomplete",
             WitnessError::SetMember { .. } => "set-member",
             WitnessError::Unjoined { .. } => "unjoined",
             WitnessError::Outcome(PropertyOutcome::Held { .. }) => "held",
-            WitnessError::Outcome(PropertyOutcome::NotApplicable) => "not-applicable",
-            WitnessError::Outcome(PropertyOutcome::Inconclusive { .. }) => "inconclusive",
+            WitnessError::Outcome(PropertyOutcome::NotApplicable { reason })
+                if reason.is_benign() =>
+            {
+                "not-applicable"
+            }
+            WitnessError::Outcome(PropertyOutcome::NotApplicable { .. }) => "incomplete",
             WitnessError::Outcome(PropertyOutcome::Violated { .. }) => "violated",
             WitnessError::Unrelated { .. } => "unrelated",
             WitnessError::LostTriggerHistory => "lost-trigger-history",
@@ -641,10 +646,11 @@ pub(crate) fn judge(
 /// [`judge`] on a run's `end` and property `reports`. Under
 /// [`Expect::Violated`], a violation of a property in `also_violates`
 /// isn't unrelated, and under [`Expect::ViolatedSet`] each of them must be
-/// violated. Under [`Expect::Holds`], and under a violated expectation for
-/// a run that went on to its end rather than stopping at its violation,
-/// another property the run left inconclusive fails the test too: the run
-/// can't show nothing else broke.
+/// violated. Under [`Expect::Holds`] and a violated expectation, another
+/// property the run left with incomplete observations, a `NotApplicable`
+/// reason that isn't benign, fails the test too: the run can't show nothing
+/// else broke. The one exception is `StoppedByViolation` in a run the
+/// expected violation stopped.
 fn judge_end(
     end: &RunEnd,
     reports: &[PropertyReport],
@@ -690,22 +696,28 @@ fn judge_end(
             property: other.property.clone(),
         });
     }
-    // A run its violation stopped can leave another property's obligation
-    // open through no fault of its own, until #1840 gives such a run an
-    // ending. A run that went on to its end, as a `Draft` run does, can't.
+    // A run its expected violation stopped can leave another property's
+    // obligation open through no fault of its own, which is what
+    // `StoppedByViolation` says. Any unexpected stop failed above. A run
+    // that went on to its end, as a `Draft` run does, leaves no such reason.
     let stopped = end.outcome == Outcome::Violation;
-    if expect == Expect::Holds || (violated && !stopped) {
-        let inconclusive = reports
+    if expect == Expect::Holds || violated {
+        let incomplete = reports
             .iter()
             .filter(|r| !expected(&r.property))
-            .find_map(|r| match &r.outcome {
-                PropertyOutcome::Inconclusive { reason } => Some((&r.property, reason)),
+            .find_map(|r| match r.outcome {
+                PropertyOutcome::NotApplicable { reason }
+                    if !reason.is_benign()
+                        && !(stopped && reason == NaReason::StoppedByViolation) =>
+                {
+                    Some((&r.property, reason))
+                }
                 _ => None,
             });
-        if let Some((other, reason)) = inconclusive {
-            return Err(WitnessError::UnrelatedInconclusive {
+        if let Some((other, reason)) = incomplete {
+            return Err(WitnessError::UnrelatedIncomplete {
                 property: other.clone(),
-                reason: reason.clone(),
+                reason,
             });
         }
     }
@@ -943,17 +955,16 @@ mod tests {
         assert_eq!(judged(&held, &also, Expect::Holds), unrelated);
     }
 
-    /// C6: a violated expectation tolerates another property left
-    /// inconclusive only in a run its violation stopped. A run that went on
-    /// to its end, as a `Draft` run does, must leave nothing else open.
+    /// C6: a violated expectation tolerates another property's
+    /// `StoppedByViolation` only in a run its violation stopped. A run that
+    /// went on to its end, as a `Draft` run does, must leave nothing else
+    /// incomplete, and a stopped run any other incomplete reason.
     #[test]
-    fn a_finished_violated_run_refuses_an_unrelated_inconclusive() {
+    fn an_expected_stop_tolerates_only_stopped_by_violation() {
         let mut report = stopped_by("test/own");
         report.properties.push(PropertyReport::new(
             "test/open",
-            PropertyOutcome::Inconclusive {
-                reason: "obligation-open".to_owned(),
-            },
+            PropertyOutcome::not_applicable(NaReason::StoppedByViolation),
         ));
         for expect in [Expect::Violated, Expect::ViolatedSet] {
             assert_eq!(
@@ -962,17 +973,64 @@ mod tests {
                 "{expect:?}"
             );
         }
+        let mut never = stopped_by("test/own");
+        never.properties.push(PropertyReport::new(
+            "test/open",
+            PropertyOutcome::not_applicable(NaReason::AssumptionsNeverHeld),
+        ));
+        assert_eq!(
+            judge(&never, "test/own", Status::Active, Expect::Violated, &[]),
+            Err(WitnessError::UnrelatedIncomplete {
+                property: "test/open".to_owned(),
+                reason: NaReason::AssumptionsNeverHeld,
+            })
+        );
         report.end.outcome = Outcome::Budget;
         report.end.violation = None;
         for expect in [Expect::Violated, Expect::ViolatedSet] {
             assert_eq!(
                 judge(&report, "test/own", Status::Draft, expect, &[]),
-                Err(WitnessError::UnrelatedInconclusive {
+                Err(WitnessError::UnrelatedIncomplete {
                     property: "test/open".to_owned(),
-                    reason: "obligation-open".to_owned()
+                    reason: NaReason::StoppedByViolation,
                 }),
                 "{expect:?}"
             );
+        }
+    }
+
+    /// E2: a held target fails beside another property whose observations
+    /// were incomplete, such as one whose assumptions never held or whose
+    /// lost assumption withdrew its only obligation, and passes beside a
+    /// benign `NotApplicable`.
+    #[test]
+    fn a_held_target_refuses_an_unrelated_incomplete() {
+        let held = |other: NaReason| {
+            let mut report = stopped_by("test/own");
+            report.end.outcome = Outcome::Budget;
+            report.end.violation = None;
+            report.properties = vec![
+                PropertyReport::new("test/own", PropertyOutcome::Held { applicable: 1 }),
+                PropertyReport::new("test/other", PropertyOutcome::not_applicable(other)),
+            ];
+            judge(&report, "test/own", Status::Active, Expect::Holds, &[])
+        };
+        for reason in [NaReason::AssumptionsNeverHeld, NaReason::AssumptionLost] {
+            assert_eq!(
+                held(reason),
+                Err(WitnessError::UnrelatedIncomplete {
+                    property: "test/other".to_owned(),
+                    reason,
+                }),
+                "{reason:?}"
+            );
+        }
+        for reason in [
+            NaReason::NeverApplied,
+            NaReason::Undeclared,
+            NaReason::Excluded,
+        ] {
+            assert_eq!(held(reason), Ok(()), "{reason:?}");
         }
     }
 

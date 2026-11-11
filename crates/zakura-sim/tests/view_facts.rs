@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zakura_rt::{collections::HashMap, sync::Mutex, task, time};
 use zakura_scheduler::SimInstant;
+use zakura_sim::NaReason;
 use zakura_sim::{
     fake::FakeStorage,
     harness::{run_harness, Subsystem},
@@ -578,15 +579,13 @@ fn an_overdue_deferral_expires_before_later_facts() {
     }
 }
 
-/// A run cut off while the obligation is deferred is inconclusive.
+/// A run cut off while the obligation is deferred leaves it open.
 #[test]
-fn a_run_cut_off_while_deferred_is_inconclusive() {
+fn a_run_cut_off_while_deferred_leaves_it_open() {
     let report = run_for(&[Fact(Wait), Fact(Defer(1)), Sleep(1), Fact(Done)], 1);
     assert_eq!(
         outcome(&report, SERVED),
-        PropertyOutcome::Inconclusive {
-            reason: "obligation-open".to_owned()
-        }
+        PropertyOutcome::not_applicable(NaReason::ObligationOpen)
     );
 }
 
@@ -682,7 +681,9 @@ fn the_view_is_read_only_for_a_fitting_report() {
             UNDECLARED,
             Expect::Holds
         ),
-        Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+        Err(WitnessError::Outcome(PropertyOutcome::not_applicable(
+            NaReason::Undeclared
+        )))
     );
     assert!(matches!(
         witness(

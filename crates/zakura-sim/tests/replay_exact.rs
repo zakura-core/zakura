@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
+use zakura_sim::NaReason;
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
@@ -410,7 +411,8 @@ fn equivalent_build_rejects_changed_results() {
 
     let dir = violating_race();
     edit(dir.path(), |lines| {
-        lines.last_mut().unwrap()["end"]["properties"][0]["outcome"] = json!("not-applicable");
+        lines.last_mut().unwrap()["end"]["properties"][0]["outcome"] =
+            json!({"not-applicable": {"reason": "never-applied"}});
     });
     assert_eq!(nondeterministic(dir.path()), (steps, "end.properties"));
 }
@@ -1419,7 +1421,7 @@ fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
             &mut zakura_sim::NullSink,
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
-            PropertyOutcome::NotApplicable
+            PropertyOutcome::not_applicable(NaReason::NeverApplied)
         ))
     );
 }
@@ -1529,7 +1531,7 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
             &mut zakura_sim::NullSink
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
-            PropertyOutcome::NotApplicable
+            PropertyOutcome::not_applicable(NaReason::NeverApplied)
         ))
     );
 }

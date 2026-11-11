@@ -961,6 +961,11 @@ impl HasView for Liveness {
         self.0.end_violations(log)
     }
 
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
     /// The storage harness's stamps.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)

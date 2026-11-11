@@ -5,6 +5,7 @@ use std::{path::Path, sync::atomic::AtomicBool};
 
 use serde_json::json;
 use tempfile::TempDir;
+use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
         self,
@@ -168,18 +169,16 @@ fn a_driver_failure_is_not_a_detection() {
 #[test]
 fn a_harness_failure_leaves_no_property_held() {
     // CHARGE holds and reaches the trigger, then PANIC ends the run as a
-    // harness failure. As in `Sim::run`, the property is inconclusive.
+    // harness failure. As in `Sim::run`, the property is `HarnessFailed`.
     let mut sink = MemorySink::default();
     let scenario = (ENTRY.draw)(&input(&[CHARGE, PANIC]));
     let error = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut sink).unwrap_err();
     let HarnessError::Run { report, .. } = error else {
         panic!("{error}");
     };
-    let inconclusive = PropertyOutcome::Inconclusive {
-        reason: "harness-failed".to_owned(),
-    };
+    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
     assert_eq!(report.properties.len(), 1);
-    assert_eq!(report.properties[0].outcome, inconclusive);
+    assert_eq!(report.properties[0].outcome, harness_failed);
     let Some(Record::End(end)) = sink.records.last() else {
         panic!("the run ends with its end record");
     };
@@ -193,7 +192,10 @@ fn a_run_applies_only_once_it_reaches_the_trigger() {
         let report = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut NullSink).unwrap();
         report.properties[0].outcome.clone()
     };
-    assert_eq!(outcome(&[IDLE, IDLE]), PropertyOutcome::NotApplicable);
+    assert_eq!(
+        outcome(&[IDLE, IDLE]),
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
+    );
     assert_eq!(
         outcome(&[IDLE, CHARGE, IDLE]),
         PropertyOutcome::Held { applicable: 2 }
@@ -239,7 +241,9 @@ fn a_witness_needs_its_trigger_history() {
     for expect in [Expect::Applicable, Expect::Holds] {
         assert_eq!(
             witness(&[IDLE], FIXTURE.name, expect),
-            Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+            Err(WitnessError::Outcome(PropertyOutcome::not_applicable(
+                NaReason::NeverApplied
+            )))
         );
     }
     assert_eq!(

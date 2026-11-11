@@ -9,14 +9,14 @@ use std::{
 use zakura_scheduler::{Op, SimInstant};
 
 use super::{
-    Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, FactAnswer, HasView,
-    Inconclusive, Kind, LivenessBound, Obligation, Property, PropertyId, Source, Status,
-    TriggerHistory, Verdict,
+    Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Kind,
+    LivenessBound, Obligation, Pending, Property, PropertyId, Source, Status, TriggerHistory,
+    Verdict,
 };
 use crate::{
     check::{
-        Checker, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx, Unfinished,
-        Violation,
+        Checker, NaReason, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx,
+        Unfinished, Violation,
     },
     end::{HarnessFailure, Outcome, RunEnd},
     model::LabelledFrame,
@@ -286,8 +286,9 @@ impl Sources {
 /// declares, in registry order:
 ///
 /// 1. It updates `holds_since` from the property's assumptions. When one
-///    stops holding, the property's open obligations end, and the property
-///    is `Inconclusive` with `assumption-lost`.
+///    stops holding, the property's open obligations are withdrawn, and if
+///    no evaluation applies in the whole run, the property is
+///    `NotApplicable` with `assumption-lost`.
 /// 2. While the assumptions hold, it runs the check and keeps the
 ///    obligations the check opens. Each `Holds` counts as applicable, and
 ///    the first `Holds` or `Violated` emits `Lifecycle::Applicable`.
@@ -317,7 +318,8 @@ impl Sources {
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
 /// `Draft` violation is only recorded, so the run goes on. Each report
-/// keeps every violation its property had.
+/// keeps every violation its property had, and its outcome follows
+/// `outcome`'s precedence.
 pub struct RegistryChecker<S: HasView> {
     properties: Vec<Property<S>>,
     state: Vec<PropertyState<S::View>>,
@@ -358,10 +360,12 @@ struct PropertyState<V> {
     holds_since: Option<(u64, SimInstant)>,
     /// True once the assumptions have all held.
     ever_held: bool,
-    /// The first reason the run can't finish the check.
-    inconclusive: Option<Inconclusive>,
-    /// Why the latest evaluation couldn't judge its fired trigger, if so.
-    unsettled: Option<Inconclusive>,
+    /// True once an assumption stopped holding while an obligation was
+    /// open, which withdrew it.
+    assumption_lost: bool,
+    /// The sites the latest evaluation marked pending
+    /// ([`CheckCtx::pending`]).
+    pending: BTreeSet<Pending>,
     /// Each quantity's largest value, as the check measured it.
     peaks: BTreeMap<String, u64>,
 }
@@ -381,8 +385,8 @@ impl<V> PropertyState<V> {
             open: Vec::new(),
             holds_since: None,
             ever_held: false,
-            inconclusive: None,
-            unsettled: None,
+            assumption_lost: false,
+            pending: BTreeSet::new(),
             peaks: BTreeMap::new(),
         }
     }
@@ -618,8 +622,8 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     }
 
     /// Tells the harness how the run ended, then reports each property's
-    /// outcome. An obligation still open now leaves
-    /// the property `Inconclusive`, never `Held`. A violation that ended the
+    /// outcome, as `outcome` decides it. An obligation or pending mark still
+    /// open now never leaves the property `Held`. A violation that ended the
     /// run outside the registry, such as the step loop's `sim/no-livelock`,
     /// belongs to the registered property with its ID, and so does each of
     /// the harness's [`HasView::end_violations`].
@@ -634,17 +638,19 @@ impl<S: HasView> Checker for RegistryChecker<S> {
         for found in self.handle.end_violations(log) {
             self.end_violation(found, end.steps);
         }
+        let stopping = self.handle.stopping();
         self.properties
             .iter()
             .zip(&self.state)
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
-                outcome: outcome(property, state),
+                outcome: outcome(property, state, end.outcome, stopping),
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
                 violations: state.violations.clone(),
                 end_found: state.end_found,
+                undeclared: !state.declared,
             })
             .collect()
     }
@@ -688,7 +694,8 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     }
 
     /// Every property's open obligations, each with its deadline as expiry
-    /// computes it, then its pending mark, if any, which has no deadline.
+    /// computes it, then its pending marks, in [`Pending`]'s order, which
+    /// have no deadline.
     fn unfinished(&self) -> Unfinished {
         let mut open = Vec::new();
         for (property, state) in self.properties.iter().zip(&self.state) {
@@ -707,10 +714,10 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                     deadline: obligation.deadline(floor),
                 });
             }
-            if let Some(reason) = state.unsettled {
+            for site in &state.pending {
                 open.push(OpenCheck {
                     property: property.id.to_string(),
-                    subject: reason.to_string(),
+                    subject: site.to_string(),
                     kind: OpenKind::Pending,
                     deadline: None,
                 });
@@ -750,9 +757,7 @@ fn step_property<S: HasView>(
                 state.holds_since = None;
                 if !state.open.is_empty() {
                     state.open.clear();
-                    state
-                        .inconclusive
-                        .get_or_insert(Inconclusive::AssumptionLost);
+                    state.assumption_lost = true;
                 }
             }
             _ => {}
@@ -784,7 +789,7 @@ fn step_property<S: HasView>(
         Verdict::Violated(v) => violations.push(v),
     }
     violations.extend(parts.recorded);
-    state.unsettled = parts.unsettled;
+    state.pending = parts.pending;
     for (quantity, value) in parts.peaks {
         let peak = state.peaks.entry(quantity.to_owned()).or_default();
         *peak = (*peak).max(value);
@@ -1018,35 +1023,360 @@ fn expiry<S: HasView>(
     }
 }
 
-/// A property's run outcome, from strongest to weakest: violated,
-/// inconclusive, held, then not applicable.
-fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState<S::View>) -> PropertyOutcome {
-    if let Some(violation) = state.violations.first() {
-        return PropertyOutcome::Violated {
-            witness: violation.witness.clone(),
-        };
-    }
-    if !state.declared {
-        return PropertyOutcome::NotApplicable;
-    }
-    if state.excluded.is_some() {
-        return PropertyOutcome::NotApplicable;
+/// A property's run outcome when the run ended with `ended`, and the
+/// harness had begun to stop the node if `stopping`
+/// ([`HasView::stopping`]). The first rule that matches decides it:
+///
+/// 1. a retained violation gives `Violated`;
+/// 2. a property the scenario doesn't declare gives `Undeclared`, and one
+///    that needs an excluded source `Excluded`;
+/// 3. a harness end gives `HarnessFailed`;
+/// 4. assumptions that never all held give `AssumptionsNeverHeld`;
+/// 5. a run an `Active` violation stopped, with an obligation, a deferred
+///    one or a pending mark still open, gives `StoppedByViolation`;
+/// 6. a pending mark left gives `NodeStopped` for a [`Pending::WatchOpen`]
+///    the stopping exempted, and `Unsettled` with its site otherwise, the
+///    first in [`Pending`]'s order;
+/// 7. an obligation still open gives `ObligationOpen`;
+/// 8. an assumption lost, with no evaluation applied, gives
+///    `AssumptionLost`;
+/// 9. otherwise `Held` if an evaluation applied, else `NeverApplied`.
+///
+/// [`leading_outcome`] holds rules 1 to 3, which the harness-end trim
+/// reapplies ([`PropertyReport::after_harness_failure`]).
+fn outcome<S: HasView>(
+    property: &Property<S>,
+    state: &PropertyState<S::View>,
+    ended: Outcome,
+    stopping: bool,
+) -> PropertyOutcome {
+    if let Some(leading) = leading_outcome(
+        &state.violations,
+        (!state.declared, state.excluded.is_some()),
+        ended == Outcome::Harness,
+    ) {
+        return leading;
     }
     let reason = if !property.assumes.is_empty() && !state.ever_held {
-        Some(Inconclusive::AssumptionsNeverHeld)
-    } else {
-        state
-            .inconclusive
-            .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
-            .or(state.unsettled)
-    };
-    match reason {
-        Some(reason) => PropertyOutcome::Inconclusive {
-            reason: reason.to_string(),
-        },
-        None if state.applicable > 0 => PropertyOutcome::Held {
+        NaReason::AssumptionsNeverHeld
+    } else if ended == Outcome::Violation && !(state.open.is_empty() && state.pending.is_empty()) {
+        NaReason::StoppedByViolation
+    } else if let Some(&site) = state.pending.first() {
+        match site {
+            Pending::WatchOpen if stopping => NaReason::NodeStopped,
+            site => NaReason::Unsettled { site },
+        }
+    } else if !state.open.is_empty() {
+        NaReason::ObligationOpen
+    } else if state.assumption_lost && state.applicable == 0 {
+        NaReason::AssumptionLost
+    } else if state.applicable > 0 {
+        return PropertyOutcome::Held {
             applicable: state.applicable,
-        },
-        None => PropertyOutcome::NotApplicable,
+        };
+    } else {
+        NaReason::NeverApplied
+    };
+    PropertyOutcome::not_applicable(reason)
+}
+
+/// [`outcome`]'s rules 1 to 3, which need only a property's `violations`,
+/// whether it's `(undeclared, excluded)`, and whether a `harness` failure
+/// ended the run. `None` if none matches, which a harness end never leaves.
+pub(crate) fn leading_outcome(
+    violations: &[Violation],
+    (undeclared, excluded): (bool, bool),
+    harness: bool,
+) -> Option<PropertyOutcome> {
+    if let Some(violation) = violations.first() {
+        return Some(PropertyOutcome::Violated {
+            witness: violation.witness.clone(),
+        });
+    }
+    let reason = if undeclared {
+        NaReason::Undeclared
+    } else if excluded {
+        NaReason::Excluded
+    } else if harness {
+        NaReason::HarnessFailed
+    } else {
+        return None;
+    };
+    Some(PropertyOutcome::not_applicable(reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A harness with no state, for building a property.
+    struct NoView;
+
+    impl HasView for NoView {
+        type View = ();
+
+        /// Nothing.
+        fn view(&self) {}
+    }
+
+    /// One precedence rule's condition, as `outcome` reads it.
+    #[derive(Clone, Copy, Debug)]
+    enum Fact {
+        /// A retained violation (rule 1).
+        Violated,
+        /// The scenario doesn't declare the assumptions (rule 2).
+        Undeclared,
+        /// The tier excludes a needed source (rule 2).
+        Excluded,
+        /// The run ended at a harness failure (rule 3).
+        Harness,
+        /// The declared assumptions never held (rule 4).
+        NeverHeld,
+        /// An `Active` violation stopped the run (rule 5, with something
+        /// open).
+        Stopped,
+        /// A pending mark at this site (rule 6).
+        Mark(Pending),
+        /// A `WatchOpen` mark with the harness stopping the node (rule 6).
+        WatchStopping,
+        /// An open obligation (rules 5 and 7).
+        Open,
+        /// A deferred obligation (rules 5 and 7).
+        Deferred,
+        /// An assumption lost while an obligation was open (rule 8).
+        Lost,
+        /// An evaluation applied (rules 8 and 9).
+        Applied,
+    }
+
+    /// The outcome `outcome` gives a property with `facts`.
+    fn judged(facts: &[Fact]) -> PropertyOutcome {
+        let assumes: &'static [Assume] = &[Assume::HonestPeer];
+        let property = Property::<NoView> {
+            id: PropertyId::new("test/p"),
+            claim: "",
+            kind: Kind::Liveness {
+                bound: LivenessBound::BeforeQuiescence,
+            },
+            assumes,
+            needs: &[],
+            status: Status::Active,
+            check: |_| Verdict::NotApplicable,
+            witness: None,
+        };
+        let mut state = PropertyState::<()>::new(true, None);
+        state.ever_held = true;
+        let (mut ended, mut stopping) = (
+            Outcome::Idle {
+                status: crate::IdleStatus::Quiescent,
+            },
+            false,
+        );
+        let obligation = |deferred| Open {
+            obligation: Obligation {
+                key: super::super::ObligationKey {
+                    property: property.id.clone(),
+                    subject: super::super::Subject::Owner("o".to_owned()),
+                },
+                opened_at: 1,
+                opened_time: SimInstant::ZERO,
+                trigger: None,
+                bound: LivenessBound::BeforeQuiescence,
+                discharged_by: |_, _| false,
+                cardinality: Cardinality::One,
+                witness: vec![1],
+                facts: None,
+            },
+            registered: 1,
+            ops: 0,
+            deferred,
+        };
+        for fact in facts {
+            match *fact {
+                Fact::Violated => state.violations.push(Violation {
+                    property: "test/p".to_owned(),
+                    step: 1,
+                    witness: vec![1],
+                    expected: String::new(),
+                    actual: String::new(),
+                }),
+                Fact::Undeclared => state.declared = false,
+                Fact::Excluded => state.excluded = Some("Frames: none".to_owned()),
+                Fact::Harness => ended = Outcome::Harness,
+                Fact::NeverHeld => state.ever_held = false,
+                Fact::Stopped => ended = Outcome::Violation,
+                Fact::Mark(site) => {
+                    state.pending.insert(site);
+                }
+                Fact::WatchStopping => {
+                    state.pending.insert(Pending::WatchOpen);
+                    stopping = true;
+                }
+                Fact::Open => state.open.push(obligation(None)),
+                Fact::Deferred => state.open.push(obligation(Some(SimInstant::ZERO))),
+                Fact::Lost => state.assumption_lost = true,
+                Fact::Applied => state.applicable = 2,
+            }
+        }
+        outcome(&property, &state, ended, stopping)
+    }
+
+    /// #1840 rules 4 to 6: each rule alone, then every pair of rules whose
+    /// conditions can co-occur, where the earlier rule wins. Applicability
+    /// never outranks an open obligation or a pending mark.
+    #[test]
+    fn outcome_applies_the_first_rule_that_matches() {
+        use Fact::*;
+        let violated = PropertyOutcome::Violated { witness: vec![1] };
+        let na = PropertyOutcome::not_applicable;
+        let unsettled = |site| na(NaReason::Unsettled { site });
+        let held = PropertyOutcome::Held { applicable: 2 };
+        let rows: Vec<(&[Fact], PropertyOutcome)> = vec![
+            // Each rule alone.
+            (&[], na(NaReason::NeverApplied)),
+            (&[Violated], violated.clone()),
+            (&[Undeclared], na(NaReason::Undeclared)),
+            (&[Excluded], na(NaReason::Excluded)),
+            (&[Harness], na(NaReason::HarnessFailed)),
+            (&[NeverHeld], na(NaReason::AssumptionsNeverHeld)),
+            (&[Stopped, Open], na(NaReason::StoppedByViolation)),
+            (
+                &[Mark(Pending::TeardownOpen)],
+                unsettled(Pending::TeardownOpen),
+            ),
+            (&[Mark(Pending::WatchOpen)], unsettled(Pending::WatchOpen)),
+            (&[WatchStopping], na(NaReason::NodeStopped)),
+            (&[Open], na(NaReason::ObligationOpen)),
+            (&[Deferred], na(NaReason::ObligationOpen)),
+            (&[Lost], na(NaReason::AssumptionLost)),
+            (&[Applied], held.clone()),
+            // Rule 1 beside every other.
+            (&[Violated, Undeclared], violated.clone()),
+            (&[Violated, Excluded], violated.clone()),
+            (&[Violated, Harness], violated.clone()),
+            (&[Violated, NeverHeld], violated.clone()),
+            (&[Violated, Stopped, Open], violated.clone()),
+            (&[Violated, Mark(Pending::FaultOpen)], violated.clone()),
+            (&[Violated, WatchStopping], violated.clone()),
+            (&[Violated, Open], violated.clone()),
+            (&[Violated, Lost], violated.clone()),
+            (&[Violated, Applied], violated.clone()),
+            // Rule 2: a property that never ran has only the run's end and
+            // its assumptions besides.
+            (&[Undeclared, Excluded], na(NaReason::Undeclared)),
+            (&[Undeclared, Harness], na(NaReason::Undeclared)),
+            (&[Undeclared, NeverHeld], na(NaReason::Undeclared)),
+            (&[Undeclared, Stopped], na(NaReason::Undeclared)),
+            (&[Excluded, Harness], na(NaReason::Excluded)),
+            (&[Excluded, NeverHeld], na(NaReason::Excluded)),
+            (&[Excluded, Stopped], na(NaReason::Excluded)),
+            // Rule 3 beside everything a run can leave.
+            (&[Harness, NeverHeld], na(NaReason::HarnessFailed)),
+            (
+                &[Harness, Mark(Pending::UnreadBoundary)],
+                na(NaReason::HarnessFailed),
+            ),
+            (&[Harness, WatchStopping], na(NaReason::HarnessFailed)),
+            (&[Harness, Open], na(NaReason::HarnessFailed)),
+            (&[Harness, Lost], na(NaReason::HarnessFailed)),
+            (&[Harness, Applied], na(NaReason::HarnessFailed)),
+            // Rule 4: assumptions that never held leave nothing run, so
+            // only the run's end can be beside them.
+            (&[NeverHeld, Stopped], na(NaReason::AssumptionsNeverHeld)),
+            // Rule 5 needs something open: an obligation, a deferred one
+            // or a pending mark. A withdrawn one isn't open.
+            (&[Stopped], na(NaReason::NeverApplied)),
+            (&[Stopped, Deferred], na(NaReason::StoppedByViolation)),
+            (
+                &[Stopped, Mark(Pending::TeardownOpen)],
+                na(NaReason::StoppedByViolation),
+            ),
+            (&[Stopped, WatchStopping], na(NaReason::StoppedByViolation)),
+            (&[Stopped, Open, Applied], na(NaReason::StoppedByViolation)),
+            (&[Stopped, Lost], na(NaReason::AssumptionLost)),
+            (&[Stopped, Applied], held.clone()),
+            // Rule 6: the first mark in `Pending`'s order, NodeStopped only
+            // when the watch mark is that one.
+            (
+                &[Mark(Pending::FaultOpen), WatchStopping],
+                unsettled(Pending::FaultOpen),
+            ),
+            (
+                &[WatchStopping, Mark(Pending::UnreadTrigger)],
+                na(NaReason::NodeStopped),
+            ),
+            (
+                &[
+                    Mark(Pending::UnjudgedDeparture),
+                    Mark(Pending::UnreadTrigger),
+                ],
+                unsettled(Pending::UnreadTrigger),
+            ),
+            (
+                &[
+                    Mark(Pending::TeardownOpen),
+                    Mark(Pending::BlockTeardownOpen),
+                ],
+                unsettled(Pending::TeardownOpen),
+            ),
+            (
+                &[Mark(Pending::UnreadBoundary), Open],
+                unsettled(Pending::UnreadBoundary),
+            ),
+            (
+                &[Mark(Pending::FaultOpen), Lost],
+                unsettled(Pending::FaultOpen),
+            ),
+            (
+                &[Mark(Pending::WatchOpen), Applied],
+                unsettled(Pending::WatchOpen),
+            ),
+            (&[WatchStopping, Open], na(NaReason::NodeStopped)),
+            (&[WatchStopping, Lost], na(NaReason::NodeStopped)),
+            (&[WatchStopping, Applied], na(NaReason::NodeStopped)),
+            // Rule 7 beside the rules after it.
+            (&[Open, Lost], na(NaReason::ObligationOpen)),
+            (&[Open, Applied], na(NaReason::ObligationOpen)),
+            (&[Deferred, Applied], na(NaReason::ObligationOpen)),
+            // Rule 8 needs no evaluation applied.
+            (&[Lost, Applied], held.clone()),
+        ];
+        for (facts, expected) in rows {
+            assert_eq!(judged(facts), expected, "{facts:?}");
+        }
+    }
+
+    /// Rules 1 to 3 need nothing but the violations, the property's
+    /// declaration and exclusion, and the run's end, so the harness-end
+    /// trim can reapply them to a report.
+    #[test]
+    fn leading_outcome_decides_every_harness_end() {
+        let violation = Violation {
+            property: "test/p".to_owned(),
+            step: 3,
+            witness: vec![2, 3],
+            expected: String::new(),
+            actual: String::new(),
+        };
+        let na = |reason| Some(PropertyOutcome::not_applicable(reason));
+        assert_eq!(
+            leading_outcome(std::slice::from_ref(&violation), (true, true), true),
+            Some(PropertyOutcome::Violated {
+                witness: vec![2, 3]
+            })
+        );
+        assert_eq!(
+            leading_outcome(&[], (true, true), true),
+            na(NaReason::Undeclared)
+        );
+        assert_eq!(
+            leading_outcome(&[], (false, true), true),
+            na(NaReason::Excluded)
+        );
+        assert_eq!(
+            leading_outcome(&[], (false, false), true),
+            na(NaReason::HarnessFailed)
+        );
+        assert_eq!(leading_outcome(&[], (false, false), false), None);
     }
 }

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use zakura_rt::{sync::atomic::AtomicU64, task::yield_now};
 use zakura_scheduler::SchedulerConfig;
+use zakura_sim::NaReason;
 use zakura_sim::{
     explore::{
         abandon_limit, classify, classify_process,
@@ -731,14 +732,17 @@ fn stats_count_each_part_of_a_run() {
     let property = |id: &str| &counts.properties[id];
     assert_eq!(property(ACTIVE).violated, 1);
     assert_eq!(property(ACTIVE).held, 3, "clean, known and abandoned runs");
-    assert_eq!(property(ACTIVE).inconclusive, harness_failed);
+    assert_eq!(property(ACTIVE).not_applicable, harness_failed);
     assert_eq!(property(KNOWN).violated, 1);
     assert_eq!(property(KNOWN).held, 3, "clean, active and abandoned runs");
     assert_eq!(property(DRAFT).violated, 0);
     assert_eq!(property(DRAFT).held, 4);
-    assert_eq!(property(DRAFT).inconclusive, harness_failed);
+    assert_eq!(property(DRAFT).not_applicable, harness_failed);
     for id in [ACTIVE, KNOWN, DRAFT] {
-        assert_eq!(property(id).not_applicable, 0, "{id}");
+        assert!(
+            !property(id).not_applicable.contains_key("never-applied"),
+            "{id}"
+        );
         assert!(property(id).evaluations >= property(id).held, "{id}");
         assert!(property(id).applied(), "{id}");
     }
@@ -757,16 +761,17 @@ fn stats_count_property_outcomes_cleanup_and_features() {
     let Ok(report) = &mut run.result else {
         panic!("the clean case runs: {:?}", run.result.err());
     };
-    let inconclusive = |reason: &str| PropertyOutcome::Inconclusive {
-        reason: reason.to_owned(),
-    };
+    let na = PropertyOutcome::not_applicable;
     report.properties = vec![
         PropertyReport::new("x/held", PropertyOutcome::Held { applicable: 4 }),
         PropertyReport::new("x/held-zero", PropertyOutcome::Held { applicable: 0 }),
-        PropertyReport::new("x/na", PropertyOutcome::NotApplicable),
-        PropertyReport::new("x/lost", inconclusive("assumption-lost")),
-        PropertyReport::new("x/never", inconclusive("assumptions-never-held")),
-        PropertyReport::new("x/open", inconclusive("obligation-open")),
+        PropertyReport::new(
+            "x/na",
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
+        ),
+        PropertyReport::new("x/lost", na(NaReason::AssumptionLost)),
+        PropertyReport::new("x/never", na(NaReason::AssumptionsNeverHeld)),
+        PropertyReport::new("x/open", na(NaReason::ObligationOpen)),
     ];
     report.cleanup.unwound = 2;
     report.cleanup.panicked = 1;
@@ -793,12 +798,12 @@ fn stats_count_property_outcomes_cleanup_and_features() {
     assert!(property("x/held").applied());
     assert_eq!(property("x/held-zero").held, 2);
     assert!(!property("x/held-zero").applied());
-    assert_eq!(property("x/na").not_applicable, 2);
+    assert_eq!(property("x/na").not_applicable["never-applied"], 2);
     assert!(!property("x/na").applied());
     assert_eq!(property("x/lost").assumption_losses(), 2);
     assert_eq!(property("x/never").assumption_losses(), 2);
     assert_eq!(property("x/open").assumption_losses(), 0);
-    assert_eq!(property("x/open").inconclusive["obligation-open"], 2);
+    assert_eq!(property("x/open").not_applicable["obligation-open"], 2);
     assert_eq!(
         counts.cleanup,
         CleanupCounts {

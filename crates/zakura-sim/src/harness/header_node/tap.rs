@@ -35,7 +35,7 @@
 //! budget with a drain that ran dry, before that read fails as
 //! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
 //! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
-//! reports as inconclusive.
+//! leaves unsettled ([`Pending::TeardownOpen`](crate::property::Pending::TeardownOpen)).
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
@@ -689,7 +689,7 @@ impl LiveEvidence for TapState {
     ///
     /// A violation's ending stops the run before the stop could finish, and
     /// a budget end whose drain was cut off at its bound leaves it honestly
-    /// unfinished, which the teardown property reports as inconclusive. Any
+    /// unfinished, which the teardown property leaves unsettled. Any
     /// other end means no task could run, yet the reactor never let go.
     fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
         if end.outcome == Outcome::Violation {

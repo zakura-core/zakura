@@ -380,15 +380,12 @@ fn run_checked(
         properties.extend(extra.at_end(&end, &log));
     }
     // As in `Sim::run`: a harness failure leaves no property held, since the
-    // run's evidence may be incomplete. The report and the end record both
-    // take these.
+    // run's evidence may be incomplete, and trims each report's end findings.
+    // The report, the full report and the end record all take these.
     if end.outcome == Outcome::Harness {
         properties = properties
             .into_iter()
-            .map(|report| PropertyReport {
-                outcome: report.outcome.after_harness_failure(),
-                ..report
-            })
+            .map(PropertyReport::after_harness_failure)
             .collect();
     }
     let report = RunReport {

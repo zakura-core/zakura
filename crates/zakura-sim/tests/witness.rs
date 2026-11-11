@@ -13,7 +13,8 @@ use zakura_sim::{
         TriggerHistory, Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
-    Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig, Sim,
+    NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig,
+    Sim,
 };
 
 /// The committed input that holds discovery's source back at its
@@ -295,15 +296,17 @@ fn a_trigger_sees_its_property_id() {
 }
 
 /// A run that ends with the property's obligation still open is
-/// inconclusive, which no expectation accepts.
+/// `NotApplicable` with incomplete observations, which no expectation
+/// accepts.
 #[test]
-fn inconclusive_report_fails() {
+fn an_incomplete_report_fails() {
     for expect in [Expect::Holds, Expect::Applicable, Expect::Violated] {
         let result = witness(probe(Behavior::Owe), OPEN, expect);
         assert!(
             matches!(
                 result,
-                Err(WitnessError::Outcome(PropertyOutcome::Inconclusive { .. }))
+                Err(WitnessError::Outcome(PropertyOutcome::NotApplicable { reason }))
+                    if !reason.is_benign()
             ),
             "{expect:?}: {result:?}"
         );
@@ -314,12 +317,12 @@ fn inconclusive_report_fails() {
 /// witness, since the run can't show nothing else broke. `Applicable`
 /// claims no bug, so it still passes on the property's own outcome.
 #[test]
-fn holds_refuses_an_unrelated_inconclusive() {
+fn holds_refuses_an_unrelated_incomplete() {
     assert_eq!(
         witness(probe(Behavior::Owe), HOLDS, Expect::Holds),
-        Err(WitnessError::UnrelatedInconclusive {
+        Err(WitnessError::UnrelatedIncomplete {
             property: OPEN.to_owned(),
-            reason: "obligation-open".to_owned()
+            reason: NaReason::ObligationOpen,
         })
     );
     check_witness(probe(Behavior::Owe), HOLDS, Expect::Applicable);

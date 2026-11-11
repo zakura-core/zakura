@@ -11,7 +11,7 @@
 //! [`AdoptionEvidence::generation`], [`AdoptionEvidence::status`] and
 //! [`AdoptionEvidence::tip`] check hdr-4's adopted-state rules over the
 //! facts. A rule whose deadline the run didn't reach is
-//! [`Acceptance::Inconclusive`].
+//! [`Acceptance::Open`].
 
 use std::{
     collections::BTreeMap,
@@ -303,7 +303,7 @@ pub enum Acceptance {
     /// The rule held over the whole run.
     Holds,
     /// The run ended before a fact the rule owes was due.
-    Inconclusive(String),
+    Open(String),
     /// The rule broke.
     Violated(String),
 }
@@ -504,7 +504,7 @@ impl AdoptionEvidence {
 
     /// The generation rule: every `Started` and locator `Dispatched` after an
     /// adoption carries that adoption's header generation. A safety rule, so
-    /// it's never inconclusive.
+    /// it's never open.
     pub fn generation(&self) -> Acceptance {
         let store = self.store();
         let mut latest = None;
@@ -546,7 +546,7 @@ impl AdoptionEvidence {
     /// watch send is a preemption point between them. A tip still owed when
     /// a settled run ends (see [`AdoptionEvidence::end`]) is therefore a
     /// break, since no task is left partway through that call. A tip still
-    /// owed at any other end, or before the run has ended, is inconclusive.
+    /// owed at any other end, or before the run has ended, stays open.
     pub fn tip(&self) -> Acceptance {
         let store = self.store();
         let mut adopted: Option<Frontier> = None;
@@ -581,12 +581,12 @@ impl AdoptionEvidence {
         match (owed, store.settled) {
             (None, _) => Acceptance::Holds,
             (Some((tip, at)), Some(true)) => unpublished(tip, at),
-            (Some((tip, at)), Some(false)) => Acceptance::Inconclusive(format!(
+            (Some((tip, at)), Some(false)) => Acceptance::Open(format!(
                 "the run stopped with {tip:?}, adopted at {at:?}, not yet published, \
                  while a task could be partway through publishing it"
             )),
             (Some((tip, at)), None) => {
-                Acceptance::Inconclusive(format!("{tip:?}, adopted at {at:?}, isn't published yet"))
+                Acceptance::Open(format!("{tip:?}, adopted at {at:?}, isn't published yet"))
             }
         }
     }
@@ -609,7 +609,7 @@ impl AdoptionEvidence {
     /// beyond its first status, and a deadline at or after its end is owed
     /// nothing. The bounds assume the harness doesn't hold the reactor's task
     /// (`Sim::hold_tasks`), as the header harnesses don't. A run that ends before a deadline is
-    /// inconclusive. Status facts for a session not in `sessions` are checked
+    /// open. Status facts for a session not in `sessions` are checked
     /// only for what they advertise.
     pub fn status(&self, sessions: &[SessionLife]) -> Acceptance {
         let store = self.store();
@@ -673,7 +673,7 @@ impl AdoptionEvidence {
             .iter()
             .find_map(|(session, owed)| owed.pending().map(|due| (*session, due)))
         {
-            Some((session, due)) => Acceptance::Inconclusive(format!(
+            Some((session, due)) => Acceptance::Open(format!(
                 "the run ended at {:?}, before session {session}'s status was due at {due:?}",
                 store.horizon
             )),
@@ -1017,7 +1017,7 @@ mod tests {
 
     /// A changed tip is owed before the next adoption, or by the end of a
     /// settled run: published by then it holds, and otherwise it breaks. Owed
-    /// while the run goes on, or when it stops unsettled, is inconclusive, and
+    /// while the run goes on, or when it stops unsettled, stays open, and
     /// a publication after the end doesn't count. A stale or lost publication
     /// breaks.
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
         // Time alone owes nothing: only the next adoption or a settled end
         // does.
         let cut = evidence(vec![(0, adopted(&first))], 60_000);
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        assert!(matches!(cut.tip(), Acceptance::Open(_)));
         let run_end = |outcome, drain| RunEnd {
             outcome,
             steps: 100,
@@ -1080,14 +1080,14 @@ mod tests {
         // A drain cut off at its bound can leave the reactor partway through
         // the call that adopts and publishes.
         cut.end(&run_end(Outcome::Budget, drained(true)));
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        assert!(matches!(cut.tip(), Acceptance::Open(_)));
         cut.end(&run_end(
             Outcome::Idle {
                 status: IdleStatus::Deadlock,
             },
             None,
         ));
-        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        assert!(matches!(cut.tip(), Acceptance::Open(_)));
         held.end(&run_end(Outcome::Budget, drained(false)));
         assert_eq!(held.tip(), Acceptance::Holds);
         // Cleanup can finish the publication after the end, which changes
@@ -1096,7 +1096,7 @@ mod tests {
         frozen.end(&run_end(Outcome::Budget, drained(true)));
         frozen.freeze();
         frozen.record(Duration::ZERO, published(first.header_best));
-        assert!(matches!(frozen.tip(), Acceptance::Inconclusive(_)));
+        assert!(matches!(frozen.tip(), Acceptance::Open(_)));
         let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);
         assert!(violates(&skipped.tip(), "UnpublishedTip"));
         let stale = evidence(
@@ -1124,7 +1124,7 @@ mod tests {
     /// bounds while it lasts, a deferral owes a retry, and a later changed
     /// adoption replaces what's owed while an unchanged one keeps the
     /// deadline. A stale queued status breaks for any session, and a run
-    /// ending before a deadline is inconclusive.
+    /// ending before a deadline stays open.
     #[test]
     fn a_session_is_owed_its_latest_status_while_it_lasts() {
         let (first, second, third) = (adoption(1, 1), adoption(2, 2), adoption(3, 3));
@@ -1169,7 +1169,7 @@ mod tests {
         ));
         assert!(matches!(
             evidence(silent, 2_000).status(&live),
-            Acceptance::Inconclusive(_)
+            Acceptance::Open(_)
         ));
 
         let unsent = vec![
@@ -1191,7 +1191,7 @@ mod tests {
             "StatusOverdue"
         ));
         let cut = evidence(unsent.clone(), 2_010);
-        assert!(matches!(cut.status(&live), Acceptance::Inconclusive(_)));
+        assert!(matches!(cut.status(&live), Acceptance::Open(_)));
 
         // An adoption that changes only the state version keeps the deadline.
         let same = Adoption {
@@ -1229,7 +1229,7 @@ mod tests {
         ];
         assert!(matches!(
             evidence(back.clone(), 3_100).status(&live),
-            Acceptance::Inconclusive(_)
+            Acceptance::Open(_)
         ));
         let mut resent = back;
         resent.push((3_000, queued(status(&first))));

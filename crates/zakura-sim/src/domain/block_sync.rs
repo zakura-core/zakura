@@ -77,8 +77,8 @@ use crate::{
         BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
     },
     property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
-        TriggerHistory, Unit, Verdict,
+        CheckCtx, HasView, Kind, Pending, Property, PropertyId, Source, Status, TriggerHistory,
+        Unit, Verdict,
     },
     Observation, ObservationLog,
 };
@@ -1502,9 +1502,9 @@ where
 /// Then the budget, the work queue's tally and the routines' unreceived
 /// estimates must all be zero, no handoff may be open, and the service's
 /// session slots must all be free again. Before settlement the property is
-/// unsettled, so a run that ends there, including one with a leaked
-/// routine, queued body or serving lease, is `Inconclusive { TeardownOpen }`,
-/// not a violation. `receiver-serving-bounded` catches a leaked serving
+/// pending ([`Pending::BlockTeardownOpen`]), so a run that ends there,
+/// including one with a leaked routine, queued body or serving lease, is
+/// unsettled, not a violation. `receiver-serving-bounded` catches a leaked serving
 /// lease. A serving lease gap leaves settlement unknown, so it is missing
 /// evidence.
 pub(crate) fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -1544,7 +1544,7 @@ where
         return Verdict::NotApplicable;
     }
     if unended > 0 || queued > 0 || serving > 0 || !at_rest(status) {
-        cx.unsettled(Inconclusive::TeardownOpen);
+        cx.pending(Pending::BlockTeardownOpen);
         return Verdict::NotApplicable;
     }
     match charges.iter().find(|(_, value)| *value > 0) {

@@ -13,6 +13,8 @@ use std::{
 
 use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::property::Pending;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::TEARDOWN_RETURNS_BASELINE,
     harness::{
@@ -178,12 +180,12 @@ fn a_shutdown_stops_the_node_and_passes_its_teardown_checks() {
 /// A run cut off right after it picks `Shutdown`, before the control task
 /// carries it out, leaves the stop honestly unfinished: its drain was cut
 /// off at its bound. It's no harness failure, and
-/// `header-sync/teardown-returns-baseline` is inconclusive, so a chosen stop
+/// `header-sync/teardown-returns-baseline` is unsettled, so a chosen stop
 /// still never ends silently untaken. The stop counts from its pick. The
 /// test searches budgets for a run whose last step is that pick, with no
 /// drain.
 #[test]
-fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
+fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
     let scenario = scenario(
         Vec::new(),
         vec![ControlStep {
@@ -226,9 +228,9 @@ fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
         .map(|property| property.outcome.clone());
     assert_eq!(
         teardown,
-        Some(PropertyOutcome::Inconclusive {
-            reason: "teardown-open".to_owned()
-        })
+        Some(PropertyOutcome::not_applicable(NaReason::Unsettled {
+            site: Pending::TeardownOpen
+        }))
     );
 }
 

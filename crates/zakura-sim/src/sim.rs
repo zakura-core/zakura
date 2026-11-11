@@ -408,8 +408,9 @@ impl Sim {
             _ => end,
         };
         // Last, so it covers every way the run ended at a harness failure,
-        // which the checker may have reported before it knew. The report and
-        // the end record both take these.
+        // which the checker may have reported before it knew. Each report is
+        // trimmed of its end findings, and the report, the full report and
+        // the end record all take the trimmed ones.
         let properties = match end.outcome {
             Outcome::Harness => after_harness_failure(properties),
             _ => properties,
@@ -977,14 +978,12 @@ impl State {
     }
 }
 
-/// `reports` of a run that ended at a harness failure.
+/// `reports` of a run that ended at a harness failure, each trimmed of its
+/// end findings ([`PropertyReport::after_harness_failure`]).
 fn after_harness_failure(reports: Vec<PropertyReport>) -> Vec<PropertyReport> {
     reports
         .into_iter()
-        .map(|report| PropertyReport {
-            outcome: report.outcome.after_harness_failure(),
-            ..report
-        })
+        .map(PropertyReport::after_harness_failure)
         .collect()
 }
 

@@ -17,10 +17,11 @@ use serde::{Deserialize, Serialize};
 pub use assume::{Assume, AssumeRecord, Assumptions};
 pub use cx::{Capture, CheckCtx, EndViolation, HasView};
 pub use id::{BadId, PropertyId};
+pub(crate) use registry::leading_outcome;
 pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
 pub use verdict::{
-    Cardinality, EndedBy, FactAnswer, FactDischarge, Inconclusive, LivenessBound, Obligation,
-    ObligationKey, Subject, Verdict,
+    Cardinality, EndedBy, FactAnswer, FactDischarge, LivenessBound, Obligation, ObligationKey,
+    Pending, Subject, Verdict,
 };
 
 use crate::ObservationLog;

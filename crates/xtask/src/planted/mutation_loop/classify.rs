@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::super::outcome::EndOutcome;
+
 /// What a mutant's case ended with, or the run failure that kept it from
 /// one. The report keeps the two apart ([`Class::is_result`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -52,13 +54,14 @@ impl Class {
 pub(in crate::planted) enum Reason {
     /// Survived: the named ID applied and held.
     Held,
-    /// Survived: the named ID never applied.
+    /// Survived: the named ID ended `not-applicable` with a benign reason:
+    /// it never applied, wasn't declared, or its tier excludes a source.
     NotApplicable,
     /// Survived: the run didn't reach the named ID's trigger history.
     TriggerLost,
-    /// Survived: the named ID ended inconclusive, and no run held it with
-    /// nonzero applicability.
-    Inconclusive,
+    /// Survived: the named ID ended `not-applicable` with incomplete
+    /// observations, and no run held it with nonzero applicability.
+    Incomplete,
     /// Harness failure: the run passed its deadline.
     Timeout,
     /// Harness failure: the memory cap killed the run.
@@ -151,9 +154,9 @@ pub(in crate::planted) enum Record {
         violated: Vec<String>,
         /// The harness failure the run ended at.
         harness: Option<String>,
-        /// Each property's outcome name, such as `held`, and its applicable
-        /// evaluations for a held one.
-        outcomes: BTreeMap<String, (String, u64)>,
+        /// Each property's outcome, with its applicable evaluations for a
+        /// held one and its reason for a `not-applicable` one.
+        outcomes: BTreeMap<String, EndOutcome>,
     },
     /// A witness judgement.
     Witness {
@@ -190,23 +193,15 @@ pub(in crate::planted) fn read_record(text: &str, source: &str) -> Result<Option
             .flatten()
         {
             let id = text_at(report, "property").unwrap_or_default();
-            let outcome = report.get("outcome");
-            let name = outcome
-                .and_then(|outcome| {
-                    outcome
-                        .as_str()
-                        .or_else(|| outcome.as_object()?.keys().next().map(String::as_str))
-                })
-                .unwrap_or_default()
-                .to_owned();
-            let applicable = outcome
-                .and_then(|outcome| outcome.pointer("/held/applicable"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if name == "violated" {
+            let outcome = EndOutcome::parse(
+                report
+                    .get("outcome")
+                    .ok_or("an end record's report has no outcome")?,
+            )?;
+            if matches!(outcome, EndOutcome::Violated {}) {
                 violated.push(id.clone());
             }
-            outcomes.insert(id, (name, applicable));
+            outcomes.insert(id, outcome);
         }
         return Ok(Some(Record::End {
             thread,
@@ -332,7 +327,7 @@ pub(in crate::planted) fn baseline(property: &str, observed: &Observed) -> Optio
     }
     let applied = observed.records.iter().any(|record| {
         matches!(record, Record::End { outcomes, .. }
-            if matches!(outcomes.get(property), Some((name, n)) if name == "held" && *n > 0))
+            if matches!(outcomes.get(property), Some(EndOutcome::Held { applicable }) if *applicable > 0))
     });
     (!applied).then(|| format!("no run holds {property} with nonzero applicability"))
 }
@@ -401,7 +396,7 @@ fn unstopped<'a>(property: &str, records: &'a [Record]) -> Vec<&'a str> {
 /// or its judgement failed only at a violation that stopped no run, the end
 /// records' outcomes give the reason ([`by_outcomes`]). Otherwise the
 /// witness judgement or the last end record gives `trigger-lost`,
-/// `not-applicable` or `inconclusive`. A witness that failed with none of
+/// `not-applicable` or `incomplete`. A witness that failed with none of
 /// these failed outside the harness run.
 ///
 /// The detail names each other ID that a run violated without stopping.
@@ -489,7 +484,7 @@ fn decide(
         .iter()
         .rev()
         .find_map(|record| match record {
-            Record::End { outcomes, .. } => outcomes.get(property).map(|(name, _)| name.as_str()),
+            Record::End { outcomes, .. } => outcomes.get(property),
             Record::Witness { .. } => None,
         });
     match (error, last_outcome) {
@@ -501,17 +496,17 @@ fn decide(
             Reason::NotApplicable,
             format!("the witness found {property} not applicable"),
         ),
-        (Some("inconclusive"), _) => survived(
-            Reason::Inconclusive,
-            format!("the witness found {property} inconclusive"),
+        (Some("incomplete"), _) => survived(
+            Reason::Incomplete,
+            format!("the witness found {property}'s observations incomplete"),
         ),
-        (_, Some("not-applicable")) => survived(
+        (_, Some(EndOutcome::NotApplicable { reason })) if reason.is_benign() => survived(
             Reason::NotApplicable,
-            format!("the witness failed with {property} not applicable on its last run"),
+            format!("the witness failed with {property} not applicable ({reason}) on its last run"),
         ),
-        (_, Some("inconclusive")) => survived(
-            Reason::Inconclusive,
-            format!("the witness failed with {property} inconclusive on its last run"),
+        (_, Some(EndOutcome::NotApplicable { reason })) => survived(
+            Reason::Incomplete,
+            format!("the witness failed with {property} incomplete ({reason}) on its last run"),
         ),
         _ => Classified::new(
             Class::HarnessFailure,
@@ -523,10 +518,11 @@ fn decide(
 
 /// A survivor's reason from the end records' outcomes of `property`:
 /// `held` if some run held it with nonzero applicability, as a baseline
-/// requires, else `inconclusive` if some run ended it inconclusive, else
-/// `not-applicable`. A harness failure if no end record reports `property`.
+/// requires, else `incomplete` if some run ended it `not-applicable` for a
+/// reason that isn't benign, else `not-applicable`. A harness failure if no
+/// end record reports `property`.
 fn by_outcomes(property: &str, observed: &Observed) -> Classified {
-    let outcomes: Vec<&(String, u64)> = observed
+    let outcomes: Vec<&EndOutcome> = observed
         .records
         .iter()
         .filter_map(|record| match record {
@@ -535,15 +531,25 @@ fn by_outcomes(property: &str, observed: &Observed) -> Classified {
         })
         .collect();
     let survived = |reason, detail: String| Classified::new(Class::Survived, Some(reason), detail);
-    if outcomes.iter().any(|(name, n)| name == "held" && *n > 0) {
+    let incomplete = outcomes.iter().find_map(|outcome| match outcome {
+        EndOutcome::NotApplicable { reason } if !reason.is_benign() => Some(*reason),
+        _ => None,
+    });
+    if outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, EndOutcome::Held { applicable } if *applicable > 0))
+    {
         survived(
             Reason::Held,
             format!("{property} held with nonzero applicability"),
         )
-    } else if outcomes.iter().any(|(name, _)| name == "inconclusive") {
+    } else if let Some(reason) = incomplete {
         survived(
-            Reason::Inconclusive,
-            format!("{property} ended inconclusive, and no run held it with nonzero applicability"),
+            Reason::Incomplete,
+            format!(
+                "{property} ended with incomplete observations ({reason}), and no run held it \
+                 with nonzero applicability"
+            ),
         )
     } else if !outcomes.is_empty() {
         survived(Reason::NotApplicable, format!("{property} never applied"))

@@ -20,7 +20,8 @@ ReadWritePaths=/var/lib/zakura-ci
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID blocks tar/openat2 on Ubuntu 26.04 (systemd#44034).
+# NoNewPrivileges still prevents gaining privileges through setuid executables.
 TasksMax=8192
 MemoryMax=30G
 MemorySwapMax=8G

@@ -800,6 +800,8 @@ jobs:
 
   temporary-unit-tests:
     name: normal unit tests on temporary runner
+    env:
+      NEXTEST_TEST_THREADS: 8
     if: vars.TEMPORARY_PR_CI == 'true'
     runs-on: [self-hosted, zakura-ci-temporary]
     timeout-minutes: 120

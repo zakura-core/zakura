@@ -62,7 +62,9 @@ use crate::{
         mining::{ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR},
     },
     methods::types::{
-        default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        default_roots::DefaultRoots,
+        long_poll::LongPollId,
+        transaction::{coinbase_needs_proof, TransactionTemplate},
     },
     server::error::{LegacyCode, MapError, OkOrError},
     EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
@@ -90,6 +92,37 @@ const MAX_PREPARED_WORK_IDS: usize = 64;
 const MAX_TEMPLATE_BUILDS: usize = 1;
 /// Bound admission waits without cancelling an already running proof.
 const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
+
+/// The work a template build does, which decides where it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateBuildWork {
+    /// No proof is created, so the build takes well under a millisecond and runs where it
+    /// was asked for.
+    ///
+    /// Handing so short a build to another thread costs more than the build: the thread has
+    /// to be found and scheduled while the node is busy with the block that prompted the
+    /// template.
+    ProofFree,
+
+    /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
+    /// on a blocking thread.
+    Proof,
+}
+
+impl TemplateBuildWork {
+    /// Returns the work of a build that creates the coinbase at `height` for this miner.
+    pub(crate) fn for_coinbase(
+        net: &Network,
+        height: block::Height,
+        miner_params: &MinerParams,
+    ) -> Self {
+        if coinbase_needs_proof(net, height, miner_params) {
+            Self::Proof
+        } else {
+            Self::ProofFree
+        }
+    }
+}
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -890,9 +923,13 @@ where
         self.pending_blocks = pending_blocks;
     }
 
-    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    /// Runs one template build at a time across RPC clones, where its `work` belongs.
+    ///
+    /// A proof build runs off the async worker and keeps its capacity until it finishes, even
+    /// if the caller stops waiting for it.
     pub(crate) async fn run_template_build<T: Send + 'static>(
         &self,
+        work: TemplateBuildWork,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
         let permit = tokio::time::timeout(
@@ -908,13 +945,30 @@ where
         })?
         .map_misc_error()?;
 
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        match work {
+            TemplateBuildWork::ProofFree => {
+                let _permit = permit;
+                // A panic becomes an RPC error, as it does when the build runs on a blocking
+                // thread.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_default();
+                        format!("mining template construction panicked: {message}")
+                    })
+                    .map_misc_error()
+            }
+            TemplateBuildWork::Proof => tokio::task::spawn_blocking(move || {
+                // Dropping the RPC future cannot release capacity while this job still owns work.
+                let _permit = permit;
+                build()
+            })
+            .await
+            .map_misc_error(),
+        }
     }
 
     /// Reserves one of the [`MAX_FULL_FIRST_ANSWERS`] places for a long poll that answers on a
@@ -1202,27 +1256,6 @@ where
     };
 
     Ok(chain_info)
-}
-
-/// Returns `true` if the coinbase of a block at `height` pays the miner to a shielded address,
-/// so building it needs a proof.
-///
-/// `issuance_deficit` is the parent's NSM value balance once ZIP 234 is active, and `None`
-/// before that.
-pub(crate) fn coinbase_needs_proof(
-    network: &Network,
-    height: block::Height,
-    miner_params: &MinerParams,
-    issuance_deficit: Option<Amount<NonNegative>>,
-) -> Result<bool, TransactionError> {
-    let coinbase = TransactionTemplate::coinbase_resource_usage(
-        network,
-        height,
-        miner_params,
-        issuance_deficit,
-    )?;
-
-    Ok(coinbase.shielded_action_counts.cost() > 0)
 }
 
 /// Returns the transactions that are currently in `mempool`, or None if the

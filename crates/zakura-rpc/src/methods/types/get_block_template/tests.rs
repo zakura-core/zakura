@@ -543,15 +543,9 @@ fn coinbase_needs_proof_only_for_a_shielded_payout() -> anyhow::Result<()> {
     assert!(!super::coinbase_needs_proof(
         &net,
         last_transparent_height,
-        &params,
-        None
-    )?);
-    assert!(super::coinbase_needs_proof(
-        &net,
-        ironwood_height,
-        &params,
-        None
-    )?);
+        &params
+    ));
+    assert!(super::coinbase_needs_proof(&net, ironwood_height, &params));
     Ok(())
 }
 

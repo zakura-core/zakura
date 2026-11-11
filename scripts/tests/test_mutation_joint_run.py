@@ -176,6 +176,8 @@ class RoutineTests(unittest.TestCase):
             plan = self.dry_run(state, *env["ZAKURA_MUTATION_ARGS"].split())
         loop = plan["steps"][1]["argv"]
         self.assertEqual(loop.count("--generate-harness-runs"), 4)
+        self.assertEqual(loop[loop.index("--cases") + 1], "qa/native-mutations")
+        self.assertEqual(loop[-2:], ["--jobs", "4"])
 
 
 if __name__ == "__main__":

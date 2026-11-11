@@ -27,7 +27,7 @@ use std::{
 use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
+    controlled::{ControlledPort, EngineRun, Fact, FactKind, OpId, ResetKind},
     evidence::{
         CallerPresence, CapacityClass, LeaseFact, LeaseKey, OperationStage, OwnerModel, OwnerState,
         PathPosition, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
@@ -103,6 +103,22 @@ pub struct HeaderStorage {
     label: String,
     /// What each failed prepare and apply blamed.
     attributions: FaultAttributions,
+    /// Each engine run the last observation logged, with the sequence number
+    /// of the fact that carried it, or 0 for a harness commit's, which no
+    /// fact carries, until [`take_runs`](Self::take_runs) takes them.
+    runs: Vec<(u64, Arc<EngineRun>)>,
+    /// Each snapshot the port's engine sent on its selected-chain watch
+    /// since the observation before the last, until
+    /// [`take_publications`](Self::take_publications) takes them.
+    publications: Vec<zakura_header_chain::EngineSnapshot>,
+    /// Each page read the last observation completed, by operation, with
+    /// each header's hash and its parent's, until
+    /// [`take_page_reads`](Self::take_page_reads) takes them. The log keeps
+    /// only a page's last header and count.
+    page_reads: Vec<(
+        u64,
+        Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+    )>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -231,6 +247,9 @@ impl HeaderStorage {
             },
             id,
             attributions: FaultAttributions::default(),
+            runs: Vec::new(),
+            publications: Vec::new(),
+            page_reads: Vec::new(),
         }
     }
 
@@ -352,6 +371,7 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             headers,
             work,
             first,
+            hashes,
         } => StorageRequest::PrepareHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
@@ -360,17 +380,22 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             headers: *headers,
             work: work.map(|work| work.as_u256().to_string()),
             first: first.map(point),
+            hashes: hashes.iter().map(|each| hash(*each)).collect(),
         },
         RequestIdentity::ApplyHeaderTarget {
             owner,
             source,
             parent_hash,
             target_tip_hash,
+            hashes,
         } => StorageRequest::ApplyHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
             parent: parent_hash.map(hash),
             target: hash(*target_tip_hash),
+            hashes: hashes
+                .as_ref()
+                .map(|hashes| hashes.iter().map(|each| hash(*each)).collect()),
         },
         RequestIdentity::SelectedChainContains { hash: asked } => {
             StorageRequest::SelectedChainContains { hash: hash(*asked) }
@@ -388,15 +413,19 @@ fn result(result: &ResultIdentity) -> StorageResult {
         ResultIdentity::PortError => StorageResult::PortError,
         ResultIdentity::Locator {
             tip,
+            hashes,
             header_generation,
             finalized,
         } => StorageResult::Locator {
             tip: point(*tip),
+            hashes: hashes.iter().map(|each| hash(*each)).collect(),
             header_generation: header_generation.get(),
             finalized: point(*finalized),
         },
         ResultIdentity::NoLocator => StorageResult::NoLocator,
-        ResultIdentity::VctResolved => StorageResult::VctResolved,
+        ResultIdentity::VctResolved { locator } => StorageResult::VctResolved {
+            locator: locator.map(point),
+        },
         ResultIdentity::VctStale => StorageResult::VctStale,
         ResultIdentity::Acquired {
             lease: key,
@@ -418,6 +447,8 @@ fn result(result: &ResultIdentity) -> StorageResult {
             last,
             count,
             complete,
+            // The served path is view-side evidence, kept out of the log.
+            links: _,
         } => StorageResult::Page {
             last: point(*last),
             count: *count,
@@ -521,6 +552,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id,
             generation,
             state_digest,
+            ..
         } => StorageFact::Committed {
             id: id.0,
             generation: generation.get(),
@@ -530,6 +562,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             kind,
             target,
             generation,
+            ..
         } => StorageFact::Reset {
             kind: match kind {
                 ResetKind::Invalidate => "invalidate",
@@ -701,16 +734,47 @@ impl ActionSource for HeaderStorage {
             }
         };
         let facts = self.port.take_facts();
+        // Only this observation's runs are kept, so a run no tap takes is
+        // dropped at the next one.
+        self.runs.clear();
+        self.page_reads.clear();
+        // Taken every observation, so a run no tap reads keeps none.
+        self.publications = self.port.engine().take_publications();
         let actual = self.port.owner_state();
-        self.model
+        // A model failure is returned only once the facts are logged and the
+        // checkpoint names this step, so the run's evidence check passes and
+        // a claim another source found this step still reports first.
+        let checked = self
+            .model
             .check_boundary(&facts, &actual)
-            .map_err(|failure| format!("{failure:?}"))?;
+            .map_err(|failure| format!("{failure:?}"));
         // After setup, the state is logged only when it may have changed.
         let with_state = self.delivered.is_none() || !facts.is_empty();
         let last = facts.last().map_or(delivered, |fact| fact.seq);
         for fact in &facts {
             self.attributions.record(self.id.index, fact);
+            if let FactKind::Completed(completion) = &fact.kind {
+                if let ResultIdentity::Page { links, .. } = &completion.result {
+                    self.page_reads.push((completion.id.0, links.clone()));
+                }
+            }
+            let run = match &fact.kind {
+                FactKind::Completed(completion) => completion.executed.clone(),
+                FactKind::Committed { executed, .. } | FactKind::Reset { executed, .. } => {
+                    Some(executed.clone())
+                }
+                _ => None,
+            };
+            self.runs.extend(run.map(|run| (fact.seq, run)));
         }
+        // A harness commit runs at its control step, which no storage action
+        // shares, so its run comes after this observation's facts' runs.
+        self.runs.extend(
+            self.port
+                .take_harness_runs()
+                .into_iter()
+                .map(|run| (0, run)),
+        );
         let mut sent: Vec<Observation> = facts
             .into_iter()
             .map(|fact| observation(fact, self.id.index))
@@ -730,7 +794,33 @@ impl ActionSource for HeaderStorage {
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        Ok(())
+        checked
+    }
+}
+
+impl HeaderStorage {
+    /// Each apply's, reset's and harness commit's engine run the observations
+    /// since the last call logged, in order, with the sequence number of the
+    /// fact that carried it, or 0 for a harness commit's.
+    pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
+        std::mem::take(&mut self.runs)
+    }
+
+    /// Each page read the last observation completed, by operation, with
+    /// each header's hash and its parent's.
+    pub(crate) fn take_page_reads(
+        &mut self,
+    ) -> Vec<(
+        u64,
+        Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+    )> {
+        std::mem::take(&mut self.page_reads)
+    }
+
+    /// Each snapshot the port's engine sent on its selected-chain watch in
+    /// the last observation's window, in order: since the observation before.
+    pub(crate) fn take_publications(&mut self) -> Vec<zakura_header_chain::EngineSnapshot> {
+        std::mem::take(&mut self.publications)
     }
 }
 

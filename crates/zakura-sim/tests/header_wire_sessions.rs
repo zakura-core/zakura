@@ -151,8 +151,10 @@ fn retired(facts: &[SessionFact], session_id: u64) -> Option<Retirement> {
 /// A close then a redial: each connection's session is joined to its own
 /// own-9 row and generation, and the second replaces nothing, because the
 /// node refuses a newcomer for a live identity and so tears the first
-/// connection down before the second registers. That teardown retires the
-/// first session.
+/// connection down before the second registers. own-9 retires the first
+/// session by whichever lands first, its generation's exit after the peer
+/// closes the stream or the connection's teardown. The schedule decides
+/// which, so either counts.
 #[test]
 fn a_close_and_redial_joins_each_connection_once() {
     for input in inputs(3, 16_384) {
@@ -166,9 +168,11 @@ fn a_close_and_redial_joins_each_connection_once() {
         for (session_id, _, origin) in [first, second] {
             assert_eq!(origin.generation, session_id, "{facts:#?}");
         }
-        assert_eq!(
-            retired(&facts, first.0),
-            Some(Retirement::TornDown),
+        assert!(
+            matches!(
+                retired(&facts, first.0),
+                Some(Retirement::TornDown | Retirement::GenerationExited)
+            ),
             "{facts:#?}"
         );
         assert_eq!(end, EndCheck::Complete, "{facts:#?}");

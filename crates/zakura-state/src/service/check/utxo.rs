@@ -11,7 +11,7 @@ use crate::{
     constants::MIN_TRANSPARENT_COINBASE_MATURITY,
     service::{
         finalized_state::ZakuraDb,
-        non_finalized_state::{CreatedUtxos, SharedMap, SpendingTransactionId},
+        non_finalized_state::{SharedMap, SpendingTransactionId},
     },
     SemanticallyVerifiedBlock,
     ValidateContextError::{
@@ -42,9 +42,11 @@ use crate::{
 /// `non_finalized_chain_created_utxos` includes outputs that were later spent
 /// by the non-finalized chain. `non_finalized_chain_spent_utxos` takes
 /// precedence over it.
-pub fn transparent_spend(
+pub fn transparent_spend<'chain>(
     semantically_verified: &SemanticallyVerifiedBlock,
-    non_finalized_chain_created_utxos: &CreatedUtxos,
+    non_finalized_chain_created_utxos: impl Fn(
+        &transparent::OutPoint,
+    ) -> Option<&'chain transparent::OrderedUtxo>,
     non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
@@ -68,7 +70,7 @@ pub fn transparent_spend(
                 spend,
                 spend_tx_index_in_block,
                 &semantically_verified.new_outputs,
-                non_finalized_chain_created_utxos,
+                &non_finalized_chain_created_utxos,
                 non_finalized_chain_spent_utxos,
                 finalized_state,
             )?;
@@ -133,11 +135,13 @@ pub fn transparent_spend(
 /// > or a previous transaction in the same block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
-fn transparent_spend_chain_order(
+fn transparent_spend_chain_order<'chain>(
     spend: transparent::OutPoint,
     spend_tx_index_in_block: usize,
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    non_finalized_chain_created_utxos: &CreatedUtxos,
+    non_finalized_chain_created_utxos: &impl Fn(
+        &transparent::OutPoint,
+    ) -> Option<&'chain transparent::OrderedUtxo>,
     non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<transparent::OrderedUtxo, ValidateContextError> {
@@ -168,9 +172,8 @@ fn transparent_spend_chain_order(
     }
 
     // This lookup is unspent because the spent index was checked first.
-    non_finalized_chain_created_utxos
-        .get(&spend)
-        .map(|utxo| utxo.as_ref().clone())
+    non_finalized_chain_created_utxos(&spend)
+        .cloned()
         // TODO: if finalized UTXO disk reads show up in profiles, fetch missing
         // UTXOs in parallel.
         .or_else(|| finalized_state.utxo(&spend))

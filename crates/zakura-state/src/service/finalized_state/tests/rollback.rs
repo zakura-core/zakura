@@ -588,8 +588,8 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
         joinsplit_data: Some(Box::new(zakura_chain::transaction::JoinSplitData {
             first: joinsplit,
             rest: Vec::new(),
-            pub_key: zakura_chain::primitives::ed25519::VerificationKeyBytes::from([0; 32]),
-            sig: zakura_chain::primitives::ed25519::Signature::from([0; 64]),
+            pub_key: zakura_chain::transaction::JoinSplitPubKey([0; 32]),
+            sig: zakura_chain::transaction::JoinSplitSig([0; 64]),
         })),
         sapling_shielded_data: None,
     })

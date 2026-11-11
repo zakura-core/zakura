@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+index 4e55811bd1..e08c3b1e69 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+@@ -323,11 +323,9 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
+             .iter()
+             .position(|(page, _)| page == cursor)
+             .ok_or(SubscribeRefused::UnknownCursor)?;
+-        let accepted = subscribed
+-            .unaccepted
+-            .drain(..=through)
+-            .last()
+-            .expect("the drained range ends at a found index");
++        // Mutation: acceptance advances the accepted cursor but keeps the
++        // queue.
++        let accepted = subscribed.unaccepted[through].clone();
+         subscribed.accepted = accepted;
+         Ok(())
+     }

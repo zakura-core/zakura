@@ -42,7 +42,7 @@ impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
 }
 
 impl<R: Read> ZcashReader<R> {
-    pub(super) fn from_stream(inner: R) -> Self {
+    pub(crate) fn from_stream(inner: R) -> Self {
         Self {
             inner,
             remaining: None,

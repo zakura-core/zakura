@@ -144,8 +144,7 @@ fn shutdown_witness() -> StorageScenario {
 }
 
 /// A planned stop with a prepare in flight drops that call, logs the
-/// reactor's last events and passes the teardown checks, where an
-/// unannounced stop would fail as `ReactorGone`. Nothing the reactor reports
+/// reactor's last events and passes the teardown checks. Nothing the reactor reports
 /// comes after its final drain. Some plans let the reactor's request
 /// timeout end the prepare first, so only some must drop it.
 #[test]
@@ -316,6 +315,7 @@ fn a_control_step_waits_for_a_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::default(),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario
     };
@@ -334,6 +334,7 @@ fn a_continuation_counts_as_another_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::main(300),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario(
             Vec::new(),

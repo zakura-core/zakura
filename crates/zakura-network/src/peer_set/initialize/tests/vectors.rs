@@ -73,6 +73,224 @@ const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum wall-clock time to wait for peer-cache startup progress.
 const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Measured RTT order survives caching and fresh startup, including failed dial attempts.
+#[tokio::test]
+async fn peer_cache_order_controls_startup_dials_even_after_failure() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_mainnet_peers: [
+            "127.0.0.1:8233".to_owned(),
+            "127.0.0.2:8233".to_owned(),
+            "127.0.0.3:9000".to_owned(),
+        ]
+        .into_iter()
+        .collect(),
+        peerset_initial_target_size: 4,
+        ..test_defaults()
+    };
+    let cached: IndexSet<PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233", "127.0.0.8:9000"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    let address_book = Arc::new(std::sync::Mutex::new(AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &config.network,
+        config.max_connections_per_ip,
+        tracing::Span::none(),
+    )));
+    // Insert in reverse RTT order; neither insertion nor address order matches preference.
+    for (addr, rtt) in [
+        (cached[2], Duration::from_millis(50)),
+        (cached[1], Duration::from_millis(30)),
+        (cached[0], Duration::from_millis(10)),
+    ] {
+        address_book
+            .lock()
+            .unwrap()
+            .update(MetaAddr::new_responded(addr, Some(rtt)))
+            .unwrap();
+    }
+    assert!(update_peer_cache_once(&config, &address_book)
+        .await
+        .unwrap());
+    let cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(cache_file).await.unwrap(),
+        "127.0.0.9:9000\n127.0.0.1:8233\n127.0.0.8:9000",
+    );
+    // Only the file crosses the restart boundary: discard all measured peer state.
+    drop(address_book);
+    let saved_config = toml::to_string(&config).unwrap();
+    drop(config);
+    let config: Config = toml::from_str(&saved_config).unwrap();
+
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    let assert_alternating = |peers: &[PeerSocketAddr]| {
+        assert_eq!(peers.len(), 4);
+        assert_eq!(peers[0], cached[0]);
+        assert_eq!(peers[2], cached[1]);
+        // Seeds remain shuffled, but get alternate turns regardless of listening port.
+        assert_eq!(
+            IndexSet::from([peers[1], peers[3]]),
+            IndexSet::from([
+                "127.0.0.2:8233".parse().unwrap(),
+                "127.0.0.3:9000".parse().unwrap()
+            ]),
+        );
+    };
+    let selected: Vec<_> = selected.into_iter().collect();
+    assert_alternating(&selected);
+    let mut discovered = Vec::new();
+    while let Some(change) = book_rx.recv().await {
+        discovered.push(change.addr());
+    }
+    assert_eq!(
+        discovered.len(),
+        5,
+        "unselected peers remain available to discovery"
+    );
+    assert_eq!(
+        discovered,
+        selected
+            .iter()
+            .copied()
+            .chain([cached[2]])
+            .collect::<Vec<_>>()
+    );
+
+    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connector = service_fn(move |request: OutboundConnectorRequest| {
+        attempt_tx
+            .send((request.addr, tokio::time::Instant::now()))
+            .unwrap();
+        async { Err::<(PeerSocketAddr, peer::Client), BoxError>("peer unavailable".into()) }
+    });
+    let (peerset_tx, _peerset_rx) = mpsc::channel(10);
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    tokio::time::pause();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        add_initial_peers(config, connector, peerset_tx, book_tx),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut attempts = Vec::new();
+    while let Some(attempt) = attempt_rx.recv().await {
+        attempts.push(attempt);
+    }
+    assert_alternating(&attempts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
+    for pair in attempts.windows(2) {
+        assert_eq!(
+            pair[1].1 - pair[0].1,
+            constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+        );
+    }
+}
+
+/// A cached peer cannot deterministically retain the only startup dial slot.
+#[tokio::test]
+async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: PeerSocketAddr = "127.0.0.9:9000".parse().unwrap();
+    let seed: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 1,
+        initial_mainnet_peers: [seed.remove_socket_addr_privacy().to_string()]
+            .into_iter()
+            .collect(),
+        ..test_defaults()
+    };
+    config
+        .update_peer_cache([cached, seed].into_iter().collect())
+        .await
+        .unwrap();
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = tokio::time::timeout(
+        PEER_CACHE_TEST_TIMEOUT,
+        super::super::limit_initial_peers(&config, book_tx),
+    )
+    .await
+    .expect("startup peer selection finishes within the test deadline");
+    assert_eq!(selected, IndexSet::from([seed]));
+    let mut discovered = IndexSet::new();
+    while let Some(change) = book_rx.recv().await {
+        discovered.insert(change.addr());
+    }
+    assert_eq!(discovered, IndexSet::from([seed, cached]));
+}
+
+/// Even an old cache with many ports on one IP cannot consume all startup attempts.
+#[tokio::test]
+async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: Vec<PeerSocketAddr> = [
+        "127.0.0.1:9000",
+        "127.0.0.1:9001",
+        "127.0.0.1:9002",
+        "127.0.0.2:9000",
+        "127.0.0.3:9000",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    for max_connections_per_ip in [1, 2] {
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            peerset_initial_target_size: 3,
+            max_connections_per_ip,
+            // A seed on the same IP must share the cache's per-IP budget.
+            initial_mainnet_peers: ["127.0.0.1:8233".to_owned()].into_iter().collect(),
+            ..test_defaults()
+        };
+        let file = config
+            .cache_dir
+            .peer_cache_file_path(&config.network)
+            .unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            file,
+            cached
+                .iter()
+                .map(|peer| peer.remove_socket_addr_privacy().to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+        let selected = tokio::time::timeout(
+            PEER_CACHE_TEST_TIMEOUT,
+            super::super::limit_initial_peers(&config, book_tx),
+        )
+        .await
+        .expect("startup peer selection finishes within the test deadline");
+        let expected = if max_connections_per_ip == 1 {
+            IndexSet::from([cached[0], cached[3], cached[4]])
+        } else {
+            IndexSet::from([cached[0], "127.0.0.1:8233".parse().unwrap(), cached[3]])
+        };
+        assert_eq!(selected, expected);
+        let mut discovered = IndexSet::new();
+        while let Some(change) = book_rx.recv().await {
+            discovered.insert(change.addr());
+        }
+        assert_eq!(
+            discovered.len(),
+            cached.len() + 1,
+            "all candidates still reach discovery"
+        );
+    }
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

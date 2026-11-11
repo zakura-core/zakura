@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-fault-acquire-timeout.bin`, a fuzz-12 item 7 witness whose run
+# shows Failed(Acquire, "timeout"). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "f1161812d202907bbd994c9a45d2754972741d22766fd810c8a6e50144b757ef"
+scenario_sha256 = "619d196c208cdebbb6fe411cffc8510e08f85843c086b2c235945f4478300086"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "16.0.0"
+version = "17.0.0"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -25,13 +25,13 @@ default = []
 progress-bar = ["howudoin", "zakura-state/progress-bar"]
 howudoin = []
 
-# Sprout Groth16 JoinSplit proof verification.
+# Sprout JoinSplit verification: the Groth16 proofs and the Ed25519 joinSplitSig.
 #
 # ZIP 218 disallows Sprout JoinSplits from NU7 onward, so blocks after NU7 never
 # need it. Builds without this feature reject every JoinSplit as a retryable
 # local verifier failure (never as consensus-invalid), so they stall instead of
 # forking on a pre-NU7 block that is above the last checkpoint and has JoinSplits.
-sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd"]
+sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd", "dep:ed25519-zebra", "dep:rand_core"]
 
 # Test-only features
 internal-bench = []
@@ -41,10 +41,11 @@ proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "z
 blake2b_simd = { workspace = true, optional = true }
 bellman = { workspace = true, optional = true }
 bls12_381 = { workspace = true, optional = true }
+ed25519-zebra = { workspace = true, optional = true }
 halo2 = { workspace = true }
 rand_10 = { workspace = true }
-# ed25519-zebra takes `rand_core` 0.6 RNGs.
-rand_core = { workspace = true, features = ["getrandom"] }
+# The Sprout Ed25519 batch verifier passes `rand_core` 0.6 RNGs to ed25519-zebra.
+rand_core = { workspace = true, features = ["getrandom"], optional = true }
 rayon = { workspace = true }
 
 chrono = { workspace = true }
@@ -69,9 +70,9 @@ zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
 zakura-script = { path = "../zakura-script", version = "5.0.5" }
-zakura-state = { path = "../zakura-state", version = "15.0.0" }
+zakura-state = { path = "../zakura-state", version = "16.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.1.0" }
-zakura-chain = { path = "../zakura-chain", version = "13.0.1" }
+zakura-chain = { path = "../zakura-chain", version = "14.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 
 zcash_protocol.workspace = true
@@ -83,7 +84,10 @@ proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
 eyre = { workspace = true }
+# Only tests built with `sprout` use these: they sign JoinSplit data and
+# exercise the Sprout Ed25519 batch verifier.
 ed25519-zebra = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
 
 hex = { workspace = true }
 proptest = { workspace = true }
@@ -92,8 +96,8 @@ toml = { workspace = true, features = ["display"] }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
-zakura-state = { path = "../zakura-state", version = "15.0.0", features = ["proptest-impl"] }
-zakura-chain = { path = "../zakura-chain", version = "13.0.1", features = ["proptest-impl"] }
+zakura-state = { path = "../zakura-state", version = "16.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "14.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 
 criterion = { workspace = true }

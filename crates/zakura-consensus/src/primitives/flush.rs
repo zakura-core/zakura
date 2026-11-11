@@ -17,7 +17,9 @@ use std::{
 
 use crate::BoxError;
 
-use super::{ed25519, halo2, sapling};
+#[cfg(feature = "sprout")]
+use super::ed25519;
+use super::{halo2, sapling};
 
 #[cfg(test)]
 mod tests;
@@ -39,6 +41,7 @@ tokio::task_local! {
 /// Sapling and Halo2 verify their bundles' signatures with their proofs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Verifier {
+    #[cfg(feature = "sprout")]
     Ed25519,
     Sapling,
     Halo2PreNu6_2,
@@ -48,7 +51,8 @@ pub(crate) enum Verifier {
 
 impl Verifier {
     /// Every verifier, in the order flushes are queued.
-    const ALL: [Self; 5] = [
+    const ALL: &[Self] = &[
+        #[cfg(feature = "sprout")]
         Self::Ed25519,
         Self::Sapling,
         Self::Halo2PreNu6_2,
@@ -65,6 +69,7 @@ impl Verifier {
     /// queue is full and so already flushing on size.
     fn try_flush(self) -> Result<bool, BoxError> {
         match self {
+            #[cfg(feature = "sprout")]
             Self::Ed25519 => ed25519::VERIFIER.primary().clone().try_flush(),
             Self::Sapling => sapling::try_flush(&sapling::VERIFIER),
             Self::Halo2PreNu6_2 => halo2::try_flush(&halo2::VERIFIER_PRE_NU6_2),
@@ -195,7 +200,7 @@ impl Drop for Queueing {
         };
 
         // The progress lock is released first: queueing a flush can wait on a batch service lock.
-        for verifier in Verifier::ALL {
+        for &verifier in Verifier::ALL {
             if queued & verifier.bit() == 0 {
                 continue;
             }

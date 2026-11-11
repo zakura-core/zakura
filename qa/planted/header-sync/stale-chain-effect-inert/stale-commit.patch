@@ -1,0 +1,29 @@
+diff --git a/crates/zakura-header-chain/src/transition/planner/admission.rs b/crates/zakura-header-chain/src/transition/planner/admission.rs
+index 9b3ee64f87..be7da40091 100644
+--- a/crates/zakura-header-chain/src/transition/planner/admission.rs
++++ b/crates/zakura-header-chain/src/transition/planner/admission.rs
+@@ -281,9 +281,21 @@ pub(super) fn rebase_header_insertion(
+         return Ok(HeaderInsertionRebase::Current);
+     }
+     if original.branch.anchor_hash == current.frontiers.finalized.hash {
+-        return Err(TransitionFailure::Stale {
+-            current: current.state_version,
+-        });
++        let authority = crate::HeaderWorkAuthority {
++            header_generation: current.header_generation,
++            branch: original.branch,
++        };
++        insert.owner = insert
++            .owner
++            .rebase_header(authority)
++            .ok_or(TransitionFailure::Authority)?;
++        for delivery in &mut insert.aux {
++            delivery.owner = delivery
++                .owner
++                .rebase_header(authority)
++                .ok_or(TransitionFailure::Authority)?;
++        }
++        return Ok(HeaderInsertionRebase::Current);
+     }
+     if original.header_generation.get() >= current.header_generation.get() {
+         return Err(TransitionFailure::Stale {

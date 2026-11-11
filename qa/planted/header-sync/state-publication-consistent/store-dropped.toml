@@ -1,0 +1,11 @@
+# Every adoption after the first leaves the reactor with no stored copy,
+# while its adoption, `Status` and tip publication carry the new snapshot.
+# On the sync witness the node's apply of the mirror's headers is adopted
+# and nothing is stored. The reactor's adoption decides what it stores, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-sync.plan"

@@ -18,12 +18,15 @@ use support::{
 use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     domain::{
+        header_sync::OUTSTANDING_WORK_BOUNDED,
         header_sync_progress::HONEST_PROGRESS,
         session::{honest_never_punished, HonestPeers, HONEST_NEVER_PUNISHED},
     },
     harness::{
         header_node::{Chain, Policy},
-        header_sync::{HeaderWire, WireScenario, FAMILY, HEADER_FAULT_PENALIZED},
+        header_sync::{
+            storage_properties, HeaderWire, WireScenario, FAMILY, HEADER_FAULT_PENALIZED,
+        },
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},
         HarnessError, LinkSpec, NetScenario, Subsystem,
@@ -38,7 +41,7 @@ use zakura_sim::{
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source},
     table::{sender_properties, table_properties, GeneratedId, Template},
     witness::{judge_report, Expect},
-    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, Violation,
 };
 
 /// Header sync's stream at the version it tables.
@@ -236,7 +239,9 @@ fn generated() -> Vec<String> {
 
 /// The harness registers header sync's generated receiver and sender IDs,
 /// then `session/honest-never-punished` and `header-sync/honest-progress`,
-/// after the storage properties and `header-sync/header-fault-penalized`.
+/// after the storage properties, less `header-sync/outstanding-work-bounded`,
+/// whose tap only the storage harness watches, and
+/// `header-sync/header-fault-penalized`.
 /// No downstream template is registered, since the adapter observes none
 /// of their effects.
 #[test]
@@ -256,8 +261,19 @@ fn the_harness_registers_the_generated_header_ids() {
         .collect();
     expected.push(HONEST_NEVER_PUNISHED.to_owned());
     expected.push(HONEST_PROGRESS.to_owned());
-    assert_eq!(registered[5], HEADER_FAULT_PENALIZED);
-    assert_eq!(registered[6..], expected[..]);
+    // The storage harness's properties but one come first, then the fault
+    // property, then the generated ones.
+    let storage: Vec<String> = storage_properties::<HeaderWire>()
+        .into_iter()
+        .map(|property| property.id.to_string())
+        .filter(|id| id != OUTSTANDING_WORK_BOUNDED)
+        .collect();
+    let fault = registered
+        .iter()
+        .position(|id| id == HEADER_FAULT_PENALIZED)
+        .expect("the wire harness registers the fault property");
+    assert_eq!(registered[..fault], storage[..], "{registered:?}");
+    assert_eq!(registered[fault + 1..], expected[..]);
 }
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`,
@@ -763,6 +779,58 @@ fn closed(cause: &str) -> Observation {
         connection: 1,
         cause: cause.to_owned(),
     }
+}
+
+/// Two punishments of an honest peer at one step, a fault close of its
+/// connection 1 and a `Misbehavior` against its connection 2, are two
+/// violations, and the report keeps both.
+#[test]
+fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
+    let second = Observation::Transport {
+        instance: 0,
+        seq: 2,
+        node: "node".to_owned(),
+        connection: Some(2),
+        remote: peer_addr(0, 1).to_string(),
+        event: TransportFact::Registered,
+    };
+    let report = run_marked(
+        true,
+        false,
+        vec![
+            vec![registered(), second],
+            vec![
+                closed("ordered_read_rejected"),
+                Observation::Misbehavior { connection: 2 },
+            ],
+        ],
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let honest = report
+        .properties
+        .iter()
+        .find(|property| property.property == HONEST_NEVER_PUNISHED)
+        .expect("registered");
+    let found = |expected: &str, actual: &str| Violation {
+        property: "session/honest-never-punished".to_owned(),
+        step: 2,
+        witness: vec![2],
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    };
+    assert_eq!(
+        honest.violations,
+        [
+            found(
+                "honest peer-0's connection 1 is never punished",
+                "a close with cause ordered_read_rejected"
+            ),
+            found(
+                "honest peer-0's connection 2 is never punished",
+                "a Misbehavior"
+            ),
+        ]
+    );
 }
 
 /// Scripted punishments of an honest peer violate

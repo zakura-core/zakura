@@ -561,6 +561,26 @@ fn config_preserves_file_scalar_conversions_and_bom() {
     assert_eq!(config.rpc.cookie_file_name, "123");
 }
 
+/// A v1.8.5 generated config sets `advert_delay_max`. Overriding the delay through the
+/// environment's new name must apply instead of failing as a duplicate field.
+#[test]
+fn config_env_advert_delay_overrides_previous_file_name() {
+    let env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[network]\nadvert_delay_min = \"0s\"\nadvert_delay_max = \"0s\"\n",
+    )
+    .expect("write config");
+    env.set_var("ZAKURA_NETWORK__ADVERT_DELAY", "250ms");
+    let config = ZakuradConfig::load(Some(path)).expect("load merged config");
+    assert_eq!(
+        config.network.advert_delay,
+        std::time::Duration::from_millis(250)
+    );
+}
+
 #[test]
 fn config_env_preserves_file_siblings() {
     let env = EnvGuard::new();

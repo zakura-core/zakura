@@ -13,9 +13,9 @@ use rand_core::OsRng;
 
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
+use ed25519_zebra::*;
 use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};
-use zakura_chain::primitives::ed25519::*;
 
 use crate::BoxError;
 

@@ -1,7 +1,6 @@
 //! Fixed test vectors for zakura-network configuration.
 
 use std::{
-    collections::HashSet,
     fs,
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -29,6 +28,304 @@ use crate::{
     },
     CacheDir, Config, P2pStack, UnconditionalPeers,
 };
+
+/// Cache line order survives parsing, deduplication, and fallback peer discovery.
+#[tokio::test]
+async fn peer_cache_preserves_order_and_alternates_with_seeds() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_mainnet_peers: ["127.0.0.1:8233".to_owned(), "127.0.0.2:8233".to_owned()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    let ordered: indexmap::IndexSet<crate::PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.1:8233"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    config.update_peer_cache(ordered.clone()).await.unwrap();
+    let file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "127.0.0.9:9000\n127.0.0.1:8233"
+    );
+    fs::write(
+        &file,
+        "127.0.0.9:9000\ninvalid\n127.0.0.1:8233\n127.0.0.9:9000\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config
+            .load_peer_cache()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ordered.iter().copied().collect::<Vec<_>>()
+    );
+    let expected: Vec<crate::PeerSocketAddr> =
+        ["127.0.0.9:9000", "127.0.0.2:8233", "127.0.0.1:8233"]
+            .into_iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        expected
+    );
+    fs::remove_file(file).unwrap();
+    assert_eq!(config.initial_peers().await.len(), 2);
+    config.cache_dir = CacheDir::disabled();
+    assert_eq!(config.initial_peers().await.len(), 2);
+    assert!(config.load_peer_cache().await.unwrap().is_empty());
+}
+
+/// A one-slot startup uses a fresh seed when available and cached peers as fallback.
+#[tokio::test]
+async fn single_startup_slot_prefers_seed_over_cached_peer() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: crate::PeerSocketAddr = "127.0.0.9:9000".parse().unwrap();
+    let seed: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let mut config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        peerset_initial_target_size: 1,
+        initial_mainnet_peers: [seed.remove_socket_addr_privacy().to_string()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![seed, cached]
+    );
+
+    // Seeds retain their source priority even behind a faster peer in the cache.
+    config
+        .update_peer_cache([cached, seed].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![seed, cached]
+    );
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+
+    // A seed already in the cache is deduplicated and the cache remains usable.
+    config.initial_mainnet_peers = [cached.remove_socket_addr_privacy().to_string()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![cached]
+    );
+    config.initial_mainnet_peers.clear();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![cached]
+    );
+    config.initial_mainnet_peers = [seed.remove_socket_addr_privacy().to_string()]
+        .into_iter()
+        .collect();
+    config.cache_dir = CacheDir::disabled();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![seed]
+    );
+}
+
+/// Cached peers retain their turns, and seed membership does not depend on the port.
+#[tokio::test]
+async fn peer_cache_alternates_with_seeds_on_any_network_port() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        let seed_addresses = ["127.0.0.2:8233", "127.0.0.3:18233", "127.0.0.4:9000"];
+        let seeds = seed_addresses
+            .iter()
+            .map(|addr| (*addr).to_owned())
+            .collect();
+        let mut config = Config {
+            network,
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            ..Config::default()
+        };
+        if config.network == Network::Mainnet {
+            config.initial_mainnet_peers = seeds;
+        } else {
+            config.initial_testnet_peers = seeds;
+        }
+        let cached = "127.0.0.9:9000";
+        config
+            .update_peer_cache([cached.parse().unwrap()].into_iter().collect())
+            .await
+            .unwrap();
+        let actual: Vec<_> = config.initial_peers().await.into_iter().collect();
+        assert_eq!(actual[0], cached.parse().unwrap());
+        let expected: std::collections::HashSet<crate::PeerSocketAddr> = seed_addresses
+            .into_iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect();
+        assert_eq!(
+            actual[1..]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        assert_eq!(actual.len(), 4);
+    }
+}
+
+/// Invalid addresses do not consume turns, and either source can exhaust first.
+#[tokio::test]
+async fn peer_cache_alternation_handles_exhaustion_and_invalid_addresses() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: Vec<crate::PeerSocketAddr> = ["127.0.0.9:9000", "127.0.0.8:9000"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    for seed_count in 0..=4 {
+        let seeds: indexmap::IndexSet<String> = (1..=seed_count)
+            .map(|ip| format!("127.0.0.{ip}:8233"))
+            .collect();
+        let config = Config {
+            initial_mainnet_peers: seeds.clone(),
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            ..Config::default()
+        };
+        config
+            .update_peer_cache(
+                ["0.0.0.0:8233".parse().unwrap()]
+                    .into_iter()
+                    .chain(cached.iter().copied())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let actual: Vec<_> = config.initial_peers().await.into_iter().collect();
+        assert_eq!(actual.len(), cached.len() + seeds.len());
+        assert_eq!(actual[0], cached[0]);
+        assert_eq!(actual[if seed_count == 0 { 1 } else { 2 }], cached[1]);
+        let actual_seeds: std::collections::HashSet<_> = actual
+            .into_iter()
+            .filter(|addr| !cached.contains(addr))
+            .collect();
+        let expected_seeds = seeds.iter().map(|addr| addr.parse().unwrap()).collect();
+        assert_eq!(actual_seeds, expected_seeds);
+    }
+}
+
+/// Truncation retains the first addresses, rather than an arbitrary set subset.
+#[tokio::test]
+async fn peer_cache_truncates_in_preference_order() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    let peers: indexmap::IndexSet<crate::PeerSocketAddr> = (10000..10310)
+        .rev()
+        .map(|ip| SocketAddr::from((std::net::Ipv4Addr::from(0x7f00_0000_u32 + ip), 9000)).into())
+        .collect();
+    config.update_peer_cache(peers.clone()).await.unwrap();
+    let saved = config.load_peer_cache().await.unwrap();
+    assert_eq!(
+        saved.into_iter().collect::<Vec<_>>(),
+        peers
+            .into_iter()
+            .take(crate::constants::MAX_PEER_DISK_CACHE_SIZE)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Many ports on one IP cannot crowd independent peers out of the saved cache.
+#[tokio::test]
+async fn peer_cache_limits_ports_per_ip_before_truncation() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    for max_connections_per_ip in [1, 2] {
+        let config = Config {
+            cache_dir: CacheDir::custom_path(cache_dir.path()),
+            max_connections_per_ip,
+            ..Config::default()
+        };
+        let peers: indexmap::IndexSet<crate::PeerSocketAddr> = (10000..10310)
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .chain(["127.0.0.2:9000".parse().unwrap()])
+            .collect();
+        config.update_peer_cache(peers.clone()).await.unwrap();
+        let saved: Vec<_> = config
+            .load_peer_cache()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let expected: Vec<_> = peers
+            .iter()
+            .take(max_connections_per_ip)
+            .copied()
+            .chain(["127.0.0.2:9000".parse().unwrap()])
+            .collect();
+        assert_eq!(saved, expected);
+    }
+}
+
+/// Regtest never imports cache entries or non-local seed addresses.
+#[tokio::test]
+async fn peer_cache_is_ignored_on_regtest() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        network: Network::new_regtest(Default::default()),
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        initial_testnet_peers: ["127.0.0.1:18244".to_owned(), "192.0.2.1:18244".to_owned()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    config
+        .update_peer_cache(["127.0.0.9:18244".parse().unwrap()].into_iter().collect())
+        .await
+        .unwrap();
+    assert_eq!(
+        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        vec!["127.0.0.1:18244".parse().unwrap()]
+    );
+}
 
 use super::super::load_or_generate_zakura_secret_key;
 
@@ -124,7 +421,7 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
     fs::write(&peer_cache_file, cached_peers).expect("pre-seeded peer cache should be writable");
 
     config
-        .update_peer_cache(HashSet::new())
+        .update_peer_cache(indexmap::IndexSet::new())
         .await
         .expect("an empty peer cache update should succeed");
 
@@ -937,26 +1234,29 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         Ok(256)
     );
 
-    // The transport holds the admitted connections and the headroom, half of
-    // it kept for dials (zakura-quic ADM-12), and two closing connections per
-    // live slot (ADM-13).
+    // The transport holds the admitted connections and the headroom, keeps
+    // one discovery record's 8 addresses for dials, lets inbound hold its
+    // connection and handshake shares (zakura-quic ADM-12), and keeps two
+    // closing connections per live slot (ADM-13).
     let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (288, 16, 576)
+        (288, 8, Some(216), 576)
     );
     let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
     assert_eq!(
         (
             bind.max_connections,
             bind.dial_reserve,
+            bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (124, 16, 248)
+        (124, 8, Some(93), 248)
     );
 
     // With a 1 GiB receive window, the handshake headroom alone exceeds the
@@ -1915,24 +2215,36 @@ fn previous_advert_window_names_still_load() {
 }
 
 #[test]
-fn advert_delays_roundtrip_and_validate() {
+fn advert_delay_roundtrips_and_validates() {
     let _init_guard = zakura_test::init();
-    let config: Config =
-        toml::from_str("advert_delay_min = '25ms'\nadvert_delay_max = '500ms'").unwrap();
-    assert_eq!(config.advert_delay_min, Duration::from_millis(25));
-    assert_eq!(config.advert_delay_max, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay = '250ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(250));
     let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
     assert_eq!(config, roundtrip);
     let default: Config = toml::from_str("").unwrap();
-    assert_eq!(default.advert_delay_min, Duration::ZERO);
-    assert_eq!(default.advert_delay_max, Duration::ZERO);
-    for text in [
-        "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
-        "advert_delay_min = '-1s'",
-        "advert_delay_max = '-1s'",
-    ] {
-        assert!(toml::from_str::<Config>(text).is_err(), "{text}");
-    }
+    assert_eq!(default.advert_delay, Duration::from_millis(500));
+    assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
+}
+
+/// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
+/// the maximum becomes the delay, and the minimum is ignored.
+#[test]
+fn previous_advert_delay_names_load() {
+    let _init_guard = zakura_test::init();
+    let config: Config =
+        toml::from_str("advert_delay_min = '0s'\nadvert_delay_max = '500ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let config: Config = toml::from_str("advert_delay_max = '0s'\nadvert_delay = '250ms'").unwrap();
+    assert_eq!(
+        config.advert_delay,
+        Duration::from_millis(250),
+        "the new name wins over the previous name"
+    );
+    let config: Config = toml::from_str("advert_delay_min = '25ms'").unwrap();
+    assert_eq!(config.advert_delay, Duration::from_millis(500));
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("advert_delay = "), "{serialized}");
+    assert!(!serialized.contains("advert_delay_m"), "{serialized}");
 }
 
 #[test]

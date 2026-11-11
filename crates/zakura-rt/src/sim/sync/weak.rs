@@ -38,6 +38,12 @@ impl<T: ?Sized> Weak<T> {
         self.0.strong_count()
     }
 
+    /// Strong owners left, read with no preemption point, for an
+    /// observer's report that mustn't add a scheduling point to its run.
+    pub fn peek_strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
     /// Weak pointers left, or 0 once no strong owner is.
     #[track_caller]
     pub fn weak_count(&self) -> usize {

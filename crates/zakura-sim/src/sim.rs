@@ -343,12 +343,9 @@ impl Sim {
             _ => (end, properties),
         };
         let cleanup = self.shut_down();
-        sink.record(Record::End(end_record(
-            &end,
-            &properties,
-            cleanup,
-            &state.picks,
-        )));
+        let record = end_record(&end, &properties, cleanup, &state.picks);
+        crate::trace::end_records::write_end(&record);
+        sink.record(Record::End(record));
         RunReport {
             end,
             properties,
@@ -428,7 +425,11 @@ impl Sim {
             }
             let now = self.sched().now();
             let offers: Vec<Offer> = match phase {
-                Phase::Live => self.sources.iter().map(|s| offer(&**s, now)).collect(),
+                Phase::Live => self
+                    .sources
+                    .iter()
+                    .map(|s| offer(&**s, now, ready.is_empty()))
+                    .collect(),
                 Phase::Drain => Vec::new(),
             };
             // A source that drew while offering, here or in the idle check
@@ -527,6 +528,11 @@ impl Sim {
                 Action::RunTask(_) => executed,
                 _ => executed.and_then(|()| self.observe_sources(st)),
             };
+            if let Action::Source { source, .. } = chosen.action {
+                if self.sources[source.0].recovering() {
+                    self.choices.borrow_mut().decider.recover();
+                }
+            }
 
             let next = self.ready(st);
             if record_steps {
@@ -619,7 +625,11 @@ impl Sim {
     /// instant took.
     fn nothing_enabled(&self, ready: &[(Identity, TaskId)]) -> bool {
         let now = self.sched().now();
-        let offers: Vec<Offer> = self.sources.iter().map(|s| offer(&**s, now)).collect();
+        let offers: Vec<Offer> = self
+            .sources
+            .iter()
+            .map(|s| offer(&**s, now, ready.is_empty()))
+            .collect();
         enabled_set(&EnabledInputs {
             phase: Phase::Live,
             now,
@@ -882,10 +892,14 @@ fn after_harness_failure(reports: Vec<PropertyReport>) -> Vec<PropertyReport> {
         .collect()
 }
 
-/// What `source` offers at `now`.
-fn offer(source: &dyn ActionSource, now: SimInstant) -> Offer {
+/// What `source` offers at `now`, with its quiet actions when `quiet`,
+/// which the run sets when no task is ready.
+fn offer(source: &dyn ActionSource, now: SimInstant, quiet: bool) -> Offer {
     let mut offer = Offer::default();
     source.enabled(now, &mut offer.actions);
+    if quiet {
+        source.quiet(now, &mut offer.actions);
+    }
     source.boundaries(now, &mut offer.boundaries);
     offer
 }

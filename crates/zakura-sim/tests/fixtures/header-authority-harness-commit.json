@@ -1,0 +1,31 @@
+{
+  "node": {
+    "main": 4,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 4,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  },
+  "controls": [
+    {
+      "peer": "node",
+      "action": {
+        "commit": {
+          "len": 2
+        }
+      },
+      "when": null
+    }
+  ]
+}

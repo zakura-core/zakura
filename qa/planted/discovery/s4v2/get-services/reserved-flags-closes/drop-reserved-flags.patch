@@ -1,0 +1,34 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index c488b85bd5..c9ff0782f3 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -729,6 +729,11 @@ async fn read_frame(
+     frame: Frame,
+     sink: &DiscoverySink,
+ ) -> Result<(), (ViolationStage, SinkReject)> {
++    // Planted bypass: discovery drops a `get-services` frame with a flag bit set
++    // instead of closing.
++    if frame.message_type == super::wire::GET_SERVICES.message_type && frame.flags != 0 {
++        return Ok(());
++    }
+     // An answer claims its query before its payload is decoded.
+     let answer = sink
+         .queries
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..f6eddb0d77 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -178,7 +178,12 @@ impl<'a> FrameFilter<'a> {
+             .filter(|rule| self.reader.admits(rule.role))
+             .ok_or(FrameRejection::UnknownMessageType)?;
+         // No native message defines a flag bit.
+-        if flags != 0 {
++        // Planted bypass: discovery's reader skips the check on its `get-services`
++        // row.
++        if flags != 0
++            && !(rules == crate::zakura::discovery::wire::RULES
++                && *rule == crate::zakura::discovery::wire::GET_SERVICES)
++        {
+             return Err(FrameRejection::ReservedFlags);
+         }
+         if payload_len < rule.payload.min() {

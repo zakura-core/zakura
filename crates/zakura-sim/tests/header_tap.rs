@@ -707,10 +707,11 @@ fn an_emission_outside_the_run_fails_it() {
     );
 }
 
-/// A reactor that drops its observer while the run is live fails it with
-/// `ReactorGone`, at the step it does.
+/// A reactor that drops its observer while the run is live, without
+/// unwinding, ended by itself: the run goes on with no harness failure, and
+/// the tap records the exit at the drain of the step it happened.
 #[test]
-fn a_dropped_observer_fails_reactor_gone() {
+fn a_dropped_observer_is_recorded_as_an_exit() {
     let whole = plain_run();
     let gone = whole
         .log
@@ -721,16 +722,20 @@ fn a_dropped_observer_fails_reactor_gone() {
         })
         .expect("the emitting task exits")
         .step;
+    let mut ends = None;
     let report = tap_run(
         Twist {
             drop_observer: true,
             ..Twist::default()
         },
-        |tap| Box::new(tap),
+        |tap| {
+            ends = Some(tap.ends());
+            Box::new(tap)
+        },
     );
-    let (_, detail) = evidence_failure(&report);
-    assert_eq!(report.end.steps, gone);
-    assert!(detail.starts_with("ReactorGone"), "{detail}");
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let ends = ends.expect("the tap was added");
+    assert_eq!(ends.reactor_exited(), Some(gone), "{:?}", ends.facts());
 }
 
 /// An event recorded after the node's port is gone fails the run with

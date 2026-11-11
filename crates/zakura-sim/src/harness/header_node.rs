@@ -11,20 +11,32 @@
 //! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts,
 //! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 //! A `Shutdown` step stops the node under test on purpose, which its tap
-//! expects. The tap and the topology's links keep the node's
+//! expects. Each harness action that ends a link or the node is recorded in
+//! the tap's [`ends::EndEvidence`] where it happens. The tap and the topology's links keep the node's
 //! [`session`] view, and the tap keeps its header capacity accounting in a
 //! [`reservation::ReservationEvidence`], and its resource probe's reads in a
 //! [`capacity::CapacityEvidence`].
 
 pub mod adoption;
+pub mod authority;
 pub mod capacity;
+pub mod chain_effect;
 pub mod claim;
+pub mod ends;
 pub mod fault;
+pub mod fork_choice;
+pub mod hold_wake;
+pub mod outstanding;
 mod pair;
 pub mod policy;
+pub mod publication;
+pub mod recovery;
 pub mod reservation;
+pub mod retirement;
+pub mod round_life;
 pub mod session;
 pub mod stale;
+pub mod stamp;
 pub mod tap;
 pub mod wake;
 
@@ -41,7 +53,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
-use zakura_header_chain::{Frontier, VctRootRepairStatus};
+use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
 use zakura_network::zakura::{
     framed_channel,
     observe::HeaderSyncObserver,
@@ -53,7 +65,7 @@ use zakura_network::zakura::{
     ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
-use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
+use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port, PrepareHeaderTarget};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
@@ -66,11 +78,17 @@ use zakura_storage::header::{
 
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
+    ends::EnvironmentAction,
+    hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
+    recovery::{
+        Driver, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED, RELINK, UNREACHED,
+    },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
+    observe::StorageFact,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -127,6 +145,11 @@ impl Chain {
         segments
     }
 
+    /// The fixture branches its headers are on: 0, and its fork's.
+    pub fn branches(&self) -> impl Iterator<Item = u8> {
+        std::iter::once(0).chain(self.fork.map(|fork| fork.branch))
+    }
+
     /// The chain's tip.
     pub fn tip(&self, fixture: &HeaderFixture) -> Frontier {
         self.segments(fixture)
@@ -156,9 +179,30 @@ fn ready<F: Future>(future: F) -> F::Output {
 /// controlled port pristine, and fixture headers validate the same against
 /// any clock only outside a run.
 pub fn preload(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| request);
+}
+
+/// [`preload`], with every header carrying the fixture's tree record
+/// ([`HeaderFixture::with_tree_aux`]), as a node that holds the chain's
+/// tree roots does. Its publisher serves them to a repair.
+pub fn preload_with_tree_aux(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| {
+        fixture.with_tree_aux(request)
+    });
+}
+
+/// Commits `chain` to `port`, one segment at a time, each segment's
+/// request passed through `request` first.
+fn preload_requests(
+    port: &EnginePort,
+    fixture: &HeaderFixture,
+    chain: &Chain,
+    request: impl Fn(PrepareHeaderTarget) -> PrepareHeaderTarget,
+) {
     for (request_id, (parent, headers)) in (1..).zip(chain.segments(fixture)) {
-        let request = fixture.target_request(&port.snapshot(), parent, &headers, request_id);
-        let prepared = ready(port.prepare_header_target(request)).expect("fixture headers prepare");
+        let target =
+            request(fixture.target_request(&port.snapshot(), parent, &headers, request_id));
+        let prepared = ready(port.prepare_header_target(target)).expect("fixture headers prepare");
         ready(port.apply_header_target(prepared)).expect("fixture headers apply");
     }
 }
@@ -263,6 +307,9 @@ pub struct Effects {
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
+    /// Finds which held operations' replies reached the reactor, once
+    /// [`PolicySource::with_hold_wakes`] turns it on.
+    hold_wake: Option<HoldWakeCheck>,
     port: Arc<ControlledPort>,
     base: Base,
     bound: Option<Duration>,
@@ -278,6 +325,8 @@ pub struct PolicySource {
     reset: usize,
     /// How many releases are recorded.
     released: usize,
+    /// The run's recovery, which retires every hold once it starts.
+    recovery: RecoveryEvidence,
 }
 
 impl PolicySource {
@@ -287,6 +336,7 @@ impl PolicySource {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             tap: None,
+            hold_wake: None,
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
@@ -299,7 +349,17 @@ impl PolicySource {
             grown: 0,
             reset: 0,
             released: 0,
+            recovery: RecoveryEvidence::default(),
         }
+    }
+
+    /// This source, retiring every hold once `recovery` starts: from then
+    /// on each operation is offered only `engine`, or `rejected` where
+    /// that's the only legal outcome, each held reply is delivered, and each
+    /// must be done within [`recovery::RECOVERY_BOUND`] of the later of its
+    /// submission, or its commit, and the `Recover` pick.
+    pub fn with_recovery(self, recovery: RecoveryEvidence) -> Self {
+        PolicySource { recovery, ..self }
     }
 
     /// This source, draining `tap` at each observation, after storage, so
@@ -308,6 +368,26 @@ impl PolicySource {
     pub fn with_tap(self, tap: ReactorTap) -> Self {
         PolicySource {
             tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This source, keeping `header-sync/hold-release-wakes`'s facts in
+    /// `evidence` ([`hold_wake`]), stamped with its tap's stamps. Call it
+    /// after [`PolicySource::with_tap`].
+    ///
+    /// # Panics
+    ///
+    /// If the source has no tap, which logs the reactor facts the check
+    /// reads.
+    pub fn with_hold_wakes(self, evidence: HoldWakeEvidence) -> Self {
+        let tap = self
+            .tap
+            .as_ref()
+            .expect("the hold-wake check reads the reactor facts the tap logs");
+        evidence.stamp_with(tap.stamps());
+        PolicySource {
+            hold_wake: Some(HoldWakeCheck::new(evidence)),
             ..self
         }
     }
@@ -328,24 +408,36 @@ impl ActionSource for PolicySource {
         let pending = self.port.pending();
         let committed = self.port.committed();
         let predicates = self.predicates.borrow();
+        let recovering = self.recovery.started().is_some();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
             match crate::storage::decode(*local) {
-                StorageAction::Complete(id, outcome) => pending
-                    .iter()
-                    .find(|op| op.id == id)
-                    .is_some_and(|op| predicates.offers(self.base, op, outcome)),
+                StorageAction::Complete(id, outcome) => {
+                    pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                        if recovering {
+                            Base::SuccessOnly.offers(&op.enabled, outcome)
+                        } else {
+                            predicates.offers(self.base, op, outcome)
+                        }
+                    })
+                }
                 StorageAction::Deliver(id) => committed
                     .iter()
                     .find(|op| op.id == id)
-                    .is_some_and(|op| predicates.delivers(op)),
+                    .is_some_and(|op| recovering || predicates.delivers(op)),
             }
         }));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         self.storage.boundaries(now, out);
+        if let Some(started) = self.recovery.started() {
+            let by = |own: Duration| Boundary::Deadline(recovery::deadline(now, started, own));
+            out.extend(self.port.pending().iter().map(|op| by(op.since_submit)));
+            out.extend(self.port.committed().iter().map(|op| by(op.since_commit)));
+            return;
+        }
         let predicates = self.predicates.borrow();
         for op in self.port.pending() {
             predicates.boundaries(self.bound, &op, now, out);
@@ -358,7 +450,8 @@ impl ActionSource for PolicySource {
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
         match crate::storage::decode(local) {
             StorageAction::Complete(id, Outcome::Engine)
-                if self.predicates.borrow().holds_reply(id) =>
+                if self.recovery.started().is_none()
+                    && self.predicates.borrow().holds_reply(id) =>
             {
                 self.port
                     .commit(id)
@@ -372,39 +465,83 @@ impl ActionSource for PolicySource {
         let before = log.entries().len();
         let stored = self.storage.observe(log);
         let mut tapped_effects = Vec::new();
+        let mut queued = Vec::new();
         // Drained even when storage failed, so a port panic the tap holds
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
             Some(tap) => {
                 // The storage source appends only its own port's facts, but
                 // a run may hold other services' storage too.
-                tap.storage_facts(log.entries()[before..].iter().filter_map(
-                    |entry| match &entry.obs {
-                        Observation::Storage {
-                            service, seq, fact, ..
-                        } if service == HEADER_SERVICE => Some((*seq, fact)),
-                        _ => None,
-                    },
-                ));
+                let runs = self.storage.take_runs();
+                tap.page_reads(&self.storage.take_page_reads());
+                tap.storage_facts(
+                    log.entries()[before..]
+                        .iter()
+                        .filter_map(|entry| match &entry.obs {
+                            Observation::Storage {
+                                service, seq, fact, ..
+                            } if service == HEADER_SERVICE => Some((*seq, fact)),
+                            _ => None,
+                        }),
+                    &runs,
+                );
+                let publications = self.storage.take_publications();
+                tap.engine_runs(&runs, &publications);
                 tapped_effects = tap.take_effects();
+                queued = tap.take_queued();
                 tap.observe(log)
             }
             None => Ok(()),
         };
+        // A claim break the tap found at this step reports before the
+        // storage source's failure.
+        let stored = match (stored, &self.tap) {
+            (Err(error), Some(tap)) => tap.fail_after_claims(log.step(), error),
+            (stored, _) => stored,
+        };
         stored?;
         tapped?;
         let mut predicates = self.predicates.borrow_mut();
+        // The node under test's name, which `Topology::new` lists first.
+        let node = self
+            .effects
+            .names
+            .borrow()
+            .first()
+            .map(|(_, name)| name.clone());
+        let names = self.effects.names.borrow();
+        let name = |storage: &str| {
+            names
+                .iter()
+                .find(|(id, _)| tap::peer(id) == storage)
+                .map(|(_, name)| name.clone())
+        };
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
                 Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
-                    predicates.record(fact)
+                    predicates.record(fact);
+                    if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
+                        predicates.record_link(LinkEffect::StorageStopped, node);
+                    }
+                    if let Some(check) = &mut self.hold_wake {
+                        check.storage(fact, &predicates, name);
+                    }
                 }
-                Observation::Reactor { event, .. } => predicates.record_reactor(event),
+                Observation::Reactor { event, .. } => {
+                    predicates.record_reactor(event);
+                    if let Some(check) = &mut self.hold_wake {
+                        check.reactor(event);
+                    }
+                }
                 _ => {}
             }
         }
-        let names = self.effects.names.borrow();
+        if let Some(check) = &mut self.hold_wake {
+            for (peer, session_id, lease) in &queued {
+                check.queued(peer, *session_id, *lease);
+            }
+        }
         for (effect, peer) in tapped_effects {
             if let Some((_, name)) = names.iter().find(|(id, _)| *id == peer) {
                 predicates.record_link(effect, name);
@@ -497,6 +634,8 @@ pub struct StartupFacts {
     pub status_refresh_interval: Duration,
     /// The largest frame the reactor writes.
     pub max_frame_bytes: u32,
+    /// The connections the node admits, which caps its admitted peers.
+    pub max_connections: usize,
 }
 
 impl HeaderNode {
@@ -517,6 +656,33 @@ impl HeaderNode {
         dispatch: DispatchFlag,
         observer: Option<Arc<dyn HeaderSyncObserver>>,
     ) -> Self {
+        Self::spawn_configured(
+            sim,
+            name,
+            seed,
+            port,
+            fixture,
+            tip,
+            dispatch,
+            observer,
+            ZakuraHeaderSyncConfig::default(),
+        )
+    }
+
+    /// [`HeaderNode::spawn`] under `config` instead of production's default
+    /// config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_configured(
+        sim: &mut Sim,
+        name: &str,
+        seed: u8,
+        port: Arc<dyn Port>,
+        fixture: &HeaderFixture,
+        tip: Frontier,
+        dispatch: DispatchFlag,
+        observer: Option<Arc<dyn HeaderSyncObserver>>,
+        config: ZakuraHeaderSyncConfig,
+    ) -> Self {
         let anchor = fixture.anchor();
         let mut startup = HeaderSyncStartup::new(
             fixture.network().clone(),
@@ -527,8 +693,9 @@ impl HeaderNode {
                 verified_block_hash: anchor.hash,
             },
             Some((tip.height, tip.hash)),
-            ZakuraHeaderSyncConfig::default(),
+            config,
             LOCAL_MAX_MESSAGE_BYTES,
+            zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let (vct_repairs, repairs) = watch::channel(VctRootRepairStatus::default());
         startup.committed_snapshots = Some(port.selected_chain());
@@ -541,6 +708,7 @@ impl HeaderNode {
             request_timeout: startup.request_timeout,
             status_refresh_interval: startup.status_refresh_interval,
             max_frame_bytes: startup.max_frame_bytes,
+            max_connections: startup.max_connections,
         };
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
@@ -587,6 +755,9 @@ impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.harness_closed(self.conn_id);
+        }
         self.record_closed();
         for token in &self.tokens {
             token.cancel();
@@ -625,6 +796,62 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
+    /// The mirror whose pages the harness holds back, if any.
+    delayed_page: Option<DelayedPage>,
+}
+
+/// A mirror whose first `Headers` frame on each of its links the harness
+/// holds for `by` of virtual time before the node under test gets it, with
+/// every later frame behind it, as a slow path to the node would. It's how
+/// a fixture makes a page arrive just before the node's request deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelayedPage {
+    /// The mirror's name.
+    pub mirror: String,
+    /// How long its first page waits.
+    pub by: Duration,
+}
+
+/// Forwards each frame from `from_mirror` to `to_node`, in order, holding
+/// the first `Headers` frame for `by` of virtual time before it goes and
+/// reading nothing meanwhile, until the link closes or either stream ends.
+async fn delay_first_page(
+    mut from_mirror: FramedRecv,
+    to_node: FramedSend,
+    by: Duration,
+    cancel: CancellationToken,
+) {
+    let mut held = false;
+    loop {
+        let frame = zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = from_mirror.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        if !held
+            && matches!(
+                decode_frame::<RegtestMessage>(&frame),
+                Ok(v9::Message::Headers(_))
+            )
+        {
+            held = true;
+            zakura_rt::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                () = zakura_rt::time::sleep(by) => {}
+            }
+        }
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            sent = to_node.send(frame) => if sent.is_err() {
+                return;
+            },
+        }
+    }
 }
 
 /// The far end of a flooding link: the dialer's streams and its connection
@@ -677,10 +904,15 @@ async fn flood(far: FarEnd) {
     }
 }
 
+/// How often one `Churn` step relinks its mirror. A bound lets a run
+/// settle once churn stops, so a node that stops taking work under churn
+/// is told apart from one still being churned.
+pub const CHURN_RELINKS: u32 = 8;
+
 /// Relinks the mirror whose index `start` delivers to the node under test
-/// as its dialer, once per scheduling step, until the node's shutdown. Each
-/// relink replaces the mirror's session, so the node's lifecycle queue
-/// takes a disconnect and a connect every time.
+/// as its dialer, once per scheduling step, [`CHURN_RELINKS`] times or until
+/// the node's shutdown. Each relink replaces the mirror's session, so the
+/// node's lifecycle queue takes a disconnect and a connect every time.
 ///
 /// Opening a link has scheduling points, so a `Shutdown` can be picked and
 /// sweep the node's links while one is half open. The sweep then misses
@@ -692,12 +924,12 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
         return;
     };
     drop(start);
-    loop {
+    for _ in 0..CHURN_RELINKS {
         if topology.stopping() {
             return;
         }
         let (link, _far) = topology.open(index, 0, true);
-        link.close();
+        topology.close(&link);
         if topology.stopping() {
             return;
         }
@@ -721,7 +953,23 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
+            delayed_page: None,
         }
+    }
+
+    /// This topology, holding back `delayed`'s mirror's first page on each
+    /// of its links ([`DelayedPage`]).
+    pub fn with_delayed_page(self, delayed: Option<DelayedPage>) -> Self {
+        Topology {
+            delayed_page: delayed,
+            ..self
+        }
+    }
+
+    /// Opens the policy's hold number `hold`, from 0, whatever its trigger
+    /// says. Opening an open hold does nothing.
+    pub(crate) fn release(&self, hold: usize) {
+        self.effects.released.borrow_mut().push(hold);
     }
 
     /// This topology, telling `tap` before it stops the node under test.
@@ -745,7 +993,7 @@ impl Topology {
 
     /// Records why a `Control` step couldn't take effect, which ends the
     /// run as a harness failure.
-    fn fail(&self, why: String) {
+    pub(crate) fn fail(&self, why: String) {
         self.effects.failure.borrow_mut().get_or_insert(why);
     }
 
@@ -757,6 +1005,22 @@ impl Topology {
         if let Some(tap) = &self.tap {
             tap.begin();
         }
+        self.environment(&self.nodes[0].name, None, EnvironmentAction::Shutdown);
+    }
+
+    /// Records in the node under test's tap that the harness's `action` on
+    /// `peer` ends `connection`, as [`ends`] describes.
+    fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
+        if let Some(tap) = &self.tap {
+            tap.environment(peer, connection, action);
+        }
+    }
+
+    /// Closes `link` as the harness's own action, which the node under
+    /// test's tap records first.
+    fn close(&self, link: &Link) {
+        self.environment(&link.peer, Some(link.conn_id), EnvironmentAction::Close);
+        link.close();
     }
 
     /// Whether a `Shutdown` step's stop of the node under test is done: its
@@ -843,13 +1107,22 @@ impl Topology {
     /// [`Topology::link`], with the dialer's side handed back as its
     /// streams, from the node and to it, instead of joining the dialer's
     /// service, when `far_end` is set.
+    ///
+    /// A link to a peer that was linked before is a relink, which the node
+    /// under test's tap records ([`ends`]) before the link exists, naming
+    /// the new connection. Two relinks of one peer can overlap at the
+    /// service's scheduling points, so the earlier session the node replaces
+    /// is the admission's to say, not this record's.
     fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
+        let peer = if dialer == 0 { listener } else { dialer };
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
+        if self.link_to(&self.nodes[peer].name).is_some() {
+            self.environment(&self.nodes[peer].name, Some(id), EnvironmentAction::Relink);
+        }
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
-        let peer = if dialer == 0 { listener } else { dialer };
         let origin = SessionOrigin {
             connection: id,
             quic_stream: None,
@@ -914,6 +1187,23 @@ impl Topology {
                 });
                 continue;
             }
+            let delay = self
+                .delayed_page
+                .as_ref()
+                .filter(|delayed| local != 0 && delayed.mirror == self.nodes[local].name)
+                .map(|delayed| delayed.by);
+            let streams = match delay {
+                Some(by) => {
+                    let (from_node, to_node) = streams;
+                    let (to_relay, from_mirror) = framed_channel(LINK_DEPTH);
+                    zakura_rt::task::spawn_named(
+                        "delay-page",
+                        delay_first_page(from_mirror, to_node, by, token.clone()),
+                    );
+                    (from_node, to_relay)
+                }
+                None => streams,
+            };
             let peer = Peer::new_versioned(
                 id,
                 self.nodes[remote].id.clone(),
@@ -968,6 +1258,34 @@ impl Topology {
     /// was picked, or its reactor is cancelled.
     fn stopping(&self) -> bool {
         self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
+    }
+
+    /// Begins the run's end, as the step loop picks it: the node under
+    /// test's stop, recorded as a `Shutdown` step's pick records it, unless
+    /// a `Shutdown` step already began it. [`Topology::finish`] carries it
+    /// out.
+    pub(crate) fn begin_finish(&self) {
+        if !self.shutdown_picked() {
+            self.expect_shutdown();
+        }
+    }
+
+    /// Ends every node's work, so a run can end idle: closes every link and
+    /// cancels the node under test's reactor, as a `Shutdown` step does,
+    /// then each mirror's. Run it from a harness task, after
+    /// [`Topology::begin_finish`].
+    pub(crate) fn finish(&self) {
+        self.shutdown();
+        for node in &self.nodes[1..] {
+            node.shutdown.cancel();
+        }
+    }
+
+    /// Whether the harness picked a `Shutdown` step, which begins the node
+    /// under test's stop. Only the harness does, so this is an environment
+    /// end ([`EndedBy`](crate::property::EndedBy)).
+    pub(crate) fn shutdown_picked(&self) -> bool {
+        self.stopping.get()
     }
 
     /// Each link's session and how long it lasted, in link order. A session
@@ -1073,9 +1391,27 @@ pub enum ControlAction {
     /// reads whatever the node sends.
     Flood,
     /// Start relinking the named mirror to the node under test, once per
-    /// scheduling step until the node's shutdown, so lifecycle events stay
-    /// queued.
+    /// scheduling step, [`CHURN_RELINKS`] times or until the node's
+    /// shutdown, so lifecycle events stay queued.
     Churn,
+    /// End the hostile prefix and recover, with the named mirror as the
+    /// source. At its pick the scenario's controls stop, every invalidation
+    /// it made is reconsidered, every hold retires, and from the next pick
+    /// the run's scheduling is fair. Offered once the task has carried out
+    /// every earlier step, and never after a `Shutdown`. See the
+    /// [`recovery`] module.
+    Recover,
+    /// Publish a VCT root repair status on the node under test's repair
+    /// watch, which the step must name, as zakura-state publishes one when
+    /// it finds tree data missing. The node's storage resolves the repair
+    /// only up to its checkpoint ceiling, which is 0 unless the harness
+    /// raised it.
+    RepairStatus {
+        /// The height whose tree data is missing, or `None` for `Idle`.
+        unavailable: Option<u32>,
+        /// The status's generation.
+        generation: u64,
+    },
 }
 
 /// What a [`ControlAction::Reset`] does, judged at its pick, since only
@@ -1110,6 +1446,8 @@ impl ControlAction {
             ControlAction::Commit { .. } => "commit",
             ControlAction::Flood => "flood",
             ControlAction::Churn => "churn",
+            ControlAction::Recover => "recover",
+            ControlAction::RepairStatus { .. } => "repair-status",
         }
     }
 
@@ -1123,6 +1461,8 @@ impl ControlAction {
                 | ControlAction::Release { .. }
                 | ControlAction::StopStorage
                 | ControlAction::Commit { .. }
+                | ControlAction::Recover
+                | ControlAction::RepairStatus { .. }
         )
     }
 }
@@ -1172,6 +1512,8 @@ pub struct Control {
     fixture: HeaderFixture,
     /// The node under test's adoption evidence, which records each commit.
     adoption: Option<AdoptionEvidence>,
+    /// What a `Recover` step drives.
+    recovery: Option<Driver>,
 }
 
 impl Control {
@@ -1211,7 +1553,7 @@ impl Control {
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => link().close(),
+                    ControlAction::Close => topology.close(&link()),
                     ControlAction::Relink => {
                         let link = link();
                         topology.link(link.dialer, link.listener);
@@ -1232,7 +1574,9 @@ impl Control {
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
                     | ControlAction::StopStorage
-                    | ControlAction::Commit { .. } => {
+                    | ControlAction::Commit { .. }
+                    | ControlAction::Recover
+                    | ControlAction::RepairStatus { .. } => {
                         unreachable!("the step loop carries out run-only steps")
                     }
                 }
@@ -1250,7 +1594,25 @@ impl Control {
             port: None,
             fixture,
             adoption: None,
+            recovery: None,
         }
+    }
+
+    /// This source, recovering from `inputs` at a `Recover` step and
+    /// keeping its progress in `evidence`. Without it, a `Recover` step
+    /// fails the run.
+    pub fn with_recovery(self, inputs: RecoveryInputs, evidence: RecoveryEvidence) -> Self {
+        Control {
+            recovery: Some(Driver { inputs, evidence }),
+            ..self
+        }
+    }
+
+    /// Whether a `Recover` step was picked.
+    fn recovering(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.started().is_some())
     }
 
     /// This source, resetting, committing to and stopping `port`, the node
@@ -1273,13 +1635,15 @@ impl Control {
     }
 
     /// Whether `step` may be offered now, apart from its trigger: a
-    /// run-only step once the task carried out every earlier step, and a
-    /// storage stop once the node's stop is done too.
+    /// run-only step once the task carried out every earlier step, a
+    /// storage stop once the node's stop is done too, and a recovery only
+    /// before any shutdown.
     fn ready(&self, step: &ControlStep) -> bool {
         match step.action {
             ControlAction::StopStorage => {
                 self.queued.get() == 0 && self.shut_down && self.topology.reactor_stopped()
             }
+            ControlAction::Recover => self.queued.get() == 0 && !self.shut_down,
             action if action.run_only() => self.queued.get() == 0,
             _ => true,
         }
@@ -1310,28 +1674,82 @@ impl Control {
                         .push(step.peer.clone());
                 }
             }
-            ControlAction::Release { hold } => {
-                self.topology.effects.released.borrow_mut().push(hold);
-            }
+            ControlAction::Release { hold } => self.topology.release(hold),
             ControlAction::StopStorage => port()?.shut_down(),
-            ControlAction::Commit { len } => self.commit(&*port()?, len)?,
+            ControlAction::Commit { len } => {
+                let adoption = self
+                    .adoption
+                    .as_ref()
+                    .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?;
+                harness_commit(&*port()?, &self.fixture, adoption, len)?;
+            }
+            ControlAction::Recover => self.recover(&*port()?, &step.peer)?,
+            ControlAction::RepairStatus {
+                unavailable,
+                generation,
+            } => {
+                let state = match unavailable {
+                    Some(height) => VctRootRepairState::Unavailable {
+                        height: zakura_chain::block::Height(height),
+                    },
+                    None => VctRootRepairState::Idle,
+                };
+                self.topology.nodes[0]
+                    .vct_repairs
+                    .send(VctRootRepairStatus { state, generation })
+                    .map_err(|_| "the node's reactor no longer follows its repairs".to_owned())?;
+            }
             _ => unreachable!("only run-only steps run at their pick"),
         }
         Ok(())
     }
+
+    /// Starts recovery from `source` at the `Recover` pick: keeps the node's
+    /// baseline, reconsiders every invalidation still in force on `port`,
+    /// newest first, and records the start, which stops the script, retires
+    /// the holds and turns on fair scheduling.
+    fn recover(&self, port: &ControlledPort, source: &str) -> Result<(), String> {
+        let driver = self
+            .recovery
+            .as_ref()
+            .ok_or_else(|| "a recovery needs the harness's recovery inputs".to_owned())?;
+        if !driver.inputs.mirrors.iter().any(|(name, _)| name == source) {
+            return Err(format!("a recover names a mirror, not {source}"));
+        }
+        let baseline = SelectedChain::of(port.engine());
+        while port
+            .reset(ResetRequest::Reconsider)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {}
+        let now = zakura_scheduler::hooks::now()
+            .ok_or_else(|| "a recovery starts inside a run".to_owned())?;
+        driver.evidence.start(source.to_owned(), now, baseline);
+        Ok(())
+    }
 }
 
-impl Control {
-    /// Commits `len` fixture headers past `port`'s selected tip straight
-    /// into its engine, then records the engine's new state as `Published`.
-    /// The step loop calls it outside any task, so the engine's watch sends
-    /// wake no task before the record.
-    fn commit(&self, port: &ControlledPort, len: u32) -> Result<(), String> {
-        let engine = port.engine();
-        let snapshot = engine.snapshot();
-        let tip = snapshot.frontiers.header_best;
-        let headers = self.fixture.extend(tip, len, 0);
-        let request = self.fixture.target_request(&snapshot, tip, &headers, 1);
+/// Commits `len` of `fixture`'s headers past `port`'s selected tip straight
+/// into its engine, through the port's harness-commit hook, which records
+/// the commit's engine run, then records the engine's new state in
+/// `adoption` as `Published`, as a `Commit` step does. Call it from the step
+/// loop, outside any task, so the engine's watch sends wake no task before
+/// the record.
+pub(crate) fn harness_commit(
+    port: &ControlledPort,
+    fixture: &HeaderFixture,
+    adoption: &AdoptionEvidence,
+    len: u32,
+) -> Result<(), String> {
+    let engine = port.engine();
+    let snapshot = engine.snapshot();
+    let tip = snapshot.frontiers.header_best;
+    let headers = fixture.extend(tip, len, 0);
+    let hashes = headers.iter().map(|header| header.hash()).collect();
+    let request = fixture.target_request(&snapshot, tip, &headers, 1);
+    // The port records the commit's engine run, so every check that
+    // judges engine runs judges it as it does an apply's.
+    port.harness_commit(hashes, |engine| {
         let applied = ready(engine.prepare_header_target(request))
             .and_then(|prepared| ready(engine.apply_header_target(prepared)))
             .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
@@ -1340,17 +1758,18 @@ impl Control {
                 "committing {len} headers on {tip:?} gave {applied:?}"
             ));
         }
-        let published = engine.snapshot();
-        self.adoption
-            .as_ref()
-            .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?
-            .publish(published.state_version, published.header_generation);
         Ok(())
-    }
+    })?;
+    let published = engine.snapshot();
+    adoption.publish(published.state_version, published.header_generation);
+    Ok(())
 }
 
 impl ActionSource for Control {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if self.recovering() {
+            return;
+        }
         let Some(step) = self.script.get(self.next) else {
             return;
         };
@@ -1369,6 +1788,10 @@ impl ActionSource for Control {
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(driver) = self.recovery.as_ref().filter(|_| self.recovering()) {
+            driver.boundaries(now, out);
+            return;
+        }
         if let Some(when) = self
             .script
             .get(self.next)
@@ -1378,21 +1801,67 @@ impl ActionSource for Control {
         }
     }
 
+    /// Recovery's `recovered` or relink pick, once the task carried out
+    /// every step.
+    fn quiet(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if let Some(driver) = &self.recovery {
+            if self.queued.get() == 0 {
+                driver.quiet(now, out);
+            }
+        }
+    }
+
+    /// True from the `Recover` pick on.
+    fn recovering(&self) -> bool {
+        Control::recovering(self)
+    }
+
     /// Checks the next step and queues it for the control task, or carries
     /// out a run-only one. A shutdown, reset, release or storage stop that
     /// doesn't name the node under test, a second shutdown, and a relink,
     /// reset or release after one fail the run here instead. A shutdown
     /// counts as begun from its pick, before the task takes it.
-    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        if let Some(driver) = &self.recovery {
+            match local {
+                RECOVERED => {
+                    if let Err(why) = driver.recovered(log.step()) {
+                        self.topology.fail(why);
+                    }
+                    return;
+                }
+                UNREACHED => {
+                    driver.evidence.give_up();
+                    return;
+                }
+                RELINK => {
+                    let step = ControlStep {
+                        peer: driver.evidence.relinked(),
+                        action: ControlAction::Relink,
+                        when: None,
+                    };
+                    self.queued.set(self.queued.get() + 1);
+                    self.to_task
+                        .try_send(step)
+                        .expect("recovery relinks only once the task took every step");
+                    return;
+                }
+                _ => {}
+            }
+        }
         let step = self.script[self.next].clone();
         self.next += 1;
         let node = &self.topology.nodes[0].name;
         let invalid = match step.action {
+            ControlAction::Recover if step.peer == *node => {
+                Some("a recover names a mirror, not the node under test".to_owned())
+            }
             ControlAction::Shutdown
             | ControlAction::Reset(_)
             | ControlAction::Release { .. }
             | ControlAction::StopStorage
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if step.peer != *node =>
             {
                 Some(format!(
@@ -1419,6 +1888,7 @@ impl ActionSource for Control {
             ControlAction::Reset(_)
             | ControlAction::Release { .. }
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if self.shut_down =>
             {
                 Some(format!(
@@ -1447,5 +1917,18 @@ impl ActionSource for Control {
         self.to_task
             .try_send(step)
             .expect("the channel holds the whole script, and the task outlives the run");
+    }
+}
+
+impl HeaderNode {
+    /// The service its links join, for a harness that builds its own
+    /// links, such as `sync/storage`'s.
+    pub(crate) fn service(&self) -> &HeaderSyncService {
+        &self.service
+    }
+
+    /// Cancels the reactor, as zakurad's shutdown ends header sync.
+    pub(crate) fn cancel(&self) {
+        self.shutdown.cancel();
     }
 }

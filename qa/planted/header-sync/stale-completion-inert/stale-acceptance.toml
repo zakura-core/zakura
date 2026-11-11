@@ -1,0 +1,13 @@
+# A stale prepare's or apply's handler accepts its peer's live subscription
+# through the last cursor it received. In the witness, the fork's round
+# goes stale once the main chain commits, while the live subscription holds
+# received pages no round accepted yet.
+# The reactor, the subscriber and the queue decide which round goes stale
+# and what the live subscription received, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

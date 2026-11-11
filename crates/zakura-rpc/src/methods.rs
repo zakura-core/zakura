@@ -80,6 +80,7 @@ use zakura_chain::{
 use zakura_consensus::{
     funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
 };
+use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zakura_node_services::mempool::{self, CreatedOrSpent, MempoolService};
 use zakura_node_services::task::spawn_erased;
@@ -121,6 +122,7 @@ use types::{
             ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
+        trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse,
     },
@@ -167,7 +169,7 @@ pub(crate) enum RpcAccess {
     /// Available on restricted unauthenticated Mainnet and Testnet RPC listeners.
     Unauthenticated,
 
-    /// Available only on authenticated listeners, except on Regtest.
+    /// Available on authenticated listeners, on Regtest, or by explicit opt-in.
     Admin,
 
     /// A Regtest control method retained on the full RPC surface.
@@ -180,6 +182,9 @@ pub(crate) enum RpcSurface {
     /// The explicitly classified unauthenticated compatibility method set.
     Restricted,
 
+    /// Compatibility and administrative methods, excluding test controls.
+    WithAdmin,
+
     /// Every registered method.
     Full,
 }
@@ -189,6 +194,10 @@ impl RpcSurface {
     pub(crate) fn exposes(self, method_name: &str) -> bool {
         match self {
             Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
+            Self::WithAdmin => matches!(
+                rpc_method_access(method_name),
+                Some(RpcAccess::Unauthenticated | RpcAccess::Admin)
+            ),
             Self::Full => true,
         }
     }
@@ -1489,6 +1498,8 @@ where
     }
 
     /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    ///
+    /// Also returns how long the build waited to start and how long it ran.
     #[allow(clippy::too_many_arguments)]
     async fn build_mining_template(
         &self,
@@ -1498,10 +1509,11 @@ where
         long_poll_id: types::long_poll::LongPollId,
         mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
-    ) -> Result<BlockTemplateResponse> {
+    ) -> Result<(BlockTemplateResponse, BuildTimes)> {
         // An empty template with a completed coinbase has no proof work to queue.
         if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
-            return BlockTemplateResponse::new_internal(
+            let started = std::time::Instant::now();
+            let template = BlockTemplateResponse::new_internal(
                 &self.network,
                 precomputed_coinbase,
                 miner_params,
@@ -1510,15 +1522,23 @@ where
                 mempool_txs,
                 submit_old,
             )
-            .map_misc_error();
+            .map_misc_error()?;
+            let times = BuildTimes {
+                wait: Duration::ZERO,
+                run: started.elapsed(),
+            };
+            return Ok((template, times));
         }
 
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
-        self.gbt
+        let requested = std::time::Instant::now();
+        let (template, times) = self
+            .gbt
             .run_template_build(move || {
-                BlockTemplateResponse::new_internal(
+                let started = std::time::Instant::now();
+                let template = BlockTemplateResponse::new_internal(
                     &network,
                     precomputed_coinbase,
                     &miner_params,
@@ -1526,10 +1546,15 @@ where
                     long_poll_id,
                     mempool_txs,
                     submit_old,
-                )
+                );
+                let times = BuildTimes {
+                    wait: started.saturating_duration_since(requested),
+                    run: started.elapsed(),
+                };
+                (template, times)
             })
-            .await?
-            .map_misc_error()
+            .await?;
+        Ok((template.map_misc_error()?, times))
     }
 
     /// Points the rejection state at `tip_hash` and returns it, unless the chain moved on.
@@ -1620,8 +1645,11 @@ where
     /// template has no mempool transactions and an ID that names none. The client's next long
     /// poll then returns the full template as soon as the mempool has any. Returns `Ok(None)`
     /// when the template was superseded, like [`Self::finish_mining_template`].
+    ///
+    /// Traces the returned template under `request_id`.
     async fn new_tip_template(
         &self,
+        request_id: u64,
         precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
@@ -1640,7 +1668,7 @@ where
 
         // After ZIP 234 activation the coinbase proof must wait for the new parent's pools, so
         // the build runs off the async worker to let other RPC requests continue.
-        let template = self
+        let (template, build_times) = self
             .build_mining_template(
                 precomputed_coinbase,
                 miner_params,
@@ -1650,8 +1678,15 @@ where
                 submit_old,
             )
             .await?;
-        self.finish_mining_template(template, chain_info, miner_params)
-            .await
+        let response = self
+            .finish_mining_template(template, chain_info, miner_params)
+            .await?;
+        if let Some(GetBlockTemplateResponse::TemplateMode(template)) = &response {
+            self.gbt
+                .trace
+                .empty_returned(request_id, template, build_times);
+        }
+        Ok(response)
     }
 
     /// Validates an empty replacement template in the foreground and publishes it.
@@ -1674,7 +1709,7 @@ where
             template.submit_old
         };
         long_poll_id.revision = state.revision;
-        let template = self
+        let (template, _) = self
             .build_mining_template(
                 None,
                 miner_params,
@@ -2006,6 +2041,13 @@ where
     /// Shares one pending-block registry with peer serving.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.gbt.set_pending_blocks(pending_blocks);
+        self
+    }
+
+    /// Writes a `mining_template.jsonl` row to `trace` for each stage of the
+    /// `getblocktemplate` path from a new tip to a returned template.
+    pub fn with_template_trace(mut self, trace: JsonlEventEmitter) -> Self {
+        self.gbt.trace = MiningTemplateTrace(trace);
         self
     }
 
@@ -2415,17 +2457,14 @@ where
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
 
         if verbosity == 0 {
-            let request = zakura_state::ReadRequest::Block(hash_or_height);
+            let request = zakura_state::ReadRequest::RawBlock(hash_or_height);
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
-                    block
-                        .zcash_serialize_to_vec()
-                        .expect("serialization to memory cannot fail")
-                        .into(),
-                )),
-                zakura_state::ReadResponse::Block(None) => {
+                zakura_state::ReadResponse::RawBlock(Some(block)) => {
+                    Ok(GetBlockResponse::Raw(block.to_vec().into()))
+                }
+                zakura_state::ReadResponse::RawBlock(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
                 _ => unreachable!("unmatched response to a block request"),
@@ -2981,6 +3020,25 @@ where
             None
         };
 
+        // Serve raw transactions from the state's stored bytes, without decoding them.
+        if !verbose {
+            return match call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::AnyChainRawTransaction(txid),
+            )
+            .await?
+            {
+                zakura_state::ReadResponse::RawTransaction(Some(tx)) => {
+                    Ok(GetRawTransactionResponse::Raw(tx.to_vec().into()))
+                }
+                zakura_state::ReadResponse::RawTransaction(None) => {
+                    Err("Transaction not found in mempool or best chain")
+                        .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                }
+                _ => unreachable!("unmatched response to an `AnyChainRawTransaction` request"),
+            };
+        }
+
         // If the tx wasn't in the mempool, check the state.
         match call_service(
             self.read_state.clone(),
@@ -2988,7 +3046,7 @@ where
         )
         .await?
         {
-            zakura_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(if verbose {
+            zakura_state::ReadResponse::AnyChainTransaction(Some((tx, raw))) => Ok(
                 if let Some((caller_block_hash, in_best_chain)) = caller_block_context {
                     // Use the caller-provided block context to avoid TOCTOU races
                     // between the validation query and the transaction fetch.
@@ -3006,8 +3064,9 @@ where
                     };
 
                     GetRawTransactionResponse::Object(Box::new(
-                        TransactionObject::from_transaction(
+                        TransactionObject::from_serialized_transaction(
                             raw_tx,
+                            raw.to_vec().into(),
                             height,
                             confirmations,
                             &self.network,
@@ -3035,8 +3094,9 @@ where
                             };
 
                             GetRawTransactionResponse::Object(Box::new(
-                                TransactionObject::from_transaction(
+                                TransactionObject::from_serialized_transaction(
                                     tx.tx.clone(),
+                                    raw.to_vec().into(),
                                     Some(tx.height),
                                     Some(tx.confirmations.into()),
                                     &self.network,
@@ -3050,8 +3110,9 @@ where
                             ))
                         }
                         AnyTx::Side((tx, block_hash)) => GetRawTransactionResponse::Object(
-                            Box::new(TransactionObject::from_transaction(
+                            Box::new(TransactionObject::from_serialized_transaction(
                                 tx.clone(),
+                                raw.to_vec().into(),
                                 None,
                                 None,
                                 &self.network,
@@ -3062,12 +3123,8 @@ where
                             )),
                         ),
                     }
-                }
-            } else {
-                let tx: TransactionHandle = tx.into();
-                let hex = tx.into();
-                GetRawTransactionResponse::Raw(hex)
-            }),
+                },
+            ),
 
             zakura_state::ReadResponse::AnyChainTransaction(None) => {
                 Err("Transaction not found in mempool or best chain")
@@ -3468,6 +3525,10 @@ where
         // To implement long polling correctly, we split this RPC into multiple phases.
         check_parameters(&parameters)?;
 
+        let request_id = next_request_id();
+        let request_started = std::time::Instant::now();
+        let mut wait_reason = WaitReason::Immediate;
+
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
         let mut template_rejections = self.gbt.template_rejections.subscribe();
 
@@ -3547,8 +3608,12 @@ where
                             .same_tip(client_long_poll_id)
                     })
                 {
+                    self.gbt
+                        .trace
+                        .tip_woke(request_id, Some((tip_height, tip_hash)));
                     if let Some(template) = self
                         .new_tip_template(
+                            request_id,
                             None,
                             miner_params,
                             &chain_info,
@@ -3724,10 +3789,14 @@ where
                     // We put the most frequent conditions first.
                     biased;
 
-                    _ = template_rejections.changed() => { continue; }
+                    _ = template_rejections.changed() => {
+                        wait_reason = WaitReason::Rejection;
+                        continue;
+                    }
 
                     // This timer elapses every few seconds
                     _elapsed = wait_for_mempool_request => {
+                        wait_reason = WaitReason::Timer;
                         tracing::debug!(
                             ?max_time,
                             ?cur_time,
@@ -3739,6 +3808,9 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
+                        self.gbt
+                            .trace
+                            .tip_woke(request_id, self.latest_chain_tip.best_tip_height_and_hash());
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
                         let Some(rejection_state) =
@@ -3757,6 +3829,7 @@ where
 
                         if let Some(template) = self
                             .new_tip_template(
+                                request_id,
                                 precomputed_coinbase,
                                 miner_params,
                                 &chain_info,
@@ -3773,6 +3846,7 @@ where
                     // Testnet reaches this when minimum difficulty becomes valid.
                     // Mainnet only reaches it after a long stall.
                     Some(_elapsed) = wait_for_max_time => {
+                        wait_reason = WaitReason::MaxTime;
                         // This log is very rare so it's ok to be info.
                         tracing::info!(
                             ?max_time,
@@ -3804,6 +3878,7 @@ where
             let height = chain_info.tip_height.next().map_misc_error()?;
 
             // Randomly select some mempool transactions.
+            let selection_started = std::time::Instant::now();
             let mempool_txs = select_mempool_transactions(
                 &self.network,
                 height,
@@ -3820,6 +3895,7 @@ where
                 mempool_tx_deps,
             )
             .map_misc_error()?;
+            let selection = selection_started.elapsed();
 
             tracing::debug!(
                 selected_mempool_tx_hashes = ?mempool_txs
@@ -3831,7 +3907,7 @@ where
 
             // - After this point, the template only depends on the previously fetched data.
 
-            let template = self
+            let (template, build_times) = self
                 .build_mining_template(
                     None,
                     miner_params,
@@ -3841,11 +3917,21 @@ where
                     submit_old,
                 )
                 .await?;
-            if let Some(template) = self
+            if let Some(response) = self
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?
             {
-                return Ok(template);
+                if let GetBlockTemplateResponse::TemplateMode(template) = &response {
+                    self.gbt.trace.full_returned(
+                        request_id,
+                        template,
+                        wait_reason,
+                        selection,
+                        build_times,
+                        request_started.elapsed(),
+                    );
+                }
+                return Ok(response);
             }
         }
 
@@ -5419,7 +5505,7 @@ impl SendRawTransactionResponse {
 #[serde(untagged)]
 pub enum GetBlockResponse {
     /// The request block, hex-encoded.
-    Raw(#[serde(with = "hex")] SerializedBlock),
+    Raw(#[serde(with = "hex_data")] SerializedBlock),
     /// The block object.
     Object(Box<BlockObject>),
 }
@@ -5784,7 +5870,7 @@ impl Default for GetBlockHashResponse {
 #[serde(untagged)]
 pub enum GetRawTransactionResponse {
     /// The raw transaction, encoded as hex bytes.
-    Raw(#[serde(with = "hex")] SerializedTransaction),
+    Raw(#[serde(with = "hex_data")] SerializedTransaction),
     /// The transaction object.
     Object(Box<TransactionObject>),
 }
@@ -6193,8 +6279,7 @@ pub mod arrayhex {
     where
         S: Serializer,
     {
-        let hex_string = hex::encode(data);
-        serializer.serialize_str(&hex_string)
+        super::hex_data::serialize(data, serializer)
     }
 
     #[allow(missing_docs)]

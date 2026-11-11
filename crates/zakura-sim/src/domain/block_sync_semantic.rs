@@ -16,8 +16,10 @@
 //! decoded-byte target, [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], is a
 //! constant.
 
+mod authority;
 mod reactor_queries;
 
+pub use authority::AuthorityModel;
 pub use reactor_queries::ReactorQueries;
 
 use std::{
@@ -37,7 +39,8 @@ use crate::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
         Status, Subject, TriggerHistory, Unit, Verdict,
     },
-    storage::BLOCK_SERVICE,
+    record::machine::ReactorAction,
+    storage::{BLOCK_SERVICE, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -62,11 +65,22 @@ pub const INPUT_DECODED_BOUND: &str = "block-sync/input-decoded-bound";
 /// identities, and refusal and close leave only the retries they owe.
 pub const REACTOR_QUERY_LIFECYCLE: &str = "block-sync/reactor-query-lifecycle";
 
-/// What every property here but [`REACTOR_QUERY_LIFECYCLE`] reads.
+/// A needed-block reply installs work only under the body-work authority
+/// the reactor adopted.
+pub const QUERY_WORK_AUTHORIZED: &str = "block-sync/query-work-authorized";
+
+/// Once a new body-work epoch reaches block sync, its work queue, routines
+/// and sequencer hold only that epoch's body work.
+pub const FRONTIER_WORK_CONSISTENT: &str = "block-sync/frontier-work-consistent";
+
+/// What every property here but [`REACTOR_QUERY_LIFECYCLE`],
+/// [`QUERY_WORK_AUTHORIZED`] and [`FRONTIER_WORK_CONSISTENT`] reads.
 const NEEDS: &[Source] = &[Source::Storage, Source::Frames, Source::View];
 
-/// What [`REACTOR_QUERY_LIFECYCLE`] reads: storage's queries, and the
-/// reactor's transitions through the view's tap. See [`reactor_queries`].
+/// What [`REACTOR_QUERY_LIFECYCLE`], [`QUERY_WORK_AUTHORIZED`] and
+/// [`FRONTIER_WORK_CONSISTENT`] read: storage's facts, and the reactor's
+/// transitions and owners' snapshots through the view's tap. See
+/// [`reactor_queries`] and [`authority`].
 const REACTOR_NEEDS: &[Source] = &[Source::Storage, Source::View];
 
 /// A view that carries a [`SemanticModel`].
@@ -77,9 +91,10 @@ pub trait SemanticView {
 
 /// The block-sync semantic properties, for a harness whose view carries the
 /// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`],
-/// [`DETACHED_SUBMISSION_BOUNDED`], [`CAPACITY_RELEASE_WAKES`] and
-/// [`INPUT_DECODED_BOUND`], all active, and [`REACTOR_QUERY_LIFECYCLE`], a
-/// draft until a simulated run exercises it.
+/// [`DETACHED_SUBMISSION_BOUNDED`], [`CAPACITY_RELEASE_WAKES`],
+/// [`INPUT_DECODED_BOUND`], [`QUERY_WORK_AUTHORIZED`] and
+/// [`FRONTIER_WORK_CONSISTENT`], all active, and [`REACTOR_QUERY_LIFECYCLE`],
+/// a draft until a simulated run exercises it.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -169,6 +184,36 @@ where
             status: Status::Draft,
             check: check_reactor_query_lifecycle::<S>,
             witness: Some(TriggerHistory::Log(query_reached_storage)),
+        },
+        Property {
+            id: PropertyId::new(QUERY_WORK_AUTHORIZED),
+            claim: "a needed-block reply installs work only under the body-work authority the \
+                    reactor adopted last: its header generation, branch anchor and target \
+                    hashes, verified generation and body-work epoch; a reply under a retired \
+                    authority installs nothing; and where the harness runs the engine, once no \
+                    task can run, the authority the reactor adopted is the engine's newest \
+                    committed view's",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: REACTOR_NEEDS,
+            status: Status::Active,
+            check: check_query_work_authorized::<S>,
+            witness: Some(TriggerHistory::View(
+                retired_reply_or_engine_moved::<S::View>,
+            )),
+        },
+        Property {
+            id: PropertyId::new(FRONTIER_WORK_CONSISTENT),
+            claim: "once the reactor adopts a new body-work epoch and no task can run, the work \
+                    queue's taken items, the routines' unreceived requests and the sequencer's \
+                    reorder and applying bodies above the verified tip all belong to that \
+                    epoch; only detached submissions outlive it",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: REACTOR_NEEDS,
+            status: Status::Active,
+            check: check_frontier_work_consistent::<S>,
+            witness: Some(TriggerHistory::Log(epoch_changed_with_work)),
         },
     ]
 }
@@ -317,6 +362,9 @@ pub struct SemanticModel {
     input_findings: Vec<Finding>,
     /// [`REACTOR_QUERY_LIFECYCLE`]'s model, with its findings.
     pub reactor_queries: ReactorQueries,
+    /// [`QUERY_WORK_AUTHORIZED`]'s and [`FRONTIER_WORK_CONSISTENT`]'s model,
+    /// with the query findings.
+    pub authority: AuthorityModel,
     /// Triggers of [`CAPACITY_RELEASE_WAKES`], not yet obliged.
     rooms: Vec<RoomFreed>,
 
@@ -619,6 +667,7 @@ impl SemanticModel {
 
     /// Folds a block-sync event, the step's observation `at`.
     fn block_sync(&mut self, event: &BlockSyncFact, at: usize) {
+        self.authority.fold(self.step.unwrap_or_default(), event);
         match event {
             BlockSyncFact::SessionAdmitted {
                 connection,
@@ -1299,6 +1348,110 @@ where
     } else {
         Verdict::NotApplicable
     })
+}
+
+/// Checks [`QUERY_WORK_AUTHORIZED`] at each reply the step classified, and,
+/// where the harness reads the engine, the reactor's adoption of the
+/// engine's newest view whenever no task can run.
+fn check_query_work_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: SemanticView,
+{
+    let model = caught_up(cx);
+    let (findings, applicable) = {
+        let mut model = model.borrow_mut();
+        let authority = &mut model.authority;
+        let mut findings = std::mem::take(&mut authority.query_findings);
+        if cx.status != zakura_scheduler::Status::Running {
+            findings.extend(authority.judge_adoption(cx.step));
+        }
+        (findings, std::mem::take(&mut authority.judged) > 0)
+    };
+    report(cx, findings).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
+}
+
+/// Checks [`FRONTIER_WORK_CONSISTENT`] whenever no task can run.
+fn check_frontier_work_consistent<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: SemanticView,
+{
+    if cx.status == zakura_scheduler::Status::Running {
+        return Verdict::NotApplicable;
+    }
+    let model = caught_up(cx);
+    let (finding, applicable) = {
+        let mut model = model.borrow_mut();
+        let finding = model.authority.judge_frontier(cx.step);
+        (finding, model.authority.epoch_changes > 0)
+    };
+    report(cx, finding.into_iter().collect()).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
+}
+
+/// [`QUERY_WORK_AUTHORIZED`]'s trigger history: a needed-block reply reached
+/// the reactor under an authority other than the one it adopted last, or,
+/// where the node's header storage runs on the same engine, a header write
+/// left the engine at a newer header generation than an accepted query's
+/// while the query had no reply yet. The second reads only the query's own
+/// authority and header storage's facts, so a reactor that never adopts the
+/// newer view reaches it too.
+fn reply_under_retired_authority(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).authority.saw_retired_reply || query_outlived_its_generation(log)
+}
+
+/// [`QUERY_WORK_AUTHORIZED`]'s trigger history for either half: a reply
+/// under a retired authority ([`reply_under_retired_authority`]), or, where
+/// the harness runs the engine, an engine view whose authority differs from
+/// the reactor's startup authority. The second reads only the harness's
+/// engine samples, so a reactor that drops every committed view reaches it.
+fn retired_reply_or_engine_moved<V: SemanticView>(view: &V, log: &ObservationLog) -> bool {
+    reply_under_retired_authority(log) || view.semantic().borrow().authority.saw_engine_move
+}
+
+/// Whether a header write left the engine at a newer header generation than
+/// an accepted needed-block query's, as header storage's completions report
+/// the engine's, before the query's reply reached the reactor.
+fn query_outlived_its_generation(log: &ObservationLog) -> bool {
+    let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
+    log.entries().iter().any(|entry| match &entry.obs {
+        Observation::Storage {
+            service,
+            fact: StorageFact::Completed { generation, .. },
+            ..
+        } if service == HEADER_SERVICE => pending.values().any(|own| generation > own),
+        Observation::BlockSync {
+            event: BlockSyncFact::Reactor { transition, .. },
+            ..
+        } => {
+            match transition {
+                ReactorAction::QueryAccepted { query } => {
+                    pending.insert(query.query_id, query.scope.header.header_generation);
+                }
+                ReactorAction::QueryReply { query_id, .. }
+                | ReactorAction::QueryFailed { query_id, .. } => {
+                    pending.remove(query_id);
+                }
+                _ => {}
+            }
+            false
+        }
+        _ => false,
+    })
+}
+
+/// [`FRONTIER_WORK_CONSISTENT`]'s trigger history: the reactor adopted a new
+/// body-work epoch while an owner held an older epoch's body work.
+fn epoch_changed_with_work(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).authority.saw_epoch_change_with_work
 }
 
 /// [`SUBMIT_ONLY_REQUESTED`]'s trigger history: storage took a submission.

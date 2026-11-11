@@ -2,8 +2,12 @@
 # deadline. The input's idle mirror spends the 32-pass burst first, so the
 # pass the release wants is deferred, and only the refill deadline brings
 # the reactor back for it. Without it, time jumps to the reactor's next
-# other timer with the waiting offer unscheduled.
-input = "crates/zakura-sim/tests/fixtures/header-release-wake-deferred.bin"
+# other timer with the waiting offer unscheduled. The violation comes at
+# the first step whose clock is past the wake's deadline. The fixture
+# lets `mirror-1`'s held prepare run only after that step, so that
+# release can't hide the bug, and a run that goes on past the violation
+# ends with nothing held.
+input ="crates/zakura-sim/tests/fixtures/header-release-wake-deferred.bin"
 # Besides state.rs, which the patch changes, the reactor's loop and its
 # scheduling key decide how many passes the relinks buy and when the
 # release's pass is wanted. A change there can move the input off its

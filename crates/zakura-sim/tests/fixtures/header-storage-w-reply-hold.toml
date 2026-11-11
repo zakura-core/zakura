@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-reply-hold.bin`, a fuzz-12 item 7 witness whose run
+# shows ReplyOutlasted. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "3ac53b04e17d04fef4c05b9d81f9038939dec244656dac2964745d17ee9c5057"
+scenario_sha256 = "ca027c533f9926c5058db9c527b4984f8cb5c2d44c7c9ce2d6be1ce91aebabe2"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

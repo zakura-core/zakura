@@ -13,8 +13,9 @@
 //!
 //! A stale call's handler, the facts under its `Completion` cause, may only
 //! return its own round's budget. A charge, a return that doesn't join its
-//! round, any credit, a retirement or release of another round, a start, a
-//! reservation, or a prepare or apply dispatch breaks
+//! round, any credit, cursor acceptance or built `Close`, a retirement or
+//! release of another round, a start, a reservation, or a prepare or apply
+//! dispatch breaks
 //! [`Claim::StaleCompletionEffect`]. A return joins a round through its
 //! reservation: a continuation's `ReservationOpened` names its round, a
 //! first or repair reservation's `ReservationBound` does once its round
@@ -151,6 +152,13 @@ impl StaleCheck {
         self.note(event);
     }
 
+    /// Whether the reactor is in a stale call's handler: its last
+    /// `CauseSet` named the `Completion` of a call that ended stale.
+    pub(super) fn in_stale_handler(&self) -> bool {
+        matches!(self.cause, ReactorCause::Completion { call }
+            if self.calls.get(&call).is_some_and(|call| call.stale.is_some()))
+    }
+
     /// The breaks found since the last call, and the step their drain is.
     /// Stale calls found since then are stamped with `step`.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
@@ -193,6 +201,22 @@ impl StaleCheck {
                 ..
             } => Some(format!(
                 "gave {peer:?} {kind:?} credit on subscription {subscription}"
+            )),
+            ReactorEvent::CursorsAccepted {
+                peer,
+                subscription,
+                through,
+                ..
+            } => Some(format!(
+                "accepted {peer:?}'s subscription {subscription} through {through:?}"
+            )),
+            ReactorEvent::CloseBuilt {
+                peer,
+                session_id,
+                subscription,
+                ..
+            } => Some(format!(
+                "closed {peer:?}'s session {session_id} subscription {subscription}"
             )),
             ReactorEvent::Retired { request, .. }
                 if other(&(request.peer.clone(), request.incarnation)) =>

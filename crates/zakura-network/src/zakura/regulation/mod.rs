@@ -53,6 +53,10 @@ mod cadence;
 pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend};
 
 mod serve;
+#[cfg(any(test, zakura_sim))]
+pub use serve::ServeInUse;
+#[cfg(any(test, zakura_sim))]
+pub(crate) use serve::ServeReports;
 pub(crate) use serve::{
     Completion, CompletionId, Completions, ExecutionSlots, OutputOrder, Produce, Push, PushPermit,
     PushSend, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,
@@ -69,6 +73,8 @@ pub(crate) use reservations::{
 
 mod session_capacity;
 pub(crate) use session_capacity::SessionCapacity;
+#[cfg(zakura_sim)]
+pub use session_capacity::{FreeSlots, SessionSlotsProbe};
 
 mod session_table;
 pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};

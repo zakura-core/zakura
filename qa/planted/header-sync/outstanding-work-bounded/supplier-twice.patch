@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4048262202..76625e154b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -180,7 +180,9 @@ impl ReactorState {
+             .expect("the fresh schedule was just inserted");
+         schedule.unproductive_requests = strikes;
+         schedule.replaced_request_budget = replaced_request_budget;
+-        if !replaced {
++        // Mutation: a replacement appends the peer to the supplier order
++        // again, keeping its old entry.
++        if replaced || !replaced {
+             self.vct_supplier_order.push_back(peer.clone());
+         }
+         replaced

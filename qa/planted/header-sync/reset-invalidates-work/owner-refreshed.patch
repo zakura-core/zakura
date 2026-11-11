@@ -1,0 +1,46 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index f6ba4a2e8c..e780a8c740 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -611,11 +611,11 @@ impl PeerWorkQueue {
+         &mut self,
+         current: &EngineSnapshot,
+     ) -> Vec<ActiveHeaderRequest> {
+-        self.policy
+-            .obsolete_active(current)
+-            .iter()
+-            .filter_map(|peer| self.remove(peer))
+-            .collect()
++        for peer in self.policy.obsolete_active(current) {
++            self.policy.refresh_owner(&peer, current);
++        }
++        self.report_slots();
++        Vec::new()
+     }
+ 
+     /// Return the exact attempt identity structurally owned by one peer slot.
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f3dc86650b..3f10206f2a 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -1024,6 +1024,20 @@ impl WorkPolicy {
+         self.repair_episodes.insert(owner, episode);
+     }
+ 
++    /// Rewrite `peer`'s ordinary owner to `current`'s generation.
++    pub(super) fn refresh_owner(&mut self, peer: &ZakuraPeerId, current: &EngineSnapshot) {
++        if let Some(request) = self.request_mut(peer) {
++            if let Some(owner) = request.owner.header_owner() {
++                request.owner = HeaderWorkAuthority {
++                    header_generation: current.header_generation,
++                    ..owner.authority
++                }
++                .bind(owner.session_id, owner.request_id)
++                .into();
++            }
++        }
++    }
++
+     /// End `peer`'s work, and return its request if it had started.
+     pub(super) fn remove(&mut self, peer: &ZakuraPeerId) -> Option<ActiveHeaderRequest> {
+         let removed = self.work_by_peer.remove(peer);

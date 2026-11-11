@@ -1,0 +1,13 @@
+# A first page's job skips its subscriber's first locator when the `Open`
+# named others. On the served-one-header witness the mirror at A1 names
+# A1 first, so storage starts the path lower, at the next locator, and
+# the page serves A1, one of the `Open`'s locators short of its target,
+# which the subscriber refuses. The read and the page agree, and so do
+# the target and marker. The publisher's job state decides where a page
+# starts, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.plan"

@@ -18,12 +18,13 @@
 //! If they all hold, the release opens the waiting peer's wake
 //! ([`WakeFact::Opened`]). Otherwise it opens nothing, so a broken fixture
 //! reads as not applicable, never as a missed wake. The waiting peer's
-//! locator reaching storage ([`WakeFact::Submitted`]) or its session ending
-//! ([`WakeFact::Ended`]) answers the wake, and a deferred cached pass
-//! ([`WakeFact::Deferred`]) moves its deadline to the pass's refill, but
-//! never past one refill interval after the wake opened.
+//! locator reaching storage ([`WakeFact::Submitted`]) answers the wake, and
+//! so does its session ending ([`WakeFact::Ended`]) when the environment
+//! ended it ([`EndedBy`]). A deferred cached pass ([`WakeFact::Deferred`])
+//! moves its deadline to the pass's refill, but never past one refill
+//! interval after the wake opened.
 //!
-//! Each fact gets a stamp, larger than every earlier one, which the
+//! Each fact takes the node's next stamp ([`super::stamp`]), which the
 //! storage view hands the registry as its view-side facts.
 
 use std::{
@@ -39,7 +40,11 @@ use zakura_network::zakura::{
 };
 use zakura_scheduler::SimInstant;
 
-use crate::observe::{StorageFact, StorageRequest};
+use super::{session::SessionEvidence, stamp::Stamps};
+use crate::{
+    observe::{StorageFact, StorageRequest},
+    property::EndedBy,
+};
 
 /// The wake fixture a harness declares. It fixes one waiting mirror whose
 /// only `Status` arrives once filling mirrors' held rounds use the room,
@@ -75,6 +80,8 @@ pub enum WakeFact {
         peer: ZakuraPeerId,
         /// The ended session.
         session_id: u64,
+        /// Who ended it, when the reactor reported the end.
+        by: EndedBy,
     },
     /// The reactor's cached pass waits for its budget's refill at `until`.
     Deferred {
@@ -88,6 +95,8 @@ pub enum WakeFact {
 struct Store {
     /// The fixture the scenario declared, if any.
     fixture: Option<WakeFixture>,
+    /// Where its stamps come from: the node's, once its tap watches it.
+    stamps: Stamps,
     /// Each fact with its stamp, in stamp order.
     facts: Vec<(u64, WakeFact)>,
 }
@@ -102,8 +111,14 @@ impl WakeEvidence {
     pub fn new(fixture: Option<WakeFixture>) -> WakeEvidence {
         WakeEvidence(Arc::new(Mutex::new(Store {
             fixture,
+            stamps: Stamps::default(),
             facts: Vec::new(),
         })))
+    }
+
+    /// Stamps facts from `stamps`, the node's, from now on.
+    pub(super) fn stamp_with(&self, stamps: Stamps) {
+        self.with(|store| store.stamps = stamps);
     }
 
     /// Runs `read` on the store. Nothing else is called while the lock is
@@ -120,21 +135,9 @@ impl WakeEvidence {
     /// Keeps `fact` with the next stamp.
     fn push(&self, fact: WakeFact) {
         self.with(|store| {
-            let stamp = store.facts.last().map_or(1, |(stamp, _)| stamp + 1);
+            let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
         });
-    }
-
-    /// The stamps after `after`, or all of them, in order.
-    pub fn stamps_after(&self, after: Option<u64>) -> Vec<u64> {
-        self.with(|store| {
-            store
-                .facts
-                .iter()
-                .map(|(stamp, _)| *stamp)
-                .filter(|stamp| after.is_none_or(|after| *stamp > after))
-                .collect()
-        })
     }
 
     /// The fact with `stamp`, if any.
@@ -142,15 +145,25 @@ impl WakeEvidence {
         self.with(|store| {
             store
                 .facts
-                .iter()
-                .find(|(at, _)| *at == stamp)
-                .map(|(_, fact)| fact.clone())
+                .binary_search_by_key(&stamp, |(at, _)| *at)
+                .ok()
+                .map(|index| store.facts[index].1.clone())
         })
     }
 
     /// Every fact so far, with its stamp.
     pub fn facts(&self) -> Vec<(u64, WakeFact)> {
         self.with(|store| store.facts.clone())
+    }
+
+    /// When the last wake a release opened opened, if any did.
+    pub fn last_opened(&self) -> Option<SimInstant> {
+        self.with(|store| {
+            store.facts.iter().rev().find_map(|(_, fact)| match fact {
+                WakeFact::Opened { at, .. } => Some(*at),
+                _ => None,
+            })
+        })
     }
 
     /// Whether any release opened a wake.
@@ -176,6 +189,8 @@ struct Wait {
 /// locator calls, the adopted tip, the budget and the probe.
 pub(super) struct WakeCheck {
     evidence: WakeEvidence,
+    /// The node's session view, which says who ended a session.
+    sessions: SessionEvidence,
     /// The offer waiting for room, if any.
     waiting: Option<Wait>,
     /// Each peer's live session.
@@ -196,10 +211,12 @@ pub(super) struct WakeCheck {
 }
 
 impl WakeCheck {
-    /// A check that keeps its facts in `evidence`.
-    pub(super) fn new(evidence: WakeEvidence) -> WakeCheck {
+    /// A check that keeps its facts in `evidence`, and reads who ended a
+    /// session from `sessions`.
+    pub(super) fn new(evidence: WakeEvidence, sessions: SessionEvidence) -> WakeCheck {
         WakeCheck {
             evidence,
+            sessions,
             waiting: None,
             live: HashMap::new(),
             started: HashSet::new(),
@@ -332,8 +349,8 @@ impl WakeCheck {
         }
     }
 
-    /// Notes that `peer`'s session `session_id` ended, which ends its wait
-    /// and answers its wake.
+    /// Notes that `peer`'s session `session_id` ended, which ends its wait,
+    /// and keeps who ended it, which decides whether that answers its wake.
     fn ended(&mut self, peer: &ZakuraPeerId, session_id: u64) {
         if self
             .waiting
@@ -345,6 +362,139 @@ impl WakeCheck {
         self.evidence.push(WakeFact::Ended {
             peer: peer.clone(),
             session_id,
+            by: self.sessions.ended_by(session_id),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use zakura_network::zakura::ZakuraPeerId;
+    use zakura_scheduler::SimInstant;
+
+    use super::{WakeEvidence, WakeFact};
+    use crate::{
+        domain::header_sync::{capacity_release_wakes, WakeView, CAPACITY_RELEASE_WAKES},
+        peer::peer_id,
+        property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
+        storage::hex,
+        ActionSource, Boundary, Identity, MemorySink, ObservationLog, PlanInput, Sim, Violation,
+    };
+
+    /// Wake evidence with no tap behind it.
+    #[derive(Clone, Default)]
+    struct Wakes(WakeEvidence);
+
+    impl WakeView for Wakes {
+        fn wake(&self) -> &WakeEvidence {
+            &self.0
+        }
+    }
+
+    impl HasView for Wakes {
+        type View = Wakes;
+
+        /// A copy sharing the store.
+        fn view(&self) -> Wakes {
+            self.clone()
+        }
+
+        /// The store's stamps.
+        fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+            Some(
+                self.0
+                    .facts()
+                    .into_iter()
+                    .map(|(stamp, _)| stamp)
+                    .filter(|stamp| after.is_none_or(|after| *stamp > after))
+                    .collect(),
+            )
+        }
+    }
+
+    /// Opens each wake in `opened` at the boundary after step 1, as a tap
+    /// would.
+    struct Opens {
+        wakes: WakeEvidence,
+        opened: Vec<WakeFact>,
+    }
+
+    impl ActionSource for Opens {
+        fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+        fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the script offers no actions");
+        }
+
+        /// Pushes every wake in `opened` after step 1.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 1 {
+                for fact in self.opened.drain(..) {
+                    self.wakes.push(fact);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A wake for `peer`'s session `session_id`.
+    fn opened(peer: &ZakuraPeerId, session_id: u64) -> WakeFact {
+        WakeFact::Opened {
+            peer: peer.clone(),
+            session_id,
+            at: SimInstant::ZERO,
+        }
+    }
+
+    /// What `capacity-release-wakes` expects of the wake for `peer`'s
+    /// session `session_id`.
+    fn discharged(peer: &ZakuraPeerId, session_id: u64) -> String {
+        format!(
+            "Session(\"{}#{session_id}\") discharged before quiescence",
+            hex(&peer.digest())
+        )
+    }
+
+    /// C21: two wakes one boundary opened, for two peers' sessions, that
+    /// nothing answers are two violations of `capacity-release-wakes`,
+    /// which expire together at quiescence, and the report keeps both,
+    /// each naming its own session.
+    #[test]
+    fn every_unanswered_wake_at_a_boundary_is_reported() {
+        let (first, second) = (peer_id([7; 32], 0), peer_id([7; 32], 1));
+        let wakes = Wakes::default();
+        let mut sim = Sim::new(crate::RunConfig::default(), PlanInput::Bytes(Vec::new()));
+        sim.add_source(Box::new(Opens {
+            wakes: wakes.0.clone(),
+            opened: vec![opened(&first, 3), opened(&second, 4)],
+        }));
+        sim.scheduler().spawn_root("reactor", async {
+            zakura_rt::task::yield_now().await;
+        });
+        let registry =
+            Registry::new(vec![capacity_release_wakes::<Wakes>()]).expect("one property");
+        let mut checker = RegistryChecker::new(
+            registry,
+            Rc::new(wakes),
+            Assumptions::none(),
+            &Sources::observed(&[Source::Schedule, Source::View]),
+        );
+        let report = sim.run(&mut checker, &mut MemorySink::default());
+        let found = |expected: String| Violation {
+            property: CAPACITY_RELEASE_WAKES.to_owned(),
+            step: 2,
+            witness: vec![1, 2],
+            expected,
+            actual: "the scheduler is Quiescent after step 2 with the obligation from step 1 open"
+                .to_owned(),
+        };
+        assert_eq!(
+            report.properties[0].violations,
+            [found(discharged(&first, 3)), found(discharged(&second, 4))]
+        );
     }
 }

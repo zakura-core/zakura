@@ -26,6 +26,16 @@ struct PendingVctLocalPort {
     apply_release: Arc<Notify>,
     prepare_delay: Option<std::time::Duration>,
     apply_delay: Option<std::time::Duration>,
+    /// When set, a continuation locator read finishes after this delay.
+    locator_delay: Option<std::time::Duration>,
+    /// When set, the apply finishes once this time passes, without waking
+    /// its waker, like a result the shared ready queue hasn't shown yet.
+    apply_silent_until: Option<Instant>,
+    /// When set, the apply finishes once this flag is raised, without waking
+    /// its waker.
+    apply_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// When set, the prepare succeeds at once with this target.
+    prepared: std::sync::Mutex<Option<port::PreparedHeaderTarget>>,
     apply_succeeds: bool,
 }
 
@@ -38,6 +48,10 @@ impl PendingVctLocalPort {
             apply_release: Arc::new(Notify::new()),
             prepare_delay: None,
             apply_delay: None,
+            locator_delay: None,
+            apply_silent_until: None,
+            apply_flag: None,
+            prepared: std::sync::Mutex::new(None),
             apply_succeeds,
         }
     }
@@ -49,6 +63,18 @@ impl PendingVctLocalPort {
     fn with_apply_delay(delay: std::time::Duration) -> Arc<Self> {
         let mut port = Self::new(true);
         port.apply_delay = Some(delay);
+        Arc::new(port)
+    }
+
+    fn with_silent_apply(until: Instant) -> Arc<Self> {
+        let mut port = Self::new(true);
+        port.apply_silent_until = Some(until);
+        Arc::new(port)
+    }
+
+    fn with_flagged_apply(flag: Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        let mut port = Self::new(true);
+        port.apply_flag = Some(flag);
         Arc::new(port)
     }
 
@@ -65,7 +91,13 @@ impl port::Port for PendingVctLocalPort {
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
     > {
-        Box::pin(async { Ok(None) })
+        let delay = self.locator_delay;
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                time::sleep(delay).await;
+            }
+            Ok(None)
+        })
     }
 
     fn vct_repair_context(
@@ -105,8 +137,16 @@ impl port::Port for PendingVctLocalPort {
         let calls = self.prepare_calls.clone();
         let release = self.prepare_release.clone();
         let delay = self.prepare_delay;
+        let prepared = self
+            .prepared
+            .lock()
+            .expect("no test panics while holding it")
+            .take();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(prepared) = prepared {
+                return Ok(prepared);
+            }
             match delay {
                 Some(delay) => time::sleep(delay).await,
                 None => release.notified().await,
@@ -129,13 +169,37 @@ impl port::Port for PendingVctLocalPort {
         let calls = self.apply_calls.clone();
         let release = self.apply_release.clone();
         let delay = self.apply_delay;
+        let silent_until = self.apply_silent_until;
+        let flag = self.apply_flag.clone();
+        let self_flagged = flag.is_some();
         let succeeds = self.apply_succeeds;
         let owner = target.owner();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            match delay {
-                Some(delay) => time::sleep(delay).await,
-                None => release.notified().await,
+            if let Some(flag) = flag {
+                std::future::poll_fn(|_| {
+                    if flag.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            match (silent_until, delay) {
+                _ if self_flagged => {}
+                (Some(until), _) => {
+                    std::future::poll_fn(|_| {
+                        if Instant::now() >= until {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await
+                }
+                (None, Some(delay)) => time::sleep(delay).await,
+                (None, None) => release.notified().await,
             }
             if succeeds {
                 Ok(port::ApplyHeaderTargetOutcome::Applied)
@@ -690,11 +754,14 @@ async fn a_cooldown_still_ends_after_a_fatal_local_operation() {
         .reactor
         .report_fatal_vct_local_operation(Instant::now()));
 
+    let limit = fixture.reactor.admitted_peer_limit();
     let cooldown = std::time::Duration::from_secs(15);
-    fixture
-        .reactor
-        .state
-        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    fixture.reactor.state.start_readmission_cooldown(
+        &fixture.peer,
+        Instant::now(),
+        cooldown,
+        limit,
+    );
     fixture.reactor.publish_peer_state();
     assert!(!fixture
         .reactor
@@ -786,6 +853,70 @@ async fn vct_apply_completion_wins_at_the_hard_deadline() {
 /// A newly published snapshot cannot run deadline enforcement ahead of a ready completion.
 #[tokio::test(start_paused = true)]
 async fn ready_vct_completion_precedes_unseen_snapshot_at_deadline() {
+    ready_vct_completion_precedes_unseen_snapshot(false).await;
+}
+
+/// A spent cooperative budget doesn't hide a ready completion from the
+/// top-of-turn drain, so the snapshot probe can't fire the apply's deadline.
+/// The simulator has no Tokio budget, so only this native test guards it.
+#[tokio::test(start_paused = true)]
+async fn a_spent_budget_hides_no_ready_completion() {
+    ready_vct_completion_precedes_unseen_snapshot(true).await;
+}
+
+/// A spent cooperative budget doesn't hide a ready shared storage completion
+/// from a turn's settle either. The locator read waits on a Tokio timer, which
+/// a spent budget would otherwise report as pending.
+#[tokio::test(start_paused = true)]
+async fn a_spent_budget_hides_no_ready_shared_completion() {
+    let delay = std::time::Duration::from_secs(1);
+    let mut port = PendingVctLocalPort::new(true);
+    port.locator_delay = Some(delay);
+    let mut fixture = VctLocalFixture::new(Arc::new(port), HeaderTargetPhase::Applying);
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+    poll_pending_operation(&mut fixture.reactor);
+    time::advance(delay).await;
+
+    while zakura_rt::task::coop::has_budget_remaining() {
+        tokio::task::consume_budget().await;
+    }
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+
+    assert!(
+        fixture.reactor.pending_port_operations.is_empty(),
+        "the settle handles the ready locator read"
+    );
+}
+
+/// Counts the reactor's watch reads.
+#[derive(Debug, Default)]
+struct WatchReads(AtomicUsize);
+
+impl observe::HeaderSyncObserver for WatchReads {
+    /// Counts each `WatchObserved`.
+    fn observe(&self, event: observe::ReactorEvent) {
+        if matches!(event, observe::ReactorEvent::WatchObserved { .. }) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Starts the reactor with an apply that completes at its hard deadline and a
+/// snapshot published at that deadline, after spending the task's coop budget
+/// when `spend_budget` is set. Once the reactor reads the snapshot, checks no
+/// deadline event fired.
+async fn ready_vct_completion_precedes_unseen_snapshot(spend_budget: bool) {
     let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
     let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
     fixture.dispatch();
@@ -802,16 +933,309 @@ async fn ready_vct_completion_precedes_unseen_snapshot_at_deadline() {
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
     snapshot.state_version = snapshot.state_version.checked_next().unwrap();
     updates.send(Some(snapshot)).unwrap();
+    let reads = Arc::new(WatchReads::default());
+    fixture.reactor.startup.observer.0 = Some(reads.clone());
     let shutdown = fixture.reactor.startup.shutdown.clone();
     let mut fatal_events = fixture.fatal_events;
-    let task = tokio::spawn(fixture.reactor.run());
-    tokio::task::yield_now().await;
+    let reactor = fixture.reactor;
+    let task = tokio::spawn(async move {
+        if spend_budget {
+            while zakura_rt::task::coop::has_budget_remaining() {
+                tokio::task::consume_budget().await;
+            }
+        }
+        reactor.run().await;
+    });
+    for _ in 0..1_000 {
+        if reads.0.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        reads.0.load(Ordering::SeqCst) > 0,
+        "the reactor reads the published snapshot"
+    );
     assert!(
         matches!(
             fatal_events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ),
         "the completed operation must be retired before snapshot-triggered maintenance"
+    );
+    assert!(!task.is_finished());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+/// An unrelated completion handled first cannot fire the fatal for a VCT
+/// apply that finished at its hard deadline.
+///
+/// The apply publishes its snapshot before it completes, and the unrelated
+/// locator read sits ahead of it in the ready queue. Handling the read observes
+/// that snapshot while the apply still looks like it's running.
+#[tokio::test(start_paused = true)]
+async fn an_earlier_completion_cannot_fire_the_fatal_for_a_finished_vct_apply() {
+    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
+    let mut snapshot = fixture.reactor.committed_snapshot.clone().unwrap();
+    let (updates, snapshots) = watch::channel(Some(snapshot.clone()));
+    fixture.reactor.startup.committed_snapshots = Some(snapshots);
+    // A new future is queued as ready when it's pushed, so the read comes
+    // before the apply's wake-up at the deadline.
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    updates.send(Some(snapshot)).unwrap();
+
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    let fatal = fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
+    );
+    assert!(!task.is_finished());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+/// A turn's settle polls the VCT local operation directly, so a finished
+/// apply whose wake the shared ready queue hasn't shown can't fire the fatal
+/// in the due maintenance after it.
+#[tokio::test(start_paused = true)]
+async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
+    let port =
+        PendingVctLocalPort::with_silent_apply(Instant::now() + VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+    fixture
+        .reactor
+        .run_due_maintenance(&mut None, Instant::now());
+
+    let fatal = fixture.fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
+    );
+    assert!(fixture.reactor.state.vct_local_operation.is_none());
+    assert!(fixture.reactor.pending_port_operations.is_empty());
+}
+
+/// A turn reads a ready repair status before its due maintenance enforces
+/// the supplier's deadline, so a repair that ended charges its supplier
+/// nothing.
+#[tokio::test(start_paused = true)]
+async fn due_maintenance_reads_a_ready_repair_status_first() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    fixture
+        .reactor
+        .startup
+        .config
+        .max_unproductive_header_requests = 1;
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(fixture.reactor.state.request_deadlines.contains_key(peer));
+    let session = fixture.reactor.sessions[peer].session.clone();
+    let (repairs_tx, repairs_rx) = watch::channel(fixture.reactor.vct_repair_status);
+    let mut repairs = Some(repairs_rx);
+    repairs_tx
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Idle,
+            generation: 99,
+        })
+        .expect("the test holds the receiver");
+    time::advance(fixture.reactor.startup.request_timeout).await;
+
+    fixture
+        .reactor
+        .run_due_maintenance(&mut repairs, Instant::now());
+
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    assert!(
+        !session.cancel_token().is_cancelled(),
+        "the supplier of an ended repair is not charged"
+    );
+}
+
+/// Wakes the reactor's capacity-release arm at the end of every turn, so
+/// that arm is ready whenever the reactor polls its `select!`.
+#[derive(Debug)]
+struct ReleaseEveryTurn(watch::Sender<u64>);
+
+impl observe::HeaderSyncObserver for ReleaseEveryTurn {
+    /// Bumps the release watch as each turn's closing pass starts.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::CauseSet {
+                cause: ReactorCause::Pass
+            }
+        ) {
+            self.0
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+}
+
+/// An input that wins the biased `select!` on every turn can't starve a due
+/// fatal deadline, since each turn runs due maintenance before its `select!`.
+#[tokio::test(start_paused = true)]
+async fn inputs_ready_every_turn_cannot_starve_the_fatal_deadline() {
+    let mut fixture = VctLocalFixture::new(
+        PendingVctLocalPort::pending(true),
+        HeaderTargetPhase::Applying,
+    );
+    fixture.dispatch();
+    let releases = fixture
+        .reactor
+        .peer_work_queue
+        .capacity_release_sender_for_test();
+    let first_release = releases.clone();
+    fixture.reactor.startup.observer =
+        observe::ObserverSlot(Some(Arc::new(ReleaseEveryTurn(releases))));
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let reactor = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    // One release starts the cycle: from then on each turn's closing pass
+    // makes the next `select!` take the release arm.
+    first_release.send_modify(|revision| *revision = revision.wrapping_add(1));
+
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    let mut fatal = None;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+        if let Ok(event) = fatal_events.try_recv() {
+            fatal = Some(event);
+            break;
+        }
+    }
+
+    assert!(
+        fatal.is_some(),
+        "the due fatal deadline runs despite a ready input"
+    );
+    shutdown.cancel();
+    reactor.await.unwrap();
+}
+
+/// A VCT prepare's handler can start an apply that finishes on its first
+/// poll. That apply can't take the drain turn of an older ready completion,
+/// which would leave the older one for a due deadline to charge.
+#[tokio::test(start_paused = true)]
+async fn a_vct_successor_cannot_take_an_older_completions_drain_turn() {
+    let port = PendingVctLocalPort::with_silent_apply(Instant::now());
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Preparing);
+    *port.prepared.lock().unwrap() = Some(prepared_vct_target(
+        &fixture.reactor,
+        &fixture.snapshot,
+        &fixture.peer,
+        fixture.source,
+        fixture.owner,
+        &fixture.context,
+    ));
+    fixture.dispatch();
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+
+    assert_eq!(
+        port.apply_calls.load(Ordering::SeqCst),
+        1,
+        "the prepare's handler started the apply"
+    );
+    assert!(
+        fixture.reactor.pending_port_operations.is_empty(),
+        "the prepare, its apply and the older locator read are all handled"
+    );
+}
+
+/// Finishes the flagged apply while the reactor takes a wire event at the
+/// start of a turn.
+#[derive(Debug)]
+struct FinishDuringEvents(Arc<std::sync::atomic::AtomicBool>);
+
+impl observe::HeaderSyncObserver for FinishDuringEvents {
+    /// Raises the flag when a turn takes a wire event.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::EventTaken {
+                queue: observe::EventQueue::Wire,
+                point: observe::TakePoint::TurnStart,
+                ..
+            }
+        ) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A VCT apply that finishes while the turn handles its events, after the
+/// turn's first settle, still wins over its due fatal deadline.
+#[tokio::test(start_paused = true)]
+async fn an_apply_that_finishes_during_the_turns_events_cannot_fire_the_fatal() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = PendingVctLocalPort::with_flagged_apply(flag.clone());
+    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    fixture.reactor.startup.observer =
+        observe::ObserverSlot(Some(Arc::new(FinishDuringEvents(flag))));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    fixture
+        ._handle
+        .send(Event::PeerDisconnected {
+            peer: other,
+            session_id: 1,
+            reason: "test",
+        })
+        .await
+        .expect("the reactor holds the event queue");
+
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    let fatal = fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
     );
     assert!(!task.is_finished());
     shutdown.cancel();
@@ -1531,6 +1955,134 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
         .copied()
         .expect("the exact repair wire request owns a deadline");
     assert!(deadline >= before + fixture.reactor.startup.request_timeout);
+}
+
+/// A carried replacement budget caps a VCT repair request's timeout, like an
+/// ordinary request's, and is used up.
+#[test]
+fn a_repair_request_uses_a_carried_budget() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let carried = std::time::Duration::from_secs(1);
+    fixture
+        .reactor
+        .state
+        .carry_replaced_request_budget(peer, carried);
+    fixture.schedule();
+    let before = Instant::now();
+    fixture.advertise(&peers, 7);
+    let after = Instant::now();
+
+    assert!(matches!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .map(|active| &active.purpose),
+        Some(HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
+    ));
+    let deadline = fixture.reactor.state.request_deadlines[peer];
+    assert!(deadline >= before + carried && deadline <= after + carried);
+    assert!(fixture.reactor.state.request_deadline_is_carried(peer));
+    assert_eq!(
+        fixture.reactor.state.peers[peer].replaced_request_budget,
+        None
+    );
+}
+
+/// A sole repair supplier that never answers can't replace its session just
+/// before each timeout forever. Each cycle, a fresh session gets the repair
+/// with a full timeout, and the session replacing it just before that timeout
+/// gets the carried second. That timeout costs a strike and requeues the
+/// repair without excluding the supplier, so the strike limit drops the peer.
+#[tokio::test(start_paused = true)]
+async fn a_sole_repair_supplier_cannot_replace_its_way_past_the_timeout() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let timeout = fixture.reactor.startup.request_timeout;
+    let limit = fixture
+        .reactor
+        .startup
+        .config
+        .max_unproductive_header_requests;
+    let left = std::time::Duration::from_secs(1);
+    let (peers, mut outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    let mut session_id = 7;
+    for strike in 1..=limit {
+        for full in [true, false] {
+            if !full {
+                time::advance(timeout - left).await;
+            }
+            session_id += 1;
+            let (replacement, outbound) = fixture.connect(&[0x71], session_id);
+            outbounds.extend(outbound);
+            fixture.advertise(&replacement, session_id);
+            assert_eq!(
+                fixture
+                    .reactor
+                    .peer_work_queue
+                    .active(peer)
+                    .map(|active| active.owner.session_id()),
+                Some(session_id),
+                "session {session_id} holds the repair before strike {strike}"
+            );
+        }
+        time::advance(left).await;
+        fixture.reactor.retire_timed_out_requests(Instant::now());
+
+        if strike < limit {
+            assert_eq!(
+                fixture.reactor.state.peers[peer].unproductive_requests,
+                strike
+            );
+            let task = fixture
+                .reactor
+                .state
+                .vct_repair
+                .current()
+                .expect("the timeout keeps the repair scheduled");
+            assert!(
+                task.tried_sources.is_empty(),
+                "a carried timeout doesn't exclude the supplier"
+            );
+        } else {
+            assert!(
+                !fixture.reactor.sessions.contains_key(peer),
+                "the strike limit drops the supplier"
+            );
+            assert!(fixture
+                .reactor
+                .state
+                .unproductive_peer_cooldowns
+                .contains_key(peer));
+        }
+    }
+}
+
+/// A repair that times out under a full timeout still excludes its supplier
+/// for the episode, as before carried budgets.
+#[tokio::test(start_paused = true)]
+async fn a_full_repair_timeout_still_excludes_the_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(!fixture.reactor.state.request_deadline_is_carried(peer));
+
+    time::advance(fixture.reactor.startup.request_timeout).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+
+    assert_eq!(fixture.reactor.state.peers[peer].unproductive_requests, 1);
+    let task = fixture
+        .reactor
+        .state
+        .vct_repair
+        .current()
+        .expect("the timeout keeps the repair scheduled");
+    assert!(task.tried_sources.contains(&source_id_from_peer(peer)));
 }
 
 #[tokio::test(start_paused = true)]

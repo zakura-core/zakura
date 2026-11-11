@@ -1,0 +1,13 @@
+# Every locator read stops at the finalized anchor while reporting the
+# generation and anchor it reads now. The forks witness's node holds headers
+# above the anchor, so its first read is already wrong, before any round
+# starts, reset lands or apply inserts, and only the locator-result check
+# sees it. The reactor, the subscriber and the queue decide how the
+# witness's rounds start and stage, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

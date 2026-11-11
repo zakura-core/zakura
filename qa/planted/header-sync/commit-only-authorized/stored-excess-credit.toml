@@ -1,0 +1,11 @@
+# The subscription primitive stores one header more of credit than the
+# Open it records grants, while the built Open carries the right credit.
+# The reactor, the subscriber, the subscription primitive and the queue
+# decide how the witness's rounds start, stage and are credited, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

@@ -213,6 +213,13 @@ impl Predicates {
             .unwrap_or_else(|| base.offers(&op.enabled, outcome))
     }
 
+    /// Whether a hold picked operation `id` at its submission, so it
+    /// completes only once that hold opens, or a reply hold did, so its
+    /// reply is delivered only once that hold opens.
+    pub fn holds_op(&self, id: u64) -> bool {
+        self.held(id) || self.reply_held(id)
+    }
+
     /// Whether a reply hold picked operation `id`, so an engine completion
     /// commits it and holds its reply.
     pub fn holds_reply(&self, id: OpId) -> bool {

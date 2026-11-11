@@ -682,11 +682,11 @@ fi
 
 # The workflow projects the release height from a digest-verified
 # release-state bundle. Local callers retain the committed checkpoint plus
-# three days as a fail-safe floor.
+# three days of blocks at target spacing as a fail-safe floor.
 eos_file="crates/zakurad/src/components/sync/end_of_support.rs"
 checkpoint_file="crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 committed_height="$(tail -1 "$checkpoint_file" | cut -d' ' -f1)"
-eos_floor=$((committed_height + 3456))
+eos_floor="$(python3 scripts/release-readiness.py eos-floor --height "$committed_height")"
 if [ -n "$latest_release_state_height" ] \
   && [ "$latest_release_state_height" -gt "$committed_height" ] \
   && [ -z "$release_state_waiver" ]; then
@@ -705,7 +705,7 @@ eos_old="$(
     | grep -oE '[0-9_]+$' | tr -d '_'
 )"
 eos_target="$eos_floor"
-eos_basis="committed checkpoint ${committed_height} + 3456"
+eos_basis="committed checkpoint ${committed_height} + three days of blocks"
 if [ -n "$estimated_release_height" ] \
   && [ "$estimated_release_height" -gt "$eos_target" ]; then
   eos_target="$estimated_release_height"

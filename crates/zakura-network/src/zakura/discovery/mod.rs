@@ -13,6 +13,8 @@ mod runtime;
 mod sequence_file;
 mod service;
 #[cfg(zakura_sim)]
+pub use peer::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
+#[cfg(zakura_sim)]
 pub(crate) use service::discovery_streams;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
@@ -35,7 +37,9 @@ pub(crate) use candidate_dialer::run_native_discovery_dialer;
 pub(crate) use candidate_dialer::{
     insert_static_bootstrap_candidates, spawn_native_discovery_dialer,
 };
-pub(crate) use dialer::{parse_bootstrap_peer, spawn_native_bootstrap_dialer};
+pub(crate) use dialer::{
+    check_bootstrap_dials_fit, parse_bootstrap_peer, spawn_native_bootstrap_dialer,
+};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use peer::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 #[cfg(test)]

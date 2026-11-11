@@ -18,7 +18,8 @@
 //!   Accounting reported from another task fails as `AccountingOffReactor`,
 //!   since then no boundary is known quiet.
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
-//!   a reactor the harness stopped is gone, nothing stays reserved or owned,
+//!   the reactor is gone without unwinding, stopped by the harness or
+//!   exited by itself, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
 //!   storage still holds pending. They're claim rules too, checked on every
 //!   read after the reactor is gone against what storage holds then, and
@@ -55,7 +56,8 @@ pub struct CapacityReading {
     pub locator_permits: usize,
     /// Whether it was compared with the queue's accounting.
     pub compared: bool,
-    /// Whether it was a teardown read, after a stopped reactor was gone.
+    /// Whether it was a teardown read, after the reactor was gone without
+    /// unwinding.
     pub teardown: bool,
 }
 
@@ -151,13 +153,24 @@ impl CapacityEvidence {
     }
 }
 
-/// A rule a read breaks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Broken {
-    /// A claim rule, which a property reports.
-    Claim(Claim, String),
-    /// An integrity rule, which fails the run.
-    Integrity(String),
+/// What a read is judged against from the probe itself: its budget's and
+/// its locator semaphore's sizes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Limits {
+    /// The headers the budget can hold, reserved and owned together.
+    pub(super) capacity: usize,
+    /// The locator permits the semaphore holds.
+    pub(super) locator_capacity: usize,
+}
+
+impl Limits {
+    /// `probe`'s sizes.
+    pub(super) fn of(probe: &HeaderResourceProbe) -> Limits {
+        Limits {
+            capacity: probe.capacity(),
+            locator_capacity: probe.locator_capacity(),
+        }
+    }
 }
 
 /// What a read is checked against.
@@ -177,91 +190,182 @@ pub(super) enum Expected {
     },
 }
 
-/// Checks `read` from `probe` against `expected`, naming the first rule it
-/// breaks, as the module doc lists them. A claim break skips the read's
-/// remaining comparisons.
+/// Checks `read` from a probe of `limits` against `expected`, as the module
+/// doc lists the rules. Returns every claim rule it breaks, in that order,
+/// or the first integrity rule it breaks. An over-capacity read isn't
+/// compared with the queue's accounting, since that integrity break would
+/// fail the run and hide the claim.
 pub(super) fn check(
-    probe: &HeaderResourceProbe,
+    limits: Limits,
     read: HeaderResources,
     expected: Expected,
-) -> Result<(), Broken> {
+) -> Result<Vec<(Claim, String)>, String> {
+    let mut broken = Vec::new();
     let claimed = read.reserved.saturating_add(read.owned);
-    if claimed > probe.capacity() {
-        return Err(Broken::Claim(
+    if claimed > limits.capacity {
+        broken.push((
             Claim::BudgetOverCapacity,
             format!(
                 "BudgetOverCapacity: the header budget holds {} reserved and {} owned, over \
                  its {} headers",
-                read.reserved,
-                read.owned,
-                probe.capacity()
+                read.reserved, read.owned, limits.capacity
             ),
         ));
     }
-    check_accounting(probe, read, expected)
-}
-
-/// The rest of [`check`]: the read against the queue's accounting, which
-/// integrity rules check, or the teardown baseline, which claim rules
-/// check.
-fn check_accounting(
-    probe: &HeaderResourceProbe,
-    read: HeaderResources,
-    expected: Expected,
-) -> Result<(), Broken> {
     match expected {
-        Expected::Live { accounted: None } => Ok(()),
+        Expected::Live { accounted: None } => {}
+        Expected::Live { .. } if !broken.is_empty() => {}
         Expected::Live {
             accounted: Some((reserved, owned)),
         } => {
             if read.reserved != reserved {
-                Err(Broken::Integrity(format!(
+                return Err(format!(
                     "ReservedMismatch: at a quiet boundary the header budget holds {} \
                      reserved, and the queue's accounting {reserved}",
                     read.reserved
-                )))
-            } else if read.owned != owned {
-                Err(Broken::Integrity(format!(
+                ));
+            }
+            if read.owned != owned {
+                return Err(format!(
                     "OwnedMismatch: at a quiet boundary the header budget holds {} owned, \
                      and the queue's accounting {owned}",
                     read.owned
-                )))
-            } else {
-                Ok(())
+                ));
             }
         }
         Expected::Teardown { storage_permits } => {
-            let free = probe.locator_capacity().saturating_sub(storage_permits);
+            let free = limits.locator_capacity.saturating_sub(storage_permits);
             if read.reserved != 0 {
-                Err(Broken::Claim(
+                broken.push((
                     Claim::TeardownReserved,
                     format!(
-                        "TeardownReserved: the stopped reactor is gone with {} headers still \
+                        "TeardownReserved: the reactor is gone with {} headers still \
                          reserved",
                         read.reserved
                     ),
-                ))
-            } else if read.owned != 0 {
-                Err(Broken::Claim(
+                ));
+            }
+            if read.owned != 0 {
+                broken.push((
                     Claim::TeardownOwned,
                     format!(
-                        "TeardownOwned: the stopped reactor is gone with {} headers still owned",
+                        "TeardownOwned: the reactor is gone with {} headers still owned",
                         read.owned
                     ),
-                ))
-            } else if read.locator_permits != free {
-                Err(Broken::Claim(
+                ));
+            }
+            if read.locator_permits != free {
+                broken.push((
                     Claim::TeardownLocatorPermits,
                     format!(
-                        "TeardownLocatorPermits: the stopped reactor is gone with {} of {} \
+                        "TeardownLocatorPermits: the reactor is gone with {} of {} \
                          locator permits free, and storage holds {storage_permits}",
-                        read.locator_permits,
-                        probe.locator_capacity()
+                        read.locator_permits, limits.locator_capacity
                     ),
-                ))
-            } else {
-                Ok(())
+                ));
             }
         }
+    }
+    Ok(broken)
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_network::zakura::observe::HeaderResources;
+
+    use super::{check, Expected, Limits};
+    use crate::harness::header_node::claim::Claim;
+
+    /// A probe of 10 headers and 4 locator permits.
+    const LIMITS: Limits = Limits {
+        capacity: 10,
+        locator_capacity: 4,
+    };
+
+    /// A read of `reserved` and `owned` headers with `locator_permits`
+    /// free.
+    fn read(reserved: usize, owned: usize, locator_permits: usize) -> HeaderResources {
+        HeaderResources {
+            reserved,
+            owned,
+            locator_permits,
+        }
+    }
+
+    /// The claims `check` finds, by rule.
+    fn claims(read: HeaderResources, expected: Expected) -> Vec<Claim> {
+        check(LIMITS, read, expected)
+            .expect("no integrity rule")
+            .into_iter()
+            .map(|(claim, _)| claim)
+            .collect()
+    }
+
+    /// C21: a teardown read that breaks several claim rules reports each,
+    /// in the module doc's order, not just the first. Each rule alone
+    /// breaks only itself, and a clean read breaks none.
+    #[test]
+    fn a_teardown_read_reports_every_claim_it_breaks() {
+        let teardown = Expected::Teardown { storage_permits: 1 };
+        assert_eq!(claims(read(0, 0, 3), teardown), []);
+        assert_eq!(claims(read(1, 0, 3), teardown), [Claim::TeardownReserved]);
+        assert_eq!(claims(read(0, 1, 3), teardown), [Claim::TeardownOwned]);
+        assert_eq!(
+            claims(read(0, 0, 4), teardown),
+            [Claim::TeardownLocatorPermits]
+        );
+        assert_eq!(
+            claims(read(1, 2, 2), teardown),
+            [
+                Claim::TeardownReserved,
+                Claim::TeardownOwned,
+                Claim::TeardownLocatorPermits
+            ]
+        );
+        assert_eq!(
+            claims(read(6, 5, 3), teardown),
+            [
+                Claim::BudgetOverCapacity,
+                Claim::TeardownReserved,
+                Claim::TeardownOwned
+            ]
+        );
+        let details: Vec<String> = check(LIMITS, read(1, 2, 2), teardown)
+            .expect("no integrity rule")
+            .into_iter()
+            .map(|(_, detail)| detail)
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "TeardownReserved: the reactor is gone with 1 headers still reserved",
+                "TeardownOwned: the reactor is gone with 2 headers still owned",
+                "TeardownLocatorPermits: the reactor is gone with 2 of 4 locator \
+                 permits free, and storage holds 1",
+            ]
+        );
+    }
+
+    /// A live read over capacity reports the claim and skips the
+    /// accounting comparison, and a quiet read off the accounting fails
+    /// the run with its first mismatch.
+    #[test]
+    fn a_live_read_judges_capacity_before_accounting() {
+        let quiet = Expected::Live {
+            accounted: Some((0, 0)),
+        };
+        assert_eq!(claims(read(6, 5, 4), quiet), [Claim::BudgetOverCapacity]);
+        assert_eq!(
+            check(LIMITS, read(1, 1, 4), quiet).map(|claims| claims.len()),
+            Err(
+                "ReservedMismatch: at a quiet boundary the header budget holds 1 reserved, \
+                 and the queue's accounting 0"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            claims(read(1, 1, 4), Expected::Live { accounted: None }),
+            []
+        );
     }
 }

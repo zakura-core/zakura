@@ -497,7 +497,9 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     allow_cross_address_bit: bool,
 ) -> Result<Option<orchard::ShieldedData>, SerializationError> {
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
-    let actions: Vec<orchard::Action> = reader.read_value()?;
+    // The actions' points are decompressed together once the whole list is read.
+    let actions: Vec<orchard::ActionEncoding> = reader.read_value()?;
+    let actions = orchard::ActionEncoding::decompress(actions)?;
 
     // "The fields flagsOrchard, valueBalanceOrchard, anchorOrchard, sizeProofsOrchard,
     // proofsOrchard , and bindingSigOrchard are present if and only if nActionsOrchard > 0."

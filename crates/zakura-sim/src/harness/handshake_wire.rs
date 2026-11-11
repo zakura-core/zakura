@@ -82,7 +82,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -93,6 +93,14 @@ impl Subsystem for Wire {
             u64::try_from(scenario.peers.len())
                 .expect("peer count fits u64")
                 .saturating_mul(2_000),
+        );
+        config.budget = config.budget.max(
+            scenario
+                .peers
+                .iter()
+                .map(|peer| u64::try_from(peer.script.len()).expect("script length fits u64"))
+                .sum::<u64>()
+                .saturating_mul(1_000),
         );
         config
     }
@@ -280,7 +288,7 @@ impl Subsystem for Wire {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
         let mut scenario = Scenario::default();
         let mut script = HandshakeSpec::default();
-        match byte(0) % 8 {
+        match byte(0) % 9 {
             0 => script.control = HELLO_FAULTS[usize::from(byte(1)) % HELLO_FAULTS.len()],
             1 => {
                 scenario.peers[0] = PeerSpec::listening();
@@ -362,7 +370,23 @@ impl Subsystem for Wire {
                     .collect();
                 return scenario;
             }
-            _ => unreachable!("eight families"),
+            8 => {
+                if byte(1) != 0 {
+                    scenario.net.default_link.min_delay_ms = 0;
+                    scenario.net.default_link.max_delay_ms = 0;
+                    scenario.peers[0].script = vec![
+                        crate::peer::PeerAction::Open {
+                            kind: u16::MAX,
+                            version: 1,
+                        };
+                        usize::from(byte(1).min(64))
+                    ];
+                    scenario.peers[0]
+                        .script
+                        .push(crate::peer::PeerAction::Close);
+                }
+            }
+            _ => unreachable!("nine families"),
         }
         for peer in &mut scenario.peers {
             peer.handshake = Some(script.clone());
@@ -428,7 +452,7 @@ mod tests {
 
     #[test]
     fn draws_round_trip_millisecond_timing_and_address_families() {
-        for family in 0..8 {
+        for family in 0..9 {
             let mut bytes = [179; Wire::SCENARIO_BYTES];
             bytes[0] = family;
             let scenario = Wire::draw(&bytes);

@@ -1971,6 +1971,28 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// The handler created a peer's stream setup.
+    StreamSetupStarted {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// Configured burst and refill per second.
+        rate: u32,
+    },
+    /// Actual per-connection stream owners and semaphore capacity.
+    StreamLoad {
+        /// Owners waiting for setup.
+        setup: usize,
+        /// Owners running a worker.
+        installed: usize,
+        /// Owners retained after their worker stopped.
+        retiring: usize,
+        /// Free stream permits.
+        available: usize,
+        /// Negotiated stream limit.
+        capacity: usize,
+        /// Configured stream-open burst and refill per second.
+        rate: u32,
+    },
     /// The control exchange captured the node's capability mask.
     HandshakeCapabilities {
         /// The TLS connection identity.

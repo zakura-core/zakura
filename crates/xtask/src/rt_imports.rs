@@ -130,7 +130,22 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 38] = [
+const ALLOWED: [(&str, &str, &str); 41] = [
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",

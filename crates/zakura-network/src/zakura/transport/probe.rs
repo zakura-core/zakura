@@ -9,7 +9,15 @@
 use std::sync::{Arc, Weak};
 
 use zakura_quic::{ConnLoad, LoadProbe};
-use zakura_rt::{sim::in_boundary_read, sync::Semaphore};
+use zakura_rt::{
+    sim::in_boundary_read,
+    sync::{
+        counter::{AtomicUsize, Ordering},
+        Semaphore,
+    },
+};
+
+use super::lifetime::{OwnerPhase, OWNER_PHASES};
 
 use crate::zakura::regulation::OutputByteBudget;
 
@@ -118,6 +126,9 @@ pub struct ConnectionProbe {
     quic: LoadProbe,
     receive_window: u64,
     kinds: Vec<KindProbe>,
+    streams: Weak<Semaphore>,
+    stream_owners: Weak<[AtomicUsize; OWNER_PHASES]>,
+    stream_limits: super::super::ZakuraConnectionLimits,
 }
 
 /// One stream kind's raw and output gates on one connection.
@@ -157,6 +168,8 @@ impl GateProbe {
 /// One [`ConnectionProbe`] read.
 #[derive(Clone, Debug)]
 pub struct ConnectionSample {
+    /// Stream owners and their enforcement permits at this boundary.
+    pub streams: StreamSample,
     /// The QUIC receive window the connection set for the kinds it
     /// negotiated, before credit holds.
     pub receive_window: u64,
@@ -165,6 +178,23 @@ pub struct ConnectionSample {
     pub quic: Option<ConnLoad>,
     /// Each negotiated kind's gates.
     pub kinds: Vec<KindSample>,
+}
+
+/// A connection's stream owners and configured bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSample {
+    /// Owners waiting for stream or session setup.
+    pub setup: usize,
+    /// Owners with running workers.
+    pub installed: usize,
+    /// Owners retained after their worker stopped.
+    pub retiring: usize,
+    /// Available stream permits, or the capacity once the pool is gone.
+    pub available: usize,
+    /// Negotiated maximum concurrent streams.
+    pub capacity: usize,
+    /// Configured stream-open burst and refill per second.
+    pub rate: u32,
 }
 
 /// One kind's gates in a [`ConnectionSample`].
@@ -188,11 +218,17 @@ impl ConnectionProbe {
     pub(crate) fn new<'g>(
         quic: LoadProbe,
         receive_window: u64,
+        streams: &Arc<Semaphore>,
+        stream_owners: &Arc<[AtomicUsize; OWNER_PHASES]>,
+        stream_limits: super::super::ZakuraConnectionLimits,
         gates: impl IntoIterator<Item = (u16, &'g OutputByteBudget, &'g OutputByteBudget)>,
     ) -> Self {
         ConnectionProbe {
             quic,
             receive_window,
+            streams: Arc::downgrade(streams),
+            stream_owners: Arc::downgrade(stream_owners),
+            stream_limits,
             kinds: gates
                 .into_iter()
                 .map(|(kind, raw, output)| KindProbe {
@@ -215,7 +251,25 @@ impl ConnectionProbe {
             in_boundary_read(),
             "a connection probe reads only inside a boundary read"
         );
+        let owners = self.stream_owners.upgrade();
+        let count = |phase: OwnerPhase| {
+            owners
+                .as_ref()
+                .map_or(0, |owners| owners[phase as usize].load(Ordering::Relaxed))
+        };
+        let capacity = usize::from(self.stream_limits.max_open_streams);
         ConnectionSample {
+            streams: StreamSample {
+                setup: count(OwnerPhase::Setup),
+                installed: count(OwnerPhase::Installed),
+                retiring: count(OwnerPhase::Retiring),
+                available: self
+                    .streams
+                    .upgrade()
+                    .map_or(capacity, |streams| streams.peek_available()),
+                capacity,
+                rate: self.stream_limits.stream_open_rate_per_second,
+            },
             receive_window: self.receive_window,
             quic: self.quic.read(),
             kinds: self

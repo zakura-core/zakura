@@ -419,6 +419,7 @@ pub struct TransportTap {
     role: TapRole,
     /// The last load it logged for each connection it samples.
     loads: BTreeMap<u64, TransportFact>,
+    stream_loads: BTreeMap<u64, TransportFact>,
     handshake_load: Option<TransportFact>,
 }
 
@@ -598,6 +599,11 @@ impl TransportObserver for TapObserver {
     }
     /// Buffers `event`, as [`TapState::push`] does.
     fn observe(&self, event: TransportEvent) {
+        if matches!(event, TransportEvent::StreamSetupStarted { .. })
+            && !self.0.handshake_sampling.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.0.push(Reported::Event(event));
     }
 
@@ -730,6 +736,7 @@ impl TransportTap {
             shared_ids: SharedIds::default(),
             role,
             loads: BTreeMap::new(),
+            stream_loads: BTreeMap::new(),
             handshake_load: None,
         };
         (observer, tap)
@@ -825,7 +832,23 @@ impl TransportTap {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         for (conn_id, probe) in probes {
-            let load = load(&zakura_rt::sim::boundary_read(|| probe.read()));
+            let sample = zakura_rt::sim::boundary_read(|| probe.read());
+            if self.state.handshake_sampling.load(Ordering::Relaxed) {
+                let streams = sample.streams;
+                let load = TransportFact::StreamLoad {
+                    setup: streams.setup,
+                    installed: streams.installed,
+                    retiring: streams.retiring,
+                    available: streams.available,
+                    capacity: streams.capacity,
+                    rate: streams.rate,
+                };
+                if self.stream_loads.get(&conn_id) != Some(&load) {
+                    self.stream_loads.insert(conn_id, load.clone());
+                    self.state.push(Reported::Load { conn_id, load });
+                }
+            }
+            let load = load(&sample);
             if self.loads.get(&conn_id) != Some(&load) {
                 self.loads.insert(conn_id, load.clone());
                 self.state.push(Reported::Load { conn_id, load });
@@ -902,6 +925,15 @@ impl TransportTap {
             }
         };
         Ok(match event {
+            TransportEvent::StreamSetupStarted {
+                conn_id,
+                quic_stream,
+                rate,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::StreamSetupStarted { quic_stream, rate },
+            ),
             TransportEvent::HandshakeCapabilities {
                 remote,
                 shared_id,

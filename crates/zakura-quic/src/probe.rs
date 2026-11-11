@@ -49,12 +49,12 @@ pub struct SlotProbe(Arc<zakura_rt::sync::counter::AtomicUsize>);
 
 impl SlotProbe {
     pub(crate) fn finish(&self) {
-        self.0.store(1, std::sync::atomic::Ordering::Release);
+        self.0.store(1, zakura_rt::sync::counter::Ordering::Release);
     }
 
     /// Reads the completed slot release without adding a scheduling point.
     pub fn released(&self) -> bool {
         assert!(in_boundary_read(), "slot probes require a boundary read");
-        self.0.load(std::sync::atomic::Ordering::Acquire) == 1
+        self.0.load(zakura_rt::sync::counter::Ordering::Acquire) == 1
     }
 }

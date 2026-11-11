@@ -105,6 +105,15 @@ impl HandshakePause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TransportEvent {
+    /// The handler created an inbound stream setup after concurrency and rate admission.
+    StreamSetupStarted {
+        /// The registered connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream being read.
+        quic_stream: u64,
+        /// The configured burst and refill per second.
+        rate: u32,
+    },
     /// The handshake captured its local capability mask.
     HandshakeCapabilities {
         /// The remote endpoint.

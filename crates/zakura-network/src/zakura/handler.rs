@@ -3585,7 +3585,10 @@ impl ZakuraProtocolHandler {
         self.resources.report_usage(limits_owner_bound);
         #[cfg(zakura_sim)]
         if let Some(observer) = &self.transport_observer {
-            observer.connection(conn_id, connection_resources.probe(connection.load_probe()));
+            observer.connection(
+                conn_id,
+                connection_resources.probe(connection.load_probe(), &stream_sem, limits),
+            );
         }
         // Set once, for the kinds this connection negotiated (zakura-quic
         // API-9). The handshake window stays inside it for the control stream.
@@ -4283,6 +4286,14 @@ impl ZakuraProtocolHandler {
         let is_initiator = admission.is_initiator;
         let close_cause = admission.close_cause.clone();
         let connection_token = admission.connection_token.clone();
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = close_cause.tap() {
+            tap.emit(super::TransportEvent::StreamSetupStarted {
+                conn_id: tap.conn_id(),
+                quic_stream: io.streams().0.id(),
+                rate: limits.stream_open_rate_per_second,
+            });
+        }
         Some(Box::pin(async move {
             let (send, recv) = io.streams();
             let prelude = match read_stream_prelude(recv, limits.prelude_timeout).await {

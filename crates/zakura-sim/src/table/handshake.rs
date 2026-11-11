@@ -97,6 +97,16 @@ pub const ACK: &[&str] = &[
 pub fn properties<S: HasView>() -> Vec<Property<S>> {
     let mut properties = Vec::new();
     properties.push(Property {
+        id: PropertyId::new("session/stream-opens-bounded"),
+        claim: "Setup and installed stream owners stay within the negotiated limit; inbound setup starts stay within the configured burst and refill rate, and teardown returns every stream permit.",
+        kind: Kind::Safety,
+        assumes: &[], needs: &[Source::Closes], status: Status::Active,
+        check: check_stream_opens::<S>,
+        witness: Some(TriggerHistory::Log(|log| log.entries().iter().any(|entry| matches!(entry.obs,
+            Observation::Transport { event: TransportFact::StreamSetupStarted { .. }, .. }
+        )))),
+    });
+    properties.push(Property {
         id: PropertyId::new("session/renegotiation-covers-inflight-handshakes"),
         claim: "Capability enablement closes every connection whose handshake captured the old capability mask.",
         kind: Kind::Liveness { bound: LivenessBound::BeforeQuiescence },
@@ -1122,6 +1132,103 @@ where
     match finding {
         Some(actual) => cx.violated(
             "an installed stream has fixture-negotiated permission on a live connection",
+            actual,
+        ),
+        None => Verdict::Holds,
+    }
+}
+
+/// Counts created stream setups, independently of the limiter's decisions.
+fn check_stream_opens<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    use std::collections::{BTreeMap, BTreeSet};
+    if !cx.observations().any(|obs| {
+        matches!(
+            obs,
+            Observation::Transport {
+                event: TransportFact::StreamSetupStarted { .. }
+                    | TransportFact::StreamLoad { .. }
+                    | TransportFact::TornDown,
+                ..
+            }
+        )
+    }) {
+        return Verdict::NotApplicable;
+    }
+    let mut now = 0u64;
+    let mut balances = BTreeMap::new();
+    let mut loads = BTreeMap::new();
+    let mut torn_down = BTreeSet::new();
+    let mut finding = None;
+    for entry in cx.log.entries() {
+        if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+        }
+        let Observation::Transport {
+            instance,
+            connection: Some(connection),
+            event,
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        if let TransportFact::StreamLoad {
+            available,
+            capacity,
+            ..
+        } = event
+        {
+            loads.insert((*instance, *connection), (*available, *capacity));
+        }
+        if matches!(event, TransportFact::TornDown) {
+            torn_down.insert((*instance, *connection));
+        }
+        match event {
+            TransportFact::StreamLoad {
+                setup,
+                installed,
+                available,
+                capacity,
+                ..
+            } if setup + installed > *capacity || available > capacity => {
+                finding = Some(format!("connection {connection}: {setup} setup, {installed} installed, {available} free, capacity {capacity}"));
+                break;
+            }
+            TransportFact::StreamSetupStarted { quic_stream, rate } => {
+                // Credits use billionths of a token, so refill never rounds upward.
+                let capacity = u128::from(*rate) * 1_000_000_000;
+                let (credit, last) = balances
+                    .entry((*instance, *connection))
+                    .or_insert((capacity, now));
+                *credit = credit
+                    .saturating_add(u128::from(now - *last) * u128::from(*rate))
+                    .min(capacity);
+                *last = now;
+                if *credit < 1_000_000_000 {
+                    finding = Some(format!("connection {connection} started stream {quic_stream} without stream-open credit"));
+                    break;
+                }
+                *credit -= 1_000_000_000;
+            }
+            _ => {}
+        }
+    }
+    if finding.is_none() {
+        for connection in torn_down {
+            if let Some((available, capacity)) = loads.get(&connection) {
+                if available != capacity {
+                    finding = Some(format!(
+                        "torn-down connection {connection:?} retains {} stream permits",
+                        capacity.saturating_sub(*available)
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    match finding {
+        Some(actual) => cx.violated(
+            "stream owners and setup starts respect the connection's bounds",
             actual,
         ),
         None => Verdict::Holds,

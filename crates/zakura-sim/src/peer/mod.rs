@@ -1759,7 +1759,13 @@ impl PeerTask {
                     self.readiness.taken();
                     self.taken += 1;
                     match action {
-                        PeerAction::Open { kind, version } => open(conn, kind, version).await,
+                        PeerAction::Open { kind, version } => {
+                            if let Some((id, code)) = open(conn, kind, version).await {
+                                if self.spec.handshake.is_some() {
+                                    self.record(remote, id, RecordBody::Reset { code });
+                                }
+                            }
+                        }
                         PeerAction::FinishHeader => {
                             let Some(mut stream) = header.take() else {
                                 return self.fail("can't finish-header without a header stream");
@@ -1881,18 +1887,25 @@ impl PeerTask {
 /// Opens a `kind` stream at `version` on `conn` and waits, for at most
 /// [`REFUSAL_WAIT`], for the node to reset it, finish it, or close the
 /// connection.
-async fn open(conn: &Conn, kind: u16, version: u16) {
-    let Ok((mut send, mut recv)) = conn.open_bi().await else {
-        return;
-    };
-    if handshake::write_prelude(&mut send, kind, version)
+async fn open(conn: &Conn, kind: u16, version: u16) -> Option<(u64, u64)> {
+    let (mut send, mut recv) = conn.open_bi().await.ok()?;
+    handshake::write_prelude(&mut send, kind, version)
         .await
-        .is_err()
-    {
-        return;
-    }
-    let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
-    let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
+        .ok()?;
+    let id = recv.id();
+    let refused = async {
+        loop {
+            match recv.read_chunk(64 * 1024).await {
+                Ok(Some(_)) => {}
+                Err(zakura_quic::ReadError::Reset(code)) => return Some((id, code.into_inner())),
+                _ => return None,
+            }
+        }
+    };
+    zakura_rt::time::timeout(REFUSAL_WAIT, refused)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]

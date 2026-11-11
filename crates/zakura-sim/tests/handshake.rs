@@ -57,7 +57,7 @@ fn honest_control_handshake_holds() {
 
 #[test]
 fn every_family_draws_a_conformant_control_exchange() {
-    for family in 0..8 {
+    for family in 0..9 {
         let mut input = [0; Wire::SCENARIO_BYTES];
         input[0] = family;
         let report = run(Wire::draw(&input));
@@ -398,4 +398,55 @@ fn installed_services_follow_each_peers_negotiation() {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn invalid_stream_churn_obeys_the_open_rate() {
+    use zakura_sim::{observe::TransportFact, Observation};
+    let report = run(Wire::draw(include_bytes!(
+        "fixtures/handshake-stream-churn.bin"
+    )));
+    assert_held(&report, "session/stream-opens-bounded");
+    zakura_sim::witness::judge_report::<Wire>(
+        &report,
+        "session/stream-opens-bounded",
+        zakura_sim::witness::Expect::Holds,
+    )
+    .unwrap();
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(
+            entry.obs,
+            Observation::Transport {
+                event: TransportFact::TornDown,
+                ..
+            }
+        )),
+        "the churn witness must tear down and return its permits"
+    );
+    assert!(
+        report
+            .log
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry.obs, Observation::PeerStreamReset { code: 3, .. })),
+        "the peer must receive a stream-open rate refusal"
+    );
+    let starts = report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Transport {
+                    event: TransportFact::StreamSetupStarted { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        starts >= 32,
+        "the hostile peer must consume the initial stream-open burst; got {starts}"
+    );
 }

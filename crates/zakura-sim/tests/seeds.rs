@@ -71,6 +71,25 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
     }
+    if stem == "handshake-stream-churn" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction},
+        };
+        let mut scenario = Scenario::default();
+        scenario.net.default_link.min_delay_ms = 0;
+        scenario.net.default_link.max_delay_ms = 0;
+        scenario.peers[0].handshake = Some(HandshakeSpec::default());
+        scenario.peers[0].script = vec![
+            PeerAction::Open {
+                kind: u16::MAX,
+                version: 1
+            };
+            64
+        ];
+        scenario.peers[0].script.push(PeerAction::Close);
+        return value(scenario);
+    }
     if stem == "handshake-installed-services" {
         use zakura_sim::{
             harness::handshake_wire::Scenario,

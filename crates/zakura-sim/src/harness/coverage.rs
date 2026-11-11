@@ -279,6 +279,14 @@ const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: "session/stream-opens-bounded",
+        passing: passes(
+            "tests/handshake.rs",
+            "invalid_stream_churn_obeys_the_open_rate",
+        ),
+        bypass: Bypass::Planted("no-stream-open-charge"),
+    },
+    Coverage {
         property: "session/installed-services-authorized",
         passing: passes(
             "tests/handshake.rs",

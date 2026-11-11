@@ -7,3 +7,5 @@ The retained witness requires `handshake/ack/conformant-never-refused` to hold b
 ```sh
 cargo xtask planted loop --only handshake/ack/conformant-never-refused --generate-runs 100 --generate-harness handshake/wire
 ```
+
+Required failure: the run ends at `handshake/ack/conformant-never-refused`.

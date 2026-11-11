@@ -7,3 +7,5 @@ The retained witness requires `handshake/prelude/conformant-never-refused` to ho
 ```sh
 cargo xtask planted loop --only handshake/prelude/conformant-never-refused --generate-runs 100 --generate-harness handshake/wire
 ```
+
+Required failure: the run ends at `handshake/prelude/conformant-never-refused`.

@@ -7,3 +7,7 @@ Both control roles must fail their `refusal-releases-slot` property. Run the cas
 ```sh
 cargo xtask planted loop --only handshake/hello/refusal-releases-slot --only handshake/ack/refusal-releases-slot --generate-runs 100 --generate-harness handshake/wire
 ```
+
+Required failure: the run ends at `handshake/hello/refusal-releases-slot`.
+
+Required failure: the run ends at `handshake/ack/refusal-releases-slot`.

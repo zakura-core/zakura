@@ -25,15 +25,28 @@ With `--generate-runs <n>`, the loop also gives each case generator lanes:
 committed input here and under `qa/planted`. Each input starts with one of
 the harness's scenario families' tags, or none, picked uniformly.
 `--generate-harness` picks the harness, `auto` by default.
+`--generate-harness-runs <harness>=<n>` gives one harness its own count, for
+a harness whose runs take seconds.
 `--generate-mode libfuzzer` runs one campaign per seed for
 `--generate-seconds` instead, from an empty corpus and with no exclusions.
-A kill must confirm in a fresh process, and the loop shrinks its trace. One
+A kill must confirm in a fresh process, and the loop shrinks its trace. The
+loop then replays the shrunk trace on the unpatched build. If the unpatched
+build violates the same ID, the lane is `baseline-fails` and the report lists
+a property finding, because the bug is in the pinned revision. One
 search per harness and seed runs on the unpatched build first, and one that
 a run failure ended reruns alone. A confirmed violation there is a property
 finding in the report. Any other search that isn't clean is a generator
 baseline failure. Either way that lane is `baseline-fails`. A property that
 no generator harness reaches has a `[[no-generator]]` record in
 `work-list.toml` with the reason.
+
+Every lane that survived, or that another rule killed, needs a triage record
+in `triage.toml`: the case's patch and property, the lane (`witness` or the
+generator harness), the causal-chain stage where the bug stopped
+(`generator`, `schedule`, `observation`, `property` or `unsupported`), the
+reason, and an optional tracking issue. The loop copies each record onto the
+lanes it names, lists records that name no such lane as stale, and prints how
+many lanes still need one.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out
 <dir>` runs the loop with generator lanes on the cases changed since the

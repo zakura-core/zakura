@@ -25,7 +25,7 @@ use super::{
         GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill,
         Lanes, OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
-    parse_flags, planted_cases, selects, summarize, test_executables, BaselineReport,
+    parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
     BuildIdentity, CaseReport, GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
@@ -777,6 +777,7 @@ fn the_report_round_trips_and_counts_by_property() {
         rerun_alone: reason == Some(Reason::Oom),
         generator: Vec::new(),
         no_generator: None,
+        triage: None,
     };
     let cases = vec![
         case(Class::KilledByNamedRule, None, NAMED),
@@ -1710,6 +1711,10 @@ fn generate_flags_parse_and_refuse_bad_values() {
             "libfuzzer",
             "--generate-seconds",
             "30",
+            "--generate-harness-runs",
+            "block-sync/storage=20",
+            "--generate-harness-runs",
+            "discovery/wire=1000",
         ]
         .map(str::to_owned)
         .into_iter(),
@@ -1723,9 +1728,15 @@ fn generate_flags_parse_and_refuse_bad_values() {
             harness: Some("block-sync/storage".to_owned()),
             mode: GenerateMode::Libfuzzer,
             seconds: 30,
+            harness_runs: BTreeMap::from([
+                ("block-sync/storage".to_owned(), 20),
+                ("discovery/wire".to_owned(), 1000),
+            ]),
         }
     );
     assert!(flags.generate.on());
+    assert_eq!(flags.generate.runs_for("block-sync/storage"), 20);
+    assert_eq!(flags.generate.runs_for("block/work-funding"), 2000);
     let off = parse_flags(
         ["--out", "o", "--generate-harness", "auto"]
             .map(str::to_owned)
@@ -1740,6 +1751,26 @@ fn generate_flags_parse_and_refuse_bad_values() {
         &["--out", "o", "--generate-seeds", "1,,2"],
         &["--out", "o", "--generate-mode", "afl"],
         &["--out", "o", "--generate-seconds", "0"],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "block-sync/storage",
+        ],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "block-sync/storage=0",
+        ],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "x=1",
+            "--generate-harness-runs",
+            "x=2",
+        ],
     ] {
         assert!(
             parse_flags(bad.iter().map(|s| (*s).to_owned())).is_err(),
@@ -1795,6 +1826,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         rerun_alone: false,
         generator,
         no_generator: no_generator.map(str::to_owned),
+        triage: None,
     };
     let cases = vec![
         case(
@@ -1824,6 +1856,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         generate: Some(GenerateConfig {
             mode: GenerateMode::Inproc,
             runs: 2000,
+            harness_runs: BTreeMap::from([("block-sync/storage".to_owned(), 20)]),
             seeds: vec![11],
             harness: "auto".to_owned(),
             seconds: None,
@@ -1918,4 +1951,125 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
     .unwrap();
     assert!(plain.get("generate").is_none());
     assert!(plain.get("property_findings").is_none());
+}
+
+/// A triage record lands on each lane it names that needs triage: the
+/// witness lane, or every seed of a generator harness. A record that names
+/// no such lane is stale, and every lane that needs triage without one
+/// counts as untriaged.
+#[test]
+fn triage_records_land_on_the_lanes_they_name() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    assert!(
+        triage::read(root.path()).unwrap().is_empty(),
+        "no file, no records"
+    );
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "witness"
+stage = "observation"
+reason = "the harness never records the dropped frame"
+issue = "#2266"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+stage = "generator"
+reason = "honest mirrors only"
+
+[[triage]]
+patch = "gone.patch"
+property = "{NAMED}"
+lane = "witness"
+stage = "property"
+reason = "stale"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    assert_eq!(records.len(), 3);
+
+    let lane = |harness: &str, seed, class| {
+        GeneratorReport::unsearched(
+            harness,
+            seed,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, None, "why"),
+        )
+    };
+    let witness = |class| CaseReport {
+        patch: "p.patch".to_owned(),
+        patch_sha256: String::new(),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result: classify::Classified::new(class, None, "why"),
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 1,
+            rerun_alone: false,
+        },
+        millis: None,
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator: vec![
+            lane("block-sync/storage", 11, Class::Survived),
+            lane("block-sync/storage", 23, Class::KilledByOtherRule),
+            lane("block-sync/storage", 47, Class::KilledByNamedRule),
+            lane("block-sync/wire", 11, Class::Survived),
+        ],
+        no_generator: None,
+        triage: None,
+    };
+    let mut cases = vec![witness(Class::Survived)];
+    assert_eq!(triage::untriaged(&cases), 4);
+    let stale = triage::apply(&mut cases, &records);
+    assert_eq!(stale, vec![&records[2]]);
+    let case = &cases[0];
+    assert_eq!(
+        case.triage.as_ref().unwrap().stage,
+        triage::Stage::Observation
+    );
+    assert_eq!(
+        case.triage.as_ref().unwrap().issue.as_deref(),
+        Some("#2266")
+    );
+    let stages: Vec<_> = case
+        .generator
+        .iter()
+        .map(|lane| lane.triage.as_ref().map(|triage| triage.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            Some(triage::Stage::Generator),
+            Some(triage::Stage::Generator),
+            None,
+            None
+        ]
+    );
+    assert_eq!(triage::untriaged(&cases), 1, "block-sync/wire seed 11");
+
+    // A kill by the named rule needs no triage, so its record is stale.
+    let mut killed = vec![witness(Class::KilledByNamedRule)];
+    killed[0].generator.clear();
+    assert_eq!(triage::apply(&mut killed, &records).len(), 3);
+    assert_eq!(killed[0].triage, None);
 }

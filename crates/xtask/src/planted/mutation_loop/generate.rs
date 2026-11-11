@@ -16,6 +16,10 @@
 //!   reports the property, else on the first harness that does, as
 //!   `zakura-sim generators` lists them. `--generate-harness <name>` runs
 //!   every case on that harness.
+//! - **Budget.** An `inproc` search draws `--generate-runs` inputs, or the
+//!   count `--generate-harness-runs <harness>=<n>` sets for its harness. A
+//!   harness whose runs take seconds gets a smaller count, and the report
+//!   records it.
 //! - **Baselines.** One search per harness and seed runs on the unpatched
 //!   build first. A search that a run failure ended, such as an OOM, a
 //!   timeout or a signal, reruns alone with the host's memory. A search
@@ -71,8 +75,10 @@ use super::{
         CampaignBounds, CampaignFacts, LaneError, LaneSpec, EXPECT_VAR,
     },
     classify::{self, kill_violations, Class, Classified, GenerateFacts, GenerateStop, Reason},
-    host_memory, key, scoped, Built, LoopCase, Ran, Runnable, Runner, Slot, BASELINE_DEADLINE,
-    DEADLINE_FACTOR, MIN_DEADLINE, WORK_LIST,
+    host_memory, key, scoped,
+    triage::Triage,
+    Built, LoopCase, Ran, Runnable, Runner, Slot, BASELINE_DEADLINE, DEADLINE_FACTOR, MIN_DEADLINE,
+    WORK_LIST,
 };
 use crate::{
     planted::pilot::hex,
@@ -148,6 +154,9 @@ pub(in crate::planted) struct GenerateFlags {
     pub(in crate::planted) mode: GenerateMode,
     /// `--generate-seconds`: a `libfuzzer` campaign's budget.
     pub(in crate::planted) seconds: u64,
+    /// `--generate-harness-runs`: the runs an `inproc` search on a harness
+    /// draws instead of `runs`.
+    pub(in crate::planted) harness_runs: BTreeMap<String, u64>,
 }
 
 impl Default for GenerateFlags {
@@ -158,6 +167,7 @@ impl Default for GenerateFlags {
             harness: None,
             mode: GenerateMode::Inproc,
             seconds: DEFAULT_SECONDS,
+            harness_runs: BTreeMap::new(),
         }
     }
 }
@@ -180,6 +190,18 @@ impl GenerateFlags {
                     .collect::<Result<_, _>>()?;
             }
             "--generate-harness" => self.harness = (value != "auto").then(|| value.to_owned()),
+            "--generate-harness-runs" => {
+                let (harness, runs) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("{flag} takes `<harness>=<runs>`, not `{value}`"))?;
+                let runs = number(runs)?;
+                if runs == 0 {
+                    return Err(format!("{flag} takes a positive count"));
+                }
+                if self.harness_runs.insert(harness.to_owned(), runs).is_some() {
+                    return Err(format!("{flag} gives {harness} twice"));
+                }
+            }
             "--generate-mode" => {
                 self.mode = match value {
                     "inproc" => GenerateMode::Inproc,
@@ -206,6 +228,11 @@ impl GenerateFlags {
     pub(in crate::planted) fn on(&self) -> bool {
         self.runs > 0
     }
+
+    /// The runs an `inproc` search on `harness` draws.
+    pub(in crate::planted) fn runs_for(&self, harness: &str) -> u64 {
+        self.harness_runs.get(harness).copied().unwrap_or(self.runs)
+    }
 }
 
 /// The generator lanes' setup, as the report records it.
@@ -214,6 +241,10 @@ pub(in crate::planted) struct GenerateConfig {
     pub(in crate::planted) mode: GenerateMode,
     /// The runs an `inproc` search draws.
     pub(in crate::planted) runs: u64,
+    /// The runs an `inproc` search on each of these harnesses draws
+    /// instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::planted) harness_runs: BTreeMap<String, u64>,
     pub(in crate::planted) seeds: Vec<u64>,
     /// `auto`, or the one harness every lane searches.
     pub(in crate::planted) harness: String,
@@ -276,6 +307,9 @@ pub(in crate::planted) struct GeneratorReport {
     /// The shrunk trace's replay on the unpatched build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) unpatched: Option<UnpatchedCheck>,
+    /// The lane's recorded triage ([`super::triage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) triage: Option<Triage>,
     /// The search's evidence, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) log: Option<PathBuf>,
@@ -325,6 +359,7 @@ impl GeneratorReport {
             confirmation: None,
             shrunk: None,
             unpatched: None,
+            triage: None,
             log: None,
         }
     }
@@ -1016,6 +1051,7 @@ impl Runner {
         let config = GenerateConfig {
             mode: flags.mode,
             runs: flags.runs,
+            harness_runs: flags.harness_runs.clone(),
             seeds: flags.seeds.clone(),
             harness: flags.harness.clone().unwrap_or_else(|| "auto".to_owned()),
             seconds: libfuzzer.then_some(flags.seconds),
@@ -1069,7 +1105,7 @@ impl Runner {
                 let runnable = Runnable::Generate {
                     harness: harness.to_owned(),
                     seed,
-                    runs: lanes.flags.runs,
+                    runs: lanes.flags.runs_for(harness),
                     exclude: lanes.exclude.clone(),
                 };
                 Searched::Inproc(self.witness(slot, built, &runnable, dir, source, deadline, cap)?)

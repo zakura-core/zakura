@@ -1,0 +1,10 @@
+# Triage for the mutation loop's non-kills (mutation plan, mut-5). See
+# README.md. One record per lane that survived or that another rule killed:
+#
+# [[triage]]
+# patch = "<the report's patch>"
+# property = "<the case's property>"
+# lane = "witness"          # or the generator harness, for every seed
+# stage = "generator"       # generator, schedule, observation, property or unsupported
+# reason = "<why the lane stopped there>"
+# issue = "#1234"           # optional

@@ -87,6 +87,7 @@ mod classify;
 mod generate;
 #[cfg(test)]
 mod tests;
+mod triage;
 
 use classify::{Class, Classified, Ended, GenerateFacts, Observed, Reason, Trigger};
 use generate::{
@@ -242,6 +243,9 @@ pub(super) struct CaseReport {
     /// Why the case has no generator lane, with the lanes on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) no_generator: Option<String>,
+    /// The witness lane's recorded triage ([`triage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) triage: Option<triage::Triage>,
 }
 
 /// The unpatched witness's run for a case's property.
@@ -459,7 +463,14 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let _ = remove_worktree(repo_root, &slot.tree);
         let _ = fs::remove_dir_all(&slot.target);
     }
-    let outcome = outcome?;
+    let mut outcome = outcome?;
+    let records = triage::read(repo_root)?;
+    for stale in triage::apply(&mut outcome.cases, &records) {
+        println!(
+            "stale triage: {} {} {}: no such lane needs triage",
+            stale.patch, stale.property, stale.lane
+        );
+    }
     let report = Report {
         schema: SCHEMA,
         pinned,
@@ -511,8 +522,10 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         );
     }
     println!(
-        "{} cases; report in {}",
+        "{} cases, {} lanes untriaged ({}); report in {}",
         report.cases.len(),
+        triage::untriaged(&report.cases),
+        triage::TRIAGE_FILE,
         flags.out.join(REPORT_FILE).display()
     );
     Ok(())
@@ -1145,6 +1158,7 @@ impl Runner {
                 rerun_alone: false,
                 generator: Vec::new(),
                 no_generator: lanes.and_then(|lanes| lanes.plans[index].clone().err()),
+                triage: None,
             }
         };
         // Gives each case's generator lanes, which didn't search, `result`.

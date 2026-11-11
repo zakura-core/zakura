@@ -255,10 +255,11 @@ pub struct StepCtx<'a> {
     /// The scheduler's status after the step.
     pub status: Status,
     /// Whether the run is quiescent after the step: no task can run, and no
-    /// source action is eligible in the step's phase. Live, that's an
-    /// enabled or quiet action, so a completion a hold hides doesn't count.
-    /// In the drain, it's a recovery action, quiet or not. A boundary ahead
-    /// never counts. A `BeforeQuiescence` obligation expires here.
+    /// source work is eligible in the step's phase. Live, that's an enabled
+    /// or quiet action, so a completion a hold hides doesn't count, and a
+    /// boundary ahead doesn't either. In the drain, it's a recovery action,
+    /// quiet or not, or a recovery boundary ahead, which the drain's clock
+    /// moves to. A `BeforeQuiescence` obligation expires here.
     pub quiescent: bool,
     /// Every observation so far.
     pub log: &'a ObservationLog,

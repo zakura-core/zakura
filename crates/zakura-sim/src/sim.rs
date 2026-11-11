@@ -30,7 +30,9 @@ use zakura_scheduler::{
 };
 
 use crate::{
-    action::{enabled_set, Action, ActionSource, DrainClock, EnabledInputs, Offer, SourceId},
+    action::{
+        enabled_set, Action, ActionSource, Boundary, DrainClock, EnabledInputs, Offer, SourceId,
+    },
     check::{Checker, OpenKind, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
@@ -757,8 +759,16 @@ impl Sim {
             let after = self.sched().now();
             let next_offers = self.offers(phase, after, ready.is_empty());
             let status = self.sched().status();
+            // In the drain, a recovery boundary ahead is work the clock can
+            // still reach, such as a delivery whose window hasn't opened.
             let quiescent = status != Status::Running
-                && next_offers.iter().all(|offer| offer.actions.is_empty());
+                && next_offers.iter().all(|offer| {
+                    offer.actions.is_empty()
+                        && (phase == Phase::Live
+                            || offer.boundaries.iter().all(|boundary| match *boundary {
+                                Boundary::Opens(t) | Boundary::Deadline(t) => t <= after,
+                            }))
+                });
             let cx = StepCtx {
                 step: st.step,
                 pick: &chosen.identity,

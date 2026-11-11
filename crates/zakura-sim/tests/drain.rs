@@ -1349,3 +1349,59 @@ fn the_drain_delivers_a_fake_datagram_in_flight() {
         drain_picks(&report)
     );
 }
+
+/// Opens an obligation for each `request-*` exit that a fake network
+/// delivery discharges.
+fn requests_delivered(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    let at: Vec<usize> = cx
+        .observations()
+        .enumerate()
+        .filter(|(_, obs)| exit_of(obs, "request"))
+        .map(|(at, _)| at)
+        .collect();
+    for at in &at {
+        let obligation = cx.obligation(
+            Some(*at),
+            Subject::Owner("p1".to_owned()),
+            |_, obs| matches!(obs, Observation::Fake { event, .. } if event.starts_with("deliver")),
+        );
+        cx.oblige(obligation);
+    }
+    Verdict::Holds
+}
+
+/// Terra 1, round 2: a drain step with a recovery boundary ahead isn't
+/// quiescent, so a `BeforeQuiescence` obligation the delivery at that
+/// boundary discharges waits for the clock to reach it instead of expiring
+/// against a correct sender.
+#[test]
+fn a_recovery_boundary_ahead_keeps_the_drain_from_quiescence() {
+    let net = FakeNet::new(Duration::from_millis(5), Duration::from_millis(10), 0);
+    let sender = net.clone();
+    let report = checked(
+        config(2, 1),
+        world(),
+        vec![Property {
+            check: requests_delivered,
+            ..served_within(LivenessBound::BeforeQuiescence)
+        }],
+        Assumptions::none(),
+        |sim| {
+            sim.add_source(Box::new(net.clone()));
+            sim.scheduler().spawn_root("request-p1", async move {
+                yields(3).await;
+                sender.send("node->p1");
+            });
+            // Keeps the live phase busy until the budget, so the request
+            // exits in the drain.
+            sim.scheduler().spawn_root("busy", yields(20));
+        },
+    );
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert_eq!(net.in_flight(), 0);
+    assert!(
+        matches!(outcome(&report, &SERVED), PropertyOutcome::Held { .. }),
+        "{:?}",
+        outcome(&report, &SERVED)
+    );
+}

@@ -189,6 +189,7 @@ proptest! {
                     prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
                     if let Some(delivery) = model[usize::from(id)].as_mut() {
                         delivery.retry_ms = now_ms + 100;
+                        delivery.deferred = None;
                     }
                 }
                 Input::StatusChange => latest += 1,

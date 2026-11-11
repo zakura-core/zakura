@@ -57,8 +57,12 @@ impl StatusDelivery {
 
     /// Back off a full queue or an unwritten previous Status without waiting
     /// for the next cadence interval.
+    ///
+    /// This drops any cadence deferral, whose time has passed, so a new tip
+    /// waits for the back-off instead of retrying at once.
     pub(super) fn queue_full(&mut self, now: Instant) {
         self.retry_at = now + QUEUE_RETRY_INTERVAL;
+        self.deferred = None;
     }
 }
 
@@ -124,6 +128,26 @@ mod tests {
         );
         delivery.queued(latest);
         assert_eq!(delivery.next_deadline(latest, true), None);
+    }
+
+    /// Queue pressure on a new tip backs off instead of reusing an older
+    /// cadence deferral, whose time is already past.
+    #[test]
+    fn queue_pressure_after_a_deferral_backs_off_a_new_tip() {
+        let now = Instant::now();
+        let mut delivery = StatusDelivery::new(now);
+        delivery.queued(status(1_000, 6_000));
+        let deferred = status(1_000, 6_001);
+        delivery.deferred_until(deferred, now, now + Duration::from_secs(1));
+        let new_tip = status(1_000, 6_002);
+        let pressure_at = now + Duration::from_secs(2);
+        assert_eq!(delivery.next_deadline(new_tip, true), Some(now));
+
+        delivery.queue_full(pressure_at);
+        assert_eq!(
+            delivery.next_deadline(new_tip, true),
+            Some(pressure_at + QUEUE_RETRY_INTERVAL)
+        );
     }
 
     #[test]

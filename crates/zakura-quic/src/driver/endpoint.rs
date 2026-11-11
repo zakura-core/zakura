@@ -509,7 +509,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                     return;
                 };
                 // ADM-7: count the handshake from Accept until it finishes.
-                let pending = self.shared.pending.enter(pending_group);
+                let pending = self.shared.pending.enter(pending_group, acceptor.clone());
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));

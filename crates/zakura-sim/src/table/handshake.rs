@@ -210,11 +210,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::Closes],
-            status: if id == "handshake/pending-bounded" {
-                Status::Known { issue: 2341 }
-            } else {
-                Status::Active
-            },
+            status: Status::Active,
             check: check_counts::<S>,
             witness: Some(TriggerHistory::PropertyLog(admission_reached)),
         });
@@ -941,7 +937,10 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             }
             "handshake/pending-bounded" => {
                 let inbound_cap = cap - if *cap >= 2 { (cap / 4).max(1) } else { 0 };
-                if pending + quic_pending > *cap || inbound + quic_pending > inbound_cap {
+                // The synchronous handoff counts one owner in both stages until QUIC releases it.
+                if *quic_handoffs == 0
+                    && (pending + quic_pending > *cap || inbound + quic_pending > inbound_cap)
+                {
                     return cx.violated(
                         format!("pending <= {cap}; inbound <= {inbound_cap}"),
                         format!("control {pending}/{inbound}, QUIC {quic_pending}"),

@@ -1236,5 +1236,15 @@
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-admission/ignore-transport-reservations/ignore-transport-reservations.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/pending-bounded",
+    "witness": {
+      "test": "pending_transport_load_bounds_outbound_control_handshakes",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
   }
 ]

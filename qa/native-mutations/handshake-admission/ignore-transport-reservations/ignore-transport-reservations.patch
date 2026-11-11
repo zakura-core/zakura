@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/transport/handshake_counts.rs
++++ b/crates/zakura-network/src/zakura/transport/handshake_counts.rs
+@@ -218,7 +218,7 @@
+             }
+             self.claim_transferred_pending();
+         } else {
+-            if self.transport_pending().saturating_add(self.pending) >= cap {
++            if self.pending >= cap {
+                 return false;
+             }
+             self.pending += 1;

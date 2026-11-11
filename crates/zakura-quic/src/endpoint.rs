@@ -86,6 +86,11 @@ pub trait Acceptor: Send + Sync + 'static {
     /// Runs synchronously on the endpoint task, after `admit` returned `Accept`.
     fn cancel_admission(&self, _incoming: &IncomingInfo) {}
 
+    /// Ends application transport accounting for an accepted attempt not cancelled above.
+    /// When `handed_off` is true, `handle` has synchronously taken responsibility
+    /// for the reservation. Otherwise the application must release it here.
+    fn finish_admission(&self, _handed_off: bool) {}
+
     /// ALPNs to offer, in preference order (WIRE-2).
     fn alpns(&self) -> Vec<Vec<u8>>;
 
@@ -837,7 +842,6 @@ pub(crate) async fn inbound_handshake(
     };
     // `handle` runs before the pending count drops, so an acceptor that moves
     // the connection into its own accounting there leaves no gap (ADM-7).
-    #[cfg(zakura_sim)]
     let pending = pending.handoff();
     let handled = acceptor.handle(Conn::new(conn, remote_id, remote, alpn));
     drop(pending);
@@ -1127,14 +1131,14 @@ impl PendingTable {
             .unwrap_or(0)
     }
 
-    pub(crate) fn enter(&self, ip: IpAddr) -> PendingGuard {
+    pub(crate) fn enter(&self, ip: IpAddr, acceptor: Arc<dyn Acceptor>) -> PendingGuard {
         let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         counts.total += 1;
         *counts.by_ip.entry(ip).or_default() += 1;
         PendingGuard {
             table: self.clone(),
             ip,
-            #[cfg(zakura_sim)]
+            acceptor,
             handing_off: false,
         }
     }
@@ -1144,13 +1148,13 @@ impl PendingTable {
 pub(crate) struct PendingGuard {
     table: PendingTable,
     ip: IpAddr,
-    #[cfg(zakura_sim)]
+    acceptor: Arc<dyn Acceptor>,
     handing_off: bool,
 }
 
-#[cfg(zakura_sim)]
 impl PendingGuard {
     fn handoff(mut self) -> Self {
+        #[cfg(zakura_sim)]
         self.table.1.fetch_add(1, Ordering::Relaxed);
         self.handing_off = true;
         self
@@ -1171,6 +1175,8 @@ impl Drop for PendingGuard {
         if self.handing_off {
             self.table.1.fetch_sub(1, Ordering::Relaxed);
         }
+        drop(counts);
+        self.acceptor.finish_admission(self.handing_off);
     }
 }
 
@@ -1467,6 +1473,42 @@ impl Drop for ConnectionSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_transport_owner_releases_application_reservation() {
+        struct AcceptorWithReservation(std::sync::atomic::AtomicUsize);
+        impl Acceptor for AcceptorWithReservation {
+            fn admit(&self, _: &IncomingInfo) -> Admit {
+                Admit::Accept
+            }
+            fn finish_admission(&self, handed_off: bool) {
+                self.0.fetch_add(
+                    if handed_off { 10 } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+            fn handle(&self, _: Conn) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+        let acceptor = Arc::new(AcceptorWithReservation(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let pending = PendingTable::default();
+        let owner = pending.enter("192.0.2.1".parse().unwrap(), acceptor.clone());
+        assert_eq!(pending.total(), 1);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(owner);
+        assert_eq!(pending.total(), 0);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let owner = pending.enter("192.0.2.2".parse().unwrap(), acceptor.clone());
+        drop(owner.handoff());
+        assert_eq!(pending.total(), 0);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 11);
+    }
 
     #[test]
     fn transport_rejections_cancel_only_accepted_application_admission() {

@@ -53,7 +53,7 @@ const MACHINE: Machine = Machine {
         (
             PENDING,
             "QUIC and control handshakes stay within total, inbound and address bounds.",
-            Status::Known { issue: 2341 },
+            Status::Active,
         ),
         (
             ADDRESS,
@@ -184,7 +184,11 @@ fn release(counts: &mut HandshakeCounts, owner: Owner) {
 
 fn release_handshake(counts: &mut HandshakeCounts, owner: Owner) {
     match owner.phase {
-        Phase::Quic => {}
+        Phase::Quic => {
+            if owner.inbound {
+                counts.release_transport();
+            }
+        }
         Phase::Control => {
             counts.release_pending(owner.inbound);
             if owner.inbound {
@@ -352,6 +356,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 active |= admitted;
                 let admitted =
                     admitted && (!inbound || cadence.attempt(&mut counts, host, ip, &mut failures));
+                let admitted = admitted && (!inbound || counts.claim_transport(PENDING_CAP));
                 // Count actual admitted owners. Bounds below judge the admission decision.
                 if admitted {
                     owners[slot] = Some(Owner {
@@ -378,8 +383,16 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 let view = expected(&owners);
                 let connection_claimed =
                     !owner.inbound || counts.claim_connection(true, CONNECTION_CAP);
-                let claimed =
-                    connection_claimed && counts.claim_pending(owner.inbound, PENDING_CAP);
+                let claimed = connection_claimed
+                    && if owner.inbound {
+                        counts.claim_transferred_pending();
+                        true
+                    } else {
+                        counts.claim_pending(false, PENDING_CAP)
+                    };
+                if owner.inbound && !claimed {
+                    counts.release_transport();
+                }
                 if !owner.inbound
                     && view.pending - view.inbound_pending < PENDING_CAP - INBOUND_CAP
                     && !claimed
@@ -467,6 +480,13 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             .flatten()
             .filter(|owner| owner.inbound && owner.phase == Phase::Quic)
             .count();
+        if counts.transport_pending() != quic_total {
+            failure(
+                &mut failures,
+                COUNTS,
+                "transport reservations differ from live owners",
+            );
+        }
         let per_host_full = (0..HOSTS).any(|host| {
             let quic = owners
                 .iter()
@@ -522,7 +542,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let actual = actual(&counts);
     let expected = CountsView::default();
     let mut failures = Vec::new();
-    if actual != expected {
+    if actual != expected || counts.transport_pending() != 0 {
         failure(&mut failures, COUNTS, "teardown retained a charge");
     }
     history.push((
@@ -618,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_control_claims_ignore_pending_quic_owners() {
+    fn outbound_control_claims_include_pending_quic_owners() {
         let mut input = Vec::new();
         for slot in 0..24u8 {
             let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
@@ -628,25 +648,17 @@ mod tests {
             input.extend([1, slot, 0, 2, slot, 0]);
         }
         let steps = history(&input);
-        let MachineStep::Handshake(last) = &steps.last().unwrap().1 else {
+        let MachineStep::Handshake(last) = &steps[steps.len() - 2].1 else {
             panic!("the admission harness records handshake steps");
         };
-        assert_eq!(last.actual.pending, 9);
+        assert_eq!(last.actual.pending, 8);
         assert_eq!(last.actual.inbound_pending, 0);
-        assert_eq!(last.failures.len(), 1);
-        assert_eq!(last.failures[0].0, PENDING);
-        assert_eq!(
-            last.failures[0].1.message,
-            "live handshake owners exceed a pending bound"
-        );
-        assert!(steps[..steps.len() - 1]
-            .iter()
-            .all(|(_, step)| step.failure().is_none()));
+        assert!(steps.iter().all(|(_, step)| step.failure().is_none()));
         (ENTRY.witness)(
             &(ENTRY.draw)(&input),
             crate::PlanInput::Bytes(Vec::new()),
             PENDING,
-            crate::witness::Expect::Violated,
+            crate::witness::Expect::Holds,
             &[],
             &mut crate::NullSink,
         )

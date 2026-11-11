@@ -3265,7 +3265,7 @@ impl ZakuraProtocolHandler {
 
     #[cfg(test)]
     async fn accept_connection(&self, connection: Connection) {
-        let claim = self.claim_inbound(&connection);
+        let claim = self.claim_inbound(&connection, false);
         self.serve_inbound(connection, claim).await;
     }
 
@@ -3275,7 +3275,7 @@ impl ZakuraProtocolHandler {
     /// `Acceptor::handle` calls this synchronously, before the transport
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
-    fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
+    fn claim_inbound(&self, connection: &Connection, transfer: bool) -> Option<InboundClaim> {
         #[cfg(zakura_sim)]
         self.observe_handshake_slot(connection);
         transport_observe!(
@@ -3290,6 +3290,7 @@ impl ZakuraProtocolHandler {
             }
         );
         let admission = self.claim_connection(true)?;
+        let pending = self.claim_pending_handshake_with_transfer(true, transfer)?;
         let control_handshake = self
             .supervisor
             .enter_control_handshake(connection.admitted_ip());
@@ -3303,6 +3304,7 @@ impl ZakuraProtocolHandler {
             (admission, control_handshake)
         };
         Some(InboundClaim {
+            pending,
             _admission: admission,
             control_handshake,
         })
@@ -3311,6 +3313,7 @@ impl ZakuraProtocolHandler {
     async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
         let conn_id = trace_conn_id(&connection);
         let Some(InboundClaim {
+            pending,
             _admission,
             control_handshake,
         }) = claim
@@ -3352,7 +3355,12 @@ impl ZakuraProtocolHandler {
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
         let (negotiated, capability_epoch) = match self
-            .run_native_responder_handshake_with_permit(&connection, &remote_peer_id, &conn)
+            .run_native_responder_handshake_with_permit(
+                &connection,
+                &remote_peer_id,
+                &conn,
+                Some(pending),
+            )
             .await
         {
             Ok(negotiated) => negotiated,
@@ -3442,6 +3450,14 @@ impl ZakuraProtocolHandler {
 
     /// Charges the machine and semaphore together without an await.
     fn claim_pending_handshake(&self, inbound: bool) -> Option<PendingHandshakeGuard> {
+        self.claim_pending_handshake_with_transfer(inbound, false)
+    }
+
+    fn claim_pending_handshake_with_transfer(
+        &self,
+        inbound: bool,
+        transfer: bool,
+    ) -> Option<PendingHandshakeGuard> {
         let mut counts = self.supervisor.ip_slots.counts();
         // Take the inbound share first, so a refused responder cannot hold a dial slot.
         let inbound_permit = if inbound {
@@ -3450,7 +3466,13 @@ impl ZakuraProtocolHandler {
             None
         };
         let shared = self.pending_handshakes.clone().try_acquire_owned().ok()?;
-        if !counts.claim_pending(inbound, self.limits.max_pending_handshakes) {
+        let claimed = if transfer {
+            counts.claim_transferred_pending();
+            true
+        } else {
+            counts.claim_pending(inbound, self.limits.max_pending_handshakes)
+        };
+        if !claimed {
             return None;
         }
         Some(PendingHandshakeGuard {
@@ -3467,10 +3489,10 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
+        permits: Option<PendingHandshakeGuard>,
     ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
         // The shared permit is taken only once the inbound one is held, so a
         // refused inbound handshake never holds a slot a dial needs.
-        let permits = self.claim_pending_handshake(true);
         let Some(_handshake) = permits else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
@@ -4949,6 +4971,13 @@ impl Acceptor for ZakuraProtocolHandler {
             return Admit::Refuse;
         }
         let mut counts = self.supervisor.ip_slots.counts();
+        if !counts.claim_transport(self.limits.max_pending_handshakes) {
+            return if incoming.validated {
+                Admit::Refuse
+            } else {
+                Admit::Retry
+            };
+        }
         #[cfg(any(test, zakura_sim))]
         let fresh = !counts.has_cadence_host(incoming.remote.ip());
         let cadence = counts.admit_cadence(
@@ -4959,6 +4988,9 @@ impl Acceptor for ZakuraProtocolHandler {
                 .saturating_add(self.limits.max_pending_handshakes),
             Instant::now(),
         );
+        if cadence != super::HandshakeCadenceAdmission::Admit {
+            counts.release_transport();
+        }
         drop(counts);
         #[cfg(any(test, zakura_sim))]
         self.observe_handshake_cadence(
@@ -4984,12 +5016,19 @@ impl Acceptor for ZakuraProtocolHandler {
     }
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
+        self.finish_admission(false);
         self.supervisor
             .ip_slots
             .counts()
             .refund_cadence(incoming.remote.ip(), Instant::now());
         #[cfg(any(test, zakura_sim))]
         self.observe_handshake_cadence(incoming.remote, "cancelled", false);
+    }
+
+    fn finish_admission(&self, handed_off: bool) {
+        if !handed_off {
+            self.supervisor.ip_slots.counts().release_transport();
+        }
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {
@@ -5004,7 +5043,10 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
         let handler = self.clone();
-        let claim = handler.claim_inbound(&connection);
+        let claim = handler.claim_inbound(&connection, true);
+        if claim.is_none() {
+            handler.finish_admission(false);
+        }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
 }
@@ -5012,6 +5054,7 @@ impl Acceptor for ZakuraProtocolHandler {
 /// An inbound connection's share of the connection cap and its per-IP control
 /// handshake slot, held from `Acceptor::handle` on.
 struct InboundClaim {
+    pending: PendingHandshakeGuard,
     _admission: ConnectionAdmissionGuard,
     control_handshake: ControlHandshakeGuard,
 }
@@ -13907,15 +13950,24 @@ mod tests {
                     self.handler.admit(incoming)
                 }
 
+                fn cancel_admission(&self, incoming: &IncomingInfo) {
+                    self.handler.cancel_admission(incoming);
+                }
+
+                fn finish_admission(&self, handed_off: bool) {
+                    self.handler.finish_admission(handed_off);
+                }
+
                 fn alpns(&self) -> Vec<Vec<u8>> {
                     self.handler.alpns()
                 }
 
                 fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
+                    let serving = self.handler.handle(connection.clone());
                     let capture = self.clone();
                     Box::pin(async move {
-                        if capture.accepted.send(connection.clone()).await.is_ok() {
-                            capture.handler.accept_connection(connection).await;
+                        if capture.accepted.send(connection).await.is_ok() {
+                            serving.await;
                         }
                     })
                 }
@@ -14516,6 +14568,7 @@ mod tests {
         // Pending transport handshakes count against the inbound share, which
         // fills before the whole budget does.
         assert_eq!(handler.admit(&attempt(true, 23)), Admit::Accept);
+        handler.finish_admission(false);
         assert_eq!(handler.admit(&attempt(true, 24)), Admit::Refuse);
         assert_eq!(handler.admit(&attempt(false, 24)), Admit::Retry);
 
@@ -14562,6 +14615,53 @@ mod tests {
             0
         );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
+    }
+
+    #[test]
+    fn pending_transport_reservations_bound_outbound_control_claims() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits,
+        );
+        for pending in 0..24 {
+            let incoming = IncomingInfo {
+                remote: SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(
+                        192,
+                        0,
+                        2,
+                        u8::try_from(pending + 1).unwrap(),
+                    )),
+                    8234,
+                ),
+                validated: true,
+                pending_total: pending,
+                pending_from_ip: 0,
+            };
+            assert_eq!(handler.admit(&incoming), Admit::Accept);
+        }
+        let dials: Vec<_> = (0..8)
+            .map(|_| handler.claim_pending_handshake(false).unwrap())
+            .collect();
+        assert!(handler.claim_pending_handshake(false).is_none());
+        let transferred = handler
+            .claim_pending_handshake_with_transfer(true, true)
+            .unwrap();
+        handler.finish_admission(true);
+        assert!(handler.claim_pending_handshake(false).is_none());
+        drop(transferred);
+        let ninth = handler.claim_pending_handshake(false).unwrap();
+        assert!(handler.claim_pending_handshake(false).is_none());
+        for _ in 0..23 {
+            handler.finish_admission(false);
+        }
+        drop((ninth, dials));
+        let counts = handler.supervisor.ip_slots.counts();
+        assert_eq!(counts.transport_pending(), 0);
+        assert_eq!(counts.pending(), 0);
     }
 
     /// Dials may use inbound's unused share, and once they fill the whole cap
@@ -14645,10 +14745,10 @@ mod tests {
         // while a dial still finds a slot.
         let claims: Vec<_> = inbound[..3]
             .iter()
-            .map(|connection| handler.claim_inbound(connection))
+            .map(|connection| handler.claim_inbound(connection, false))
             .collect();
         assert!(claims.iter().all(Option::is_some));
-        assert!(handler.claim_inbound(&inbound[3]).is_none());
+        assert!(handler.claim_inbound(&inbound[3], false).is_none());
         assert_eq!(handler.admission.available_permits(), 1);
         drop(claims);
         assert_eq!(handler.inbound_admission.available_permits(), 3);
@@ -14662,7 +14762,12 @@ mod tests {
                 let peer = ZakuraPeerId::new(connection.remote_id().as_bytes().to_vec())?;
                 let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&connection), &peer);
                 handler
-                    .run_native_responder_handshake_with_permit(&connection, &peer, &conn)
+                    .run_native_responder_handshake_with_permit(
+                        &connection,
+                        &peer,
+                        &conn,
+                        handler.claim_pending_handshake(true),
+                    )
                     .await
                     .map(|_| ())
             }

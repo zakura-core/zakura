@@ -47,6 +47,7 @@ pub struct HandshakeCounts {
     handshaking: HashMap<IpAddr, usize>,
     pending: usize,
     inbound_pending: usize,
+    inbound_reservations: usize,
     connections: usize,
     inbound_connections: usize,
     cadence: HashMap<IpAddr, Bucket>,
@@ -176,14 +177,51 @@ impl HandshakeCounts {
             || transport_pending.saturating_add(self.inbound_pending) >= inbound_share(cap)
     }
 
-    /// Claims a control-handshake permit within the appropriate share.
-    pub fn claim_pending(&mut self, inbound: bool, cap: usize) -> bool {
-        if self.pending >= cap || (inbound && self.inbound_pending >= inbound_share(cap)) {
+    /// Counts transport owners that have not transferred into control handshakes.
+    pub fn transport_pending(&self) -> usize {
+        self.inbound_reservations - self.inbound_pending
+    }
+
+    /// Reserves the shared pending budget before an inbound TLS attempt starts.
+    pub fn claim_transport(&mut self, cap: usize) -> bool {
+        if self.pending_full(self.transport_pending(), cap) {
             return false;
         }
+        self.inbound_reservations += 1;
+        true
+    }
+
+    /// Releases a transport attempt that did not transfer into control accounting.
+    pub fn release_transport(&mut self) {
+        assert!(
+            self.transport_pending() > 0,
+            "an admitted transport owns its reservation"
+        );
+        self.inbound_reservations -= 1;
+    }
+
+    /// Transfers an existing reservation without reacquiring the shared budget.
+    pub fn claim_transferred_pending(&mut self) {
+        assert!(
+            self.transport_pending() > 0,
+            "a handoff owns a transport reservation"
+        );
         self.pending += 1;
+        self.inbound_pending += 1;
+    }
+
+    /// Claims a control-handshake permit within the appropriate share.
+    pub fn claim_pending(&mut self, inbound: bool, cap: usize) -> bool {
         if inbound {
-            self.inbound_pending += 1;
+            if !self.claim_transport(cap) {
+                return false;
+            }
+            self.claim_transferred_pending();
+        } else {
+            if self.transport_pending().saturating_add(self.pending) >= cap {
+                return false;
+            }
+            self.pending += 1;
         }
         true
     }
@@ -199,6 +237,7 @@ impl HandshakeCounts {
                 .inbound_pending
                 .checked_sub(1)
                 .expect("an inbound handshake owns its inbound charge");
+            self.inbound_reservations -= 1;
         }
     }
 
@@ -305,6 +344,28 @@ pub fn inbound_share(cap: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_and_control_share_one_pending_budget() {
+        let mut counts = HandshakeCounts::default();
+        for _ in 0..24 {
+            assert!(counts.claim_transport(32));
+        }
+        assert!(!counts.claim_transport(32));
+        for _ in 0..8 {
+            assert!(counts.claim_pending(false, 32));
+        }
+        assert!(!counts.claim_pending(false, 32));
+        // A handoff replaces its existing reservation even at capacity.
+        counts.claim_transferred_pending();
+        assert!(!counts.claim_pending(false, 32));
+        counts.release_pending(true);
+        assert!(counts.claim_transport(32));
+        // A failed transport attempt frees exactly one place for a dial.
+        counts.release_transport();
+        assert!(counts.claim_pending(false, 32));
+        assert!(!counts.claim_pending(false, 32));
+    }
 
     #[test]
     fn handshake_cadence_charges_refills_and_refunds_one_address() {

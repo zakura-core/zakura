@@ -752,51 +752,6 @@ fn complete_session_transfers_setup_to_installed_owners() {
 }
 
 #[test]
-fn pending_transport_load_exposes_outbound_control_overcommit() {
-    use zakura_sim::{
-        harness::{LinkEntry, LinkSpec},
-        peer::{PeerSpec, NODE_ADDR},
-    };
-    let mut scenario = Scenario::default();
-    scenario.net.default_link = LinkSpec {
-        min_delay_ms: 0,
-        max_delay_ms: 0,
-        reorder: false,
-        loss_budget: 0,
-    };
-    scenario.peers = (0..8).map(|_| PeerSpec::dialing()).collect();
-    for (index, peer) in scenario.peers.iter().enumerate() {
-        scenario.net.links.push(LinkEntry {
-            src: NODE_ADDR,
-            dst: peer.address(index, 0),
-            model: LinkSpec {
-                min_delay_ms: 9_000,
-                max_delay_ms: 9_000,
-                ..scenario.net.default_link
-            },
-        });
-    }
-    scenario.peers.extend((0..32).map(|_| {
-        let mut peer = PeerSpec::listening();
-        peer.handshake = Some(HandshakeSpec {
-            dial_delay_ms: 20,
-            length_delay_ms: 8_000,
-            ..HandshakeSpec::default()
-        });
-        peer
-    }));
-    zakura_sim::witness::witness_into::<Wire>(
-        &scenario,
-        PlanInput::Bytes(Vec::new()),
-        "handshake/pending-bounded",
-        zakura_sim::witness::Expect::Violated,
-        &[],
-        &mut NullSink,
-    )
-    .unwrap();
-}
-
-#[test]
 fn fast_fail_handshakes_exhaust_the_address_cadence() {
     let report = run(Wire::draw(include_bytes!(
         "fixtures/handshake-cadence-burst.bin"
@@ -878,5 +833,79 @@ fn sixteen_conformant_dialers_share_an_address_cadence() {
     assert!(
         admitted >= 32,
         "all sixteen dialers must reach TLS twice; observed {admitted}"
+    );
+}
+
+#[test]
+fn pending_transport_load_bounds_outbound_control_handshakes() {
+    use zakura_sim::{
+        harness::{LinkEntry, LinkSpec},
+        observe::TransportFact,
+        peer::{PeerSpec, NODE_ADDR},
+        Observation,
+    };
+    let mut scenario = Scenario::default();
+    scenario.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        loss_budget: 0,
+    };
+    scenario.peers = (0..8).map(|_| PeerSpec::dialing()).collect();
+    for (index, peer) in scenario.peers.iter().enumerate() {
+        scenario.net.links.push(LinkEntry {
+            src: NODE_ADDR,
+            dst: peer.address(index, 0),
+            model: LinkSpec {
+                min_delay_ms: 9_000,
+                max_delay_ms: 9_000,
+                ..scenario.net.default_link
+            },
+        });
+    }
+    scenario.peers.extend((0..32).map(|_| {
+        let mut peer = PeerSpec::listening();
+        peer.handshake = Some(HandshakeSpec {
+            dial_delay_ms: 20,
+            length_delay_ms: 8_000,
+            ..HandshakeSpec::default()
+        });
+        peer
+    }));
+    let report = run(scenario);
+    assert_held(&report, "handshake/pending-bounded");
+    assert_held(&report, "handshake/counts-match-permits");
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(
+            &entry.obs,
+            Observation::Transport {
+                event: TransportFact::HandshakeCounts {
+                    quic_pending,
+                    pending,
+                    cap,
+                    quic_handoffs: 0,
+                    ..
+                },
+                ..
+            } if *quic_pending > 0 && pending + quic_pending == *cap
+        )),
+        "the witness must fill the combined transport and control budget: {:?}",
+        report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Transport {
+                    event:
+                        TransportFact::HandshakeCounts {
+                            pending,
+                            quic_pending,
+                            ..
+                        },
+                    ..
+                } => Some((*pending, *quic_pending)),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
     );
 }

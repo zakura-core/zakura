@@ -1053,6 +1053,41 @@ fn stranded_work_with_a_timed_obligation_open_fails_the_run() {
     );
 }
 
+/// Sol S3: stranded source work at a quiescent drain step fails the run
+/// before that step's quiescence expires a `BeforeQuiescence` obligation,
+/// which would blame the node for work the harness withheld.
+#[test]
+fn stranded_work_fails_the_run_before_a_quiescent_expiry() {
+    let report = checked(
+        config(2, 1),
+        world(),
+        vec![served_within(LivenessBound::BeforeQuiescence)],
+        Assumptions::none(),
+        |sim| {
+            sim.add_source(Box::new(Stranded));
+            sim.scheduler().spawn_root("request-p1", async {});
+            // Keeps the run from quiescence until the drain.
+            sim.scheduler().spawn_root("busy", yields(20));
+        },
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert_eq!(
+        report.picks.last().map(|pick| pick.phase),
+        Some(Phase::Drain)
+    );
+    assert_eq!(
+        report.end.harness,
+        Some(HarnessFailure::SourceEvidence {
+            source: "source 0".to_owned(),
+            detail: "Stranded: the test's operation can never complete".to_owned(),
+        })
+    );
+    assert_eq!(
+        outcome(&report, &SERVED),
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
+    );
+}
+
 /// The control: a source that holds work at a dry end, with nothing open,
 /// fails the run too.
 #[test]

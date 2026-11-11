@@ -769,6 +769,15 @@ impl Sim {
                 quiescent,
                 log: &st.log,
             };
+            // A quiescent drain step expires `BeforeQuiescence` obligations,
+            // so work no recovery action finishes fails the run first, as
+            // it does before the drain's clock moves. Live, a source's work
+            // can still wait on a step only the live phase offers.
+            if phase == Phase::Drain && quiescent {
+                if let Some(failure) = self.stranded() {
+                    return st.end_harness(failure);
+                }
+            }
             let violation = checker.after_step(&cx);
             if let Some(failure) = self.failure.take().or_else(|| checker.harness_failure()) {
                 return st.end_harness(failure);

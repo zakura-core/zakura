@@ -276,6 +276,57 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
     }
 }
 
+/// Terra 1, round 4: a report that retains a step violation says so, at an
+/// ordinary violation end too, whatever the end closure reported: `Held`,
+/// or `Violated` with an end finding's witness. The outcome's witness is
+/// the first retained violation's.
+#[test]
+fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
+    let end_only = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![5],
+            expected: "an end".into(),
+            actual: "the end".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![5] })
+    };
+    for stop in [
+        PropertyReport::new("test/stop", PropertyOutcome::Held { applicable: 1 }),
+        end_only,
+    ] {
+        let mut checker = FnChecker::new(
+            |cx: &check::StepCtx<'_>| {
+                (cx.step == 5).then(|| Violation {
+                    property: "test/stop".into(),
+                    step: cx.step,
+                    witness: vec![2, 5],
+                    expected: "fewer steps".into(),
+                    actual: "step 5".into(),
+                })
+            },
+            move |_: &RunEnd, _: &ObservationLog| vec![stop.clone()],
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Violation);
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated {
+                witness: vec![2, 5]
+            }
+        );
+    }
+}
+
 /// Sol 2, round 2: a report's end finding that names a step outside the
 /// run is dropped as a harness failure, and the step finding before it
 /// stays, so the trim's count of end findings follows what's left.

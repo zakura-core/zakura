@@ -446,7 +446,8 @@ where
     /// the end, so a harness failure keeps them
     /// ([`PropertyReport::after_harness_failure`]). One the report already
     /// holds as a step finding isn't added again, and one it holds only as
-    /// an end finding moves to the step findings.
+    /// an end finding moves to the step findings. A report left with any
+    /// violation is `Violated` with the first one's witness.
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         let mut reports = (self.end)(end, log);
         for report in &mut reports {
@@ -465,6 +466,13 @@ where
             report.end_found = end_findings.len();
             report.violations.splice(0..0, found);
             report.violations.append(&mut end_findings);
+            // The first retained violation is the outcome's, as for any
+            // report ([`PropertyReport::violations`]).
+            if let Some(first) = report.violations.first() {
+                report.outcome = PropertyOutcome::Violated {
+                    witness: first.witness.clone(),
+                };
+            }
         }
         reports
     }

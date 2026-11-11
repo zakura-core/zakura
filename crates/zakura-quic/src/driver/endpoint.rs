@@ -485,6 +485,15 @@ impl<F: SocketFactory> EndpointTask<F> {
             pending_from_ip: self.shared.pending.for_ip(pending_group),
         };
         let decision = decide(&self.shared.config, acceptor.as_ref(), &info);
+        #[cfg(zakura_sim)]
+        self.shared
+            .pending
+            .record(crate::HandshakeEvent::Admission {
+                incoming: info,
+                decision,
+                max_pending_per_ip: self.shared.config.max_pending_per_ip,
+                retry_threshold: self.shared.config.retry_threshold,
+            });
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
         self.response_buf.clear();
         match decision {
@@ -513,6 +522,11 @@ impl<F: SocketFactory> EndpointTask<F> {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Started {
+                            remote: raw_remote,
+                            deadline: self.shared.config.handshake_timeout(),
+                        });
                         self.tasks.spawn_named(
                             "quic.inbound_handshake",
                             inbound_handshake(

@@ -38,6 +38,12 @@ pub struct Scenario {
     /// A runtime capability change ordered against the control handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_flip: Option<CapabilityFlip>,
+    /// An optional QUIC pending limit for admission-guard scenarios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_pending_per_ip: Option<u32>,
+    /// An optional QUIC Retry threshold for admission-guard scenarios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_retry_threshold: Option<u32>,
 }
 
 /// The reconnect snapshot's order relative to an in-flight handshake.
@@ -58,6 +64,8 @@ impl Default for Scenario {
             net: NetScenario::default(),
             peers: vec![PeerSpec::dialing()],
             capability_flip: None,
+            quic_pending_per_ip: None,
+            quic_retry_threshold: None,
         }
     }
 }
@@ -82,7 +90,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 6;
+    const GENERATOR: u32 = 7;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -178,10 +186,17 @@ impl Subsystem for Wire {
         } else {
             vec![NODE_ADDR]
         };
+        let mut config = super::wire_node::config(&network);
+        if let Some(limit) = scenario.quic_pending_per_ip {
+            config.zakura.quic.max_pending_per_ip = Some(limit);
+        }
+        if let Some(threshold) = scenario.quic_retry_threshold {
+            config.zakura.quic.retry_threshold = Some(threshold);
+        }
         let node = WireNode::spawn_with_services(
             sim,
             header,
-            &network,
+            config,
             net.sim(),
             seed,
             observer,
@@ -299,7 +314,7 @@ impl Subsystem for Wire {
     }
 
     fn families() -> Vec<super::ScenarioFamily> {
-        [
+        let mut families: Vec<_> = [
             "hello",
             "ack",
             "prelude",
@@ -319,11 +334,24 @@ impl Subsystem for Wire {
                 [u8::try_from(index).expect("ten families fit in a byte")],
             )
         })
-        .collect()
+        .collect();
+        for (mode, name) in ["quic-pending", "quic-retry", "quic-timeout"]
+            .into_iter()
+            .enumerate()
+        {
+            families.push(super::ScenarioFamily::new(
+                name,
+                vec![254, u8::try_from(mode).expect("three QUIC modes fit u8")],
+            ));
+        }
+        families
     }
 
     fn draw(prefix: &[u8]) -> Scenario {
         let byte = |index| prefix.get(index).copied().unwrap_or(0);
+        if byte(0) == 254 {
+            return quic_scenario(byte(1) % 3, byte(2));
+        }
         let mut scenario = Scenario::default();
         let mut script = HandshakeSpec::default();
         match byte(0) % 10 {
@@ -471,6 +499,65 @@ impl Subsystem for Wire {
     }
 }
 
+/// Draws production QUIC limits and enough concurrent peers to reach them.
+fn quic_scenario(mode: u8, size: u8) -> Scenario {
+    use super::{LinkEntry, LinkSpec};
+    let mut scenario = Scenario::default();
+    scenario.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        loss_budget: 0,
+    };
+    let count = match mode {
+        0 => {
+            let limit = u32::from(size % 3) + 1;
+            scenario.quic_pending_per_ip = Some(limit);
+            usize::try_from(limit).expect("at most three pending peers") + 1
+        }
+        1 => {
+            let threshold = u32::from(size % 3);
+            scenario.quic_retry_threshold = Some(threshold);
+            usize::try_from(threshold).expect("at most two pending peers") + 2
+        }
+        _ => 1,
+    };
+    scenario.peers = (0..count)
+        .map(|_| {
+            let mut peer = PeerSpec::dialing();
+            if mode == 0 {
+                peer.handshake = Some(HandshakeSpec {
+                    bind_ip: Some("192.0.2.1".parse().expect("fixture IP")),
+                    ..HandshakeSpec::default()
+                });
+            } else if mode == 2 {
+                peer.handshake = Some(HandshakeSpec {
+                    tls_timeout_secs: Some(60),
+                    ..HandshakeSpec::default()
+                });
+            }
+            peer
+        })
+        .collect();
+    for (index, peer) in scenario.peers.iter().enumerate() {
+        let delay = if mode == 2 {
+            15_000 + u64::from(size) * 20
+        } else {
+            500
+        };
+        scenario.net.links.push(LinkEntry {
+            src: NODE_ADDR,
+            dst: peer.address(index, 0),
+            model: LinkSpec {
+                min_delay_ms: delay,
+                max_delay_ms: delay,
+                ..scenario.net.default_link
+            },
+        });
+    }
+    scenario
+}
+
 /// Every independently corruptible hello guard, with the honest case first.
 pub const HELLO_FAULTS: &[ControlFault] = &[
     ControlFault::None,
@@ -528,9 +615,9 @@ mod tests {
 
     #[test]
     fn draws_round_trip_millisecond_timing_and_address_families() {
-        for family in 0..10 {
+        for family in Wire::families() {
             let mut bytes = [179; Wire::SCENARIO_BYTES];
-            bytes[0] = family;
+            bytes[..family.tag.len()].copy_from_slice(&family.tag);
             let scenario = Wire::draw(&bytes);
             let json = serde_json::to_string(&scenario).unwrap();
             assert_eq!(scenario, serde_json::from_str::<Scenario>(&json).unwrap());

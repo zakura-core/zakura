@@ -97,6 +97,37 @@ pub const ACK: &[&str] = &[
 pub fn properties<S: HasView>() -> Vec<Property<S>> {
     let mut properties = Vec::new();
     for (id, claim) in [
+        (
+            "handshake/quic/pending-per-address-bounded",
+            "QUIC refuses an attempt whose address already holds its configured pending limit.",
+        ),
+        (
+            "handshake/quic/retry-before-unvalidated-accept",
+            "QUIC never accepts an unvalidated source at or above its Retry threshold.",
+        ),
+    ] {
+        properties.push(Property {
+            id: PropertyId::new(id),
+            claim,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Closes],
+            status: Status::Active,
+            check: check_quic_admission::<S>,
+            witness: Some(TriggerHistory::PropertyLog(quic_admission_reached)),
+        });
+    }
+    properties.push(Property {
+        id: PropertyId::new("handshake/quic/finishes-in-time"),
+        claim: "An inbound TLS attempt finishes within the ten-second timeout and three-second shutdown allowance.",
+        kind: Kind::Liveness { bound: LivenessBound::VirtualTime(std::time::Duration::from_secs(13)) },
+        assumes: &[], needs: &[Source::Closes], status: Status::Active,
+        check: check_quic_deadline::<S>,
+        witness: Some(TriggerHistory::Log(|log| log.entries().iter().any(|entry| matches!(
+            entry.obs, Observation::Transport { event: TransportFact::QuicHandshakeStarted { deadline_ms: Some(10_000), .. }, .. }
+        )))),
+    });
+    for (id, claim) in [
         ("session/capacity-conserved", "Live reservations, including retained owners, account for every direction and setup permit."),
         ("session/setup-slot-bounded", "Inbound partial sessions leave the outbound setup slot available and release setup permits within the prelude deadline.")
     ] {
@@ -253,6 +284,115 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         });
     }
     properties
+}
+
+fn quic_admission_applies(property: &str, event: &TransportFact) -> bool {
+    let TransportFact::QuicAdmission {
+        validated,
+        pending_total,
+        pending_from_ip,
+        max_pending_per_ip,
+        retry_threshold,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    match property {
+        "handshake/quic/pending-per-address-bounded" => max_pending_per_ip.is_some_and(|limit| {
+            *pending_from_ip >= usize::try_from(limit).expect("QUIC limit fits usize")
+        }),
+        "handshake/quic/retry-before-unvalidated-accept" => {
+            !validated
+                && retry_threshold.is_some_and(|threshold| {
+                    *pending_total >= usize::try_from(threshold).expect("QUIC threshold fits usize")
+                })
+        }
+        _ => false,
+    }
+}
+
+fn quic_admission_reached(property: &str, log: &crate::ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        matches!(&entry.obs,
+            Observation::Transport { event, .. } if quic_admission_applies(property, event)
+        )
+    })
+}
+
+fn check_quic_admission<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut applies = false;
+    for obs in cx.observations() {
+        let Observation::Transport { event, .. } = obs else {
+            continue;
+        };
+        if !quic_admission_applies(cx.id().as_str(), event) {
+            continue;
+        }
+        applies = true;
+        if let TransportFact::QuicAdmission {
+            decision, remote, ..
+        } = event
+        {
+            if decision == "accept" {
+                return cx.violated(
+                    "the endpoint refuses or retries the attempt",
+                    format!("accepted {remote}"),
+                );
+            }
+        }
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn quic_handshake_finished(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::Transport {
+        event: TransportFact::QuicHandshakeFinished { remote, .. }, ..
+    } if key.subject == Subject::Owner(remote.clone()))
+}
+
+fn check_quic_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let mut pending = Vec::new();
+    let mut applies = false;
+    for (at, obs) in cx.observations().enumerate() {
+        let Observation::Transport {
+            event:
+                TransportFact::QuicHandshakeStarted {
+                    remote,
+                    deadline_ms: Some(10_000),
+                },
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        applies = true;
+        let obligation = cx.obligation(
+            Some(at),
+            Subject::Owner(remote.clone()),
+            quic_handshake_finished,
+        );
+        if !cx
+            .log
+            .entries()
+            .iter()
+            .any(|entry| quic_handshake_finished(&obligation.key, &entry.obs))
+        {
+            pending.push(obligation);
+        }
+    }
+    for obligation in pending {
+        cx.oblige(obligation);
+    }
+    if applies {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
 }
 
 fn epoch_closed(key: &ObligationKey, obs: &Observation) -> bool {

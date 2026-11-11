@@ -47,7 +47,7 @@ pub use conn::{
 };
 pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
 #[cfg(zakura_sim)]
-pub use endpoint::{AdmissionProbe, AdmissionSample};
+pub use endpoint::{AdmissionProbe, AdmissionSample, HandshakeEvent};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };

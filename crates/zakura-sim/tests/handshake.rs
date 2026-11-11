@@ -66,22 +66,38 @@ fn honest_control_handshake_holds() {
 
 #[test]
 fn conformant_control_and_prelude_are_accepted() {
-    for family in [0, 1] {
-        let mut input = [0; Wire::SCENARIO_BYTES];
-        input[0] = family;
-        let report = run(Wire::draw(&input));
-        assert_witness_holds(
-            &report,
-            if family == 0 {
-                "handshake/hello/conformant-never-refused"
-            } else {
-                "handshake/ack/conformant-never-refused"
-            },
-        );
-        if family == 0 {
-            assert_witness_holds(&report, "handshake/prelude/conformant-never-refused");
-        }
-    }
+    let report = run(Wire::draw(&[0]));
+    assert_witness_holds(&report, "handshake/hello/conformant-never-refused");
+    assert_witness_holds(&report, "handshake/prelude/conformant-never-refused");
+}
+
+#[test]
+fn conformant_ack_is_accepted() {
+    let report = run(Wire::draw(&[1]));
+    assert_witness_holds(&report, "handshake/ack/conformant-never-refused");
+}
+
+#[test]
+fn quic_pending_limit_refuses_another_tls_attempt() {
+    let report = run(Wire::draw(&[254, 0, 0]));
+    assert_witness_holds(&report, "handshake/quic/pending-per-address-bounded");
+}
+
+#[test]
+fn quic_retry_validates_sources_before_tls() {
+    let report = run(Wire::draw(&[254, 1, 0]));
+    assert_witness_holds(&report, "handshake/quic/retry-before-unvalidated-accept");
+}
+
+#[test]
+fn quic_deadline_ends_a_stalled_tls_attempt() {
+    let report = run(Wire::draw(&[254, 2, 0]));
+    assert_witness_holds(&report, "handshake/quic/finishes-in-time");
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport {
+            event: zakura_sim::observe::TransportFact::QuicHandshakeFinished { error: Some(error), .. }, ..
+        } if error == "QUIC handshake timed out"
+    )), "the production TLS timeout must end the attempt");
 }
 
 #[test]

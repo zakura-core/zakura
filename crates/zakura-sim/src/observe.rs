@@ -1971,6 +1971,37 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// QUIC admission after the acceptor and endpoint guards.
+    QuicAdmission {
+        /// The source socket address.
+        remote: String,
+        /// Whether Retry or another mechanism validated the address.
+        validated: bool,
+        /// Pending TLS attempts on the endpoint.
+        pending_total: usize,
+        /// Pending TLS attempts in this source's admission group.
+        pending_from_ip: usize,
+        /// The production action: accept, refuse, retry, or ignore.
+        decision: String,
+        /// The configured per-address pending limit.
+        max_pending_per_ip: Option<u32>,
+        /// The configured Retry threshold.
+        retry_threshold: Option<u32>,
+    },
+    /// An admitted inbound TLS attempt started.
+    QuicHandshakeStarted {
+        /// The source socket address.
+        remote: String,
+        /// The configured TLS timeout, if enabled.
+        deadline_ms: Option<u64>,
+    },
+    /// An inbound TLS attempt completed or failed.
+    QuicHandshakeFinished {
+        /// The source socket address.
+        remote: String,
+        /// The production error, if any.
+        error: Option<String>,
+    },
     /// Production session permits and their actual reservation owners.
     SessionCapacity {
         /// Live inbound reservations that still hold setup permits.

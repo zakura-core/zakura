@@ -792,6 +792,11 @@ pub(crate) async fn inbound_handshake(
     let remote = connecting.remote;
     let shared = connecting.conn.shared.clone();
     let result = establish(connecting, deadline).await;
+    #[cfg(zakura_sim)]
+    pending.table.record(HandshakeEvent::Finished {
+        remote,
+        error: result.as_ref().err().map(ToString::to_string),
+    });
     record_handshake(&result, started);
     let Ok((conn, handshake)) = result else {
         // A failed or timed-out attempt keeps its pending slot until the
@@ -943,7 +948,39 @@ async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
 pub(crate) struct PendingTable(
     Arc<Mutex<PendingCounts>>,
     #[cfg(zakura_sim)] Arc<counter::AtomicUsize>,
+    #[cfg(zakura_sim)] Arc<std::sync::Mutex<Vec<HandshakeEvent>>>,
 );
+
+/// Production admission and TLS decisions retained for simulator observation.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug)]
+pub enum HandshakeEvent {
+    /// The endpoint applied both the acceptor and QUIC admission policy.
+    Admission {
+        /// The counters and validation state before admission.
+        incoming: IncomingInfo,
+        /// The resulting admission action.
+        decision: Admit,
+        /// The configured per-address TLS limit.
+        max_pending_per_ip: Option<u32>,
+        /// The configured threshold for unvalidated sources.
+        retry_threshold: Option<u32>,
+    },
+    /// An admitted inbound connection started TLS.
+    Started {
+        /// The peer's socket address.
+        remote: SocketAddr,
+        /// The configured TLS timeout.
+        deadline: Option<Duration>,
+    },
+    /// TLS completed or failed, before control-handshake dispatch.
+    Finished {
+        /// The peer's socket address.
+        remote: SocketAddr,
+        /// The production TLS or timeout error, if any.
+        error: Option<String>,
+    },
+}
 
 #[derive(Default)]
 struct PendingCounts {
@@ -982,6 +1019,23 @@ pub struct AdmissionSample {
 
 #[cfg(zakura_sim)]
 impl AdmissionProbe {
+    /// Drains events without adding simulator scheduling points.
+    pub fn take_events(&self) -> Vec<HandshakeEvent> {
+        assert!(
+            zakura_rt::sim::in_boundary_read(),
+            "QUIC admission probes require a boundary read"
+        );
+        let Some(shared) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let mut events = shared
+            .pending
+            .2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *events)
+    }
+
     /// Reads through peeks. A held pending lock leaves the transition unsampled.
     pub fn read(&self) -> Option<AdmissionSample> {
         use zakura_rt::sim::{in_boundary_read, Peek};
@@ -1017,6 +1071,14 @@ impl AdmissionProbe {
 }
 
 impl PendingTable {
+    #[cfg(zakura_sim)]
+    pub(crate) fn record(&self, event: HandshakeEvent) {
+        self.2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
+    }
+
     pub(crate) fn total(&self) -> usize {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).total
     }

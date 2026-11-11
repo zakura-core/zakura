@@ -543,7 +543,7 @@ witness = { test = "prelude_guards_apply_each_declared_consequence", test_target
 [[entry.instance]]
 property = "handshake/hello/conformant-never-refused"
 code = ["crates/zakura-network/src/zakura/handshake.rs"]
-witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+witness = { test = "conformant_ack_is_accepted", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/conformant-never-refused"
@@ -658,3 +658,25 @@ shared = []
 property = "session/honest-never-punished"
 code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "honest_peer_never_punished", test_target = "header_wire_witness" }
+
+[[entry]]
+id = "handshake-quic"
+kind = "shared-definition"
+claim = "QUIC admission preserves configured source limits, validates busy sources, and ends stalled TLS attempts."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs"]
+
+[[entry.instance]]
+property = "handshake/quic/pending-per-address-bounded"
+code = []
+witness = { test = "quic_pending_limit_refuses_another_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/retry-before-unvalidated-accept"
+code = []
+witness = { test = "quic_retry_validates_sources_before_tls", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/finishes-in-time"
+code = []
+witness = { test = "quic_deadline_ends_a_stalled_tls_attempt", test_target = "handshake" }

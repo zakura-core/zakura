@@ -101,7 +101,7 @@ impl WireNode {
         Self::spawn_with_services(
             sim,
             header,
-            network,
+            config(network),
             net,
             seed,
             observer,
@@ -117,7 +117,7 @@ impl WireNode {
     pub(crate) fn spawn_with_services<F: Future<Output = ()> + Send + 'static>(
         sim: &mut Sim,
         header: HeaderNode,
-        network: &Network,
+        network_config: Config,
         net: SimNet,
         seed: [u8; 32],
         observer: Arc<dyn TransportObserver>,
@@ -131,7 +131,7 @@ impl WireNode {
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
         let endpoint = WireEndpoint::spawn_configured(
             sim,
-            config(network),
+            network_config,
             net,
             seed,
             None,
@@ -787,6 +787,48 @@ impl TransportTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        if let Some(probe) = &quic {
+            for event in zakura_rt::sim::boundary_read(|| probe.take_events()) {
+                use zakura_quic::{Admit, HandshakeEvent};
+                let fact = match event {
+                    HandshakeEvent::Admission {
+                        incoming,
+                        decision,
+                        max_pending_per_ip,
+                        retry_threshold,
+                    } => TransportFact::QuicAdmission {
+                        remote: incoming.remote.to_string(),
+                        validated: incoming.validated,
+                        pending_total: incoming.pending_total,
+                        pending_from_ip: incoming.pending_from_ip,
+                        decision: match decision {
+                            Admit::Accept => "accept",
+                            Admit::Refuse => "refuse",
+                            Admit::Retry => "retry",
+                            Admit::Ignore => "ignore",
+                        }
+                        .into(),
+                        max_pending_per_ip,
+                        retry_threshold,
+                    },
+                    HandshakeEvent::Started { remote, deadline } => {
+                        TransportFact::QuicHandshakeStarted {
+                            remote: remote.to_string(),
+                            deadline_ms: deadline.map(|duration| {
+                                u64::try_from(duration.as_millis()).expect("QUIC timeouts fit u64")
+                            }),
+                        }
+                    }
+                    HandshakeEvent::Finished { remote, error } => {
+                        TransportFact::QuicHandshakeFinished {
+                            remote: remote.to_string(),
+                            error,
+                        }
+                    }
+                };
+                self.state.push(Reported::HandshakeLoad(fact));
+            }
+        }
         let Some(quic) = quic.and_then(|probe| zakura_rt::sim::boundary_read(|| probe.read()))
         else {
             return;

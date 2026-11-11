@@ -1145,7 +1145,7 @@
     "entry": "handshake-table",
     "property": "handshake/ack/conformant-never-refused",
     "witness": {
-      "test": "conformant_control_and_prelude_are_accepted",
+      "test": "conformant_ack_is_accepted",
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
@@ -1176,6 +1176,36 @@
     "property": "handshake/ack/refusal-releases-slot",
     "witness": {
       "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch",
+    "entry": "handshake-quic",
+    "property": "handshake/quic/pending-per-address-bounded",
+    "witness": {
+      "test": "quic_pending_limit_refuses_another_tls_attempt",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "handshake-quic/skip-retry-threshold/skip-retry-threshold.patch",
+    "entry": "handshake-quic",
+    "property": "handshake/quic/retry-before-unvalidated-accept",
+    "witness": {
+      "test": "quic_retry_validates_sources_before_tls",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "handshake-quic/skip-inbound-tls-deadline/skip-inbound-tls-deadline.patch",
+    "entry": "handshake-quic",
+    "property": "handshake/quic/finishes-in-time",
+    "witness": {
+      "test": "quic_deadline_ends_a_stalled_tls_attempt",
       "test_target": "handshake"
     },
     "fault_class": "resource-lifetime"

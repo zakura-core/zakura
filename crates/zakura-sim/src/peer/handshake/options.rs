@@ -207,6 +207,9 @@ impl PreludeFault {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandshakeSpec {
+    /// Peer-side TLS timeout override for stalled-handshake scenarios.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_timeout_secs: Option<u32>,
     /// Delay before the peer begins dialing.
     pub dial_delay_ms: u64,
     /// Field corruption on the hello or ack, according to the peer's role.

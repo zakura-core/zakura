@@ -295,6 +295,21 @@ const fn handshake_guard(
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     handshake_guard(
+        "handshake/quic/pending-per-address-bounded",
+        "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch",
+        "quic_pending_limit_refuses_another_tls_attempt",
+    ),
+    handshake_guard(
+        "handshake/quic/retry-before-unvalidated-accept",
+        "handshake-quic/skip-retry-threshold/skip-retry-threshold.patch",
+        "quic_retry_validates_sources_before_tls",
+    ),
+    handshake_guard(
+        "handshake/quic/finishes-in-time",
+        "handshake-quic/skip-inbound-tls-deadline/skip-inbound-tls-deadline.patch",
+        "quic_deadline_ends_a_stalled_tls_attempt",
+    ),
+    handshake_guard(
         "handshake/hello/refusal-releases-slot",
         "handshake-release/retain-quic-slot/retain-quic-slot.patch",
         "hello_guards_refuse_each_corrupt_field",
@@ -312,7 +327,7 @@ pub static COVERAGE: &[Coverage] = &[
     handshake_guard(
         "handshake/ack/conformant-never-refused",
         "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch",
-        "conformant_control_and_prelude_are_accepted",
+        "conformant_ack_is_accepted",
     ),
     handshake_guard(
         "handshake/prelude/conformant-never-refused",

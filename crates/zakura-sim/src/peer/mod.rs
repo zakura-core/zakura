@@ -1341,6 +1341,15 @@ impl PeerTask {
 
     /// Binds the endpoint for the `dial`-th connection.
     fn bind(&self, dial: usize) -> QuicEndpoint {
+        let mut quic = QuicConfig::default();
+        if let Some(timeout) = self
+            .spec
+            .handshake
+            .as_ref()
+            .and_then(|spec| spec.tls_timeout_secs)
+        {
+            quic.handshake_timeout_secs = Some(timeout);
+        }
         let inputs = u32::try_from(dial)
             .ok()
             .and_then(|dial| dial.checked_mul(256))
@@ -1358,7 +1367,7 @@ impl PeerTask {
                 ),
             ),
             &bind_config(self.address(dial)),
-            &QuicConfig::default(),
+            &quic,
             self.net.clone(),
             SeededInputs::new(self.seed, inputs).endpoint_inputs(),
         )

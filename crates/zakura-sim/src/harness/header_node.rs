@@ -24,10 +24,12 @@ pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;
+pub mod fork_choice;
 pub mod hold_wake;
 pub mod outstanding;
 mod pair;
 pub mod policy;
+pub mod publication;
 pub mod recovery;
 pub mod reservation;
 pub mod retirement;
@@ -69,7 +71,7 @@ use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
     adapter::EnginePort,
-    controlled::{ControlledPort, ResetRequest},
+    controlled::{ControlledPort, OpId, ResetRequest},
     fixture::HeaderFixture,
     Outcome,
 };
@@ -79,14 +81,18 @@ use self::{
     ends::EnvironmentAction,
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
-    recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RELINK, UNREACHED},
+    recovery::{
+        Disruption, Driver, Hostile, Prefix, RecoveryEvidence, RecoveryInputs, SelectedChain,
+        RECOVERED, RELINK, UNREACHED,
+    },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
     observe::StorageFact,
+    sim::Generators,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
 /// Frames each direction of a link buffers, enough for a page and control
@@ -220,9 +226,7 @@ impl Base {
     pub fn offers(self, legal: &[Outcome], outcome: Outcome) -> bool {
         match self {
             Base::Any => true,
-            Base::SuccessOnly => {
-                outcome == Outcome::Engine || legal == [Outcome::Rejected].as_slice()
-            }
+            Base::SuccessOnly => crate::storage::succeeds(legal, outcome),
         }
     }
 }
@@ -249,6 +253,11 @@ pub struct Policy {
     /// older scenarios keep their encoding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_holds: Vec<ReplyHold>,
+    /// What a typed test takes away from recovery after its `Recover` step
+    /// (hdr-13). Left out of a scenario that declares none, so others keep
+    /// their encoding. The grammar can't encode one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disruptions: Vec<Disruption>,
 }
 
 impl Policy {
@@ -259,6 +268,7 @@ impl Policy {
             bound_ms: Some(5_000),
             holds: Vec::new(),
             reply_holds: Vec::new(),
+            disruptions: Vec::new(),
         }
     }
 }
@@ -284,6 +294,9 @@ pub struct Effects {
     pub reset: Rc<RefCell<Vec<String>>>,
     /// Each hold a `Release` step opened, by its index, in order.
     pub released: Rc<RefCell<Vec<usize>>>,
+    /// The holds whose release the scenario itself plans, by index, which
+    /// the drain doesn't retire ([`Topology::own`]).
+    pub owned: Rc<RefCell<BTreeSet<usize>>>,
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
@@ -323,6 +336,8 @@ pub struct PolicySource {
     released: usize,
     /// The run's recovery, which retires every hold once it starts.
     recovery: RecoveryEvidence,
+    /// Set at drain entry, which retires every hold but the owned ones.
+    drained: bool,
 }
 
 impl PolicySource {
@@ -346,6 +361,7 @@ impl PolicySource {
             reset: 0,
             released: 0,
             recovery: RecoveryEvidence::default(),
+            drained: false,
         }
     }
 
@@ -353,7 +369,11 @@ impl PolicySource {
     /// on each operation is offered only `engine`, or `rejected` where
     /// that's the only legal outcome, each held reply is delivered, and each
     /// must be done within [`recovery::RECOVERY_BOUND`] of the later of its
-    /// submission, or its commit, and the `Recover` pick.
+    /// submission, or its commit, and the `Recover` pick. Under
+    /// [`Disruption::SlowStorage`] each is offered only at that deadline. Before that it
+    /// counts each hold's catch and each fault it executes in `recovery`'s
+    /// prefix ([`recovery::Prefix`]), and once the prefix is full it catches
+    /// and offers as recovery will.
     pub fn with_recovery(self, recovery: RecoveryEvidence) -> Self {
         PolicySource { recovery, ..self }
     }
@@ -397,6 +417,14 @@ impl PolicySource {
     pub fn attributions(&self) -> FaultAttributions {
         self.storage.attributions()
     }
+
+    /// Whether operation `id`'s hold is one the scenario owns
+    /// ([`Topology::own`]).
+    fn owned(&self, predicates: &Predicates, id: OpId) -> bool {
+        predicates
+            .hold_of(id.0)
+            .is_some_and(|hold| self.effects.owned.borrow().contains(&hold))
+    }
 }
 
 impl ActionSource for PolicySource {
@@ -404,26 +432,42 @@ impl ActionSource for PolicySource {
         let pending = self.port.pending();
         let committed = self.port.committed();
         let predicates = self.predicates.borrow();
-        let recovering = self.recovery.started().is_some();
+        let started = self.recovery.started();
+        let recovering = started.is_some();
+        let full = self.recovery.prefix().full();
+        // Under `SlowStorage`, an operation is offered only once its
+        // recovery deadline, `own` after its submission or commit, comes.
+        let due = |own: Duration| {
+            !self.recovery.disrupts(Disruption::SlowStorage)
+                || started.is_none_or(|started| recovery::deadline(now, started, own) <= now)
+        };
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
-        out.extend(offered.into_iter().filter(|(_, local)| {
-            match crate::storage::decode(*local) {
-                StorageAction::Complete(id, outcome) => {
-                    pending.iter().find(|op| op.id == id).is_some_and(|op| {
-                        if recovering {
-                            Base::SuccessOnly.offers(&op.enabled, outcome)
-                        } else {
-                            predicates.offers(self.base, op, outcome)
-                        }
-                    })
-                }
-                StorageAction::Deliver(id) => committed
-                    .iter()
-                    .find(|op| op.id == id)
-                    .is_some_and(|op| recovering || predicates.delivers(op)),
-            }
-        }));
+        out.extend(
+            offered
+                .into_iter()
+                .filter(|(_, local)| match crate::storage::decode(*local) {
+                    StorageAction::Complete(id, outcome) => {
+                        pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                            let success = Base::SuccessOnly.offers(&op.enabled, outcome);
+                            if recovering {
+                                success && due(op.since_submit)
+                            } else {
+                                predicates.offers(self.base, op, outcome) && (success || !full)
+                            }
+                        })
+                    }
+                    StorageAction::Deliver(id) => {
+                        committed.iter().find(|op| op.id == id).is_some_and(|op| {
+                            if recovering {
+                                due(op.since_commit)
+                            } else {
+                                predicates.delivers(op)
+                            }
+                        })
+                    }
+                }),
+        );
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
@@ -444,9 +488,22 @@ impl ActionSource for PolicySource {
     }
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        if let StorageAction::Complete(id, outcome) = crate::storage::decode(local) {
+            let fault = self
+                .port
+                .pending()
+                .iter()
+                .any(|op| op.id == id && !Base::SuccessOnly.offers(&op.enabled, outcome));
+            if fault && self.recovery.in_prefix() {
+                self.recovery
+                    .prefix()
+                    .spend(log.step(), Hostile::Fault(id.0));
+            }
+        }
         match crate::storage::decode(local) {
             StorageAction::Complete(id, Outcome::Engine)
-                if self.recovery.started().is_none()
+                if !self.drained
+                    && self.recovery.started().is_none()
                     && self.predicates.borrow().holds_reply(id) =>
             {
                 self.port
@@ -455,6 +512,71 @@ impl ActionSource for PolicySource {
             }
             _ => self.storage.execute(local, log),
         }
+    }
+
+    /// The storage's recovery set, which holds don't filter, as in the
+    /// `Recover` mode `enabled` follows: the same success rule
+    /// ([`crate::storage::succeeds`]) and every held reply's delivery.
+    ///
+    /// The exception is an owned hold ([`Topology::own`]), such as the
+    /// release-wake fixture's. Its operation keeps the live rule: nothing
+    /// until its planned release, a `Release` step or `Settle`, and then
+    /// only the hold's own outcomes. So the fixture's first prepare still
+    /// fails with its planned local fault, and never before the waiting
+    /// offer its release step waits for.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        let pending = self.port.pending();
+        let predicates = self.predicates.borrow();
+        let mut free = RecoveryOffer::default();
+        self.storage.recovery(now, &mut free);
+        out.actions.extend(free.actions.into_iter().filter(
+            |(_, local)| match crate::storage::decode(*local) {
+                StorageAction::Complete(id, _) => !self.owned(&predicates, id),
+                StorageAction::Deliver(_) => true,
+            },
+        ));
+        out.quiet.extend(free.quiet);
+        out.boundaries.extend(free.boundaries);
+        let mut live = Vec::new();
+        self.storage.enabled(now, &mut live);
+        out.actions.extend(live.into_iter().filter(|(_, local)| {
+            match crate::storage::decode(*local) {
+                StorageAction::Complete(id, outcome) => {
+                    self.owned(&predicates, id)
+                        && pending
+                            .iter()
+                            .find(|op| op.id == id)
+                            .is_some_and(|op| predicates.offers(self.base, op, outcome))
+                }
+                StorageAction::Deliver(_) => false,
+            }
+        }));
+        for op in pending.iter().filter(|op| self.owned(&predicates, op.id)) {
+            let mut boundaries = Vec::new();
+            predicates.boundaries(None, op, now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) if at > now => Some(at),
+                        Boundary::Opens(_) | Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+    }
+
+    /// Retires every hold but the owned ones: from now on an engine
+    /// completion of a reply-held apply completes it instead of holding
+    /// its reply.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.drained = true;
+        self.storage.enter_drain(log);
+    }
+
+    /// The storage's stranded work. An owned hold that can never release
+    /// is its owner's to report, as `Settle` does.
+    fn holds_work(&self) -> Option<String> {
+        self.storage.holds_work()
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
@@ -469,6 +591,7 @@ impl ActionSource for PolicySource {
                 // The storage source appends only its own port's facts, but
                 // a run may hold other services' storage too.
                 let runs = self.storage.take_runs();
+                tap.page_reads(&self.storage.take_page_reads());
                 tap.storage_facts(
                     log.entries()[before..]
                         .iter()
@@ -480,7 +603,8 @@ impl ActionSource for PolicySource {
                         }),
                     &runs,
                 );
-                tap.engine_runs(&runs);
+                let publications = self.storage.take_publications();
+                tap.engine_runs(&runs, &publications);
                 tapped_effects = tap.take_effects();
                 queued = tap.take_queued();
                 tap.observe(log)
@@ -514,7 +638,16 @@ impl ActionSource for PolicySource {
         for entry in &log.entries()[before..] {
             match &entry.obs {
                 Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
+                    let prefix = self.recovery.in_prefix().then(|| self.recovery.prefix());
+                    if prefix.is_some_and(Prefix::full) {
+                        predicates.stop_catching();
+                    }
                     predicates.record(fact);
+                    if let (StorageFact::Submitted { id, .. }, Some(prefix)) = (fact, prefix) {
+                        if predicates.holds_op(*id) {
+                            prefix.spend(entry.step, Hostile::Caught(*id));
+                        }
+                    }
                     if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
                         predicates.record_link(LinkEffect::StorageStopped, node);
                     }
@@ -650,6 +783,33 @@ impl HeaderNode {
         dispatch: DispatchFlag,
         observer: Option<Arc<dyn HeaderSyncObserver>>,
     ) -> Self {
+        Self::spawn_configured(
+            sim,
+            name,
+            seed,
+            port,
+            fixture,
+            tip,
+            dispatch,
+            observer,
+            ZakuraHeaderSyncConfig::default(),
+        )
+    }
+
+    /// [`HeaderNode::spawn`] under `config` instead of production's default
+    /// config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_configured(
+        sim: &mut Sim,
+        name: &str,
+        seed: u8,
+        port: Arc<dyn Port>,
+        fixture: &HeaderFixture,
+        tip: Frontier,
+        dispatch: DispatchFlag,
+        observer: Option<Arc<dyn HeaderSyncObserver>>,
+        config: ZakuraHeaderSyncConfig,
+    ) -> Self {
         let anchor = fixture.anchor();
         let mut startup = HeaderSyncStartup::new(
             fixture.network().clone(),
@@ -660,7 +820,7 @@ impl HeaderNode {
                 verified_block_hash: anchor.hash,
             },
             Some((tip.height, tip.hash)),
-            ZakuraHeaderSyncConfig::default(),
+            config,
             LOCAL_MAX_MESSAGE_BYTES,
             zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
@@ -822,7 +982,8 @@ async fn delay_first_page(
 }
 
 /// The far end of a flooding link: the dialer's streams and its connection
-/// token, held by a harness task instead of a service.
+/// token, held by a harness task instead of a service. [`Topology::flood`]
+/// swaps the token for its generator's own child of it.
 struct FarEnd {
     from_node: FramedRecv,
     to_node: FramedSend,
@@ -831,11 +992,14 @@ struct FarEnd {
 
 /// Floods the node under test over `far`. It waits for the node's first
 /// `Status` on the session, then sends that frame back as fast as the node
-/// takes it, reading whatever the node sends meanwhile, until the link
-/// closes or either stream ends. The node's receiver awaits room in its
+/// takes it, reading whatever the node sends meanwhile, until `far`'s token
+/// is cancelled, by `link`'s close or the generator's retirement, or
+/// either stream ends. The node's receiver awaits room in its
 /// events queue for each `Status` it forwards, so the session stays open
-/// while the queue is full.
-async fn flood(far: FarEnd) {
+/// while the queue is full. A retirement only stops the sending: the flood
+/// then [`keep`]s its streams until the link closes, so the node's session
+/// outlives it.
+async fn flood(far: FarEnd, link: CancellationToken) {
     let FarEnd {
         mut from_node,
         to_node,
@@ -844,7 +1008,7 @@ async fn flood(far: FarEnd) {
     let status = loop {
         let frame = zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => frame,
         };
         let Some(frame) = frame else {
@@ -860,11 +1024,29 @@ async fn flood(far: FarEnd) {
     loop {
         zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => return keep(from_node, to_node, &link).await,
             frame = from_node.recv() => if frame.is_none() {
                 return;
             },
             sent = to_node.send(status.clone()) => if sent.is_err() {
+                return;
+            },
+        }
+    }
+}
+
+/// Keeps a retired flood's session open, as a quiet peer would: holds the
+/// stream to the node and reads and drops what the node sends, until
+/// `link` closes or the node ends the stream. Dropping the streams instead
+/// would end the session with an EOF that no harness close records, which
+/// the session view would blame on the node.
+async fn keep(mut from_node: FramedRecv, to_node: FramedSend, link: &CancellationToken) {
+    let _to_node = to_node;
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = link.cancelled() => return,
+            frame = from_node.recv() => if frame.is_none() {
                 return;
             },
         }
@@ -939,6 +1121,19 @@ impl Topology {
         self.effects.released.borrow_mut().push(hold);
     }
 
+    /// Marks the policy's hold number `hold` as one whose release the
+    /// scenario itself plans, through a `Release` step or a source of its
+    /// own. The drain doesn't retire it: the hold stays until that release
+    /// runs, then offers only its own outcomes. Call it at setup.
+    pub(crate) fn own(&self, hold: usize) {
+        self.effects.owned.borrow_mut().insert(hold);
+    }
+
+    /// Whether [`Topology::own`] marked hold `hold`.
+    fn owns(&self, hold: usize) -> bool {
+        self.effects.owned.borrow().contains(&hold)
+    }
+
     /// This topology, telling `tap` before it stops the node under test.
     pub fn with_tap(self, tap: TapShutdown) -> Self {
         Topology {
@@ -960,7 +1155,7 @@ impl Topology {
 
     /// Records why a `Control` step couldn't take effect, which ends the
     /// run as a harness failure.
-    fn fail(&self, why: String) {
+    pub(crate) fn fail(&self, why: String) {
         self.effects.failure.borrow_mut().get_or_insert(why);
     }
 
@@ -1214,11 +1409,23 @@ impl Topology {
 
     /// Links the mirror named `peer` to the node under test again, as its
     /// dialer, with a flooding task at the mirror's end in place of its
-    /// service ([`flood`]). The node replaces the mirror's earlier session.
-    fn flood(&self, peer: &str) {
+    /// service ([`flood`]), registered with `generators`. The node replaces
+    /// the mirror's earlier session.
+    ///
+    /// The task's token is a child of the far end's connection token: the
+    /// connection's close still stops it, and its retirement cancels only
+    /// the child, so the connection stays open. One token keeps the loop's
+    /// preemption points as they were.
+    fn flood(&self, peer: &str, generators: &Generators) {
         let (_, far) = self.open(self.index(peer), 0, true);
         let far = far.expect("an open with a far end hands it back");
-        zakura_rt::task::spawn_named("flood", flood(far));
+        let link = far.cancel.clone();
+        let stop = link.child_token();
+        let far = FarEnd {
+            cancel: stop.clone(),
+            ..far
+        };
+        generators.spawn("flood", stop, flood(far, link));
     }
 
     /// Whether the node under test's shutdown has begun: a `Shutdown` step
@@ -1462,6 +1669,14 @@ pub struct ControlStep {
 /// task has carried out every earlier step, so the script keeps its order.
 /// A churn step hands its mirror to its own churn task, which relinks it
 /// from then on.
+///
+/// Each step it picks before a `Recover` counts in the recovery's hostile
+/// prefix ([`recovery::Prefix`]). Once that's full it offers only the
+/// `Recover` step, and the steps between are dropped. The script stops at
+/// the `Recover` pick. A typed test's closes after the `Recover` step go on
+/// from the `recovered` pick, each the harness ending a member, which
+/// breaks recovery's membership assumption (hdr-13's loss path).
+/// The grammar can't encode one.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -1510,6 +1725,7 @@ impl Control {
             })
             .collect();
         let task_fixture = fixture.clone();
+        let generators = sim.generators();
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
             let topology = task_topology;
@@ -1527,7 +1743,7 @@ impl Control {
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => topology.flood(&step.peer),
+                    ControlAction::Flood => topology.flood(&step.peer, &generators),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
@@ -1580,6 +1796,37 @@ impl Control {
         self.recovery
             .as_ref()
             .is_some_and(|driver| driver.evidence.started().is_some())
+    }
+
+    /// Whether the script goes on after its `Recover` step: from the
+    /// `recovered` pick on, so a typed test's closes after it can run.
+    fn resumed(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.record().is_some())
+    }
+
+    /// Whether the hostile prefix before the `Recover` pick is full
+    /// ([`Prefix`]).
+    fn prefix_full(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.in_prefix() && driver.evidence.prefix().full())
+    }
+
+    /// The index of the script step to offer next: the next one, or once
+    /// the hostile prefix is full, the `Recover` step at or after it,
+    /// skipping the steps between. `None` once the script is done, or with
+    /// the prefix full and no `Recover` step left.
+    fn next_step(&self) -> Option<usize> {
+        if !self.prefix_full() {
+            return (self.next < self.script.len()).then_some(self.next);
+        }
+        self.script
+            .iter()
+            .skip(self.next)
+            .position(|step| step.action == ControlAction::Recover)
+            .map(|offset| self.next + offset)
     }
 
     /// This source, resetting, committing to and stopping `port`, the node
@@ -1643,7 +1890,13 @@ impl Control {
             }
             ControlAction::Release { hold } => self.topology.release(hold),
             ControlAction::StopStorage => port()?.shut_down(),
-            ControlAction::Commit { len } => self.commit(&*port()?, len)?,
+            ControlAction::Commit { len } => {
+                let adoption = self
+                    .adoption
+                    .as_ref()
+                    .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?;
+                harness_commit(&*port()?, &self.fixture, adoption, len)?;
+            }
             ControlAction::Recover => self.recover(&*port()?, &step.peer)?,
             ControlAction::RepairStatus {
                 unavailable,
@@ -1665,10 +1918,10 @@ impl Control {
         Ok(())
     }
 
-    /// Starts recovery from `source` at the `Recover` pick: reconsiders
-    /// every invalidation still in force on `port`, newest first, and
-    /// records the start, which stops the script, retires the holds and
-    /// turns on fair scheduling.
+    /// Starts recovery from `source` at the `Recover` pick: keeps the node's
+    /// baseline, reconsiders every invalidation still in force on `port`,
+    /// newest first, and records the start, which stops the script, retires
+    /// the holds and turns on fair scheduling.
     fn recover(&self, port: &ControlledPort, source: &str) -> Result<(), String> {
         let driver = self
             .recovery
@@ -1677,6 +1930,7 @@ impl Control {
         if !driver.inputs.mirrors.iter().any(|(name, _)| name == source) {
             return Err(format!("a recover names a mirror, not {source}"));
         }
+        let baseline = SelectedChain::of(port.engine());
         while port
             .reset(ResetRequest::Reconsider)
             .map_err(|error| error.to_string())?
@@ -1684,22 +1938,32 @@ impl Control {
         {}
         let now = zakura_scheduler::hooks::now()
             .ok_or_else(|| "a recovery starts inside a run".to_owned())?;
-        driver.evidence.start(source.to_owned(), now);
+        driver.evidence.start(source.to_owned(), now, baseline);
         Ok(())
     }
 }
 
-impl Control {
-    /// Commits `len` fixture headers past `port`'s selected tip straight
-    /// into its engine, then records the engine's new state as `Published`.
-    /// The step loop calls it outside any task, so the engine's watch sends
-    /// wake no task before the record.
-    fn commit(&self, port: &ControlledPort, len: u32) -> Result<(), String> {
-        let engine = port.engine();
-        let snapshot = engine.snapshot();
-        let tip = snapshot.frontiers.header_best;
-        let headers = self.fixture.extend(tip, len, 0);
-        let request = self.fixture.target_request(&snapshot, tip, &headers, 1);
+/// Commits `len` of `fixture`'s headers past `port`'s selected tip straight
+/// into its engine, through the port's harness-commit hook, which records
+/// the commit's engine run, then records the engine's new state in
+/// `adoption` as `Published`, as a `Commit` step does. Call it from the step
+/// loop, outside any task, so the engine's watch sends wake no task before
+/// the record.
+pub(crate) fn harness_commit(
+    port: &ControlledPort,
+    fixture: &HeaderFixture,
+    adoption: &AdoptionEvidence,
+    len: u32,
+) -> Result<(), String> {
+    let engine = port.engine();
+    let snapshot = engine.snapshot();
+    let tip = snapshot.frontiers.header_best;
+    let headers = fixture.extend(tip, len, 0);
+    let hashes = headers.iter().map(|header| header.hash()).collect();
+    let request = fixture.target_request(&snapshot, tip, &headers, 1);
+    // The port records the commit's engine run, so every check that
+    // judges engine runs judges it as it does an apply's.
+    port.harness_commit(hashes, |engine| {
         let applied = ready(engine.prepare_header_target(request))
             .and_then(|prepared| ready(engine.apply_header_target(prepared)))
             .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
@@ -1708,46 +1972,60 @@ impl Control {
                 "committing {len} headers on {tip:?} gave {applied:?}"
             ));
         }
-        let published = engine.snapshot();
-        self.adoption
-            .as_ref()
-            .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?
-            .publish(published.state_version, published.header_generation);
         Ok(())
+    })?;
+    let published = engine.snapshot();
+    adoption.publish(published.state_version, published.header_generation);
+    Ok(())
+}
+
+impl Control {
+    /// The next step and its action, if it may be picked at `now`: before
+    /// any `Recover` pick, or from its `recovered` pick on, once
+    /// [`Control::ready`] and its trigger hold.
+    fn next_offer(&self, now: SimInstant) -> Option<(&ControlStep, (Identity, u64))> {
+        // From the `Recover` pick the script stops, until the `recovered`
+        // pick lets a typed test's closes after it go on.
+        if self.recovering() && !self.resumed() {
+            return None;
+        }
+        let index = self.next_step()?;
+        let step = &self.script[index];
+        // A full prefix has ended, so its `Recover` comes at once: its
+        // trigger can wait on a step the cutoff skipped.
+        let open = self.ready(step)
+            && (self.prefix_full()
+                || step
+                    .when
+                    .as_ref()
+                    .is_none_or(|when| self.predicates.borrow().control_holds(when, now)));
+        // A script is far shorter than u64.
+        open.then(|| {
+            (
+                step,
+                (Identity::peer(&step.peer, step.action.name()), index as u64),
+            )
+        })
     }
 }
 
 impl ActionSource for Control {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        if self.recovering() {
-            return;
-        }
-        let Some(step) = self.script.get(self.next) else {
-            return;
-        };
-        let open = self.ready(step)
-            && step
-                .when
-                .as_ref()
-                .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
-        if open {
-            // A script is far shorter than u64.
-            out.push((
-                Identity::peer(&step.peer, step.action.name()),
-                self.next as u64,
-            ));
-        }
+        out.extend(self.next_offer(now).map(|(_, action)| action));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         if let Some(driver) = self.recovery.as_ref().filter(|_| self.recovering()) {
             driver.boundaries(now, out);
-            return;
+            // The steps after the `Recover` step go on from the `recovered`
+            // pick, their triggers' times with them.
+            if !self.resumed() {
+                return;
+            }
         }
         if let Some(when) = self
-            .script
-            .get(self.next)
-            .and_then(|step| step.when.as_ref())
+            .next_step()
+            .and_then(|index| self.script[index].when.as_ref())
         {
             self.predicates.borrow().control_boundaries(when, now, out);
         }
@@ -1763,9 +2041,95 @@ impl ActionSource for Control {
         }
     }
 
-    /// True from the `Recover` pick on.
+    /// True from the `Recover` pick on, which turns on the fair recovery
+    /// policy, unless the scenario declares [`Disruption::Unfair`].
     fn recovering(&self) -> bool {
         Control::recovering(self)
+            && !self
+                .recovery
+                .as_ref()
+                .is_some_and(|driver| driver.evidence.disrupts(Disruption::Unfair))
+    }
+
+    /// While a `Recover` establishes, its quiet `recovered` pick, under the
+    /// same condition as [`ActionSource::quiet`], but no relink or give-up,
+    /// and the end of the source's cooldown as a boundary.
+    /// Otherwise the next step, if it's the planned `Release` of an owned
+    /// hold ([`Topology::own`]) and may be picked as it would be live, with
+    /// its trigger's openings. No other script step runs in the drain.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        if let Some(driver) = self.recovery.as_ref().filter(|_| self.queued.get() == 0) {
+            let mut quiet = Vec::new();
+            driver.quiet(now, &mut quiet);
+            out.quiet
+                .extend(quiet.into_iter().filter(|(_, local)| *local == RECOVERED));
+            // The end of the source's cooldown, which `recovered` waits for.
+            let mut boundaries = Vec::new();
+            driver.boundaries(now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) if at > now => Some(at),
+                        Boundary::Opens(_) | Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+        let owned_release = |step: &ControlStep| match step.action {
+            ControlAction::Release { hold } => self.topology.owns(hold),
+            _ => false,
+        };
+        if let Some((_, action)) = self.next_offer(now).filter(|(step, _)| owned_release(step)) {
+            out.actions.push(action);
+        } else if let Some(when) = self
+            .script
+            .get(self.next)
+            .filter(|step| !self.recovering() && owned_release(step))
+            .and_then(|step| step.when.as_ref())
+        {
+            let mut boundaries = Vec::new();
+            self.predicates
+                .borrow()
+                .control_boundaries(when, now, &mut boundaries);
+            out.boundaries.extend(
+                boundaries
+                    .into_iter()
+                    .filter_map(|boundary| match boundary {
+                        Boundary::Opens(at) => Some(at),
+                        Boundary::Deadline(_) => None,
+                    }),
+            );
+        }
+    }
+
+    /// Nothing: a queued step still runs on the control task, and the
+    /// script holds nothing else.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// A planned `Release` of an owned hold ([`Topology::own`]) that's still
+    /// to come behind a step the drain never offers, such as a peer's
+    /// growth, so the hold's operation can never finish. A release that's
+    /// next waits only on its own trigger, which node work can still meet,
+    /// and once a `Recover` is picked every hold retires.
+    fn holds_work(&self) -> Option<String> {
+        if self.recovering() {
+            return None;
+        }
+        let owned_release = |step: &ControlStep| match step.action {
+            ControlAction::Release { hold } => self.topology.owns(hold).then_some(hold),
+            _ => None,
+        };
+        let next = self.script.get(self.next)?;
+        if owned_release(next).is_some() {
+            return None;
+        }
+        let hold = self.script[self.next..].iter().find_map(owned_release)?;
+        Some(format!(
+            "the planned release of owned hold {hold} waits behind the {} step of {}, which \
+             the drain doesn't run",
+            next.action.name(),
+            next.peer
+        ))
     }
 
     /// Checks the next step and queues it for the control task, or carries
@@ -1773,22 +2137,26 @@ impl ActionSource for Control {
     /// doesn't name the node under test, a second shutdown, and a relink,
     /// reset or release after one fail the run here instead. A shutdown
     /// counts as begun from its pick, before the task takes it.
-    fn execute(&mut self, local: u64, _: &mut ObservationLog) {
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
         if let Some(driver) = &self.recovery {
             match local {
                 RECOVERED => {
-                    if let Err(why) = driver.recovered() {
+                    if let Err(why) = driver.recovered(log.step()) {
                         self.topology.fail(why);
                     }
                     return;
                 }
                 UNREACHED => {
-                    driver.evidence.give_up();
+                    driver.evidence.give_up(log.step());
                     return;
                 }
                 RELINK => {
                     let step = ControlStep {
-                        peer: driver.evidence.relinked(),
+                        peer: driver.evidence.relinked(
+                            zakura_scheduler::hooks::now()
+                                .unwrap_or_default()
+                                .saturating_duration_since(SimInstant::from_start(Duration::ZERO)),
+                        ),
                         action: ControlAction::Relink,
                         when: None,
                     };
@@ -1801,8 +2169,18 @@ impl ActionSource for Control {
                 _ => {}
             }
         }
-        let step = self.script[self.next].clone();
-        self.next += 1;
+        // `enabled` offered this step's index, which came from a usize.
+        let index = local as usize;
+        let step = self.script[index].clone();
+        self.next = index + 1;
+        if let Some(driver) = &self.recovery {
+            if step.action != ControlAction::Recover && driver.evidence.in_prefix() {
+                driver
+                    .evidence
+                    .prefix()
+                    .spend(log.step(), Hostile::Step(index));
+            }
+        }
         let node = &self.topology.nodes[0].name;
         let invalid = match step.action {
             ControlAction::Recover if step.peer == *node => {

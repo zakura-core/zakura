@@ -15,6 +15,8 @@ use std::{cell::RefCell, process::Command, rc::Rc};
 
 use support::inputs;
 use zakura_sim::{
+    check::PropertyOutcome,
+    domain::header_sync::STATE_PUBLICATION_CONSISTENT,
     harness::{
         header_node::{
             adoption::{Acceptance, AdoptionEvidence, AdoptionFact},
@@ -25,11 +27,12 @@ use zakura_sim::{
             storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
             Storage, StorageScenario, StorageView,
         },
-        run_prepared, Subsystem,
+        run_prepared, HarnessError, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
     property::{EndViolation, HasView, Property, Sources},
-    MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
+    HarnessFailure, MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd,
+    RunReport, Sim,
 };
 
 /// The last view a run's checks read, with how many adoption facts it held
@@ -76,6 +79,11 @@ impl HasView for Adopting {
     /// The storage harness's end-of-run violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.storage.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.storage.stopping()
     }
 }
 
@@ -143,9 +151,24 @@ impl Run {
         &self.view.adoption
     }
 
-    /// The status rule over the node's sessions.
-    fn status(&self) -> Acceptance {
-        self.adoption().status(&self.view.sessions)
+    /// hdr-4's status and tip rules, which
+    /// `header-sync/state-publication-consistent` owns now, as its outcome
+    /// in the run's report: held, broken, or, with nothing judged, open.
+    fn publication(&self) -> Acceptance {
+        let outcome = &self
+            .report
+            .properties
+            .iter()
+            .find(|reported| reported.property == STATE_PUBLICATION_CONSISTENT)
+            .expect("the storage harness registers the property")
+            .outcome;
+        match outcome {
+            PropertyOutcome::Held { .. } => Acceptance::Holds,
+            PropertyOutcome::Violated { .. } => {
+                Acceptance::Violated(format!("{:?}", self.report.end.violation))
+            }
+            other => Acceptance::Open(format!("{other:?}")),
+        }
     }
 }
 
@@ -160,7 +183,9 @@ fn run_for(scenario: &StorageScenario, budget: Option<u64>, input: PlanInput) ->
     run_limited(scenario, budget, None, input)
 }
 
-/// [`run_for`], with a drain of at most `drain_bound` steps, if set.
+/// [`run_for`], with a drain of at most `drain_bound` steps, if set. A run
+/// whose drain that bound cuts off ends at a `DrainBound` harness failure,
+/// which these tests read as a cut-off run's report.
 fn run_limited(
     scenario: &StorageScenario,
     budget: Option<u64>,
@@ -173,14 +198,20 @@ fn run_limited(
         drain_bound,
     };
     let ready = Adopting::prepare(&scenario);
-    let report = run_prepared::<Adopting>(
+    let report = match run_prepared::<Adopting>(
         &scenario,
         ready.clone(),
         input,
         &mut MemorySink::default(),
         None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    ) {
+        Ok(report) => report,
+        Err(HarnessError::Run {
+            failure: HarnessFailure::DrainBound { .. },
+            report,
+        }) if scenario.drain_bound.is_some() => *report,
+        Err(error) => panic!("{error}"),
+    };
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let (view, seen) = ready
         .last
@@ -214,10 +245,12 @@ fn grow_witness() -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(3),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
             MirrorSpec {
                 chain: Chain::main(9),
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             },
         ],
         policy: Policy {
@@ -274,7 +307,7 @@ fn nth(
 #[derive(Debug, Default)]
 struct Tally {
     held: usize,
-    inconclusive: usize,
+    open: usize,
 }
 
 impl Tally {
@@ -282,7 +315,7 @@ impl Tally {
     fn count(&mut self, rule: &str, outcome: Acceptance) {
         match outcome {
             Acceptance::Holds => self.held += 1,
-            Acceptance::Inconclusive(_) => self.inconclusive += 1,
+            Acceptance::Open(_) => self.open += 1,
             Acceptance::Violated(why) => panic!("the {rule} rule broke: {why}"),
         }
     }
@@ -398,18 +431,13 @@ fn new_work_carries_the_adopted_generation() {
     sweep("generation", |run| run.adoption().generation());
 }
 
-/// The status rule holds on the witness: both live sessions get each adopted
-/// status in time.
+/// The status and tip rules hold on the witness: every queued status
+/// advertises the latest adoption, the initial tip and each adopted tip are
+/// published, and every publication reaches the node's handle. Their
+/// deadline is checked on `header-sync/liveness`'s status fixtures.
 #[test]
-fn every_live_session_gets_the_adopted_status() {
-    sweep("status", Run::status);
-}
-
-/// The tip rule holds on the witness: the initial tip and each adopted tip
-/// are published, and every publication reaches the node's handle.
-#[test]
-fn every_adopted_tip_is_published() {
-    sweep("tip", |run| run.adoption().tip());
+fn every_adopted_status_and_tip_is_published() {
+    sweep("publication", Run::publication);
 }
 
 /// One tip change, with nothing after it: the node at A3 syncs A5 from
@@ -423,6 +451,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(5),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy::converging(),
         controls: Vec::new(),
@@ -442,24 +471,20 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
             "{:?}",
             run.report.end
         );
-        assert_eq!(run.adoption().tip(), Acceptance::Holds);
+        assert_eq!(run.publication(), Acceptance::Holds);
     }
 }
 
 /// Runs cut off early break no rule: whatever they owe when the budget ends
-/// is inconclusive, not a violation. The checks' own tests cover which
-/// endings are inconclusive.
+/// stays open, not a violation. The checks' own tests cover which
+/// endings are open.
 #[test]
 fn a_run_that_ends_early_breaks_no_rule() {
     let scenario = grow_witness();
     for budget in [1, 20, 60, 120, 240, 480] {
         for input in inputs(4, 256) {
             let run = run_for(&scenario, Some(budget), input);
-            for outcome in [
-                run.adoption().generation(),
-                run.adoption().tip(),
-                run.status(),
-            ] {
+            for outcome in [run.adoption().generation(), run.publication()] {
                 assert!(
                     !matches!(outcome, Acceptance::Violated(_)),
                     "budget {budget}: {outcome:?}"
@@ -489,7 +514,7 @@ fn a_cut_off_run_keeps_the_evidence_it_ended_with() {
                 &run.adoption().facts()[run.seen..]
             );
             assert!(
-                !matches!(run.adoption().tip(), Acceptance::Violated(_)),
+                !matches!(run.publication(), Acceptance::Violated(_)),
                 "budget {budget}"
             );
         }

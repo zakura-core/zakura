@@ -13,6 +13,8 @@ const ID: &str = "block/reactor-policy";
 const OTHER: &str = "sim/no-task-panic";
 const HELD: &str = r#"{"held":{"applicable":4}}"#;
 const VIOLATED: &str = r#"{"violated":{"witness":[3]}}"#;
+/// A `not-applicable` outcome whose check never applied.
+const NEVER_APPLIED: &str = r#"{"not-applicable":{"reason":"never-applied"}}"#;
 
 /// The planted runner's reading of an `end` line with `violation`, and
 /// `reports` as (property, outcome JSON) pairs.
@@ -177,7 +179,7 @@ fn sensitivity_rejects_failed_baselines() {
             Some(trace(Some(4))),
         )),
         Ok(recorded(
-            run(None, &[(ID, r#""not-applicable""#)]),
+            run(None, &[(ID, NEVER_APPLIED)]),
             Some(trace(None)),
         )),
         Ok(recorded(run(None, &[(ID, HELD)]), Some(trace(Some(0))))),
@@ -205,9 +207,9 @@ fn sensitivity_rejects_broken_patches() {
     assert_eq!(class(&case), Class::InvalidMutant);
 }
 
-/// A run that reports nothing for the intended ID, ends inconclusive,
-/// leaks state, crashes, or doesn't pair with the original's build has
-/// incomplete observations: a harness failure.
+/// A run that reports nothing for the intended ID, ends at a harness
+/// failure, leaks state, crashes, or doesn't pair with the original's build
+/// has incomplete observations: a harness failure.
 #[test]
 fn sensitivity_rejects_incomplete_observations() {
     let leaky = TraceFacts {
@@ -227,7 +229,7 @@ fn sensitivity_rejects_incomplete_observations() {
         sensitivity_run(
             run(
                 None,
-                &[(ID, r#"{"inconclusive":{"reason":"harness-failed"}}"#)],
+                &[(ID, r#"{"not-applicable":{"reason":"harness-failed"}}"#)],
             ),
             None,
         ),
@@ -240,6 +242,34 @@ fn sensitivity_rejects_incomplete_observations() {
     }
 }
 
+/// Each `not-applicable` reason, read from its serialized end record: only
+/// `never-applied` is [`Class::NotApplicable`], and every other reason,
+/// benign or not, is incomplete observations.
+#[test]
+fn sensitivity_classifies_each_not_applicable_reason() {
+    for (reason, expected) in [
+        (r#""never-applied""#, Class::NotApplicable),
+        (r#""undeclared""#, Class::HarnessFailure),
+        (r#""excluded""#, Class::HarnessFailure),
+        (r#""assumptions-never-held""#, Class::HarnessFailure),
+        (r#""assumption-lost""#, Class::HarnessFailure),
+        (r#""stopped-by-violation""#, Class::HarnessFailure),
+        (r#""harness-failed""#, Class::HarnessFailure),
+        (r#""node-stopped""#, Class::HarnessFailure),
+        (
+            r#"{"unsettled":{"site":"watch-open"}}"#,
+            Class::HarnessFailure,
+        ),
+    ] {
+        let outcome = format!(r#"{{"not-applicable":{{"reason":{reason}}}}}"#);
+        assert_eq!(
+            class(&sensitivity_run(run(None, &[(ID, &outcome)]), None)),
+            expected,
+            "{reason}"
+        );
+    }
+}
+
 /// A held mutant run survives, a never-applying one is not applicable, and
 /// only review metadata makes a case equivalent.
 #[test]
@@ -249,10 +279,7 @@ fn sensitivity_names_survivors_and_equivalents() {
         Class::SurvivedBudget
     );
     assert_eq!(
-        class(&sensitivity_run(
-            run(None, &[(ID, r#""not-applicable""#)]),
-            None
-        )),
+        class(&sensitivity_run(run(None, &[(ID, NEVER_APPLIED)]), None)),
         Class::NotApplicable
     );
     let review = SensitivityRun {

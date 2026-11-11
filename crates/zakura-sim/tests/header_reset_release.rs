@@ -34,7 +34,11 @@ fn node_step(action: ControlAction, when: Option<Trigger>) -> ControlStep {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or

@@ -25,7 +25,7 @@ use zakura_sim::{
                 Actions, Actual, Companion, End, ExecMeta, Execution, Report, ResultFile,
                 ResultRecord, TestOutcome, TestRan,
             },
-            reasons::{self, NA_REASONS, NOT_HEADER},
+            reasons::{NA_REASONS, NOT_HEADER},
             required::{gate_rule, required_keys, Inventories, Registered, GATE_OBLIGATIONS},
             rows::{self, NativeClass, HEADER_HARNESSES},
             sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found,
@@ -1282,6 +1282,49 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "forks-sharing-a-header ",
                 "multi-page-sync ",
                 "relinked-mid-round ",
+                "harness-commit ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/expected-chain-selected"),
+            [
+                "stronger-first ",
+                "stronger-last ",
+                "three-forks ",
+                "equal-work ",
+                "heavier-offered-to-longer ",
+                "invalidated-then-reconsidered ",
+                "harness-commit ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/state-publication-consistent"),
+            [
+                "startup-only ",
+                "quiet-reset ",
+                "invalidate-only ",
+                "grow ",
+                "reset-inside-status-floor ",
+                "harness-commit ",
+                "sync ",
+                "served ",
+                "served-one-header ",
+                "served-from-a-lower-locator ",
+                "served-in-pages ",
+                "served-after-growth ",
+                "served-across-a-reset ",
             ]
             .iter()
             .flat_map(|name| plans(name, "inputs(8, 256)", 8))
@@ -1302,6 +1345,19 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "header-outstanding-churn",
                 "header-outstanding-serving-churn",
                 "header-outstanding-serving-replaced",
+                "header-outstanding-capacity-waits",
+            ]),
+        ),
+        (
+            "header-sync/repair",
+            "tests/header_repair.rs",
+            "the_committed_repair_inputs_hold_outstanding_work_bounded",
+            Some("header-sync/outstanding-work-bounded"),
+            owned(&[
+                "committed header-repair-applied input",
+                "committed header-repair-prepare-departs input",
+                "committed header-repair-apply-departs input",
+                "committed header-repair-supplier-pruned input",
             ]),
         ),
         (
@@ -1314,6 +1370,18 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "header-hold-held-prepare",
                 "header-hold-held-apply",
                 "header-hold-serving-read",
+            ]),
+        ),
+        (
+            "header-sync/liveness",
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+            Some("header-sync/bounded-adversary-progress"),
+            owned(&[
+                "header-recovery-successor",
+                "header-recovery-closes",
+                "header-recovery-faults",
+                "header-recovery-departure",
             ]),
         ),
         (
@@ -3124,614 +3192,9 @@ fn every_header_harness_has_its_needs_read() {
     assert!(header_acceptance::needs_of(&added).is_err());
 }
 
-/// One `NotApplicable` construction the scan found: its file, its
-/// qualified function and its trimmed source line.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Construction {
-    file: String,
-    function: String,
-    line: String,
-    /// Its enclosing function's [`fingerprint`].
-    fingerprint: String,
-    /// Whether the statement before it in its block calls
-    /// `missing_evidence`, which makes it a harness failure, not a reason.
-    after_missing: bool,
-}
-
-/// Walks a parsed file, collecting every `Verdict::NotApplicable` and
-/// `PropertyOutcome::NotApplicable` in expression position, by its
-/// qualified function. Comparisons and patterns aren't constructions.
-/// Anything the scan can't see through, an alias of the variant or a macro
-/// other than a known assertion naming it, is an error.
-struct Scan<'a> {
-    file: &'a str,
-    /// Every file the scan reads, by its path relative to the crate.
-    files: &'a BTreeSet<String>,
-    lines: Vec<&'a str>,
-    scope: Vec<String>,
-    /// The enclosing functions' fingerprints, innermost last.
-    prints: Vec<String>,
-    /// `Verdict`'s definition and each `impl` block for it in this file, as
-    /// `(line, source text)`.
-    verdict: Vec<(usize, String)>,
-    /// Set while visiting a statement that follows a `missing_evidence`
-    /// call in its block.
-    after_missing: bool,
-    /// The inline modules enclosing the item being visited.
-    modules: Vec<String>,
-    found: Vec<Construction>,
-    errors: Vec<String>,
-    /// Every function's text, by its qualified name, with the module it
-    /// sits in.
-    functions: Vec<(String, String, String)>,
-    /// Every module-scope `use` item's text, by its module.
-    uses: Vec<(String, String)>,
-}
-
-impl Scan<'_> {
-    /// Whether `path` ends in `NotApplicable`, whatever qualifies it, so an
-    /// alias such as `V::NotApplicable` or `Self::NotApplicable` counts.
-    fn names_variant(path: &syn::Path) -> bool {
-        path.segments
-            .last()
-            .is_some_and(|segment| segment.ident == "NotApplicable")
-    }
-
-    /// The source text from `start` to `end`, lines kept.
-    fn source(&self, start: proc_macro2::LineColumn, end: proc_macro2::LineColumn) -> String {
-        let mut text = Vec::new();
-        for line in start.line..=end.line {
-            let source: Vec<char> = self.lines.get(line - 1).unwrap_or(&"").chars().collect();
-            let from = if line == start.line { start.column } else { 0 };
-            let to = if line == end.line {
-                end.column
-            } else {
-                source.len()
-            };
-            text.push(
-                source[from.min(source.len())..to.min(source.len())]
-                    .iter()
-                    .collect::<String>(),
-            );
-        }
-        text.join("\n")
-    }
-
-    /// Visits a function whose signature starts at `start` and whose body
-    /// ends at `end`, under `name`, with its [`fingerprint`].
-    fn function(
-        &mut self,
-        name: String,
-        start: proc_macro2::LineColumn,
-        end: proc_macro2::LineColumn,
-        visit: impl FnOnce(&mut Self),
-    ) {
-        let text = self.source(start, end);
-        let print = fingerprint(&text);
-        self.scope.push(name);
-        self.functions
-            .push((self.scope.join("::"), self.modules.join("::"), text));
-        self.prints.push(print);
-        visit(self);
-        self.prints.pop();
-        self.scope.pop();
-    }
-
-    /// The trimmed source line `span` starts on.
-    fn line(&self, span: proc_macro2::Span) -> String {
-        let line = span.start().line;
-        self.lines
-            .get(line.saturating_sub(1))
-            .map(|line| line.trim().to_owned())
-            .unwrap_or_default()
-    }
-
-    /// Records a construction at `span`.
-    fn construction(&mut self, span: proc_macro2::Span) {
-        let line = self.line(span);
-        if self.scope.is_empty() {
-            self.errors.push(format!(
-                "{}: a construction outside a function: {line}",
-                self.file
-            ));
-        }
-        self.found.push(Construction {
-            file: self.file.to_owned(),
-            function: self.scope.join("::"),
-            line,
-            fingerprint: self.prints.last().cloned().unwrap_or_default(),
-            after_missing: self.after_missing,
-        });
-    }
-
-    /// Sees through a macro that names the variant: a known pattern or
-    /// assertion macro's expression arguments are parsed and visited like
-    /// any other expression, its pattern isn't a construction, and an
-    /// `assert_eq!` or `assert_ne!` argument that's the bare variant is a
-    /// comparison. Any other macro naming it, or a known one that doesn't
-    /// parse, can't be seen through.
-    fn check_macro(&mut self, mac: &syn::Macro) {
-        use syn::parse::Parser;
-        let name = mac
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default();
-        // A macro other than a value-building one that names a verdict type
-        // could generate a definition or impl for it, which the pin
-        // wouldn't see.
-        let value_macro = matches!(
-            name.as_str(),
-            "matches"
-                | "assert"
-                | "assert_eq"
-                | "assert_ne"
-                | "debug_assert"
-                | "debug_assert_eq"
-                | "debug_assert_ne"
-                | "vec"
-                | "format"
-                | "write"
-                | "writeln"
-                | "panic"
-                | "unreachable"
-        );
-        let names_type = mac.tokens.clone().into_iter().any(|token| {
-            VERDICT_TYPES
-                .iter()
-                .any(|verdict| names_ident(&token, verdict))
-        });
-        if names_type && !value_macro {
-            let line = self.line(mac.path.segments[0].ident.span());
-            self.errors.push(format!(
-                "{}: {name}! names a verdict type, so it could generate an impl: {line}",
-                self.file
-            ));
-        }
-        let names = mac
-            .tokens
-            .clone()
-            .into_iter()
-            .any(|token| contains_variant(&token));
-        // A value macro naming either is seen through, so an item in its
-        // arguments, an impl inside a block, is visited too.
-        if !names && !names_type {
-            return;
-        }
-        let args = || {
-            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
-                .parse2(mac.tokens.clone())
-        };
-        let parsed: syn::Result<Vec<syn::Expr>> = match name.as_str() {
-            "matches" => (|input: syn::parse::ParseStream<'_>| {
-                let scrutinee: syn::Expr = input.parse()?;
-                input.parse::<syn::Token![,]>()?;
-                syn::Pat::parse_multi_with_leading_vert(input)?;
-                let mut exprs = vec![scrutinee];
-                if input.peek(syn::Token![if]) {
-                    input.parse::<syn::Token![if]>()?;
-                    exprs.push(input.parse()?);
-                }
-                if input.peek(syn::Token![,]) {
-                    input.parse::<syn::Token![,]>()?;
-                }
-                Ok(exprs)
-            })
-            .parse2(mac.tokens.clone()),
-            "assert" | "debug_assert" | "vec" | "format" | "write" | "writeln" | "panic"
-            | "unreachable" => args().map(|args| args.into_iter().collect()),
-            "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne" => {
-                args().map(|args| {
-                    args.into_iter()
-                        .filter(|arg| {
-                            !matches!(arg, syn::Expr::Path(p) if Self::names_variant(&p.path))
-                        })
-                        .collect()
-                })
-            }
-            _ => Err(syn::Error::new(
-                mac.path.segments[0].ident.span(),
-                "unknown",
-            )),
-        };
-        match parsed {
-            Ok(exprs) => {
-                for expr in &exprs {
-                    syn::visit::Visit::visit_expr(self, expr);
-                }
-            }
-            Err(_) => {
-                let line = self.line(mac.path.segments[0].ident.span());
-                self.errors.push(format!(
-                    "{}: {name}! names NotApplicable or a verdict type and can't be seen \
-                     through: {line}",
-                    self.file
-                ));
-            }
-        }
-    }
-}
-
-/// The last identifier of `ty`'s path, through any parentheses or
-/// invisible groups around it, or `None` for a type that isn't a path.
-fn type_name(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
-        syn::Type::Paren(inner) => type_name(&inner.elem),
-        syn::Type::Group(inner) => type_name(&inner.elem),
-        _ => None,
-    }
-}
-
-/// Whether `tree` renames a verdict type anywhere: `Verdict as V`, or
-/// `Verdict::{self as V}` under a path ending in one.
-fn renames_verdict(tree: &syn::UseTree, under_verdict: bool) -> bool {
-    match tree {
-        syn::UseTree::Path(path) => renames_verdict(
-            &path.tree,
-            VERDICT_TYPES.contains(&path.ident.to_string().as_str()),
-        ),
-        syn::UseTree::Rename(rename) => {
-            VERDICT_TYPES.contains(&rename.ident.to_string().as_str())
-                || (under_verdict && rename.ident == "self")
-        }
-        syn::UseTree::Group(group) => group
-            .items
-            .iter()
-            .any(|item| renames_verdict(item, under_verdict)),
-        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
-    }
-}
-
-/// Whether `token` is or contains the identifier `NotApplicable`.
-fn contains_variant(token: &proc_macro2::TokenTree) -> bool {
-    names_ident(token, "NotApplicable")
-}
-
-/// Whether `token` is or contains the identifier `name`.
-fn names_ident(token: &proc_macro2::TokenTree, name: &str) -> bool {
-    match token {
-        proc_macro2::TokenTree::Ident(ident) => ident == name,
-        proc_macro2::TokenTree::Group(group) => {
-            group.stream().into_iter().any(|t| names_ident(&t, name))
-        }
-        _ => false,
-    }
-}
-
-/// Whether `stmt` is a `missing_evidence(..)` method call.
-fn calls_missing_evidence(stmt: &syn::Stmt) -> bool {
-    matches!(stmt, syn::Stmt::Expr(syn::Expr::MethodCall(call), _) if call.method == "missing_evidence")
-}
-
-impl<'ast> syn::visit::Visit<'ast> for Scan<'_> {
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        use syn::spanned::Spanned;
-        let start = item.sig.span().start();
-        let end = item.block.brace_token.span.close().end();
-        self.function(item.sig.ident.to_string(), start, end, |scan| {
-            syn::visit::visit_item_fn(scan, item);
-        });
-    }
-
-    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        use syn::spanned::Spanned;
-        let start = item.sig.span().start();
-        let end = item.block.brace_token.span.close().end();
-        self.function(item.sig.ident.to_string(), start, end, |scan| {
-            syn::visit::visit_impl_item_fn(scan, item);
-        });
-    }
-
-    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-        // The verdict types' definitions, attributes included, are pinned:
-        // a derive or `cfg_attr` can generate a constructor the scan can't
-        // see.
-        if VERDICT_TYPES.contains(&item.ident.to_string().as_str()) {
-            use syn::spanned::Spanned;
-            let span = item.span();
-            self.verdict
-                .push((span.start().line, self.source(span.start(), span.end())));
-        }
-        syn::visit::visit_item_enum(self, item);
-    }
-
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        let name = type_name(&item.self_ty).unwrap_or_else(|| "impl".to_owned());
-        // An impl for a type that names a verdict type without being one,
-        // such as `Identity<Verdict>`, or for a projection, could be an impl
-        // for it the pin can't see.
-        {
-            use syn::spanned::Spanned;
-            let span = item.self_ty.span();
-            let written = self.source(span.start(), span.end());
-            let names_verdict = written
-                .parse::<proc_macro2::TokenStream>()
-                .is_ok_and(|tokens| {
-                    tokens
-                        .into_iter()
-                        .any(|token| VERDICT_TYPES.iter().any(|v| names_ident(&token, v)))
-                });
-            let projection =
-                matches!(&*item.self_ty, syn::Type::Path(path) if path.qself.is_some());
-            if (names_verdict && !VERDICT_TYPES.contains(&name.as_str())) || projection {
-                self.errors.push(format!(
-                    "{}: an impl for {written} could be one for a verdict type",
-                    self.file
-                ));
-            }
-        }
-        // Every `impl` block for a verdict type is pinned with its
-        // definition. Aliases of the types are refused, so the name the
-        // impl is written for is the type's own.
-        if VERDICT_TYPES.contains(&name.as_str()) {
-            use syn::spanned::Spanned;
-            let span = item.span();
-            self.verdict
-                .push((span.start().line, self.source(span.start(), span.end())));
-        }
-        self.scope.push(name);
-        syn::visit::visit_item_impl(self, item);
-        self.scope.pop();
-    }
-
-    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        // A module loaded from a `#[path]` file must be a file the scan
-        // reads ([`crate_sources`] follows each one).
-        if item.content.is_none() {
-            if let Some(target) = path_target(self.file, item) {
-                if !self.files.contains(&target) {
-                    self.errors.push(format!(
-                        "{}: module {} loads {target}, which the scan doesn't read",
-                        self.file, item.ident
-                    ));
-                }
-            } else if !self.file.starts_with("src/") {
-                // The scan follows a file outside `src/` only through its
-                // `#[path]`, so a module it declares is one it doesn't read.
-                self.errors.push(format!(
-                    "{}: module {} is outside the files the scan reads",
-                    self.file, item.ident
-                ));
-            }
-            // A `path` chosen through `cfg_attr` loads a file the scan
-            // can't pick.
-            let conditional_path = item.attrs.iter().any(|attr| {
-                attr.path().is_ident("cfg_attr")
-                    && attr.meta.require_list().is_ok_and(|list| {
-                        list.tokens
-                            .clone()
-                            .into_iter()
-                            .any(|token| names_ident(&token, "path"))
-                    })
-            });
-            if conditional_path {
-                self.errors.push(format!(
-                    "{}: module {} picks its file through cfg_attr",
-                    self.file, item.ident
-                ));
-            }
-        }
-        // Test modules build fixtures, not reasons.
-        let test = item.attrs.iter().any(|attr| {
-            attr.path().is_ident("cfg")
-                && attr
-                    .meta
-                    .require_list()
-                    .is_ok_and(|list| list.tokens.to_string() == "test")
-        });
-        if !test {
-            self.scope.push(item.ident.to_string());
-            self.modules.push(item.ident.to_string());
-            syn::visit::visit_item_mod(self, item);
-            self.modules.pop();
-            self.scope.pop();
-        }
-    }
-
-    fn visit_block(&mut self, block: &'ast syn::Block) {
-        let outer = self.after_missing;
-        for (at, stmt) in block.stmts.iter().enumerate() {
-            self.after_missing = at > 0 && calls_missing_evidence(&block.stmts[at - 1]);
-            self.visit_stmt(stmt);
-        }
-        self.after_missing = outer;
-    }
-
-    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
-        match expr {
-            syn::Expr::Path(path) if Self::names_variant(&path.path) => {
-                let span = path.path.segments.last().map(|s| s.ident.span()).unwrap();
-                self.construction(span);
-            }
-            syn::Expr::Struct(construct) if Self::names_variant(&construct.path) => {
-                let span = construct
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.span())
-                    .unwrap();
-                self.construction(span);
-                syn::visit::visit_expr_struct(self, construct);
-            }
-            // A comparison reads the variant; it doesn't construct it.
-            syn::Expr::Binary(binary)
-                if matches!(binary.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) =>
-            {
-                for side in [&*binary.left, &*binary.right] {
-                    if !matches!(side, syn::Expr::Path(p) if Self::names_variant(&p.path)) {
-                        self.visit_expr(side);
-                    }
-                }
-            }
-            _ => syn::visit::visit_expr(self, expr),
-        }
-    }
-
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        // Included source isn't a file the scan reads, so it can't be
-        // inventoried.
-        if mac
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "include")
-        {
-            self.errors.push(format!(
-                "{}: include! hides source from the scan",
-                self.file
-            ));
-        }
-        self.check_macro(mac);
-    }
-
-    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        if renames_verdict(&item.tree, false) {
-            self.errors
-                .push(format!("{}: a use item renames a verdict type", self.file));
-        }
-        if self.prints.is_empty() {
-            use syn::spanned::Spanned;
-            let span = item.span();
-            let text = self.source(span.start(), span.end());
-            self.uses.push((self.modules.join("::"), text));
-        }
-        syn::visit::visit_item_use(self, item);
-    }
-
-    fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
-        let name = rename.ident.to_string();
-        if name == "NotApplicable" || VERDICT_TYPES.contains(&name.as_str()) {
-            self.errors.push(format!(
-                "{}: {name} renamed to {}",
-                self.file, rename.rename
-            ));
-        }
-    }
-
-    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
-        // An associated type set to a verdict type is an alias of it.
-        if type_name(&item.ty).is_some_and(|name| VERDICT_TYPES.contains(&name.as_str())) {
-            self.errors.push(format!(
-                "{}: associated type {} aliases a verdict type",
-                self.file, item.ident
-            ));
-        }
-        syn::visit::visit_impl_item_type(self, item);
-    }
-
-    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        // A type alias of a verdict type would hide an impl for it from the
-        // pin, so none is allowed.
-        {
-            if type_name(&item.ty).is_some_and(|name| VERDICT_TYPES.contains(&name.as_str())) {
-                self.errors.push(format!(
-                    "{}: {} aliases a verdict type",
-                    self.file, item.ident
-                ));
-            }
-        }
-        syn::visit::visit_item_type(self, item);
-    }
-}
-
-/// What [`scan`] read from the crate's sources.
-struct Scanned {
-    /// Every construction.
-    found: Vec<Construction>,
-    /// Every error the scan hit.
-    errors: Vec<String>,
-    /// Every function's text, by `(file, qualified function)`, with the
-    /// module it sits in.
-    functions: BTreeMap<(String, String), (String, String)>,
-    /// Every module-scope `use` item's text, by `(file, module)`.
-    uses: BTreeMap<(String, String), Vec<String>>,
-}
-
-/// Every construction under `src/` and every error the scan hit, with
-/// each function's text and each module's `use` items, from the files in
-/// `sources` as `(path relative to the crate, text)`.
-///
-/// It also checks the verdict types' pin: the [`fingerprint`] of the
-/// [`VERDICT_TYPES`]' definitions and every `impl` block for them, in file
-/// and line order, must be [`reasons::VERDICT_FINGERPRINT`].
-fn scan(sources: &[(String, String)]) -> Scanned {
-    let mut found = Vec::new();
-    let mut errors = Vec::new();
-    let mut verdict = Vec::new();
-    let mut functions = BTreeMap::new();
-    let mut uses: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    let files: BTreeSet<String> = sources.iter().map(|(file, _)| file.clone()).collect();
-    for (file, text) in sources {
-        let parsed = match syn::parse_file(text) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                errors.push(format!("{file}: {error}"));
-                continue;
-            }
-        };
-        let mut scan = Scan {
-            file,
-            files: &files,
-            lines: text.lines().collect(),
-            scope: Vec::new(),
-            prints: Vec::new(),
-            verdict: Vec::new(),
-            after_missing: false,
-            modules: Vec::new(),
-            found: Vec::new(),
-            errors: Vec::new(),
-            functions: Vec::new(),
-            uses: Vec::new(),
-        };
-        syn::visit::Visit::visit_file(&mut scan, &parsed);
-        found.extend(scan.found);
-        errors.extend(scan.errors);
-        for (function, module, text) in scan.functions {
-            functions.insert((file.clone(), function), (module, text));
-        }
-        for (module, text) in scan.uses {
-            uses.entry((file.clone(), module)).or_default().push(text);
-        }
-        verdict.extend(
-            scan.verdict
-                .into_iter()
-                .map(|(line, text)| (file.clone(), line, text)),
-        );
-    }
-    verdict.sort();
-    let pinned = fingerprint(
-        &verdict
-            .iter()
-            .map(|(_, _, text)| text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    if pinned != reasons::VERDICT_FINGERPRINT {
-        errors.push(format!(
-            "the verdict types' definitions or impls changed: reread every NotApplicable meaning in reasons.rs, then update VERDICT_FINGERPRINT from {} to {pinned}",
-            reasons::VERDICT_FINGERPRINT
-        ));
-    }
-    Scanned {
-        found,
-        errors,
-        functions,
-        uses,
-    }
-}
-
-/// The types whose `NotApplicable` is a reason: their definitions and
-/// impls are pinned together by [`reasons::VERDICT_FINGERPRINT`].
-const VERDICT_TYPES: [&str; 2] = ["Verdict", "PropertyOutcome"];
-
-/// A function's or a type's fingerprint (C20): the first 16 hex digits of
-/// the SHA-256 of `text`'s token stream, so comments and whitespace don't
-/// count and any other edit does. [`reasons::NA_REASONS`] pins each
-/// producer's, so a producer's meanings are reread whenever it changes. A
-/// function it calls is that function's owner's contract (Rule 23), so
-/// only the producer's own text counts.
+/// A text's fingerprint: the first 16 hex digits of the SHA-256 of `text`'s
+/// token stream, so comments and whitespace don't count and any other edit
+/// does.
 fn fingerprint(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let tokens = text
@@ -3742,314 +3205,6 @@ fn fingerprint(text: &str) -> String {
         .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// Every identifier `text` uses as a path segment, followed by `::` or
-/// anywhere in a `use` item, groups and renames included, each with the
-/// trimmed source line it's on, once per use. A field or a local of the
-/// same name isn't a path, and comments aren't tokens.
-fn idents(text: &str) -> BTreeMap<String, Vec<String>> {
-    /// Collects `stream`'s path identifiers into `out`, all of them inside
-    /// a `use` item when `in_use`.
-    fn walk(
-        stream: proc_macro2::TokenStream,
-        in_use: bool,
-        lines: &[&str],
-        out: &mut BTreeMap<String, Vec<String>>,
-    ) {
-        use proc_macro2::{Spacing, TokenTree};
-        let tokens: Vec<TokenTree> = stream.into_iter().collect();
-        let mut using = in_use;
-        for (at, token) in tokens.iter().enumerate() {
-            match token {
-                TokenTree::Ident(ident) => {
-                    let path = matches!(
-                        (tokens.get(at + 1), tokens.get(at + 2)),
-                        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
-                            if a.as_char() == ':' && a.spacing() == Spacing::Joint && b.as_char() == ':'
-                    );
-                    if using || path {
-                        let line = lines
-                            .get(ident.span().start().line.saturating_sub(1))
-                            .map(|line| line.trim().to_owned())
-                            .unwrap_or_default();
-                        out.entry(ident.to_string()).or_default().push(line);
-                    }
-                    if ident == "use" {
-                        using = true;
-                    }
-                }
-                TokenTree::Group(group) => walk(group.stream(), using, lines, out),
-                TokenTree::Punct(punct) if punct.as_char() == ';' && !in_use => using = false,
-                _ => {}
-            }
-        }
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = BTreeMap::new();
-    if let Ok(tokens) = text.parse::<proc_macro2::TokenStream>() {
-        walk(tokens, false, &lines, &mut out);
-    }
-    out
-}
-
-/// Every `.rs` file under the crate's `src/`, as `(path, text)`.
-fn crate_sources() -> Vec<(String, String)> {
-    /// Collects `.rs` files under `dir`.
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(root, &path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned();
-                out.push((relative, std::fs::read_to_string(&path).unwrap()));
-            }
-        }
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = Vec::new();
-    walk(root, &root.join("src"), &mut sources);
-    // A `#[path]` module can load a file outside `src/`, so each one's
-    // target is read too, until no new file turns up.
-    let mut at = 0;
-    while at < sources.len() {
-        let (file, text) = sources[at].clone();
-        for target in path_targets(&file, &text) {
-            if !sources.iter().any(|(known, _)| *known == target) {
-                if let Ok(text) = std::fs::read_to_string(root.join(&target)) {
-                    sources.push((target, text));
-                }
-            }
-        }
-        at += 1;
-    }
-    sources.sort();
-    sources
-}
-
-/// The files `text`'s `#[path]` modules load, relative to the crate, as
-/// [`path_target`] resolves them.
-fn path_targets(file: &str, text: &str) -> Vec<String> {
-    /// Collects each file-backed module's `#[path]` target.
-    struct Targets<'a> {
-        file: &'a str,
-        out: Vec<String>,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for Targets<'_> {
-        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-            if item.content.is_none() {
-                self.out.extend(path_target(self.file, item));
-            }
-            syn::visit::visit_item_mod(self, item);
-        }
-    }
-    let Ok(parsed) = syn::parse_file(text) else {
-        return Vec::new();
-    };
-    let mut targets = Targets {
-        file,
-        out: Vec::new(),
-    };
-    syn::visit::Visit::visit_file(&mut targets, &parsed);
-    targets.out
-}
-
-/// The file module `item`, declared in `file`, loads through its
-/// `#[path = "..."]`, relative to the crate: the attribute's path taken
-/// from `file`'s directory, `..` resolved. `None` without the attribute.
-fn path_target(file: &str, item: &syn::ItemMod) -> Option<String> {
-    let value = item.attrs.iter().find_map(|attr| match &attr.meta {
-        syn::Meta::NameValue(pair) if pair.path.is_ident("path") => match &pair.value {
-            syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(path),
-                ..
-            }) => Some(path.value()),
-            _ => None,
-        },
-        _ => None,
-    })?;
-    let mut parts: Vec<String> = Path::new(file)
-        .parent()
-        .into_iter()
-        .flat_map(|dir| dir.components())
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    for part in Path::new(&value).components() {
-        match part {
-            std::path::Component::ParentDir => {
-                parts.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
-        }
-    }
-    Some(parts.join("/"))
-}
-
-/// The path identifiers of all header-side text ([`reasons::Basis::NotNamedByHeader`]),
-/// each by where it is: every file under [`reasons::HEADER_SIDE`], whole,
-/// and for each [`NA_REASONS`] producer elsewhere, its own text and its
-/// module scope's `use` items.
-fn header_side_idents(
-    sources: &[(String, String)],
-    functions: &BTreeMap<(String, String), (String, String)>,
-    uses: &BTreeMap<(String, String), Vec<String>>,
-) -> Vec<(String, BTreeMap<String, Vec<String>>)> {
-    let header_file = |file: &str| {
-        reasons::HEADER_SIDE
-            .iter()
-            .any(|prefix| file.starts_with(prefix))
-    };
-    let mut side: Vec<(String, BTreeMap<String, Vec<String>>)> = sources
-        .iter()
-        .filter(|(file, _)| header_file(file))
-        .map(|(file, text)| (file.clone(), idents(text)))
-        .collect();
-    for producer in NA_REASONS.iter().filter(|p| !header_file(p.file)) {
-        let at = (producer.file.to_owned(), producer.function.to_owned());
-        // A listed producer the scan doesn't find is its own error.
-        let Some((module, text)) = functions.get(&at) else {
-            continue;
-        };
-        side.push((
-            format!("{} {}", producer.file, producer.function),
-            idents(text),
-        ));
-        for item in uses
-            .get(&(producer.file.to_owned(), module.clone()))
-            .into_iter()
-            .flatten()
-        {
-            side.push((
-                format!("{}'s module-scope use items", producer.file),
-                idents(item),
-            ));
-        }
-    }
-    side
-}
-
-/// Constructions by `(file, function)`, each as `(line, fingerprint,
-/// after_missing)` in source order.
-type Producers = BTreeMap<(String, String), Vec<(String, String, bool)>>;
-
-/// Every difference between a scan of `sources` and the inventory, with
-/// the scan's own errors: a construction in a header-reachable file that
-/// no entry lists at its function and position, a listed one the scan
-/// doesn't find there, a producer whose text changed since its meanings
-/// were read, a [`NOT_HEADER`] file the inventory also lists, and one whose
-/// [`reasons::Basis`] doesn't hold.
-fn scan_errors(sources: &[(String, String)]) -> Vec<String> {
-    let Scanned {
-        found,
-        mut errors,
-        functions,
-        uses,
-    } = scan(sources);
-    let not_header: BTreeSet<&str> = NOT_HEADER.iter().map(|n| n.file).collect();
-    let mut by_function: Producers = BTreeMap::new();
-    for found in found
-        .into_iter()
-        .filter(|f| !not_header.contains(f.file.as_str()))
-    {
-        by_function
-            .entry((found.file, found.function))
-            .or_default()
-            .push((found.line, found.fingerprint, found.after_missing));
-    }
-    let listed: Producers = NA_REASONS
-        .iter()
-        .map(|producer| {
-            (
-                (producer.file.to_owned(), producer.function.to_owned()),
-                producer
-                    .constructions
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.line.to_owned(),
-                            producer.fingerprint.to_owned(),
-                            c.kind == reasons::NaKind::MissingEvidence,
-                        )
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
-    // Each excluded file is excluded on a basis the scan checks: no
-    // header-side text names its module, or it names no `Verdict` or
-    // `PropertyOutcome`.
-    let header_side = header_side_idents(sources, &functions, &uses);
-    for excluded in NOT_HEADER {
-        match excluded.basis {
-            reasons::Basis::NotNamedByHeader => {
-                for (place, idents) in &header_side {
-                    for line in idents.get(excluded.module).into_iter().flatten() {
-                        errors.push(format!(
-                            "{place} names {}, which NOT_HEADER excludes: {line}",
-                            excluded.module
-                        ));
-                    }
-                }
-            }
-            reasons::Basis::NamesNoVerdict => {
-                let names = sources.iter().any(|(file, text)| {
-                    file == excluded.file
-                        && text
-                            .parse::<proc_macro2::TokenStream>()
-                            .is_ok_and(|tokens| {
-                                tokens.into_iter().any(|token| {
-                                    names_ident(&token, "Verdict")
-                                        || names_ident(&token, "PropertyOutcome")
-                                })
-                            })
-                });
-                if names {
-                    errors.push(format!("{} names a verdict type", excluded.file));
-                }
-            }
-        }
-    }
-    if listed.len() != NA_REASONS.len() {
-        errors.push("a producer is listed twice".into());
-    }
-    // A producer's constructions without their fingerprints, to tell a
-    // changed text from a changed construction.
-    let shape = |lines: &[(String, String, bool)]| -> Vec<(String, bool)> {
-        lines
-            .iter()
-            .map(|(line, _, missing)| (line.clone(), *missing))
-            .collect()
-    };
-    for (at, lines) in &by_function {
-        match listed.get(at) {
-            Some(listed) if listed == lines => {}
-            Some(listed) if shape(listed) == shape(lines) => errors.push(format!(
-                "{} {} changed: reread the meanings of its NotApplicable constructions in reasons.rs, then update its fingerprint from {} to {}",
-                at.0,
-                at.1,
-                listed.first().map_or("", |(_, print, _)| print.as_str()),
-                lines.first().map_or("", |(_, print, _)| print.as_str()),
-            )),
-            Some(listed) => errors.push(format!("{at:?}: found {lines:?}, listed {listed:?}")),
-            None => errors.push(format!("{at:?}: found {lines:?}, unlisted")),
-        }
-    }
-    for at in listed.keys() {
-        if !by_function.contains_key(at) {
-            errors.push(format!("{at:?}: listed, not found"));
-        }
-        if not_header.contains(at.0.as_str()) {
-            errors.push(format!("{at:?}: listed in a file NOT_HEADER names"));
-        }
-    }
-    errors
 }
 
 /// The fingerprint of `NARROWING`'s source in `contracts` (that file's
@@ -4200,520 +3355,296 @@ fn the_narrowing_rules_match_their_pin() {
     );
 }
 
-#[test]
-fn the_not_applicable_inventory_equals_a_source_scan() {
-    let sources = crate_sources();
-    assert_eq!(scan_errors(&sources), Vec::<String>::new());
-    for excluded in NOT_HEADER {
-        assert!(
-            sources.iter().any(|(f, _)| f == excluded.file),
-            "{} doesn't exist",
-            excluded.file
-        );
-    }
-    // A prefix that matches nothing, after a rename, would leave header
-    // files outside the header-side text.
-    for prefix in reasons::HEADER_SIDE {
-        assert!(
-            sources.iter().any(|(f, _)| f.starts_with(prefix)),
-            "no file is under HEADER_SIDE's {prefix}"
-        );
-    }
-}
-
-/// `sources` with `extra` appended to `file`, or with `from` replaced by
-/// `to` in it.
-fn edited(
-    sources: &[(String, String)],
-    file: &str,
-    edit: &dyn Fn(&str) -> String,
-) -> Vec<(String, String)> {
-    sources
-        .iter()
-        .map(|(name, text)| {
-            (
-                name.clone(),
-                if name == file {
-                    edit(text)
-                } else {
-                    text.clone()
-                },
-            )
+/// The variant names of `pub enum {name}` in the crate source file `file`:
+/// each identifier that opens a line at the enum body's top level.
+fn enum_variants(file: &str, name: &str) -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+    let text = std::fs::read_to_string(&path).expect("the enum's source file reads");
+    let open = format!("pub enum {name} {{\n");
+    let body = &text[text.find(&open).expect("the enum is defined there") + open.len()..];
+    let body = &body[..body.find("\n}\n").expect("the enum's body closes")];
+    body.lines()
+        .filter_map(|line| line.strip_prefix("    "))
+        .filter(|line| line.starts_with(|c: char| c.is_ascii_uppercase()))
+        .map(|line| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .expect("a line has a first word")
+                .to_owned()
         })
         .collect()
 }
 
-/// One defect at a time fails the scan: a new producer, a second
-/// construction in a listed function, a construction moved to a same-named
-/// function in another file, a construction hidden after a `//` in a string,
-/// an alias, an unknown macro, and a construction swapped for another line
-/// at the same count. A comparison, a pattern and a comment aren't
-/// constructions.
-#[test]
-fn the_source_scan_refuses_an_unlisted_producer() {
-    let sources = crate_sources();
-    let header = "src/domain/header_sync.rs";
-    let refused = |changed: Vec<(String, String)>, what: &str| {
-        assert!(!scan_errors(&changed).is_empty(), "{what}");
-    };
-    refused(
-        edited(&sources, header, &|t| {
-            format!("{t}\nfn check_new<S>() -> Verdict {{\n    Verdict::NotApplicable\n}}\n")
-        }),
-        "new producer",
-    );
-    refused(
-        edited(&sources, header, &|t| {
-            t.replacen(
-                "        Verdict::NotApplicable\n",
-                "        let _ = Verdict::NotApplicable;\n        Verdict::NotApplicable\n",
-                1,
-            )
-        }),
-        "second construction",
-    );
-    refused(
-        edited(&sources, "src/table.rs", &|t| {
-            format!("{t}\nfn check_teardown() -> Verdict {{\n    Verdict::NotApplicable\n}}\n")
-        }),
-        "same function name in another file",
-    );
-    refused(
-        edited(&sources, header, &|t| {
-            format!(
-                "{t}\nfn check_url() -> Verdict {{\n    (\"https://x.invalid\", Verdict::NotApplicable).1\n}}\n"
-            )
-        }),
-        "a construction after a // inside a string",
-    );
-    refused(
-        edited(&sources, header, &|t| {
-            format!("{t}\nuse crate::property::Verdict::NotApplicable as Na;\n")
-        }),
-        "an alias",
-    );
-    refused(
-        edited(&sources, header, &|t| {
-            format!(
-                "{t}\nfn check_vec() -> Vec<Verdict> {{\n    vec![Verdict::NotApplicable]\n}}\n"
-            )
-        }),
-        "an unknown macro",
-    );
-    refused(
-        edited(&sources, header, &|t| {
-            t.replacen(
-                "        _ => Verdict::NotApplicable,\n",
-                "        _ => { Verdict::NotApplicable }\n",
-                1,
-            )
-        }),
-        "a construction on another line at the same count",
-    );
-    for (extra, what) in [
-        (
-            "use crate::property::Verdict as V;\nfn check_alias() -> V {\n    V::NotApplicable\n}\n",
-            "an enum alias",
-        ),
-        (
-            "fn check_struct() -> Verdict {\n    Verdict::NotApplicable {}\n}\n",
-            "a struct-literal constructor",
-        ),
-        (
-            "fn check_guard(v: bool) -> Verdict {\n    matches!(Some(()), Some(()) if { if v { return Verdict::NotApplicable; } true });\n    Verdict::Holds\n}\n",
-            "a return in an allowed macro's guard",
-        ),
-        (
-            "fn check_replace(mut verdict: Verdict) -> Verdict {\n    assert_eq!(std::mem::replace(&mut verdict, Verdict::NotApplicable), Verdict::Holds);\n    verdict\n}\n",
-            "a construction in an assertion's argument",
-        ),
-        (
-            "fn check_try(input: Option<bool>) -> Result<bool, Verdict> {\n    Ok(matches!(input.ok_or(Verdict::NotApplicable)?, true))\n}\n",
-            "a construction propagated out of a pattern macro's scrutinee",
-        ),
-        (
-            "fn check_opaque() {\n    assert!(Verdict::NotApplicable => 1);\n}\n",
-            "a known macro that doesn't parse",
-        ),
-        (
-            "fn check_break(ready: bool) -> Verdict {\n    'done: {\n        let _ = matches!((), () if ready || (break 'done Verdict::NotApplicable));\n        Verdict::Holds\n    }\n}\n",
-            "a construction broken out of an allowed macro's guard",
-        ),
-        (
-            "use crate::domain::shared::{bounds};\n",
-            "a grouped import of an excluded module",
-        ),
-        (
-            "use crate::domain::shared;\nfn check_module() {\n    let _ = shared::bounds::bound::<(), ()>;\n}\n",
-            "an excluded module reached through its parent's import",
-        ),
-        (
-            "fn check_reach() {\n    let _ = crate::domain::shared::bounds::bound;\n}\n",
-            "a header file naming an excluded module",
-        ),
-        (
-            "use crate::domain::discovery as found;\n",
-            "a header file aliasing an excluded module",
-        ),
-        (
-            "fn check_rows() {\n    let _ = crate::domain::block_sync::BUDGET_LEDGERS_AGREE;\n}\n",
-            "a header file naming block sync's checks",
-        ),
-    ] {
-        refused(edited(&sources, header, &|t| format!("{t}\n{extra}")), what);
-    }
-    // A shared producer's own text naming an excluded module, and an
-    // import in its module scope redirected to one, its text unchanged,
-    // each refused as naming it, not only by a changed fingerprint.
-    let names_excluded = |changed: Vec<(String, String)>, what: &str| {
-        let errors = scan_errors(&changed);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("which NOT_HEADER excludes")),
-            "{what}: {errors:?}"
-        );
-    };
-    names_excluded(
-        edited(&sources, "src/harness/mod.rs", &|t| {
-            t.replacen(
-                "        Phase::Drain => Verdict::NotApplicable,\n",
-                "        Phase::Drain => {\n            let _ = block_sync::Storage::NAME;\n            Verdict::NotApplicable\n        }\n",
-                1,
-            )
-        }),
-        "a shared producer naming an excluded module",
-    );
-    names_excluded(
-        edited(&sources, "src/table.rs", &|t| {
-            format!("{t}\nuse crate::domain::block_sync::check_ledgers as judged;\n")
-        }),
-        "a shared producer's module-scope import of an excluded module",
-    );
-    // The evaluator starting to name a verdict type.
-    refused(
-        edited(
-            &sources,
-            "src/harness/header_acceptance/evaluate.rs",
-            &|t| format!("{t}\nuse crate::property::Verdict;\n"),
-        ),
-        "an excluded file losing its basis",
-    );
-    // A construction's outer condition changed, its innermost one and its
-    // line kept.
-    refused(
-        edited(&sources, "src/domain/header_sync_progress.rs", &|t| {
-            t.replacen(
-                "    if !read_now {\n        return Verdict::NotApplicable;\n    }",
-                "    if cx.step > 0 {\n        if !read_now {\n            return Verdict::NotApplicable;\n        }\n    }",
-                1,
-            )
-        }),
-        "an outer condition added",
-    );
-    // A matched name bound to another value, its match and arm kept.
-    refused(
-        edited(&sources, "src/domain/header_sync.rs", &|t| {
-            t.replacen(
-                "let boundary = view.capacity().boundary(step);",
-                "let boundary = view.capacity().boundary(step.saturating_sub(1));",
-                1,
-            )
-        }),
-        "a matched name bound to another value",
-    );
-    // A `let ... else` initializer changed, its inner branch and line kept.
-    refused(
-        edited(&sources, "src/harness/machine.rs", &|t| {
-            t.replacen(
-                "let Some(failure) = step.failure() else {",
-                "let Some(failure) = step.failure().filter(|failure| failure.property_failure) else {",
-                1,
-            )
-        }),
-        "a let-else initializer changed",
-    );
-    // NotApplicable made a derived default, which generates a constructor
-    // the scan can't see.
-    refused(
-        edited(&sources, "src/property/verdict.rs", &|t| {
-            t.replacen(
-                "    NotApplicable,\n",
-                "    #[default]\n    NotApplicable,\n",
-                1,
-            )
-        }),
-        "a derived-default NotApplicable",
-    );
-    // A match arm's construction answering another matched value.
-    refused(
-        edited(&sources, "src/domain/header_sync.rs", &|t| {
-            t.replacen(
-                "    match boundary {\n        Some(BoundaryRead::Read) => Verdict::Holds,",
-                "    match view.capacity().boundary(step.saturating_sub(1)) {\n        Some(BoundaryRead::Read) => Verdict::Holds,",
-                1,
-            )
-        }),
-        "a match on another value",
-    );
-    // A re-export in a shared producer's module scope, which its producer
-    // could call.
-    names_excluded(
-        edited(&sources, "src/harness/mod.rs", &|t| {
-            format!("{t}\npub use block_sync::Storage as ReexportedStorage;\n")
-        }),
-        "a re-export in a shared producer's module scope",
-    );
-    // One of two identical returns given another trigger.
-    refused(
-        edited(&sources, "src/domain/header_sync_progress.rs", &|t| {
-            t.replacen("if first != Some(cx.step) {", "if first.is_none() {", 1)
-        }),
-        "an identical return's trigger changed",
-    );
-    // Moving missing_evidence between two identical returns changes their
-    // kinds, which the inventory's kinds must follow.
-    refused(
-        edited(&sources, "src/domain/header_sync_progress.rs", &|t| {
-            t.replacen(
-                "    if first != Some(cx.step) {\n        return Verdict::NotApplicable;",
-                "    if first != Some(cx.step) {\n        cx.missing_evidence(\"moved\");\n        return Verdict::NotApplicable;",
-                1,
-            )
-        }),
-        "missing_evidence moved before another identical line",
-    );
-    // The C20 fingerprint rule: any edit to a producer's own text changes
-    // its fingerprint, and any change to `Verdict` or its impls changes the
-    // type's. Each of round 6's counterexamples is refused.
-    let replaced = |file: &str, from: &'static str, to: &'static str| {
-        let from = from.to_owned();
-        let to = to.to_owned();
-        edited(&sources, file, &move |t| {
-            assert!(t.contains(&from), "{from}");
-            t.replacen(&from, &to, 1)
-        })
-    };
-    for (changed, what) in [
-        (
-            replaced(
-                header,
-                "        Some(BoundaryRead::Read) | None => {}\n",
-                "        Some(BoundaryRead::Read) if step % 2 == 0 => {}\n        Some(BoundaryRead::Read) | None => {}\n",
-            ),
-            "an earlier arm's guard in check_chunk_budget_bound",
-        ),
-        (
-            replaced(
-                "src/property/registry.rs",
-                "None if state.applicable > 0 =>",
-                "None if state.applicable > 1 =>",
-            ),
-            "the registry's applicability guard before its fallback arm",
-        ),
-        (
-            replaced(
-                "src/domain/header_sync_progress.rs",
-                "    if !read_now {\n        return Verdict::NotApplicable;",
-                "    let read_now = read_now && cx.step > 3;\n    if !read_now {\n        return Verdict::NotApplicable;",
-            ),
-            "a recorded condition's name rebound after its initializer",
-        ),
-        (
-            replaced(
-                "src/property/verdict.rs",
-                "    /// The check didn't apply at this step.\n    NotApplicable,",
-                "    /// The check didn't apply at this step.\n    #[cfg_attr(zakura_sim, default)]\n    NotApplicable,",
-            ),
-            "a conditional default on NotApplicable",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nimpl Default for crate::property::Verdict {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "a new impl block for Verdict",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nuse crate::property::Verdict as V;\nimpl Default for V {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl for Verdict through an import alias",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\ntype V = crate::property::Verdict;\nimpl Default for V {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl for Verdict through a type alias",
-        ),
-        (
-            edited(&sources, header, &|t| format!("{t}\ninclude!(\"checks.inc\");\n")),
-            "an included source",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nuse crate::property::Verdict::{{self as V}};\nimpl Default for V {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl for Verdict through a grouped self rename",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nimpl Default for (crate::property::Verdict) {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl for a parenthesized Verdict",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\ntype V = (crate::property::Verdict);\nimpl Default for V {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl through a parenthesized type alias",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nmacro_rules! default_of {{\n    ($t:ty) => {{\n        impl Default for $t {{\n            fn default() -> Self {{\n                Self::Holds\n            }}\n        }}\n    }};\n}}\ndefault_of!(crate::property::Verdict);\n")
-            }),
-            "an impl a macro generates for Verdict",
-        ),
-        (
-            edited(&sources, "src/lib.rs", &|t| {
-                format!("{t}\n#[path = \"../outside/checks.rs\"]\nmod outside_checks;\n")
-            }),
-            "a module loaded from a file the scan doesn't read",
-        ),
-        (
-            edited(&sources, "src/lib.rs", &|t| {
-                format!("{t}\n#[cfg_attr(zakura_sim, path = \"../outside/checks.rs\")]\nmod outside_checks;\n")
-            }),
-            "a module whose file cfg_attr picks",
-        ),
-        (
-            edited(&sources, "build/provenance.rs", &|t| format!("{t}\nmod detail;\n")),
-            "a module an out-of-tree file declares",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\ntype Identity<T> = T;\nimpl Default for Identity<crate::property::Verdict> {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl through a generic identity alias",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\ntrait Id {{\n    type Output;\n}}\nstruct Marker;\nimpl Id for Marker {{\n    type Output = crate::property::Verdict;\n}}\nimpl Default for <Marker as Id>::Output {{\n    fn default() -> Self {{\n        Self::Holds\n    }}\n}}\n")
-            }),
-            "an impl through an associated type",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\nfn check_hidden() {{\n    assert!({{\n        impl Default for crate::property::Verdict {{\n            fn default() -> Self {{\n                Self::Holds\n            }}\n        }}\n        true\n    }});\n}}\n")
-            }),
-            "an impl inside a value macro's argument",
-        ),
-        (
-            edited(&sources, "src/check.rs", &|t| {
-                t.replacen(
-                    "pub enum PropertyOutcome {",
-                    "#[derive(Default)]\npub enum PropertyOutcome {",
-                    1,
-                )
-            }),
-            "a derive on PropertyOutcome",
-        ),
-    ] {
-        let errors = scan_errors(&changed);
-        assert!(!errors.is_empty(), "{what}");
-    }
-    // A producer whose text changed but whose constructions didn't says
-    // what to reread.
-    let errors = scan_errors(&replaced(
-        "src/property/registry.rs",
-        "None if state.applicable > 0 =>",
-        "None if state.applicable > 1 =>",
-    ));
-    assert!(
-        errors.iter().any(|e| e.starts_with(
-            "src/property/registry.rs outcome changed: reread the meanings of its NotApplicable constructions in reasons.rs"
-        )),
-        "{errors:?}"
-    );
-    // A comment or whitespace in a producer isn't an edit.
-    assert_eq!(
-        scan_errors(&replaced(
-            "src/property/registry.rs",
-            "None if state.applicable > 0 =>",
-            "None if  state.applicable > 0 /* applied */ =>",
-        )),
-        Vec::<String>::new()
-    );
+/// The files that name `Pending`'s variants without producing them: its
+/// definition, the registry that judges marks, and the inventory itself.
+const PENDING_CONSUMERS: [&str; 3] = [
+    "property/verdict.rs",
+    "property/registry.rs",
+    "harness/header_acceptance/reasons.rs",
+];
 
-    // The reachable sender helper's entry removed from the inventory is
-    // refused too, since downstream.rs isn't a file NOT_HEADER names.
-    let found = scan(&sources).found;
-    assert!(found
-        .iter()
-        .any(|f| f.file == "src/downstream.rs" && f.function == "check_with"));
-    for (changed, what) in [
-        (
-            edited(&sources, header, &|t| {
-                format!(
-                    "{t}\nfn check_cmp(v: Verdict) -> bool {{\n    v == Verdict::NotApplicable\n}}\n"
-                )
-            }),
-            "a comparison",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!(
-                    "{t}\nfn check_pat(v: Verdict) -> bool {{\n    matches!(v, Verdict::NotApplicable)\n}}\n"
-                )
-            }),
-            "a pattern macro",
-        ),
-        (
-            edited(&sources, header, &|t| {
-                format!("{t}\n// Verdict::NotApplicable\n")
-            }),
-            "a comment",
-        ),
-        // Other teams naming their own modules (Evan's examples) don't touch
-        // the scan: an unrelated same-named module, a new coverage row, and
-        // a reference in a shared producer's file outside the producer and
-        // its imports.
-        (
-            edited(&sources, "src/peer/discovery/content.rs", &|t| {
-                format!("{t}\nfn unix_now_again() {{\n    let _ = crate::peer::discovery::unix_now;\n}}\n")
-            }),
-            "an unrelated module of an excluded module's name",
-        ),
-        (
-            edited(&sources, "src/harness/coverage.rs", &|t| {
-                format!("{t}\nfn another_row() {{\n    let _ = crate::domain::block_sync::BUDGET_LEDGERS_AGREE;\n}}\n")
-            }),
-            "a new coverage reference to block sync",
-        ),
-        (
-            edited(&sources, "src/harness/mod.rs", &|t| {
-                format!("{t}\nfn other_entry() {{\n    let _ = block_sync::Storage::NAME;\n}}\n")
-            }),
-            "a reference outside a shared file's producer",
-        ),
-        // The accepted gap (Rule 23): a helper in a shared file, which a
-        // producer could later call, isn't followed until the producer's
-        // own text changes.
-        (
-            edited(&sources, "src/table.rs", &|t| {
-                format!(
-                    "{t}\nfn helper() {{\n    let _ = crate::domain::block_sync::BlockSync;\n}}\n"
-                )
-            }),
-            "a new helper in a shared file",
-        ),
-        (
-            edited(&sources, "src/harness/mod.rs", &|t| {
-                format!("{t}\nfn reach() {{\n    let _ = crate::domain::discovery::wait_complete_wakes::<()>;\n}}\n")
-            }),
-            "a call added in a shared file outside its producer",
-        ),
+/// Every site the crate's `src` names outside test code and
+/// [`PENDING_CONSUMERS`], with the files that name it, relative to `src`.
+/// Naming a site is producing it, so the scan sees a mark however it's
+/// spelled ([`marked_sites`]).
+fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let mut producers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(&src)
+            .expect("under src")
+            .display()
+            .to_string();
+        let test_file = file.file_name().is_some_and(|name| name == "tests.rs")
+            || file.components().any(|part| part.as_os_str() == "tests");
+        if test_file || PENDING_CONSUMERS.contains(&relative.as_str()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("a source file reads");
+        for site in marked_sites(&text, &relative) {
+            producers.entry(site).or_default().insert(relative.clone());
+        }
+    }
+    producers
+}
+
+/// Each `Pending` site the Rust source `text`, the file `file`, names as a
+/// `Pending::Site` path outside test code, in order: a mark as `cx.pending`,
+/// as `CheckCtx::pending(cx, ...)`, or through a variable alike. A `use`
+/// that imports `Pending`'s variants or renames `Pending` would hide a
+/// path, so it fails the scan.
+fn marked_sites(text: &str, file: &str) -> Vec<String> {
+    use syn::visit::Visit;
+    /// Collects the site paths.
+    struct Sites<'a> {
+        variants: &'a BTreeSet<String>,
+        file: &'a str,
+        found: Vec<String>,
+    }
+    /// Whether `attrs` mark test-only code: `#[test]`, or a `cfg` whose
+    /// whole condition is `test`. Any other condition that names `test`,
+    /// such as `any(test, zakura_sim)` or `not(test)`, can hold in a
+    /// simulator build, so its code is scanned.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
+        })
+    }
+    /// Fails on a `use` tree that imports from `Pending` or renames it.
+    fn check_use(tree: &syn::UseTree, file: &str) {
+        match tree {
+            syn::UseTree::Path(path) if path.ident == "Pending" => {
+                panic!("{file}: a `use` imports Pending's variants, which the scan can't see")
+            }
+            syn::UseTree::Path(path) => check_use(&path.tree, file),
+            syn::UseTree::Rename(rename) if rename.ident == "Pending" => {
+                panic!("{file}: a `use` renames Pending, which the scan can't see")
+            }
+            syn::UseTree::Group(group) => group.items.iter().for_each(|tree| check_use(tree, file)),
+            _ => {}
+        }
+    }
+    impl<'ast> Visit<'ast> for Sites<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            check_use(&item.tree, self.file);
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if let [.., kind, site] = &names[..] {
+                if kind == "Pending" && self.variants.contains(site) {
+                    self.found.push(site.clone());
+                }
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let variants = enum_variants("src/property/verdict.rs", "Pending");
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut sites = Sites {
+        variants: &variants,
+        file,
+        found: Vec::new(),
+    };
+    sites.visit_file(&parsed);
+    sites.found
+}
+
+/// C20: the reason inventory lists every `NotApplicable` reason exactly
+/// once, in `NA_REASONS` for the ones a header ID can carry or `NOT_HEADER`
+/// for the rest, and each in the trace's typed form. The complete set comes
+/// from the enums' definitions, and a pending site's side from the checks
+/// that mark it: a site a header source marks is a header reason, unless
+/// the dry end turns it into missing evidence, and each header site has a
+/// header producer. The match is exhaustive too, so a new reason or
+/// `Pending` site fails to compile here until it's classified.
+#[test]
+fn the_not_applicable_inventory_lists_every_reason() {
+    use zakura_sim::{property::Pending, NaReason};
+    let header = |reason: NaReason| match reason {
+        NaReason::NeverApplied
+        | NaReason::Undeclared
+        | NaReason::Excluded
+        | NaReason::AssumptionsNeverHeld
+        | NaReason::AssumptionLost
+        | NaReason::StoppedByViolation
+        | NaReason::HarnessFailed
+        | NaReason::NodeStopped
+        | NaReason::Unsettled {
+            site:
+                Pending::FaultOpen
+                | Pending::TeardownOpen
+                | Pending::WatchOpen
+                | Pending::UnreadTrigger
+                | Pending::UnjudgedDeparture
+                | Pending::TipUnpublished,
+        } => true,
+        // A dry end turns an unread boundary into missing evidence.
+        NaReason::Unsettled {
+            site: Pending::UnreadBoundary | Pending::BlockTeardownOpen,
+        } => false,
+    };
+    let listed: Vec<NaReason> = NA_REASONS.iter().map(|entry| entry.reason).collect();
+    let excluded: Vec<NaReason> = NOT_HEADER.iter().map(|(reason, _)| *reason).collect();
+    let all: BTreeSet<NaReason> = listed.iter().chain(&excluded).copied().collect();
+    assert_eq!(
+        all.len(),
+        listed.len() + excluded.len(),
+        "a reason is listed twice"
+    );
+    // Every variant, as the enums define them.
+    let site_of = |reason: &NaReason| match reason {
+        NaReason::Unsettled { site } => Some(format!("{site:?}")),
+        _ => None,
+    };
+    let variant_of = |reason: &NaReason| match site_of(reason) {
+        Some(_) => "Unsettled".to_owned(),
+        None => format!("{reason:?}"),
+    };
+    assert_eq!(
+        all.iter().map(variant_of).collect::<BTreeSet<_>>(),
+        enum_variants("src/check.rs", "NaReason"),
+        "every reason"
+    );
+    assert_eq!(
+        all.iter().filter_map(site_of).collect::<BTreeSet<_>>(),
+        enum_variants("src/property/verdict.rs", "Pending"),
+        "every pending site"
+    );
+    // The one site a header check marks that no header ID ends with: the
+    // registry's dry end fails the run at it instead, as
+    // `tests/drain.rs`'s
+    // `a_dry_end_fails_an_unread_boundary_as_missing_evidence` shows.
+    let converted = [Pending::UnreadBoundary].map(|site| format!("{site:?}"));
+    let header_sites: BTreeSet<String> = listed.iter().filter_map(site_of).collect();
+    // The scan reads a site however the mark is spelled: whatever its
+    // receiver, through `CheckCtx::pending`, or through a variable (Terra 3,
+    // rounds 3 and 7). Test-only code doesn't count, but code a simulator
+    // build compiles does (Terra, round 8), and a `use` that would hide a
+    // site's path fails it.
+    let text = "fn check(cx: &mut Cx) {\n\
+                    cx.pending(Pending::FaultOpen);\n\
+                    ctx.pending(Pending::BlockTeardownOpen);\n\
+                    CheckCtx::pending(cx, Pending::TeardownOpen);\n\
+                    let site = Pending::WatchOpen;\n\
+                    cx.pending(site);\n\
+                    let ops = self.port.pending();\n\
+                }\n\
+                #[cfg(test)]\n\
+                mod tests {\n\
+                    fn t() { let _ = Pending::UnreadTrigger; }\n\
+                }\n\
+                #[cfg(any(test, zakura_sim))]\n\
+                fn sim() { cx.pending(Pending::UnjudgedDeparture); }\n\
+                #[cfg(not(test))]\n\
+                fn live() { cx.pending(Pending::UnreadBoundary); }\n";
+    assert_eq!(
+        marked_sites(text, "t.rs"),
+        [
+            "FaultOpen",
+            "BlockTeardownOpen",
+            "TeardownOpen",
+            "WatchOpen",
+            "UnjudgedDeparture",
+            "UnreadBoundary"
+        ]
+    );
+    for hidden in [
+        "use crate::property::Pending::FaultOpen;",
+        "use crate::property::Pending as Mark;",
     ] {
-        assert_eq!(scan_errors(&changed), Vec::<String>::new(), "{what}");
+        let scanned = std::panic::catch_unwind(|| marked_sites(hidden, "t.rs"));
+        assert!(scanned.is_err(), "{hidden}");
+    }
+    let producers = pending_producers();
+    let by_header = |site: &String| {
+        producers
+            .get(site)
+            .is_some_and(|files| files.iter().any(|file| file.contains("header")))
+    };
+    for site in producers.keys().filter(|site| by_header(site)) {
+        assert!(
+            header_sites.contains(site) || converted.contains(site),
+            "a header check marks {site}, which NA_REASONS doesn't list"
+        );
+    }
+    for site in &header_sites {
+        assert!(by_header(site), "no header check marks {site}");
+    }
+    for site in &converted {
+        assert!(
+            NOT_HEADER
+                .iter()
+                .any(|(reason, _)| site_of(reason).as_ref() == Some(site)),
+            "{site}"
+        );
+    }
+    for entry in NA_REASONS {
+        assert!(
+            header(entry.reason),
+            "{:?} isn't a header reason",
+            entry.reason
+        );
+        assert!(!entry.meaning.is_empty(), "{:?}", entry.reason);
+        let json = serde_json::to_value(entry.reason).unwrap();
+        assert_eq!(
+            serde_json::from_value::<NaReason>(json).ok(),
+            Some(entry.reason)
+        );
+    }
+    for (reason, why) in NOT_HEADER {
+        assert!(!header(*reason), "{reason:?} is a header reason");
+        assert!(!why.is_empty(), "{reason:?}");
     }
 }
 
@@ -5070,7 +4001,7 @@ fn held() -> Report {
 /// `NotApplicable` for `reason`.
 fn na(reason: &str) -> Report {
     Report::NotApplicable {
-        reason: Some(reason.into()),
+        reason: reason.into(),
     }
 }
 
@@ -5354,12 +4285,10 @@ fn the_evaluator_accepts_genuine_results() {
     // A catch stopped at a step is a prefix: another property may still be
     // open there.
     let mut pending = results();
-    caught_runs(&mut pending, CASE).1.reports.insert(
-        "t/b".into(),
-        Report::Inconclusive {
-            reason: "obligation-open".into(),
-        },
-    );
+    caught_runs(&mut pending, CASE)
+        .1
+        .reports
+        .insert("t/b".into(), na("stopped-by-violation"));
     assert_eq!(
         state(&manifest, &pending, &Key::catch("t/a")),
         ObligationState::Verified
@@ -5538,8 +4467,8 @@ fn the_evaluator_refuses_each_single_defect() {
         refused(&holds, |r| defect(run_of(r, &holds_id())));
     }
     // The other reports: the expected NotApplicable with another reason, or
-    // held instead; a missing or extra report; another property
-    // Inconclusive; and a Draft override on a normal run.
+    // held instead; a missing or extra report; another property left
+    // unsettled; and a Draft override on a normal run.
     let report_defects: [fn(&mut Execution); 7] = [
         |run| {
             run.reports.insert("t/b".into(), na("another reason"));
@@ -5558,12 +4487,8 @@ fn the_evaluator_refuses_each_single_defect() {
             run.reports.insert("t/c".into(), b);
         },
         |run| {
-            run.reports.insert(
-                "t/b".into(),
-                Report::Inconclusive {
-                    reason: "teardown-open".into(),
-                },
-            );
+            run.reports
+                .insert("t/b".into(), na("unsettled:teardown-open"));
         },
         |run| run.meta.draft_override = vec!["t/a".into()],
     ];
@@ -5604,14 +4529,12 @@ fn the_evaluator_refuses_each_single_defect() {
         caught_runs(r, CASE).1.reports.insert("t/a".into(), held());
     });
     // A Draft run with the right violated set, but another property
-    // Inconclusive or unexpectedly NotApplicable (rule 16).
+    // left open or unexpectedly NotApplicable (rule 16).
     refused(&catch, |r| {
-        caught_runs(r, CASE).2.reports.insert(
-            "t/b".into(),
-            Report::Inconclusive {
-                reason: "obligation-open".into(),
-            },
-        );
+        caught_runs(r, CASE)
+            .2
+            .reports
+            .insert("t/b".into(), na("stopped-by-violation"));
     });
     refused(&catch, |r| {
         caught_runs(r, CASE)
@@ -6475,15 +5398,13 @@ fn the_evaluator_binds_runners_and_traces() {
     refused(&catch, |r| {
         caught_runs(r, CASE).2.meta.run_by = RunBy::Planted
     });
-    // A completed end-found catch with an unrelated Inconclusive or an
+    // A completed end-found catch with an unrelated open obligation or an
     // unexpected NotApplicable.
     refused(&late, |r| {
-        caught_runs(r, END_CASE).1.reports.insert(
-            "t/b".into(),
-            Report::Inconclusive {
-                reason: "obligation-open".into(),
-            },
-        );
+        caught_runs(r, END_CASE)
+            .1
+            .reports
+            .insert("t/b".into(), na("stopped-by-violation"));
     });
     refused(&late, |r| {
         caught_runs(r, END_CASE)
@@ -6810,7 +5731,7 @@ fn the_evaluator_binds_runners_and_traces() {
             if let Some(Report::NotApplicable { reason }) =
                 run_of(&mut r, &stays_id()).reports.get_mut("t/b")
             {
-                *reason = Some(String::new());
+                *reason = String::new();
             }
         }
         assert!(

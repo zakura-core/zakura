@@ -13,6 +13,7 @@ use std::{fs, path::PathBuf, process::Command};
 use zakura_network::zakura::observe::HeaderTargetPhase;
 
 use support::{byte_inputs, inputs};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -167,7 +168,10 @@ fn every_departure_fixture_holds() {
                 assert!(
                     matches!(
                         outcome(&report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        PropertyOutcome::Held { .. }
+                            | PropertyOutcome::NotApplicable {
+                                reason: NaReason::NeverApplied
+                            }
                     ),
                     "{fixture:?}: {control}: {:?}",
                     outcome(&report, control)
@@ -212,7 +216,10 @@ fn every_timeout_fixture_holds_after_its_deadline() {
                 assert!(
                     matches!(
                         outcome(&report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        PropertyOutcome::Held { .. }
+                            | PropertyOutcome::NotApplicable {
+                                reason: NaReason::NeverApplied
+                            }
                     ),
                     "{fixture:?}: {control}: {:?}",
                     outcome(&report, control)
@@ -329,7 +336,9 @@ fn the_storage_harness_holds_it_across_relinks() {
         assert_eq!(report.end.harness, None, "{:?}", report.end);
         match outcome(&report, PEER_RETIREMENT_PROGRESS) {
             PropertyOutcome::Held { applicable } if *applicable > 0 => applied += 1,
-            PropertyOutcome::NotApplicable => {}
+            PropertyOutcome::NotApplicable {
+                reason: NaReason::NeverApplied,
+            } => {}
             other => panic!("{other:?}"),
         }
     }

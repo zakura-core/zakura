@@ -1,0 +1,16 @@
+# hdr-8's skipped apply on the recovery control: the reactor takes an
+# ordinary prepared target, ends its retained headers and returns, so the
+# source's one successor, A4, never reaches storage and the node stays at
+# A3, its baseline at the `Recover` pick. The `recovered` pick then owes A4,
+# and the obligation runs to its 30-second deadline. The harness offers a
+# time boundary just past it, so the violation comes there, and the
+# fixture's finish ends the run idle after it.
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides whether the successor is offered, located and prepared. A change
+# there can move the input off its prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-successor.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-successor.plan"

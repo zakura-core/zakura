@@ -1,10 +1,10 @@
 //! What a check sees.
 
-use std::ops::Deref;
+use std::{collections::BTreeSet, ops::Deref};
 
 use super::{
-    Cardinality, FactAnswer, FactDischarge, Inconclusive, Kind, LivenessBound, Obligation,
-    ObligationKey, Property, PropertyId, Source, Subject, Verdict,
+    Cardinality, FactAnswer, FactDischarge, Kind, LivenessBound, Obligation, ObligationKey,
+    Pending, Property, PropertyId, Source, Subject, Verdict,
 };
 use crate::{
     check::Violation, end::RunEnd, model::LabelledFrame, Observation, ObservationLog, StepCtx,
@@ -43,10 +43,33 @@ pub trait HasView {
     /// The violations only the run's end shows, judged over its whole `log`
     /// after [`ended`](HasView::ended), such as an obligation still open
     /// when a settled run stopped. The registry records each against its
-    /// property, unless that property was already violated. None by
-    /// default.
+    /// property, beside the violations its steps found, so one that repeats
+    /// a break a step check already reported must be left out here, where
+    /// the break's identity is known. None by default.
     fn end_violations(&self, _log: &ObservationLog) -> Vec<EndViolation> {
         Vec::new()
+    }
+
+    /// Whether the harness had begun to stop the node under test when the
+    /// run ended. That's an environment end ([`EndedBy`](super::EndedBy)),
+    /// and the one that may leave a watch read open with no break
+    /// ([`crate::domain::header_sync::watch_end_violations`]), so the
+    /// registry reports a property it left with a [`Pending::WatchOpen`]
+    /// mark as `NodeStopped`. Read after [`ended`](HasView::ended). False by
+    /// default.
+    fn stopping(&self) -> bool {
+        false
+    }
+
+    /// The harness's evidence stores as they stand after the run's end and
+    /// before shutdown, for the run's full report
+    /// ([`crate::record::FullReport`]), or `None` for a harness that keeps
+    /// none, as by default. Two runs that end with equal stores must give
+    /// equal snapshots. It runs under the simulated runtime, so it reads
+    /// shared state only through non-preempting peeks, such as
+    /// `Weak::peek_strong_count`, or a saved input's replay drifts.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        None
     }
 
     /// The stamps of the view-side facts that [`view`](HasView::view) shows
@@ -114,7 +137,7 @@ pub struct CheckCtx<'a, S: HasView> {
     missing: Option<String>,
     labelled: Vec<LabelledFrame>,
     peaks: Vec<(&'static str, u64)>,
-    unsettled: Option<Inconclusive>,
+    pending: BTreeSet<Pending>,
 }
 
 /// What a check left behind besides its verdict.
@@ -129,8 +152,8 @@ pub(crate) struct CheckParts<V> {
     pub(crate) labelled: Vec<LabelledFrame>,
     /// The quantities it measured, by name.
     pub(crate) peaks: Vec<(&'static str, u64)>,
-    /// Why its trigger fired but it couldn't judge yet, if so.
-    pub(crate) unsettled: Option<Inconclusive>,
+    /// The sites whose trigger fired but that couldn't judge yet.
+    pub(crate) pending: BTreeSet<Pending>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -153,7 +176,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             missing: None,
             labelled: Vec::new(),
             peaks: Vec::new(),
-            unsettled: None,
+            pending: BTreeSet::new(),
         }
     }
 
@@ -165,7 +188,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             missing: self.missing,
             labelled: self.labelled,
             peaks: self.peaks,
-            unsettled: self.unsettled,
+            pending: self.pending,
         }
     }
 
@@ -336,13 +359,16 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
         self.peaks.push((quantity, value));
     }
 
-    /// Records that the property's trigger fired but the run hasn't yet
-    /// shown what the check needs to judge it, such as a teardown's
-    /// settlement. Only the latest evaluation counts: if the run ends after
-    /// one that recorded `reason`, the property is `Inconclusive` with it,
-    /// unless it was violated.
-    pub fn unsettled(&mut self, reason: Inconclusive) {
-        self.unsettled = Some(reason);
+    /// Marks `site` pending: the property's trigger fired, but the run
+    /// hasn't yet shown what the check needs to judge it, such as a
+    /// teardown's settlement. Marks are kept per site, so a check that
+    /// evaluates two halves on one context, such as the composed teardown,
+    /// keeps both. Only the latest evaluation's marks count: if the run ends
+    /// after one that left a mark, and no end judgment resolved it, the
+    /// property is `NotApplicable` with its reason, unless it was violated
+    /// (`registry::outcome`).
+    pub fn pending(&mut self, site: Pending) {
+        self.pending.insert(site);
     }
 
     /// Records that a source the property needs lacks evidence the check

@@ -142,6 +142,11 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "block_encoding"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "redpallas"
 harness = false
 

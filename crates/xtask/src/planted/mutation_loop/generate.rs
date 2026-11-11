@@ -532,7 +532,7 @@ impl Search {
                     return Unpatched::Violation(id.clone());
                 }
                 match campaign_failure(&facts) {
-                    Some(why) => failed(Reason::Incomplete, format!("the campaign {why}"), false),
+                    Some(why) => failed(Reason::CampaignIncomplete, format!("the campaign {why}"), false),
                     None => Unpatched::Clean,
                 }
             }
@@ -549,7 +549,7 @@ fn campaign_run_failure(facts: &CampaignFacts) -> Option<Classified> {
         |reason, detail| Some(Classified::new(Class::HarnessFailure, Some(reason), detail));
     if facts.initial_inputs > 0 {
         return harness(
-            Reason::Incomplete,
+            Reason::CampaignIncomplete,
             format!(
                 "the campaign started from {} inputs, not an empty corpus",
                 facts.initial_inputs
@@ -611,7 +611,7 @@ pub(super) fn campaign_class(
     if let Some(why) = campaign_failure(facts) {
         return Classified::new(
             Class::HarnessFailure,
-            Some(Reason::Incomplete),
+            Some(Reason::CampaignIncomplete),
             format!("the campaign {why}"),
         );
     }

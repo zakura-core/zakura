@@ -158,6 +158,7 @@ pub fn progress_scenario() -> WireScenario {
             bound_ms: Some(PROGRESS_STORAGE_BOUND_MS),
             holds: Vec::new(),
             reply_holds: Vec::new(),
+            disruptions: Vec::new(),
         },
     }
 }

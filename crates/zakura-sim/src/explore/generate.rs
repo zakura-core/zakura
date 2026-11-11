@@ -118,9 +118,10 @@ pub struct Applicability {
     pub held: u64,
     /// Runs where it was violated.
     pub violated: u64,
-    /// Runs where it ended inconclusive.
-    pub inconclusive: u64,
-    /// Runs where no evaluation applied, including a hold with none.
+    /// Runs where it ended not-applicable with incomplete observations.
+    pub incomplete: u64,
+    /// Runs where nothing was judged: a benign not-applicable reason, or a
+    /// hold with no applicable evaluation.
     pub not_applicable: u64,
 }
 
@@ -135,10 +136,12 @@ impl Applicability {
     fn count(&mut self, outcome: &PropertyOutcome) {
         let counter = match outcome {
             PropertyOutcome::Held { applicable } if *applicable > 0 => &mut self.held,
-            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable => {
+            PropertyOutcome::NotApplicable { reason } if !reason.is_benign() => {
+                &mut self.incomplete
+            }
+            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable { .. } => {
                 &mut self.not_applicable
             }
-            PropertyOutcome::Inconclusive { .. } => &mut self.inconclusive,
             PropertyOutcome::Violated { .. } => &mut self.violated,
         };
         *counter += 1;

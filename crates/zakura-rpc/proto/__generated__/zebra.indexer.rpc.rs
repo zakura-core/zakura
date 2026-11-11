@@ -66,6 +66,23 @@ pub struct BlockRangeRequest {
     #[prost(uint32, tag = "2")]
     pub end_height: u32,
 }
+/// A request for a transaction by its ID.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransactionRequest {
+    /// The 32-byte transaction ID in display order.
+    #[prost(bytes = "vec", tag = "1")]
+    pub txid: ::prost::alloc::vec::Vec<u8>,
+}
+/// An encoded transaction.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RawTransaction {
+    /// The transaction's consensus encoding, the bytes `getrawtransaction` with
+    /// verbosity 0 returns as hex.
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 /// A request to subscribe to non-finalized state changes.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -380,6 +397,32 @@ pub mod indexer_client {
                 .insert(GrpcMethod::new("zebra.indexer.rpc.Indexer", "GetBlockRange"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Returns the encoded transaction with the given ID from any chain in the
+        /// state, as stored, without hex or JSON.
+        ///
+        /// Mempool transactions are not included. Rejects an ID that is not 32 bytes
+        /// with `INVALID_ARGUMENT`, and returns `NOT_FOUND` for an unknown ID.
+        pub async fn get_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::RawTransaction>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zebra.indexer.rpc.Indexer/GetTransaction",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("zebra.indexer.rpc.Indexer", "GetTransaction"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -472,6 +515,15 @@ pub mod indexer_server {
             tonic::Response<Self::GetBlockRangeStream>,
             tonic::Status,
         >;
+        /// Returns the encoded transaction with the given ID from any chain in the
+        /// state, as stored, without hex or JSON.
+        ///
+        /// Mempool transactions are not included. Rejects an ID that is not 32 bytes
+        /// with `INVALID_ARGUMENT`, and returns `NOT_FOUND` for an unknown ID.
+        async fn get_transaction(
+            &self,
+            request: tonic::Request<super::TransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::RawTransaction>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct IndexerServer<T> {
@@ -772,6 +824,51 @@ pub mod indexer_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zebra.indexer.rpc.Indexer/GetTransaction" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetTransactionSvc<T: Indexer>(pub Arc<T>);
+                    impl<
+                        T: Indexer,
+                    > tonic::server::UnaryService<super::TransactionRequest>
+                    for GetTransactionSvc<T> {
+                        type Response = super::RawTransaction;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TransactionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Indexer>::get_transaction(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetTransactionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

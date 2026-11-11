@@ -34,8 +34,9 @@
 //! `ReactorGone`. A run that ends idle, or at its
 //! budget with a drain that ran dry, before that read fails as
 //! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
-//! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
-//! reports as inconclusive.
+//! stop honestly unfinished. That run ends as the harness failure
+//! `DrainBound`, so `header-sync/teardown-returns-baseline` keeps only the
+//! violations its steps found, and is otherwise `HarnessFailed`.
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
@@ -108,9 +109,14 @@ use super::{
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
+    fork_choice::{
+        settled::{ForkFixture, Outside},
+        ForkChoice, ForkChoiceEvidence,
+    },
     outstanding::{HeldHeaders, Outstanding, OutstandingEvidence},
     pair::{PairError, Pairer},
     policy::LinkEffect,
+    publication::{Publication, PublicationEvidence},
     reservation::ReservationEvidence,
     retirement::{Retirement, RetirementEvidence},
     round_life::{RoundLife, RoundLifeEvidence},
@@ -217,6 +223,12 @@ struct TapState {
     /// Checks the reactor's growable containers. None until
     /// [`ReactorTap::watch_outstanding`].
     outstanding: Mutex<Option<Outstanding>>,
+    /// Checks that the engine selects a max-work eligible tip of what it
+    /// holds. None until [`ReactorTap::watch_fork_choice`].
+    fork_choice: Mutex<Option<ForkChoice>>,
+    /// Checks that committed states are published and adopted as they were.
+    /// None until [`ReactorTap::watch_publication`].
+    publication: Mutex<Option<Publication>>,
     /// Checks rounds' owner binding and pages' paths. None until
     /// [`ReactorTap::watch_authority`].
     authority: Mutex<Option<Authority>>,
@@ -447,6 +459,43 @@ impl TapState {
                 detail,
             });
         }
+        let selected = match self
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(selection) => {
+                let breaks = selection.drain(step).unwrap_or_else(|error| {
+                    broken.get_or_insert(error);
+                    selection.take_breaks()
+                });
+                selection.settle(step, self.outside());
+                breaks
+            }
+            None => Vec::new(),
+        };
+        for detail in selected {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::ExpectedChainSelected,
+                detail,
+            });
+        }
+        let published = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|publication| publication.drain(step))
+            .unwrap_or_default();
+        for detail in published {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::StatePublicationConsistent,
+                detail,
+            });
+        }
         let mut authorized = self.sessions.take_claims();
         let joined = self.sessions.take_joined();
         if let Some(authority) = self
@@ -531,6 +580,32 @@ impl TapState {
         self.port
             .upgrade()
             .map_or(0, |port| port.engine().snapshot().header_generation.get())
+    }
+
+    /// What a settled point reads outside the reactor now: whether the
+    /// node's port has an operation pending or a reply held, whether the
+    /// harness closed or relinked a link, virtual time, and the scenario
+    /// clock.
+    fn outside(&self) -> Outside {
+        let port_busy = self
+            .port
+            .upgrade()
+            .is_some_and(|port| !port.pending().is_empty() || !port.committed().is_empty());
+        let environment_acted = self.ends.facts().iter().any(|(_, fact)| {
+            matches!(
+                fact,
+                EndFact::Environment {
+                    action: EnvironmentAction::Close | EnvironmentAction::Relink,
+                    ..
+                }
+            )
+        });
+        Outside {
+            port_busy,
+            environment_acted,
+            now: zakura_scheduler::hooks::now().unwrap_or_default(),
+            clock: zakura_rt::time::utc_now().into(),
+        }
     }
 
     /// The node's engine now, or `None` once its port is gone.
@@ -687,16 +762,15 @@ impl LiveEvidence for TapState {
     /// it still holds its observer, so its last events and the teardown
     /// checks haven't happened.
     ///
-    /// A budget end whose drain was cut off at its bound leaves the stop
-    /// honestly unfinished, which the teardown property reports as
-    /// inconclusive. Any other end means no task could run, yet the reactor
-    /// never let go.
+    /// A violation's ending stops the run before the stop could finish.
+    /// Any other end the run asks about ran dry, so no task could run, yet
+    /// the reactor never let go. A drain cut off at its bound is already a
+    /// harness failure, which the run doesn't ask about.
     fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
-        // A cut-off stop is the teardown property's to report, if one read
-        // the last drain's settlement.
-        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted)
-            && self.rounds.read_at(end.steps);
-        (!cut_off && self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
+        if end.outcome == Outcome::Violation {
+            return None;
+        }
+        (self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
             .then_some("ShutdownIncomplete: the run ended before the stopped reactor's task ended")
     }
 }
@@ -828,6 +902,7 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
             {
+                outstanding.at(zakura_scheduler::hooks::now().map(|now| now.since_start()));
                 outstanding.observe(&event);
             }
             if let Some(retirement) = state
@@ -854,6 +929,26 @@ impl TapState {
             {
                 authority.observe(&event, on_reactor, stale_handler);
             }
+            if let Some(publication) = state
+                .publication
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                publication.observe(&event, on_reactor);
+            }
+            if let Some(selection) = state
+                .fork_choice
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                selection.observe(
+                    &event,
+                    on_reactor,
+                    zakura_scheduler::hooks::now().unwrap_or_default(),
+                );
+            }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
                 state
@@ -864,12 +959,12 @@ impl TapState {
             }
         }
         // Budget changes, credit and built closes, causes, headroom waits,
-        // deferred passes, taken events, watch reads, the reactor's and the
-        // service's sizes, completed targets, publisher starts and ends, the
-        // queue's slots, cursor claims and acceptances and the subscriber's
-        // and publisher's containers and the serving reports stay out of the
-        // log, whose format pinned Plans fix, and a teardown's returns after
-        // the run are expected.
+        // deferred passes, taken events, watch reads, stored snapshots, the
+        // reactor's and the service's sizes, completed targets, publisher
+        // starts and ends, the queue's slots, cursor claims and acceptances
+        // and the subscriber's and publisher's containers and the serving
+        // reports stay out of the log, whose format pinned Plans fix, and a
+        // teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -879,6 +974,7 @@ impl TapState {
                 | ReactorEvent::CachedPassDeferred { .. }
                 | ReactorEvent::EventTaken { .. }
                 | ReactorEvent::WatchObserved { .. }
+                | ReactorEvent::SnapshotStored { .. }
                 | ReactorEvent::Slots { .. }
                 | ReactorEvent::Sizes { .. }
                 | ReactorEvent::ServiceSizes { .. }
@@ -1025,6 +1121,11 @@ impl TapState {
             }
         };
         let mut buffer = state.buffer();
+        if let ReactorEvent::Retired { request, .. } = &event {
+            buffer
+                .effects
+                .push((LinkEffect::Retired, request.peer.clone()));
+        }
         buffer.last = buffer
             .last
             .checked_add(1)
@@ -1185,6 +1286,8 @@ impl ReactorTap {
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
                 outstanding: Mutex::default(),
+                fork_choice: Mutex::default(),
+                publication: Mutex::default(),
                 authority: Mutex::default(),
                 retirement: Mutex::default(),
             }))
@@ -1236,20 +1339,67 @@ impl ReactorTap {
         (observer, tap)
     }
 
-    /// Hands the authority check each apply's and reset's engine run that
-    /// the header storage source just logged.
-    pub(crate) fn engine_runs(
+    /// Hands the publication check the links of each page read that
+    /// completed in the observation whose storage facts come next
+    /// ([`super::publication`]).
+    pub(crate) fn page_reads(
         &self,
-        runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
+        reads: &[(
+            u64,
+            Vec<(zakura_chain::block::Hash, zakura_chain::block::Hash)>,
+        )],
     ) {
-        if let Some(authority) = self
+        if let Some(publication) = self
             .state
-            .authority
+            .publication
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            authority.engine_runs(runs.iter().map(|(_, run)| run.as_ref()));
+            publication.page_reads(reads);
+        }
+    }
+
+    /// Hands the authority, fork-choice and publication checks each apply's,
+    /// reset's and harness commit's engine run that the header storage
+    /// source just logged, in order, and the publication check the port's
+    /// `publications` on its selected-chain watch in the same observation.
+    /// A run the authority check's commit-contents rules find corrupt
+    /// taints fork choice and publication from then on
+    /// ([`super::fork_choice`], [`super::publication`]).
+    pub(crate) fn engine_runs(
+        &self,
+        runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
+        publications: &[zakura_header_chain::EngineSnapshot],
+    ) {
+        let mut authority = self
+            .state
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut selection = self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut publication = self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (_, run) in runs {
+            let corrupt = authority
+                .as_mut()
+                .is_some_and(|authority| authority.engine_run(run));
+            if let Some(selection) = selection.as_mut() {
+                selection.run(run, corrupt);
+            }
+            if let Some(publication) = publication.as_mut() {
+                publication.run(run, corrupt);
+            }
+        }
+        if let Some(publication) = publication.as_mut() {
+            publication.publications(publications);
         }
     }
 
@@ -1264,6 +1414,17 @@ impl ReactorTap {
         runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
     ) {
         let facts: Vec<_> = facts.into_iter().collect();
+        if let Some(publication) = self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (_, fact) in &facts {
+                publication.storage(fact);
+            }
+        }
         let mut wake = self
             .state
             .wake
@@ -1312,6 +1473,10 @@ impl ReactorTap {
                 }),
                 self.state.engine_generation(),
             );
+            // A harness commit's run, which no fact carries.
+            for (_, run) in runs.iter().filter(|(carried, _)| *carried == 0) {
+                rounds.harness_run(run);
+            }
         }
         if let Some(chain) = self
             .state
@@ -1332,6 +1497,17 @@ impl ReactorTap {
             .as_mut()
         {
             authority.storage(facts.iter().map(|(_, fact)| *fact));
+        }
+        if let Some(selection) = self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (_, fact) in &facts {
+                selection.storage(fact);
+            }
         }
         self.pairer.facts(facts);
     }
@@ -1390,9 +1566,15 @@ impl ReactorTap {
     /// Checks from now on that this reactor's growable containers stay
     /// within their bounds and keep only live keys, as
     /// [`super::outstanding`] describes, for a node that admits
-    /// `peer_limit` peers, keeping each row's peak in `evidence`. Call it
+    /// `peer_limit` peers and keeps history for `departed_limit` departed
+    /// VCT repair suppliers, keeping each row's peak in `evidence`. Call it
     /// before the run starts.
-    pub fn watch_outstanding(&self, evidence: OutstandingEvidence, peer_limit: usize) {
+    pub fn watch_outstanding(
+        &self,
+        evidence: OutstandingEvidence,
+        peer_limit: usize,
+        departed_limit: usize,
+    ) {
         let port = self.state.port.clone();
         *self
             .state
@@ -1401,6 +1583,7 @@ impl ReactorTap {
             .unwrap_or_else(PoisonError::into_inner) = Some(Outstanding::new(
             evidence,
             peer_limit,
+            departed_limit,
             HeldHeaders::new(move || {
                 let state = port.upgrade()?.engine().durable_state();
                 Some(state.graph.nodes.into_keys().collect())
@@ -1423,6 +1606,71 @@ impl ReactorTap {
             .chain_effect
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(ChainEffect::new(evidence, engine));
+    }
+
+    /// Checks from now on that the node's engine selects a max-work eligible
+    /// tip of the headers it holds, placed among `fixture`'s headers on
+    /// `branches`, as [`super::fork_choice`] describes, keeping when the
+    /// check applied in `evidence`. It first judges the engine as it is
+    /// now, before the reactor starts, with the headers it holds admitted
+    /// at `preloaded_at`, the clock they were committed at. In the fork
+    /// fixture, `fork`, it judges settled convergence too. Call it before
+    /// the run starts. A harness that calls it must hand the tap the node's
+    /// storage facts and engine runs.
+    pub fn watch_fork_choice(
+        &self,
+        evidence: ForkChoiceEvidence,
+        fixture: HeaderFixture,
+        branches: impl IntoIterator<Item = u8>,
+        preloaded_at: chrono::DateTime<chrono::Utc>,
+        fork: Option<ForkFixture>,
+    ) {
+        let port = self
+            .state
+            .port
+            .upgrade()
+            .expect("the tap's port outlives its harness's setup");
+        let engine = port.engine();
+        let mut check = ForkChoice::new(
+            evidence,
+            fixture,
+            branches,
+            &engine.durable_state(),
+            &engine.snapshot(),
+            preloaded_at,
+        );
+        if let Some(fork) = &fork {
+            check.settle_in(fork);
+        }
+        *self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(check);
+    }
+
+    /// Checks from now on that the node's port publishes each committed
+    /// engine state as it was and the reactor adopts and advertises only
+    /// engine records, as [`super::publication`] describes, keeping when the
+    /// check applied in `evidence`. Its first record is the engine as it is
+    /// now, before the reactor starts, and what the port published before
+    /// now is dropped. Call it before the run starts. A harness that calls
+    /// it must hand the tap the node's engine runs and publications.
+    pub fn watch_publication(&self, evidence: PublicationEvidence) {
+        let port = self
+            .state
+            .port
+            .upgrade()
+            .expect("the tap's port outlives its harness's setup");
+        let engine = port.engine();
+        engine.take_publications();
+        evidence.stamp_with(self.state.stamps.clone());
+        *self
+            .state
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Publication::new(evidence, engine.snapshot()));
     }
 
     /// Checks from now on that each round's owner is bound to its `Open`
@@ -1988,6 +2236,17 @@ impl ActionSource for ReactorTap {
             Ok(()) => Ok(()),
             Err(error) => self.state.fail_after_claims(step, error),
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

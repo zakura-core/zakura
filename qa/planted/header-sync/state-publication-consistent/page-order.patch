@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index 92f6a1aaac..e8411afa8b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -1115,6 +1115,10 @@ fn page_output<const HEADER_BYTES: usize>(
+             tree_aux,
+         });
+     }
++    // Mutation: the publisher swaps a page's first two headers.
++    if entries.len() >= 2 {
++        entries.swap(0, 1);
++    }
+     let Some(last) = entries.last() else {
+         return Err(on_empty_page(job.following).into());
+     };

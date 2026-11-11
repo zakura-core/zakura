@@ -77,10 +77,12 @@ fn two_mirrors() -> Vec<MirrorSpec> {
         MirrorSpec {
             chain: Chain::main(5),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         },
         MirrorSpec {
             chain: Chain::main(3),
             dialer: Dialer::Node,
+            max_headers_per_response: None,
         },
     ]
 }
@@ -241,10 +243,12 @@ fn hand_built_scenarios_round_trip() {
                         fork: Some(Fork { branch: 1, len: 4 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::default(),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {
@@ -262,6 +266,7 @@ fn hand_built_scenarios_round_trip() {
                     deadline_ms: None,
                 }],
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: vec![step(
                 "mirror-1",
@@ -528,6 +533,17 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
                 ..StorageScenario::default()
             },
             "a weight is 4",
+        ),
+        (
+            StorageScenario {
+                mirrors: vec![MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                    max_headers_per_response: Some(235),
+                }],
+                ..StorageScenario::default()
+            },
+            "a mirror's response limit is 235",
         ),
         (
             StorageScenario {

@@ -992,7 +992,9 @@ pub fn storage_config(scenario: &BlockScenario) -> RunConfig {
         budget: scenario
             .steps
             .unwrap_or(8_000 + STEPS_PER_BLOCK * (u64::from(scenario.blocks) + changed)),
-        drain_bound: 2_000,
+        // The longest drain measured on the committed inputs, which runs the
+        // peers' timers to the harness timer cap, is about 12,800 steps.
+        drain_bound: 60_000,
         ..RunConfig::default()
     }
 }

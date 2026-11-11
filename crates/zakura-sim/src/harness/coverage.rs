@@ -469,6 +469,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("wrong-request"),
     },
     Coverage {
+        property: super::super::domain::header_sync::STATE_PUBLICATION_CONSISTENT,
+        passing: passes(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("publication-skipped"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::EXPECTED_CHAIN_SELECTED,
+        passing: passes(
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("score-corrupted"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",
@@ -933,6 +949,18 @@ pub static COVERAGE: &[Coverage] = &[
             HEADER_WITNESSES,
             "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
         )),
+    },
+    // The committed recovery fixtures: hdr-11's control and hdr-13's close,
+    // fault and departure classes. `cargo xtask planted` runs every case
+    // under the property's directory, hdr-11's `skipped-apply` and hdr-13's
+    // four; this row names one of hdr-13's.
+    Coverage {
+        property: crate::domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
+        passing: passes(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("stalled-successor"),
     },
     Coverage {
         property: crate::domain::header_sync_progress::HONEST_PROGRESS,

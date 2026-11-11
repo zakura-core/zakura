@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
-    reasons::{NaKind, NaProducer},
+    reasons::NaEntry,
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
     Tier, PLAN, TIERS,
 };
@@ -60,8 +60,8 @@ pub struct Inventories<'a> {
     pub requirements: &'a [GateObligation],
     /// The composition checks.
     pub composition: &'a [&'a str],
-    /// The `NotApplicable` producers.
-    pub reasons: &'a [NaProducer],
+    /// The `NotApplicable` reasons a header ID can carry.
+    pub reasons: &'a [NaEntry],
     /// The manifest's expected results, read only for the planted runs they
     /// count, each of which owes a replay and, when it completes, a cleanup
     /// comparison.
@@ -501,6 +501,13 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         // commits, whose credit and update rules are exchange rules too.
         "header-sync/reset-invalidates-work" | "header-sync/stale-chain-effect-inert" => vec![G2],
         "header-sync/commit-only-authorized" => vec![G2, G3],
+        // Which tip a settled node selects, judged at the engine that owns
+        // the choice.
+        "header-sync/expected-chain-selected" => vec![G2],
+        // A committed state's publication, adoption and advertisement in
+        // order, each served page as an exchange with what was read, and a
+        // timely status.
+        "header-sync/state-publication-consistent" => vec![G1, G3, G4],
         "header-sync/chunk-budget-bound"
         | "header-sync/teardown-returns-baseline"
         | "header-sync/stale-completion-inert"
@@ -514,7 +521,10 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         | "header/publisher-policy" => vec![G5],
         // Liveness and the step loop's own claims serve no single gate. The
         // run's overall acceptance still counts them.
-        "header-sync/honest-progress" | "sim/no-task-panic" | "sim/no-livelock" => Vec::new(),
+        "header-sync/honest-progress"
+        | "header-sync/bounded-adversary-progress"
+        | "sim/no-task-panic"
+        | "sim/no-livelock" => Vec::new(),
         _ => return None,
     })
 }
@@ -704,19 +714,13 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
             }
         }
     }
-    for producer in inv.reasons {
-        for (index, construction) in producer.constructions.iter().enumerate() {
-            if construction.kind != NaKind::MissingEvidence {
-                keys.insert(
-                    Key::NaReason {
-                        file: producer.file.to_owned(),
-                        function: producer.function.to_owned(),
-                        index,
-                    },
-                    BTreeSet::from([Gate::G6]),
-                );
-            }
-        }
+    for entry in inv.reasons {
+        keys.insert(
+            Key::NaReason {
+                reason: entry.reason,
+            },
+            BTreeSet::from([Gate::G6]),
+        );
     }
     for registration in inv.registered {
         let own = if registration.machine {

@@ -1,0 +1,21 @@
+# hdr-13's bounded verdict: a departed peer's readmission pause outlasts
+# the configured cooldown by a century. Recovery waits for the node's own
+# reported cooldown at most one configured cooldown past the later of the
+# recover and its last relink, so in the close fixture its three relinks
+# come at 0, 60 and 120 seconds, the node refuses each, and recovery ends
+# unreached within its window, which only the node refusing an honest
+# source can cause, so the property is violated at that pick. Without the
+# cap the verdict waits for the pause, the clock runs straight to it, and
+# the source is let back in. The fixture's finish then ends the run idle.
+# Besides reactor.rs, which the patch changes, the reactor's state decides
+# when a pause lifts, and the service decides how a refused session ends.
+# A change there can move the input off its refusals.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The same pause keeps a departure fixture's relinked taker out, as with
+# `refusal-never-lifts`.
+also_violates = ["header-sync/peer-retirement-progress"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-closes.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-closes.plan"

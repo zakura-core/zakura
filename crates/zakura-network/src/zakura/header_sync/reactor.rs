@@ -330,6 +330,8 @@ fn build_header_sync_reactor(
     caused!(reactor, ReactorCause::Startup, {
         if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
             observe!(reactor, ReactorEvent::adopted(snapshot));
+            // The startup adoption is the stored copy itself.
+            observe!(reactor, ReactorEvent::stored(Some(snapshot)));
             reactor.emit_snapshot_observed(None, snapshot);
         }
         // The returned handle holds the watch's only receiver, so it sees this value.
@@ -846,7 +848,7 @@ impl HeaderSyncReactor {
             },
             pruned_peers: sorted(state.pruned_peers.keys()),
             completed_targets: state.completed_targets.keys(),
-            repair_sources: state.vct_repair.source_entries(),
+            repair_sources: state.vct_repair.sources(),
         }
     }
 
@@ -2721,6 +2723,7 @@ impl HeaderSyncReactor {
         let status = Status::from_snapshot(&snapshot, self.page_limits);
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
+        observe!(self, ReactorEvent::stored(self.committed_snapshot.as_ref()));
         self.schedule_current_vct_repair();
         self.request_vct_repair_context();
         for handles in self.sessions.values_mut() {

@@ -9,6 +9,7 @@ mod support;
 use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -55,6 +56,11 @@ impl HasView for Viewed {
     /// The storage harness's end violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.0.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
     }
 
     /// The storage harness's stamped facts.
@@ -117,6 +123,7 @@ fn mirror(chain: Chain) -> MirrorSpec {
     MirrorSpec {
         chain,
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     }
 }
 
@@ -332,7 +339,10 @@ fn every_witness_holds_and_applies() {
                 assert!(
                     matches!(
                         outcome(&report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        PropertyOutcome::Held { .. }
+                            | PropertyOutcome::NotApplicable {
+                                reason: NaReason::NeverApplied
+                            }
                     ),
                     "{name}: {control}: {:?}",
                     outcome(&report, control)

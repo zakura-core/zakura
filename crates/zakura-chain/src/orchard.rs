@@ -17,6 +17,7 @@ pub mod shielded_data;
 pub mod tree;
 
 pub use action::Action;
+pub(crate) use action::ActionEncoding;
 pub use commitment::{NoteCommitment, ValueCommitment};
 pub use note::{EncryptedNote, Nullifier, WrappedNoteKey};
 pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};

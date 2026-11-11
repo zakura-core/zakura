@@ -6,7 +6,12 @@
 
 mod support;
 
-use support::inputs;
+use std::time::Duration;
+
+use support::{
+    inputs,
+    steer::{steer, Steer},
+};
 use zakura_sim::{
     domain::{
         block_sync::TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
@@ -17,11 +22,13 @@ use zakura_sim::{
         },
     },
     harness::{
+        block_node::policy::Trigger,
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncStorage},
         HarnessError, Subsystem,
     },
-    MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
+    observe::{ReactorCall, ReactorFact},
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, StepCtx,
 };
 
 /// Runs saved scenario `saved` under `input`. Fails the test on a harness
@@ -169,6 +176,134 @@ fn a_reorg_at_each_pipeline_stage_retires_old_epoch_work() {
             applicable_and_held(&report, BLOCK_REQUESTS_FOLLOW_HEADERS);
             applicable_and_held(&report, HEADER_REORG_RETIRES_BLOCK_WORK);
         }
+    }
+}
+
+/// Asserts that `report` held `sync/teardown-returns-baseline`, violated
+/// nothing, and that its node's first header prepare, the held one, ended
+/// `dropped`: the stopped reactor dropped the call unfinished. A later
+/// prepare, from the other mirror after the round's deadline, may come
+/// before a late shutdown.
+fn dropped_a_held_prepare(label: &str, report: &RunReport) {
+    assert_eq!(report.end.violation, None, "{label}: {:?}", report.end);
+    applicable_and_held(report, TEARDOWN_RETURNS_BASELINE);
+    let facts: Vec<&ReactorFact> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect();
+    let prepares: Vec<u64> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            ReactorFact::Dispatched {
+                call,
+                port: ReactorCall::Prepare { .. },
+            } => Some(*call),
+            _ => None,
+        })
+        .collect();
+    let Some(&prepare) = prepares.first() else {
+        panic!("{label}: the node prepares: {prepares:?}");
+    };
+    assert!(
+        facts.iter().any(|fact| matches!(
+            fact,
+            ReactorFact::CallEnded { call, end, .. } if *call == prepare && end == "dropped"
+        )),
+        "{label}: the stopped reactor drops the held prepare's call"
+    );
+}
+
+/// The header half of the teardown matrix: the node shuts down while header
+/// storage holds its first prepare, so the stopped reactor drops that
+/// prepare's call unfinished, and the call's headers return only through
+/// that drop. `sync/teardown-returns-baseline` applies and holds under the
+/// committed input and generated Plans.
+#[test]
+fn header_teardown_across_a_held_prepare_returns_baseline() {
+    let committed = Plan::from_fuzz(&[]);
+    for (index, input) in std::iter::once(committed).chain(inputs(4, 256)).enumerate() {
+        dropped_a_held_prepare(
+            &format!("plan {index}"),
+            &run(SavedSync::TeardownHeaders, input),
+        );
+    }
+}
+
+/// When [`a_late_teardown_still_drops_the_held_prepare`] first offers the
+/// shutdown, in virtual time: well past the round's 30 s request deadline.
+const LATE: Duration = Duration::from_secs(120);
+
+/// The teardown fixture with its shutdown taken as early as it can be,
+/// steered: every step that can advance time does, and the shutdown runs as
+/// soon as it's offered, so nothing but time's own bounds keeps it after
+/// the prepare's submission. It still drops the held prepare.
+#[test]
+fn a_rushed_teardown_still_drops_the_held_prepare() {
+    let rushed = |cx: &StepCtx<'_>| -> Result<Steer, String> {
+        let names: Vec<String> = cx
+            .enabled
+            .iter()
+            .map(|enabled| enabled.identity.to_string())
+            .collect();
+        Ok(names
+            .iter()
+            .find(|name| name.ends_with(":teardown"))
+            .or_else(|| names.iter().find(|name| name.starts_with("advance-time")))
+            .map_or(Steer::Fine, |pick| Steer::Pick(pick.clone())))
+    };
+    let scenario = SavedSync::TeardownHeaders.scenario();
+    let (report, _, _) = steer(Plan::from_fuzz(&[]), &rushed, &mut |plan, checker| {
+        let mut sink = MemorySink::default();
+        let report = match run_prepared::<SyncStorage>(
+            &scenario,
+            SyncStorage::prepare(&scenario),
+            plan,
+            &mut sink,
+            Some(checker),
+        ) {
+            Ok(report) => report,
+            Err(HarnessError::Run { report, .. }) => *report,
+            Err(error) => panic!("{error}"),
+        };
+        (report, sink.lines())
+    });
+    dropped_a_held_prepare("rushed", &report);
+}
+
+/// The teardown fixture with its shutdown first offered at [`LATE`], after
+/// the round's request deadline, under the committed input and generated
+/// Plans. The round's deadline retires the round first, and the node may
+/// prepare again from its other mirror, but however late the shutdown, the
+/// held prepare can't finish first, so the stopped reactor still drops its
+/// call.
+#[test]
+fn a_late_teardown_still_drops_the_held_prepare() {
+    let mut scenario = SavedSync::TeardownHeaders.scenario();
+    let late = u64::try_from(LATE.as_millis()).expect("120 s in milliseconds fits u64");
+    for step in &mut scenario.control {
+        step.when = Some(Trigger::VirtualTime(late));
+    }
+    let committed = Plan::from_fuzz(&[]);
+    for (index, input) in std::iter::once(committed).chain(inputs(4, 256)).enumerate() {
+        let report = match run_prepared::<SyncStorage>(
+            &scenario,
+            SyncStorage::prepare(&scenario),
+            input,
+            &mut MemorySink::default(),
+            None,
+        ) {
+            Ok(report) => report,
+            Err(HarnessError::Run { failure, report }) => {
+                panic!("plan {index}: {failure}: {:?}", report.end)
+            }
+            Err(error) => panic!("plan {index}: {error}"),
+        };
+        dropped_a_held_prepare(&format!("late plan {index}"), &report);
     }
 }
 

@@ -1956,10 +1956,30 @@ impl ActionSource for Control {
     /// script holds nothing else.
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
-    /// None. An owned hold's release that never comes is its fixture's to
-    /// report.
+    /// A planned `Release` of an owned hold ([`Topology::own`]) that's still
+    /// to come behind a step the drain never offers, such as a peer's
+    /// growth, so the hold's operation can never finish. A release that's
+    /// next waits only on its own trigger, which node work can still meet,
+    /// and once a `Recover` is picked every hold retires.
     fn holds_work(&self) -> Option<String> {
-        None
+        if self.recovering() {
+            return None;
+        }
+        let owned_release = |step: &ControlStep| match step.action {
+            ControlAction::Release { hold } => self.topology.owns(hold).then_some(hold),
+            _ => None,
+        };
+        let next = self.script.get(self.next)?;
+        if owned_release(next).is_some() {
+            return None;
+        }
+        let hold = self.script[self.next..].iter().find_map(owned_release)?;
+        Some(format!(
+            "the planned release of owned hold {hold} waits behind the {} step of {}, which \
+             the drain doesn't run",
+            next.action.name(),
+            next.peer
+        ))
     }
 
     /// Checks the next step and queues it for the control task, or carries

@@ -240,10 +240,11 @@ impl ActionSource for Settle {
     /// Nothing: its hold is owned, so the drain keeps it.
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
-    /// While the release hasn't run, `mirror-1`'s held prepare, which only a
-    /// wake's opening can release.
+    /// While the release hasn't run and no wake has opened, `mirror-1`'s
+    /// held prepare, which only a wake's opening can release. Once one has,
+    /// [`ActionSource::recovery`]'s action or boundary releases it.
     fn holds_work(&self) -> Option<String> {
-        (!self.done).then(|| {
+        (!self.done && self.wake.last_opened().is_none()).then(|| {
             "release-wake fixture holds mirror-1's prepare until a wake opens and its \
              cached-pass refill passes"
                 .to_owned()

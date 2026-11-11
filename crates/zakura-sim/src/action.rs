@@ -133,6 +133,26 @@ pub(crate) struct Offer {
     pub(crate) boundaries: Vec<Boundary>,
 }
 
+impl Offer {
+    /// The drain's form of `recovery`: its actions, with its quiet ones
+    /// when `quiet`, which the run sets when no task is ready, and each
+    /// boundary as an opening.
+    pub(crate) fn recovery(recovery: RecoveryOffer, quiet: bool) -> Self {
+        let mut actions = recovery.actions;
+        if quiet {
+            actions.extend(recovery.quiet);
+        }
+        Offer {
+            actions,
+            boundaries: recovery
+                .boundaries
+                .into_iter()
+                .map(Boundary::Opens)
+                .collect(),
+        }
+    }
+}
+
 /// Everything [`enabled_set`] reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EnabledInputs<'a> {
@@ -142,8 +162,26 @@ pub(crate) struct EnabledInputs<'a> {
     pub(crate) ready: &'a [(Identity, TaskId)],
     /// The scheduler's earliest timer.
     pub(crate) next_deadline: Option<SimInstant>,
-    /// Each source's offer, indexed by [`SourceId`]. Empty in the drain.
+    /// Each source's offer, indexed by [`SourceId`]: its live one, or in the
+    /// drain its recovery one ([`Offer::recovery`]).
     pub(crate) offers: &'a [Offer],
+    /// What may move the drain's clock. Read only in the drain, at a step
+    /// with no task ready and no recovery action.
+    pub(crate) clock: DrainClock,
+}
+
+/// What may move the clock in the drain, besides a recovery boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrainClock {
+    /// Whether the checker still has an obligation open
+    /// ([`Checker::unfinished`](crate::Checker::unfinished)), pending marks
+    /// aside.
+    pub(crate) unfinished: bool,
+    /// The earliest open check's deadline, which it expires just after.
+    pub(crate) earliest_deadline: Option<SimInstant>,
+    /// The last instant a scheduler timer alone may move the clock to: the
+    /// drain's entry plus the run's harness timer cap.
+    pub(crate) timer_cap: Option<SimInstant>,
 }
 
 /// The actions enabled now, sorted by identity.
@@ -152,7 +190,11 @@ pub(crate) struct EnabledInputs<'a> {
 /// task is ready, it also offers one `AdvanceTime` to the earliest boundary:
 /// the scheduler's next timer, which may be due now after a clamp, or a source
 /// boundary after now. A source deadline at or before now blocks time instead.
-/// In the drain only ready tasks run.
+///
+/// In the drain it's every ready task and every recovery action. With no
+/// task ready and no recovery action, it offers one `AdvanceTime` if an
+/// obligation is still open, a recovery boundary is ahead, or a scheduler
+/// timer is due by the timer cap (see [`drain_time`]).
 ///
 /// Returns the identity that two enabled actions share, if any.
 pub(crate) fn enabled_set(i: &EnabledInputs<'_>) -> Result<Vec<Enabled>, Identity> {
@@ -164,24 +206,25 @@ pub(crate) fn enabled_set(i: &EnabledInputs<'_>) -> Result<Vec<Enabled>, Identit
             action: Action::RunTask(*task),
         })
         .collect();
-    if i.phase == Phase::Live {
-        for (index, offer) in i.offers.iter().enumerate() {
-            enabled.extend(offer.actions.iter().map(|(identity, local)| Enabled {
-                identity: identity.clone(),
-                action: Action::Source {
-                    source: SourceId(index),
-                    local: *local,
-                },
-            }));
-        }
-        if i.ready.is_empty() {
-            if let Some(to) = next_time(i) {
-                enabled.push(Enabled {
-                    identity: Identity::advance_time(to),
-                    action: Action::AdvanceTime(to),
-                });
-            }
-        }
+    for (index, offer) in i.offers.iter().enumerate() {
+        enabled.extend(offer.actions.iter().map(|(identity, local)| Enabled {
+            identity: identity.clone(),
+            action: Action::Source {
+                source: SourceId(index),
+                local: *local,
+            },
+        }));
+    }
+    let to = match i.phase {
+        Phase::Live if i.ready.is_empty() => next_time(i),
+        Phase::Drain if enabled.is_empty() => drain_time(i),
+        Phase::Live | Phase::Drain => None,
+    };
+    if let Some(to) = to {
+        enabled.push(Enabled {
+            identity: Identity::advance_time(to),
+            action: Action::AdvanceTime(to),
+        });
     }
     enabled.sort_by(|a, b| a.identity.cmp(&b.identity));
     match enabled.windows(2).find(|w| w[0].identity == w[1].identity) {
@@ -207,6 +250,39 @@ fn next_time(i: &EnabledInputs<'_>) -> Option<SimInstant> {
         }
     }
     earliest
+}
+
+/// The instant the drain's `AdvanceTime` goes to, or `None` when time
+/// can't move. Whether it may move comes first: only for an obligation
+/// still open, a recovery boundary ahead, or a scheduler timer due by the
+/// timer cap, so a periodic timer with nothing open doesn't keep the drain alive
+/// forever. A timer due now fires whatever the cap, since it doesn't move
+/// the clock. Where it lands comes second: the earliest of the next timer,
+/// the next recovery boundary and just past the earliest deadline, since a
+/// check expires once the clock is past its deadline. So a later boundary
+/// never skips an earlier timer.
+fn drain_time(i: &EnabledInputs<'_>) -> Option<SimInstant> {
+    let timer = i.next_deadline.map(|t| t.max(i.now));
+    let boundary = i
+        .offers
+        .iter()
+        .flat_map(|o| o.boundaries.iter())
+        .filter_map(|boundary| match *boundary {
+            Boundary::Opens(t) | Boundary::Deadline(t) if t > i.now => Some(t),
+            Boundary::Opens(_) | Boundary::Deadline(_) => None,
+        })
+        .min();
+    let timer_counts =
+        timer.is_some_and(|t| t <= i.now || i.clock.timer_cap.is_some_and(|cap| t <= cap));
+    if !(i.clock.unfinished || boundary.is_some() || timer_counts) {
+        return None;
+    }
+    let expiry = i
+        .clock
+        .earliest_deadline
+        .and_then(|deadline| deadline.checked_add(std::time::Duration::from_nanos(1)))
+        .filter(|t| *t > i.now);
+    [timer, boundary, expiry].into_iter().flatten().min()
 }
 
 #[cfg(test)]
@@ -240,17 +316,50 @@ mod tests {
         next_deadline: Option<SimInstant>,
         offers: &[Offer],
     ) -> Vec<String> {
+        shown_with(phase, ready, next_deadline, offers, DrainClock::default())
+    }
+
+    /// [`shown`], with the drain's `clock`.
+    fn shown_with(
+        phase: Phase,
+        ready: &[(Identity, TaskId)],
+        next_deadline: Option<SimInstant>,
+        offers: &[Offer],
+        clock: DrainClock,
+    ) -> Vec<String> {
         enabled_set(&EnabledInputs {
             phase,
             now: ms(5),
             ready,
             next_deadline,
             offers,
+            clock,
         })
         .unwrap()
         .iter()
         .map(|e| e.identity.to_string())
         .collect()
+    }
+
+    /// A recovery offer of `actions` and `quiet`, opening at `boundaries`,
+    /// in the drain's form for a step where no task is ready if `idle`.
+    fn recovery(actions: &[&str], quiet: &[&str], boundaries: &[SimInstant], idle: bool) -> Offer {
+        let acts = |peers: &[&str], verb: &str| -> Vec<(Identity, u64)> {
+            peers
+                .iter()
+                .enumerate()
+                // A test offers a handful of actions.
+                .map(|(i, peer)| (Identity::peer(peer, verb), i as u64))
+                .collect()
+        };
+        Offer::recovery(
+            RecoveryOffer {
+                actions: acts(actions, "act"),
+                quiet: acts(quiet, "quiet"),
+                boundaries: boundaries.to_vec(),
+            },
+            idle,
+        )
     }
 
     fn offer(actions: &[&str], boundaries: &[Boundary]) -> Offer {
@@ -302,14 +411,110 @@ mod tests {
     }
 
     #[test]
-    fn drain_offers_only_ready_tasks() {
+    fn drain_offers_ready_tasks_and_recovery_actions() {
         let ready = [(task("a.1"), first_task())];
-        let offers = [offer(&["p1"], &[Boundary::Opens(ms(6))])];
+        let offers = [recovery(&["p1"], &[], &[ms(6)], false)];
         assert_eq!(
-            shown(Phase::Drain, &ready, None, &offers),
+            shown(Phase::Drain, &ready, Some(ms(6)), &offers),
+            ["task:a.1:poll#1", "peer:p1:act"]
+        );
+        // A recovery action keeps the clock still, as a ready task does.
+        let offers = [recovery(&["p1"], &[], &[ms(6)], true)];
+        assert_eq!(
+            shown(Phase::Drain, &[], Some(ms(6)), &offers),
+            ["peer:p1:act"]
+        );
+        // Nothing to finish, nothing open and no timer by the cap: dry.
+        assert!(shown(Phase::Drain, &[], Some(ms(6)), &[]).is_empty());
+    }
+
+    #[test]
+    fn drain_adds_quiet_actions_only_with_no_task_ready() {
+        let ready = [(task("a.1"), first_task())];
+        let busy = [recovery(&[], &["p1"], &[], false)];
+        assert_eq!(
+            shown(Phase::Drain, &ready, None, &busy),
             ["task:a.1:poll#1"]
         );
-        assert!(shown(Phase::Drain, &[], Some(ms(6)), &offers).is_empty());
+        let quiet = [recovery(&[], &["p1"], &[], true)];
+        assert_eq!(shown(Phase::Drain, &[], None, &quiet), ["peer:p1:quiet"]);
+    }
+
+    #[test]
+    fn drain_time_lands_on_the_earliest_timer_first() {
+        let open = DrainClock {
+            unfinished: true,
+            earliest_deadline: Some(ms(20)),
+            timer_cap: Some(ms(5)),
+        };
+        // A boundary at 10 ms never skips the timer at 7 ms.
+        let offers = [recovery(&[], &[], &[ms(10)], true)];
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(7)), &offers, open),
+            ["advance-time:7000000"]
+        );
+        // With no earlier timer, the boundary.
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(30)), &offers, open),
+            ["advance-time:10000000"]
+        );
+    }
+
+    #[test]
+    fn drain_time_lands_just_past_a_deadline() {
+        let open = DrainClock {
+            unfinished: true,
+            earliest_deadline: Some(ms(8)),
+            timer_cap: None,
+        };
+        // Expiry is `now > deadline`, so 1 ns past it.
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(30)), &[], open),
+            ["advance-time:8000001"]
+        );
+        // An open check with no deadline still lets a timer past the cap
+        // move the clock: a deadline must be reached.
+        let ops = DrainClock {
+            earliest_deadline: None,
+            ..open
+        };
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(30)), &[], ops),
+            ["advance-time:30000000"]
+        );
+        // With nothing to land on, the drain is dry.
+        assert!(shown_with(Phase::Drain, &[], None, &[], ops).is_empty());
+    }
+
+    #[test]
+    fn drain_timers_move_the_clock_only_within_the_cap() {
+        let capped = DrainClock {
+            unfinished: false,
+            earliest_deadline: None,
+            timer_cap: Some(ms(10)),
+        };
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(10)), &[], capped),
+            ["advance-time:10000000"]
+        );
+        // A periodic timer past the cap, with nothing open and no boundary,
+        // doesn't keep the drain alive.
+        assert!(shown_with(Phase::Drain, &[], Some(ms(11)), &[], capped).is_empty());
+        // A timer already due fires whatever the cap, since the clock stays.
+        let past = DrainClock {
+            timer_cap: Some(ms(1)),
+            ..capped
+        };
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(5)), &[], past),
+            ["advance-time:5000000"]
+        );
+        // A recovery boundary moves it whatever the cap.
+        let offers = [recovery(&[], &[], &[ms(40)], true)];
+        assert_eq!(
+            shown_with(Phase::Drain, &[], Some(ms(50)), &offers, past),
+            ["advance-time:40000000"]
+        );
     }
 
     #[test]
@@ -321,6 +526,7 @@ mod tests {
             ready: &[],
             next_deadline: None,
             offers: &offers,
+            clock: DrainClock::default(),
         });
         assert_eq!(
             duplicate.map(|_| ()).unwrap_err().to_string(),

@@ -1175,6 +1175,7 @@ mod tests {
                 phase: Phase::Live,
                 now: SimInstant::ZERO,
                 status: SchedulerStatus::Quiescent,
+                quiescent: true,
                 log: &self.log,
             };
             let mut cx = CheckCtx::new(&step, &NoView, (&registered[0], &registered), None);

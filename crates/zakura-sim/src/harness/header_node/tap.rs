@@ -687,19 +687,15 @@ impl LiveEvidence for TapState {
     /// it still holds its observer, so its last events and the teardown
     /// checks haven't happened.
     ///
-    /// A violation's ending stops the run before the stop could finish, and
-    /// a budget end whose drain was cut off at its bound leaves it honestly
-    /// unfinished, which the teardown property leaves unsettled. Any
-    /// other end means no task could run, yet the reactor never let go.
+    /// A violation's ending stops the run before the stop could finish.
+    /// Any other end the run asks about ran dry, so no task could run, yet
+    /// the reactor never let go. A drain cut off at its bound is already a
+    /// harness failure, which the run doesn't ask about.
     fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
         if end.outcome == Outcome::Violation {
             return None;
         }
-        // A cut-off stop is the teardown property's to report, if one read
-        // the last drain's settlement.
-        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted)
-            && self.rounds.read_at(end.steps);
-        (!cut_off && self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
+        (self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
             .then_some("ShutdownIncomplete: the run ended before the stopped reactor's task ended")
     }
 }

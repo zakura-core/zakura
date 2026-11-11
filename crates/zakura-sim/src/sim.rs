@@ -4,6 +4,15 @@
 //! one action, runs it, records what happened, and calls the checker. A run
 //! ends at a violation, when nothing is enabled, or after its step budget and
 //! a bounded drain.
+//!
+//! The drain finishes what the live phase started, so every property ends
+//! with an answer (#1840 rule 2). It starts at the budget, or at a live end
+//! that still has work to resolve. It offers the ready tasks and each
+//! source's recovery actions, never an adversary act, and moves the clock
+//! while an obligation is open, a recovery boundary is ahead, or a timer is
+//! due within [`RunConfig::harness_timer_cap`] of its start. It ends dry, with
+//! nothing left to run, or at its step bound with work left, which is a
+//! harness failure ([`HarnessFailure::DrainBound`]).
 
 use std::{
     cell::RefCell,
@@ -11,6 +20,7 @@ use std::{
     future::Future,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use zakura_rt::sync::CancellationToken;
@@ -19,8 +29,8 @@ use zakura_scheduler::{
 };
 
 use crate::{
-    action::{enabled_set, Action, ActionSource, EnabledInputs, Offer, SourceId},
-    check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
+    action::{enabled_set, Action, ActionSource, DrainClock, EnabledInputs, Offer, SourceId},
+    check::{Checker, OpenKind, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     evidence::{Checkpoint, EvidenceId, Mark},
@@ -29,7 +39,7 @@ use crate::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
         ViolationRecord,
     },
-    Identity, ObservationLog, Plan, PlanInput,
+    Identity, ObservationLog, Plan, PlanInput, RecoveryOffer,
 };
 
 /// The next run's ID. IDs are never serialized, so their values don't
@@ -38,6 +48,11 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// The property a run violates when it spins at one instant too long.
 pub const NO_LIVELOCK: &str = "sim/no-livelock";
+
+/// [`RunConfig::harness_timer_cap`]'s default: four times `sync/wire`'s
+/// 10-second redial settle, which covers its slowest bounded tail, every
+/// redial a connection has left. The peers' redial settles as long.
+pub const HARNESS_TIMER_CAP: Duration = Duration::from_secs(40);
 
 /// Limits and settings for one run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +69,13 @@ pub struct RunConfig {
     pub max_steps_per_instant: u64,
     /// Whether passing `max_steps_per_instant` violates [`NO_LIVELOCK`].
     pub enforce_no_livelock: bool,
+    /// How long after the drain starts a scheduler timer alone may still
+    /// move its clock, with no obligation open and no recovery boundary
+    /// ahead.
+    /// It lets a bounded harness tail asleep on a timer, such as a redial's
+    /// settle, finish, and keeps a periodic timer from moving the clock
+    /// forever once nothing is left to judge.
+    pub harness_timer_cap: Duration,
 }
 
 impl Default for RunConfig {
@@ -64,6 +86,7 @@ impl Default for RunConfig {
             drain_bound: 10_000,
             max_steps_per_instant: 100_000,
             enforce_no_livelock: false,
+            harness_timer_cap: HARNESS_TIMER_CAP,
         }
     }
 }
@@ -74,7 +97,8 @@ impl Default for RunConfig {
 /// A held task sits out only while something else is enabled. When only
 /// held tasks are ready, the clock can still move, as it would for a slow
 /// thread. When nothing else is enabled at all, every held task is enabled
-/// again, so a hold never ends a run.
+/// again, so a hold never ends a run. Every hold retires when the drain
+/// starts, so the drain runs ready tasks fairly.
 pub trait TaskHold {
     /// True if `task`, which resumes at `at`, sits out the next pick. The
     /// run asks after each step's observations, once per ready task.
@@ -271,7 +295,8 @@ impl Sim {
     }
 
     /// Cancels every generator's token, so none produces more work. A
-    /// generator registered later is cancelled at once.
+    /// generator registered later is cancelled at once. The drain's start
+    /// calls it.
     pub fn retire_generators(&mut self) {
         self.generators.retire();
     }
@@ -396,14 +421,17 @@ impl Sim {
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
         // Read even when a failure is already recorded. One `at_end` or its
-        // reports caused still replaces the outcome, as before, and a source
-        // `at_end` dropped ends the run only if nothing else did.
+        // reports caused still replaces the outcome, as before. A failure
+        // the checker found at the end, such as an unread boundary at a dry
+        // end, and a source `at_end` dropped end the run only if nothing
+        // else did, the checker's first.
+        let late = checker.harness_failure();
         let dropped = self.check_evidence(&state).err();
         let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
-        let end = match dropped {
+        let end = match late.or(dropped) {
             Some(failure) if end.outcome != Outcome::Harness => state.end_harness(failure),
             _ => end,
         };
@@ -497,32 +525,36 @@ impl Sim {
             Err(failure) => return st.end_harness(failure),
         };
         let mut phase = Phase::Live;
+        // When the drain started, once it has.
+        let mut entered = None;
         let mut drained = 0;
         let mut at_instant = 0;
+        // The offers the last step computed for its quiescence, which still
+        // hold at the next pick if its phase is the same.
+        let mut cached: Option<(Phase, Vec<Offer>)> = None;
         loop {
+            let now = self.sched().now();
+            let mut offers = match cached.take() {
+                Some((at, offers)) if at == phase => offers,
+                _ => self.offers(phase, now, ready.is_empty()),
+            };
             // A run whose last live step left nothing enabled stays live, so
-            // it ends idle below rather than at its budget.
+            // it ends idle below, or enters the drain there, rather than at
+            // its budget.
             if phase == Phase::Live
                 && st.step >= self.config.budget
-                && !self.nothing_enabled(&ready)
+                && !nothing_enabled(now, &ready, self.sched().next_deadline(), &offers)
             {
+                ready = match self.enter_drain(st) {
+                    Ok(ready) => ready,
+                    Err(failure) => return st.end_harness(failure),
+                };
                 phase = Phase::Drain;
+                entered = Some(now);
+                offers = self.offers(phase, now, ready.is_empty());
             }
-            if phase == Phase::Drain && drained >= self.config.drain_bound {
-                // Exhausted only if the bound cut off work still waiting.
-                return st.end_budget(drained, !ready.is_empty());
-            }
-            let now = self.sched().now();
-            let offers: Vec<Offer> = match phase {
-                Phase::Live => self
-                    .sources
-                    .iter()
-                    .map(|s| offer(&**s, now, ready.is_empty()))
-                    .collect(),
-                Phase::Drain => Vec::new(),
-            };
-            // A source that drew while offering, here or in the idle check
-            // above, ends the run before anything else runs.
+            // A source that drew while offering, here or in the step before,
+            // ends the run before anything else runs.
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }
@@ -535,41 +567,75 @@ impl Sim {
                     .cloned()
                     .collect()
             });
-            let enabled = match enabled_set(&EnabledInputs {
+            // Read only when the drain's clock might move, since it lists
+            // every open check.
+            let clock = match phase {
+                Phase::Drain
+                    if ready.is_empty() && offers.iter().all(|offer| offer.actions.is_empty()) =>
+                {
+                    self.clock(checker, entered)
+                }
+                Phase::Live | Phase::Drain => DrainClock::default(),
+            };
+            let inputs = |ready| EnabledInputs {
                 phase,
                 now,
-                ready: free.as_deref().unwrap_or(&ready),
+                ready,
                 next_deadline: self.sched().next_deadline(),
                 offers: &offers,
-            })
-            .and_then(|enabled| {
-                if enabled.is_empty() && free.is_some() {
-                    enabled_set(&EnabledInputs {
-                        phase,
-                        now,
-                        ready: &ready,
-                        next_deadline: self.sched().next_deadline(),
-                        offers: &offers,
-                    })
-                } else {
-                    Ok(enabled)
-                }
-            }) {
-                Ok(enabled) => enabled,
-                Err(identity) => {
-                    return st.end_harness(HarnessFailure::DuplicateIdentity {
-                        identity: identity.to_string(),
-                    })
-                }
+                clock,
             };
+            let enabled =
+                match enabled_set(&inputs(free.as_deref().unwrap_or(&ready))).and_then(|enabled| {
+                    if enabled.is_empty() && free.is_some() {
+                        enabled_set(&inputs(&ready))
+                    } else {
+                        Ok(enabled)
+                    }
+                }) {
+                    Ok(enabled) => enabled,
+                    Err(identity) => {
+                        return st.end_harness(HarnessFailure::DuplicateIdentity {
+                            identity: identity.to_string(),
+                        })
+                    }
+                };
             if enabled.is_empty() {
+                // A live end that the drain can still resolve enters it.
+                if phase == Phase::Live && self.resolvable(checker, now, &ready) {
+                    ready = match self.enter_drain(st) {
+                        Ok(ready) => ready,
+                        Err(failure) => return st.end_harness(failure),
+                    };
+                    phase = Phase::Drain;
+                    entered = Some(now);
+                    continue;
+                }
+                // A dry end. Work a source still holds would leave a check
+                // open for the node to be blamed for, so it fails first.
+                if let Some(failure) = self.stranded() {
+                    return st.end_harness(failure);
+                }
                 return match phase {
-                    Phase::Drain => st.end_budget(drained, false),
+                    Phase::Drain => st.end_budget(drained),
                     Phase::Live => match idle_status(self.sched().status()) {
                         Ok(status) => st.end(Outcome::Idle { status }),
                         Err(failure) => st.end_harness(failure),
                     },
                 };
+            }
+            if phase == Phase::Drain {
+                // Before the clock moves toward an expiry that would blame
+                // the node, work no recovery action finishes fails the run.
+                let advances = enabled
+                    .iter()
+                    .any(|enabled| matches!(enabled.action, Action::AdvanceTime(_)));
+                if let Some(failure) = advances.then(|| self.stranded()).flatten() {
+                    return st.end_harness(failure);
+                }
+                if drained >= self.config.drain_bound {
+                    return st.end_drain_bound(drained, unfinished_work(checker, &enabled));
+                }
             }
 
             let identities: Vec<Identity> = enabled.iter().map(|e| e.identity.clone()).collect();
@@ -655,13 +721,21 @@ impl Sim {
             } else {
                 at_instant += 1;
             }
+            // What the sources offer now, in this step's phase, for its
+            // quiescence and the next pick.
+            let after = self.sched().now();
+            let next_offers = self.offers(phase, after, ready.is_empty());
+            let status = self.sched().status();
+            let quiescent = status != Status::Running
+                && next_offers.iter().all(|offer| offer.actions.is_empty());
             let cx = StepCtx {
                 step: st.step,
                 pick: &chosen.identity,
                 enabled: &enabled,
                 phase,
-                now: self.sched().now(),
-                status: self.sched().status(),
+                now: after,
+                status,
+                quiescent,
                 log: &st.log,
             };
             let violation = checker.after_step(&cx);
@@ -677,7 +751,8 @@ impl Sim {
             let spinning = phase == Phase::Live
                 && self.config.enforce_no_livelock
                 && at_instant > self.config.max_steps_per_instant
-                && !self.nothing_enabled(&ready);
+                && !nothing_enabled(after, &ready, self.sched().next_deadline(), &next_offers);
+            cached = Some((phase, next_offers));
             let livelock = spinning.then(|| Violation {
                 property: NO_LIVELOCK.to_owned(),
                 step: st.step,
@@ -719,24 +794,90 @@ impl Sim {
         }
     }
 
-    /// True if no action is enabled now, so the run is about to end idle. A
-    /// run that ends this way isn't spinning, however many steps its last
-    /// instant took.
-    fn nothing_enabled(&self, ready: &[(Identity, TaskId)]) -> bool {
-        let now = self.sched().now();
-        let offers: Vec<Offer> = self
-            .sources
+    /// Starts the drain, once, in this order: the task holds retire, every
+    /// source retires its own holds ([`ActionSource::enter_drain`]), the
+    /// generators retire ([`Sim::retire_generators`]), and the picks switch
+    /// to the recovery policy, so every ready task and recovery action is
+    /// picked within a bounded number of steps. Returns the ready tasks
+    /// after, which include each retired generator woken to stop.
+    fn enter_drain(&mut self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
+        self.holds.clear();
+        st.held.clear();
+        for source in &mut self.sources {
+            source.enter_drain(&mut st.log);
+        }
+        self.retire_generators();
+        self.choices.borrow_mut().decider.recover();
+        self.ready(st)
+    }
+
+    /// Each source's offer at `now` in `phase`: its live one, with its quiet
+    /// actions when `quiet`, or in the drain its recovery one in the same
+    /// form ([`Offer::recovery`]).
+    fn offers(&self, phase: Phase, now: SimInstant, quiet: bool) -> Vec<Offer> {
+        self.sources
             .iter()
-            .map(|s| offer(&**s, now, ready.is_empty()))
-            .collect();
+            .map(|source| match phase {
+                Phase::Live => offer(&**source, now, quiet),
+                Phase::Drain => {
+                    let mut recovery = RecoveryOffer::default();
+                    source.recovery(now, &mut recovery);
+                    Offer::recovery(recovery, quiet)
+                }
+            })
+            .collect()
+    }
+
+    /// What may move the drain's clock, for a drain that started at
+    /// `entered`: `checker`'s open obligations and the timer cap. A pending
+    /// mark doesn't count. It has no deadline, and its site's end judgment
+    /// decides it at the dry end, so past the cap it would only let a
+    /// periodic timer keep the drain from ever running dry.
+    fn clock(&self, checker: &dyn Checker, entered: Option<SimInstant>) -> DrainClock {
+        let unfinished = checker.unfinished();
+        DrainClock {
+            unfinished: unfinished
+                .open
+                .iter()
+                .any(|check| check.kind != OpenKind::Pending),
+            earliest_deadline: unfinished.earliest_deadline(),
+            timer_cap: entered.and_then(|at| at.checked_add(self.config.harness_timer_cap)),
+        }
+    }
+
+    /// Whether a live run that has nothing enabled at `now` still has work
+    /// the drain can resolve: a recovery action, a recovery boundary, or an
+    /// open obligation with a deadline or a timer for the clock to reach.
+    /// Asked as the drain's first step would be, starting now.
+    fn resolvable(
+        &self,
+        checker: &dyn Checker,
+        now: SimInstant,
+        ready: &[(Identity, TaskId)],
+    ) -> bool {
+        let offers = self.offers(Phase::Drain, now, ready.is_empty());
         enabled_set(&EnabledInputs {
-            phase: Phase::Live,
+            phase: Phase::Drain,
             now,
             ready,
             next_deadline: self.sched().next_deadline(),
             offers: &offers,
+            clock: self.clock(checker, Some(now)),
         })
-        .is_ok_and(|enabled| enabled.is_empty())
+        .is_ok_and(|enabled| !enabled.is_empty())
+    }
+
+    /// The first source's work that nothing will finish
+    /// ([`ActionSource::holds_work`]), as a failure.
+    fn stranded(&self) -> Option<HarnessFailure> {
+        self.sources.iter().enumerate().find_map(|(index, source)| {
+            source
+                .holds_work()
+                .map(|detail| HarnessFailure::SourceEvidence {
+                    source: format!("source {index}"),
+                    detail,
+                })
+        })
     }
 
     /// Lets every source append what happened inside it to the current
@@ -961,11 +1102,26 @@ impl State {
         }
     }
 
-    /// An end after a budget and a drain of `steps`.
-    fn end_budget(&self, steps: u64, exhausted: bool) -> RunEnd {
+    /// An end after a drain of `steps` that ran dry.
+    fn end_budget(&self, steps: u64) -> RunEnd {
         RunEnd {
-            drain: Some(Drain { steps, exhausted }),
+            drain: Some(Drain {
+                steps,
+                exhausted: false,
+            }),
             ..self.end(Outcome::Budget)
+        }
+    }
+
+    /// An end after a drain cut off at its bound of `steps`, with `open`
+    /// the work it left ([`HarnessFailure::DrainBound`]).
+    fn end_drain_bound(&self, steps: u64, open: String) -> RunEnd {
+        RunEnd {
+            drain: Some(Drain {
+                steps,
+                exhausted: true,
+            }),
+            ..self.end_harness(HarnessFailure::DrainBound { open })
         }
     }
 
@@ -985,6 +1141,47 @@ fn after_harness_failure(reports: Vec<PropertyReport>) -> Vec<PropertyReport> {
         .into_iter()
         .map(PropertyReport::after_harness_failure)
         .collect()
+}
+
+/// True if no action is enabled live at `now`, given the ready tasks and
+/// the sources' live `offers`, so the live phase is about to end. A run
+/// that ends this way isn't spinning, however many steps its last instant
+/// took.
+fn nothing_enabled(
+    now: SimInstant,
+    ready: &[(Identity, TaskId)],
+    next_deadline: Option<SimInstant>,
+    offers: &[Offer],
+) -> bool {
+    enabled_set(&EnabledInputs {
+        phase: Phase::Live,
+        now,
+        ready,
+        next_deadline,
+        offers,
+        clock: DrainClock::default(),
+    })
+    .is_ok_and(|enabled| enabled.is_empty())
+}
+
+/// What a drain cut off at its bound left, for
+/// [`HarnessFailure::DrainBound`]: the first check `checker` still has
+/// open, by property and subject, or else the first of `enabled`'s ready
+/// tasks, recovery actions and advance, in that order. A task's name says
+/// whose code it runs.
+fn unfinished_work(checker: &dyn Checker, enabled: &[crate::Enabled]) -> String {
+    if let Some(check) = checker.unfinished().open.first() {
+        return format!("{} {}", check.property, check.subject);
+    }
+    let rank = |enabled: &&crate::Enabled| match enabled.action {
+        Action::RunTask(_) => 0,
+        Action::Source { .. } => 1,
+        Action::AdvanceTime(_) => 2,
+    };
+    enabled
+        .iter()
+        .min_by_key(rank)
+        .map_or_else(String::new, |enabled| enabled.identity.to_string())
 }
 
 /// What `source` offers at `now`, with its quiet actions when `quiet`,
@@ -1108,12 +1305,14 @@ fn end_record(
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
         // The record holds what the trace writes, which leaves out each
-        // report's violations, so a replay compares like with like.
+        // report's violations and the fields the trim reads, so a replay
+        // compares like with like.
         properties: properties
             .iter()
             .map(|report| PropertyReport {
                 violations: Vec::new(),
                 end_found: 0,
+                undeclared: false,
                 ..report.clone()
             })
             .collect(),

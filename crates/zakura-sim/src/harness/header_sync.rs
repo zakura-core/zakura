@@ -134,7 +134,7 @@ impl Subsystem for Smoke {
                 ..SchedulerConfig::default()
             },
             budget: 2_000,
-            drain_bound: 1_000,
+            drain_bound: 5_000,
             ..RunConfig::default()
         }
     }
@@ -1855,7 +1855,10 @@ pub fn wire_config() -> RunConfig {
     RunConfig {
         scheduler: SchedulerConfig::default(),
         budget: 30_000,
-        drain_bound: 2_000,
+        // The longest drain measured on the saved Plans, which runs the QUIC
+        // timers to the harness timer cap, is about 4,700 steps, and more
+        // peers take more.
+        drain_bound: 50_000,
         ..RunConfig::default()
     }
 }
@@ -1869,7 +1872,10 @@ pub fn storage_config() -> RunConfig {
             ..SchedulerConfig::default()
         },
         budget: 4_000,
-        drain_bound: 1_000,
+        // The drain runs the mirrors' timers to the harness timer cap. That
+        // took about 3,600 steps on the committed inputs, and over 10,000
+        // with 17 mirrors, so the bound leaves room for many more.
+        drain_bound: 50_000,
         ..RunConfig::default()
     }
 }
@@ -2463,6 +2469,7 @@ mod tests {
                 phase: Phase::Live,
                 now: SimInstant::ZERO,
                 status: SchedulerStatus::Quiescent,
+                quiescent: true,
                 log: &log,
             };
             let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);

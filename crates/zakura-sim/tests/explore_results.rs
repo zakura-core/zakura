@@ -156,10 +156,10 @@ impl Subsystem for Results {
         match case {
             HARNESS_CASE => scheduler.spawn_root("bad:name", async {}),
             ABANDON_CASE | ACTIVE_ABANDON_CASE => scheduler.spawn_root("spinner", async {
-                // Nothing ever stores, and every load is a point, so
-                // cleanup gets stuck and shutdown abandons the run.
-                let flag = AtomicU64::new(0);
-                while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+                // It waits for good, so the run ends dry, and spins once
+                // shutdown drops it.
+                let _spin = SpinOnDrop;
+                std::future::pending::<()>().await;
             }),
             ABORT_CASE => scheduler.spawn_root("tick", async {
                 yield_now().await;
@@ -259,6 +259,20 @@ fn from_trace(exit: ProcessExit, stderr: &[u8], dir: &Path) -> ProcessClassified
 /// The variable that makes [`results_child`] run a case, as
 /// `<mode>:<directory>`.
 const CHILD: &str = "ZAKURA_SIM_RESULTS_CHILD";
+
+/// Spins once dropped. Nothing ever stores, and every load is a point, so
+/// the shutdown that drops it gets stuck, and abandons the run. A task that
+/// spun live would instead keep its drain from running dry, which fails the
+/// run as `DrainBound`.
+struct SpinOnDrop;
+
+impl Drop for SpinOnDrop {
+    /// Spins on a value no one sets.
+    fn drop(&mut self) {
+        let flag = AtomicU64::new(0);
+        while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+    }
+}
 
 /// Runs a case when run as the child, and does nothing otherwise.
 ///
@@ -709,15 +723,18 @@ fn stats_count_each_part_of_a_run() {
     assert_eq!(
         counts.ends,
         map(&[
-            ("budget", 1),
             ("harness", 1),
+            ("idle/deadlock", 1),
             ("idle/quiescent", 2),
             (NOT_RUN, 1),
             ("violation", 1)
         ])
     );
-    assert_eq!(counts.budget_exits(), 1);
-    assert_eq!(counts.drains_exhausted, 1, "the spinner outlasts the drain");
+    assert_eq!(counts.budget_exits(), 0);
+    assert_eq!(
+        counts.drains_exhausted, 0,
+        "the spinner waits, so no drain runs"
+    );
     assert_eq!(
         counts.cleanup,
         CleanupCounts {
@@ -771,7 +788,7 @@ fn stats_count_property_outcomes_cleanup_and_features() {
         ),
         PropertyReport::new("x/lost", na(NaReason::AssumptionLost)),
         PropertyReport::new("x/never", na(NaReason::AssumptionsNeverHeld)),
-        PropertyReport::new("x/open", na(NaReason::ObligationOpen)),
+        PropertyReport::new("x/open", na(NaReason::NodeStopped)),
     ];
     report.cleanup.unwound = 2;
     report.cleanup.panicked = 1;
@@ -803,7 +820,7 @@ fn stats_count_property_outcomes_cleanup_and_features() {
     assert_eq!(property("x/lost").assumption_losses(), 2);
     assert_eq!(property("x/never").assumption_losses(), 2);
     assert_eq!(property("x/open").assumption_losses(), 0);
-    assert_eq!(property("x/open").not_applicable["obligation-open"], 2);
+    assert_eq!(property("x/open").not_applicable["node-stopped"], 2);
     assert_eq!(
         counts.cleanup,
         CleanupCounts {

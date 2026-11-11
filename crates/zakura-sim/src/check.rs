@@ -99,12 +99,6 @@ pub enum NaReason {
         /// The mark's site.
         site: Pending,
     },
-    /// Incomplete: an obligation was still open at run end, within its
-    /// bound. Phase B removes it: an obligation open at a dry end becomes
-    /// `Violated`, and one open at the drain's bound a `DrainBound` harness
-    /// failure.
-    #[doc(hidden)]
-    ObligationOpen,
 }
 
 impl NaReason {
@@ -132,7 +126,6 @@ impl NaReason {
             NaReason::HarnessFailed => "harness-failed",
             NaReason::NodeStopped => "node-stopped",
             NaReason::Unsettled { site } => return Cow::Owned(format!("unsettled:{site}")),
-            NaReason::ObligationOpen => "obligation-open",
         })
     }
 }
@@ -244,7 +237,8 @@ impl PropertyReport {
 pub enum Phase {
     /// Before the step budget runs out. Every action can be enabled.
     Live,
-    /// After the budget, when only ready tasks run.
+    /// After the budget, or a live end with work left to resolve, when only
+    /// ready tasks, recovery actions and the clock move.
     Drain,
 }
 
@@ -263,6 +257,12 @@ pub struct StepCtx<'a> {
     pub now: SimInstant,
     /// The scheduler's status after the step.
     pub status: Status,
+    /// Whether the run is quiescent after the step: no task can run, and no
+    /// source action is eligible in the step's phase. Live, that's an
+    /// enabled or quiet action, so a completion a hold hides doesn't count.
+    /// In the drain, it's a recovery action, quiet or not. A boundary ahead
+    /// never counts. A `BeforeQuiescence` obligation expires here.
+    pub quiescent: bool,
     /// Every observation so far.
     pub log: &'a ObservationLog,
 }
@@ -344,8 +344,9 @@ pub trait Checker {
 
     /// A harness failure the checker found, such as a source a property
     /// needs that the harness lacks, or a stale view. The run calls it
-    /// before the first step and after every step, and ends at the first
-    /// failure.
+    /// before the first step, after every step and after
+    /// [`at_end`](Self::at_end), and ends at the first failure. One found
+    /// at the end still fails a run that didn't already fail.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         None
     }

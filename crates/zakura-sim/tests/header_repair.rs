@@ -187,7 +187,8 @@ fn ended<'a>(facts: &[&'a ReactorFact], call: u64) -> Option<&'a str> {
     })
 }
 
-/// Checks that every property of `run` held or didn't apply, that
+/// Checks that every property of `run` held, didn't apply, or isn't
+/// declared, as `sim/no-livelock` isn't here, that
 /// `stale-completion-inert` applied, that its one stale call was the stale
 /// peer's ordinary prepare, and that the repair prepared and applied once,
 /// retired admitted, and left the node's records constraining the next
@@ -207,7 +208,7 @@ fn repaired(run: &Run) {
                 property.outcome,
                 PropertyOutcome::Held { .. }
                     | PropertyOutcome::NotApplicable {
-                        reason: NaReason::NeverApplied
+                        reason: NaReason::NeverApplied | NaReason::Undeclared
                     }
             ),
             "{property:?}"

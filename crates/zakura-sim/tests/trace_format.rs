@@ -1533,7 +1533,6 @@ fn na_reason() -> impl Strategy<Value = NaReason> {
             NaReason::StoppedByViolation,
             NaReason::HarnessFailed,
             NaReason::NodeStopped,
-            NaReason::ObligationOpen,
         ]),
         prop::sample::select(vec![
             Pending::FaultOpen,

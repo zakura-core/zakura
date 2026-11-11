@@ -995,7 +995,10 @@ pub fn sync_config(scenario: &SyncScenario) -> RunConfig {
         budget: scenario.steps.unwrap_or(
             12_000 + STEPS_PER_BLOCK * (u64::from(scenario.blocks) + scenario.changed()),
         ),
-        drain_bound: 2_000,
+        // The longest drain measured on the saved scenarios, which runs the
+        // peers' timers to the harness timer cap, is about 2,200 steps here
+        // and 18,600 over `sync/wire`'s QUIC, which shares this bound.
+        drain_bound: 80_000,
         ..RunConfig::default()
     }
 }

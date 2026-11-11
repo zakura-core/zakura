@@ -510,20 +510,18 @@ impl Checker for Points {
     }
 }
 
-/// If the deferred timer is lost and nothing else is armed, the run ends
-/// idle before the deferred instant. Time can't reach it then, so the
-/// obligation violates at the run's end instead of staying open, and its
-/// expiry reaches the checkers after the registry.
+/// If the deferred timer is lost and nothing else is armed, the live phase
+/// goes idle before the deferred instant. The open obligation sends the run
+/// into the drain, whose clock moves just past the deadline, where the
+/// obligation expires as a step's finding, and its expiry reaches the
+/// checkers after the registry.
 #[test]
-fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
+fn a_deferral_with_nothing_armed_violates_at_its_deadline_in_the_drain() {
     let mut points = Points::default();
     let report = run_checked(&[Fact(Wait), Fact(Defer(1))], 50, Some(&mut points));
     assert_eq!(points.0.last(), Some(&Lifecycle::Expired), "{:?}", points.0);
-    assert!(
-        matches!(report.end.outcome, Outcome::Idle { .. }),
-        "{:?}",
-        report.end
-    );
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    assert!(report.end.drain.is_some(), "{:?}", report.end);
     assert!(violated(&report, SERVED), "{:?}", report.properties);
     let served = report
         .properties
@@ -534,13 +532,9 @@ fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
         served.violations[0].expected,
         r#"Owner("w") discharged by its deferred deadline, 1000000 ns"#
     );
-    assert_eq!(
-        served.violations[0].actual,
-        "the run went idle at 0 ns with it still open"
-    );
-    // The run's end found it, not a step, so a nested judge can't take its
-    // reporting step for a break.
-    assert_eq!(served.end_found, served.violations.len(), "{served:?}");
+    assert_eq!(served.violations[0].actual, "still open at 1000001 ns");
+    // A step found it, not the run's end.
+    assert_eq!(served.end_found, 0, "{served:?}");
 }
 
 /// While the task waits on storage, the scheduler alone looks deadlocked,
@@ -579,13 +573,32 @@ fn an_overdue_deferral_expires_before_later_facts() {
     }
 }
 
-/// A run cut off while the obligation is deferred leaves it open.
+/// A budget that ends while the obligation is deferred leaves it to the
+/// drain, whose clock reaches the task's timer at the deadline, where the
+/// discharge is in time.
 #[test]
-fn a_run_cut_off_while_deferred_leaves_it_open() {
+fn the_drain_discharges_an_obligation_deferred_at_the_budget() {
     let report = run_for(&[Fact(Wait), Fact(Defer(1)), Sleep(1), Fact(Done)], 1);
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert!(
+        matches!(outcome(&report, SERVED), PropertyOutcome::Held { .. }),
+        "{:?}",
+        outcome(&report, SERVED)
+    );
+}
+
+/// A deferred deadline earlier than every timer and boundary is reached
+/// first: the drain's clock lands just past it, and the obligation expires
+/// there, before the task's later timer could discharge it.
+#[test]
+fn the_drain_reaches_a_deferred_deadline_before_a_later_timer() {
+    let report = run_for(&[Fact(Wait), Fact(Defer(1)), Sleep(5), Fact(Done)], 1);
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    let violation = report.end.violation.as_ref().expect("it violated");
+    assert_eq!(violation.property, SERVED);
     assert_eq!(
-        outcome(&report, SERVED),
-        PropertyOutcome::not_applicable(NaReason::ObligationOpen)
+        report.picks.last().map(|pick| pick.identity.as_str()),
+        Some("advance-time:1000001")
     );
 }
 
@@ -621,8 +634,10 @@ fn a_view_trigger_history_is_judged_on_the_final_view() {
 }
 
 /// A trigger that only the scheduler's shutdown reaches isn't the judged
-/// run's. The run ends with the task stopped at a lock, and shutdown
-/// resumes it to its poll boundary, past the wait it records next.
+/// run's. The run is cut with the task stopped at a lock and no drain to
+/// resume it, which fails it at the drain's bound, so the wait it would
+/// record next never counts, though shutdown resumes it to its poll
+/// boundary.
 #[test]
 fn a_trigger_only_shutdown_reaches_is_lost() {
     let cut = WitnessScenario::<Stamped> {
@@ -634,9 +649,12 @@ fn a_trigger_only_shutdown_reaches_is_lost() {
         },
         input: Plan::from_fuzz(&[]),
     };
-    assert_eq!(
-        witness(cut, SERVED, Expect::Holds),
-        Err(WitnessError::LostTriggerHistory)
+    assert!(
+        matches!(
+            witness(cut, SERVED, Expect::Holds),
+            Err(WitnessError::HarnessEnd(failure)) if failure.starts_with("drain-bound:")
+        ),
+        "the cut fails at the drain's bound"
     );
 }
 

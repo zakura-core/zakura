@@ -20,7 +20,8 @@ use zakura_sim::{
         ReplayOptions, Trace, TraceReader,
     },
     witness::{Expect, WitnessError},
-    MemorySink, NullSink, PlanInput, PropertyOutcome, Record,
+    Checker, HarnessFailure, MemorySink, NullSink, ObservationLog, Outcome, PlanInput,
+    PropertyOutcome, PropertyReport, Record, RunEnd, StepCtx, Unfinished, Violation,
 };
 
 /// An operation with no effect.
@@ -183,6 +184,66 @@ fn a_harness_failure_leaves_no_property_held() {
         panic!("the run ends with its end record");
     };
     assert_eq!(end.properties, report.properties);
+}
+
+/// An extra checker that holds its one property and finds a harness
+/// failure only at the run's end.
+#[derive(Default)]
+struct FailsAtEnd {
+    failure: Option<HarnessFailure>,
+}
+
+impl Checker for FailsAtEnd {
+    fn after_step(&mut self, _: &StepCtx<'_>) -> Option<Violation> {
+        None
+    }
+
+    /// Reports `test/late` held, and finds missing evidence.
+    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        self.failure = Some(HarnessFailure::MissingEvidence {
+            property: "test/late".to_owned(),
+            step: end.steps,
+            detail: "the end found the evidence short".to_owned(),
+        });
+        vec![PropertyReport::new(
+            "test/late",
+            PropertyOutcome::Held { applicable: 1 },
+        )]
+    }
+
+    /// The failure `at_end` found, once.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.failure.take()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> Unfinished {
+        Unfinished::default()
+    }
+}
+
+/// A failure only the extra checker finds, at the machine run's end, fails
+/// the run, as in `Sim::run`: the run ends `Harness`, and neither the
+/// machine's property nor the extra checker's is held.
+#[test]
+fn an_extra_checkers_end_failure_fails_the_run() {
+    let mut extra = FailsAtEnd::default();
+    let run = (ENTRY.run_bytes)(&input(&[CHARGE]), &mut NullSink, Some(&mut extra));
+    let report = run.report().expect("the machine ran");
+    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert!(matches!(
+        report.end.harness,
+        Some(HarnessFailure::MissingEvidence { .. })
+    ));
+    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
+    assert!(
+        report
+            .properties
+            .iter()
+            .all(|property| property.outcome == harness_failed),
+        "{:?}",
+        report.properties
+    );
 }
 
 #[test]

@@ -334,9 +334,10 @@ fn honest_progress_applies_only_in_its_fixture() {
     let honest = SavedPlan::HonestSync.scenario();
     assert!(!progress_fixture(&honest));
     let (report, _) = run(&honest, Plan::from_fuzz(&[]));
+    // The honest sync doesn't declare the progress fixture's assumptions.
     assert_eq!(
         outcome(&report, HONEST_PROGRESS),
-        &PropertyOutcome::not_applicable(NaReason::NeverApplied)
+        &PropertyOutcome::not_applicable(NaReason::Undeclared)
     );
 }
 

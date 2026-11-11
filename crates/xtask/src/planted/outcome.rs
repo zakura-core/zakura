@@ -73,8 +73,6 @@ pub(super) enum NaReason {
         /// The mark's site.
         site: Pending,
     },
-    /// Incomplete: an obligation was still open at the run's end.
-    ObligationOpen,
 }
 
 impl NaReason {
@@ -103,7 +101,6 @@ impl fmt::Display for NaReason {
             NaReason::HarnessFailed => "harness-failed",
             NaReason::NodeStopped => "node-stopped",
             NaReason::Unsettled { site } => return write!(f, "unsettled:{site}"),
-            NaReason::ObligationOpen => "obligation-open",
         })
     }
 }
@@ -163,7 +160,6 @@ mod tests {
             "stopped-by-violation",
             "harness-failed",
             "node-stopped",
-            "obligation-open",
         ];
         for name in units {
             let parsed = EndOutcome::parse(&json!({"not-applicable": {"reason": name}}));
@@ -199,6 +195,7 @@ mod tests {
         );
         for bad in [
             json!({"not-applicable": {"reason": "lost"}}),
+            json!({"not-applicable": {"reason": "obligation-open"}}),
             json!({"not-applicable": {"reason": {"unsettled": {"site": "elsewhere"}}}}),
             json!({"inconclusive": {"reason": "harness-failed"}}),
             json!("not-applicable"),

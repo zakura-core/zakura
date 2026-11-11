@@ -1,4 +1,4 @@
-//! M1.5: a budget leaves an open liveness claim open, the drain
+//! M1.5: a drain cut off at its bound is a harness failure, the drain
 //! admits nothing external, and a violation ends the run at once.
 #![cfg(zakura_sim)]
 
@@ -12,8 +12,8 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::{self, FnChecker, Phase},
     sim::NO_LIVELOCK,
-    ActionSource, Boundary, Identity, NaReason, NoChecks, Observation, ObservationLog, Outcome,
-    Plan, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
+    ActionSource, Boundary, HarnessFailure, Identity, NoChecks, Observation, ObservationLog,
+    Outcome, Plan, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
 };
 
 /// A task that yields `n` times, then finishes.
@@ -24,29 +24,28 @@ async fn yields(n: u32) {
 }
 
 /// A checker for a liveness claim, "`done.1` finishes". It reports the claim
-/// held if the task exited, and `NotApplicable` with the obligation open if
-/// the run ended at its budget first.
+/// held if the task exited, and violated otherwise.
 fn finishes() -> impl check::Checker {
     FnChecker::new(
         |_: &check::StepCtx<'_>| None,
-        |end: &RunEnd, log: &ObservationLog| {
+        |_: &RunEnd, log: &ObservationLog| {
             let exited = log.entries().iter().any(
                 |e| matches!(&e.obs, Observation::TaskExited { task, .. } if task == "done.1"),
             );
-            let outcome = match (exited, end.outcome) {
-                (true, _) => PropertyOutcome::Held { applicable: 1 },
-                (false, Outcome::Budget) => {
-                    PropertyOutcome::not_applicable(NaReason::ObligationOpen)
-                }
-                (false, _) => PropertyOutcome::Violated { witness: vec![] },
+            let outcome = match exited {
+                true => PropertyOutcome::Held { applicable: 1 },
+                false => PropertyOutcome::Violated { witness: vec![] },
             };
             vec![PropertyReport::new("test/done-finishes", outcome)]
         },
     )
 }
 
+/// #1840 rule 2: a drain cut off at its bound with a task still spinning,
+/// and nothing open, is a harness failure naming the task, never a budget
+/// end whose claims read as held.
 #[test]
-fn budget_open_obligation_not_applicable() {
+fn a_drain_cut_off_while_a_task_spins_is_drain_bound() {
     let config = RunConfig {
         drain_bound: 20,
         ..config(2, 10)
@@ -57,18 +56,20 @@ fn budget_open_obligation_not_applicable() {
         |sim| {
             sim.scheduler().spawn_root("done", yields(1_000));
         },
-        &mut finishes(),
+        &mut NoChecks,
     );
-    assert_eq!(report.end.outcome, Outcome::Budget);
+    assert_eq!(report.end.outcome, Outcome::Harness);
     let drain = report.end.drain.unwrap();
     assert!(drain.exhausted && drain.steps == 20);
     assert_eq!(report.end.steps, 30);
-    assert!(matches!(
-        report.properties[0].outcome,
-        PropertyOutcome::NotApplicable {
-            reason: NaReason::ObligationOpen
-        }
-    ));
+    assert!(
+        matches!(
+            &report.end.harness,
+            Some(HarnessFailure::DrainBound { open }) if open.starts_with("task:done.1:")
+        ),
+        "{:?}",
+        report.end.harness
+    );
 
     // A task that finishes during the drain discharges the claim.
     let report = run(

@@ -620,6 +620,7 @@ mod tests {
                 ready: &ready,
                 next_deadline: w.next_deadline.map(ms),
                 offers: &offers,
+                clock: crate::action::DrainClock::default(),
             })
             .expect("fakes never share an identity");
             let shown: Vec<String> = enabled.iter().map(|e| e.identity.to_string()).collect();

@@ -431,8 +431,9 @@ fn run_end(outcome: crate::Outcome, exhausted: bool) -> RunEnd {
 }
 
 /// A departed session own-9 never retired is a leak once the run ended idle,
-/// and open when the run hasn't ended or stopped first, at its
-/// budget included, since the budget's drain fires no timer.
+/// and open when the run hasn't ended or stopped first, at its budget
+/// included, since a dry drain can leave a timer past the harness timer
+/// cap pending.
 #[test]
 fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
     let open = vec![("peer-0".to_owned(), 5)];
@@ -440,7 +441,12 @@ fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
     for (end, check) in [
         (None, EndCheck::Open(open.clone())),
         (
-            Some(run_end(crate::Outcome::Budget, true)),
+            Some(RunEnd {
+                harness: Some(crate::HarnessFailure::DrainBound {
+                    open: "task:reactor.1:poll#1".to_owned(),
+                }),
+                ..run_end(crate::Outcome::Harness, true)
+            }),
             EndCheck::Open(open.clone()),
         ),
         (

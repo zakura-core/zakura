@@ -605,10 +605,29 @@ fn shutdown_releases_everything_and_logs_nothing() {
             sim.add_source(Box::new(storage));
             held = Some((port, semaphore));
         },
-        &mut zakura_sim::NoChecks,
+        // A violation stops the run at the step that submits the call,
+        // before the drain could complete it.
+        &mut zakura_sim::check::after_step(|cx| {
+            let submitted = cx.observations().any(|obs| {
+                matches!(
+                    obs,
+                    Observation::Storage {
+                        fact: StorageFact::Submitted { .. },
+                        ..
+                    }
+                )
+            });
+            submitted.then(|| zakura_sim::Violation {
+                property: "test/stop".to_owned(),
+                step: cx.step,
+                witness: vec![cx.step],
+                expected: "a stop before the call completes".to_owned(),
+                actual: format!("step {}", cx.step),
+            })
+        }),
     );
     let (port, semaphore) = held.expect("setup ran");
-    assert_eq!(report.end.outcome, Outcome::Budget);
+    assert_eq!(report.end.outcome, Outcome::Violation);
     let logged = heads(&report);
     assert!(
         matches!(logged.as_slice(), [StorageFact::Submitted { .. }]),

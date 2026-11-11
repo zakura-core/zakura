@@ -296,7 +296,6 @@ fn each_not_applicable_reason_survives_by_its_class() {
         (json!("stopped-by-violation"), Reason::Incomplete),
         (json!("harness-failed"), Reason::Incomplete),
         (json!("node-stopped"), Reason::Incomplete),
-        (json!("obligation-open"), Reason::Incomplete),
         (
             json!({"unsettled": {"site": "teardown-open"}}),
             Reason::Incomplete,
@@ -335,7 +334,7 @@ fn each_not_applicable_reason_survives_by_its_class() {
 fn an_incomplete_named_id_survives_incomplete_not_held() {
     let incomplete = observed(
         Ended::Exited(0),
-        vec![end(None, &[(NAMED, "not-applicable/obligation-open", 0)])],
+        vec![end(None, &[(NAMED, "not-applicable/assumption-lost", 0)])],
     );
     assert_eq!(
         classified(&incomplete),
@@ -345,7 +344,7 @@ fn an_incomplete_named_id_survives_incomplete_not_held() {
     let judged_incomplete = observed(
         Ended::Exited(1),
         vec![
-            end(None, &[(NAMED, "not-applicable/obligation-open", 0)]),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
             judged(Some("incomplete"), Trigger::None),
         ],
     );
@@ -358,7 +357,7 @@ fn an_incomplete_named_id_survives_incomplete_not_held() {
     let one_held = observed(
         Ended::Exited(0),
         vec![
-            end(None, &[(NAMED, "not-applicable/obligation-open", 0)]),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
             end(None, &[(NAMED, "held", 3)]),
         ],
     );

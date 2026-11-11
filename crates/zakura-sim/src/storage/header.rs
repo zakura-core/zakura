@@ -829,3 +829,26 @@ impl Drop for HeaderStorage {
         self.port.shut_down();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use zakura_storage::header::{Fault, Outcome};
+
+    use super::succeeds;
+
+    /// The drain's success rule: `engine` wherever it's legal, and
+    /// `rejected` for a request whose only legal outcome it is, such as one
+    /// that fails an adapter-side input check, so recovery still ends it.
+    #[test]
+    fn a_rejection_only_request_succeeds_by_its_rejection() {
+        let ordinary = [
+            Outcome::Engine,
+            Outcome::Fault(Fault::Timeout),
+            Outcome::Rejected,
+        ];
+        assert!(succeeds(&ordinary, Outcome::Engine));
+        assert!(!succeeds(&ordinary, Outcome::Fault(Fault::Timeout)));
+        assert!(!succeeds(&ordinary, Outcome::Rejected));
+        assert!(succeeds(&[Outcome::Rejected], Outcome::Rejected));
+    }
+}

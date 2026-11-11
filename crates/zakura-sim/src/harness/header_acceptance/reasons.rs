@@ -72,10 +72,6 @@ pub static NA_REASONS: &[NaEntry] = &[
         "a penalty or a failed reply was still open at an unsettled end",
     ),
     unsettled(
-        Pending::UnreadBoundary,
-        "the last budget boundary was read with the reactor mid-poll",
-    ),
-    unsettled(
         Pending::TeardownOpen,
         "a released round or the node's stop hadn't settled at an unsettled end",
     ),
@@ -91,16 +87,21 @@ pub static NA_REASONS: &[NaEntry] = &[
         Pending::UnjudgedDeparture,
         "a departure the slot rule hadn't judged at a unit boundary yet",
     ),
-    entry(
-        NaReason::ObligationOpen,
-        "an obligation was still open within its bound, until E1's drain concludes it",
-    ),
 ];
 
 /// The reasons no header ID can end with, and why.
-pub static NOT_HEADER: &[(NaReason, &str)] = &[(
-    NaReason::Unsettled {
-        site: Pending::BlockTeardownOpen,
-    },
-    "block sync's teardown mark, which only block-sync and sync IDs set",
-)];
+pub static NOT_HEADER: &[(NaReason, &str)] = &[
+    (
+        NaReason::Unsettled {
+            site: Pending::UnreadBoundary,
+        },
+        "the budget boundary mark, which a dry end turns into missing evidence, a harness \
+         failure, and which a violation's stop or a harness end outranks",
+    ),
+    (
+        NaReason::Unsettled {
+            site: Pending::BlockTeardownOpen,
+        },
+        "block sync's teardown mark, which only block-sync and sync IDs set",
+    ),
+];

@@ -25,11 +25,12 @@ use zakura_sim::{
             storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
             Storage, StorageScenario, StorageView,
         },
-        run_prepared, Subsystem,
+        run_prepared, HarnessError, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
     property::{EndViolation, HasView, Property, Sources},
-    MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
+    HarnessFailure, MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd,
+    RunReport, Sim,
 };
 
 /// The last view a run's checks read, with how many adoption facts it held
@@ -165,7 +166,9 @@ fn run_for(scenario: &StorageScenario, budget: Option<u64>, input: PlanInput) ->
     run_limited(scenario, budget, None, input)
 }
 
-/// [`run_for`], with a drain of at most `drain_bound` steps, if set.
+/// [`run_for`], with a drain of at most `drain_bound` steps, if set. A run
+/// whose drain that bound cuts off ends at a `DrainBound` harness failure,
+/// which these tests read as a cut-off run's report.
 fn run_limited(
     scenario: &StorageScenario,
     budget: Option<u64>,
@@ -178,14 +181,20 @@ fn run_limited(
         drain_bound,
     };
     let ready = Adopting::prepare(&scenario);
-    let report = run_prepared::<Adopting>(
+    let report = match run_prepared::<Adopting>(
         &scenario,
         ready.clone(),
         input,
         &mut MemorySink::default(),
         None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    ) {
+        Ok(report) => report,
+        Err(HarnessError::Run {
+            failure: HarnessFailure::DrainBound { .. },
+            report,
+        }) if scenario.drain_bound.is_some() => *report,
+        Err(error) => panic!("{error}"),
+    };
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let (view, seen) = ready
         .last

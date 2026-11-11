@@ -274,11 +274,31 @@ fn block_storage_histories_repeat_a_a_and_a_b_a() {
 
 /// ST4.7: a run that ends with block operations held releases them when
 /// the source drops at shutdown, and nothing from shutdown reaches the
-/// frozen log.
+/// frozen log. A violation stops the run at its last live step, before the
+/// drain could complete them.
 #[test]
 fn block_shutdown_releases_everything_and_logs_nothing() {
-    let (report, blocks) = block_run(PlanInput::Bytes(Vec::new()), 12);
-    assert_eq!(report.end.outcome, Outcome::Budget);
+    let blocks = Blocks::new();
+    let mut stop = zakura_sim::check::after_step(|cx| {
+        (cx.step == 12).then(|| zakura_sim::Violation {
+            property: "test/stop".to_owned(),
+            step: cx.step,
+            witness: vec![cx.step],
+            expected: "a stop before the drain".to_owned(),
+            actual: "step 12".to_owned(),
+        })
+    });
+    let report = run(
+        storage_config(12),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            spawn_sync(sim, &blocks);
+            let storage = BlockStorage::new(sim, blocks.service.clone());
+            sim.add_source(Box::new(storage));
+        },
+        &mut stop,
+    );
+    assert_eq!(report.end.outcome, Outcome::Violation);
     assert!(report.log.entries().iter().any(|entry| matches!(
         &entry.obs,
         Observation::Storage {

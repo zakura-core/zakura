@@ -253,15 +253,17 @@ impl AdoptionFact {
 
 /// Whether a run that ended as `end` settled: it ended with no task ready,
 /// idle with every task finished or waiting outside the scheduler, or after
-/// a drain that ran out of ready tasks. Any other end, such as a drain cut
-/// off at its bound, a violation or a harness failure, can stop a task
-/// partway through a synchronous call.
+/// a drain that ran dry. Any other end, a violation or a harness failure,
+/// a drain cut off at its bound included, can stop a task partway through a
+/// synchronous call.
 pub fn settled(end: &RunEnd) -> bool {
     match end.outcome {
         Outcome::Idle { status } => matches!(
             status,
             IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
         ),
+        // A drain cut off at its bound ends at a harness failure, so this
+        // reads only one that ran dry.
         Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
         Outcome::Violation | Outcome::Harness => false,
     }
@@ -867,10 +869,15 @@ mod tests {
             }),
             harness: None,
         };
+        // A drain cut off at its bound is a harness failure.
         let cut = RunEnd {
+            outcome: Outcome::Harness,
             drain: Some(Drain {
                 steps: 10,
                 exhausted: true,
+            }),
+            harness: Some(crate::HarnessFailure::DrainBound {
+                open: "task:reactor.1:poll#1".to_owned(),
             }),
             ..settled.clone()
         };
@@ -1077,9 +1084,14 @@ mod tests {
             cut.end(&settled);
             assert!(violates(&cut.tip(), "UnpublishedTip"), "{settled:?}");
         }
-        // A drain cut off at its bound can leave the reactor partway through
-        // the call that adopts and publishes.
-        cut.end(&run_end(Outcome::Budget, drained(true)));
+        // A drain cut off at its bound, a harness failure, can leave the
+        // reactor partway through the call that adopts and publishes.
+        cut.end(&RunEnd {
+            harness: Some(crate::HarnessFailure::DrainBound {
+                open: "task:reactor.1:poll#1".to_owned(),
+            }),
+            ..run_end(Outcome::Harness, drained(true))
+        });
         assert!(matches!(cut.tip(), Acceptance::Open(_)));
         cut.end(&run_end(
             Outcome::Idle {

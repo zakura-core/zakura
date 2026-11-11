@@ -306,14 +306,20 @@ impl Sources {
 ///    `BeforeQuiescence` obligation ([`FactAnswer::DefersTo`]). One deferred
 ///    to an instant already behind the clock expires there, before the
 ///    step's later facts.
-/// 6. When no task can run after the step, it expires every
-///    `BeforeQuiescence` obligation still open that isn't deferred.
+/// 6. When the run is quiescent after the step ([`StepCtx::quiescent`]),
+///    it expires every `BeforeQuiescence` obligation still open that isn't
+///    deferred.
 ///
-/// At the run's end, a run that ended idle expires every obligation still
-/// deferred, since nothing is left to bring the clock to its instant. The
-/// scheduler's status alone can't tell that during a step, because a
-/// source can still offer an action or a time boundary. A run cut off by
-/// its budget leaves a deferred obligation open.
+/// A run that ends idle, or whose drain runs dry, ends at a dry end: no
+/// task, source action or clock move is left that could discharge
+/// anything. There it concludes every obligation still open as violated,
+/// whatever its bound, with its witness running from its opening to the
+/// last step. A pending mark isn't convicted there. Its site's end
+/// judgment, if it has one, decides it, and otherwise `outcome` reports
+/// it. The one exception is [`Pending::UnreadBoundary`], whose boundary no
+/// later read can supply, so it fails the run as missing evidence. A run a
+/// violation or a harness failure stopped concludes nothing, and a drain
+/// cut off at its bound is a harness failure.
 ///
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
@@ -351,7 +357,7 @@ struct PropertyState<V> {
     /// Every violation, in order.
     violations: Vec<Violation>,
     /// How many of `violations`, the last ones, the run's end found: the
-    /// harness's end findings and the obligations its idle end expired.
+    /// harness's end findings and the obligations its dry end concluded.
     end_found: usize,
     /// Open obligations, oldest first.
     open: Vec<Open<V>>,
@@ -532,17 +538,15 @@ impl<S: HasView> RegistryChecker<S> {
         }
     }
 
-    /// Expires every obligation still deferred when the run went idle after
-    /// step `last`, as the type's docs describe, emitting each expiry as the
-    /// other expiry paths do. The run's end found each, so it counts among
-    /// `end_found`.
-    fn expire_deferred(&mut self, last: u64) {
+    /// Concludes the run's dry end after step `last`, as the type's docs
+    /// describe: every obligation still open expires, emitting each expiry
+    /// as the other expiry paths do, and counts among `end_found`, since the
+    /// run's end found it. A property left with an unread boundary fails the
+    /// run as missing evidence.
+    fn conclude_dry_end(&mut self, last: u64) {
         for (property, state) in self.properties.iter().zip(&mut self.state) {
-            let (expired, open) = std::mem::take(&mut state.open)
-                .into_iter()
-                .partition(|open| open.deferred.is_some());
-            state.open = open;
-            for open in expired {
+            let floor = state.holds_since.map(|(_, at)| at);
+            for open in std::mem::take(&mut state.open) {
                 self.events.push(CheckEvent::Lifecycle {
                     property: property.id.clone(),
                     to: Lifecycle::Expired,
@@ -550,7 +554,19 @@ impl<S: HasView> RegistryChecker<S> {
                 state.end_found += 1;
                 state
                     .violations
-                    .push(idle_expiry(property, &open, last, self.last_now));
+                    .push(dry_expiry(property, &open, floor, last, self.last_now));
+            }
+            if state.pending.contains(&Pending::UnreadBoundary) {
+                self.failure
+                    .get_or_insert_with(|| HarnessFailure::MissingEvidence {
+                        property: property.id.to_string(),
+                        step: last,
+                        detail: format!(
+                            "the run ran dry after step {last} with a boundary unread: the \
+                             budget's lock was held there with the reactor stopped mid-poll, \
+                             and no later read can supply it"
+                        ),
+                    });
             }
         }
     }
@@ -621,16 +637,20 @@ impl<S: HasView> Checker for RegistryChecker<S> {
         first
     }
 
-    /// Tells the harness how the run ended, then reports each property's
-    /// outcome, as `outcome` decides it. An obligation or pending mark still
-    /// open now never leaves the property `Held`. A violation that ended the
-    /// run outside the registry, such as the step loop's `sim/no-livelock`,
-    /// belongs to the registered property with its ID, and so does each of
-    /// the harness's [`HasView::end_violations`].
+    /// Tells the harness how the run ended, concludes a dry end, then
+    /// reports each property's outcome, as `outcome` decides it. An
+    /// obligation or pending mark still open now never leaves the property
+    /// `Held`. A violation that ended the run outside the registry, such as
+    /// the step loop's `sim/no-livelock`, belongs to the registered property
+    /// with its ID, and so does each of the harness's
+    /// [`HasView::end_violations`]. An unread boundary at a dry end leaves a
+    /// failure for the run's [`Checker::harness_failure`] call after this.
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         self.handle.ended(end);
-        if matches!(end.outcome, Outcome::Idle { .. }) {
-            self.expire_deferred(end.steps);
+        // Only an idle end and a drain that ran dry end with nothing left
+        // to run. A drain cut off at its bound is a harness failure.
+        if matches!(end.outcome, Outcome::Idle { .. } | Outcome::Budget) {
+            self.conclude_dry_end(end.steps);
         }
         if let Some(violation) = &end.violation {
             self.step_loop_violation(violation);
@@ -660,7 +680,8 @@ impl<S: HasView> Checker for RegistryChecker<S> {
         std::mem::take(&mut self.events)
     }
 
-    /// The first missing source, stale view, or missing evidence, once.
+    /// The first missing source, stale view, or missing evidence, once,
+    /// including an unread boundary [`Checker::at_end`] found.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         self.failure.take()
     }
@@ -908,7 +929,7 @@ fn step_property<S: HasView>(
     state.open.retain(|open| {
         let gone = open.obligation.bound == LivenessBound::BeforeQuiescence
             && open.deferred.is_none()
-            && cx.status != zakura_scheduler::Status::Running;
+            && cx.quiescent;
         if gone {
             events.push(event(Lifecycle::Expired));
             violations.push(expiry(property, open, floor, cx));
@@ -938,36 +959,20 @@ fn deadline<V>(
     origin.checked_add(within)
 }
 
-/// The violation a deferred obligation reports when the run went idle after
-/// step `last`, at `now`.
-fn idle_expiry<S: HasView>(
+/// The violation an obligation still open at the run's dry end after step
+/// `last`, at `now`, reports.
+fn dry_expiry<S: HasView>(
     property: &Property<S>,
     open: &Open<S::View>,
+    holds_since: Option<SimInstant>,
     last: u64,
     now: SimInstant,
 ) -> Violation {
-    let obligation = &open.obligation;
-    let at = open
-        .deferred
-        .expect("only a deferred obligation expires at an idle end");
-    let mut witness = obligation.witness.clone();
-    witness.push(last);
-    witness.sort_unstable();
-    witness.dedup();
-    Violation {
-        property: property.id.to_string(),
-        step: last,
-        witness,
-        expected: format!(
-            "{:?} discharged by its deferred deadline, {} ns",
-            obligation.key.subject,
-            at.since_start().as_nanos()
-        ),
-        actual: format!(
-            "the run went idle at {} ns with it still open",
-            now.since_start().as_nanos()
-        ),
-    }
+    let actual = format!(
+        "the run ran dry after step {last}, at {} ns, with it still open",
+        now.since_start().as_nanos()
+    );
+    concluded(property, open, holds_since, last, actual)
 }
 
 /// The violation an expired obligation reports.
@@ -977,46 +982,56 @@ fn expiry<S: HasView>(
     holds_since: Option<SimInstant>,
     cx: &StepCtx<'_>,
 ) -> Violation {
+    let actual = match (open.deferred, open.obligation.bound) {
+        (None, LivenessBound::BeforeQuiescence) => format!(
+            "the scheduler is {:?} after step {} with the obligation from step {} open",
+            cx.status, cx.step, open.obligation.opened_at
+        ),
+        (None, LivenessBound::Ops { .. }) => format!("still open after {}", open.ops),
+        (Some(_), _) | (None, LivenessBound::VirtualTime(_)) => {
+            format!("still open at {} ns", cx.now.since_start().as_nanos())
+        }
+    };
+    concluded(property, open, holds_since, cx.step, actual)
+}
+
+/// The violation `open` reports when it's concluded at `step`, as `actual`
+/// says: it expected its discharge within its bound, and its witness runs
+/// from its opening to `step`.
+fn concluded<S: HasView>(
+    property: &Property<S>,
+    open: &Open<S::View>,
+    holds_since: Option<SimInstant>,
+    step: u64,
+    actual: String,
+) -> Violation {
     let obligation = &open.obligation;
     let subject = &obligation.key.subject;
-    let (expected, actual) = match (open.deferred, obligation.bound) {
-        (Some(at), _) => (
-            format!(
-                "{subject:?} discharged by its deferred deadline, {} ns",
-                at.since_start().as_nanos()
-            ),
-            format!("still open at {} ns", cx.now.since_start().as_nanos()),
+    let expected = match (open.deferred, obligation.bound) {
+        (Some(at), _) => format!(
+            "{subject:?} discharged by its deferred deadline, {} ns",
+            at.since_start().as_nanos()
         ),
-        (None, LivenessBound::BeforeQuiescence) => (
-            format!("{subject:?} discharged before quiescence"),
-            format!(
-                "the scheduler is {:?} after step {} with the obligation from step {} open",
-                cx.status, cx.step, obligation.opened_at
-            ),
+        (None, LivenessBound::BeforeQuiescence) => {
+            format!("{subject:?} discharged before quiescence")
+        }
+        (None, LivenessBound::VirtualTime(within)) => format!(
+            "{subject:?} discharged by {} ns",
+            deadline(obligation, holds_since, within)
+                .map_or(u128::MAX, |at| at.since_start().as_nanos())
         ),
-        (None, LivenessBound::VirtualTime(within)) => (
-            format!(
-                "{subject:?} discharged by {} ns",
-                deadline(obligation, holds_since, within)
-                    .map_or(u128::MAX, |at| at.since_start().as_nanos())
-            ),
-            format!("still open at {} ns", cx.now.since_start().as_nanos()),
-        ),
-        (None, LivenessBound::Ops { task, op, max, .. }) => (
-            format!(
-                "{subject:?} discharged within {max} {} points of {task}",
-                op.name()
-            ),
-            format!("still open after {}", open.ops),
+        (None, LivenessBound::Ops { task, op, max, .. }) => format!(
+            "{subject:?} discharged within {max} {} points of {task}",
+            op.name()
         ),
     };
     let mut witness = obligation.witness.clone();
-    witness.push(cx.step);
+    witness.push(step);
     witness.sort_unstable();
     witness.dedup();
     Violation {
         property: property.id.to_string(),
-        step: cx.step,
+        step,
         witness,
         expected,
         actual,
@@ -1037,10 +1052,14 @@ fn expiry<S: HasView>(
 /// 6. a pending mark left gives `NodeStopped` for a [`Pending::WatchOpen`]
 ///    the stopping exempted, and `Unsettled` with its site otherwise, the
 ///    first in [`Pending`]'s order;
-/// 7. an obligation still open gives `ObligationOpen`;
-/// 8. an assumption lost, with no evaluation applied, gives
+/// 7. an assumption lost, with no evaluation applied, gives
 ///    `AssumptionLost`;
-/// 9. otherwise `Held` if an evaluation applied, else `NeverApplied`.
+/// 8. otherwise `Held` if an evaluation applied, else `NeverApplied`.
+///
+/// No obligation survives to it open but at a violation's stop (rule 5) or
+/// a harness end (rule 3): a dry end concludes every open one
+/// ([`Checker::at_end`]), and a drain cut off at its bound is a harness
+/// failure.
 ///
 /// [`leading_outcome`] holds rules 1 to 3, which the harness-end trim
 /// reapplies ([`PropertyReport::after_harness_failure`]).
@@ -1066,8 +1085,6 @@ fn outcome<S: HasView>(
             Pending::WatchOpen if stopping => NaReason::NodeStopped,
             site => NaReason::Unsettled { site },
         }
-    } else if !state.open.is_empty() {
-        NaReason::ObligationOpen
     } else if state.assumption_lost && state.applicable == 0 {
         NaReason::AssumptionLost
     } else if state.applicable > 0 {
@@ -1139,13 +1156,14 @@ mod tests {
         Mark(Pending),
         /// A `WatchOpen` mark with the harness stopping the node (rule 6).
         WatchStopping,
-        /// An open obligation (rules 5 and 7).
+        /// An open obligation (rule 5). Only a violation's stop and a
+        /// harness end leave one open.
         Open,
-        /// A deferred obligation (rules 5 and 7).
+        /// A deferred obligation (rule 5), as `Open`.
         Deferred,
-        /// An assumption lost while an obligation was open (rule 8).
+        /// An assumption lost while an obligation was open (rule 7).
         Lost,
-        /// An evaluation applied (rules 8 and 9).
+        /// An evaluation applied (rules 7 and 8).
         Applied,
     }
 
@@ -1246,8 +1264,6 @@ mod tests {
             ),
             (&[Mark(Pending::WatchOpen)], unsettled(Pending::WatchOpen)),
             (&[WatchStopping], na(NaReason::NodeStopped)),
-            (&[Open], na(NaReason::ObligationOpen)),
-            (&[Deferred], na(NaReason::ObligationOpen)),
             (&[Lost], na(NaReason::AssumptionLost)),
             (&[Applied], held.clone()),
             // Rule 1 beside every other.
@@ -1320,10 +1336,6 @@ mod tests {
                 unsettled(Pending::TeardownOpen),
             ),
             (
-                &[Mark(Pending::UnreadBoundary), Open],
-                unsettled(Pending::UnreadBoundary),
-            ),
-            (
                 &[Mark(Pending::FaultOpen), Lost],
                 unsettled(Pending::FaultOpen),
             ),
@@ -1331,14 +1343,9 @@ mod tests {
                 &[Mark(Pending::WatchOpen), Applied],
                 unsettled(Pending::WatchOpen),
             ),
-            (&[WatchStopping, Open], na(NaReason::NodeStopped)),
             (&[WatchStopping, Lost], na(NaReason::NodeStopped)),
             (&[WatchStopping, Applied], na(NaReason::NodeStopped)),
-            // Rule 7 beside the rules after it.
-            (&[Open, Lost], na(NaReason::ObligationOpen)),
-            (&[Open, Applied], na(NaReason::ObligationOpen)),
-            (&[Deferred, Applied], na(NaReason::ObligationOpen)),
-            // Rule 8 needs no evaluation applied.
+            // Rule 7 needs no evaluation applied.
             (&[Lost, Applied], held.clone()),
         ];
         for (facts, expected) in rows {

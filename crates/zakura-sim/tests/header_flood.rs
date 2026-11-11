@@ -12,6 +12,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use zakura_network::zakura::observe::{EventQueue, TakePoint};
 use zakura_sim::{
+    check::Phase,
     harness::{
         header_node::{
             adoption::AdoptionFact, fault::CooldownFact, Chain, ControlAction, ControlStep, Policy,
@@ -22,8 +23,8 @@ use zakura_sim::{
         },
         run_prepared, Subsystem,
     },
-    property::{EndViolation, HasView, Property, Sources},
-    MemorySink, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
+    property::{Assumptions, EndViolation, HasView, Property, Registry, RegistryChecker, Sources},
+    MemorySink, ObservationLog, Outcome, Plan, PlanInput, RunConfig, RunEnd, RunReport, Sim,
 };
 
 /// The live steps a run may take. 16 flooding or churning mirrors take
@@ -341,6 +342,74 @@ fn a_wire_flood_keeps_the_events_queue_loaded() {
             .count();
         assert!(admitted >= 2 * FLOODERS, "{cooldowns:?}");
     }
+}
+
+/// `scenario` cut after `budget` live steps, under the empty Plan, through
+/// the storage harness with its properties.
+fn cut(scenario: &StorageScenario, budget: u64) -> RunReport {
+    let config = RunConfig {
+        budget,
+        ..storage_config()
+    };
+    let mut sim = Sim::new(config, Plan::from_fuzz(&[]));
+    let storage = Rc::new(Storage::build(
+        &mut sim,
+        scenario,
+        Storage::prepare(scenario),
+    ));
+    let registry = Registry::new(storage_properties()).expect("the storage IDs are unique");
+    let mut checker = RegistryChecker::new(
+        registry,
+        Rc::clone(&storage),
+        Assumptions::none(),
+        &storage_sources(),
+    );
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    drop((checker, storage));
+    report
+}
+
+/// The drain picks of `report` that run a flood task.
+fn flood_picks(report: &RunReport) -> usize {
+    report
+        .picks
+        .iter()
+        .filter(|pick| pick.phase == Phase::Drain && pick.identity.contains("flood"))
+        .count()
+}
+
+/// E1's generator retirement: 16 floods still sending when the budget cuts
+/// the run are cancelled at the drain's start, without closing their
+/// links, so the drain runs dry rather than flooding to its bound.
+#[test]
+fn a_flood_cut_by_the_budget_drains_dry() {
+    let report = cut(&flooded(ControlAction::Flood), BUDGET);
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert!(flood_picks(&report) > 0, "each flood woke to stop");
+}
+
+/// A cut right after a `Flood` pick leaves the control task to start the
+/// flood in the drain. The flood registers after the generators retired,
+/// so it's cancelled at once and never floods, and the drain runs dry.
+#[test]
+fn a_flood_picked_at_the_budget_is_cancelled_at_once() {
+    let scenario = scenario(vec![step("mirror-0", ControlAction::Flood)]);
+    let full = cut(&scenario, BUDGET);
+    let picked = full
+        .picks
+        .iter()
+        .find(|pick| pick.identity == "peer:mirror-0:flood")
+        .map(|pick| pick.step)
+        .expect("the run picks the flood");
+    let report = cut(&scenario, picked);
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert!(
+        flood_picks(&report) < 8,
+        "the flood stopped at once: {}",
+        flood_picks(&report)
+    );
 }
 
 /// Under 16 `Churn` steps, once the lifecycle queue fills, each turn's

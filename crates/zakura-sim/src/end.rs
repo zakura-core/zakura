@@ -93,6 +93,15 @@ pub enum HarnessFailure {
         /// `BoundarySkipped`.
         detail: String,
     },
+    /// The drain reached its step bound with work still enabled, a time
+    /// advance included, so it never reached a dry end that could judge
+    /// what was open. That covers a node task that spins with nothing open,
+    /// which `sim/no-livelock` doesn't check in the drain.
+    DrainBound {
+        /// The first open check, as `<property> <subject>`, or else the first
+        /// enabled action: a ready task, a recovery action or the advance.
+        open: String,
+    },
     /// A tapped reactor caught one of its port calls panicking, which no
     /// run expects. It outranks any evidence failure of the same step,
     /// since the panic leaves the call's storage receipt unpaired.
@@ -167,6 +176,12 @@ impl fmt::Display for HarnessFailure {
             HarnessFailure::SourceEvidence { source, detail } => {
                 write!(f, "{source}'s evidence failed: {detail}")
             }
+            HarnessFailure::DrainBound { open } => {
+                write!(
+                    f,
+                    "drain-bound: the drain reached its step bound with {open} unfinished"
+                )
+            }
             HarnessFailure::ReactorPortPanicked { source, call } => {
                 write!(f, "{source}'s port call {call} panicked")
             }
@@ -193,9 +208,12 @@ pub enum IdleStatus {
 pub enum Outcome {
     /// A property was violated.
     Violation,
-    /// The step budget ran out, and the drain followed.
+    /// The live phase ended, at its step budget or idle with work the drain
+    /// could still resolve, and the drain followed and ran dry. A drain cut
+    /// off at its bound is [`HarnessFailure::DrainBound`] instead.
     Budget,
-    /// Nothing was enabled.
+    /// Nothing was enabled in the live phase, and nothing was left for the
+    /// drain to resolve.
     Idle {
         /// What the scheduler reported.
         status: IdleStatus,
@@ -210,7 +228,8 @@ pub enum Outcome {
 pub struct Drain {
     /// Steps the drain took.
     pub steps: u64,
-    /// True if it stopped at its bound with tasks still ready.
+    /// True if it stopped at its bound with work still enabled, which ends
+    /// the run at [`HarnessFailure::DrainBound`].
     pub exhausted: bool,
 }
 

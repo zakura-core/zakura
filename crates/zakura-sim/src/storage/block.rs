@@ -628,7 +628,7 @@ mod tests {
 
     use zakura_storage::block::controlled::OpId;
 
-    use super::{code, decode, outcome, CODES};
+    use super::{code, decode, outcome, succeeds, CODES};
 
     /// Every outcome the contract lists has its own code, which decodes
     /// back to it.
@@ -650,6 +650,24 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes, (0..18).collect::<Vec<_>>(), "every code is in use");
+    }
+
+    /// The drain's success rule: an answer, admission, applied record,
+    /// served read or commit, and a duplicate only where no commit is
+    /// legal. A failure or a retryable verdict is never a success.
+    #[test]
+    fn a_duplicate_succeeds_only_where_a_commit_is_illegal() {
+        let (committed, duplicate) = (
+            outcome(6).expect("code 6 is a commit"),
+            outcome(7).expect("code 7 is a duplicate"),
+        );
+        assert!(succeeds(&[committed, duplicate], committed));
+        assert!(!succeeds(&[committed, duplicate], duplicate));
+        assert!(succeeds(&[duplicate], duplicate));
+        let retryable = outcome(12).expect("code 12 is retryable");
+        assert!(!succeeds(&[retryable], retryable));
+        let fail = outcome(1).expect("code 1 is a failure");
+        assert!(!succeeds(&[fail], fail));
     }
 
     /// Each outcome's name in its action identity, by code. A renamed

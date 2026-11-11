@@ -687,9 +687,9 @@ fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
     assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
 }
 
-/// A stop cut off at the drain bound is the teardown property's to report,
-/// but a tap with no property reading its settlement still fails it as
-/// `ShutdownIncomplete`, so the unfinished stop never ends silently.
+/// A stop cut off at the drain bound fails the run as `DrainBound`, which
+/// names the task still running, so the unfinished stop never ends
+/// silently, whether or not a property reads its settlement.
 #[test]
 fn a_cut_off_stop_with_no_property_still_fails() {
     let config = zakura_sim::RunConfig {
@@ -711,8 +711,15 @@ fn a_cut_off_stop_with_no_property_still_fails() {
     });
     // The reactor yields forever, so the drain runs to its bound.
     let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
-    let detail = evidence_failure(&report);
-    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+    assert!(
+        matches!(
+            &report.end.harness,
+            Some(zakura_sim::HarnessFailure::DrainBound { open })
+                if open.starts_with("task:reactor.1:")
+        ),
+        "{:?}",
+        report.end
+    );
 }
 
 /// The scheduler reports how a task ended, a panic included, to the tap,
@@ -1230,7 +1237,8 @@ fn an_observer_panic_ends_the_run_reactor_gone() {
 /// A hold on the node's applies until `Handled` opens once its reactor has
 /// handled its first prepare, so the tap's events reach the policy's
 /// predicates. Held until a VCT context call it never makes, no apply
-/// completes.
+/// completes in the live phase. Only the drain, which retires the hold,
+/// completes them.
 #[test]
 fn a_hold_waits_for_the_reactor_to_handle_a_call() {
     let fixture = HeaderFixture::regtest();
@@ -1271,8 +1279,37 @@ fn a_hold_waits_for_the_reactor_to_handle_a_call() {
             kind: Some(OpKind::VctContext),
             ..Select::default()
         }))]);
-        let (_, node) = storage_run(&scenario, input);
-        assert_ne!(node.engine().snapshot().frontiers.header_best, a5);
+        let (report, _) = storage_run(&scenario, input);
+        let applies: Vec<u64> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Storage {
+                    fact:
+                        StorageFact::Submitted {
+                            id,
+                            request: StorageRequest::ApplyHeaderTarget { .. },
+                            ..
+                        },
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert!(!applies.is_empty(), "the node applies");
+        let live_completions: Vec<&str> = report
+            .picks
+            .iter()
+            .filter(|pick| pick.phase == zakura_sim::check::Phase::Live)
+            .map(|pick| pick.identity.as_str())
+            .filter(|pick| {
+                applies
+                    .iter()
+                    .any(|id| pick.starts_with(&format!("storage:header:{id}:")))
+            })
+            .collect();
+        assert_eq!(live_completions, Vec::<&str>::new());
     }
 }
 

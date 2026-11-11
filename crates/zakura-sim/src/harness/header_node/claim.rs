@@ -179,7 +179,8 @@ impl SettlementEvidence {
     }
 
     /// Notes how the run ended: at rest when it went idle or its drain ran
-    /// dry, and not when its drain was cut off at its bound.
+    /// dry, and not at a violation or a harness failure, a drain cut off at
+    /// its bound included.
     pub(crate) fn end(&self, end: &RunEnd) {
         let at_rest = match end.outcome {
             Outcome::Idle { .. } => true,
@@ -202,18 +203,6 @@ impl SettlementEvidence {
                     *read = true;
                     *row
                 })
-        })
-    }
-
-    /// Whether a property read the drain of `step`'s settlement.
-    pub(super) fn read_at(&self, step: u64) -> bool {
-        self.with(|store| {
-            store
-                .rows
-                .iter()
-                .rev()
-                .find(|(row, _)| row.step == step)
-                .is_some_and(|(_, read)| *read)
         })
     }
 

@@ -3311,18 +3311,17 @@ fn the_not_applicable_inventory_lists_every_reason() {
         | NaReason::StoppedByViolation
         | NaReason::HarnessFailed
         | NaReason::NodeStopped
-        | NaReason::ObligationOpen
         | NaReason::Unsettled {
             site:
                 Pending::FaultOpen
-                | Pending::UnreadBoundary
                 | Pending::TeardownOpen
                 | Pending::WatchOpen
                 | Pending::UnreadTrigger
                 | Pending::UnjudgedDeparture,
         } => true,
+        // A dry end turns an unread boundary into missing evidence.
         NaReason::Unsettled {
-            site: Pending::BlockTeardownOpen,
+            site: Pending::UnreadBoundary | Pending::BlockTeardownOpen,
         } => false,
     };
     let listed: Vec<NaReason> = NA_REASONS.iter().map(|entry| entry.reason).collect();
@@ -3353,7 +3352,6 @@ fn the_not_applicable_inventory_lists_every_reason() {
         NaReason::StoppedByViolation,
         NaReason::HarnessFailed,
         NaReason::NodeStopped,
-        NaReason::ObligationOpen,
     ]
     .into_iter()
     .chain(sites.map(|site| NaReason::Unsettled { site }))
@@ -4018,7 +4016,7 @@ fn the_evaluator_accepts_genuine_results() {
     caught_runs(&mut pending, CASE)
         .1
         .reports
-        .insert("t/b".into(), na("obligation-open"));
+        .insert("t/b".into(), na("stopped-by-violation"));
     assert_eq!(
         state(&manifest, &pending, &Key::catch("t/a")),
         ObligationState::Verified
@@ -4264,7 +4262,7 @@ fn the_evaluator_refuses_each_single_defect() {
         caught_runs(r, CASE)
             .2
             .reports
-            .insert("t/b".into(), na("obligation-open"));
+            .insert("t/b".into(), na("stopped-by-violation"));
     });
     refused(&catch, |r| {
         caught_runs(r, CASE)
@@ -5134,7 +5132,7 @@ fn the_evaluator_binds_runners_and_traces() {
         caught_runs(r, END_CASE)
             .1
             .reports
-            .insert("t/b".into(), na("obligation-open"));
+            .insert("t/b".into(), na("stopped-by-violation"));
     });
     refused(&late, |r| {
         caught_runs(r, END_CASE)

@@ -1751,18 +1751,27 @@ mod tests {
         );
     }
 
-    /// A run that ends at an unread boundary mid-poll is unsettled there.
+    /// D4 site 2: a run whose dry end comes at an unread boundary mid-poll
+    /// can never read it, so the run fails as missing evidence, never a
+    /// verdict, and the property is `HarnessFailed`.
     #[test]
-    fn a_run_ending_unread_mid_poll_is_unsettled() {
+    fn a_run_ending_unread_mid_poll_is_missing_evidence() {
         let report = run(&[
             Scripted::Read(10),
             Scripted::Unread(BoundaryRead::UnreadMidPoll),
         ]);
+        assert!(
+            matches!(
+                &report.end.harness,
+                Some(HarnessFailure::MissingEvidence { property, step: 2, .. })
+                    if property == CHUNK_BUDGET_BOUND
+            ),
+            "{:?}",
+            report.end
+        );
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::not_applicable(NaReason::Unsettled {
-                site: Pending::UnreadBoundary
-            })
+            PropertyOutcome::not_applicable(NaReason::HarnessFailed)
         );
     }
 

@@ -343,6 +343,7 @@ fn run_checked(
             phase: Phase::Live,
             now: SimInstant::ZERO,
             status: SchedulerStatus::Quiescent,
+            quiescent: true,
             log: &log,
         };
         end.violation = checker.after_step(&cx);
@@ -376,8 +377,16 @@ fn run_checked(
         }
     };
     let mut properties = checker.at_end(&end, &log);
+    // A failure either checker found at the end fails a run that didn't
+    // already fail, the registry's first, as in `Sim::run`.
+    let mut late = checker.harness_failure();
     if let Some(extra) = extra {
         properties.extend(extra.at_end(&end, &log));
+        late = late.or_else(|| extra.harness_failure());
+    }
+    if let (None, Some(failure)) = (&end.harness, late) {
+        end.harness = Some(failure);
+        end.outcome = Outcome::Harness;
     }
     // As in `Sim::run`: a harness failure leaves no property held, since the
     // run's evidence may be incomplete, and trims each report's end findings.

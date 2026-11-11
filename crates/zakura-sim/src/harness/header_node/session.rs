@@ -346,9 +346,10 @@ impl SessionEvidence {
 
     /// Records whether the run ended idle: with every task finished or
     /// waiting outside the scheduler, and nothing enabled. Nothing can
-    /// retire a session after that. A drain after the budget runs only
-    /// ready tasks and fires no timer, so a session whose retirement waits
-    /// on one could still retire, and that end doesn't count.
+    /// retire a session after that. A drain fires a timer alone only within
+    /// the harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so
+    /// a dry drain can leave a later timer pending, and a session whose
+    /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
         self.ledger().idle = Some(matches!(
             end.outcome,

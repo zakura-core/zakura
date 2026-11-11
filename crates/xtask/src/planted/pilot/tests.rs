@@ -254,7 +254,6 @@ fn sensitivity_classifies_each_not_applicable_reason() {
         (r#""stopped-by-violation""#, Class::HarnessFailure),
         (r#""harness-failed""#, Class::HarnessFailure),
         (r#""node-stopped""#, Class::HarnessFailure),
-        (r#""obligation-open""#, Class::HarnessFailure),
         (
             r#"{"unsettled":{"site":"watch-open"}}"#,
             Class::HarnessFailure,

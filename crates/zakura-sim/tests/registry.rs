@@ -283,8 +283,8 @@ impl Checker for Recorder {
 
 const TWO_SECONDS: LivenessBound = LivenessBound::VirtualTime(Duration::from_secs(2));
 
-/// P1.1: a discharged, an expired, and an open obligation give `Held`,
-/// `Violated`, and `NotApplicable` with the obligation open.
+/// P1.1: a discharged obligation gives `Held`, and an expired one
+/// `Violated`, live or after the drain moves the clock to its deadline.
 #[test]
 fn obligations_discharge_expire_and_stay_open() {
     let served_after = |serve: Option<Duration>| {
@@ -332,12 +332,21 @@ fn obligations_discharge_expire_and_stay_open() {
         }
     );
 
-    // The run goes idle at 0 s with the 2 s deadline still ahead.
+    // The live phase goes idle at 0 s with the 2 s deadline still ahead,
+    // and no source offers a boundary. The open check sends the run into
+    // the drain, whose clock moves just past the deadline and convicts it.
     let open = served_after(None);
+    assert_eq!(open.end.outcome, Outcome::Violation, "{:?}", open.end);
+    let violation = open.end.violation.as_ref().expect("it violated");
+    assert_eq!(violation.property, SERVED.as_str());
+    let last = picks(&open);
+    assert_eq!(last.last().copied(), Some("advance-time:2000000001"));
     assert_eq!(
-        outcome(&open, &SERVED),
-        not_applicable(NaReason::ObligationOpen)
+        open.picks.last().map(|pick| pick.phase),
+        Some(zakura_sim::check::Phase::Drain)
     );
+    let request = exit_step(&open.log, "request-p1.1");
+    assert_eq!(violation.witness, vec![request, violation.step]);
 }
 
 /// P1.1, review P-03: two owners' obligations and one completion. The
@@ -467,9 +476,9 @@ fn handler(sim: &mut Sim, ops: usize) {
 /// P1.1, review P-01: the first completion wakes the handler. The enabled set
 /// at that step didn't have the handler in it, but the scheduler's status
 /// after the step is `Running`, so the obligation stays open until the
-/// handler exits. A handler that waits again instead leaves no task able to
-/// run, and the property fails at that step, before the second completion
-/// can repair it.
+/// handler exits. A handler that waits again isn't quiescent either while
+/// the second completion is still enabled ([`StepCtx::quiescent`]): that
+/// completion wakes it, and its exit discharges the obligation.
 #[test]
 fn before_quiescence_reads_post_step_status() {
     let woken = report(
@@ -489,24 +498,16 @@ fn before_quiescence_reads_post_step_status() {
         Assumptions::none(),
         |sim| handler(sim, 2),
     );
-    assert_eq!(parked.end.outcome, Outcome::Violation);
-    let violation = parked.end.violation.as_ref().expect("it violated");
+    assert_eq!(
+        outcome(&parked, &HANDLED),
+        PropertyOutcome::Held { applicable: 1 }
+    );
     let picks = picks(&parked);
-    let step = usize::try_from(violation.step).expect("a small step");
     assert!(
-        picks[step - 1].starts_with("task:handler.1:"),
-        "the violation is at the handler's step: {picks:?}"
-    );
-    assert!(
-        picks[step - 2].starts_with("storage:store:1:"),
-        "right after the completion that woke it: {picks:?}"
-    );
-    assert_eq!(picks.len(), step, "the run ended at that step");
-    assert!(
-        !picks
+        picks
             .iter()
             .any(|pick| pick.starts_with("storage:store:2:")),
-        "the second completion never ran: {picks:?}"
+        "the second completion ran: {picks:?}"
     );
 }
 

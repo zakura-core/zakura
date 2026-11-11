@@ -9,8 +9,8 @@ use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{self, discovery::WaitComplete, Subsystem},
     property::{
-        HasView, Kind, LivenessBound, Property, PropertyId, Source, Sources, Status, Subject,
-        TriggerHistory, Verdict,
+        HasView, Kind, Pending, Property, PropertyId, Source, Sources, Status, TriggerHistory,
+        Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig,
@@ -130,17 +130,17 @@ fn unregistered_property_fails() {
 enum Behavior {
     /// Sleeps 1 ms at a time until the budget ends the run.
     Sleep,
-    /// Sleeps as [`Behavior::Sleep`] does, and [`OPEN`] opens its
-    /// obligation, which never closes.
+    /// Sleeps three times as [`Behavior::Sleep`] does, then waits forever,
+    /// and [`OPEN`] marks its check pending, which nothing settles.
     Owe,
     /// Panics on its first poll.
     Panic,
 }
 
 /// One task, checked by properties whose verdicts don't depend on it: one
-/// that holds, a `Known` one that holds, one whose obligation never closes
-/// under [`Behavior::Owe`], one with no trigger-history check, and two that
-/// share an ID-aware one. Its view is whether the scenario owes.
+/// that holds, a `Known` one that holds, one that never settles under
+/// [`Behavior::Owe`], one with no trigger-history check, and two that share
+/// an ID-aware one. Its view is whether the scenario owes.
 struct Probe {
     owes: bool,
 }
@@ -170,10 +170,13 @@ impl Subsystem for Probe {
     type Scenario = Behavior;
     type Prepared = ();
 
+    /// No harness timer cap, so the drain doesn't follow the sleeper's
+    /// timers once nothing is open.
     fn config(_: &Behavior) -> RunConfig {
         RunConfig {
             budget: 50,
             drain_bound: 10,
+            harness_timer_cap: Duration::ZERO,
             ..RunConfig::default()
         }
     }
@@ -185,9 +188,15 @@ impl Subsystem for Probe {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {
-                Behavior::Sleep | Behavior::Owe => loop {
+                Behavior::Sleep => loop {
                     sleep(Duration::from_millis(1)).await;
                 },
+                Behavior::Owe => {
+                    for _ in 0..3 {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                    std::future::pending::<()>().await;
+                }
                 Behavior::Panic => panic!("the probe panics"),
             }
         });
@@ -217,21 +226,16 @@ impl Subsystem for Probe {
             holds(KNOWN, Status::Known { issue: 1 }),
             Property {
                 id: PropertyId::new(OPEN),
-                claim: "an hour-long obligation never closes",
-                kind: Kind::Liveness {
-                    bound: LivenessBound::VirtualTime(Duration::from_secs(3_600)),
-                },
+                claim: "a check that never settles",
+                kind: Kind::Safety,
                 assumes: &[],
                 needs: &[Source::Schedule, Source::View],
                 status: Status::Active,
                 check: |cx| {
-                    if !cx.view() {
-                        return Verdict::NotApplicable;
+                    if cx.view() {
+                        cx.pending(Pending::WatchOpen);
                     }
-                    let obligation =
-                        cx.obligation(None, Subject::Owner("probe".into()), |_, _| false);
-                    cx.oblige(obligation);
-                    Verdict::Holds
+                    Verdict::NotApplicable
                 },
                 witness: Some(TriggerHistory::Log(any_step)),
             },
@@ -295,7 +299,7 @@ fn a_trigger_sees_its_property_id() {
     );
 }
 
-/// A run that ends with the property's obligation still open is
+/// A run that ends with the property's check still pending is
 /// `NotApplicable` with incomplete observations, which no expectation
 /// accepts.
 #[test]
@@ -322,7 +326,9 @@ fn holds_refuses_an_unrelated_incomplete() {
         witness(probe(Behavior::Owe), HOLDS, Expect::Holds),
         Err(WitnessError::UnrelatedIncomplete {
             property: OPEN.to_owned(),
-            reason: NaReason::ObligationOpen,
+            reason: NaReason::Unsettled {
+                site: Pending::WatchOpen
+            },
         })
     );
     check_witness(probe(Behavior::Owe), HOLDS, Expect::Applicable);

@@ -1925,10 +1925,10 @@ mod tests {
         );
     }
 
-    /// A record still queued when the run ends at its budget fails it too:
-    /// the log freezes before the record can be placed. So does a placed
-    /// frame the evidence still holds back, such as a discovery request
-    /// waiting for the node's count.
+    /// A record still queued when the run ends after its budget and a dry
+    /// drain fails it too: the log freezes before the record can be placed.
+    /// So does a placed frame the evidence still holds back, such as a
+    /// discovery request waiting for the node's count.
     #[test]
     fn evidence_still_unlogged_at_the_budget_fails_the_run() {
         let mut sim = Sim::new(
@@ -1947,8 +1947,9 @@ mod tests {
             SharedIds::default(),
         );
         sim.add_source(Box::new(control));
+        // Busy past the budget, then done, so the drain runs dry.
         sim.scheduler().spawn_root("spin", async {
-            loop {
+            for _ in 0..20 {
                 zakura_rt::task::yield_now().await;
             }
         });

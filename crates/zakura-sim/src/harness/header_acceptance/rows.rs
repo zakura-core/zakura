@@ -376,6 +376,25 @@ const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
     case: "header-authority-forks-sharing-a-header",
 };
 
+/// Each committed repair input, as its witness test names its execution.
+const REPAIR_OUTSTANDING_CASES: [&str; 4] = [
+    "committed header-repair-applied input",
+    "committed header-repair-prepare-departs input",
+    "committed header-repair-apply-departs input",
+    "committed header-repair-supplier-pruned input",
+];
+
+/// The committed repair inputs, each holding and applying
+/// `outstanding-work-bounded` under its committed Plan.
+const REPAIR_OUTSTANDING: HistoryRef = HistoryRef {
+    harness: REPAIR,
+    witness: sim_test(
+        "tests/header_repair.rs",
+        "the_committed_repair_inputs_hold_outstanding_work_bounded",
+    ),
+    case: "committed header-repair-applied input",
+};
+
 /// Each committed hold-release fixture, by its fixture stem, which its
 /// witness test runs under the fixed Plan.
 const HOLD_CASES: [&str; 4] = [
@@ -754,6 +773,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             HistoryRef {
                 case,
                 ..OUTSTANDING_WITNESSES
+            },
+            OUTSTANDING,
+        ));
+    }
+    for case in REPAIR_OUTSTANDING_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..REPAIR_OUTSTANDING
             },
             OUTSTANDING,
         ));
@@ -1778,6 +1806,12 @@ fn hand_written_rows() -> Vec<Row> {
         (
             "deadline-kept",
             STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "departed-source-unpruned",
+            REPAIR,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,
         ),

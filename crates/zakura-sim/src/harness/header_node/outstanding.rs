@@ -135,28 +135,58 @@
 //!   engine's headers above the anchor, and a check that took an unknown
 //!   target as known breaks.
 //!
-//! Two rows are listed and not checked: the VCT repair requirement's source
-//! entries and its open context reads. No storage fixture reaches a repair
-//! episode, and `Sizes` reports the source sets only as one sum, so their
-//! per-set bound has no fact to judge. Cooldowns are capped by #2131, and
-//! the pruned-peer map by #2209, each at the admitted peer limit.
+//! - VCT repair sources (#2298): the repair requirement's departed
+//!   suppliers stay within the departed limit, restated here as the
+//!   configured `max_inbound_peers + max_outbound_peers` the reactor prunes
+//!   them to, and none is an admitted peer's source. Every key of its
+//!   tried, excluded-input, busy and target-refusal sets is an admitted
+//!   peer's source or a departed one, so each set stays within the
+//!   admitted peers plus the departed limit. A source is its peer's
+//!   digest, as production derives it. Whether a supplier earned its entry,
+//!   or how long its hold lasts, is the repair policy's, not judged here.
+//! - VCT repair context reads (#2298): by `Dispatched` and `CallEnded`,
+//!   at most one open per repair owner, and, while the reactor runs, none
+//!   still open, or ending, past the reactor's 30 s request timeout after
+//!   its dispatch, in virtual time. A reactor whose VCT local operation
+//!   passed its fatal deadline stops polling its calls and only waits for
+//!   shutdown, so a read its shutdown unit still holds, or its teardown
+//!   drops, isn't judged by age.
+//!   The port times each read out at that timeout, and a requirement asks
+//!   again only once its read is answered or past that deadline. A
+//!   replaced episode's read can still be open beside its successor's,
+//!   under another owner. An episode is replaced when storage publishes a
+//!   new repair status, or when the node adopts committed state that moves
+//!   the repair's generation or branch, and production caps neither that
+//!   rate nor the node-wide count. So the node-wide count is listed, not
+//!   checked, beyond these two rules.
+//!
+//! Cooldowns are capped by #2131, and the pruned-peer map by #2209, each at
+//! the admitted peer limit.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use zakura_chain::block;
-use zakura_header_chain::{BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner};
+use zakura_header_chain::{
+    BodyWorkOwner, BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner, SourceId,
+};
 use zakura_network::zakura::{
     observe::{
-        HeaderRequestTerminal, HeaderTargetPhase, PortCall, PublicationChange, PublisherSite,
-        ReactorCause, ReactorEvent, ReactorSizes, ServeInUse, StorageCallKind, SubscriberChange,
-        WorkSlot,
+        CallEnd, HeaderRequestTerminal, HeaderTargetPhase, PortCall, PublicationChange,
+        PublisherSite, ReactorCause, ReactorEvent, ReactorSizes, RepairSources, ServeInUse,
+        StorageCallKind, SubscriberChange, WorkSlot,
     },
     ZakuraPeerId,
 };
 use zakura_rt::sync::CancellationToken;
+
+/// The reactor's request timeout, `HeaderSyncStartup`'s 30 s default, which
+/// the storage harness keeps. The port times each VCT repair context read
+/// out at it.
+pub const REPAIR_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The queue's slot limit, `MAX_STAGED_TARGETS_V1`.
 pub const MAX_STAGED_TARGETS: usize = 16;
@@ -309,13 +339,16 @@ impl std::fmt::Debug for HeldHeaders {
 }
 
 /// A dispatched call that hasn't ended: what it asks for, and for which
-/// peer when it's a locator read.
+/// peer when it's a locator read or which owner when it's a repair context
+/// read.
 #[derive(Clone, Debug)]
 enum Open {
     Locator(ZakuraPeerId),
+    /// A repair context read, with its owner and the virtual time it was
+    /// dispatched at, when the run had a clock.
+    VctContext(BodyWorkOwner, Option<Duration>),
     Prepare,
     Apply,
-    Other,
 }
 
 /// The rule's state: what the reactor's facts say it should hold, and the
@@ -325,6 +358,11 @@ pub(super) struct Outstanding {
     evidence: OutstandingEvidence,
     /// The admitted peer limit the harness configured.
     peer_limit: usize,
+    /// The departed VCT repair suppliers the reactor keeps history for.
+    departed_limit: usize,
+    /// The virtual time the facts being observed came at, since the run's
+    /// start, when the run has a clock.
+    now: Option<Duration>,
     /// Each admitted peer's current session.
     admitted: HashMap<ZakuraPeerId, u64>,
     /// Each dispatched call with no `CallEnded`.
@@ -389,13 +427,21 @@ pub(super) struct Outstanding {
 }
 
 impl Outstanding {
-    /// The rule for a node whose admitted peer limit is `peer_limit`,
-    /// keeping its peaks in `evidence` and reading its engine's headers
-    /// with `held`.
-    pub(super) fn new(evidence: OutstandingEvidence, peer_limit: usize, held: HeldHeaders) -> Self {
+    /// The rule for a node whose admitted peer limit is `peer_limit` and
+    /// that keeps history for at most `departed_limit` departed VCT repair
+    /// suppliers, keeping its peaks in `evidence` and reading its engine's
+    /// headers with `held`.
+    pub(super) fn new(
+        evidence: OutstandingEvidence,
+        peer_limit: usize,
+        departed_limit: usize,
+        held: HeldHeaders,
+    ) -> Self {
         Outstanding {
             evidence,
             peer_limit,
+            departed_limit,
+            now: None,
             admitted: HashMap::new(),
             calls: HashMap::new(),
             holding: HashMap::new(),
@@ -664,14 +710,19 @@ impl Outstanding {
             ReactorEvent::Dispatched { call, op } => {
                 let open = match op {
                     PortCall::Locator { peer, .. } => Open::Locator(peer.clone()),
+                    PortCall::VctContext { owner, .. } => Open::VctContext(*owner, self.now),
                     PortCall::Prepare { .. } => Open::Prepare,
                     PortCall::Apply { .. } => Open::Apply,
-                    _ => Open::Other,
                 };
                 self.calls.insert(*call, open);
             }
-            ReactorEvent::CallEnded { call, .. } => {
-                self.calls.remove(call);
+            ReactorEvent::CallEnded { call, end } => {
+                let open = self.calls.remove(call);
+                if let (Some(Open::VctContext(owner, dispatched)), false) =
+                    (open, *end == CallEnd::Dropped)
+                {
+                    self.context_read_ended(owner, dispatched);
+                }
             }
             ReactorEvent::Started { request, .. } => {
                 self.rounds
@@ -962,6 +1013,113 @@ impl Outstanding {
         });
     }
 
+    /// Breaks if a repair context read for `owner`, dispatched at
+    /// `dispatched`, ends now, past the request timeout, which a `Sizes`
+    /// report between its dispatch and its end might not have seen.
+    fn context_read_ended(&mut self, owner: BodyWorkOwner, dispatched: Option<Duration>) {
+        if let Some(age) = self
+            .now
+            .zip(dispatched)
+            .map(|(now, at)| now.saturating_sub(at))
+            .filter(|age| *age > REPAIR_CONTEXT_TIMEOUT)
+        {
+            self.breaks.push(format!(
+                "OutstandingWork: the reactor ended a repair context read for {owner:?} \
+                 {age:?} after its dispatch, past the {REPAIR_CONTEXT_TIMEOUT:?} request timeout"
+            ));
+        }
+    }
+
+    /// Sets the virtual time, since the run's start, that the next facts
+    /// come at, or `None` outside a run's clock.
+    pub(super) fn at(&mut self, now: Option<Duration>) {
+        self.now = now;
+    }
+
+    /// Judges the VCT repair rows, the requirement's `sources` and the open
+    /// context reads, into `found`.
+    fn judge_repair(&self, sources: &RepairSources, found: &mut Vec<String>) {
+        let RepairSources {
+            tried,
+            excluded_input,
+            busy,
+            target_refusals,
+            departed,
+        } = sources;
+        let admitted: HashSet<SourceId> = self
+            .admitted
+            .keys()
+            .map(|peer| SourceId::from_digest(peer.digest()))
+            .collect();
+        self.peak("departed repair sources", departed.len());
+        if departed.len() > self.departed_limit {
+            found.push(format!(
+                "holds {} departed repair sources, past its {}",
+                departed.len(),
+                self.departed_limit
+            ));
+        }
+        let connected: Vec<&SourceId> = departed
+            .iter()
+            .filter(|source| admitted.contains(source))
+            .collect();
+        if !connected.is_empty() {
+            found.push(format!(
+                "holds departed repair history for {connected:?}, which are admitted peers"
+            ));
+        }
+        // Sets have no duplicate keys, so membership bounds each one by the
+        // admitted peers plus the departed limit.
+        for (row, keys) in [
+            ("tried repair sources", tried),
+            ("excluded repair sources", excluded_input),
+            ("busy repair sources", busy),
+            ("repair target refusals", target_refusals),
+        ] {
+            self.peak(row, keys.len());
+            let stray: Vec<&SourceId> = keys
+                .iter()
+                .filter(|source| !admitted.contains(source) && !departed.contains(source))
+                .collect();
+            if !stray.is_empty() {
+                found.push(format!(
+                    "holds {row} {stray:?}, which are neither admitted peers nor held \
+                     departures"
+                ));
+            }
+        }
+        let mut reads: HashMap<&BodyWorkOwner, usize> = HashMap::new();
+        for open in self.calls.values() {
+            let Open::VctContext(owner, dispatched) = open else {
+                continue;
+            };
+            *reads.entry(owner).or_default() += 1;
+            // See the module docs: the shutdown unit's reads aren't judged
+            // by age.
+            if self.shut_down {
+                continue;
+            }
+            let age = self
+                .now
+                .zip(*dispatched)
+                .map(|(now, at)| now.saturating_sub(at));
+            if let Some(age) = age.filter(|age| *age > REPAIR_CONTEXT_TIMEOUT) {
+                found.push(format!(
+                    "holds a repair context read for {owner:?} open {age:?} after its \
+                     dispatch, past the {REPAIR_CONTEXT_TIMEOUT:?} request timeout"
+                ));
+            }
+        }
+        self.peak("repair context reads", reads.values().sum());
+        for (owner, count) in reads {
+            if count > 1 {
+                found.push(format!(
+                    "holds {count} open repair context reads for {owner:?}, past its 1"
+                ));
+            }
+        }
+    }
+
     /// Judges one `Sizes` report against every row.
     fn judge(&mut self, sizes: &ReactorSizes) {
         let ReactorSizes {
@@ -983,8 +1141,7 @@ impl Outstanding {
             cooldowns,
             pruned_peers,
             completed_targets,
-            // Listed, not checked: no fixture reaches a repair episode.
-            repair_sources: _,
+            repair_sources,
         } = sizes;
         self.evidence.with(|store| store.pending = true);
         let limit = self.peer_limit;
@@ -1129,6 +1286,7 @@ impl Outstanding {
                 }
             }
         }
+        self.judge_repair(repair_sources, &mut found);
         for (row, peers) in [
             ("cached offers", cached_offers),
             ("supplier order", supplier_order),

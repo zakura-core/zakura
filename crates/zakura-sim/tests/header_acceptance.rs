@@ -1305,6 +1305,18 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             ]),
         ),
         (
+            "header-sync/repair",
+            "tests/header_repair.rs",
+            "the_committed_repair_inputs_hold_outstanding_work_bounded",
+            Some("header-sync/outstanding-work-bounded"),
+            owned(&[
+                "committed header-repair-applied input",
+                "committed header-repair-prepare-departs input",
+                "committed header-repair-apply-departs input",
+                "committed header-repair-supplier-pruned input",
+            ]),
+        ),
+        (
             "header-sync/liveness",
             "tests/header_hold_release.rs",
             "the_committed_fixtures_match_their_names",

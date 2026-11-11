@@ -3314,9 +3314,18 @@ fn enum_variants(file: &str, name: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every site a check in the crate's `src` marks pending, with the files
-/// that mark it, relative to `src`. Every `cx.pending(` call must name its
-/// site as a `Pending::` literal, so the scan sees each one.
+/// The files that name `Pending`'s variants without producing them: its
+/// definition, the registry that judges marks, and the inventory itself.
+const PENDING_CONSUMERS: [&str; 3] = [
+    "property/verdict.rs",
+    "property/registry.rs",
+    "harness/header_acceptance/reasons.rs",
+];
+
+/// Every site the crate's `src` names outside test code and
+/// [`PENDING_CONSUMERS`], with the files that name it, relative to `src`.
+/// Naming a site is producing it, so the scan sees a mark however it's
+/// spelled ([`marked_sites`]).
 fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("src reads") {
@@ -3333,12 +3342,17 @@ fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
     walk(&src, &mut files);
     let mut producers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for file in files {
-        let text = std::fs::read_to_string(&file).expect("a source file reads");
         let relative = file
             .strip_prefix(&src)
             .expect("under src")
             .display()
             .to_string();
+        let test_file = file.file_name().is_some_and(|name| name == "tests.rs")
+            || file.components().any(|part| part.as_os_str() == "tests");
+        if test_file || PENDING_CONSUMERS.contains(&relative.as_str()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("a source file reads");
         for site in marked_sites(&text, &relative) {
             producers.entry(site).or_default().insert(relative.clone());
         }
@@ -3346,22 +3360,80 @@ fn pending_producers() -> BTreeMap<String, BTreeSet<String>> {
     producers
 }
 
-/// Each site `text`, the source of `file`, marks pending: every
-/// `.pending(` call with an argument, whatever its receiver, must name a
-/// `Pending::` literal. One with no argument is a query, not a mark.
+/// Each `Pending` site the Rust source `text`, the file `file`, names as a
+/// `Pending::Site` path outside test code, in order: a mark as `cx.pending`,
+/// as `CheckCtx::pending(cx, ...)`, or through a variable alike. A `use`
+/// that imports `Pending`'s variants or renames `Pending` would hide a
+/// path, so it fails the scan.
 fn marked_sites(text: &str, file: &str) -> Vec<String> {
-    text.match_indices(".pending(")
-        .map(|(at, _)| &text[at + ".pending(".len()..])
-        .filter(|call| !call.starts_with(')'))
-        .map(|call| {
-            call.strip_prefix("Pending::")
-                .and_then(|rest| rest.split_once(')'))
-                .map(|(site, _)| site)
-                .filter(|site| site.chars().all(|c| c.is_ascii_alphanumeric()))
-                .unwrap_or_else(|| panic!("{file}: a pending mark the scan can't read"))
-                .to_owned()
+    use syn::visit::Visit;
+    /// Collects the site paths.
+    struct Sites<'a> {
+        variants: &'a BTreeSet<String>,
+        file: &'a str,
+        found: Vec<String>,
+    }
+    /// Whether `attrs` mark test-only code.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string().contains("test")))
         })
-        .collect()
+    }
+    /// Fails on a `use` tree that imports from `Pending` or renames it.
+    fn check_use(tree: &syn::UseTree, file: &str) {
+        match tree {
+            syn::UseTree::Path(path) if path.ident == "Pending" => {
+                panic!("{file}: a `use` imports Pending's variants, which the scan can't see")
+            }
+            syn::UseTree::Path(path) => check_use(&path.tree, file),
+            syn::UseTree::Rename(rename) if rename.ident == "Pending" => {
+                panic!("{file}: a `use` renames Pending, which the scan can't see")
+            }
+            syn::UseTree::Group(group) => group.items.iter().for_each(|tree| check_use(tree, file)),
+            _ => {}
+        }
+    }
+    impl<'ast> Visit<'ast> for Sites<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            check_use(&item.tree, self.file);
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if let [.., kind, site] = &names[..] {
+                if kind == "Pending" && self.variants.contains(site) {
+                    self.found.push(site.clone());
+                }
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let variants = enum_variants("src/property/verdict.rs", "Pending");
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut sites = Sites {
+        variants: &variants,
+        file,
+        found: Vec::new(),
+    };
+    sites.visit_file(&parsed);
+    sites.found
 }
 
 /// C20: the reason inventory lists every `NotApplicable` reason exactly
@@ -3430,17 +3502,38 @@ fn the_not_applicable_inventory_lists_every_reason() {
     // `a_dry_end_fails_an_unread_boundary_as_missing_evidence` shows.
     let converted = [Pending::UnreadBoundary].map(|site| format!("{site:?}"));
     let header_sites: BTreeSet<String> = listed.iter().filter_map(site_of).collect();
-    // The scan reads a mark whatever its receiver is called, fails on an
-    // argument it can't read, and skips a `pending()` query (Terra 3, round
-    // 3).
-    let text = "cx.pending(Pending::FaultOpen);\nctx.pending(Pending::BlockTeardownOpen);\n\
-                let ops = self.port.pending();\n";
+    // The scan reads a site however the mark is spelled: whatever its
+    // receiver, through `CheckCtx::pending`, or through a variable (Terra 3,
+    // rounds 3 and 7). Test code doesn't count, and a `use` that would hide
+    // a site's path fails it.
+    let text = "fn check(cx: &mut Cx) {\n\
+                    cx.pending(Pending::FaultOpen);\n\
+                    ctx.pending(Pending::BlockTeardownOpen);\n\
+                    CheckCtx::pending(cx, Pending::TeardownOpen);\n\
+                    let site = Pending::WatchOpen;\n\
+                    cx.pending(site);\n\
+                    let ops = self.port.pending();\n\
+                }\n\
+                #[cfg(test)]\n\
+                mod tests {\n\
+                    fn t() { let _ = Pending::UnreadTrigger; }\n\
+                }\n";
     assert_eq!(
         marked_sites(text, "t.rs"),
-        ["FaultOpen", "BlockTeardownOpen"]
+        [
+            "FaultOpen",
+            "BlockTeardownOpen",
+            "TeardownOpen",
+            "WatchOpen"
+        ]
     );
-    let unreadable = std::panic::catch_unwind(|| marked_sites("view.pending(site);", "t.rs"));
-    assert!(unreadable.is_err(), "a mark the scan can't read fails it");
+    for hidden in [
+        "use crate::property::Pending::FaultOpen;",
+        "use crate::property::Pending as Mark;",
+    ] {
+        let scanned = std::panic::catch_unwind(|| marked_sites(hidden, "t.rs"));
+        assert!(scanned.is_err(), "{hidden}");
+    }
     let producers = pending_producers();
     let by_header = |site: &String| {
         producers

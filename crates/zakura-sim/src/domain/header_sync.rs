@@ -213,7 +213,10 @@ where
 /// so [`teardown_end_violations`] violates it then. A run that ends with a
 /// stop begun and the node unsettled stays pending only when its drain
 /// was cut off at its bound. Otherwise the tap fails it as
-/// `ShutdownIncomplete`. The node half of the claim is about a stopped
+/// `ShutdownIncomplete`. A drain cut off at its bound ends the run as the
+/// harness failure `DrainBound`, which keeps only the violations steps
+/// found, so a mark still pending there leaves the property
+/// `HarnessFailed`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
 /// round-level case relies on that. A step with a released round a claim

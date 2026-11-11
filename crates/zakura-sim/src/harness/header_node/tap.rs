@@ -34,8 +34,9 @@
 //! `ReactorGone`. A run that ends idle, or at its
 //! budget with a drain that ran dry, before that read fails as
 //! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
-//! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
-//! leaves unsettled ([`Pending::TeardownOpen`](crate::property::Pending::TeardownOpen)).
+//! stop honestly unfinished. That run ends as the harness failure
+//! `DrainBound`, so `header-sync/teardown-returns-baseline` keeps only the
+//! violations its steps found, and is otherwise `HarnessFailed`.
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands

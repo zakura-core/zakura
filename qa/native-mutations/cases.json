@@ -706,5 +706,45 @@
       "test_target": "handshake"
     },
     "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "handshake-table/skip-network-binding/skip-network-binding.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/wrong-network-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-authenticated-identity/skip-authenticated-identity.patch",
+    "entry": "handshake-table",
+    "property": "handshake/hello/identity-mismatch-refused",
+    "witness": {
+      "test": "hello_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/accept-unoffered-capability/accept-unoffered-capability.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/unoffered-capability-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-table/skip-nonce-echo/skip-nonce-echo.patch",
+    "entry": "handshake-table",
+    "property": "handshake/ack/bad-nonce-echo-refused",
+    "witness": {
+      "test": "ack_guards_refuse_each_corrupt_field",
+      "test_target": "handshake"
+    },
+    "fault_class": "request-authorization"
   }
 ]

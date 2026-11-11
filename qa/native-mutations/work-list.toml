@@ -333,211 +333,211 @@ id = "handshake-table"
 kind = "shared-definition"
 claim = "Control and prelude guards apply their declared consequence without registering or installing an invalid exchange."
 check = ["crates/zakura-sim/src/table/handshake.rs"]
-shared = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
+shared = []
 
 [[entry.instance]]
 property = "handshake/hello/bad-magic-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-version-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-protocol-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-path-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-role-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/wrong-network-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/wrong-chain-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/identity-mismatch-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/missing-capability-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-frame-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-message-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-stream-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-queue-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/bad-idle-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/nonzero-initiator-nonce-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/nonzero-responder-nonce-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/nonzero-native-transcript-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/oversize-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/hello/conformant-never-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-magic-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-version-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-protocol-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-nonce-echo-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/unoffered-capability-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-frame-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-message-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-stream-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-queue-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/bad-idle-limit-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/limits-above-request-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/oversize-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/conformant-never-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/conformant-never-refused"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/bad-magic-resets"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/unknown-kind-resets"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/unnegotiated-capability-resets"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/unselected-version-resets"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/undersized-cap-closes"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/unexpected-request-id-closes"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/request-without-id-closes"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/prelude/ineligible-opener-closes"
-code = []
+code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
 
 [[entry]]

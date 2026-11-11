@@ -1318,6 +1318,13 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
         ),
         (
             "header-sync/liveness",
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+            Some("header-sync/bounded-adversary-progress"),
+            owned(&["header-recovery-successor"]),
+        ),
+        (
+            "header-sync/liveness",
             "tests/header_peer_retirement.rs",
             "the_committed_fixtures_match_their_names",
             Some("header-sync/peer-retirement-progress"),

@@ -162,6 +162,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_recovery_progress.rs"
+test = "regenerate_recovery_fixtures"
+run = false
+reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"
 test = "regenerate_chain_witnesses"
 run = false
@@ -427,7 +433,7 @@ reason = "no target: the harness has three fixed scenarios, the repair fixtures,
 [[missing-target]]
 harness = "header-sync/liveness"
 owner = "E5a"
-reason = "no target: the harness has fixed scenarios, the hdr-10 liveness fixtures, and no plan maps it to a target"
+reason = "no target: the harness has fixed scenarios, the hdr-10 and hdr-11 liveness fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"
@@ -463,12 +469,6 @@ plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15
 id = "header-sync/state-publication-consistent"
 kind = "property"
 owner = "H4"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/bounded-adversary-progress"
-kind = "property"
-owner = "H5"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]

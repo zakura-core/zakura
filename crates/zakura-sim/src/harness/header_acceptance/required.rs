@@ -514,7 +514,10 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         | "header/publisher-policy" => vec![G5],
         // Liveness and the step loop's own claims serve no single gate. The
         // run's overall acceptance still counts them.
-        "header-sync/honest-progress" | "sim/no-task-panic" | "sim/no-livelock" => Vec::new(),
+        "header-sync/honest-progress"
+        | "header-sync/bounded-adversary-progress"
+        | "sim/no-task-panic"
+        | "sim/no-livelock" => Vec::new(),
         _ => return None,
     })
 }

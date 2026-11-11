@@ -79,7 +79,9 @@ use self::{
     ends::EnvironmentAction,
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
-    recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RELINK, UNREACHED},
+    recovery::{
+        Driver, RecoveryEvidence, RecoveryInputs, SelectedChain, RECOVERED, RELINK, UNREACHED,
+    },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
@@ -1665,10 +1667,10 @@ impl Control {
         Ok(())
     }
 
-    /// Starts recovery from `source` at the `Recover` pick: reconsiders
-    /// every invalidation still in force on `port`, newest first, and
-    /// records the start, which stops the script, retires the holds and
-    /// turns on fair scheduling.
+    /// Starts recovery from `source` at the `Recover` pick: keeps the node's
+    /// baseline, reconsiders every invalidation still in force on `port`,
+    /// newest first, and records the start, which stops the script, retires
+    /// the holds and turns on fair scheduling.
     fn recover(&self, port: &ControlledPort, source: &str) -> Result<(), String> {
         let driver = self
             .recovery
@@ -1677,6 +1679,7 @@ impl Control {
         if !driver.inputs.mirrors.iter().any(|(name, _)| name == source) {
             return Err(format!("a recover names a mirror, not {source}"));
         }
+        let baseline = SelectedChain::of(port.engine());
         while port
             .reset(ResetRequest::Reconsider)
             .map_err(|error| error.to_string())?
@@ -1684,7 +1687,7 @@ impl Control {
         {}
         let now = zakura_scheduler::hooks::now()
             .ok_or_else(|| "a recovery starts inside a run".to_owned())?;
-        driver.evidence.start(source.to_owned(), now);
+        driver.evidence.start(source.to_owned(), now, baseline);
         Ok(())
     }
 }
@@ -1773,11 +1776,11 @@ impl ActionSource for Control {
     /// doesn't name the node under test, a second shutdown, and a relink,
     /// reset or release after one fail the run here instead. A shutdown
     /// counts as begun from its pick, before the task takes it.
-    fn execute(&mut self, local: u64, _: &mut ObservationLog) {
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
         if let Some(driver) = &self.recovery {
             match local {
                 RECOVERED => {
-                    if let Err(why) = driver.recovered() {
+                    if let Err(why) = driver.recovered(log.step()) {
                         self.topology.fail(why);
                     }
                     return;

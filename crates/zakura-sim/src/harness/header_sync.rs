@@ -648,8 +648,6 @@ pub struct Storage {
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     topology: Rc<Topology>,
-    /// The node's session view.
-    sessions: SessionEvidence,
     /// The run's recovery, once a `Recover` step is picked.
     recovery: RecoveryEvidence,
 }
@@ -1134,6 +1132,7 @@ impl Subsystem for Storage {
                     .collect(),
                 sessions: ports.sessions.clone(),
                 cooldowns,
+                ends: ports.ends.clone(),
                 cooldown,
                 names,
             },
@@ -1159,7 +1158,6 @@ impl Subsystem for Storage {
             stamps,
             faults,
             topology,
-            sessions: ports.sessions,
             recovery,
         }
     }
@@ -1174,45 +1172,15 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// A scenario with a `Recover` step declares hdr-13's five assumptions,
-    /// none of which holds before the `recovered` pick
-    /// ([`RecoveryEvidence::holds`]). Others declare none.
+    /// A scenario with a `Recover` step declares hdr-13's five assumptions
+    /// ([`recovery_assumptions`]), none of which holds before the
+    /// `recovered` pick ([`RecoveryEvidence::holds`]). Others declare none.
     fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
-        let Some(source) = scenario
-            .controls
-            .iter()
-            .find(|step| step.action == ControlAction::Recover)
-            .map(|step| step.peer.clone())
-        else {
+        let Some(source) = recovery_source(scenario) else {
             return Assumptions::none();
         };
-        Assumptions::declare(vec![
-            AssumeRecord {
-                assume: Assume::StableMembership,
-                params: serde_json::json!({ "membership": "recorded" }),
-            },
-            AssumeRecord {
-                assume: Assume::HonestPeer,
-                params: serde_json::json!({ "peers": [source] }),
-            },
-            AssumeRecord {
-                assume: Assume::BoundedStorage,
-                params: serde_json::json!({ "max_ms": RECOVERY_BOUND.as_millis() }),
-            },
-            AssumeRecord {
-                assume: Assume::BoundedDelivery,
-                params: serde_json::json!({
-                    "link": "in-memory",
-                    "added_delay_ms": 0,
-                    "loss": "none",
-                }),
-            },
-            AssumeRecord {
-                assume: Assume::FairScheduling,
-                params: serde_json::json!({ "contract": crate::record::CONTRACT_VERSION }),
-            },
-        ])
-        .holds_when(|storage, assume| storage.recovery.holds(&storage.sessions, assume))
+        Assumptions::declare(recovery_assumptions(&source))
+            .holds_when(|storage, assume| storage.recovery.holds(&storage.ends, assume))
     }
 
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its
@@ -1894,6 +1862,47 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     properties.push(honest_never_punished());
     properties.push(crate::domain::header_sync_progress::honest_progress());
     properties
+}
+
+/// The mirror `scenario`'s `Recover` step names, if it has one.
+pub fn recovery_source(scenario: &StorageScenario) -> Option<String> {
+    scenario
+        .controls
+        .iter()
+        .find(|step| step.action == ControlAction::Recover)
+        .map(|step| step.peer.clone())
+}
+
+/// The five assumptions a recovery from `source` declares: the recorded
+/// membership stays, the source is honest, and storage, delivery and
+/// scheduling stay bounded and fair.
+pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
+    vec![
+        AssumeRecord {
+            assume: Assume::StableMembership,
+            params: serde_json::json!({ "membership": "recorded" }),
+        },
+        AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::json!({ "peers": [source] }),
+        },
+        AssumeRecord {
+            assume: Assume::BoundedStorage,
+            params: serde_json::json!({ "max_ms": RECOVERY_BOUND.as_millis() }),
+        },
+        AssumeRecord {
+            assume: Assume::BoundedDelivery,
+            params: serde_json::json!({
+                "link": "in-memory",
+                "added_delay_ms": 0,
+                "loss": "none",
+            }),
+        },
+        AssumeRecord {
+            assume: Assume::FairScheduling,
+            params: serde_json::json!({ "contract": crate::record::CONTRACT_VERSION }),
+        },
+    ]
 }
 
 /// The storage harness's properties, [`OPERATION_IDS`],

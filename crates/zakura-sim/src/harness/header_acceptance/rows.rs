@@ -73,6 +73,8 @@ const HOLD: &str = "header-sync/hold-release-wakes";
 const RETIREMENT: &str = "header-sync/peer-retirement-progress";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
+/// `header-sync/bounded-adversary-progress`.
+const RECOVERY_ID: &str = "header-sync/bounded-adversary-progress";
 /// `header-sync/watch-observed-under-flood`.
 const WATCH_WIRE: &str = "header-sync/watch-observed-under-flood";
 /// `header-sync/watch-observed-under-lifecycle-flood`.
@@ -127,6 +129,7 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
+    matrix.push((LIVENESS, RECOVERY_ID, Status::Draft));
     matrix
 }
 
@@ -415,6 +418,17 @@ const RETIRE_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_fixtures_match_their_names",
     ),
     case: "header-retire-timeout",
+};
+
+/// The committed recovery control, holding and applying
+/// `bounded-adversary-progress` under the fixed Plan.
+const RECOVERY_WITNESS: HistoryRef = HistoryRef {
+    harness: LIVENESS,
+    witness: sim_test(
+        "tests/header_recovery_progress.rs",
+        "the_committed_fixtures_match_their_names",
+    ),
+    case: "header-recovery-successor",
 };
 
 /// The flood witness test, which runs both committed flood inputs.
@@ -753,6 +767,7 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             histories.push((HistoryRef { case, ..history }, id));
         }
     }
+    histories.push((RECOVERY_WITNESS, RECOVERY_ID));
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
@@ -881,6 +896,7 @@ pub fn witness_tests() -> Vec<TestRef> {
         OUTSTANDING_WITNESSES.witness,
         HOLD_WITNESSES.witness,
         RETIRE_WITNESSES.witness,
+        RECOVERY_WITNESS.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
         MID_PREPARE.witness,
@@ -2009,6 +2025,28 @@ fn hand_written_rows() -> Vec<Row> {
             owner: "Evan",
         }),
         expected: progressing,
+    });
+
+    let recovery = RECOVERY_ID;
+    let mut recovering = holds(recovery, NONE, RECOVERY_WITNESS);
+    recovering.extend(caught(
+        LIVENESS,
+        case(recovery, "skipped-apply"),
+        &[RECOVERY_ID],
+        Found::AtStep,
+        NONE,
+        false,
+    ));
+    rows.push(Row {
+        property: recovery,
+        tier: Tier::Sim,
+        harnesses: &[LIVENESS],
+        status: Status::Draft,
+        promotion: Some(Promotion {
+            condition: "hdr-13 adds the hostile prefixes and Evan agrees to promote it",
+            owner: "Evan",
+        }),
+        expected: recovering,
     });
 
     let mut reactor = vec![result(

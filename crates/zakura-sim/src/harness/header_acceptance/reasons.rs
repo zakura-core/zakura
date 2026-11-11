@@ -315,6 +315,15 @@ pub static NA_REASONS: &[NaProducer] = &[
     },
     NaProducer {
         file: "src/domain/header_sync_progress.rs",
+        function: "check_bounded_adversary_progress",
+        fingerprint: "6d9098d79cff89e0",
+        constructions: &[
+            step("no recovery has recorded a `recovered` pick that owes a successor", RETURN),
+            step("this step isn't the `recovered` pick's", RETURN),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/header_sync_progress.rs",
         function: "check_honest_progress",
         fingerprint: "55a7629dc8fe3ca6",
         constructions: &[

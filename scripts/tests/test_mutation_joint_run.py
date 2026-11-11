@@ -12,21 +12,22 @@ joint = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(joint)
 
 
-def case(patch, witness, generator=(), baseline=True):
+def case(patch, witness, generator=(), baseline=True, test="t", mode="inproc"):
     return {
         "patch": patch,
         "property": "block-sync/retained-byte-bound",
+        "witness": {"test": test, "test_target": "block_table"},
         "result": {"class": witness},
         "baseline": {"passed": baseline, "detail": None if baseline else "a run violates it"},
         "generator": [
-            {"harness": "block-sync/storage", "seed": seed, "result": {"class": kind}}
+            {"harness": "block-sync/storage", "seed": seed, "mode": mode, "result": {"class": kind}}
             for seed, kind in generator
         ],
     }
 
 
-def finding(seed, prop):
-    return {"harness": "discovery/wire", "seed": seed, "mode": "inproc", "property": prop, "detail": "stopped"}
+def finding(seed, prop, detail="stopped", mode="inproc"):
+    return {"harness": "discovery/wire", "seed": seed, "mode": mode, "property": prop, "detail": detail}
 
 
 class DiffTests(unittest.TestCase):
@@ -50,8 +51,8 @@ class DiffTests(unittest.TestCase):
         }
         changes = joint.diff(previous, new)
         self.assertEqual(
-            [entry["lane"][3:] for entry in changes["newly_surviving"]],
-            [["generator", "block-sync/storage", 23], ["witness"]],
+            [entry["lane"][4:] for entry in changes["newly_surviving"]],
+            [["generator", "block-sync/storage", 23, "inproc"], ["witness"]],
         )
         self.assertEqual(changes["newly_surviving"][1]["was"], "killed-by-named-rule")
         self.assertEqual([entry["case"][0] for entry in changes["newly_failing_baselines"]], ["two.patch"])
@@ -70,6 +71,31 @@ class DiffTests(unittest.TestCase):
             self.assertEqual(joint.main(["diff", str(old), str(new_dir / "report.json")]), 0)
             written = json.loads((new_dir / joint.DIFF_FILE).read_text())
             self.assertEqual(written["previous_pinned"], "a" * 40)
+
+    def test_lanes_differ_by_mode_and_cases_by_witness(self):
+        previous = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "survived")], test="a")]}
+        new = {"cases": [
+            case("one.patch", "killed-by-named-rule", [(11, "survived")], test="a"),
+            case("one.patch", "killed-by-named-rule", [(11, "survived")], test="a", mode="libfuzzer"),
+            case("one.patch", "survived", test="b"),
+        ]}
+        surviving = [entry["lane"] for entry in joint.diff(previous, new)["newly_surviving"]]
+        self.assertEqual(len(surviving), 2, surviving)
+        self.assertIn("libfuzzer", surviving[0] + surviving[1])
+        self.assertTrue(any('"b"' in entry[3] and entry[4] == "witness" for entry in surviving))
+
+    def test_findings_are_keyed_by_property_not_by_detail(self):
+        previous = {"cases": [], "property_findings": [
+            finding(11, "discovery/x", "run 7 at /old/path"),
+            finding(23, None, "run 3 at /old/path"),
+        ]}
+        new = {"cases": [], "property_findings": [
+            finding(11, "discovery/x", "run 9 at /new/path"),
+            finding(23, None, "run 4 at /new/path"),
+            finding(11, "discovery/x", mode="libfuzzer"),
+        ]}
+        found = joint.diff(previous, new)["new_property_findings"]
+        self.assertEqual([entry["mode"] for entry in found], ["libfuzzer"])
 
     def test_the_loop_runs_on_what_changed_since_the_previous_pin(self):
         command = joint.loop_command({"pinned": "a" * 40}, Path("out"), 500, ["--jobs", "8"])

@@ -30,24 +30,24 @@ REPORT_FILE = "report.json"
 
 
 def case_key(case):
-    """Return one case's identity across reports: its patch, property and protocol table."""
-    return (case["patch"], case["property"], case.get("table"))
+    """Return one case's identity across reports: its patch, property, protocol table and witness."""
+    return (case["patch"], case["property"], case.get("table"), json.dumps(case.get("witness"), sort_keys=True))
 
 
 def lanes(report):
-    """Return every lane's class by its identity: the case's, then `witness` or the generator's harness and seed."""
+    """Return every lane's class by its identity: the case's, then `witness` or the generator's harness, seed and mode."""
     found = {}
     for case in report.get("cases", []):
         key = case_key(case)
         found[(*key, "witness")] = case["result"]["class"]
         for lane in case.get("generator", []):
-            found[(*key, "generator", lane["harness"], lane["seed"])] = lane["result"]["class"]
+            found[(*key, "generator", lane["harness"], lane["seed"], lane.get("mode", "inproc"))] = lane["result"]["class"]
     return found
 
 
 def finding_key(finding):
-    """Return one property finding's identity: its harness, seed, mode, and the ID or stop it found."""
-    return (finding["harness"], finding["seed"], finding.get("mode"), finding.get("property") or finding["detail"])
+    """Return one property finding's identity: the ID it violated, and its harness, seed and mode."""
+    return (finding.get("property"), finding["harness"], finding["seed"], finding.get("mode", "inproc"))
 
 
 def diff(previous, new):

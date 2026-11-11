@@ -124,8 +124,8 @@ pub use service::finalized_state::{
 };
 #[cfg(feature = "internal-bench")]
 pub use service::non_finalized_state::{
-    benchmark_height_map, benchmark_transparent_indexes, AllocationProbe,
-    HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig, TransparentIndexBenchmarkSample,
+    benchmark_height_map, benchmark_transparent_indexes, AllocationProbe, HeightMapBenchmarkSample,
+    TransparentIndexBenchmarkConfig, TransparentIndexBenchmarkSample,
 };
 pub use service::read::{
     derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,

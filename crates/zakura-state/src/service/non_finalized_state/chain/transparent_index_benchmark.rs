@@ -36,8 +36,10 @@ pub struct AllocationProbe {
 pub struct TransparentIndexBenchmarkConfig {
     /// Blocks with stuffed coinbases on the best chain.
     pub stuffed_blocks: usize,
-    /// Distinct-address P2SH outputs added to each stuffed coinbase.
+    /// P2SH outputs added to each stuffed coinbase.
     pub outputs_per_block: usize,
+    /// The number of addresses the outputs cycle through, or zero for a new address per output.
+    pub address_pool: usize,
     /// Side chains forked from the best chain, spread through the stuffed blocks.
     pub side_chains: usize,
     /// Root blocks finalized on every chain.
@@ -105,9 +107,21 @@ pub fn benchmark_transparent_indexes(
     let before = (probe.live_bytes)();
     for index in 0..config.stuffed_blocks {
         let block = if index == 0 {
-            stuffed(&parent, 0, index, config.outputs_per_block)
+            stuffed(
+                &parent,
+                0,
+                index,
+                config.outputs_per_block,
+                config.address_pool,
+            )
         } else {
-            stuffed(&child_of(&parent), 0, index, config.outputs_per_block)
+            stuffed(
+                &child_of(&parent),
+                0,
+                index,
+                config.outputs_per_block,
+                config.address_pool,
+            )
         };
         if index == 0 {
             addresses.extend(stuffed_addresses(&block, &network).take(100));
@@ -120,7 +134,7 @@ pub fn benchmark_transparent_indexes(
 
         if side_chains.len() < config.side_chains && (index + 1) % fork_every == 0 {
             // A one-output sibling of `block`, so the side chain shares everything below it.
-            let sibling = stuffed(&child_of(&parent), 1, index, 1);
+            let sibling = stuffed(&child_of(&parent), 1, index, 1, 0);
             let fork = best
                 .fork(parent.hash())
                 .or_else(|| (index == 0).then(|| best.clone()))
@@ -195,7 +209,9 @@ pub fn benchmark_transparent_indexes(
             });
         };
         query("balance query", &|| {
-            black_box(best.partial_transparent_balance_change(&queried));
+            black_box(
+                best.partial_transparent_balance_change(&queried, best.non_finalized_root_height()),
+            );
         });
         query("utxo query", &|| {
             black_box(best.partial_transparent_utxo_changes(&queried));
@@ -236,8 +252,15 @@ fn child_of(parent: &Arc<Block>) -> Arc<Block> {
 
 /// Replaces `block`'s extra coinbase outputs with `count` zero-value P2SH outputs.
 ///
-/// `tag` and `index` keep the script hashes distinct across blocks and siblings.
-fn stuffed(block: &Arc<Block>, tag: u8, index: usize, count: usize) -> Arc<Block> {
+/// With an `address_pool`, output `i` pays address `i % address_pool`. Otherwise `tag` and
+/// `index` keep the script hashes distinct across blocks and siblings.
+fn stuffed(
+    block: &Arc<Block>,
+    tag: u8,
+    index: usize,
+    count: usize,
+    address_pool: usize,
+) -> Arc<Block> {
     let mut block = Block::clone(block);
     let coinbase = Arc::make_mut(&mut block.transactions[0]);
     let outputs = match coinbase {
@@ -246,6 +269,11 @@ fn stuffed(block: &Arc<Block>, tag: u8, index: usize, count: usize) -> Arc<Block
     };
     outputs.truncate(1);
     outputs.extend((0..count).map(|output| {
+        let (tag, index, output) = if address_pool > 0 {
+            (0xaa, 0, output % address_pool)
+        } else {
+            (tag, index, output)
+        };
         let mut script = vec![0xa9, 0x14];
         script.push(tag);
         script.extend_from_slice(&u32::try_from(index).expect("index fits").to_le_bytes());

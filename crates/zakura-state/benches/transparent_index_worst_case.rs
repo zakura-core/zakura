@@ -57,7 +57,11 @@ static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
-        .map(|value| value.parse().expect("benchmark settings are positive integers"))
+        .map(|value| {
+            value
+                .parse()
+                .expect("benchmark settings are positive integers")
+        })
         .unwrap_or(default)
 }
 
@@ -65,6 +69,7 @@ fn main() {
     let config = TransparentIndexBenchmarkConfig {
         stuffed_blocks: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_BLOCKS", 50),
         outputs_per_block: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_OUTPUTS", 60_000),
+        address_pool: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_ADDRESSES", 0),
         side_chains: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_SIDE_CHAINS", 9),
         finalizations: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_FINALIZATIONS", 3),
         query_samples: env_usize("ZAKURA_TRANSPARENT_INDEX_BENCH_QUERY_SAMPLES", 200),

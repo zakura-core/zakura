@@ -345,18 +345,15 @@ impl SessionEvidence {
         }
     }
 
-    /// Records whether the run ran dry idle ([`RunEnd::rest`]): with every
-    /// task finished or waiting outside the scheduler, no timer pending,
-    /// and nothing enabled, live or after a drain. Nothing can retire a
+    /// Records whether the run ran dry idle: at rest
+    /// ([`RunEnd::at_rest`]) with no timer pending, live or after a drain. Nothing can retire a
     /// session after that. A drain fires a timer alone only within the
     /// harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so a dry
     /// drain can leave a later timer pending, and a session whose
     /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
-        self.ledger().idle = Some(matches!(
-            end.rest,
-            Some(SchedulerStatus::Quiescent | SchedulerStatus::WaitingOnExternal)
-        ));
+        self.ledger().idle =
+            Some(end.at_rest() && end.rest != Some(SchedulerStatus::WaitingOnTime));
     }
 
     /// Whether own-9 retired every session that left the reactor's view:

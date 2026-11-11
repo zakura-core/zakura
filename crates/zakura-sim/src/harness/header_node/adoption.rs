@@ -28,7 +28,6 @@ use zakura_network::zakura::{
 
 use super::stamp::Stamps;
 use crate::RunEnd;
-use zakura_scheduler::Status as SchedulerStatus;
 
 /// How long after an adoption that changes a session's status the reactor
 /// may wait before it queues that status or records a deferral:
@@ -252,22 +251,11 @@ impl AdoptionFact {
     }
 }
 
-/// Whether a run that ended as `end` settled: it ran dry
-/// ([`RunEnd::rest`]) with no task ready, every task finished, waiting
-/// outside the scheduler, or waiting on a timer a dry drain left past the
-/// harness timer cap. Any other end can stop a task partway through a
-/// synchronous call: a violation, a harness failure, a drain cut off at its
-/// bound included, or a run dry with a ready task that never got a worker
-/// or a deadlock.
+/// Whether a run that ended as `end` settled: it ran dry at rest
+/// ([`RunEnd::at_rest`]). Any other end can stop a task partway through a
+/// synchronous call.
 pub fn settled(end: &RunEnd) -> bool {
-    matches!(
-        end.rest,
-        Some(
-            SchedulerStatus::Quiescent
-                | SchedulerStatus::WaitingOnExternal
-                | SchedulerStatus::WaitingOnTime
-        )
-    )
+    end.at_rest()
 }
 
 /// An [`AdoptionFact`] and the virtual time since the run's start that the
@@ -746,6 +734,7 @@ mod tests {
         end::Drain,
         IdleStatus, Outcome,
     };
+    use zakura_scheduler::Status as SchedulerStatus;
 
     /// An adoption at generation `generation` whose tip is at `height`.
     fn adoption(generation: u64, height: u32) -> Adoption {

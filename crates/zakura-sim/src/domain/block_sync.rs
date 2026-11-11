@@ -1000,7 +1000,7 @@ impl OwnerModel {
     /// handoffs, at most one per live routine, since a routine hands one
     /// body at a time; none at rest, since a handoff never parks.
     pub fn counted_handoffs(&self, status: SchedulerStatus) -> u64 {
-        if at_rest(status) {
+        if crate::at_rest(status) {
             return 0;
         }
         u64::try_from(self.handoffs.len())
@@ -1208,18 +1208,6 @@ fn payload_retained(log: &ObservationLog) -> bool {
     )
 }
 
-/// True if no task can run after a step that left the scheduler at
-/// `status`: every task finished or waits on time or an external source.
-/// A worker-starved run still has a ready task, so it isn't at rest.
-fn at_rest(status: SchedulerStatus) -> bool {
-    matches!(
-        status,
-        SchedulerStatus::Quiescent
-            | SchedulerStatus::WaitingOnTime
-            | SchedulerStatus::WaitingOnExternal
-    )
-}
-
 /// [`RETAINED_BYTE_BOUND`], checked after every step. A holder gap, such
 /// as a sequencer snapshot that disagrees with the holder events, leaves
 /// the retained bytes unknown, so the reading is missing evidence.
@@ -1369,7 +1357,7 @@ fn check_ledgers<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {
-    if !at_rest(cx.status) {
+    if !crate::at_rest(cx.status) {
         return Verdict::NotApplicable;
     }
     let (reserved, queued, unreceived, handoffs, gap) = cx.view().read_owners(|owners| {
@@ -1433,7 +1421,7 @@ where
     type Peaks = [(&'static str, u64); 4];
 
     fn read(cx: &CheckCtx<'_, S>) -> Reading<LookaheadTerms, Self::Peaks> {
-        if !at_rest(cx.status) {
+        if !crate::at_rest(cx.status) {
             return Reading::Unjudged;
         }
         let (quantities, limits, gap) = cx
@@ -1543,7 +1531,7 @@ where
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
-    if unended > 0 || queued > 0 || serving > 0 || !at_rest(status) {
+    if unended > 0 || queued > 0 || serving > 0 || !crate::at_rest(status) {
         cx.pending(Pending::BlockTeardownOpen);
         return Verdict::NotApplicable;
     }

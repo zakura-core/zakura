@@ -440,9 +440,9 @@ where
 
 /// Checks [`OUTSTANDING_WORK_BOUNDED`] at the boundary after a step: it's
 /// violated by an `OutstandingWork` claim break the tap found at this
-/// step, or, after a step that leaves no task able to run, by a publisher
-/// still running under its session's cancelled token, and holds once a
-/// drain judged a `Sizes`.
+/// step, or, after a step that leaves the scheduler at rest
+/// ([`crate::at_rest`]), by a publisher still running under its session's
+/// cancelled token, and holds once a drain judged a `Sizes`.
 fn check_outstanding_work_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -461,7 +461,7 @@ where
     // Not quiescence: a source action, such as the drain finishing a read
     // the publisher waits on, can still end a publisher that ignored its
     // cancellation, and hide it.
-    if cx.status != zakura_scheduler::Status::Running {
+    if crate::at_rest(cx.status) {
         let lingering = view.outstanding().lingering_cancelled();
         if !lingering.is_empty() {
             breaks.push(format!(
@@ -1525,6 +1525,49 @@ mod tests {
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NaReason, ObservationLog,
         Outcome, PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
+
+    /// Terra 3: a released round left stuck breaks the teardown rule only at
+    /// an end the scheduler settled at, never a worker-starved or
+    /// deadlocked one, where the ready task that would settle it never got
+    /// to run.
+    #[test]
+    fn a_stuck_round_breaks_teardown_only_at_a_settled_end() {
+        use zakura_scheduler::Status as SchedulerStatus;
+        for (rest, breaks) in [
+            (SchedulerStatus::Quiescent, true),
+            (SchedulerStatus::WaitingOnExternal, true),
+            (SchedulerStatus::WaitingOnTime, true),
+            (SchedulerStatus::WorkerStarved, false),
+            (SchedulerStatus::Deadlock, false),
+        ] {
+            let rounds = SettlementEvidence::default();
+            rounds.record(Settlement {
+                step: 3,
+                released: 1,
+                unsettled: 1,
+                stuck: 1,
+                tainted: 0,
+                shutdown: false,
+                settled: false,
+            });
+            rounds.end(&RunEnd {
+                outcome: Outcome::Budget,
+                steps: 3,
+                violation: None,
+                drain: Some(crate::end::Drain {
+                    steps: 1,
+                    exhausted: false,
+                }),
+                harness: None,
+                rest: Some(rest),
+            });
+            assert_eq!(
+                !teardown_end_violations(&rounds).is_empty(),
+                breaks,
+                "{rest:?}"
+            );
+        }
+    }
 
     /// The model's capacity and refill interval are production's.
     #[test]

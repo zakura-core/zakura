@@ -44,7 +44,7 @@ pub use check::{
     Checker, NaReason, NoChecks, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx,
     Unfinished, Violation,
 };
-pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
+pub use end::{at_rest, HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};
 pub use plan::{

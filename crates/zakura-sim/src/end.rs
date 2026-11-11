@@ -252,6 +252,26 @@ pub struct RunEnd {
     /// after its drain ran dry. `None` for any other end. A dry drain can
     /// end worker-starved, deadlocked, or waiting on a timer past the
     /// harness timer cap, so a check that needs every task at rest reads
-    /// this, not the outcome.
+    /// [`Self::at_rest`], not the outcome.
     pub rest: Option<Status>,
+}
+
+impl RunEnd {
+    /// Whether the run ran dry with the scheduler at rest ([`at_rest`]).
+    pub fn at_rest(&self) -> bool {
+        self.rest.is_some_and(at_rest)
+    }
+}
+
+/// Whether a scheduler at `status` has come to rest, so a check may judge
+/// what the node left undone: every task finished, or waits outside the
+/// scheduler or on a timer. A worker-starved scheduler has a ready task
+/// with no worker, and a deadlocked one can hold a task parked partway
+/// through a call, so neither is: what that task would do next is still
+/// owed. Every check that judges rest asks this.
+pub fn at_rest(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Quiescent | Status::WaitingOnExternal | Status::WaitingOnTime
+    )
 }

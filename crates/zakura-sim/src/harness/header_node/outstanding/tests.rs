@@ -1005,3 +1005,116 @@ fn retained_paths_hold_at_sixteen_and_break_past_it() {
         assert_eq!(rule.drain(3), Vec::<String>::new(), "{row}");
     }
 }
+
+/// What `outstanding-work-bounded` reads, with no tap behind it.
+#[derive(Clone, Default)]
+struct Probe {
+    claims: super::super::claim::ClaimEvidence,
+    outstanding: OutstandingEvidence,
+}
+
+impl crate::domain::header_sync::OutstandingView for Probe {
+    fn claims(&self) -> &super::super::claim::ClaimEvidence {
+        &self.claims
+    }
+
+    fn outstanding(&self) -> &OutstandingEvidence {
+        &self.outstanding
+    }
+}
+
+impl crate::property::HasView for Probe {
+    type View = Probe;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> Probe {
+        self.clone()
+    }
+
+    /// Keeps the run's end for the end check.
+    fn ended(&self, end: &crate::RunEnd) {
+        self.outstanding.end(end);
+    }
+
+    /// [`crate::domain::header_sync::outstanding_end_violations`].
+    fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+        crate::domain::header_sync::outstanding_end_violations(&self.outstanding)
+    }
+}
+
+/// `outstanding-work-bounded`'s outcome over a run with one worker, where
+/// a publisher whose session's token is cancelled is still running from
+/// the start, and the run's tasks are `starve`d of their worker or not.
+fn lingering_outcome(starve: bool) -> crate::PropertyOutcome {
+    use crate::property::{Assumptions, Registry, RegistryChecker, Source, Sources};
+    let probe = Probe::default();
+    let mut publisher = Outstanding::new(probe.outstanding.clone(), 8, held());
+    publisher.observe(&ReactorEvent::PublisherStarted {
+        peer: mirror(3),
+        session_id: 6,
+    });
+    let token = CancellationToken::new();
+    publisher.session_cancel(&mirror(3), 6, token.clone());
+    token.cancel();
+    let registry = Registry::new(vec![
+        crate::domain::header_sync::outstanding_work_bounded::<Probe>(),
+    ])
+    .expect("one property");
+    let mut checker = RegistryChecker::new(
+        registry,
+        std::rc::Rc::new(probe),
+        Assumptions::none(),
+        &Sources::observed(&[Source::View]),
+    );
+    let config = crate::RunConfig {
+        scheduler: zakura_scheduler::SchedulerConfig {
+            workers: 1,
+            stack_size: 64 * 1024,
+            ..zakura_scheduler::SchedulerConfig::default()
+        },
+        budget: 0,
+        drain_bound: 1_000,
+        ..crate::RunConfig::default()
+    };
+    let mut sim = crate::Sim::new(config, crate::Plan::from_fuzz(&[]));
+    // The holder yields holding the lock, the waiter takes the only worker
+    // and parks on it, and the holder is ready with no worker to run on.
+    let lock = std::sync::Arc::new(zakura_rt::sync::Mutex::new(()));
+    let held_lock = lock.clone();
+    sim.scheduler().spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held_lock.lock().unwrap();
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    if starve {
+        sim.scheduler().spawn_root("waiter", async move {
+            drop(lock.lock().unwrap());
+        });
+    }
+    let report = sim.run(&mut checker, &mut crate::MemorySink::default());
+    report.properties[0].outcome.clone()
+}
+
+/// Sol 1 and Terra 2: a cancelled publisher isn't judged at a worker-starved
+/// step, where a ready task has no worker yet, only once the run is at
+/// rest.
+#[test]
+fn a_worker_starved_step_does_not_judge_a_cancelled_publisher() {
+    assert!(
+        matches!(
+            lingering_outcome(false),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "a run at rest judges it"
+    );
+    assert!(
+        !matches!(
+            lingering_outcome(true),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "{:?}",
+        lingering_outcome(true)
+    );
+}

@@ -4420,6 +4420,38 @@ fn inserting_after_finality_moved_loads_the_finalized_lease_only_when_the_parent
 }
 
 #[test]
+fn a_header_prepared_before_finality_moved_commits_on_a_fully_retained_parent_without_reads() {
+    let span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
+        .expect("the span fits in u32");
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(span + 12);
+    let parent = path.last().expect("the fixture path is nonempty");
+    // Header sync prepares the batch, then two more headers finalize before it is applied.
+    let mut request = child_insertion(&runtime, parent);
+    finalize_serving_test_path(&runtime, &db, &path[3..5]);
+    let after = runtime.publisher().snapshot();
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        unreachable!("child_insertion builds a header insertion");
+    };
+    assert_ne!(
+        insert.owner.header_authority().branch.anchor_hash,
+        after.frontiers.finalized.hash,
+        "the batch names the finalized header it was prepared under",
+    );
+    request.expected_version = after.state_version;
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let result = runtime.apply(request, &header_insertion_context(&runtime));
+
+    assert!(matches!(result, Ok(ApplyResult::Committed)), "{result:?}");
+    assert_eq!(
+        HeaderChainStore::header_node_disk_reads(),
+        1,
+        "the store looks up the one header row it writes and reads no lease: neither the \
+         parent's nor the finalized header's",
+    );
+}
+
+#[test]
 fn inserting_a_header_one_short_of_full_retention_rereads_and_checks_every_predecessor() {
     let (runtime, path, _) = hashed_evidence_fixture();
     let parent_index = lowest_fully_retained_parent_index() - 1;

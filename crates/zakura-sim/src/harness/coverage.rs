@@ -626,6 +626,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("install-unnegotiated-service"),
     },
     Coverage {
+        property: "handshake/finishes-in-time",
+        passing: passes(
+            "tests/handshake.rs",
+            "slow_control_steps_share_one_deadline",
+        ),
+        bypass: Bypass::Planted("no-overall-deadline"),
+    },
+    Coverage {
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
         passing: passes(
             "tests/block_resource_properties.rs",

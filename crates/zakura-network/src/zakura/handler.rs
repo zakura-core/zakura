@@ -3459,9 +3459,16 @@ impl ZakuraProtocolHandler {
         };
         let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
-        let result = self
-            .run_native_responder_handshake(connection, remote_peer_id, conn)
-            .await;
+        // The overall deadline bounds peers that pace each control step.
+        let result = match timeout(
+            self.limits.control_timeout,
+            self.run_native_responder_handshake(connection, remote_peer_id, conn),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ZakuraHandlerError::Timeout("control handshake")),
+        };
         #[cfg(any(test, zakura_sim))]
         self.observe_control_result(connection, "hello", &result);
         result

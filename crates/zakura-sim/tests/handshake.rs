@@ -305,13 +305,8 @@ fn inbound_connection_pressure_preserves_a_wire_dial() {
 }
 
 #[test]
-fn slow_control_steps_exceed_the_overall_deadline() {
-    let mut scenario = Scenario::default();
-    scenario.peers[0].handshake = Some(HandshakeSpec {
-        length_delay_ms: 9_000,
-        payload_delay_ms: 9_000,
-        ..HandshakeSpec::default()
-    });
+fn slow_control_steps_share_one_deadline() {
+    let scenario = Wire::draw(include_bytes!("fixtures/handshake-slow-control.bin"));
     let entry = harness::find(Wire::NAME).unwrap();
     let report = (entry.run)(
         &serde_json::to_value(scenario).unwrap(),
@@ -323,25 +318,15 @@ fn slow_control_steps_exceed_the_overall_deadline() {
     zakura_sim::witness::judge_report::<Wire>(
         &report,
         "handshake/finishes-in-time",
-        zakura_sim::witness::Expect::Violated,
+        zakura_sim::witness::Expect::Holds,
     )
     .unwrap();
-    let deadline = report
-        .properties
-        .iter()
-        .find(|property| property.property == "handshake/finishes-in-time")
-        .unwrap();
-    assert!(
-        matches!(deadline.outcome, PropertyOutcome::Violated { .. }),
-        "{deadline:?}"
-    );
-    assert!(
-        deadline
-            .violations
-            .iter()
-            .any(|violation| violation.actual.ends_with("Some(18000) ms")),
-        "{deadline:?}"
-    );
+    assert_held(&report, "handshake/finishes-in-time");
+    assert_held(&report, "handshake/hello/refusal-releases-slot");
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport { event: zakura_sim::observe::TransportFact::Handshake { stage, elapsed_ms: Some(10_000), .. }, .. }
+            if stage == "released"
+    )), "the control claim must release at the overall ten-second deadline");
 }
 
 #[test]

@@ -210,7 +210,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         },
         assumes: &[],
         needs: &[Source::Closes],
-        status: Status::Known { issue: 2333 },
+        status: Status::Active,
         check: check_deadline::<S>,
         witness: Some(TriggerHistory::Log(paced_control_reached)),
     });

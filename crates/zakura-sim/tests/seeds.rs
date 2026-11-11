@@ -173,6 +173,17 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-slow-control" => {
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.peers[0].handshake =
+                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                    length_delay_ms: 9_000,
+                    payload_delay_ms: 9_000,
+                    ..Default::default()
+                });
+            value(scenario)
+        }
+
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],

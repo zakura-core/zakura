@@ -19,7 +19,10 @@ use shared_template::{SharedTemplate, SharedTemplateJson};
 use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -499,7 +502,7 @@ pub struct BlockTemplateResponse {
     pub(crate) submit_old: Option<bool>,
 
     /// The JSON of this template's answer, when the template was taken from the store that
-    /// long polls share, so that the answer is encoded once for all of them.
+    /// requests share, so that the answer is encoded once for all of them.
     ///
     /// It describes the template as it was taken, with this `submit_old`. It is set as the
     /// template is returned to its caller, and the template is not changed after that.
@@ -531,6 +534,16 @@ impl PartialEq for SharedJson {
 impl Eq for SharedJson {}
 
 impl BlockTemplateResponse {
+    /// Whether this template carries the times and difficulty that a template built from
+    /// `chain_info` would: it was built on the same chain state, in the same second of the
+    /// node's clock.
+    pub(crate) fn has_times_of(&self, chain_info: &GetBlockTemplateChainInfo) -> bool {
+        self.cur_time == chain_info.cur_time
+            && self.min_time == chain_info.min_time
+            && self.max_time == chain_info.max_time
+            && self.bits == chain_info.expected_difficulty
+    }
+
     /// Returns this template's answer as finished JSON, if it shares one and is being written
     /// into an RPC response.
     fn shared_response_json(&self) -> Option<&RawValue> {
@@ -948,8 +961,20 @@ where
     /// Records the stages of each template this handler returns.
     pub(crate) trace: trace::MiningTemplateTrace,
 
-    /// The newest full template, shared by long polls that ask for the same work.
+    /// The newest full template, shared by requests that ask for the same work.
     pub(crate) shared_template: SharedTemplate,
+
+    /// How many long polls have waited for their work to change and are not answered yet.
+    waiting_long_polls: Arc<AtomicUsize>,
+}
+
+/// A long poll that has waited for its work to change, until it is dropped.
+pub(crate) struct WaitingLongPoll(Arc<AtomicUsize>);
+
+impl Drop for WaitingLongPoll {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -985,6 +1010,7 @@ where
             speculation_breaker: SpeculationBreaker::default(),
             trace: trace::MiningTemplateTrace::default(),
             shared_template: SharedTemplate::default(),
+            waiting_long_polls: Arc::default(),
         }
     }
 
@@ -1057,6 +1083,20 @@ where
             .ok()
     }
 
+    /// Counts a long poll as waiting for its work to change. Its request holds the returned
+    /// value until it has an answer.
+    pub(crate) fn long_poll_waiting(&self) -> WaitingLongPoll {
+        self.waiting_long_polls.fetch_add(1, Ordering::SeqCst);
+        WaitingLongPoll(self.waiting_long_polls.clone())
+    }
+
+    /// Whether a long poll that waited for its work to change has not been answered yet.
+    ///
+    /// A change of tip wakes every such long poll, and each answers on the new tip itself.
+    pub(crate) fn has_waiting_long_poll(&self) -> bool {
+        self.waiting_long_polls.load(Ordering::SeqCst) > 0
+    }
+
     pub(crate) fn reserve_mined_submission(
         &self,
         hash: block::Hash,
@@ -1122,6 +1162,7 @@ where
             miner_params.randomize_memo();
         }
         self.shared_template = SharedTemplate::default();
+        self.waiting_long_polls = Arc::default();
     }
 }
 

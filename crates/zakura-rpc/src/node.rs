@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tower::{buffer::Buffer, BoxError};
+use tracing::Instrument;
 
 use zakura_chain::{block, chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_consensus::RouterError;
@@ -151,6 +152,11 @@ pub fn new_rpc_impl(
     let rpc_impl = rpc_impl
         .with_pending_blocks(pending_blocks)
         .with_end_of_support_height(end_of_support_height);
+
+    // Build each new tip's mining template ahead of the requests for it. The task ends by
+    // itself: at once without a miner address, otherwise when the chain tip channel closes or
+    // the node shuts down.
+    tokio::spawn(rpc_impl.clone().run_template_builder().in_current_span());
 
     (rpc_impl, rpc_tx_queue_handle)
 }

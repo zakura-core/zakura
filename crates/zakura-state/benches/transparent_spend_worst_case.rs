@@ -168,6 +168,7 @@ fn benchmark_fixture(
         origin: zakura_state::BlockOrigin::Network,
         auth_data_root: None,
         receipt_order: None,
+        parent_utxos: Default::default(),
     };
 
     (block, prepared, spent_utxos)

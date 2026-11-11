@@ -8,7 +8,7 @@
 //! verification, where it may be accepted or rejected.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -682,7 +682,7 @@ where
                 let parent = block.header().previous_block_hash;
                 // Kept apart from `known_utxos`, which also becomes the block's `new_outputs`
                 // and carries the in-block ordering of each output.
-                let mut parent_utxos = Arc::new(HashMap::new());
+                let mut parent_utxos = Arc::new(zs::ParentUtxos::default());
                 if !external_inputs.is_empty() {
                     match check_parent_inputs(
                         state_service.clone(),
@@ -737,8 +737,6 @@ where
                         });
                     async_checks.push(rsp);
                 }
-                // Free the outputs as soon as the last transaction check finishes with them.
-                drop(parent_utxos);
                 tracing::trace!(len = async_checks.len(), "built async tx checks");
 
                 // Get the transaction results back from the transaction verifier.
@@ -871,6 +869,8 @@ where
                     deferred_pool_balance_change: Some(deferred_pool_balance_change),
                     auth_data_root: Some(auth_data_digests.root),
                     receipt_order,
+                    // Contextual validation reuses these outputs instead of reading them again.
+                    parent_utxos,
                 };
 
                 // Return early for proposal requests.

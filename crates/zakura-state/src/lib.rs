@@ -69,7 +69,7 @@ pub use request::Spend;
 
 pub use response::{
     AnyTx, AuthDataCommitment, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock,
-    MinedTx, NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs,
+    MinedTx, NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs, ParentUtxos,
     PreparedMinedRelayEligibility, ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]

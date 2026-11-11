@@ -656,6 +656,7 @@ fn test_block_db_round_trip_with(
                 origin: crate::BlockOrigin::Network,
                 auth_data_root: None,
                 receipt_order: None,
+                parent_utxos: Default::default(),
             })
         };
 

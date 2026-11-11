@@ -1746,17 +1746,21 @@ async fn parent_outputs_stay_out_of_the_in_block_ordering_check() {
     Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
     let block = Arc::new(block);
 
-    let parent_utxos: Arc<HashMap<_, _>> = Arc::new(
+    let parent_utxos = Arc::new(zs::ParentUtxos::new_for_test(
+        block.header.previous_block_hash,
         [external(1), external(2)]
             .into_iter()
             .map(|outpoint| {
                 (
                     outpoint,
-                    transparent::Utxo::new(output.clone(), height, false),
+                    transparent::OrderedUtxo::from_utxo(
+                        transparent::Utxo::new(output.clone(), height, false),
+                        1,
+                    ),
                 )
             })
             .collect(),
-    );
+    ));
     let committed = Arc::new(Mutex::new(None));
     let state = service_fn({
         let parent_utxos = parent_utxos.clone();
@@ -1827,6 +1831,8 @@ async fn parent_outputs_stay_out_of_the_in_block_ordering_check() {
     assert_eq!(committed.new_outputs[&later_output].tx_index_in_block, 2);
     assert!(!committed.new_outputs.contains_key(&external(1)));
     assert!(!committed.new_outputs.contains_key(&external(2)));
+    // State reuses the parent outputs instead of reading them again.
+    assert_eq!(committed.parent_utxos, parent_utxos);
 }
 
 #[tokio::test]

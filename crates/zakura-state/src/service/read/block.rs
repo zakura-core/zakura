@@ -31,11 +31,11 @@ use zakura_chain::{
     block_info::BlockInfo,
     serialization::ZcashSerialize as _,
     transaction::{self},
-    transparent::{self, Utxo},
+    transparent::{self, OrderedUtxo, Utxo},
 };
 
 use crate::{
-    response::{AnyTx, MinedTx, ParentInputs},
+    response::{AnyTx, MinedTx, ParentInputs, ParentUtxos},
     service::{
         finalized_state::ZakuraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -399,29 +399,6 @@ pub fn transaction_hashes_for_any_block<'a>(
         })
 }
 
-/// Returns the [`Utxo`] for [`transparent::OutPoint`], if it exists in the
-/// non-finalized `chain` or finalized `db`.
-///
-/// Non-finalized UTXOs are returned regardless of whether they have been spent.
-///
-/// Finalized UTXOs are only returned if they are unspent in the finalized chain.
-/// They may have been spent in the non-finalized chain,
-/// but this function returns them without checking for non-finalized spends,
-/// because we don't know which non-finalized chain will be committed to the finalized state.
-pub fn utxo<C>(chain: Option<C>, db: &ZakuraDb, outpoint: transparent::OutPoint) -> Option<Utxo>
-where
-    C: AsRef<Chain>,
-{
-    // # Correctness
-    //
-    // Since UTXOs are the same in the finalized and non-finalized state,
-    // we check the most efficient alternative first. (`chain` is always in
-    // memory, but `db` stores transactions on disk, with a memory cache.)
-    chain
-        .and_then(|chain| chain.as_ref().created_utxo(&outpoint))
-        .or_else(|| db.utxo(&outpoint).map(|utxo| utxo.utxo))
-}
-
 /// Returns the [`Utxo`] for [`transparent::OutPoint`], if it exists and is unspent in the
 /// non-finalized `chain` or finalized `db`.
 pub fn unspent_utxo<C>(
@@ -432,9 +409,27 @@ pub fn unspent_utxo<C>(
 where
     C: AsRef<Chain>,
 {
+    unspent_ordered_utxo(chain, db, outpoint).map(|ordered_utxo| ordered_utxo.utxo)
+}
+
+/// Returns the [`OrderedUtxo`] for [`transparent::OutPoint`], if it exists and is unspent in
+/// the non-finalized `chain` or finalized `db`.
+///
+/// This is [`unspent_utxo`] with the index of the transaction that created the output, which
+/// contextual validation needs to record the block's spent outputs.
+fn unspent_ordered_utxo<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    outpoint: transparent::OutPoint,
+) -> Option<OrderedUtxo>
+where
+    C: AsRef<Chain>,
+{
     match chain {
         Some(chain) if chain.as_ref().spent_utxos.contains_key(&outpoint) => None,
-        chain => utxo(chain, db, outpoint),
+        chain => chain
+            .and_then(|chain| chain.as_ref().created_ordered_utxo(&outpoint).cloned())
+            .or_else(|| db.utxo(&outpoint)),
     }
 }
 
@@ -480,8 +475,8 @@ const MAX_KEPT_PARENT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The result of reading one input in [`read_parent_inputs`].
 enum ParentInputRead {
-    /// The output, kept for the transaction checks.
-    Kept(Utxo),
+    /// The output, kept for the transaction and contextual checks.
+    Kept(OrderedUtxo),
     /// The output exists, but keeping it would pass the byte limit.
     Dropped,
     /// The output is not unspent at the parent.
@@ -490,7 +485,7 @@ enum ParentInputRead {
     Skipped,
 }
 
-/// Reads `outpoints` with `lookup`, which returns an output if it is unspent at the parent.
+/// Reads `outpoints` with `lookup`, which returns an output if it is unspent at `parent`.
 ///
 /// Returns [`ParentInputs::Missing`] with the first missing input in `outpoints` order, or
 /// [`ParentInputs::Unspent`] if every input was found, retaining only outputs whose locking
@@ -498,9 +493,10 @@ enum ParentInputRead {
 /// already known to be missing are not read, so an invalid block can't
 /// make this keep more than `max_kept_bytes` of scripts.
 fn read_parent_inputs(
+    parent: block::Hash,
     outpoints: &[transparent::OutPoint],
     max_kept_bytes: usize,
-    lookup: impl Fn(&transparent::OutPoint) -> Option<Utxo> + Sync,
+    lookup: impl Fn(&transparent::OutPoint) -> Option<OrderedUtxo> + Sync,
 ) -> ParentInputs {
     let mut seen = HashSet::with_capacity(outpoints.len());
     let outpoints: Vec<transparent::OutPoint> = outpoints
@@ -521,7 +517,7 @@ fn read_parent_inputs(
             first_missing.fetch_min(index, Ordering::Relaxed);
             return ParentInputRead::Missing;
         };
-        let size = utxo.output.lock_script.as_raw_bytes().len();
+        let size = utxo.utxo.output.lock_script.as_raw_bytes().len();
         let fits = kept_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
                 kept.checked_add(size)
@@ -559,7 +555,7 @@ fn read_parent_inputs(
             ParentInputRead::Dropped | ParentInputRead::Skipped => {}
         }
     }
-    ParentInputs::Unspent(Arc::new(utxos))
+    ParentInputs::Unspent(Arc::new(ParentUtxos::new(parent, utxos)))
 }
 
 /// Checks `outpoints` against the UTXO set at `parent`.
@@ -579,8 +575,8 @@ pub fn parent_inputs(
     outpoints: &[transparent::OutPoint],
 ) -> ParentInputs {
     let read_inputs = |chain: Option<&Arc<Chain>>| {
-        read_parent_inputs(outpoints, MAX_KEPT_PARENT_INPUT_BYTES, |outpoint| {
-            unspent_utxo(chain, db, *outpoint)
+        read_parent_inputs(parent, outpoints, MAX_KEPT_PARENT_INPUT_BYTES, |outpoint| {
+            unspent_ordered_utxo(chain, db, *outpoint)
         })
     };
 
@@ -742,6 +738,9 @@ mod tests {
 
     use super::*;
 
+    /// The parent every test read is relative to.
+    const PARENT: block::Hash = block::Hash([3; 32]);
+
     /// Returns `count` distinct outpoints.
     fn outpoints(count: usize) -> Vec<transparent::OutPoint> {
         (0..count)
@@ -753,14 +752,14 @@ mod tests {
     }
 
     /// Returns an output with a `script_len`-byte locking script.
-    fn utxo(script_len: usize) -> Utxo {
-        Utxo::new(
+    fn utxo(script_len: usize) -> OrderedUtxo {
+        OrderedUtxo::new(
             transparent::Output {
                 value: Amount::zero(),
                 lock_script: Script::new(&vec![0; script_len]),
             },
             Height(1),
-            false,
+            1,
         )
     }
 
@@ -771,7 +770,7 @@ mod tests {
             let inputs = outpoints(count);
 
             let ParentInputs::Unspent(utxos) =
-                read_parent_inputs(&inputs, usize::MAX, |_| Some(utxo(1)))
+                read_parent_inputs(PARENT, &inputs, usize::MAX, |_| Some(utxo(1)))
             else {
                 panic!("every input exists, so {count} inputs are unspent");
             };
@@ -779,7 +778,7 @@ mod tests {
 
             let (first, second) = (inputs[count / 2], inputs[count - 1]);
             assert_eq!(
-                read_parent_inputs(&inputs, usize::MAX, |outpoint| {
+                read_parent_inputs(PARENT, &inputs, usize::MAX, |outpoint| {
                     (*outpoint != first && *outpoint != second).then(|| utxo(1))
                 }),
                 ParentInputs::Missing(first),
@@ -795,30 +794,34 @@ mod tests {
         let total = inputs.len() * 10;
 
         assert!(matches!(
-            read_parent_inputs(&inputs, total, |_| Some(utxo(10))),
+            read_parent_inputs(PARENT, &inputs, total, |_| Some(utxo(10))),
             ParentInputs::Unspent(_)
         ));
         let ParentInputs::Unspent(kept) =
-            read_parent_inputs(&inputs, total - 1, |_| Some(utxo(10)))
+            read_parent_inputs(PARENT, &inputs, total - 1, |_| Some(utxo(10)))
         else {
             panic!("all inputs exist even when their scripts exceed the retention budget");
         };
         assert_eq!(kept.len(), inputs.len() - 1);
         assert!(
-            kept.values()
+            inputs
+                .iter()
+                .filter_map(|outpoint| kept.get(outpoint))
                 .map(|utxo| utxo.output.lock_script.as_raw_bytes().len())
                 .sum::<usize>()
                 < total
         );
 
-        let ParentInputs::Unspent(kept) = read_parent_inputs(&inputs, 0, |_| Some(utxo(10))) else {
+        let ParentInputs::Unspent(kept) =
+            read_parent_inputs(PARENT, &inputs, 0, |_| Some(utxo(10)))
+        else {
             panic!("a zero retention budget still checks every input");
         };
         assert!(kept.is_empty());
 
         let missing = inputs[inputs.len() - 1];
         assert_eq!(
-            read_parent_inputs(&inputs, 0, |outpoint| (*outpoint != missing)
+            read_parent_inputs(PARENT, &inputs, 0, |outpoint| (*outpoint != missing)
                 .then(|| utxo(10))),
             ParentInputs::Missing(missing)
         );
@@ -833,7 +836,7 @@ mod tests {
             let inputs = outpoints(count);
             let lookups = AtomicUsize::new(0);
             let ParentInputs::Unspent(kept) =
-                read_parent_inputs(&inputs, MAX_KEPT_PARENT_INPUT_BYTES, |_| {
+                read_parent_inputs(PARENT, &inputs, MAX_KEPT_PARENT_INPUT_BYTES, |_| {
                     lookups.fetch_add(1, Ordering::Relaxed);
                     Some(utxo(script_len))
                 })
@@ -851,7 +854,7 @@ mod tests {
     fn repeated_and_later_inputs_are_not_read() {
         let lookups = AtomicUsize::new(0);
         let repeated = vec![outpoints(1)[0]; MIN_WIDE_PARENT_INPUT_READS];
-        read_parent_inputs(&repeated, usize::MAX, |_| {
+        read_parent_inputs(PARENT, &repeated, usize::MAX, |_| {
             lookups.fetch_add(1, Ordering::Relaxed);
             Some(utxo(1))
         });
@@ -860,7 +863,7 @@ mod tests {
         let lookups = AtomicUsize::new(0);
         let inputs = outpoints(MIN_PARALLEL_PARENT_INPUT_READS - 1);
         assert_eq!(
-            read_parent_inputs(&inputs, usize::MAX, |_| {
+            read_parent_inputs(PARENT, &inputs, usize::MAX, |_| {
                 lookups.fetch_add(1, Ordering::Relaxed);
                 None
             }),

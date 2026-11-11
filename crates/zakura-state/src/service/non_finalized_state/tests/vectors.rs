@@ -1625,6 +1625,50 @@ fn equal_work_prefers_first_receipt_through_forks_and_reconsideration() {
     }
 }
 
+/// A block below a fork is on every chain that shares it. Updating the backup leaves that
+/// block's file alone when it is already on disk, however many chains hold the block.
+#[test]
+fn backup_update_does_not_rewrite_a_block_shared_by_two_chains() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let root = Arc::new(network.test_block(653599, 583999).unwrap());
+    let tip_a = root.make_fake_child().set_work(10);
+    let tip_b = root.make_fake_child().set_work(11);
+
+    let (mut state, finalized) = new_invalidate_test_state(&network);
+    state
+        .commit_new_chain(root.clone().prepare(), &finalized.db)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(tip_a.prepare(), &finalized.db)
+        .expect("first tip should extend the root chain");
+    state
+        .commit_block(tip_b.prepare(), &finalized.db)
+        .expect("second tip should fork from the root chain");
+    assert_eq!(state.chain_count(), 2, "both chains hold the root block");
+
+    let backup = tempfile::tempdir().unwrap();
+    state.write_to_backup(backup.path());
+
+    // Mark the root's file, so a second write of it would show.
+    let root_file = backup.path().join(root.hash().to_string());
+    let marker = b"already backed up";
+    std::fs::write(&root_file, marker).unwrap();
+
+    state.write_to_backup(backup.path());
+
+    assert_eq!(
+        std::fs::read(&root_file).unwrap(),
+        marker,
+        "a block that is already backed up is not written again"
+    );
+    assert_eq!(
+        std::fs::read_dir(backup.path()).unwrap().count(),
+        3,
+        "the root and both tips stay backed up"
+    );
+}
+
 #[test]
 fn receipt_fallback_and_backup_restore_ignore_replay_order() {
     let _init_guard = zakura_test::init();

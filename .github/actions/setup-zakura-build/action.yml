@@ -19,8 +19,27 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Verify prepared temporary runner packages
+      if: runner.os == 'Linux' && vars.TEMPORARY_PR_CI == 'true' && startsWith(runner.name, 'zakura-ci-temporary-')
+      shell: bash
+      env:
+        INSTALL_LIBCLANG: ${{ inputs.libclang }}
+        INSTALL_PROTOC: ${{ inputs.protoc }}
+      run: |
+        packages=(librocksdb-dev)
+        if [[ "$INSTALL_LIBCLANG" == true ]]; then
+          packages+=(clang libclang-dev)
+        fi
+        if [[ "$INSTALL_PROTOC" == true ]]; then
+          packages+=(protobuf-compiler)
+        fi
+        for package in "${packages[@]}"; do
+          dpkg-query -W -f='${Status}\n' "$package" | grep -qx 'install ok installed'
+        done
+        echo 'ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu' >> "$GITHUB_ENV"
+
     - name: Install librocksdb-dev on Ubuntu
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && !(vars.TEMPORARY_PR_CI == 'true' && startsWith(runner.name, 'zakura-ci-temporary-'))
       shell: bash
       env:
         INSTALL_LIBCLANG: ${{ inputs.libclang }}

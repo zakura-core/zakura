@@ -7,8 +7,10 @@
 //! `getrawtransaction`, and transfers half as many bytes. `.hex` returns the same
 //! bytes as hex text followed by a newline, as zcashd does.
 //!
-//! The endpoints are enabled by `rpc.enable_rest`. They serve public chain data
-//! without authentication, like zcashd's and bitcoind's REST interface.
+//! Every RPC listener serves these endpoints, behind the same HTTP middleware as
+//! JSON-RPC. A listener with cookie authentication requires the cookie for REST
+//! requests too, unlike zcashd's and bitcoind's REST interface, which is always
+//! unauthenticated.
 
 use std::{
     future::Future,
@@ -38,13 +40,13 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct RestRouter<S, ReadState> {
     inner: S,
-    /// The state that answers REST requests, or `None` when REST is disabled.
-    read_state: Option<ReadState>,
+    /// The state that answers REST requests.
+    read_state: ReadState,
 }
 
 impl<S, ReadState> RestRouter<S, ReadState> {
-    /// Routes REST requests to `read_state` if it is set, and all other requests to `inner`.
-    pub fn new(inner: S, read_state: Option<ReadState>) -> Self {
+    /// Routes REST requests to `read_state`, and all other requests to `inner`.
+    pub fn new(inner: S, read_state: ReadState) -> Self {
         Self { inner, read_state }
     }
 }
@@ -65,19 +67,16 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
-        match &self.read_state {
-            Some(read_state) if request.uri().path().starts_with(REST_PREFIX) => {
-                let read_state = read_state.clone();
-                let method = request.method().clone();
-                let path = request.uri().path().to_owned();
-                Box::pin(async move { Ok(answer(read_state, &method, &path).await) })
-            }
-            _ => {
-                // `poll_ready` readied this service, so call it and leave a fresh clone.
-                let clone = self.inner.clone();
-                let mut ready = std::mem::replace(&mut self.inner, clone);
-                Box::pin(ready.call(request))
-            }
+        if request.uri().path().starts_with(REST_PREFIX) {
+            let read_state = self.read_state.clone();
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            Box::pin(async move { Ok(answer(read_state, &method, &path).await) })
+        } else {
+            // `poll_ready` readied this service, so call it and leave a fresh clone.
+            let clone = self.inner.clone();
+            let mut ready = std::mem::replace(&mut self.inner, clone);
+            Box::pin(ready.call(request))
         }
     }
 }

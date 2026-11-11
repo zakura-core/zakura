@@ -155,18 +155,6 @@ pub struct Config {
 
     /// Optional TLS configuration for the primary RPC listener.
     pub tls: Option<TlsConfig>,
-
-    /// Serve raw blocks and transactions as binary on the primary RPC listener,
-    /// like zcashd's and bitcoind's `-rest` interface:
-    ///
-    /// - `GET /rest/block/<hash>.bin` or `.hex`
-    /// - `GET /rest/tx/<txid>.bin` or `.hex`
-    ///
-    /// These endpoints serve public chain data without authentication, like
-    /// bitcoind's REST interface, so they are disabled by default. They return the
-    /// stored consensus encoding, without the hex and JSON of `getblock` and
-    /// `getrawtransaction`.
-    pub enable_rest: bool,
 }
 
 /// TLS configuration for an RPC listener.
@@ -223,7 +211,6 @@ impl Default for Config {
 
             // 50 MiB
             max_response_body_size: 52_428_800,
-            enable_rest: false,
 
             // Serve plain HTTP unless a caller wires TLS explicitly.
             tls: None,

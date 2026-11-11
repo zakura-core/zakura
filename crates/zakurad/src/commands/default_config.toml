@@ -150,9 +150,6 @@ cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false
 enable_cookie_auth = true
-# Serves raw blocks and transactions at /rest/block/<hash>.bin and
-# /rest/tx/<txid>.bin without authentication, like zcashd's -rest.
-enable_rest = false
 max_response_body_size = 52428800
 parallel_cpu_threads = 0
 

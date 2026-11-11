@@ -13,7 +13,12 @@ use zakura_node_services::block_memory::{OwnedRawBlock, OwnedRawTransaction, Rea
 use zakura_state::{HashOrHeight, ReadRequest, ReadResponse};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use super::*;
+use super::{
+    super::{
+        cookie::Cookie, http::HttpBody, http_request_compatibility::HttpRequestMiddlewareLayer,
+    },
+    *,
+};
 
 fn retained<T: zakura_node_services::block_memory::DecodedSize>(
     value: T,
@@ -26,7 +31,7 @@ fn retained<T: zakura_node_services::block_memory::DecodedSize>(
 
 /// A router whose non-REST requests answer `inner`.
 fn router(
-    read_state: Option<MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>>,
+    read_state: MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
 ) -> impl Service<
     HttpRequest<()>,
     Response = HttpResponse,
@@ -109,7 +114,7 @@ async fn rest_serves_stored_bytes_and_passes_other_requests_on() {
     let txid = transaction.hash();
 
     let mut state = MockService::build().for_unit_tests();
-    let mut service = router(Some(state.clone()));
+    let mut service = router(state.clone());
 
     // A block, as binary and as hex.
     for (extension, expected, content_type) in [
@@ -191,20 +196,33 @@ async fn rest_serves_stored_bytes_and_passes_other_requests_on() {
     assert_eq!((status, bytes), (StatusCode::OK, b"inner".to_vec()));
 }
 
+/// A listener with cookie authentication refuses REST requests without the cookie,
+/// before they read the state.
 #[tokio::test]
-async fn disabled_rest_passes_rest_paths_on() {
+async fn rest_requires_the_listeners_cookie() {
     let _init_guard = zakura_test::init();
 
-    let mut service = router(None);
-    let (status, _, bytes) = read(
-        service
-            .ready()
-            .await
-            .unwrap()
-            .call(get("/rest/block/00.bin"))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!((status, bytes), (StatusCode::OK, b"inner".to_vec()));
+    let mut state: MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError> =
+        MockService::build().for_unit_tests();
+    let inner = service_fn(|_: HttpRequest| async {
+        Ok::<_, BoxError>(body(StatusCode::OK, b"inner".to_vec(), "text/plain"))
+    });
+    let mut service = tower::ServiceBuilder::new()
+        .layer(HttpRequestMiddlewareLayer::new(
+            Some(Cookie::default()),
+            1024,
+        ))
+        .service(RestRouter::new(inner, state.clone()));
+
+    let hash = "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08";
+    let request = hyper::Request::get(format!("/rest/block/{hash}.bin"))
+        .body(HttpBody::default())
+        .expect("valid request");
+    let response = service.call(request).await;
+
+    assert!(
+        response.is_err(),
+        "unauthenticated REST requests are refused"
+    );
+    state.expect_no_requests().await;
 }

@@ -294,11 +294,23 @@ fn hex(bytes: &[u8]) -> String {
 #[test]
 fn handshake_family_selectors_cover_every_decoder_branch() {
     use zakura_sim::harness::{handshake_wire::Wire, Subsystem};
+    // The first byte, modulo ten, selects a one-byte family. The QUIC
+    // families take two-byte tags whose first byte, 253 or 254, the decoder
+    // reserves, so those bytes alias no one-byte family.
+    const RESERVED: [u8; 2] = [253, 254];
     let families = Wire::families();
-    assert_eq!(families.len(), 10);
-    for (index, family) in families.iter().enumerate() {
+    assert_eq!(families.len(), 15);
+    let (single, quic) = families.split_at(10);
+    for family in quic {
+        assert_eq!(family.tag.len(), 2);
+        assert!(RESERVED.contains(&family.tag[0]), "{}", family.name);
+    }
+    for (index, family) in single.iter().enumerate() {
         assert_eq!(family.tag, [u8::try_from(index).unwrap()]);
-        for alias in (index..=255).step_by(10) {
+        for alias in (index..=255)
+            .step_by(10)
+            .filter(|alias| !RESERVED.contains(&u8::try_from(*alias).unwrap()))
+        {
             let mut prefix = [173; Wire::SCENARIO_BYTES];
             prefix[0] = u8::try_from(alias).unwrap();
             let scenario = Wire::draw(&prefix);

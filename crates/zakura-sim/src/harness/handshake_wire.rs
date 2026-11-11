@@ -90,7 +90,7 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 10;
+    const GENERATOR: u32 = 11;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
@@ -554,7 +554,8 @@ impl Subsystem for Wire {
         }
         for (index, peer) in scenario.peers.iter_mut().enumerate() {
             let mut script = script.clone();
-            if byte(0) % 8 == 5 {
+            // The retry family staggers its dialers.
+            if byte(0) % 10 == 5 {
                 script.dial_delay_ms =
                     u64::try_from(index).expect("peer index fits u64") * u64::from(byte(6)) * 4;
             }

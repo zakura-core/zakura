@@ -435,6 +435,26 @@ fn a_row_past_its_bound_breaks() {
     assert!(breaks[0].contains("17 slots"), "{breaks:?}");
 }
 
+/// The pruned-peer map holds up to the admitted peer limit, as #2209 caps
+/// it, and breaks past it.
+#[test]
+fn pruned_peers_past_the_peer_limit_break() {
+    let mut rule = rule();
+    rule.observe(&sizes(|sizes| {
+        sizes.pruned_peers = (0..8).map(|n| mirror(n + 10)).collect();
+    }));
+    assert_eq!(rule.drain(1), Vec::<String>::new());
+    rule.observe(&sizes(|sizes| {
+        sizes.pruned_peers = (0..9).map(|n| mirror(n + 10)).collect();
+    }));
+    let breaks = rule.drain(2);
+    assert_eq!(breaks.len(), 1, "{breaks:?}");
+    assert!(
+        breaks[0].contains("9 pruned peers, past its 8"),
+        "{breaks:?}"
+    );
+}
+
 /// Open locator calls past the 16 permits break the rule, even when each
 /// has its port future.
 #[test]

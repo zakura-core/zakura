@@ -335,6 +335,7 @@ fn decode_as(
                 } else {
                     Dialer::Node
                 },
+                max_headers_per_response: None,
             })
             .collect(),
         policy: Policy {
@@ -505,6 +506,11 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         .iter()
         .zip(header[MIRRORS..].as_chunks_mut::<MIRROR>().0)
     {
+        if let Some(limit) = spec.max_headers_per_response {
+            return Err(Unencodable(format!(
+                "a mirror's response limit is {limit}, which the grammar can't express"
+            )));
+        }
         encode_chain(&spec.chain, &mut record[..3])?;
         record[3] = match spec.dialer {
             Dialer::Mirror => 0,

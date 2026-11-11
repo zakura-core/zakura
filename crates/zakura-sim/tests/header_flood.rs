@@ -129,6 +129,7 @@ fn scenario(controls: Vec<ControlStep>) -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(4),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy::converging(),
         controls,
@@ -248,6 +249,7 @@ fn flooded(action: ControlAction) -> StorageScenario {
         MirrorSpec {
             chain: Chain::main(4),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         };
         FLOODERS
     ];
@@ -406,6 +408,7 @@ fn a_shutdown_during_churn_stops_it_cleanly() {
     scenario.mirrors.push(MirrorSpec {
         chain: Chain::main(4),
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     });
     for input in support::inputs(32, 256) {
         run(&scenario, input);

@@ -50,6 +50,7 @@ fn fork(branch: u8, len: u32, dialer: Dialer) -> MirrorSpec {
             fork: Some(Fork { branch, len }),
         },
         dialer,
+        max_headers_per_response: None,
     }
 }
 
@@ -101,6 +102,7 @@ pub fn three_forks() -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(4),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
             fork(1, 5, Dialer::Node),
             fork(2, 3, Dialer::Mirror),
@@ -187,6 +189,7 @@ pub fn harness_commit() -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::default(),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy::converging(),
         controls: vec![node_step(ControlAction::Commit { len: 2 }, None)],

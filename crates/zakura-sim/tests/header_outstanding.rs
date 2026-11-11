@@ -106,16 +106,17 @@ fn the_witnesses_hold_under_generated_plans() {
 
 /// The limit fixtures. The slot and locator fixtures have 17 mirrors, each
 /// at its own height of the main chain so each offers a distinct target. In
-/// the slot fixture storage holds
-/// every prepare for the run, so the queue fills its 16 slots and the 17th
-/// offer waits. In the locator fixture storage holds every locator read
-/// until 16 are submitted, so the reads fill the 16 permits and the 17th
-/// waits. In the serving fixture 11 mirrors sit below the node, so the
-/// node serves each of them, and storage holds every serving read until 8
-/// are submitted, so the reads fill the node's 8 execution slots and the
-/// rest wait. Each row reaches its limit and no further. The harness's step
-/// budget ends these runs before release and reuse, which the committed
-/// witnesses cover at their own scale.
+/// the slot fixture storage holds every prepare for the run, and each
+/// mirror advertises 235 headers per response, so 17 rounds' reservations
+/// fit the 4,000-header chunk budget. The queue fills its 16 slots, and the
+/// slot cap, not the budget, holds the 17th offer back. In the locator
+/// fixture storage holds every locator read until 16 are submitted, so the
+/// reads fill the 16 permits and the 17th waits. In the serving fixture 11
+/// mirrors sit below the node, so the node serves each of them, and storage
+/// holds every serving read until 8 are submitted, so the reads fill the
+/// node's 8 execution slots and the rest wait. Each row reaches its limit
+/// and no further. The harness's step budget ends these runs before release
+/// and reuse, which the committed witnesses cover at their own scale.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
     for (stem, row, limit, sessions) in [

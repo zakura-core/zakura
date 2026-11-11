@@ -200,6 +200,7 @@ fn overlapping_relinks_each_name_their_own_connection() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: zakura_sim::harness::header_node::Chain::main(4),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         controls: vec![
             ControlStep {

@@ -105,7 +105,11 @@ impl Subsystem for Viewed {
 
 /// A mirror holding `chain`, which `dialer` links.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// `peer`'s control step `action`, offered once `when` holds, or at once.

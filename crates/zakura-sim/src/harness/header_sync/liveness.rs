@@ -233,6 +233,7 @@ impl RecoveryFixture {
         let mirror = |chain| MirrorSpec {
             chain,
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         };
         let fork = |main, len| Chain {
             main,
@@ -592,6 +593,7 @@ impl LivenessScenario {
                 scenario.mirrors.push(MirrorSpec {
                     chain: Chain::main(1),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 });
                 scenario.controls[0].when = Some(Trigger::All(vec![
                     Trigger::Submitted(Select::nth(kind.op(), 1)),
@@ -724,6 +726,7 @@ fn level() -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(3),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy::converging(),
         controls: Vec::new(),
@@ -751,6 +754,7 @@ fn serving(then: Allow, mirror: u32) -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(mirror),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy {
             holds: vec![Hold {
@@ -879,10 +883,12 @@ fn departure(stage: Stage, by: Departs) -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(6),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
             MirrorSpec {
                 chain: Chain::main(3),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
         ],
         policy: Policy {
@@ -901,6 +907,7 @@ fn held(kind: OpKind) -> StorageScenario {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(6),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         policy: Policy {
             holds: vec![Hold {

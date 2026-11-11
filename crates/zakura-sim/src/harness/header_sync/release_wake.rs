@@ -75,6 +75,7 @@ impl WakeScenario {
             scenario.mirrors.push(MirrorSpec {
                 chain: Chain::main(NODE_TIP),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             });
             // Control steps run in order, so these come before
             // `mirror-2`'s growth. `linked` counts the setup link too.
@@ -117,6 +118,7 @@ fn release() -> StorageScenario {
             fork: Some(Fork { branch, len: 400 }),
         },
         dialer: Dialer::Mirror,
+        max_headers_per_response: None,
     };
     let control = |peer: &str, action, when| ControlStep {
         peer: peer.to_owned(),
@@ -131,6 +133,7 @@ fn release() -> StorageScenario {
             MirrorSpec {
                 chain: Chain::main(NODE_TIP),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             },
         ],
         policy: Policy {

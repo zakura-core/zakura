@@ -77,7 +77,11 @@ fn requests(report: &RunReport) -> Vec<StorageRequest> {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// The hex peer identity of the actor whose key is `seed` repeated, as

@@ -217,6 +217,12 @@ pub struct MirrorSpec {
     pub chain: Chain,
     /// Which end of its link to the node dials.
     pub dialer: Dialer,
+    /// The most headers its `Status` says it serves in one response, or
+    /// production's default when unset. The node reserves each round's
+    /// share from this, so a smaller value lets more rounds fit the chunk
+    /// budget at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_headers_per_response: Option<u32>,
 }
 
 /// How much more work each header of fork branches 1 and 2 carries. A
@@ -283,6 +289,7 @@ impl Default for StorageScenario {
             mirrors: vec![MirrorSpec {
                 chain: Chain::main(5),
                 dialer: Dialer::Mirror,
+                max_headers_per_response: None,
             }],
             policy: Policy::converging(),
             controls: Vec::new(),
@@ -303,6 +310,7 @@ impl StorageScenario {
                 MirrorSpec {
                     chain: Chain::main(5),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain {
@@ -310,6 +318,7 @@ impl StorageScenario {
                         fork: Some(Fork { branch: 1, len: 4 }),
                     },
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
             ],
             controls: vec![
@@ -344,10 +353,12 @@ impl StorageScenario {
                 MirrorSpec {
                     chain: Chain::main(5),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::main(1),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain {
@@ -355,6 +366,7 @@ impl StorageScenario {
                         fork: Some(Fork { branch: 2, len: 3 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
             ],
             controls: vec![
@@ -396,10 +408,12 @@ impl StorageScenario {
                 MirrorSpec {
                     chain: Chain::main(6),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::main(4),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain {
@@ -407,10 +421,12 @@ impl StorageScenario {
                         fork: Some(Fork { branch: 1, len: 5 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::default(),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {
@@ -466,6 +482,7 @@ impl StorageScenario {
                 MirrorSpec {
                     chain: Chain::main(9),
                     dialer: Dialer::Node,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain {
@@ -473,6 +490,7 @@ impl StorageScenario {
                         fork: Some(Fork { branch: 2, len: 6 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {
@@ -1268,7 +1286,11 @@ impl Subsystem for Storage {
             let name = format!("mirror-{index}");
             // The served-page rule reads each mirror's `Open`s.
             let observer = ports.publication.subscriber(&name);
-            nodes.push(HeaderNode::spawn(
+            let mut config = ZakuraHeaderSyncConfig::default();
+            if let Some(limit) = spec.max_headers_per_response {
+                config.max_headers_per_response = limit;
+            }
+            nodes.push(HeaderNode::spawn_configured(
                 sim,
                 &name,
                 seed,
@@ -1277,6 +1299,7 @@ impl Subsystem for Storage {
                 spec.chain.tip(&ports.fixture),
                 dispatch.clone(),
                 Some(observer),
+                config,
             ));
         }
         let cooldown = nodes[0].startup.config.unproductive_peer_cooldown;
@@ -2384,6 +2407,7 @@ mod tests {
                 .map(|chain| MirrorSpec {
                     chain,
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 })
                 .collect(),
             policy: Policy {

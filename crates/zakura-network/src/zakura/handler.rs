@@ -3263,12 +3263,6 @@ impl ZakuraProtocolHandler {
         self
     }
 
-    #[cfg(test)]
-    async fn accept_connection(&self, connection: Connection) {
-        let claim = self.claim_inbound(&connection, false);
-        self.serve_inbound(connection, claim).await;
-    }
-
     /// Moves an inbound connection from the transport's pending count into
     /// this handler's own accounting (zakura-quic ADM-7).
     ///
@@ -8406,6 +8400,8 @@ mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
     mod frame_lifetime;
+    #[cfg(not(zakura_sim))]
+    mod handshake_cost;
     mod quic_progress;
     mod read_close_cause;
     mod transport_observer;

@@ -29,7 +29,8 @@
 # `Active` block-sync, block and discovery ID appears in exactly one entry
 # or under `[[excluded]]`, and that each protocol table appears once.
 # `scripts/mutation_inventory.py` checks each generated case against this
-# file.
+# file. The `[[no-generator]]` records at the end say which IDs no
+# generator harness reaches (mutation plan, mut-4.2).
 
 schema = 1
 
@@ -324,3 +325,77 @@ witness = { planted = "qa/planted/discovery/late-response-admitted/revoke-on-tim
 [[excluded]]
 property = "block-sync/reactor-query-lifecycle"
 reason = "Draft: the claim itself is under test, so its violation doesn't end a run."
+
+# Each `[[no-generator]]` names `Active` IDs that no generator harness can
+# reach, and why. A generator harness is one that reports the ID and doesn't
+# plant its bugs (`zakura-sim generators`); every ID here has one, but its
+# grammar never builds the run the ID applies to. `cargo xtask planted loop
+# --generate-harness auto` gives these IDs' cases no generator lane and
+# reports the reason instead. `crates/zakura-sim/tests/mutation_work_list.rs`
+# checks that every in-scope `Active` ID has a generator harness or a record
+# here.
+
+[[no-generator]]
+reason = "Each ID applies only when a peer sends a frame that stream 6's table refuses. block-sync/storage, the only harness that reports these IDs, draws honest mirrors only. Its hostile frames come from `ProbeSend` control steps, which no drawn scenario carries: only typed scenarios and the `block_table` tests build them. A 50-run `zakura-sim generate` on seed 11 applied none of them."
+properties = [
+    "block-sync/s6v3/block/bad-content-closes",
+    "block-sync/s6v3/block/long-payload-closes",
+    "block-sync/s6v3/block/over-owed-closes",
+    "block-sync/s6v3/block/reserved-flags-closes",
+    "block-sync/s6v3/block/short-payload-closes",
+    "block-sync/s6v3/block/unsolicited-closes",
+    "block-sync/s6v3/blocks-done/bad-content-closes",
+    "block-sync/s6v3/blocks-done/long-payload-closes",
+    "block-sync/s6v3/blocks-done/over-owed-closes",
+    "block-sync/s6v3/blocks-done/reserved-flags-closes",
+    "block-sync/s6v3/blocks-done/short-payload-closes",
+    "block-sync/s6v3/blocks-done/unsolicited-closes",
+    "block-sync/s6v3/get-blocks/bad-content-closes",
+    "block-sync/s6v3/get-blocks/long-payload-closes",
+    "block-sync/s6v3/get-blocks/over-margin-closes",
+    "block-sync/s6v3/get-blocks/reserved-flags-closes",
+    "block-sync/s6v3/get-blocks/short-payload-closes",
+    "block-sync/s6v3/range-unavailable/bad-content-closes",
+    "block-sync/s6v3/range-unavailable/long-payload-closes",
+    "block-sync/s6v3/range-unavailable/over-owed-closes",
+    "block-sync/s6v3/range-unavailable/reserved-flags-closes",
+    "block-sync/s6v3/range-unavailable/short-payload-closes",
+    "block-sync/s6v3/range-unavailable/unsolicited-closes",
+    "block-sync/s6v3/status/bad-content-closes",
+    "block-sync/s6v3/status/long-payload-closes",
+    "block-sync/s6v3/status/reserved-flags-closes",
+    "block-sync/s6v3/status/short-payload-closes",
+    "block-sync/s6v3/undeclared-type-closes",
+]
+
+[[no-generator]]
+reason = "Each ID applies only when a peer sends a frame that stream 4's table refuses. discovery/wire, the only harness that reports these IDs, draws only its honest saved Plans and the default honest peer. Its refused frames come from the `discovery_wire_witness` tests' act scenarios, which its grammar can't encode."
+properties = [
+    "discovery/s4v2/get-peers/bad-content-closes",
+    "discovery/s4v2/get-peers/long-payload-closes",
+    "discovery/s4v2/get-peers/over-margin-closes",
+    "discovery/s4v2/get-peers/reserved-flags-closes",
+    "discovery/s4v2/get-peers/short-payload-closes",
+    "discovery/s4v2/get-services/bad-content-closes",
+    "discovery/s4v2/get-services/long-payload-closes",
+    "discovery/s4v2/get-services/over-margin-closes",
+    "discovery/s4v2/get-services/reserved-flags-closes",
+    "discovery/s4v2/get-services/short-payload-closes",
+    "discovery/s4v2/hello/bad-content-closes",
+    "discovery/s4v2/hello/long-payload-closes",
+    "discovery/s4v2/hello/reserved-flags-closes",
+    "discovery/s4v2/hello/short-payload-closes",
+    "discovery/s4v2/peers/bad-content-closes",
+    "discovery/s4v2/peers/long-payload-closes",
+    "discovery/s4v2/peers/over-owed-closes",
+    "discovery/s4v2/peers/reserved-flags-closes",
+    "discovery/s4v2/peers/short-payload-closes",
+    "discovery/s4v2/peers/unsolicited-closes",
+    "discovery/s4v2/services/bad-content-closes",
+    "discovery/s4v2/services/long-payload-closes",
+    "discovery/s4v2/services/over-owed-closes",
+    "discovery/s4v2/services/reserved-flags-closes",
+    "discovery/s4v2/services/short-payload-closes",
+    "discovery/s4v2/services/unsolicited-closes",
+    "discovery/s4v2/undeclared-type-closes",
+]

@@ -470,7 +470,7 @@ fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
         ),
         (
             idle(crate::IdleStatus::Deadlock, SchedulerStatus::Deadlock),
-            EndCheck::Open(open.clone()),
+            EndCheck::Unretired(open.clone()),
         ),
         (
             idle(crate::IdleStatus::Quiescent, SchedulerStatus::Quiescent),

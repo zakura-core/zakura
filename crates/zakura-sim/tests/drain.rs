@@ -959,12 +959,16 @@ fn a_periodic_timer_past_the_cap_does_not_move_the_drain() {
 }
 
 /// A bounded harness tail asleep on a timer within the cap, as a redial's
-/// 10 s settle is, is reached with nothing open, so the tail finishes in
-/// the drain instead of the drain going dry before it.
+/// 10 s settle is, is reached with nothing open in a harness that opts into
+/// the cap, so the tail finishes in the drain instead of the drain going
+/// dry before it.
 #[test]
 fn a_sleep_within_the_cap_is_reached() {
     let report = run(
-        config(2, 1),
+        RunConfig {
+            harness_timer_cap: zakura_sim::sim::HARNESS_TIMER_CAP,
+            ..config(2, 1)
+        },
         Plan::from_fuzz(&[]),
         |sim| {
             sim.scheduler().spawn_root("redial", async {

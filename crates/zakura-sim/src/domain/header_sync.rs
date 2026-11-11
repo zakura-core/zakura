@@ -1899,9 +1899,9 @@ mod tests {
     };
 
     /// Terra 3: a released round left stuck breaks the teardown rule only at
-    /// an end the scheduler settled at, never a worker-starved or
-    /// deadlocked one, where the ready task that would settle it never got
-    /// to run.
+    /// an end the scheduler settled at, a deadlocked one included, never a
+    /// worker-starved one, where the ready task that would settle it never
+    /// got to run.
     #[test]
     fn a_stuck_round_breaks_teardown_only_at_a_settled_end() {
         use zakura_scheduler::Status as SchedulerStatus;
@@ -1910,7 +1910,7 @@ mod tests {
             (SchedulerStatus::WaitingOnExternal, true),
             (SchedulerStatus::WaitingOnTime, true),
             (SchedulerStatus::WorkerStarved, false),
-            (SchedulerStatus::Deadlock, false),
+            (SchedulerStatus::Deadlock, true),
         ] {
             let rounds = SettlementEvidence::default();
             rounds.record(Settlement {

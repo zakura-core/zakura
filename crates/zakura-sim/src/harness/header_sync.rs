@@ -2331,13 +2331,9 @@ pub fn storage_config() -> RunConfig {
         // A drain took about 3,600 steps on the committed inputs, and over
         // 10,000 with 17 mirrors, so the bound leaves room for many more.
         drain_bound: 50_000,
-        // No harness tail here waits on a timer: controls run as queued,
-        // churn relinks by steps, and `Settle` and a recovery's cooldown
-        // offer recovery boundaries. A cap would only let the mirrors' and
-        // the node's periodic timers run the drain for 40 s, which a node
-        // wedged under 16 mirrors' `Status` timers, or one re-arming a 1 ms
-        // refill timer, can't finish within any bound.
-        harness_timer_cap: std::time::Duration::ZERO,
+        // No harness tail here waits on a timer, so the default zero cap
+        // holds: controls run as queued, churn relinks by steps, and
+        // `Settle` and a recovery's cooldown offer recovery boundaries.
         ..RunConfig::default()
     }
 }

@@ -53,9 +53,14 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// The property a run violates when it spins at one instant too long.
 pub const NO_LIVELOCK: &str = "sim/no-livelock";
 
-/// [`RunConfig::harness_timer_cap`]'s default: four times `sync/wire`'s
-/// 10-second redial settle, which covers its slowest bounded tail, every
-/// redial a connection has left. The peers' redial settles as long.
+/// The [`RunConfig::harness_timer_cap`] a harness with a bounded tail asleep
+/// on a timer opts into: four times `sync/wire`'s 10-second redial settle,
+/// which covers its slowest bounded tail, every redial a connection has
+/// left. The peers' redial settles as long. Only `sync/wire` has such a
+/// tail. The default is zero, since a cap lets a node that keeps
+/// re-arming a fast timer, such as a 1 ms refill, spend the drain's bound
+/// before an open check's deadline, a harness failure where its deadline
+/// would convict it.
 pub const HARNESS_TIMER_CAP: Duration = Duration::from_secs(40);
 
 /// Limits and settings for one run.
@@ -75,10 +80,11 @@ pub struct RunConfig {
     pub enforce_no_livelock: bool,
     /// How long after the drain starts a scheduler timer alone may still
     /// move its clock, with no obligation open and no recovery boundary
-    /// ahead.
-    /// It lets a bounded harness tail asleep on a timer, such as a redial's
-    /// settle, finish, and keeps a periodic timer from moving the clock
-    /// forever once nothing is left to judge.
+    /// ahead. Zero by default, so only an open check's deadline or a
+    /// recovery boundary moves it then. A harness whose bounded tail sleeps
+    /// on a timer, such as a redial's settle, opts into
+    /// [`HARNESS_TIMER_CAP`] so the tail finishes. Either way a periodic
+    /// timer never moves the clock forever once nothing is left to judge.
     pub harness_timer_cap: Duration,
 }
 
@@ -90,7 +96,7 @@ impl Default for RunConfig {
             drain_bound: 10_000,
             max_steps_per_instant: 100_000,
             enforce_no_livelock: false,
-            harness_timer_cap: HARNESS_TIMER_CAP,
+            harness_timer_cap: Duration::ZERO,
         }
     }
 }

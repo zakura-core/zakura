@@ -690,3 +690,46 @@ witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_targe
 property = "handshake/quic/identity-required"
 code = []
 witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-deadline"
+kind = "single"
+claim = "One deadline bounds the whole inbound control exchange."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/finishes-in-time"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-slow-control.bin" }
+
+
+[[entry]]
+id = "handshake-capability-generation"
+kind = "single"
+claim = "Registration rejects a capability snapshot that a concurrent change made obsolete."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/renegotiation-covers-inflight-handshakes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-capability-before.bin" }
+
+
+[[entry]]
+id = "handshake-cadence"
+kind = "shared-definition"
+claim = "TLS attempts consume available address credit, and funded attempts receive neutral admission."
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+shared = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/regulation/cadence.rs", "crates/zakura-quic/src/endpoint.rs"]
+
+[[entry.instance]]
+property = "handshake/attempts-within-cadence"
+code = []
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-burst.bin" }
+
+[[entry.instance]]
+property = "handshake/cadence-never-refuses-conformant"
+code = ["crates/zakura-network/src/zakura/discovery/redial.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-conformant.bin" }

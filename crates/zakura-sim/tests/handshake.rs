@@ -676,3 +676,48 @@ fn complete_session_transfers_setup_to_installed_owners() {
         "the installed outbound session must release its setup permit"
     );
 }
+
+#[test]
+fn pending_transport_load_exposes_outbound_control_overcommit() {
+    use zakura_sim::{
+        harness::{LinkEntry, LinkSpec},
+        peer::{PeerSpec, NODE_ADDR},
+    };
+    let mut scenario = Scenario::default();
+    scenario.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        loss_budget: 0,
+    };
+    scenario.peers = (0..8).map(|_| PeerSpec::dialing()).collect();
+    for (index, peer) in scenario.peers.iter().enumerate() {
+        scenario.net.links.push(LinkEntry {
+            src: NODE_ADDR,
+            dst: peer.address(index, 0),
+            model: LinkSpec {
+                min_delay_ms: 9_000,
+                max_delay_ms: 9_000,
+                ..scenario.net.default_link
+            },
+        });
+    }
+    scenario.peers.extend((0..32).map(|_| {
+        let mut peer = PeerSpec::listening();
+        peer.handshake = Some(HandshakeSpec {
+            dial_delay_ms: 20,
+            length_delay_ms: 8_000,
+            ..HandshakeSpec::default()
+        });
+        peer
+    }));
+    zakura_sim::witness::witness_into::<Wire>(
+        &scenario,
+        PlanInput::Bytes(Vec::new()),
+        "handshake/pending-bounded",
+        zakura_sim::witness::Expect::Violated,
+        &[],
+        &mut NullSink,
+    )
+    .unwrap();
+}

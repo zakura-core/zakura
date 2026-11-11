@@ -366,7 +366,9 @@ fn admission_reached(property: &str, log: &crate::ObservationLog) -> bool {
             }
             "handshake/counts-match-permits" => *pending > 0 || *connections > 0,
             "handshake/pending-bounded" => {
-                *cap > 0 && inbound + quic_pending >= cap - reserve(*cap)
+                *cap > 0
+                    && (pending + quic_pending >= *cap
+                        || inbound + quic_pending >= cap - reserve(*cap))
             }
             "handshake/dial-reserve-kept" => {
                 (*cap > 0 && *inbound >= cap - reserve(*cap))

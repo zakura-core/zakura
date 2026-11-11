@@ -1,0 +1,49 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 43cd9b5124..45c301d05d 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1110,6 +1110,7 @@ impl HeaderSyncReactor {
+             self.startup.config.unproductive_peer_cooldown,
+             self.admitted_peer_limit(),
+         );
++        self.state.planted_departed.insert(peer.clone());
+         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
+             self.retry_vct_repair(
+                 owner,
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 39e9ec72ee..f453b17ea0 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -37,6 +37,8 @@ pub(super) struct ReactorState {
+     pub(super) cached_pass_budget: CachedPassBudget,
+     /// A changed key whose pass waits for [`Self::cached_pass_budget`] to refill.
+     pub(super) cached_pass_deferred: bool,
++    /// Planted: every peer whose session ever ended, never cleared.
++    pub(super) planted_departed: HashSet<ZakuraPeerId>,
+     /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
+     ///
+     /// Each entry represents one admitted session that survived
+@@ -123,6 +125,7 @@ impl ReactorState {
+             last_scheduling_opportunity: None,
+             cached_pass_budget: CachedPassBudget::new(now),
+             cached_pass_deferred: false,
++            planted_departed: HashSet::new(),
+             unproductive_peer_cooldowns: HashMap::new(),
+             cooldowns_end: None,
+             #[cfg(any(test, zakura_sim))]
+@@ -335,9 +338,12 @@ impl ReactorState {
+ 
+     /// Whether `peer`'s readmission cooldown still holds at `now`.
+     pub(super) fn readmission_refused(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+-        self.unproductive_peer_cooldowns
+-            .get(peer)
+-            .is_some_and(|until| *until > now)
++        // Planted: a departed peer's readmission pause never lifts.
++        self.planted_departed.contains(peer)
++            || self
++                .unproductive_peer_cooldowns
++                .get(peer)
++                .is_some_and(|until| *until > now)
+     }
+ 
+     /// Refuse `peer`'s readmission for `cooldown` from `now`. A zero cooldown

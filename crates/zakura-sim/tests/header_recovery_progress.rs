@@ -222,11 +222,14 @@ fn the_recovery_control_repeats_a_a_and_a_b_a() {
 /// The fixtures `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-recovery-<name>.json` with its Plan bytes
 /// beside it in `header-recovery-<name>.plan`.
-fn committed_fixtures() -> [(&'static str, LivenessScenario); 1] {
-    [(
-        "successor",
-        LivenessScenario::Recovery(RecoveryFixture::Successor),
-    )]
+fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
+    [
+        ("successor", RecoveryFixture::Successor),
+        ("closes", RecoveryFixture::Closes),
+        ("faults", RecoveryFixture::Faults),
+        ("departure", RecoveryFixture::Departure),
+    ]
+    .map(|(name, fixture)| (name, LivenessScenario::Recovery(fixture)))
 }
 
 /// The Plan bytes every committed fixture runs under: a fixed draw.
@@ -369,8 +372,8 @@ fn fork(main: u32, len: u32) -> Chain {
     }
 }
 
-/// Every other recovery control holds under 4 plans, each met at the
-/// `recovered` pick, with the objective its doc names. Mirrors sync from
+/// Every other recovery control holds under 4 plans, each but `Faults` met
+/// at the `recovered` pick, with the objective its doc names. Mirrors sync from
 /// the node too, so a member's recorded chain can be one it took from the
 /// node, and the expected headers come from the fixture's chains:
 ///
@@ -385,11 +388,15 @@ fn fork(main: u32, len: u32) -> Chain {
 ///   B5, which it holds at the pick. The source's lighter A3 and A4 don't
 ///   meet it.
 ///
+/// - `Closes`, `Faults` and `Departure` (hdr-13's prefix classes): the
+///   source's A6 chain past the baseline, which is A3 after `Faults`'
+///   failed prepares.
+///
 /// `SyncedFirst`'s baseline already holds A4, so nothing is owed and the
 /// property doesn't apply.
 #[test]
 fn every_recovery_control_holds() {
-    for fixture in RecoveryFixture::ALL {
+    for fixture in RecoveryFixture::all() {
         for input in inputs(4, 256) {
             let run = run(fixture, input);
             let (record, objective) = run.recovery.objective().expect("the pick wrote its record");
@@ -419,8 +426,10 @@ fn every_recovery_control_holds() {
                 "{fixture:?}"
             );
             let objective = objective.expect("a successor is owed");
+            // A failed prepare leaves the node waiting out a retry, so after
+            // `Faults` it can meet the objective after the pick.
             assert!(
-                objective.met_by(&record.node_tip.0),
+                fixture == RecoveryFixture::Faults || objective.met_by(&record.node_tip.0),
                 "{fixture:?}: met at the pick"
             );
             let (mut expected, unmet) = match fixture {
@@ -443,6 +452,13 @@ fn every_recovery_control_holds() {
                     assert_eq!(base, 2, "{fixture:?}");
                     assert_eq!(record.node_tip.0.height.0, 5, "{fixture:?}");
                     (above(fork(2, 3), 2), above(Chain::main(4), 2))
+                }
+                RecoveryFixture::Faults => {
+                    assert_eq!(base, 3, "{fixture:?}: every prepare failed");
+                    (above(Chain::main(6), 3), Vec::new())
+                }
+                RecoveryFixture::Closes | RecoveryFixture::Departure => {
+                    (above(Chain::main(6), base), Vec::new())
                 }
                 RecoveryFixture::SyncedFirst => unreachable!("judged above"),
             };

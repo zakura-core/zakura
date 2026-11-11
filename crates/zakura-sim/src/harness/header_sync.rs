@@ -31,7 +31,8 @@ use zakura_network::zakura::{
     ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
-use zakura_scheduler::SchedulerConfig;
+use zakura_rt::sync::watch;
+use zakura_scheduler::{SchedulerConfig, SimInstant};
 
 use zakura_storage::header::{
     adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture,
@@ -53,7 +54,7 @@ use super::{
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         publication::{Arming, PublicationEvidence},
-        recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
+        recovery::{RecoveryEvidence, RecoveryInputs, RecoveryProgress, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
         round_life::RoundLifeEvidence,
@@ -81,6 +82,7 @@ use crate::{
             BudgetView, ChainView, ForkView, HoldWakeView, OutstandingView, PublicationView,
             ResetView, RetirementView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
+        header_sync_progress::{bounded_adversary_progress, recovery_deadline},
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
@@ -95,7 +97,7 @@ use crate::{
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
-    Observation, ObservationLog, RunConfig, RunEnd, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RunConfig, RunEnd, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -466,6 +468,7 @@ impl StorageScenario {
                     },
                 ],
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             ..StorageScenario::default()
         }
@@ -580,7 +583,7 @@ pub const FORK_FIXTURE_MAX_HEADERS: u32 = 1_000;
 /// judges: the node at genesis, two or three mirrors whose initial chains
 /// are forks from one ancestor, none a prefix of another, holding at most
 /// [`FORK_FIXTURE_MAX_HEADERS`] headers together, storage success-only
-/// within a 10 ms bound, no holds and no controls. A mirror runs header
+/// within a 10 ms bound, no holds, disruptions or controls. A mirror runs header
 /// sync too, so it may take a fork from the node later, but only one some
 /// mirror held at the start, so no mirror ever holds more work than the
 /// heaviest initial chain. See
@@ -591,6 +594,7 @@ pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
         bound_ms,
         holds,
         reply_holds,
+        disruptions,
     } = &scenario.policy;
     let declared = scenario.node == Chain::default()
         && (2..=3).contains(&scenario.mirrors.len())
@@ -598,6 +602,7 @@ pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
         && bound_ms.is_some_and(|bound| bound <= 10)
         && holds.is_empty()
         && reply_holds.is_empty()
+        && disruptions.is_empty()
         && scenario.controls.is_empty()
         && scenario
             .mirrors
@@ -728,6 +733,10 @@ pub struct Ports {
     /// When the node's publication check first applied, and the tip it
     /// still owes, which its tap finds during the run.
     pub publication: PublicationEvidence,
+    /// Whether the harness ends a recovering run once its recovery
+    /// concludes ([`RecoveryFinish`]). Set for a scenario with a `Recover`
+    /// step. A harness with its own finish clears it.
+    pub finishes: bool,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -1075,9 +1084,16 @@ impl Subsystem for Storage {
     type Scenario = StorageScenario;
     type Prepared = Ports;
 
-    /// [`storage_config`].
-    fn config(_: &StorageScenario) -> RunConfig {
-        storage_config()
+    /// [`storage_config`], with [`RECOVERY_BUDGET`] for a scenario with a
+    /// `Recover` step.
+    fn config(scenario: &StorageScenario) -> RunConfig {
+        match recovery_source(scenario) {
+            Some(_) => RunConfig {
+                budget: RECOVERY_BUDGET,
+                ..storage_config()
+            },
+            None => storage_config(),
+        }
     }
 
     /// Commits each actor's chain to its port.
@@ -1085,9 +1101,13 @@ impl Subsystem for Storage {
     /// # Panics
     ///
     /// If a hold or control step waits for a trigger the node never records
-    /// ([`policy::undriven`]), or a `Recover` step is out of place: it must
-    /// be the last step, follow no `Shutdown`, and follow no churn or flood,
-    /// whose tasks keep acting after their step.
+    /// ([`policy::undriven`]), or a `Recover` step is out of place: only
+    /// closes may follow it, and it follows no `Shutdown`, and no churn or
+    /// flood, whose tasks keep acting after their step. A close after it is
+    /// hdr-13's loss path, which only a typed scenario takes: the control
+    /// source offers it from the `recovered` pick on, and the grammar can't
+    /// encode it. Also if the policy declares a disruption with no `Recover`
+    /// step to disrupt.
     fn prepare(scenario: &StorageScenario) -> Ports {
         let triggers = scenario
             .policy
@@ -1141,8 +1161,11 @@ impl Subsystem for Storage {
             .iter()
             .position(|step| step.action == ControlAction::Recover)
         {
-            if let Some(after) = scenario.controls.get(at + 1) {
-                panic!("no control step follows a recover, but {after:?} does");
+            if let Some(after) = scenario.controls[at + 1..]
+                .iter()
+                .find(|step| step.action != ControlAction::Close)
+            {
+                panic!("only a close follows a recover, but {after:?} does");
             }
             if let Some(before) = scenario.controls[..at].iter().find(|step| {
                 matches!(
@@ -1152,6 +1175,12 @@ impl Subsystem for Storage {
             }) {
                 panic!("a recover can't follow {before:?}");
             }
+        }
+        if recovery_source(scenario).is_none() && !scenario.policy.disruptions.is_empty() {
+            panic!(
+                "a disruption takes something away from a recovery, but {:?} has no recover",
+                scenario.policy.disruptions
+            );
         }
         let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
@@ -1186,7 +1215,11 @@ impl Subsystem for Storage {
             chain_effect: ChainEffectEvidence::default(),
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
-            recovery: RecoveryEvidence::default(),
+            recovery: if recovery_source(scenario).is_some() {
+                RecoveryEvidence::bounded(&scenario.policy.disruptions)
+            } else {
+                RecoveryEvidence::default()
+            },
             delayed_page: None,
             fork_choice: ForkChoiceEvidence::default(),
             // A flood or churn scenario's adoption is the watch-flood
@@ -1198,6 +1231,7 @@ impl Subsystem for Storage {
                     .any(|step| matches!(step.action, ControlAction::Flood | ControlAction::Churn)),
                 status: false,
             }),
+            finishes: recovery_source(scenario).is_some(),
         }
     }
 
@@ -1355,6 +1389,32 @@ impl Subsystem for Storage {
             recovery.clone(),
         );
         sim.add_source(Box::new(control));
+        sim.add_source(Box::new(RecoveryDeadline {
+            recovery: recovery.clone(),
+            adoption: adoption.clone(),
+            ends: ends.clone(),
+        }));
+        if ports.finishes {
+            let (to_task, mut finishing) = watch::channel(false);
+            let task_topology = topology.clone();
+            sim.scheduler().spawn_root("finish", async move {
+                while !*finishing.borrow_and_update() {
+                    if finishing.changed().await.is_err() {
+                        return;
+                    }
+                }
+                task_topology.finish();
+            });
+            sim.add_source(Box::new(RecoveryFinish {
+                recovery: recovery.clone(),
+                adoption: adoption.clone(),
+                ends: ends.clone(),
+                topology: topology.clone(),
+                to_task,
+                step: 0,
+                done: false,
+            }));
+        }
         Storage {
             port: ports.node,
             dispatch,
@@ -1380,9 +1440,13 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`storage_properties`].
+    /// [`storage_properties`], then
+    /// `header-sync/bounded-adversary-progress`, which applies after a
+    /// `Recover` step, so the fuzzer checks it on every input with one.
     fn properties() -> Vec<Property<Self>> {
-        storage_properties()
+        let mut properties = storage_properties();
+        properties.push(bounded_adversary_progress());
+        properties
     }
 
     /// [`storage_sources`].
@@ -1392,13 +1456,15 @@ impl Subsystem for Storage {
 
     /// A scenario with a `Recover` step declares hdr-13's five assumptions
     /// ([`recovery_assumptions`]), none of which holds before the
-    /// `recovered` pick ([`RecoveryEvidence::holds`]). Others declare none.
+    /// `recovered` pick ([`RecoveryEvidence::holds`]), and
+    /// `BoundedAdversary` ([`recovered_bound`]). Others declare none.
     fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
         let Some(source) = recovery_source(scenario) else {
             return Assumptions::none();
         };
-        Assumptions::declare(recovery_assumptions(&source))
-            .holds_when(|storage, assume| storage.recovery.holds(&storage.ends, assume))
+        let mut declared = vec![recovered_bound()];
+        declared.extend(recovery_assumptions(&source));
+        Assumptions::declare(declared).holds_when(Storage::recovery_holds)
     }
 
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its
@@ -2022,6 +2088,7 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
                 bound_ms: Some(PROGRESS_STORAGE_BOUND_MS),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             }
 }
 
@@ -2052,6 +2119,166 @@ pub fn wire_config() -> RunConfig {
         // peers take more.
         drain_bound: 50_000,
         ..RunConfig::default()
+    }
+}
+
+/// Offers a time boundary one millisecond past an owed recovery's deadline
+/// ([`RecoveryEvidence::progress`]), so the clock reaches it even when no
+/// other timer would, and the registry can expire
+/// `header-sync/bounded-adversary-progress`'s obligation (the hdr-9 to
+/// hdr-13 plan's acceptance: deadlines reach the clock). It offers no
+/// action.
+struct RecoveryDeadline {
+    recovery: RecoveryEvidence,
+    adoption: AdoptionEvidence,
+    ends: EndEvidence,
+}
+
+impl ActionSource for RecoveryDeadline {
+    /// None: it only stops the clock.
+    fn enabled(&self, _now: SimInstant, _out: &mut Vec<(Identity, u64)>) {}
+
+    /// One millisecond past the owed recovery's deadline, while that's still
+    /// ahead of `now`.
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        let RecoveryProgress::Owed { since } = self.recovery.progress(&self.adoption, &self.ends)
+        else {
+            return;
+        };
+        out.extend(
+            recovery_deadline(since)
+                .checked_add(std::time::Duration::from_millis(1))
+                .filter(|at| *at > now)
+                .map(Boundary::Opens),
+        );
+    }
+
+    /// Never called: it offers no action.
+    fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
+        unreachable!("the recovery deadline source offers no action")
+    }
+}
+
+/// The steps a `header-sync/storage` run with a `Recover` step may take.
+/// Its `BoundedAdversary` puts the livelock limit at a tenth of it, 5,000
+/// steps at one instant, and honest recoveries take at most about 480 there
+/// after the `recovered` pick, a grown source's, measured over 16 plans
+/// each. A test keeps every recovery witness under half the limit. The run
+/// usually ends far sooner, at its [`RecoveryFinish`].
+pub const RECOVERY_BUDGET: u64 = 50_000;
+
+/// What a scenario with a `Recover` step declares besides its five recovery
+/// assumptions: `BoundedAdversary`, from the `recovered` pick on
+/// ([`Storage::recovery_holds`]). Recovery then lets nothing hostile act,
+/// so a node that keeps the clock from moving with an obligation open is
+/// spinning on its own, and `sim/no-livelock` catches it rather than the
+/// step budget ending the run (Rule 13 of the hdr-9 to hdr-13 plan). The
+/// prefix before it is unbounded: honest storage runs can take thousands of
+/// steps at one instant there, which the limit would fail.
+pub fn recovered_bound() -> AssumeRecord {
+    AssumeRecord {
+        assume: Assume::BoundedAdversary,
+        params: serde_json::json!({ "hostile_peers": 0, "from": "recovered" }),
+    }
+}
+
+impl Storage {
+    /// Whether `assume` holds after a step: `BoundedAdversary` from the
+    /// `recovered` pick on ([`recovered_bound`]), and the recovery
+    /// assumptions as [`RecoveryEvidence::holds`] says.
+    pub fn recovery_holds(&self, assume: Assume) -> bool {
+        match assume {
+            Assume::BoundedAdversary => self.recovery.record().is_some(),
+            assume => self.recovery.holds(&self.ends, assume),
+        }
+    }
+}
+
+/// Ends a recovering `header-sync/storage` run once its recovery concludes,
+/// so it ends idle rather than at its budget (Rule 13): once
+/// `header-sync/bounded-adversary-progress` has nothing owed
+/// ([`RecoveryProgress::Concluded`]), once the clock has passed an owed
+/// recovery's deadline, which its expiry needs, or, with no `Recover`
+/// picked yet, once the run has taken [`storage_config`]'s budget, which a
+/// prefix whose recover never comes ran to before. Its pick begins the node
+/// under test's stop, as a `Shutdown` step's does, and a harness task then
+/// stops every node ([`Topology::finish`]). It offers no time boundary.
+///
+/// A run that reaches [`RECOVERY_BUDGET`] after its `Recover` pick with no
+/// `recovered` pick yet fails as a harness failure instead. Recovery's
+/// transitions are quiet actions, offered only once no task is ready, so a
+/// reactor that never stops being ready keeps the pick, and with it every
+/// recovery assumption and `BoundedAdversary`, from ever coming. Nothing
+/// would judge that run, and a budget end alone proves no missed deadline,
+/// but it mustn't count as clean (Rule 13). Honest recoveries reach their
+/// pick far sooner, though they can be busy for thousands of steps at one
+/// instant first, which is why `BoundedAdversary` waits for the pick
+/// ([`recovered_bound`]).
+struct RecoveryFinish {
+    recovery: RecoveryEvidence,
+    adoption: AdoptionEvidence,
+    ends: EndEvidence,
+    topology: Rc<Topology>,
+    /// Wakes the task that carries the finish out.
+    to_task: watch::Sender<bool>,
+    /// The last step observed.
+    step: u64,
+    /// Set once the finish was picked.
+    done: bool,
+}
+
+impl RecoveryFinish {
+    /// Whether the run's recovery has concluded at `now`, as
+    /// [`RecoveryFinish`] says.
+    fn due(&self, now: SimInstant) -> bool {
+        if self.done {
+            return false;
+        }
+        match self.recovery.progress(&self.adoption, &self.ends) {
+            RecoveryProgress::Concluded => true,
+            RecoveryProgress::Owed { since } => now > recovery_deadline(since),
+            RecoveryProgress::Pending => {
+                self.recovery.started().is_none() && self.step >= storage_config().budget
+            }
+        }
+    }
+}
+
+impl ActionSource for RecoveryFinish {
+    /// Offers `peer:node:finish` once, while [`RecoveryFinish::due`].
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if self.due(now) {
+            out.push((Identity::peer("node", "finish"), 0));
+        }
+    }
+
+    /// None, as [`RecoveryFinish`] says.
+    fn boundaries(&self, _now: SimInstant, _out: &mut Vec<Boundary>) {}
+
+    /// Begins the stop and wakes the task.
+    fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
+        self.done = true;
+        self.topology.begin_finish();
+        self.to_task.send_replace(true);
+    }
+
+    /// Notes the step, for the prefix's budget, and fails the run at
+    /// [`RECOVERY_BUDGET`] with the `recovered` pick still to come, as
+    /// [`RecoveryFinish`] says.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        self.step = log.step();
+        let waiting = self.recovery.started().is_some()
+            && self.recovery.progress(&self.adoption, &self.ends) == RecoveryProgress::Pending;
+        if waiting && self.step >= RECOVERY_BUDGET {
+            return Err(format!(
+                "the step budget ran out at step {} before the `recovered` pick, after the \
+                 `Recover` pick at {:?}: a task never stopped being ready, so recovery's \
+                 quiet transitions were never offered",
+                self.step,
+                self.recovery.started(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2463,6 +2690,7 @@ mod tests {
                 bound_ms: Some(10),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: Vec::new(),
             weights: Weights::default(),
@@ -2676,6 +2904,81 @@ mod tests {
         );
     }
 
+    /// A harness whose view holds only a recovery and the adoption and end
+    /// evidence its progress reads, for driving
+    /// `bounded-adversary-progress`'s check directly.
+    struct RecoveryOnly {
+        recovery: RecoveryEvidence,
+        adoption: AdoptionEvidence,
+        ends: EndEvidence,
+    }
+
+    impl HasView for RecoveryOnly {
+        type View = StorageView;
+
+        /// [`FaultsOnly`]'s empty view, with the harness's recovery,
+        /// adoption and ends.
+        fn view(&self) -> StorageView {
+            StorageView {
+                recovery: self.recovery.clone(),
+                adoption: self.adoption.clone(),
+                ends: self.ends.clone(),
+                ..FaultsOnly(FaultEvidence::default()).view()
+            }
+        }
+    }
+
+    /// With the successor owed, a step at the run's budget fails the run as
+    /// missing evidence while the clock is at or before the deadline, and
+    /// not once it's past it, where the registry's expiry judges the
+    /// obligation. A step before the budget fails nothing.
+    #[test]
+    fn a_budget_end_is_missing_evidence_only_before_the_deadline() {
+        use crate::{
+            check::{Phase, StepCtx},
+            domain::header_sync_progress::{bounded_adversary_progress, recovery_deadline},
+            harness::header_node::recovery::{tests::owed, RecoveryProgress},
+        };
+        use std::time::Duration;
+        use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
+
+        let (recovery, adoption, ends) = owed();
+        let harness = RecoveryOnly {
+            recovery,
+            adoption,
+            ends,
+        };
+        let RecoveryProgress::Owed { since } =
+            harness.recovery.progress(&harness.adoption, &harness.ends)
+        else {
+            panic!("the recovery owes its successor");
+        };
+        let deadline = recovery_deadline(since);
+        let registered = [bounded_adversary_progress::<RecoveryOnly>()];
+        let log = ObservationLog::default();
+        let pick = crate::Identity::advance_time(SimInstant::ZERO);
+        let missing = |step: u64, now: SimInstant| {
+            let step = StepCtx {
+                step,
+                pick: &pick,
+                enabled: &[],
+                phase: Phase::Live,
+                budget: 10,
+                now,
+                status: SchedulerStatus::Quiescent,
+                log: &log,
+            };
+            let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
+            (registered[0].check)(&mut cx);
+            cx.into_parts().missing
+        };
+        let past = crate::harness::policy::after(deadline, Duration::from_millis(1));
+        assert!(missing(10, deadline).is_some());
+        assert!(missing(11, since).is_some());
+        assert_eq!(missing(10, past), None);
+        assert_eq!(missing(9, since), None);
+    }
+
     /// A harness whose view holds only its fault evidence, for driving
     /// [`HEADER_FAULT_PENALIZED`]'s check directly.
     struct FaultsOnly(FaultEvidence);
@@ -2739,6 +3042,7 @@ mod tests {
                 pick: &pick,
                 enabled: &[],
                 phase: Phase::Live,
+                budget: u64::MAX,
                 now: SimInstant::ZERO,
                 status: SchedulerStatus::Quiescent,
                 quiescent: true,

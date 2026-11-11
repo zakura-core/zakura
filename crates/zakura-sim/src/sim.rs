@@ -801,6 +801,7 @@ impl Sim {
                 pick: &chosen.identity,
                 enabled: &enabled,
                 phase,
+                budget: self.config.budget,
                 now: after,
                 status,
                 quiescent,

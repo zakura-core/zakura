@@ -813,6 +813,15 @@ impl Storage {
         self.verified.transactions()
     }
 
+    /// Returns transactions by descending ancestor-package fee per cost, with
+    /// older insertion times and then TXIDs breaking ties.
+    ///
+    /// Scores include all unconfirmed ancestors. Template selection must account
+    /// for parents it has already selected and emit them before their children.
+    pub(super) fn mining_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> {
+        self.verified.mining_transactions()
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         self.verified.transaction_dependencies()

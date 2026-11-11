@@ -538,6 +538,10 @@ impl Sim {
         let mut cached: Option<(Phase, Vec<Offer>)> = None;
         // Set at the drain's start, until no task is ready. See below.
         let mut settling = false;
+        // Set when the drain started at a live idle end rather than at the
+        // budget, so a drain that finds nothing to do ends idle, as the run
+        // would have without it.
+        let mut from_idle = false;
         loop {
             let now = self.sched().now();
             let mut offers = match cached.take() {
@@ -634,16 +638,11 @@ impl Sim {
                 enabled.retain(|enabled| !matches!(enabled.action, Action::AdvanceTime(_)));
             }
             if enabled.is_empty() {
-                // A live end that the drain can still resolve enters it.
-                let resolvable = match phase {
-                    Phase::Live => self.resolvable(checker, now, &ready),
-                    Phase::Drain => Ok(false),
-                };
-                let resolvable = match resolvable {
-                    Ok(resolvable) => resolvable,
-                    Err(failure) => return st.end_harness(failure),
-                };
-                if resolvable {
+                // A live end enters the drain before it asks whether work is
+                // left, since entry itself can enable some, as a generator's
+                // retirement wakes it. Only then do the sources' recovery
+                // offers count ([`ActionSource::enter_drain`]).
+                if phase == Phase::Live {
                     ready = match self.enter_drain(st) {
                         Ok(ready) => ready,
                         Err(failure) => return st.end_harness(failure),
@@ -651,6 +650,7 @@ impl Sim {
                     phase = Phase::Drain;
                     entered = Some(now);
                     settling = true;
+                    from_idle = true;
                     continue;
                 }
                 // A dry end. Work a source still holds would leave a check
@@ -666,15 +666,18 @@ impl Sim {
                         status: "worker-starved",
                     });
                 }
-                return match phase {
-                    Phase::Drain => st.end_budget(drained, rest),
-                    Phase::Live => match idle_status(rest) {
+                // A drain a live idle end entered that found nothing to do
+                // ends idle, as the run would have without it.
+                return if from_idle && drained == 0 {
+                    match idle_status(rest) {
                         Ok(status) => RunEnd {
                             rest: Some(rest),
                             ..st.end(Outcome::Idle { status })
                         },
                         Err(failure) => st.end_harness(failure),
-                    },
+                    }
+                } else {
+                    st.end_budget(drained, rest)
                 };
             }
             if phase == Phase::Drain {
@@ -911,32 +914,6 @@ impl Sim {
             earliest_deadline: unfinished.earliest_deadline(),
             timer_cap: entered.and_then(|at| at.checked_add(self.config.harness_timer_cap)),
         }
-    }
-
-    /// Whether a live run that has nothing enabled at `now` still has work
-    /// the drain can resolve: a recovery action, a recovery boundary, or an
-    /// open obligation with a deadline or a timer for the clock to reach.
-    /// Asked as the drain's first step would be, starting now, so two
-    /// offers that share an identity fail it as they would fail that step.
-    fn resolvable(
-        &self,
-        checker: &dyn Checker,
-        now: SimInstant,
-        ready: &[(Identity, TaskId)],
-    ) -> Result<bool, HarnessFailure> {
-        let offers = self.offers(Phase::Drain, now, ready.is_empty());
-        enabled_set(&EnabledInputs {
-            phase: Phase::Drain,
-            now,
-            ready,
-            next_deadline: self.sched().next_deadline(),
-            offers: &offers,
-            clock: self.clock(checker, Some(now)),
-        })
-        .map(|enabled| !enabled.is_empty())
-        .map_err(|identity| HarnessFailure::DuplicateIdentity {
-            identity: identity.to_string(),
-        })
     }
 
     /// The first source's work that nothing will finish

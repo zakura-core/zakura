@@ -1450,3 +1450,43 @@ fn a_worker_starved_end_fails_rather_than_conclude() {
         );
     }
 }
+
+/// Terra 1, round 7: a live idle end enters the drain before it asks
+/// whether anything is left, since entry itself can enable work. Here a
+/// generator's retirement wakes it, its cleanup lets `serve-p1` finish,
+/// and that discharges the open `Ops` obligation the idle end would have
+/// concluded against the node.
+#[test]
+fn a_live_idle_end_enters_the_drain_before_judging() {
+    let report = checked(
+        config(2, 1_000),
+        world(),
+        vec![served_within(LivenessBound::Ops {
+            task: "ticker.1",
+            op: Op::Sleep,
+            object: None,
+            max: 3,
+        })],
+        Assumptions::none(),
+        |sim| {
+            let go = CancellationToken::new();
+            let serve = go.clone();
+            sim.scheduler().spawn_root("request-p1", async {});
+            sim.scheduler().spawn_root("serve-p1", async move {
+                serve.cancelled().await;
+            });
+            let token = CancellationToken::new();
+            let stop = token.clone();
+            sim.spawn_generator("gen", token, async move {
+                stop.cancelled().await;
+                go.cancel();
+            });
+        },
+    );
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert!(
+        matches!(outcome(&report, &SERVED), PropertyOutcome::Held { .. }),
+        "{:?}",
+        outcome(&report, &SERVED)
+    );
+}

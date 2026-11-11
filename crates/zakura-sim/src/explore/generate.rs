@@ -26,6 +26,13 @@
 //!
 //! The report counts each property's outcomes over the runs, so a reader
 //! can tell a property that held from one that never applied.
+//!
+//! A harness whose draw picks scenario families by a tag at the prefix's
+//! start ([`HarnessEntry::families`]) would almost never see a tagged
+//! family from uniform bytes. [`draws`] therefore picks, for each run, one
+//! of the families or no tag, uniformly, from the seed and the run's index,
+//! and writes the family's tag over the input's first bytes. The input
+//! stays the whole run, so replay, shrink and confirm read it unchanged.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -41,13 +48,16 @@ use sha2::{Digest, Sha256};
 use super::{Bucket, ExploreOutcome, Worker};
 use crate::{
     check::PropertyOutcome,
-    harness::{HarnessEntry, HARNESSES},
+    harness::{HarnessEntry, ScenarioFamily, HARNESSES},
     record::EndRecord,
     trace::{end_records, meta::hex},
 };
 
 /// The file [`generate`] writes its report to, in its output directory.
 pub const REPORT_FILE: &str = "generate.json";
+
+/// The name [`draws`] gives a run on which it wrote no family's tag.
+pub const UNTAGGED: &str = "untagged";
 
 /// The longest input [`inputs`] draws by default: the pilot's discovery
 /// campaigns' `max_len`.
@@ -169,6 +179,14 @@ pub struct GenerateReport {
     /// Its SHA-256.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
+    /// The scenario family whose tag starts that input, or [`UNTAGGED`].
+    /// `None` for a harness without families, or a clean search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Inputs run in each scenario family, and [`UNTAGGED`], for a harness
+    /// with families.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub families: BTreeMap<String, u64>,
     /// True if the stopping run's end record went to the record directory.
     pub record: bool,
     /// Runs that violated each `Known` or `Draft` property, by bucket and
@@ -201,6 +219,47 @@ pub fn inputs(seed: u64, max_bytes: usize) -> impl Iterator<Item = Vec<u8>> {
         // Each byte is the low 8 bits of a draw.
         (0..len).map(|_| next() as u8).collect()
     })
+}
+
+/// The inputs a search with `seed` draws on a harness with `families`, in
+/// order, each with its family's name. Each is [`inputs`]' input with one
+/// family's tag written over its first bytes, extending a shorter input, or
+/// unchanged and named [`UNTAGGED`]. The family is uniform over `families`
+/// and no tag, from `seed` and the input's index alone. Without families,
+/// every input is [`inputs`]' and has no name.
+pub fn draws(
+    seed: u64,
+    max_bytes: usize,
+    families: Vec<ScenarioFamily>,
+) -> impl Iterator<Item = (Option<&'static str>, Vec<u8>)> {
+    // A usize always fits in a u64 on supported targets.
+    let choices = families.len() as u64 + 1;
+    inputs(seed, max_bytes)
+        .zip(0u64..)
+        .map(move |(mut input, index)| {
+            if families.is_empty() {
+                return (None, input);
+            }
+            // The remainder is below `choices`, the families' count plus 1.
+            match families.get((mix(seed.rotate_left(32) ^ index) % choices) as usize) {
+                Some(family) => {
+                    if input.len() < family.tag.len() {
+                        input.resize(family.tag.len(), 0);
+                    }
+                    input[..family.tag.len()].copy_from_slice(&family.tag);
+                    (Some(family.name), input)
+                }
+                None => (Some(UNTAGGED), input),
+            }
+        })
+}
+
+/// SplitMix64's finalizer: a well-mixed function of `x`.
+fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Reads an exclusion file: one SHA-256 in hex per line. Blank lines and
@@ -272,6 +331,8 @@ pub fn generate(
         violated: None,
         input: None,
         input_sha256: None,
+        family: None,
+        families: BTreeMap::new(),
         record: false,
         notes: BTreeMap::new(),
         abandoned: 0,
@@ -279,13 +340,17 @@ pub fn generate(
     };
     let mut worker = Worker::new();
     let mut stopped = None;
-    for (index, input) in (0..options.runs).zip(inputs(options.seed, options.max_bytes)) {
+    let drawn = draws(options.seed, options.max_bytes, (entry.families)());
+    for (index, (family, input)) in (0..options.runs).zip(drawn) {
         let digest = hex(&Sha256::digest(&input));
         if options.exclude.contains(&digest) {
             report.skipped += 1;
             continue;
         }
         report.executed += 1;
+        if let Some(family) = family {
+            *report.families.entry(family.to_owned()).or_default() += 1;
+        }
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             worker.explore(entry, &input, |_, run, classified| {
                 let stops = !matches!(
@@ -317,7 +382,7 @@ pub fn generate(
                     .map(|text| (*text).to_owned())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
-                stopped = Some((index, input, digest, Stop::Panic { message }, None));
+                stopped = Some((index, family, input, digest, Stop::Panic { message }, None));
                 break;
             }
         };
@@ -350,11 +415,11 @@ pub fn generate(
             ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => None,
         };
         if let Some(stop) = stop {
-            stopped = Some((index, input, digest, stop, ran.end));
+            stopped = Some((index, family, input, digest, stop, ran.end));
             break;
         }
     }
-    if let Some((index, input, digest, stop, end)) = stopped {
+    if let Some((index, family, input, digest, stop, end)) = stopped {
         // The input goes to disk before anything else, as a fuzz target
         // saves its failures.
         let path = options.out.join(format!("{digest}.bin"));
@@ -369,6 +434,7 @@ pub fn generate(
         report.kill_run = Some(index);
         report.input = Some(path);
         report.input_sha256 = Some(digest);
+        report.family = family.map(str::to_owned);
         report.stop = stop;
     }
     report.millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);

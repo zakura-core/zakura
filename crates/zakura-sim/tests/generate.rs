@@ -1,18 +1,24 @@
 //! `zakura-sim generate`'s search (mutation plan, mut-4.1): a seed gives
 //! the same result on every run, a clean search writes no end record, a
 //! kill writes exactly one, and an excluded input is skipped. Each search
-//! runs a race fixture, whose runs take milliseconds.
+//! runs a race fixture, whose runs take milliseconds. Every tag a harness's
+//! draw matches is one of its scenario families, and the draws reach each
+//! family; those tests draw scenarios and run nothing.
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeSet, env, fs, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    env, fs,
+    path::Path,
+};
 
 use sha2::{Digest, Sha256};
 use zakura_sim::{
     explore::generate::{
-        generate, generator_harnesses, inputs, read_exclusions, GenerateOptions, GenerateReport,
-        Stop, REPORT_FILE,
+        draws, generate, generator_harnesses, inputs, read_exclusions, GenerateOptions,
+        GenerateReport, Stop, REPORT_FILE, UNTAGGED,
     },
-    harness::{self, HarnessEntry},
+    harness::{self, HarnessEntry, HARNESSES},
     trace::end_records::END_RECORDS_VAR,
 };
 
@@ -91,6 +97,9 @@ fn the_same_seed_gives_the_same_kill() {
     assert_eq!(written, one);
     let property = one.violated.as_deref().unwrap();
     assert!(one.properties[property].violated == 1);
+    // The race fixture's draw has no families.
+    assert_eq!(one.family, None);
+    assert!(one.families.is_empty());
 }
 
 /// With the hook's variable set, the search's runs write no records, and
@@ -187,6 +196,91 @@ fn the_generator_map_leaves_out_planted_harnesses() {
     assert!(map.values().flatten().all(|name| *name != PLANTED));
     assert!(map["sim/no-task-panic"].contains(&CLEAN));
     assert!(map["block-sync/retained-byte-bound"].contains(&"block-sync/storage"));
+}
+
+/// Every harness draw's tags are listed: of all 65,536 two-byte prefixes
+/// (the rest zero), each one that draws a rare scenario, one that at most
+/// one prefix in 256 draws, starts with one of the harness's families. A
+/// one-byte tag, such as a grammar's version byte, draws one scenario from
+/// its 256 prefixes.
+/// A draw that matches a new tag fails here until the harness lists it.
+/// Some prefix that each listed tag starts draws a rare scenario, so no
+/// family is stale.
+#[test]
+fn every_tag_a_draw_matches_is_a_listed_family() {
+    const RARE: usize = 256;
+    for entry in HARNESSES
+        .iter()
+        .filter(|entry| !entry.machine && entry.scenario_bytes >= 2)
+    {
+        let families = (entry.families)();
+        let mut drawn: Vec<([u8; 2], String)> = Vec::with_capacity(1 << 16);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for first in 0..=u8::MAX {
+            for second in 0..=u8::MAX {
+                let scenario = entry.scenario(&[first, second]).to_string();
+                *counts.entry(scenario.clone()).or_default() += 1;
+                drawn.push(([first, second], scenario));
+            }
+        }
+        let listed = |prefix: &[u8]| {
+            families
+                .iter()
+                .any(|family| prefix.starts_with(&family.tag))
+        };
+        for (prefix, scenario) in &drawn {
+            assert!(
+                counts[scenario] > RARE || listed(prefix),
+                "{}: the prefix {prefix:02x?} draws a scenario at most {RARE} prefixes \
+                 draw, and no family's tag starts it; list its tag in `families`",
+                entry.name
+            );
+        }
+        for family in &families {
+            assert!(
+                drawn.iter().any(|(prefix, scenario)| {
+                    prefix.starts_with(&family.tag) && counts[scenario] <= RARE
+                }),
+                "{}: no prefix family {}'s tag starts draws a rare scenario, so the tag \
+                 picks nothing",
+                entry.name,
+                family.name
+            );
+        }
+    }
+}
+
+/// The draws reach every family of `block-sync/storage`, and untagged
+/// inputs, within a few times their count, and each tagged input draws its
+/// family's scenario. A harness without families draws [`inputs`]' inputs.
+#[test]
+fn the_draws_reach_each_family() {
+    let entry = entry("block-sync/storage");
+    let families = (entry.families)();
+    assert!(families.len() >= 10, "{families:?}");
+    let runs = (families.len() + 1) * 8;
+    let mut reached = BTreeSet::new();
+    for (family, input) in draws(SEED, 512, families.clone()).take(runs) {
+        let family = family.unwrap();
+        reached.insert(family);
+        if let Some(listed) = families.iter().find(|listed| listed.name == family) {
+            assert!(input.starts_with(&listed.tag));
+            assert_eq!(entry.scenario(&input), entry.scenario(&listed.tag));
+        }
+    }
+    let mut every: BTreeSet<&str> = families.iter().map(|family| family.name).collect();
+    every.insert(UNTAGGED);
+    assert_eq!(reached, every, "within {runs} draws");
+    let plain: Vec<Vec<u8>> = inputs(SEED, 64).take(32).collect();
+    let untagged: Vec<(Option<&str>, Vec<u8>)> = draws(SEED, 64, Vec::new()).take(32).collect();
+    assert!(untagged.iter().all(|(family, _)| family.is_none()));
+    assert_eq!(
+        untagged
+            .into_iter()
+            .map(|(_, input)| input)
+            .collect::<Vec<_>>(),
+        plain
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -82,7 +82,7 @@ use super::{
     },
     header_sync::Dialer,
     policy::LinkEffect,
-    Subsystem,
+    ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
@@ -1105,6 +1105,14 @@ impl Subsystem for SyncStorage {
     /// observations ([`storage_sources`]).
     fn sources() -> Sources {
         storage_sources()
+    }
+
+    /// Each saved scenario's tag ([`SavedSync::tag`]).
+    fn families() -> Vec<ScenarioFamily> {
+        SavedSync::ALL
+            .into_iter()
+            .map(|saved| ScenarioFamily::new(saved.name(), saved.tag()))
+            .collect()
     }
 
     /// The saved scenario `prefix` tags ([`SavedSync::from_tag`]), or the

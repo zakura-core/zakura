@@ -49,6 +49,9 @@ pub struct Machine {
     pub identity: &'static str,
     /// The property's claim, in one sentence.
     pub claim: &'static str,
+    /// Named rules for a machine with several independent invariants.
+    /// An empty slice keeps the single rule named by `name` and `claim`.
+    pub rules: &'static [(&'static str, &'static str)],
     /// The decoder's version.
     pub generator: u32,
     /// The most operations the decoder returns.
@@ -143,16 +146,25 @@ pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
 }
 
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
-    vec![Property {
-        id: PropertyId::new(machine.name),
-        claim: machine.claim,
-        kind: Kind::Safety,
-        assumes: &[],
-        needs: &[Source::View],
-        status: Status::Active,
-        check,
-        witness: None,
-    }]
+    let fallback = [(machine.name, machine.claim)];
+    let rules = if machine.rules.is_empty() {
+        &fallback[..]
+    } else {
+        machine.rules
+    };
+    rules
+        .iter()
+        .map(|&(id, claim)| Property {
+            id: PropertyId::new(id),
+            claim,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status: Status::Active,
+            check,
+            witness: None,
+        })
+        .collect()
 }
 
 /// A step that fails is a violation, even before the run reaches the
@@ -164,7 +176,7 @@ fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         cx.missing_evidence("machine transition has no captured view");
         return Verdict::NotApplicable;
     };
-    let Some(failure) = step.failure() else {
+    let Some(failure) = step.failure_for(cx.id().as_str()) else {
         return if reached {
             Verdict::Holds
         } else {
@@ -440,7 +452,7 @@ pub fn witness(
     also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    if property != machine.name {
+    if !registered(machine).iter().any(|rule| rule.id == property) {
         return Err(WitnessError::Unregistered);
     }
     let mut evidence = WitnessSink {

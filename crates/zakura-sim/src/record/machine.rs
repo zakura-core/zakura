@@ -30,6 +30,8 @@ pub enum MachineStep {
     /// [`crate::harness::fixtures`] tests the simulator. No production machine
     /// records it.
     Fixture(FixtureStep),
+    /// Admission decisions and charges checked against live connection owners.
+    Handshake(CountsStep),
     /// Logical block-work ownership and its independent model.
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
@@ -97,12 +99,25 @@ impl From<zakura_node_services::block_memory::model::RetentionStep> for DecodedR
 }
 
 impl MachineStep {
+    /// Selects the failure for one named rule of a machine.
+    pub fn failure_for(&self, property: &str) -> Option<MachineFailure> {
+        match self {
+            Self::Handshake(step) => step
+                .failures
+                .iter()
+                .find(|(id, _)| id == property)
+                .map(|(_, failure)| failure.clone()),
+            _ => self.failure(),
+        }
+    }
+
     /// The failure that stopped the run at this operation, if any.
     pub fn failure(&self) -> Option<MachineFailure> {
         match self {
             Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
             Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
             Self::Fixture(step) => step.failure.clone(),
+            Self::Handshake(step) => step.failures.first().map(|(_, failure)| failure.clone()),
             Self::Work(step) => step.failure.clone(),
             Self::WorkFunding(step) => step.failure.clone(),
             Self::Reactor(step) => step.failure.clone(),
@@ -1001,4 +1016,34 @@ mod tests {
             .unwrap();
         assert!(failure.property_failure);
     }
+}
+
+/// The state after one causal operation. The trace records both ledgers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountsStep {
+    /// The causal bytes that selected this operation.
+    pub input: Vec<u8>,
+    /// The production machine counters.
+    pub actual: CountsView,
+    /// The independently counted live owners.
+    pub expected: CountsView,
+    /// Whether this history admitted any connection.
+    pub active: bool,
+    /// Each named rule violated at this operation.
+    pub failures: Vec<(String, MachineFailure)>,
+}
+
+/// Counts by independent address group, plus the global handshake permits.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountsView {
+    /// Registered owners per address group.
+    pub registered: [usize; 8],
+    /// Inbound control owners per address group.
+    pub handshaking: [usize; 8],
+    /// All control-handshake permits.
+    pub pending: usize,
+    /// The inbound share of control-handshake permits.
+    pub inbound_pending: usize,
 }

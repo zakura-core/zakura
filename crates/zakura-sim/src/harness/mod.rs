@@ -19,6 +19,8 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
+pub mod handshake_counts;
+pub mod handshake_wire;
 pub mod header_acceptance;
 pub mod header_node;
 pub mod header_sync;
@@ -512,6 +514,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     header_work::REACTOR_ENTRY,
     header_work::PUBLISHER_ENTRY,
     block_work::REACTOR_ENTRY,
+    handshake_counts::ENTRY,
+    entry::<handshake_wire::Wire>(),
     discovery_machine::BOOK_ENTRY,
     discovery_machine::STATE_ENTRY,
     entry::<discovery::VerificationCapacity>(),

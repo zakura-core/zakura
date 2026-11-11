@@ -52,6 +52,21 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TransportEvent {
+    /// A control-handshake boundary, including connections that never register.
+    Handshake {
+        /// The address charged by admission.
+        remote: SocketAddr,
+        /// The TLS-derived connection identity.
+        shared_id: [u8; 16],
+        /// Started, hello, ack, or released.
+        stage: &'static str,
+        /// The production validation error, if validation rejected the payload.
+        validation: Option<crate::zakura::ZakuraValidationError>,
+        /// A read, write, codec, or capacity failure.
+        error: Option<String>,
+        /// Time since inbound handling began, on release.
+        elapsed: Option<std::time::Duration>,
+    },
     /// The control handshake succeeded.
     Negotiated {
         /// The remote address the connection was admitted from.

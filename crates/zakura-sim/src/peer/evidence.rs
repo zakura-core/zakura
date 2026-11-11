@@ -138,6 +138,11 @@ pub(crate) struct PeerRecord {
 /// A [`PeerRecord`]'s observation, without its connection.
 #[derive(Clone, Debug)]
 pub(crate) enum RecordBody {
+    /// A control payload or prelude, keyed before registration.
+    Handshake {
+        row: &'static str,
+        label: &'static str,
+    },
     /// [`Observation::PeerFrame`]: a frame offered, as the models labelled
     /// it.
     Frame {
@@ -426,10 +431,20 @@ impl WireEvidence {
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
     fn place(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
+        if let RecordBody::Handshake { row, label } = &record.body {
+            return Some(Ok(vec![Observation::PeerHandshake {
+                remote: record.remote.addr.to_string(),
+                shared_id: hex(&record.remote.shared_id),
+                quic_stream: record.quic_stream,
+                row: (*row).into(),
+                label: (*label).into(),
+            }]));
+        }
         let connection = *self.connections.get(&Self::key(record.remote))?;
         let stream = *self.streams.get(&(connection, record.quic_stream))?;
         let quic_stream = record.quic_stream;
         Some(Ok(vec![match record.body.clone() {
+            RecordBody::Handshake { .. } => unreachable!("handshake records need no session"),
             RecordBody::Frame {
                 seq,
                 row,

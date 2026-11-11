@@ -12,6 +12,19 @@ use crate::model::Label;
 #[serde(tag = "obs", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Observation {
+    /// A scripted control payload or prelude, labelled before its write.
+    PeerHandshake {
+        /// The peer endpoint's address.
+        remote: String,
+        /// The connection identity derived from TLS.
+        shared_id: String,
+        /// The QUIC stream, including streams that never install a session.
+        quic_stream: u64,
+        /// Hello, ack, or prelude.
+        row: String,
+        /// The deliberate deviation, or conformant.
+        label: String,
+    },
     /// A task the run hadn't seen before became ready. A task spawned while
     /// every worker is busy shows up at the step that first offers it.
     TaskSpawned {
@@ -1942,6 +1955,19 @@ pub enum DatagramOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum TransportFact {
+    /// A control-handshake boundary before registration.
+    Handshake {
+        /// The TLS connection identity.
+        shared_id: String,
+        /// The production boundary.
+        stage: String,
+        /// The label mapped exhaustively from the production validation error.
+        validation: Option<String>,
+        /// Any control-handshake failure.
+        error: Option<String>,
+        /// Elapsed control-handshake time, in milliseconds, at release.
+        elapsed_ms: Option<u64>,
+    },
     /// The control handshake succeeded.
     Negotiated {
         /// The capability mask the node sent: its hello's, or, as the

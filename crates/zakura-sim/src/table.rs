@@ -22,6 +22,8 @@
 //! label, or an unclaimed fault, fails the run as a harness failure, so it
 //! can't hide an obligation.
 
+pub mod handshake;
+
 use std::fmt;
 
 use zakura_network::zakura::{MessageRole, MessageRule, Stream};

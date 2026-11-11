@@ -98,6 +98,25 @@ impl WireNode {
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
     ) -> Self {
+        Self::spawn_with_services(sim, header, network, net, seed, observer, dials, |_, _| {
+            Vec::new()
+        })
+    }
+
+    /// Builds the same wire node with additional production services in its registry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_services(
+        sim: &mut Sim,
+        header: HeaderNode,
+        network: &Network,
+        net: SimNet,
+        seed: [u8; 32],
+        observer: Arc<dyn TransportObserver>,
+        dials: DialReporter,
+        additional: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> Vec<Arc<dyn Service>>
+            + Send
+            + 'static,
+    ) -> Self {
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
         let endpoint = WireEndpoint::spawn(
             sim,
@@ -106,7 +125,11 @@ impl WireNode {
             seed,
             observer,
             dials,
-            move |_, _| (vec![service], ()),
+            move |supervisor, limits| {
+                let mut services = vec![service];
+                services.extend(additional(supervisor, limits));
+                (services, ())
+            },
             |_, _, ()| async {},
         );
         WireNode { header, endpoint }
@@ -678,6 +701,28 @@ impl TransportTap {
             }
         };
         Ok(match event {
+            TransportEvent::Handshake {
+                remote,
+                shared_id,
+                stage,
+                validation,
+                error,
+                elapsed,
+            } => (
+                None,
+                remote,
+                TransportFact::Handshake {
+                    shared_id: crate::storage::hex(&shared_id),
+                    stage: stage.into(),
+                    validation: validation
+                        .map(|error| crate::table::handshake::validation_label(error).into()),
+                    error,
+                    elapsed_ms: elapsed.map(|elapsed| {
+                        u64::try_from(elapsed.as_millis())
+                            .expect("a simulation fits u64 milliseconds")
+                    }),
+                },
+            ),
             TransportEvent::Negotiated {
                 remote,
                 local,

@@ -6,6 +6,7 @@
 mod clock;
 mod frame;
 mod guard;
+mod handshake_counts;
 mod io;
 mod lifetime;
 mod message_rule;
@@ -22,6 +23,7 @@ mod sim_reader;
 
 pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
+pub use handshake_counts::{inbound_share, HandshakeCounts, IpAdmission};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.

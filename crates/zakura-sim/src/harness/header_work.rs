@@ -6,6 +6,7 @@ use crate::record::machine::MachineStep;
 
 /// Header reactor policy, against its independent model.
 pub const REACTOR: Machine = Machine {
+    rules: &[],
     name: "header/reactor-policy",
     identity: "header-reactor",
     claim: "The header reactor's scheduling and locator state agree with the \
@@ -21,6 +22,7 @@ pub const REACTOR_ENTRY: HarnessEntry = crate::machine_entry!(REACTOR);
 
 /// Header publisher policy, against its independent model.
 pub const PUBLISHER: Machine = Machine {
+    rules: &[],
     name: "header/publisher-policy",
     identity: "header-publisher",
     claim: "The header publisher's credit, jobs, terminal outcomes, and slots agree with \

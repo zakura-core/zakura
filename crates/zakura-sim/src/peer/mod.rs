@@ -38,7 +38,7 @@ pub mod adversary;
 mod content;
 pub mod discovery;
 mod evidence;
-pub(crate) mod handshake;
+pub mod handshake;
 pub mod honest;
 pub mod limit;
 mod stage;
@@ -125,6 +125,9 @@ pub fn peer_addr(index: usize, dial: usize) -> SocketAddr {
 
 /// The peer that binds `addr`, by index, if [`peer_addr`] gives it.
 pub fn peer_of(addr: SocketAddr) -> Option<usize> {
+    if addr.port() >= 4001 {
+        return Some(usize::from((addr.port() - 4001) % 256));
+    }
     let SocketAddr::V4(v4) = addr else {
         return None;
     };
@@ -169,6 +172,9 @@ pub struct PeerSpec {
     /// Whether, as the responder, it echoes the node's nonce wrongly.
     #[serde(default)]
     pub bad_nonce_echo: bool,
+    /// Per-connection control, prelude, address and timing inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake: Option<handshake::options::HandshakeSpec>,
     /// Its actions, in order.
     #[serde(default)]
     pub script: Vec<PeerAction>,
@@ -195,12 +201,25 @@ pub struct PeerSpec {
 }
 
 impl PeerSpec {
+    /// The endpoint address, with a distinct port when peers share an IP.
+    pub fn address(&self, index: usize, dial: usize) -> SocketAddr {
+        match self.handshake.as_ref().and_then(|spec| spec.bind_ip) {
+            Some(ip) => SocketAddr::new(
+                ip,
+                u16::try_from(4001 + index + 256 * dial)
+                    .expect("a handshake scenario has bounded peers and retries"),
+            ),
+            None => peer_addr(index, dial),
+        }
+    }
+
     /// A peer that dials and offers header sync alone.
     pub fn dialing() -> Self {
         PeerSpec {
             dialer: Dialer::Peer,
             capabilities: ZAKURA_CAP_HEADER_SYNC,
             bad_nonce_echo: false,
+            handshake: None,
             script: Vec::new(),
             honest: None,
             adversary: None,
@@ -233,6 +252,11 @@ impl PeerSpec {
             && self.adversary.is_none()
             && !self.invalid_tip
             && !self.bad_nonce_echo
+            && self.handshake.as_ref().is_none_or(|spec| {
+                spec.control == handshake::options::ControlFault::None
+                    && spec.prelude == handshake::options::PreludeFault::None
+                    && spec.abandon_after.is_none()
+            })
             && !self
                 .script
                 .iter()
@@ -1230,7 +1254,7 @@ impl PeerTask {
     /// Runs the peer until the run ends, with `discovery`'s stream, the one
     /// `DiscoveryService::streams()` declares, for its discovery script.
     pub(crate) async fn run_with(mut self, discovery: Option<Stream>) {
-        let local = Local::regtest();
+        let local = Local::regtest(self.spec.handshake.as_ref(), self.records.clone());
         let adversary = self.spec.adversary.clone().map(Adversary::new);
         let (announce, serve) = adversary.as_ref().map_or((true, true), |adversary| {
             (adversary.announces(), adversary.serves())
@@ -1290,6 +1314,10 @@ impl PeerTask {
         Ended::Failed
     }
 
+    fn address(&self, dial: usize) -> SocketAddr {
+        self.spec.address(self.index, dial)
+    }
+
     /// Binds the endpoint for the `dial`-th connection.
     fn bind(&self, dial: usize) -> QuicEndpoint {
         let inputs = u32::try_from(dial)
@@ -1298,8 +1326,17 @@ impl PeerTask {
             .and_then(|base| base.checked_add(key_index(self.index)))
             .expect("a peer dials fewer than 2^24 times");
         QuicEndpoint::bind_with(
-            SeededInputs::node_key(self.seed, key_index(self.index)),
-            &bind_config(peer_addr(self.index, dial)),
+            SeededInputs::node_key(
+                self.seed,
+                key_index(
+                    self.spec
+                        .handshake
+                        .as_ref()
+                        .and_then(|spec| spec.identity)
+                        .unwrap_or(self.index),
+                ),
+            ),
+            &bind_config(self.address(dial)),
             &QuicConfig::default(),
             self.net.clone(),
             SeededInputs::new(self.seed, inputs).endpoint_inputs(),
@@ -1316,13 +1353,30 @@ impl PeerTask {
             let Ok(conn) = quic.connect(self.node.clone(), &[P2P_V2_ALPN]).await else {
                 return;
             };
-            let Ok(negotiated) =
-                handshake::initiate(&conn, quic.local_id(), self.spec.capabilities, local).await
+            let Ok(negotiated) = handshake::initiate(
+                &conn,
+                quic.local_id(),
+                self.spec.capabilities,
+                local,
+                Remote {
+                    addr: self.address(dial),
+                    shared_id: conn.shared_id(),
+                },
+            )
+            .await
             else {
+                if let Some(script) = &self.spec.handshake {
+                    if dial < usize::from(script.retries) {
+                        quic.shutdown().await;
+                        handshake::options::delay(script.retry_delay_ms).await;
+                        dial += 1;
+                        continue;
+                    }
+                }
                 return;
             };
             let remote = Remote {
-                addr: peer_addr(self.index, dial),
+                addr: self.address(dial),
                 shared_id: conn.shared_id(),
             };
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
@@ -1367,12 +1421,18 @@ impl PeerTask {
         };
         while let Some(conn) = incoming.recv().await {
             let remote = Remote {
-                addr: peer_addr(self.index, 0),
+                addr: self.address(0),
                 shared_id: conn.shared_id(),
             };
-            let answered =
-                handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
-                    .await;
+            let answered = handshake::respond(
+                &conn,
+                conn.remote_id(),
+                self.spec.capabilities,
+                echo,
+                local,
+                remote,
+            )
+            .await;
             let ended = match answered {
                 Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {
@@ -1458,10 +1518,23 @@ impl PeerTask {
             let Ok((mut send, recv)) = conn.open_bi().await else {
                 return Ended::Closed;
             };
-            let opened = handshake::write_prelude(
+            self.record(
+                remote,
+                send.id(),
+                RecordBody::Handshake {
+                    row: "prelude",
+                    label: self
+                        .spec
+                        .handshake
+                        .as_ref()
+                        .map_or("conformant", |script| script.prelude.label()),
+                },
+            );
+            let opened = handshake::write_prelude_with(
                 &mut send,
                 ZAKURA_STREAM_HEADER_SYNC,
                 ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                self.spec.handshake.as_ref(),
             )
             .await;
             if opened.is_err() {
@@ -1492,9 +1565,26 @@ impl PeerTask {
             let Ok((mut send, recv)) = conn.open_bi().await else {
                 return Ended::Closed;
             };
-            if handshake::write_prelude(&mut send, layout.kind, layout.version)
-                .await
-                .is_err()
+            self.record(
+                remote,
+                send.id(),
+                RecordBody::Handshake {
+                    row: "prelude",
+                    label: self
+                        .spec
+                        .handshake
+                        .as_ref()
+                        .map_or("conformant", |script| script.prelude.label()),
+                },
+            );
+            if handshake::write_prelude_with(
+                &mut send,
+                layout.kind,
+                layout.version,
+                self.spec.handshake.as_ref(),
+            )
+            .await
+            .is_err()
             {
                 return Ended::Closed;
             }

@@ -75,6 +75,17 @@ where
     let mut punished = Vec::new();
     for (at, entry) in entries.iter().enumerate().skip(start) {
         match &entry.obs {
+            Observation::Transport {
+                remote,
+                event:
+                    TransportFact::Handshake {
+                        validation: Some(reason),
+                        ..
+                    },
+                ..
+            } if peer_at(remote).is_some_and(|peer| view.is_honest(peer)) => {
+                return cx.violated("an honest peer passes control validation", reason);
+            }
             Observation::Transport { remote, .. }
                 if peer_at(remote).is_some_and(|peer| view.is_honest(peer)) =>
             {

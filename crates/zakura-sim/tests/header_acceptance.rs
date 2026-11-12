@@ -2859,6 +2859,7 @@ fn the_contracts_table_has_one_row_per_required_contract() {
     assert!(!contract_errors(&doubled).is_empty());
     let mut unproved = table.clone();
     unproved[0].state = ContractState::Satisfied;
+    unproved[0].proving = &[];
     assert!(!contract_errors(&unproved).is_empty());
 }
 

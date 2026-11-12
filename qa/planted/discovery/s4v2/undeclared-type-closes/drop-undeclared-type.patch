@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
-index c488b85bd5..47e8d8ae0d 100644
+index a5a086e91e..b49fa8fc53 100644
 --- a/crates/zakura-network/src/zakura/discovery/service.rs
 +++ b/crates/zakura-network/src/zakura/discovery/service.rs
-@@ -729,6 +729,14 @@ async fn read_frame(
+@@ -732,6 +732,14 @@ async fn read_frame(
      frame: Frame,
      sink: &DiscoverySink,
  ) -> Result<(), (ViolationStage, SinkReject)> {
@@ -18,27 +18,27 @@ index c488b85bd5..47e8d8ae0d 100644
      let answer = sink
          .queries
 diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
-index aea707b24c..c43e253418 100644
+index 64b530f368..819a0a3238 100644
 --- a/crates/zakura-network/src/zakura/handler.rs
 +++ b/crates/zakura-network/src/zakura/handler.rs
-@@ -2679,8 +2679,15 @@ fn admit_inbound_message(
-     // A stream with a table charges only the rows that declare a cadence.
-     // Commitments bound requests and reservations bound responses.
-     if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
--        let rule = MessageRule::find(rules, frame.message_type)
--            .expect("the frame filter admits only rows of the stream's table");
-+        let rule = match MessageRule::find(rules, frame.message_type) {
-+            Some(rule) => rule,
-+            // Planted bypass: discovery's reader admits a type its table
-+            // doesn't declare, which no row's cadence charges.
-+            None if rules == crate::zakura::discovery::wire::RULES => {
-+                return InboundMessageAdmission::Admit
-+            }
-+            None => panic!("the frame filter admits only rows of the stream's table"),
-+        };
-         let charge = cadence
-             .buckets
-             .lock()
+@@ -2818,8 +2818,15 @@ pub(crate) fn admit_tabled_message(
+     charge: impl FnOnce(&MessageRule) -> CadenceCharge,
+     exhausted: impl FnOnce(),
+ ) -> InboundMessageAdmission {
+-    let rule = MessageRule::find(rules, frame.message_type)
+-        .expect("the frame filter admits only rows of the stream's table");
++    let rule = match MessageRule::find(rules, frame.message_type) {
++        Some(rule) => rule,
++        // Planted bypass: discovery's reader admits a type its table
++        // doesn't declare, which no row's cadence charges.
++        None if rules == crate::zakura::discovery::wire::RULES => {
++            return InboundMessageAdmission::Admit
++        }
++        None => panic!("the frame filter admits only rows of the stream's table"),
++    };
+     // A sibling stream can keep the connection alive during an unbounded
+     // transport stall. Exhaustion cannot prove a sender violation.
+     if charge(rule) == CadenceCharge::Exhausted {
 diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
 index 3d5746878a..ebabcd0866 100644
 --- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs

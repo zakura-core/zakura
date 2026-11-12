@@ -2043,6 +2043,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "own9-join",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "owner-swap",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -3291,18 +3297,6 @@ const PROBE_ACCOUNTING: HistoryRef = HistoryRef {
     case: "plan 0 of inputs(16, 256)",
 };
 
-/// A [`NativeClass::ToMove`].
-const fn to_move(
-    patch: &'static str,
-    property: &'static str,
-    until: &'static str,
-) -> NativeMutation {
-    NativeMutation {
-        patch,
-        class: NativeClass::ToMove { property, until },
-    }
-}
-
 /// Every native mutation on `main`, classified. The ledger rules each one
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
@@ -3358,7 +3352,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "stored-order",
         },
     },
-    to_move("own9-join", COMMIT, "hdr-9c.1a"),
+    NativeMutation {
+        patch: "own9-join",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "own9-join",
+        },
+    },
     NativeMutation {
         patch: "owner-swap",
         class: NativeClass::Moved {

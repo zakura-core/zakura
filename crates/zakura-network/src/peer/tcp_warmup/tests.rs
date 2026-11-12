@@ -23,15 +23,34 @@ fn warmup(
     (TcpWarmup::new(config, tip_rx), tip_tx)
 }
 
+/// Writes `chunk` the way a connection does, and returns its pong sender.
+fn write(chunk: WarmupChunk) -> oneshot::Sender<()> {
+    chunk
+        .written
+        .send(())
+        .expect("the driver waits for the write");
+    chunk.pong
+}
+
 /// Answers each warm-up ping on `link` with an immediate pong, and returns the paddings in
 /// the order they arrived once the driver closes the link.
 async fn answer_all(mut link: mpsc::Receiver<WarmupChunk>) -> Vec<u32> {
     let mut paddings = Vec::new();
     while let Some(chunk) = link.recv().await {
         paddings.push(chunk.padding);
-        let _ = chunk.pong.send(());
+        let _ = write(chunk).send(());
     }
     paddings
+}
+
+/// Answers the probe on `link`, and returns the first padded ping without writing it.
+async fn first_padded_ping(link: &mut mpsc::Receiver<WarmupChunk>) -> WarmupChunk {
+    let probe = link.recv().await.expect("the driver sends the probe");
+    assert_eq!(probe.padding, 0);
+    let _ = write(probe).send(());
+    let chunk = link.recv().await.expect("the driver sends a padded ping");
+    assert!(chunk.padding > 0);
+    chunk
 }
 
 #[test]
@@ -189,9 +208,10 @@ async fn run_stops_on_a_missing_pong_and_keeps_no_claim_without_padding() {
     let unanswered = tokio::spawn(async move {
         let probe = chunks.recv().await.expect("the driver sends the probe");
         assert_eq!(probe.padding, 0);
+        let pong = write(probe);
         // Hold the pong sender and the link, so only the timeout ends the wait.
         let _ = chunks.recv().await;
-        drop(probe);
+        drop(pong);
     });
     warmup.clone().run(PEER, link).await;
 
@@ -226,7 +246,7 @@ async fn padded_pings_wait_for_a_quiet_tip() {
         .recv()
         .await
         .expect("the probe does not wait for the tip");
-    let _ = probe.pong.send(());
+    let _ = write(probe).send(());
 
     // A tip change half-way through the quiet time restarts it.
     tokio::time::advance(config.tip_quiet / 2).await;
@@ -240,4 +260,44 @@ async fn padded_pings_wait_for_a_quiet_tip() {
     drop(chunk);
     drop(chunks);
     driver.await.unwrap();
+}
+
+/// A padded ping that stays queued behind other connection work until the chunk timeout is
+/// never written, so it does not start the cooldown (V12 F-722).
+#[tokio::test(start_paused = true)]
+async fn queued_padding_that_is_never_written_keeps_no_claim() {
+    let config = enabled_config();
+    let (warmup, _tip) = warmup(config.clone(), None);
+
+    let (link, mut chunks) = mpsc::channel(WARMUP_QUEUE);
+    let driver = tokio::spawn(warmup.clone().run(PEER, link));
+    let queued = first_padded_ping(&mut chunks).await;
+
+    driver.await.unwrap();
+    assert!(
+        queued.written.send(()).is_err(),
+        "the connection skips a ping whose warm-up stopped"
+    );
+    assert!(
+        warmup.claim(PEER).is_some(),
+        "padding that was never written does not start the cooldown"
+    );
+}
+
+/// A padded ping that was written starts the cooldown, even if its pong never arrives.
+#[tokio::test(start_paused = true)]
+async fn written_padding_without_a_pong_keeps_the_claim() {
+    let config = enabled_config();
+    let (warmup, _tip) = warmup(config.clone(), None);
+
+    let (link, mut chunks) = mpsc::channel(WARMUP_QUEUE);
+    let driver = tokio::spawn(warmup.clone().run(PEER, link));
+    let pong = write(first_padded_ping(&mut chunks).await);
+
+    driver.await.unwrap();
+    drop(pong);
+    assert!(
+        warmup.claim(PEER).is_none(),
+        "written padding starts the cooldown"
+    );
 }

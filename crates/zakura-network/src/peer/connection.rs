@@ -1282,9 +1282,11 @@ where
         let WarmupChunk {
             nonce,
             padding,
+            written,
             pong,
         } = chunk;
-        if pong.is_closed() {
+        if written.send(()).is_err() {
+            // The warm-up stopped while the ping was queued.
             return;
         }
 

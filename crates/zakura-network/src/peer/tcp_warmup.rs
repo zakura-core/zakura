@@ -46,6 +46,9 @@ pub(crate) struct WarmupChunk {
     pub nonce: Nonce,
     /// The zero bytes after the nonce.
     pub padding: u32,
+    /// Fires just before the connection writes the ping. The connection skips the ping if the
+    /// receiver is gone, because the warm-up has stopped.
+    pub written: oneshot::Sender<()>,
     /// Fires when the peer's `pong` arrives.
     pub pong: oneshot::Sender<()>,
 }
@@ -118,8 +121,10 @@ impl TcpWarmup {
     /// Returns when the warm-up completes or stops. It stops if a `pong` takes longer than the
     /// chunk timeout, or if the connection closes, and it never closes the connection itself.
     /// The chunk timeout is less than half the connection's send timeout, and each ping is at
-    /// most twice the size of the last one that the peer answered in time, so writing the next
-    /// ping never takes long enough to fail the connection.
+    /// most twice the size of the last one that the peer answered in time. A peer whose link
+    /// stays as fast as its last `pong` showed therefore accepts the next ping within the send
+    /// timeout. A write that stalls past the send timeout still fails the connection, as any
+    /// write does.
     pub(crate) async fn run(self, peer_ip: IpAddr, link: mpsc::Sender<WarmupChunk>) {
         let Some(mut claim) = self.claim(peer_ip) else {
             metrics::counter!("peer.tcp_warmup.skipped", "reason" => "cooldown").increment(1);
@@ -146,21 +151,38 @@ impl TcpWarmup {
                 }
             }
 
+            let (written_tx, mut written_rx) = oneshot::channel();
             let (pong_tx, pong_rx) = oneshot::channel();
             let chunk = WarmupChunk {
                 nonce: Nonce::default(),
                 padding,
+                written: written_tx,
                 pong: pong_tx,
             };
-            let sent_at = Instant::now();
+            let deadline = Instant::now() + config.chunk_timeout;
             if link.send(chunk).await.is_err() {
                 return abort("closed", &rtts);
+            }
+
+            // A peer that keeps the connection busy can hold the ping in its queue. The
+            // cooldown starts only once padding is actually written.
+            match tokio::time::timeout_at(deadline, &mut written_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return abort("closed", &rtts),
+                Err(_) => {
+                    // Stop the connection from writing the ping, unless it already started.
+                    written_rx.close();
+                    if written_rx.try_recv().is_err() {
+                        return abort("timeout", &rtts);
+                    }
+                }
             }
             if padding > 0 {
                 claim.keep();
             }
+            let sent_at = Instant::now();
 
-            match tokio::time::timeout(config.chunk_timeout, pong_rx).await {
+            match tokio::time::timeout_at(deadline, pong_rx).await {
                 Ok(Ok(())) => {
                     let rtt = sent_at.elapsed();
                     metrics::counter!("peer.tcp_warmup.bytes_sent").increment(padding.into());

@@ -53,8 +53,8 @@ pub struct TcpWarmupConfig {
     /// closes the connection.
     ///
     /// It must be less than half of [`REQUEST_TIMEOUT`], the time a connection allows for each
-    /// write. Each ping is twice the size of the last one, so a peer that answered the last
-    /// one within this time takes at most about twice this time to accept the next one.
+    /// write. Each ping is twice the size of the last one, so a peer whose link stays as fast
+    /// as its last answer showed takes at most about twice this time to accept the next one.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub chunk_timeout: Duration,
 }
@@ -74,8 +74,8 @@ impl Default for TcpWarmupConfig {
 }
 
 impl TcpWarmupConfig {
-    /// Checks that the settings describe a warm-up that peers accept and that never fails a
-    /// connection.
+    /// Checks that the settings describe a warm-up that peers accept and that fits each ping
+    /// inside the connection's send timeout.
     pub fn validate(&self) -> Result<(), String> {
         if self.first_chunk_bytes == 0 {
             return Err("network.tcp_warmup.first_chunk_bytes must be greater than 0".into());
@@ -97,7 +97,7 @@ impl TcpWarmupConfig {
         if self.chunk_timeout.is_zero() || self.chunk_timeout * 2 >= REQUEST_TIMEOUT {
             return Err(format!(
                 "network.tcp_warmup.chunk_timeout must be greater than 0 and less than {:?}, \
-                 so that writing the next ping never times out the connection",
+                 so that each ping fits inside the connection's send timeout",
                 REQUEST_TIMEOUT / 2
             ));
         }

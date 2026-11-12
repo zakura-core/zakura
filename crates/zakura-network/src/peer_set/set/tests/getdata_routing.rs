@@ -432,6 +432,76 @@ async fn pruned_routing_single_archive_does_not_capture_every_request() {
     );
 }
 
+/// A busy archive peer does not take a block request from an idle pruned peer: readiness ranks
+/// above the full-history claim, and load alone would pick the busy archive.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_prefers_idle_pruned_over_busy_archive() {
+    let _init_guard = zakura_test::init();
+
+    let BusyAndIdleAdvertisers {
+        mut peer_set,
+        _guard,
+        busy: mut archive,
+        idle: mut pruned,
+        ..
+    } = busy_and_idle_peers(
+        PeerServices::NODE_NETWORK,
+        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+        None,
+    )
+    .await;
+
+    let _block_response = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(StoragePeers::block_request());
+
+    assert_eq!(
+        pruned.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the block request leaves through the idle pruned peer without waiting",
+    );
+    assert_eq!(archive.written_now().await, None);
+}
+
+/// A peer that advertises no services, such as an older Zakura pruned node, makes no full-history
+/// claim, so it does not outrank a peer with the pruned hint.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_does_not_favour_peers_without_node_network() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 200;
+
+    let mut no_services = TestPeer::spawn_with_services(1, PeerServices::empty(), None);
+    let mut pruned = TestPeer::spawn_with_services(
+        2,
+        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+        None,
+    );
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (mut set, _guard) = PeerSetBuilder::new()
+        .with_discover(discover(vec![
+            no_services.discovered(),
+            pruned.discovered(),
+        ]))
+        .with_minimum_peer_version(minimum)
+        .max_conns_per_ip(2)
+        .build();
+    set.ready().await.expect("both peers are ready");
+    let candidates: HashSet<_> = set.ready_services.keys().copied().collect();
+    assert_eq!(candidates.len(), 2);
+
+    let no_services_selections = (0..SELECTIONS)
+        .filter(|_| set.select_archive_or_pruned_peer(&candidates) == Some(no_services.addr))
+        .count();
+
+    // Equal ranks and equal fresh loads leave the choice to the random sample order.
+    assert!(
+        (1..SELECTIONS).contains(&no_services_selections),
+        "the peer without services took {no_services_selections} of {SELECTIONS} selections",
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_transactions_still_use_pruned_advertisers() {
     let _init_guard = zakura_test::init();
@@ -539,7 +609,7 @@ async fn block_getdata_waits_behind_tx_response_on_only_advertiser() {
     );
 }
 
-/// Peers that both advertised `inventory`: one awaiting a transaction response, one idle.
+/// Two connected peers: one awaiting a transaction response, one idle.
 struct BusyAndIdleAdvertisers {
     peer_set: PeerSet<TestDiscover, MockChainTip>,
     _guard: PeerSetGuard,
@@ -556,8 +626,23 @@ struct BusyAndIdleAdvertisers {
 /// its peak-EWMA load is higher than the busy peer's load, even though the busy peer has one request
 /// outstanding. Load alone therefore selects the busy peer.
 async fn busy_and_idle_advertisers(inventory: InventoryHash) -> BusyAndIdleAdvertisers {
-    let mut busy = TestPeer::spawn(1);
-    let mut idle = TestPeer::spawn(2);
+    busy_and_idle_peers(
+        PeerServices::NODE_NETWORK,
+        PeerServices::NODE_NETWORK,
+        Some(inventory),
+    )
+    .await
+}
+
+/// Connects a busy and an idle peer with the given services, as
+/// [`busy_and_idle_advertisers`] does, with both peers advertising `inventory` if it is given.
+async fn busy_and_idle_peers(
+    busy_services: PeerServices,
+    idle_services: PeerServices,
+    inventory: Option<InventoryHash>,
+) -> BusyAndIdleAdvertisers {
+    let mut busy = TestPeer::spawn_with_services(1, busy_services, None);
+    let mut idle = TestPeer::spawn_with_services(2, idle_services, None);
     let tx = test_transaction();
 
     // Let the default RTT estimates decay, then give the idle peer a slow round trip.
@@ -584,25 +669,28 @@ async fn busy_and_idle_advertisers(inventory: InventoryHash) -> BusyAndIdleAdver
         .max_conns_per_ip(2)
         .build();
 
-    // The test inventory channel holds one change, so register each advert before the next.
-    for addr in [busy.addr, idle.addr] {
-        guard
-            .inventory_sender()
-            .as_mut()
-            .expect("guard has an inventory sender")
-            .send(InventoryStatus::new_available(inventory, addr))
-            .expect("peer set receives inventory");
-        peer_set.ready().await.expect("peer set is ready");
-    }
+    peer_set.ready().await.expect("peer set is ready");
+    if let Some(inventory) = inventory {
+        // The test inventory channel holds one change, so register each advert before the next.
+        for addr in [busy.addr, idle.addr] {
+            guard
+                .inventory_sender()
+                .as_mut()
+                .expect("guard has an inventory sender")
+                .send(InventoryStatus::new_available(inventory, addr))
+                .expect("peer set receives inventory");
+            peer_set.ready().await.expect("peer set is ready");
+        }
 
-    assert_eq!(
-        peer_set
-            .inventory_registry
-            .advertising_peers(inventory)
-            .copied()
-            .collect::<HashSet<_>>(),
-        HashSet::from([busy.addr, idle.addr]),
-    );
+        assert_eq!(
+            peer_set
+                .inventory_registry
+                .advertising_peers(inventory)
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([busy.addr, idle.addr]),
+        );
+    }
     assert_eq!(
         peer_set
             .ready_services

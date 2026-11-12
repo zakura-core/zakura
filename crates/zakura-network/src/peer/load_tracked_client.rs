@@ -86,9 +86,15 @@ impl LoadTrackedClient {
         self.connection_info.remote.version
     }
 
-    /// Returns the peer's self-reported services from its handshake.
-    pub(crate) fn remote_services(&self) -> PeerServices {
-        self.connection_info.remote.services
+    /// Returns true if the peer's handshake claims full block history: it advertises
+    /// [`PeerServices::NODE_NETWORK`] without the [`PeerServices::NODE_PRUNED`] hint.
+    ///
+    /// The claim is self-reported. Older Zakura pruned nodes advertise no services at all, so a
+    /// peer without `NODE_NETWORK` makes no claim even though it lacks the pruned hint.
+    pub(crate) fn claims_full_block_history(&self) -> bool {
+        let services = self.connection_info.remote.services;
+        services.contains(PeerServices::NODE_NETWORK)
+            && !services.contains(PeerServices::NODE_PRUNED)
     }
 
     /// Returns true if the connection would write a request sent now, rather than leave it queued

@@ -20,7 +20,8 @@
 //!
 //! 1. records the input with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
-//!    expecting `holds`;
+//!    expecting `holds`, and replays that trace in a fresh `zakura-sim
+//!    replay` of the same build, which must match Exact;
 //! 2. applies the patch, which must not change, delete or rename the
 //!    case's witness files (its input and sidecar, or its scenario and
 //!    Plan file), so both runs read the same committed witness. It then
@@ -33,8 +34,10 @@
 //!    pass the witness test. A case file's `also_violates` names properties
 //!    the patch's bug breaks too. Any run may violate them beside the case's
 //!    property, and a campaign run may violate one of them instead;
-//! 4. for a typed case, replays the patched trace in a fresh `zakura-sim
-//!    replay`, which must match Exact, since no fuzz target can confirm it;
+//! 4. replays the patched trace in a fresh `zakura-sim replay` of the
+//!    patched build, which must match Exact. Each fresh replay writes its
+//!    full report and how its child ended under the trace's `replay/`,
+//!    which the acceptance tool reads (C4);
 //! 5. resets the worktree to `HEAD`, so the next patched build recompiles
 //!    only what the two patches touch.
 //!
@@ -677,6 +680,32 @@ pub(super) fn case_index(repo_root: &Path, property: &str, name: &str) -> Result
         .ok_or_else(|| format!("{property}/{name} has no planted case").into())
 }
 
+/// The index [`run`] gives case `name` of `property` when it runs that
+/// property with `--targets`: its position among the property's cases that
+/// a fuzz target runs, as [`run`] keeps them, which names its `case-<index>`
+/// directory there. `None` if no fuzz target runs the case.
+pub(super) fn target_case_index(
+    repo_root: &Path,
+    property: &str,
+    name: &str,
+) -> Result<Option<usize>, BoxError> {
+    let harnesses = sim_minimize::fuzz_targets(repo_root)?;
+    let mut on_targets = Vec::new();
+    for case in cases(repo_root)?
+        .into_iter()
+        .filter(|case| case.property == property)
+    {
+        if let Witness::Input(input) = &case.witness {
+            if target_of(&harnesses, &harness_of(repo_root, input)?).is_some() {
+                on_targets.push(case);
+            }
+        }
+    }
+    Ok(on_targets
+        .iter()
+        .position(|case| case.patch.file_stem().and_then(|stem| stem.to_str()) == Some(name)))
+}
+
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
 fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
     let root = repo_root.join(PLANTED_DIR);
@@ -921,6 +950,7 @@ fn check_case(
 ) -> Result<Verdict, BoxError> {
     let harness = case.witness.harness(worktree)?;
     let input = case.witness.located(worktree);
+    let baseline_binary = baseline;
     let baseline = record(
         Command::new(baseline),
         &harness,
@@ -932,6 +962,13 @@ fn check_case(
     )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
+    }
+    // The baseline replays fresh with its own binary too (C4), so the
+    // acceptance tool reads both of the case's runs with their replays.
+    if let Some(why) = replay_misses(baseline_binary, &scratch.join("baseline"), RUN_DEADLINE)? {
+        return Ok(Verdict::BaselineFails(format!(
+            "its trace doesn't replay Exact: {why}"
+        )));
     }
     if let Some(verdict) = apply_case_patch(worktree, case)? {
         return Ok(verdict);
@@ -1464,25 +1501,58 @@ fn fresh_replay(
     })
 }
 
-/// Replays the trace in `trace` with `zakura_sim` in a fresh process, and
-/// says why it didn't match Exact, or `None` if it did. The replay's output
-/// goes to `<trace>.replay.log`, and a replay past `deadline` is killed and
-/// misses.
+/// A recorded run's fresh replay, the directory inside its trace directory,
+/// as the acceptance tool's reader (`tool::REPLAY_DIR`) names it.
+pub(super) const REPLAY_DIR: &str = "replay";
+/// A fresh replay's full report inside [`REPLAY_DIR`]
+/// (`tool::FULL_REPORT_FILE`).
+const REPLAY_REPORT: &str = "full-report.json";
+/// How a fresh replay's child ended, inside [`REPLAY_DIR`]
+/// (`tool::REPLAY_FILE`, a `ReplayRun`).
+const REPLAY_FILE: &str = "replay.json";
+
+/// Replays the trace in `trace` with `zakura_sim`, the binary that recorded
+/// it, in a fresh process, and says why it didn't match Exact, or `None` if
+/// it did. The replay writes its full report to `<trace>/replay/`, beside
+/// `replay.json`, its child's end and output, which the acceptance tool
+/// reads as the run's fresh replay (C4, C8). A replay past `deadline` is
+/// killed and misses.
 fn replay_misses(
     zakura_sim: &Path,
     trace: &Path,
     deadline: Duration,
 ) -> Result<Option<String>, BoxError> {
-    let log = trace.with_extension("replay.log");
+    let dir = trace.join(REPLAY_DIR);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(&dir)?;
+    let log = dir.join("replay.log");
     let mut replay = Command::new(zakura_sim);
-    replay.arg("replay").arg(trace);
+    replay
+        .arg("replay")
+        .arg(trace)
+        .arg("--report")
+        .arg(dir.join(REPLAY_REPORT));
     let end = sim_minimize::run_child(&mut replay, &log, Some(deadline), &NEVER_INTERRUPTED)?;
+    let output = fs::read_to_string(&log).unwrap_or_default();
+    fs::write(
+        dir.join(REPLAY_FILE),
+        serde_json::json!({
+            "exited_ok": end == sim_minimize::ChildEnd::Exited(0),
+            "killed": matches!(
+                end,
+                sim_minimize::ChildEnd::TimedOut
+                    | sim_minimize::ChildEnd::Signaled(_)
+                    | sim_minimize::ChildEnd::Interrupted
+            ),
+            "log": output,
+        })
+        .to_string(),
+    )?;
     Ok(match end {
         sim_minimize::ChildEnd::Exited(0) => None,
-        end => Some(format!(
-            "`zakura-sim replay` {end}: {}",
-            fs::read_to_string(&log).unwrap_or_default().trim()
-        )),
+        end => Some(format!("`zakura-sim replay` {end}: {}", output.trim())),
     })
 }
 
@@ -1628,7 +1698,7 @@ pub(super) fn git(dir: &Path) -> Command {
 /// and running the script meanwhile fails with ETXTBSY. Once it starts, no
 /// process holds it open for writing.
 #[cfg(all(test, unix))]
-fn wait_until_executable(script: &Path) {
+pub(super) fn wait_until_executable(script: &Path) {
     while let Err(error) = Command::new(script)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

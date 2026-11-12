@@ -127,6 +127,10 @@ pub enum Actual {
         /// The source digest the test binary embeds, or `None` if the tool
         /// couldn't read one, which blocks the test's key.
         binary_source: Option<String>,
+        /// The source digest of the checkout the test ran in, which reads
+        /// its files, or `None` if the tool couldn't read one, which blocks
+        /// the test's key too.
+        checkout_source: Option<String>,
     },
 }
 
@@ -636,25 +640,38 @@ impl<'a> Evidence<'a> {
                 "its result is from {}, not the subject {}",
                 record.commit, self.subject
             )),
-            // A test whose binary embeds another source, or whose digest
-            // couldn't be read, isn't shown to have run S, whatever C5 says
-            // of provenance in general.
+            // A test whose binary embeds another source, or that ran in a
+            // checkout of another source, whose files it reads, or whose
+            // digest couldn't be read, isn't shown to have run S, whatever C5
+            // says of provenance in general.
             Some(
                 [ResultRecord {
-                    actual: Actual::Test { binary_source, .. },
+                    actual:
+                        Actual::Test {
+                            binary_source,
+                            checkout_source,
+                            ..
+                        },
                     ..
                 }],
-            ) if binary_source.as_deref() != Some(self.subject_source) => Err(format!(
-                "its binary embeds {binary_source:?}, not the subject's source {}",
-                self.subject_source
-            )),
+            ) if binary_source.as_deref() != Some(self.subject_source)
+                || checkout_source.as_deref() != Some(self.subject_source) =>
+            {
+                Err(format!(
+                    "its binary embeds {binary_source:?} and it ran in a checkout of \
+                     {checkout_source:?}, not the subject's source {}",
+                    self.subject_source
+                ))
+            }
             Some([record]) => Ok(record),
             Some(_) => Err("its result is duplicated".into()),
         }
     }
 
     /// Whether `test` passed at the subject commit, and, when `bootstrap`,
-    /// ran from a binary embedding the subject's source digest.
+    /// ran from a binary embedding the subject's source digest, which must
+    /// be known. [`Evidence::one_result`] already requires that digest of
+    /// its binary and its checkout alike.
     fn test_passed(&self, test: TestRef, bootstrap: bool) -> Result<(), String> {
         let id = Expected::Passes { test }
             .id()

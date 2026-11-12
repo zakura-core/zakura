@@ -18,7 +18,10 @@
 //! # The runner's artifacts
 //!
 //! Every path below is under the task's directory `<i>`, which holds its
-//! [`TASK_FILE`] first. A file a child didn't write is missing, and a child
+//! [`TASK_FILE`] first: the run's ID, as the root's [`RUN_FILE`] names it,
+//! the task's index and the task itself ([`task_binding`]). A directory
+//! whose task file names another run, such as one kept from an earlier
+//! attempt, isn't read. A file a child didn't write is missing, and a child
 //! killed at its deadline leaves [`KILLED_FILE`] in its directory. A
 //! missing or killed artifact gives its execution no result, so it blocks.
 //!
@@ -58,13 +61,18 @@
 //!   <expect>` and, if its `beside` isn't empty, `--also-violates <beside,
 //!   comma-separated>`: `violated` beside the case's `also_violates`, or
 //!   `violated-set` with a nested case's exact `set`. With the runs come
-//!   [`PROVENANCE_FILE`] as before, [`VERDICT_FILE`], a [`VerdictCheck`]
+//!   [`PROVENANCE_FILE`], a [`ProvenanceCheck`] naming the `base` commit
+//!   the rebuild's checkout was made from, which must be S, the SHA-256 of
+//!   the patch it applied (`patch_sha256`), which must be the task's
+//!   `patch` at S, and the `source` it measured there, [`VERDICT_FILE`], a
+//!   [`VerdictCheck`]
 //!   naming the `baseline` and `patched` traces it judged by SHA-256, and
 //!   [`TARGET_FILE`], a [`TargetCheck`] naming the `source` of the patched
 //!   build it ran, which must be the provenance check's, and, with a
 //!   target, the SHA-256 of the committed input it ran (`input_sha256`) and
 //!   of its own patched run's trace (`trace`), copied whole to
-//!   [`CONFIRMATION_DIR`], whose meta must name that source and input.
+//!   [`CONFIRMATION_DIR`], whose meta must name that source and input and
+//!   the case's `harness`, the one the target maps to.
 //!   A node case's task names `draft`, its set: then `<i>/draft` is
 //!   recorded by the case's own rebuilt binary with `zakura-sim record
 //!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
@@ -137,11 +145,19 @@ pub const RUN_FILE: &str = "run.json";
 /// [`task_binding`] gives it.
 pub const TASK_FILE: &str = "task.json";
 
-/// What a task directory's [`TASK_FILE`] must hold: its index in the plan
-/// and the plan's task itself, so a directory is read only as the task the
-/// runner wrote it for, never by its position alone.
-pub fn task_binding(index: usize, task: &Task) -> serde_json::Value {
-    serde_json::json!({ "index": index, "task": task })
+/// What a task directory's [`TASK_FILE`] must hold: the ID of the run that
+/// wrote it (`run_id`), its index in the plan and the plan's task itself,
+/// so a directory is read only as the task this run's runner wrote it for,
+/// never by its position alone, and never as another attempt's.
+pub fn task_binding(run_id: &str, index: usize, task: &Task) -> serde_json::Value {
+    serde_json::json!({ "run_id": run_id, "index": index, "task": task })
+}
+
+/// Whether `artifacts`' directory for `task`, at `index`, is the one the
+/// run `run_id` wrote for it ([`task_binding`]).
+fn task_bound(artifacts: &Path, run_id: &str, index: usize, task: &Task) -> bool {
+    read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
+        == Some(task_binding(run_id, index, task))
 }
 
 /// What an artifacts directory says of the run that wrote it, at its root.
@@ -730,6 +746,8 @@ pub struct PatchedBuild {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceCheck {
+    /// The commit the patched checkout was made from, which must be S.
+    pub base: String,
     /// The patched checkout's source digest.
     pub source: String,
     /// The SHA-256 of the patch the rebuild applied, which must be the
@@ -784,14 +802,17 @@ pub struct TargetCheck {
 }
 
 /// A test result from its artifact: every test libtest reported, in the
-/// package and file xtask ran. A killed child fails every test it ran, a
-/// child that didn't exit 0 fails every test it reported `ok`, and an
-/// unreadable artifact is a result that ran nothing.
+/// package and file xtask ran, with the sources of its binary and of the
+/// checkout it ran in, both of which the evaluator requires to be S's. A
+/// killed child fails every test it ran, a child that didn't exit 0 fails
+/// every test it reported `ok`, and an unreadable artifact is a result that
+/// ran nothing.
 fn test_actual(dir: &Path) -> Actual {
     let Some(run) = read_json::<TestRun>(&dir.join(TEST_FILE)) else {
         return Actual::Test {
             ran: Vec::new(),
             binary_source: None,
+            checkout_source: None,
         };
     };
     let ran = run
@@ -812,6 +833,7 @@ fn test_actual(dir: &Path) -> Actual {
     Actual::Test {
         ran,
         binary_source: run.binary_source,
+        checkout_source: run.checkout_source,
     }
 }
 
@@ -1356,10 +1378,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             results,
         };
     }
-    let bound = |index: usize, task: &Task| {
-        read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
-            == Some(task_binding(index, task))
-    };
+    let bound = |index: usize, task: &Task| task_bound(artifacts, &run.run_id, index, task);
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
         // A directory the runner didn't write for this task gives it no
@@ -1424,7 +1443,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     &witness.beside,
                 );
                 credit_sources(&dir, subject_source, &mut baseline, &mut patched);
-                if let Some(why) = patch_refusal(repo, patch, &dir) {
+                if let Some(why) = rebuild_refusal(repo, patch, subject, &dir) {
                     fail(&mut patched, why);
                 }
                 // The runner's own verdict covers what the traces don't, its
@@ -1653,13 +1672,13 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
 
 /// A history task's run, `run`, in `dir`: its witness test (`test`, as
 /// package, file, name and case) must have passed at S from a binary
-/// embedding S, and declared the history once ([`declaration`]); then
-/// `dir/run`, S's recording of that declaration, must bind to it (C18) and
-/// come from S's build. Its trigger comes only from a `witness.json` that
-/// judges the task's own `witness`, its property and expectation, as a
-/// planted run's must ([`CaseChecks::planted`]): one judging another
-/// property or expectation fails the run, and a task with no expectation
-/// shows no trigger.
+/// embedding S, in a checkout of S, and declared the history once
+/// ([`declaration`]); then `dir/run`, S's recording of that declaration,
+/// must bind to it (C18) and come from S's build. Its trigger comes only
+/// from a `witness.json` that judges the task's own `witness`, its property
+/// and expectation, as a planted run's must ([`CaseChecks::planted`]): one
+/// judging another property or expectation fails the run, and a task with
+/// no expectation shows no trigger.
 fn history_execution(
     dir: &Path,
     run: RunId,
@@ -1687,7 +1706,9 @@ fn history_execution(
             && ran.file == file
             && !ran.killed
             && ran.exited_ok
+            && known(Some(subject_source))
             && ran.binary_source.as_deref() == Some(subject_source)
+            && ran.checkout_source.as_deref() == Some(subject_source)
             && ran.tests == [(name.to_owned(), "ok".to_owned())]
     });
     if !passed {
@@ -1753,18 +1774,18 @@ fn credit_sources(
 
 /// Why the planted runner didn't credit case `name` of `property` in `dir`:
 /// it didn't report it caught, or it wasn't confirmed through `target`,
-/// the fuzz target its harness maps to, if any, or either check is
+/// the fuzz target its `harness` maps to, if any, or either check is
 /// missing, names another case or another target, or judged runs other
 /// than this attempt's ([`verdict_refusal`], [`target_refusal`]).
 fn case_refusal(
     repo: &Path,
     dir: &Path,
     (property, name): (&str, &str),
-    target: Option<&str>,
+    (harness, target): (&str, Option<&str>),
     input: &CaseInput,
 ) -> Option<String> {
     verdict_refusal(dir, property, name)
-        .or_else(|| target_refusal(repo, dir, (property, name), target, input))
+        .or_else(|| target_refusal(repo, dir, (property, name), (harness, target), input))
 }
 
 /// Why `dir`'s [`VERDICT_FILE`] isn't the planted runner's catch of case
@@ -1794,12 +1815,13 @@ fn verdict_refusal(dir: &Path, property: &str, name: &str) -> Option<String> {
 /// or target, or ran a build other than the one the case's provenance check
 /// measured. With a target, it must also name the case's committed `input`
 /// and its own run in [`CONFIRMATION_DIR`] ([`judged_refusal`]), which must
-/// have run that input. Without one, it names no input or run.
+/// have run that input on `harness`, the harness `target` maps to. Without
+/// one, it names no input or run.
 fn target_refusal(
     repo: &Path,
     dir: &Path,
     (property, name): (&str, &str),
-    target: Option<&str>,
+    (harness, target): (&str, Option<&str>),
     input: &CaseInput,
 ) -> Option<String> {
     let artifact = read_json::<Value>(&dir.join(TARGET_FILE));
@@ -1855,6 +1877,18 @@ fn target_refusal(
             "its target confirmation isn't its run {trace}'s: {why}"
         ));
     }
+    // A run of another harness on the same build and input confirms
+    // nothing through this target.
+    match crate::trace::TraceReader::open(&run) {
+        Ok(trace) if trace.meta.sim != harness => {
+            return Some(format!(
+                "its target confirmation's trace ran {}, not {harness}",
+                trace.meta.sim
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Some(format!("{}: {error}", run.display())),
+    }
     input_refusal(repo, input, &run)
 }
 
@@ -1876,7 +1910,7 @@ fn mapped_case_refusal(
             repo,
             dir,
             case,
-            target_of(targets, harness).as_deref(),
+            (harness, target_of(targets, harness).as_deref()),
             input,
         ),
         Err(why) => Some(format!("the fuzz-target mapping can't be read: {why}")),
@@ -1975,10 +2009,12 @@ fn patched_build_refusal(
     None
 }
 
-/// Why case `dir`'s provenance check isn't for its committed patch at
-/// `patch` (a path under `repo`): its recorded SHA-256 is another patch's,
-/// or either can't be read.
-fn patch_refusal(repo: &Path, patch: &str, dir: &Path) -> Option<String> {
+/// Why case `dir`'s provenance check isn't for S, `subject`, with its
+/// committed patch at `patch` (a path under `repo`) applied: its checkout
+/// was made from another commit, its recorded SHA-256 is another patch's,
+/// or either can't be read. An older checkout with the same patch then
+/// never counts as S's catch.
+fn rebuild_refusal(repo: &Path, patch: &str, subject: &str, dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let Ok(bytes) = fs::read(repo.join(patch)) else {
         return Some(format!("the committed patch {patch} can't be read"));
@@ -1988,6 +2024,10 @@ fn patch_refusal(repo: &Path, patch: &str, dir: &Path) -> Option<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     match read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)) {
+        Some(check) if check.base != subject => Some(format!(
+            "its rebuild's checkout was made from {}, not S, {subject}",
+            check.base
+        )),
         Some(check) if check.patch_sha256 == committed => None,
         Some(check) => Some(format!(
             "its rebuild applied a patch with SHA-256 {}, and {patch} is {committed}",
@@ -2865,8 +2905,7 @@ pub fn record(
 ) -> Record {
     let links = match refusal {
         None => links(manifest, plan, |index, task| {
-            read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
-                == Some(task_binding(index, task))
+            task_bound(artifacts, &run.run_id, index, task)
         }),
         Some(_) => BTreeMap::new(),
     };
@@ -3606,6 +3645,7 @@ mod tests {
         };
         let passed = |source: &str| {
             Some(ProvenanceCheck {
+                base: "s".into(),
                 source: source.into(),
                 patch_sha256: String::new(),
                 refused: None,
@@ -3635,6 +3675,7 @@ mod tests {
         );
         // A refused or missing provenance check.
         let refused = Some(ProvenanceCheck {
+            base: "s".into(),
             source: "patched".into(),
             patch_sha256: String::new(),
             refused: Some("it embeds S".into()),
@@ -3668,6 +3709,7 @@ mod tests {
             record_into(&dir.path().join(run), source);
         }
         let check = ProvenanceCheck {
+            base: "s".into(),
             source: patched.into(),
             patch_sha256: String::new(),
             refused: None,
@@ -3746,7 +3788,13 @@ mod tests {
                     }
                 }
             }
-            case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input)
+            case_refusal(
+                &repo,
+                case.path(),
+                ("p", "a"),
+                (MACHINE, Some("fuzz_a")),
+                &input,
+            )
         };
         assert_eq!(read(Some(&mine), Some(&confirmed)), None);
         // Confirmed through no target, or another one, while the harness
@@ -3791,17 +3839,25 @@ mod tests {
         let (verdict, untargeted) = case_checks(case.path(), None);
         write_checks(case.path(), &verdict, &untargeted);
         assert_eq!(
-            case_refusal(&repo, case.path(), ("p", "a"), None, &input),
+            case_refusal(&repo, case.path(), ("p", "a"), (MACHINE, None), &input),
             None
         );
-        assert!(case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input).is_some());
+        assert!(case_refusal(
+            &repo,
+            case.path(),
+            ("p", "a"),
+            (MACHINE, Some("fuzz_a")),
+            &input
+        )
+        .is_some());
     }
 
     /// Sol P2: an older attempt's checks for the same case never count
     /// beside this attempt's runs. A verdict that judged an older baseline
     /// or patched trace is refused, and so is a target confirmation that
     /// ran an older patched build, another input, or names a run other
-    /// than the one beside it, even when that run and its check agree.
+    /// than the one beside it, even when that run and its check agree, or
+    /// one of another harness than its target maps to.
     #[test]
     fn an_older_attempt_s_case_checks_are_refused() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3814,7 +3870,13 @@ mod tests {
         let (old_verdict, old_target) = case_checks(older.path(), Some("fuzz_a"));
         let refusal = |verdict: &VerdictCheck, target: &TargetCheck| {
             write_checks(current.path(), verdict, target);
-            case_refusal(&repo, current.path(), ("p", "a"), Some("fuzz_a"), &input)
+            case_refusal(
+                &repo,
+                current.path(),
+                ("p", "a"),
+                (MACHINE, Some("fuzz_a")),
+                &input,
+            )
         };
         assert_eq!(refusal(&mine, &confirmed), None);
         let substitutes = [
@@ -3868,11 +3930,89 @@ mod tests {
         for (substitute, verdict, target) in substitutes {
             assert!(refusal(&verdict, &target).is_some(), "{substitute}");
         }
+        // A run of another harness on the same build and input, which the
+        // confirmation names: only the trace's harness is off the one the
+        // target maps to.
+        let on_another_harness = TargetCheck {
+            trace: Some({
+                rewrite(&current.path().join(CONFIRMATION_DIR), |lines| {
+                    lines[0]["meta"]["sim"] = Value::String(NODE.to_owned());
+                });
+                digest(&current.path().join(CONFIRMATION_DIR).join("trace.jsonl"))
+            }),
+            ..confirmed.clone()
+        };
+        let why = refusal(&mine, &on_another_harness).expect("another harness's run is refused");
+        assert!(why.contains(&format!("ran {NODE}, not {MACHINE}")), "{why}");
         // The older attempt's confirmation run copied in with its own check,
         // which agree with each other, still isn't from the measured build.
         fs::remove_dir_all(current.path().join(CONFIRMATION_DIR)).expect("it exists");
         record_into(&current.path().join(CONFIRMATION_DIR), "patched-before");
         assert!(refusal(&mine, &old_target).is_some());
+    }
+
+    /// C5: a planted catch counts only from a rebuild of S itself with the
+    /// case's committed patch. A rebuild from an older checkout with the
+    /// same patch, whose patched run, confirmation and checks all name the
+    /// source it measured, and whose baseline is S's, is refused for its
+    /// base alone.
+    #[test]
+    fn a_planted_build_from_another_base_is_refused() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let patch = "qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch";
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let case = case_dir("s", "patched");
+        let (verdict, target) = case_checks(case.path(), Some("fuzz_a"));
+        write_checks(case.path(), &verdict, &target);
+        let rebuilt_from = |base: &str| {
+            let check = ProvenanceCheck {
+                base: base.into(),
+                source: "patched".into(),
+                patch_sha256: digest(&repo.join(patch)),
+                refused: None,
+            };
+            fs::write(
+                case.path().join(PROVENANCE_FILE),
+                serde_json::to_string(&check).expect("a check serializes"),
+            )
+            .expect("the temp dir is writable");
+            // Every measured-source join and case check holds.
+            let read = |run: &str| {
+                execution(
+                    &case.path().join(run),
+                    history_run(),
+                    MACHINE,
+                    RunBy::Planted,
+                )
+            };
+            let (mut baseline, mut patched) = (read("baseline"), read("patched"));
+            credit_sources(case.path(), "s", &mut baseline, &mut patched);
+            assert_eq!(
+                (baseline.end, patched.end),
+                (End::Completed, End::Completed)
+            );
+            assert_eq!(
+                case_refusal(
+                    &repo,
+                    case.path(),
+                    ("p", "a"),
+                    (MACHINE, Some("fuzz_a")),
+                    &input
+                ),
+                None
+            );
+            rebuild_refusal(&repo, patch, "s", case.path())
+        };
+        assert_eq!(rebuilt_from("s"), None);
+        let older = rebuilt_from("older");
+        assert!(
+            older
+                .as_deref()
+                .is_some_and(|why| why.contains("made from older")),
+            "{older:?}"
+        );
     }
 
     /// The committed fuzz-target mapping is read from the fuzz package, as
@@ -4099,6 +4239,7 @@ mod tests {
         fs::write(
             case.path().join(PROVENANCE_FILE),
             serde_json::to_string(&ProvenanceCheck {
+                base: "s".into(),
                 source: "patched".into(),
                 patch_sha256: String::new(),
                 refused: None,
@@ -4274,8 +4415,9 @@ mod tests {
 
     /// An artifacts directory counts only for the run of S it names: one
     /// with no `run.json`, or another subject's, gives no result, so every
-    /// obligation blocks. A case's provenance check must be for its
-    /// committed patch.
+    /// obligation blocks, and a task directory another attempt wrote gives
+    /// its task none. A case's provenance check must be for its committed
+    /// patch.
     #[test]
     fn artifacts_count_only_for_their_own_run_and_patch() {
         let manifest = Manifest::committed();
@@ -4351,14 +4493,43 @@ mod tests {
         let write_task = |index: usize, task: &Task| {
             let dir = artifacts.path().join(index.to_string());
             fs::create_dir_all(&dir).expect("the temp dir is writable");
-            fs::write(dir.join(TASK_FILE), task_binding(index, task).to_string())
-                .expect("the temp dir is writable");
+            fs::write(
+                dir.join(TASK_FILE),
+                task_binding("run-1", index, task).to_string(),
+            )
+            .expect("the temp dir is writable");
         };
         for (index, task) in plan.tasks.iter().enumerate() {
             write_task(index, task);
         }
         let all = results(artifacts.path(), &plan);
         assert!(all > 0);
+        // A task directory kept from an earlier attempt at S, under this
+        // run's `run.json`: only its run ID differs, and it gives no result
+        // and links nothing.
+        let kept = plan
+            .tasks
+            .iter()
+            .position(|task| matches!(task, Task::Test { .. }))
+            .expect("the plan has a test task");
+        fs::write(
+            artifacts.path().join(kept.to_string()).join(TASK_FILE),
+            task_binding("run-0", kept, &plan.tasks[kept]).to_string(),
+        )
+        .expect("the temp dir is writable");
+        assert_eq!(results(artifacts.path(), &plan), all - 1);
+        let (_, record) = evaluate_artifacts(&repo, &plan, artifacts.path(), &run);
+        let prefix = format!("{kept}/");
+        assert!(![&record.verified, &record.excluded, &record.blocked]
+            .into_iter()
+            .flatten()
+            .any(|entry| entry
+                .links
+                .artifacts
+                .iter()
+                .any(|path| path.starts_with(&prefix))));
+        write_task(kept, &plan.tasks[kept]);
+        assert_eq!(results(artifacts.path(), &plan), all);
         // Two test tasks' directories swapped: each names the other task,
         // so neither gives a result.
         let tests: Vec<usize> = plan
@@ -4395,7 +4566,7 @@ mod tests {
         // The right task at the wrong index.
         fs::write(
             artifacts.path().join(a.to_string()).join(TASK_FILE),
-            task_binding(b, &plan.tasks[a]).to_string(),
+            task_binding("run-1", b, &plan.tasks[a]).to_string(),
         )
         .expect("the temp dir is writable");
         assert_eq!(results(artifacts.path(), &plan), all - 2);
@@ -4426,6 +4597,7 @@ mod tests {
         let case = tempfile::tempdir().expect("a temp dir can be created");
         let check = |sha: String| {
             let check = ProvenanceCheck {
+                base: "s".into(),
                 source: "patched".into(),
                 patch_sha256: sha,
                 refused: None,
@@ -4443,11 +4615,11 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
         check(committed);
-        assert_eq!(patch_refusal(&repo, patch, case.path()), None);
+        assert_eq!(rebuild_refusal(&repo, patch, "s", case.path()), None);
         check("00".repeat(32));
-        assert!(patch_refusal(&repo, patch, case.path()).is_some());
+        assert!(rebuild_refusal(&repo, patch, "s", case.path()).is_some());
         fs::remove_file(case.path().join(PROVENANCE_FILE)).expect("the file exists");
-        assert!(patch_refusal(&repo, patch, case.path()).is_some());
+        assert!(rebuild_refusal(&repo, patch, "s", case.path()).is_some());
     }
 
     /// A record names artifacts under its own directory relative to it, and
@@ -4698,7 +4870,8 @@ mod tests {
     }
 
     /// A test artifact's results: a killed child fails every test it ran,
-    /// and an unreadable artifact ran nothing.
+    /// and an unreadable artifact ran nothing. Its binary's and checkout's
+    /// sources are each carried as measured, even when they differ.
     #[test]
     fn a_test_artifact_is_read_by_name() {
         let dir = tempfile::tempdir().expect("a temp dir can be created");
@@ -4711,7 +4884,7 @@ mod tests {
                 exited_ok,
                 log: String::new(),
                 binary_source: Some("source".into()),
-                checkout_source: Some("source".into()),
+                checkout_source: Some("t".into()),
             };
             fs::write(
                 dir.path().join(TEST_FILE),
@@ -4727,6 +4900,19 @@ mod tests {
         assert_eq!(
             outcomes(test_actual(dir.path())),
             [TestOutcome::Passed, TestOutcome::Skipped]
+        );
+        // It carries both measured sources for the evaluator to judge.
+        let Actual::Test {
+            binary_source,
+            checkout_source,
+            ..
+        } = test_actual(dir.path())
+        else {
+            unreachable!("a test artifact reads as a test result");
+        };
+        assert_eq!(
+            (binary_source.as_deref(), checkout_source.as_deref()),
+            (Some("source"), Some("t"))
         );
         // `ok` and then a nonzero exit or a signal isn't a pass.
         write(false, false);
@@ -4979,41 +5165,54 @@ mod tests {
 
     /// C5, for a standalone witness history: its run counts only when the
     /// binary that recorded its trace and the one its witness test ran in
-    /// both embed the subject's source digest. A trace recorded by a binary
-    /// built from other source, or one embedding the `unknown` marker, a
-    /// witness test from a stale binary or one that embeds no digest, each
-    /// fail the run, naming why. An unknown digest matches nothing, not
-    /// even an unknown subject's.
+    /// both embed the subject's source digest, and that test ran in a
+    /// checkout of S. A trace recorded by a binary built from other source,
+    /// or one embedding the `unknown` marker, a witness test from a stale
+    /// binary or one that embeds no digest, and one that ran in another
+    /// checkout or one whose checkout wasn't measured, each fail the run,
+    /// naming why. An unknown digest matches nothing, not even an unknown
+    /// subject's.
     #[test]
     fn a_history_from_a_stale_binary_is_refused() {
-        let read = |subject: &str, trace: Option<&str>, binary: Option<&str>| {
-            let dir = tempfile::tempdir().expect("a temp dir can be created");
-            history_task_dir(dir.path(), None);
-            if let Some(source) = trace {
-                rewrite(&dir.path().join("run"), |lines| {
-                    lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
-                });
-            }
-            if let Some(source) = binary {
-                let path = dir.path().join(TEST_FILE);
-                let mut ran: TestRun =
-                    serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
-                        .expect("it reads back");
-                ran.binary_source = Some(source.to_owned());
-                fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
-                    .expect("the temp dir is writable");
-            }
-            history_execution(
-                dir.path(),
-                history_run(),
-                NODE,
-                ("p/a", None),
-                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
-                subject,
-            )
-            .end
-        };
-        let fresh = read("s", None, None);
+        type Measured<'a> = Option<Option<&'a str>>;
+        let read =
+            |subject: &str, trace: Option<&str>, binary: Option<&str>, checkout: Measured| {
+                let dir = tempfile::tempdir().expect("a temp dir can be created");
+                history_task_dir(dir.path(), None);
+                if let Some(source) = trace {
+                    rewrite(&dir.path().join("run"), |lines| {
+                        lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
+                    });
+                }
+                if let Some(source) = binary {
+                    let path = dir.path().join(TEST_FILE);
+                    let mut ran: TestRun =
+                        serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                            .expect("it reads back");
+                    ran.binary_source = Some(source.to_owned());
+                    fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                        .expect("the temp dir is writable");
+                }
+                if let Some(source) = checkout {
+                    let path = dir.path().join(TEST_FILE);
+                    let mut ran: TestRun =
+                        serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                            .expect("it reads back");
+                    ran.checkout_source = source.map(str::to_owned);
+                    fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                        .expect("the temp dir is writable");
+                }
+                history_execution(
+                    dir.path(),
+                    history_run(),
+                    NODE,
+                    ("p/a", None),
+                    ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                    subject,
+                )
+                .end
+            };
+        let fresh = read("s", None, None, None);
         assert!(!matches!(fresh, End::Failed { .. }), "{fresh:?}");
         let refused = |end: End, why: &str| {
             assert!(
@@ -5023,13 +5222,17 @@ mod tests {
         };
         let stale_trace = "its trace's build source isn't the subject's";
         let stale_test = "its witness test zakura-sim/tests/header_node.rs::test didn't pass at S";
-        refused(read("s", Some("stale"), None), stale_trace);
-        refused(read("s", Some("unknown"), None), stale_trace);
-        refused(read("s", None, Some("stale")), stale_test);
-        refused(read("s", None, Some(NOT_EMBEDDED)), stale_test);
+        refused(read("s", Some("stale"), None, None), stale_trace);
+        refused(read("s", Some("unknown"), None, None), stale_trace);
+        refused(read("s", None, Some("stale"), None), stale_test);
+        refused(read("s", None, Some(NOT_EMBEDDED), None), stale_test);
+        // A binary of S run in a checkout that has since moved, or whose
+        // checkout wasn't measured: only `checkout_source` differs.
+        refused(read("s", None, None, Some(Some("t"))), stale_test);
+        refused(read("s", None, None, Some(None)), stale_test);
         // Unknown on both sides, the subject's and every binary's.
         refused(
-            read("unknown", Some("unknown"), Some("unknown")),
+            read("unknown", Some("unknown"), Some("unknown"), None),
             stale_trace,
         );
     }
@@ -5515,8 +5718,11 @@ mod tests {
             .expect("the temp dir is writable");
             let dir = artifacts.path().join(index.to_string());
             fs::create_dir_all(&dir).expect("the temp dir is writable");
-            fs::write(dir.join(TASK_FILE), task_binding(index, task).to_string())
-                .expect("the temp dir is writable");
+            fs::write(
+                dir.join(TASK_FILE),
+                task_binding(&run.run_id, index, task).to_string(),
+            )
+            .expect("the temp dir is writable");
             for (name, source, result) in [
                 ("unpatched", "subject", "ok"),
                 ("patched", ran, "FAILED"),

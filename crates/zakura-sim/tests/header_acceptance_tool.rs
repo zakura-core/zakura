@@ -487,7 +487,7 @@ fn two_planted_cases_run_through_the_tool() {
         std::fs::create_dir_all(&dir).expect("the temp dir is writable");
         std::fs::write(
             dir.join(tool::TASK_FILE),
-            tool::task_binding(index, task).to_string(),
+            tool::task_binding(&run.run_id, index, task).to_string(),
         )
         .expect("the temp dir is writable");
     }
@@ -539,6 +539,7 @@ fn two_planted_cases_run_through_the_tool() {
             (
                 "provenance.json",
                 serde_json::json!({
+                    "base": run.subject,
                     "source": source,
                     "patch_sha256": digest(&repo.join(patch)),
                     "refused": null,

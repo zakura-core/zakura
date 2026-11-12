@@ -221,6 +221,9 @@ pub(crate) enum RecordBody {
         /// What the frame asks for, if it's a discovery request, which
         /// bounds the node's answer. Not logged.
         asks: Option<Asked>,
+        /// The header hashes of the page the frame carries, in hex as
+        /// storage writes them, or none for any other frame. Not logged.
+        hashes: Vec<String>,
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
@@ -240,6 +243,29 @@ pub(crate) enum RecordBody {
         frame: Frame,
         at: Duration,
     },
+}
+
+/// The header hashes of each page the peers sent, by connection, QUIC stream
+/// and frame, as the identity map places them: what the peer put on the
+/// wire, apart from what the node did with it. They stay out of the log.
+/// Cloning shares the store.
+#[derive(Clone, Debug, Default)]
+pub struct SentPages(Rc<RefCell<BTreeMap<(u64, u64, u64), Vec<String>>>>);
+
+impl SentPages {
+    /// Keeps `hashes` as the page of frame `key`.
+    pub(crate) fn record(&self, key: (u64, u64, u64), hashes: Vec<String>) {
+        self.0.borrow_mut().insert(key, hashes);
+    }
+
+    /// The header hashes, in hex, of the page the peer sent as frame `seq`
+    /// on `connection` and `quic_stream`, if it sent one there.
+    pub fn page(&self, connection: u64, quic_stream: u64, seq: u64) -> Option<Vec<String>> {
+        self.0
+            .borrow()
+            .get(&(connection, quic_stream, seq))
+            .cloned()
+    }
 }
 
 /// A page carrying a header the peer's fixture made invalid.
@@ -300,6 +326,8 @@ pub(crate) struct WireEvidence {
     discovery: Option<StreamId>,
     /// Labels the node's frames on the discovery stream.
     discovery_sender: Option<DiscoverySender>,
+    /// Each placed page's header hashes.
+    sent: SentPages,
     /// Each discovery request the peer's models labelled `OverMargin`, its
     /// `PeerFrame` waiting for the serving to count it.
     unsettled: BTreeMap<FrameKey, Unsettled>,
@@ -339,6 +367,12 @@ impl WireEvidence {
             shared_ids,
             ..WireEvidence::default()
         }
+    }
+
+    /// This evidence, also keeping each placed page's header hashes in
+    /// `sent`.
+    pub(crate) fn with_sent(self, sent: SentPages) -> Self {
+        WireEvidence { sent, ..self }
     }
 
     /// This evidence, also logging the peers' frames on `discovery`'s
@@ -514,8 +548,12 @@ impl WireEvidence {
                 payload,
                 prepares,
                 asks,
+                hashes,
             } => {
                 let key = (connection, quic_stream, seq);
+                if !hashes.is_empty() {
+                    self.sent.record(key, hashes);
+                }
                 self.labels.insert(key, label);
                 if let (Some(sender), Some(asks)) = (self.discovery_sender.as_mut(), asks) {
                     if Some(stream) == self.discovery {
@@ -1283,6 +1321,7 @@ mod tests {
                 payload: 0,
                 prepares: None,
                 asks: None,
+                hashes: Vec::new(),
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]);
@@ -1657,6 +1696,7 @@ mod tests {
                 payload: 6,
                 prepares: None,
                 asks: None,
+                hashes: Vec::new(),
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]).with_discovery(stream);

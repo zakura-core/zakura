@@ -672,10 +672,8 @@ where
         });
         let nonces = Arc::new(futures::lock::Mutex::new(IndexSet::new()));
         let user_agent = self.user_agent.unwrap_or_default();
-        let our_services = configured_advertised_services(
-            &config,
-            self.our_services.unwrap_or_else(PeerServices::empty),
-        );
+        let our_services =
+            config.handshake_services(self.our_services.unwrap_or_else(PeerServices::empty));
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
@@ -727,17 +725,6 @@ where
             tcp_warmup: None,
         }
     }
-}
-
-/// Return the services Zakura should advertise for this handshake.
-fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
-    services.remove(PeerServices::NODE_P2P_V2);
-
-    if config.v2_p2p() {
-        services |= PeerServices::NODE_P2P_V2;
-    }
-
-    services
 }
 
 fn inbound_error_address_change(

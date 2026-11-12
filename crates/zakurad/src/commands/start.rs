@@ -774,7 +774,9 @@ impl StartCmd {
             pending_blocks,
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
-        let rpc_impl = rpc_impl.with_template_trace(template_path_trace);
+        let rpc_impl = rpc_impl
+            .with_template_trace(template_path_trace)
+            .with_local_services(config.network.handshake_services(advertised_services));
         node_tasks.track(&rpc_tx_queue_handle);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {

@@ -90,6 +90,9 @@ const SIM_WIDE: [&str; 2] = ["sim/no-task-panic", "sim/no-livelock"];
 const PENALIZED: &str = "header-sync/header-fault-penalized";
 /// `session/honest-never-punished`.
 const HONEST: &str = "session/honest-never-punished";
+/// `header-sync/s5v9/conformant-never-closes`, the broader claim
+/// [`NESTS`] lists over [`HONEST`].
+const CONFORMANT: &str = "header-sync/s5v9/conformant-never-closes";
 
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
@@ -1103,10 +1106,6 @@ const SCRIPTED_CATCH: &str = "only a scripted bypass today: a production patch g
 /// Why `header-fault-penalized`'s counted history is still owed.
 const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
                                  COVERAGE test runs test/header-wire-watched";
-/// Why `honest-never-punished`'s catch is still owed.
-const HONEST_CATCH: &str = "only a scripted bypass today, and any production punishment of an \
-                            honest peer also breaks conformant-never-closes, so its catch is \
-                            nested (decision 2)";
 /// Why a sim-wide ID's catch is still owed.
 const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
                               header-harness catch or an approved Open is still owed";
@@ -1134,7 +1133,6 @@ pub fn owed_open(key: &Key) -> Option<Expected> {
         {
             (SCRIPTED_CATCH, "hdr-14.4")
         }
-        Key::Catch { property } if property == HONEST => (HONEST_CATCH, "hdr-14.4"),
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
         }
@@ -2352,7 +2350,16 @@ fn hand_written_rows() -> Vec<Row> {
 
     let honest = HONEST;
     let mut never = holds(honest, G2, HONEST_PEER);
-    never.push(owed(Key::catch(honest), G2));
+    // Any production punishment of an honest peer also breaks
+    // conformant-never-closes, so the catch is nested (decision 2).
+    never.extend(caught(
+        WIRE,
+        case(honest, "target-page-refused"),
+        &[HONEST, CONFORMANT],
+        Found::AtStep,
+        G2,
+        true,
+    ));
     rows.push(sim_row(honest, &[WIRE], never));
 
     let progress = PROGRESS_ID;

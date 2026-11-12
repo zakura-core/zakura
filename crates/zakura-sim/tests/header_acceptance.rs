@@ -2813,7 +2813,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let honest = "session/honest-never-punished";
+    let flags = "header-sync/s5v9/status/reserved-flags-closes";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -2834,17 +2834,17 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: honest.into(),
-            name: "punished-honest".into(),
+            property: flags.into(),
+            name: "reserved-flags".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: honest,
-                name: "punished-honest",
+                property: flags,
+                name: "reserved-flags",
             },
             harness,
-            set: &["session/honest-never-punished"],
+            set: &["header-sync/s5v9/status/reserved-flags-closes"],
             found,
             not_applicable,
             companions,

@@ -10,7 +10,7 @@ mod unready_service;
 
 pub(crate) use candidate_set::CandidateSet;
 pub(crate) use inventory_registry::InventoryChange;
-pub(crate) use limit::{ActiveConnectionCounter, ConnectionTracker};
+pub(crate) use limit::{ActiveConnectionCounter, ClosedConnection, ConnectionTracker};
 
 use inventory_registry::InventoryRegistry;
 pub(crate) use set::PeerSet;

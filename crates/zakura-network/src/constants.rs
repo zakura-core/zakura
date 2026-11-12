@@ -290,6 +290,32 @@ pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1
 /// and our side of the handshake initiated, after this minimum time has elapsed.
 pub const MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long an inbound seat stays reserved for the IP address that just left it, implemented
+/// by `peer_set::initialize::accept_inbound_connections`.
+///
+/// A node that restarts closes every connection it dialed. On Mainnet most listeners are at
+/// their inbound limit, and another peer takes a freed seat within seconds, so the restarted
+/// node is refused when it dials again. This hold covers a restart (about half a minute on
+/// the Mainnet fleet) and the startup dials that follow it (about another minute).
+///
+/// ## Security
+///
+/// See `peer_set::initialize::held_seats` for why a hold gives a peer nothing that staying
+/// connected would not.
+pub const INBOUND_SEAT_HOLD_DURATION: Duration = Duration::from_secs(3 * 60);
+
+/// How long an inbound connection must stay open for its seat to be held when it closes.
+///
+/// This must be at least [`INBOUND_SEAT_HOLD_DURATION`], so a peer never holds a seat for
+/// longer than it used it.
+pub const MIN_HELD_SEAT_CONNECTION_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// The inbound connection limit divided by this is the most seats held at one time.
+///
+/// Held seats are empty, so this bounds the inbound capacity that holds can keep from new
+/// peers. Limits below this divisor hold no seats.
+pub const INBOUND_SEAT_HOLD_LIMIT_DIVISOR: usize = 10;
+
 /// The minimum time between successive calls to
 /// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
 ///
@@ -543,6 +569,22 @@ mod tests {
                     .as_secs() as f32
                 <= 2.0,
             "each peer should only have a few connection attempts in each connection interval",
+        );
+    }
+
+    /// Make sure a held inbound seat is never held for longer than the peer used it.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn ensure_seat_hold_is_no_longer_than_the_connection_that_earns_it() {
+        let _init_guard = zakura_test::init();
+
+        assert!(
+            INBOUND_SEAT_HOLD_DURATION <= MIN_HELD_SEAT_CONNECTION_AGE,
+            "a peer that connects for a moment must not be able to keep a seat empty for longer"
+        );
+        assert!(
+            INBOUND_SEAT_HOLD_LIMIT_DIVISOR > 1,
+            "held seats must leave most of the inbound limit to connected peers"
         );
     }
 

@@ -63,6 +63,7 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+mod held_seats;
 mod recent_by_ip;
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
@@ -826,6 +827,10 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
+///
+/// When a long-lived public peer disconnects, its seat stays reserved for its IP
+/// address for a short time, so a node that restarts can connect again. See
+/// [`held_seats`] for the rules and their security argument.
 #[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]
 async fn accept_inbound_connections<S>(
     config: Config,
@@ -860,6 +865,7 @@ where
     let public_inbound_connection_limit = config
         .peerset_inbound_connection_limit()
         .saturating_sub(zcashd_compat_reserved_slots);
+    let mut held_seats = held_seats::HeldSeats::new(public_inbound_connection_limit);
 
     let mut handshakes: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
         FuturesUnordered::new();
@@ -909,6 +915,26 @@ where
                 active_zcashd_compat_connections.update_count();
             let active_total_inbound_connections =
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
+
+            // Hold the seats of the long-lived public peers that closed since the last accept.
+            let now = Instant::now();
+            for closed_connection in active_inbound_connections.take_closed_connections() {
+                if held_seats.hold(closed_connection, &bans, now) {
+                    metrics::counter!("peer.inbound.held_seats.held").increment(1);
+                }
+            }
+            // A new peer must leave the seats that are held for other peers empty.
+            let seats_held_for_others = held_seats.held_for_others(addr.ip(), now);
+            // Held seats never exceed a tenth of the inbound limit, so the cast is exact.
+            metrics::gauge!("peer.inbound.held_seats").set(held_seats.len() as f64);
+
+            let is_full = active_public_inbound_connections >= public_inbound_connection_limit
+                || active_total_inbound_connections >= config.peerset_inbound_connection_limit();
+            // Held seats are public seats, so the public limit is the one they count against.
+            let only_held_seats_left = !is_full
+                && active_public_inbound_connections.saturating_add(seats_held_for_others)
+                    >= public_inbound_connection_limit;
+
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
             let connection_tracker = if is_zcashd_compat_peer {
@@ -926,19 +952,31 @@ where
                 }
 
                 active_zcashd_compat_connections.track_connection()
-            } else if active_public_inbound_connections >= public_inbound_connection_limit
-                || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
+            } else if is_full
+                || only_held_seats_left
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
-                // Too many open inbound connections or pending handshakes already.
-                // Close the connection.
+                // Too many open inbound connections, pending handshakes, or seats held for
+                // other peers already. Close the connection.
+                if only_held_seats_left {
+                    metrics::counter!("peer.inbound.held_seats.refused").increment(1);
+                }
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,
                 // but still put a limit on our CPU and network usage from failed connections.
                 tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL).await;
                 continue;
             } else {
-                active_inbound_connections.track_connection()
+                if held_seats.take_back(addr.ip(), now) {
+                    metrics::counter!("peer.inbound.held_seats.taken_back").increment(1);
+                    info!(
+                        peer = %addr_label,
+                        "an inbound peer took back the seat that was held for it"
+                    );
+                }
+
+                // The tracker reports when this connection closes, so its seat can be held.
+                active_inbound_connections.track_connection_from(addr.ip())
             };
             debug!(
                 inbound_connections = ?active_total_inbound_connections,

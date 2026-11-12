@@ -14,7 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -26,7 +26,7 @@ use chrono::Utc;
 use futures::{channel::mpsc, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
     task::{JoinError, JoinHandle},
 };
@@ -1932,6 +1932,202 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     );
 
     std::mem::drop(banned_connection);
+}
+
+/// A seat that an inbound test peer holds: its side of the connection, the listener's side,
+/// and the tracker that the listener gave the handshake.
+type InboundSeat = (TcpStream, TcpStream, ConnectionTracker);
+
+/// Connects to the listener on `listen_port` from the loopback address `source_ip`.
+async fn connect_from_loopback(source_ip: IpAddr, listen_port: u16) -> TcpStream {
+    let socket = match source_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .expect("test should create a TCP socket");
+    socket
+        .bind(SocketAddr::new(source_ip, 0))
+        .expect("test should bind to a loopback source address");
+    socket
+        .connect(SocketAddr::new(source_ip, listen_port))
+        .await
+        .expect("test should connect to the inbound listener")
+}
+
+/// Connects from `source_ip`, and returns the seat once the listener has handshaked on it.
+async fn take_inbound_seat(
+    source_ip: IpAddr,
+    listen_port: u16,
+    accepted_rx: &mut mpsc::UnboundedReceiver<(IpAddr, TcpStream, ConnectionTracker)>,
+) -> InboundSeat {
+    let peer_stream = connect_from_loopback(source_ip, listen_port).await;
+    let (accepted_ip, listener_stream, connection_tracker) =
+        tokio::time::timeout(LISTENER_TEST_DURATION, accepted_rx.next())
+            .await
+            .expect("the listener should handshake with a peer that has a seat")
+            .expect("the handshaker stays alive for the whole test");
+    assert_eq!(accepted_ip, source_ip, "the listener handshakes in order");
+
+    (peer_stream, listener_stream, connection_tracker)
+}
+
+/// Connects from `source_ip`, and checks the listener closes the connection without a
+/// handshake.
+async fn expect_no_inbound_seat(
+    source_ip: IpAddr,
+    listen_port: u16,
+    accepted_rx: &mut mpsc::UnboundedReceiver<(IpAddr, TcpStream, ConnectionTracker)>,
+) {
+    let mut peer_stream = connect_from_loopback(source_ip, listen_port).await;
+
+    // The fake handshaker never writes, so the read ends only when the listener closes.
+    let closed = tokio::time::timeout(LISTENER_TEST_DURATION, peer_stream.read(&mut [0; 1]))
+        .await
+        .expect("the listener should close a connection that has no seat");
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "the listener sends nothing to a peer it refuses: {closed:?}"
+    );
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "the listener must not handshake with a peer it refuses"
+    );
+}
+
+/// Moves the listener's clock forward by `duration`, without waiting for it.
+async fn advance_listener_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
+/// Test the listener keeps the seat of a long-lived peer for its IP address after it
+/// disconnects, refuses that seat to other peers, and releases it when the hold ends.
+#[tokio::test]
+async fn listener_holds_the_seat_of_a_long_lived_peer() {
+    let _init_guard = zakura_test::init();
+
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    // The two kinds of peer need different IP addresses, and every machine has one IPv4
+    // and one IPv6 localhost address.
+    if zakura_test::net::zebra_skip_ipv6_tests() {
+        return;
+    }
+
+    let returning_ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+    let other_ip: IpAddr = Ipv6Addr::LOCALHOST.into();
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded();
+
+    let open_inbound_handshaker = service_fn(move |req: HandshakeRequest<TcpStream>| {
+        let accepted_tx = accepted_tx.clone();
+        async move {
+            let HandshakeRequest {
+                data_stream: tcp_stream,
+                connected_addr,
+                mut connection_tracker,
+            } = req;
+
+            let ConnectedAddr::InboundDirect { addr } = connected_addr else {
+                unreachable!("inbound listener handshakes use inbound direct addresses");
+            };
+
+            // A handshake that succeeds marks its connection open.
+            connection_tracker.mark_open();
+
+            let (fake_client, _harness) = ClientTestHarness::build()
+                .with_connected_addr(connected_addr)
+                .finish();
+
+            accepted_tx
+                .unbounded_send((addr.ip(), tcp_stream, connection_tracker))
+                .expect("unexpected error sending to unbounded channel");
+
+            Ok(fake_client)
+        }
+    });
+
+    let mut config = Config {
+        // A dual-stack listener, so IPv4 peers arrive as IPv4-mapped addresses.
+        listen_addr: "[::]:0".parse().unwrap(),
+        // The smallest target size whose inbound limit has room for one held seat.
+        peerset_initial_target_size: 4,
+        // Each kind of peer shares one address, and the recent-IP limit is not under test.
+        max_connections_per_ip: usize::MAX,
+        ..test_defaults()
+    };
+    let inbound_limit = config.peerset_inbound_connection_limit();
+    assert_eq!(
+        inbound_limit / constants::INBOUND_SEAT_HOLD_LIMIT_DIVISOR,
+        1,
+        "this test needs room for exactly one held seat"
+    );
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+    let listen_port = listen_addr.port();
+
+    // Every seat taken in this test sends one peer change.
+    let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(inbound_limit * 4);
+
+    let listen_fut = accept_inbound_connections(
+        config.clone(),
+        tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+        tower::util::BoxCloneService::new(open_inbound_handshaker),
+        peerset_tx,
+        BannedIps::default(),
+        Vec::new(),
+    );
+    let listen_task_handle = tokio::spawn(listen_fut);
+
+    // Fill the listener: one seat for the peer that leaves and returns, the rest for others.
+    let mut returning_seat =
+        Some(take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await);
+    let mut other_seats = Vec::new();
+    for _ in 1..inbound_limit {
+        other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+    }
+    expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
+
+    // A peer that leaves after a short connection holds no seat, so another peer takes it.
+    returning_seat.take();
+    other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+
+    // Give the returning peer a seat again, and let every connection grow old enough.
+    other_seats.pop();
+    returning_seat = Some(take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await);
+    advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
+
+    // A long-lived peer that leaves keeps its seat: other peers are refused, and it
+    // connects again.
+    returning_seat.take();
+    expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
+    returning_seat = Some(take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await);
+    expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
+
+    // The seat that was taken back is no longer held. If it were, it would use the only
+    // hold, and count against the peer that takes the next seat to open.
+    other_seats.pop();
+    other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+
+    // A held seat that its peer does not take back goes to another peer when the hold ends.
+    advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
+    returning_seat.take();
+    expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
+    advance_listener_clock(constants::INBOUND_SEAT_HOLD_DURATION).await;
+    other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+
+    assert_eq!(
+        other_seats.len(),
+        inbound_limit,
+        "the released seat leaves the listener full of other peers"
+    );
 }
 
 /// Test the listener with a multi-peer inbound limit, and a handshaker that always errors.

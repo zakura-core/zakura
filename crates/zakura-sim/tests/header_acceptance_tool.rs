@@ -546,12 +546,24 @@ fn two_planted_cases_run_through_the_tool() {
             ),
             (
                 "verdict.json",
-                serde_json::json!({"property": property, "name": name, "refused": null}),
+                serde_json::json!({
+                    "property": property,
+                    "name": name,
+                    "baseline": digest(&dir.join("baseline").join("trace.jsonl")),
+                    "patched": digest(&dir.join("patched").join("trace.jsonl")),
+                    "refused": null,
+                }),
             ),
             (
                 "target.json",
                 serde_json::json!({
-                    "property": property, "name": name, "target": null, "refused": null,
+                    "property": property,
+                    "name": name,
+                    "target": null,
+                    "source": source,
+                    "input_sha256": null,
+                    "trace": null,
+                    "refused": null,
                 }),
             ),
         ];

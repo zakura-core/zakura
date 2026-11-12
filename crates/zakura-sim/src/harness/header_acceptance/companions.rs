@@ -11,8 +11,9 @@
 //! - [`FAULT_CLOSE`]: the node closed the rejected frame's connection with a
 //!   cause in [`FAULT_CAUSES`](crate::model::FAULT_CAUSES), after it judged
 //!   that frame, and the session's reader refused a frame for the page's
-//!   content fault, [`CONTENT_FAULT`]. It joins on the connection and the
-//!   session, so a close for another fault doesn't count.
+//!   content fault, [`CONTENT_FAULT`]. It joins on the connection, and on
+//!   the peer and the session, so a close for another fault, or another
+//!   peer's refusal, doesn't count.
 //! - [`STAGED`]: exactly one `PageStaged` came from that frame. It joins on
 //!   the session the frame's connection and QUIC stream carry, the
 //!   subscription the frame names, and the frame's position among the
@@ -227,19 +228,24 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
     })
 }
 
-/// What the peer sent as `page`: the peer `peers` names for its harness
-/// name, by `(name, peer)`, and the header hashes `sent` holds for its
-/// frame. An error says which is missing.
+/// The peer `page` came from, as `peers` names it for its harness name, by
+/// `(name, peer)`, in hex as findings spell it.
+fn page_peer(page: &RejectedPage, peers: &[(String, String)]) -> Result<String, String> {
+    peers
+        .iter()
+        .find(|(name, _)| *name == page.peer)
+        .map(|(_, peer)| peer.clone())
+        .ok_or_else(|| format!("no peer is named {}", page.peer))
+}
+
+/// What the peer sent as `page`: its peer ([`page_peer`]) and the header
+/// hashes `sent` holds for its frame. An error says which is missing.
 pub fn sent_page(
     page: &RejectedPage,
     peers: &[(String, String)],
     sent: &SentPages,
 ) -> Result<SentPage, String> {
-    let peer = peers
-        .iter()
-        .find(|(name, _)| *name == page.peer)
-        .map(|(_, peer)| peer.clone())
-        .ok_or_else(|| format!("no peer is named {}", page.peer))?;
+    let peer = page_peer(page, peers)?;
     let hashes = sent
         .page(page.connection, page.quic_stream, page.frame)
         .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
@@ -248,13 +254,16 @@ pub fn sent_page(
 
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
 /// after it judged `page`'s frame, with a fault cause, and `refusals` hold
-/// exactly one of `page`'s session, for [`CONTENT_FAULT`]. A reader ends its
-/// session at its first refusal, so that one is the close's.
+/// exactly one of `page`'s peer ([`page_peer`], from `peers`) and session,
+/// for [`CONTENT_FAULT`]. A reader ends its session at its first refusal,
+/// so that one is the close's.
 pub fn fault_close(
     observations: &[Observation],
     refusals: &[Refusal],
     page: &RejectedPage,
+    peers: &[(String, String)],
 ) -> Result<(), String> {
+    let peer = page_peer(page, peers)?;
     let judged = observations
         .iter()
         .position(|obs| {
@@ -286,12 +295,13 @@ pub fn fault_close(
         Some(_) => {
             let of_session: Vec<&Refusal> = refusals
                 .iter()
-                .filter(|refusal| refusal.session == page.session)
+                .filter(|refusal| refusal.peer == peer && refusal.session == page.session)
                 .collect();
             match of_session[..] {
                 [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
                 _ => Err(format!(
-                    "session {}'s reader refused {of_session:?}, not one frame for {CONTENT_FAULT}",
+                    "peer {peer}'s session {} reader refused {of_session:?}, not one frame for \
+                     {CONTENT_FAULT}",
                     page.session
                 )),
             }
@@ -419,9 +429,14 @@ pub fn judge(evidence: &DraftEvidence) -> Verdicts {
     vec![
         (
             FAULT_CLOSE,
-            page.as_ref()
-                .map_err(Clone::clone)
-                .and_then(|page| fault_close(&evidence.observations, &evidence.refusals, page)),
+            page.as_ref().map_err(Clone::clone).and_then(|page| {
+                fault_close(
+                    &evidence.observations,
+                    &evidence.refusals,
+                    page,
+                    &evidence.peers,
+                )
+            }),
         ),
         (
             STAGED,
@@ -744,10 +759,15 @@ mod tests {
     /// its content refusal: a fault close there after the session's reader
     /// refused a frame for linkage holds, and the same close of another
     /// connection, a close there with a cause that isn't a fault, or a close
-    /// after a refusal for another fault, or none, doesn't.
+    /// after a refusal for another fault, of another session or of another
+    /// peer, or none, doesn't.
     #[test]
     fn the_fault_close_joins_the_rejected_frames_connection() {
         let linkage = refused(CONTENT_FAULT);
+        let peers = vec![("peer-0".to_owned(), "ab".to_owned())];
+        let fault_close = |log: &[Observation], refusals: &[Refusal], page: &RejectedPage| {
+            fault_close(log, refusals, page, &peers)
+        };
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         assert_eq!(
             page,
@@ -771,6 +791,12 @@ mod tests {
         let mut other = linkage.clone();
         other[0].session = 12;
         assert!(fault_close(&closed, &other, &page).is_err());
+        // Nor is another peer's, on the same session for the same fault.
+        let mut other = linkage.clone();
+        other[0].peer = "cd".into();
+        assert!(fault_close(&closed, &other, &page).is_err());
+        // A page whose peer no harness name resolves has no refusal.
+        assert!(super::fault_close(&closed, &linkage, &page, &[]).is_err());
     }
 
     /// What peer `ab` sent as the rejected page: headers `01` and `02`.

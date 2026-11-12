@@ -717,7 +717,9 @@ const C18_PROVING: &[TestRef] = &[
 /// C5's proving tests: a stale-binary control for a catch, whose baseline
 /// must come from S's build and its patched run from the checkout its
 /// provenance check measured, one for a standalone witness history, whose
-/// trace and witness test must both come from S's build, and one for a
+/// trace and witness test must both come from S's build, one for an
+/// integrity catch, whose patched test and history must come from the
+/// measured build of S with the mutation's committed patch, and one for a
 /// contract test, C5's own, whose binary must embed the subject's source,
 /// each with an unknown digest matching nothing, even on both sides, and a
 /// dirty checkout's agreeing digests anchoring nothing. Each runs in a
@@ -731,6 +733,10 @@ const C5_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_acceptance/tool.rs",
         "harness::header_acceptance::tool::tests::a_history_from_a_stale_binary_is_refused",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_stale_integrity_build_is_refused",
     ),
     sim_test(
         super::rows::ACCEPTANCE_TESTS,
@@ -1131,10 +1137,9 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C21 by hf-8 with E4's
-/// sidecar. Every other row's deliveries landed, and its state names
-/// what's still missing: C4's and C22's proving tests pass, but don't yet
-/// prove them.
+/// stores, C13 by hf-1 to hf-3 and C15 by hf-5. Every other row's
+/// deliveries landed, and its state names what's still missing: C4's, C21's
+/// and C22's proving tests pass, but don't yet prove them.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1314,12 +1319,18 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        satisfied(
+        proved_short(
             C21,
             "Adam's harness",
             "Every header check keeps every finding at a boundary, not just its first.",
             C21_PROVING,
             "hf-8",
+            "a two-finding history through the real reactor tap, with both findings in the \
+             recorded full report and its fresh replay, since `ClaimRun` and the scripted \
+             claim cases insert their claim records themselves; and sidecar coverage for the \
+             generated `header-sync/s5v9` receiver and sender checks and \
+             `session/honest-never-punished`, which `wire_properties` registers and which can \
+             each find several failures at one boundary",
         ),
         proved_short(
             C22,

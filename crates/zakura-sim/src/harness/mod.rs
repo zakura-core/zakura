@@ -28,6 +28,8 @@ pub mod machine;
 pub mod policy;
 mod record;
 pub mod scenario;
+#[cfg(test)]
+pub(crate) mod scripted;
 pub mod sync;
 pub mod sync_wire;
 pub mod wire_node;

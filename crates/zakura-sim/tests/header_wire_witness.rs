@@ -915,16 +915,16 @@ const DEFAULT_PLAN: &str = "header-wire-default.plan";
 /// The committed scenarios of the generated IDs' typed planted cases
 /// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
 /// focused scenario ([`act_scenario`]) for each act no saved Plan takes, an
-/// adversary holding the node's chain and the held subscription, both with
-/// no act, and the node serving an honest subscriber. The saved Plans' inputs serve the other cases.
+/// adversary serving the node its chain and the held subscription, both
+/// with no act, and the node serving an honest subscriber. The saved Plans' inputs serve the other cases.
 fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     let act = |name, act| (name, act_scenario(act));
     let mut held = act_scenario(Act::MinPayload {
         row: Row::SubscribeHeaders,
     });
     held.peers[0].script.clear();
-    let mut quiet = act_scenario(Act::MinPayload { row: Row::Status });
-    quiet.peers[0].script.clear();
+    let mut serving = act_scenario(Act::ExtraEnding);
+    serving.peers[0].script.clear();
     vec![
         act(
             "status-bad-content",
@@ -1000,7 +1000,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
                 rule: ContentRule::OutcomeWindow,
             },
         ),
-        ("quiet-adversary", quiet),
+        ("serving-adversary", serving),
         ("held-subscription", held),
         ("served-subscription", served_subscription()),
     ]

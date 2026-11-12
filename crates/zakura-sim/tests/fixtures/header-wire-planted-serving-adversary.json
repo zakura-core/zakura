@@ -54,12 +54,12 @@
       "bad_nonce_echo": false,
       "script": [],
       "honest": {
-        "chain": 50,
+        "chain": 120,
         "subscribe": null
       },
       "adversary": {
         "announce": true,
-        "serve": false,
+        "serve": true,
         "withhold": false
       }
     }

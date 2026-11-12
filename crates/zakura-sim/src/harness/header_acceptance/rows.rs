@@ -204,7 +204,7 @@ const GENERATED: [Generated; 32] = {
             "conformant-never-closes",
             EVERY,
             G2,
-            Case("min-payload-refused"),
+            Case("target-page-refused"),
         ),
         gen(
             "status/sender-cadence",

@@ -254,6 +254,22 @@ fn index_traces(dir: &Path, traces: &mut std::collections::BTreeMap<String, std:
         };
         if kind.is_dir() {
             index_traces(&path, traces);
+        } else if kind.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| name == crate::harness::header_acceptance::tool::TEST_FILE)
+            && dir.join("history").is_dir()
+        {
+            // An integrity mutation's execution names its `test.json` by
+            // digest, and the run it judges is the recorded `history` trace
+            // beside it.
+            if let Ok(Some(bytes)) =
+                crate::trace::read::read_bounded(&path, crate::trace::MAX_TRACE_BYTES)
+            {
+                use sha2::{Digest, Sha256};
+                let id = crate::trace::meta::hex(&Sha256::digest(&bytes));
+                traces.insert(id, dir.join("history"));
+            }
         } else if kind.is_file() && path.file_name().is_some_and(|name| name == TRACE_FILE) {
             // A regular file only, read without following a link and within
             // the trace limit, so a link to `/dev/zero` or a FIFO can't hang

@@ -831,6 +831,23 @@ mod manifest {
         std::fs::read_to_string(seed::repo_root().join(path)).unwrap_or_default()
     }
 
+    /// The rows' fixed content is pinned: unchanged, it matches the pin,
+    /// and changing one field of one row moves it.
+    #[test]
+    fn a_changed_row_field_fails_the_pin() {
+        use zakura_sim::sim_acceptance::manifest::{
+            rows, rows_digest, rows_digest_of, Derived, ROWS_SHA256,
+        };
+        assert_eq!(rows_digest(), ROWS_SHA256);
+        let mut changed = rows(&Derived::default());
+        changed[0].never_excluded = !changed[0].never_excluded;
+        assert_ne!(rows_digest_of(&changed), ROWS_SHA256);
+        let mut fewer = rows(&Derived::default());
+        let row = fewer.iter_mut().find(|row| row.expected.len() > 1).unwrap();
+        row.expected.pop();
+        assert_ne!(rows_digest_of(&fewer), ROWS_SHA256);
+    }
+
     #[test]
     fn the_committed_manifest_has_no_problems() {
         let derived = derived();

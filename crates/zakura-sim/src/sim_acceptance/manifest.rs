@@ -192,6 +192,37 @@ fn row(id: &str, never_excluded: bool, expected: Vec<Expected>) -> Row {
     }
 }
 
+/// The digest of the rows' fixed content: each row's ID, whether it can be
+/// excluded, and its results, built with every derived family empty, so a
+/// new seed or schedule doesn't move it and an edited row does.
+pub fn rows_digest() -> String {
+    rows_digest_of(&rows(&Derived::default()))
+}
+
+/// The digest [`rows_digest`] takes, of `rows`.
+pub fn rows_digest_of(rows: &[Row]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let fixed: Vec<(String, bool, Vec<String>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.id.clone(),
+                row.never_excluded,
+                row.expected.iter().map(ToString::to_string).collect(),
+            )
+        })
+        .collect();
+    let json = serde_json::to_vec(&fixed).expect("strings and booleans serialize");
+    Sha256::digest(&json)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// [`rows_digest`] at S, which a change to any row's fixed content must
+/// move.
+pub const ROWS_SHA256: &str = "65e9a2055cd6ff1b09070bf545d4a2e4c35b9c93a0b99f9c03524b52820b0903";
+
 /// The race agreement pairs: one per registered race fixture, so a new
 /// fixture joins S4.4 by itself ([`problems`] checks each has a saved
 /// schedule).
@@ -875,6 +906,15 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
     if fixtures != schedules {
         problems
             .push("the race fixtures and the saved race schedules aren't the same set".to_owned());
+    }
+    // The rows' hand-written content, every family left empty, is pinned,
+    // so editing one field of one row is a manifest change that fails here
+    // until the pin moves with it.
+    if rows_digest() != ROWS_SHA256 {
+        problems.push(format!(
+            "the rows' fixed content changed (digest {}), so ROWS_SHA256 must move with it",
+            rows_digest()
+        ));
     }
     if held("corpus/header-table-pairs") != pairs {
         problems.push("the header table row doesn't hold exactly the generated IDs".to_owned());

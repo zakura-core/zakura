@@ -1705,19 +1705,38 @@ fn minimized_bundle_refusal(
     minimized: &str,
 ) -> Option<String> {
     let root = dir.join("minimize");
-    let bundle = root.join(report.pointer("/minimized/dir")?.as_str()?);
-    let input =
-        crate::trace::read::read_bounded(&bundle.join("input.bin"), header::MAX_ARTIFACT_BYTES)
+    // A report path must be relative and stay inside the checked tree.
+    let inside = |pointer: &str| -> Result<std::path::PathBuf, String> {
+        let path = report
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("sim-minimize's report has no {pointer}"))?;
+        let path = Path::new(path);
+        let confined = path.is_relative()
+            && path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if confined {
+            Ok(root.join(path))
+        } else {
+            Err(format!("sim-minimize's {pointer} leaves its directory"))
+        }
+    };
+    let (bundle, trace) = match (inside("/minimized/dir"), inside("/minimized/trace")) {
+        (Ok(bundle), Ok(trace)) => (bundle, trace),
+        (Err(why), _) | (_, Err(why)) => return Some(why),
+    };
+    let bounded = |path: &Path| {
+        crate::trace::read::read_bounded(path, header::MAX_ARTIFACT_BYTES)
             .ok()
             .flatten()
-            .map(|bytes| sha256_hex(&bytes));
+    };
+    let input = bounded(&bundle.join("input.bin")).map(|bytes| sha256_hex(&bytes));
     if input.as_deref() != Some(minimized) {
         return Some("the kept minimized input isn't the one the report names".to_owned());
     }
-    let confirmation: Option<Value> =
-        fs::read_to_string(bundle.join("confirm").join("confirmation.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok());
+    let confirmation: Option<Value> = bounded(&bundle.join("confirm").join("confirmation.json"))
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     let confirmed = confirmation.as_ref().is_some_and(|c| {
         c.get("status").and_then(Value::as_str) == Some("confirmed")
             && c.get("property").and_then(Value::as_str) == Some(property)
@@ -1726,9 +1745,8 @@ fn minimized_bundle_refusal(
     if !confirmed {
         return Some("the kept minimized input's confirmation doesn't confirm it".to_owned());
     }
-    let trace = TraceReader::open(&root.join(report.pointer("/minimized/trace")?.as_str()?)).ok();
     let pinned = report.pointer("/build/sim_binary").and_then(Value::as_str);
-    let bound = trace.as_ref().is_some_and(|trace| {
+    let bound = TraceReader::open(&trace).ok().is_some_and(|trace| {
         trace.meta.input.as_ref().map(|i| i.sha256.as_str()) == Some(minimized)
             && Some(trace.meta.build.binary.as_str()) == pinned
     });

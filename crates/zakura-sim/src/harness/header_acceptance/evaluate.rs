@@ -94,6 +94,13 @@ pub enum Actual {
         /// The patched run.
         patched: Execution,
     },
+    /// A harness-caught planted case's two runs.
+    HarnessCaught {
+        /// The unpatched baseline.
+        baseline: Execution,
+        /// The patched run, which ends at its harness failure.
+        patched: Execution,
+    },
     /// A native integrity mutation's three runs, each naming the history
     /// it ran in [`ExecMeta::input`].
     IntegrityCaught {
@@ -775,8 +782,8 @@ impl<'a> Evidence<'a> {
             Expected::Passes { test } => self.test_passed(test, bootstrap),
             // A proving catch is its case's own judgment, which reads no
             // contract.
-            Expected::Caught { .. } if !bootstrap => {
-                let id = result.expected.id().expect("a Caught has an identity");
+            Expected::Caught { .. } | Expected::HarnessCaught { .. } if !bootstrap => {
+                let id = result.expected.id().expect("a catch has an identity");
                 self.one_result(&id).and_then(|record| {
                     judge(
                         self.manifest,
@@ -955,9 +962,11 @@ fn owned_runs(expected: &Expected) -> Vec<RunId> {
         Expected::Caught { case, .. } => [CaseRun::Baseline, CaseRun::Patched, CaseRun::Draft]
             .map(|run| RunId::case(case, run))
             .to_vec(),
-        Expected::MachineCaught { case, .. } => [CaseRun::Baseline, CaseRun::Patched]
-            .map(|run| RunId::case(case, run))
-            .to_vec(),
+        Expected::MachineCaught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            [CaseRun::Baseline, CaseRun::Patched]
+                .map(|run| RunId::case(case, run))
+                .to_vec()
+        }
         Expected::IntegrityCaught { patch, .. } => {
             [CaseRun::Unpatched, CaseRun::Patched, CaseRun::Restored]
                 .map(|run| RunId::native(patch, run))
@@ -977,7 +986,8 @@ fn executions(actual: &Actual) -> Vec<&Execution> {
             draft,
             ..
         } => vec![baseline, patched, draft],
-        Actual::MachineCaught { baseline, patched } => vec![baseline, patched],
+        Actual::MachineCaught { baseline, patched }
+        | Actual::HarnessCaught { baseline, patched } => vec![baseline, patched],
         Actual::IntegrityCaught {
             unpatched,
             patched,
@@ -996,9 +1006,9 @@ fn expected_harness(manifest: &Manifest, expected: &Expected) -> Option<String> 
         Expected::Holds { history, .. }
         | Expected::StaysNotApplicable { history, .. }
         | Expected::IntegrityCaught { history, .. } => Some(history.harness.to_owned()),
-        Expected::Caught { harness, .. } | Expected::MachineCaught { harness, .. } => {
-            Some((*harness).to_owned())
-        }
+        Expected::Caught { harness, .. }
+        | Expected::MachineCaught { harness, .. }
+        | Expected::HarnessCaught { harness, .. } => Some((*harness).to_owned()),
         Expected::Replays { run } => replayed_harness(manifest, run),
         Expected::Passes { .. } | Expected::Open { .. } => None,
     }
@@ -1016,6 +1026,7 @@ fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
                 .find_map(|result| match result.expected {
                     Expected::Caught { case, harness, .. }
                     | Expected::MachineCaught { case, harness }
+                    | Expected::HarnessCaught { case, harness, .. }
                         if case.property == property && case.name == name =>
                     {
                         Some(harness.to_owned())
@@ -1209,6 +1220,43 @@ fn judge(
             exactly_violated(patched, &[case.property])
         }
         (
+            Expected::HarnessCaught {
+                case,
+                harness,
+                detail,
+                not_applicable,
+            },
+            Actual::HarnessCaught { baseline, patched },
+        ) => {
+            if manifest.machines.contains(&harness) {
+                return Err(format!("{harness} is a machine, which runs no drain"));
+            }
+            whole_report(
+                manifest,
+                baseline,
+                &RunId::case(case, CaseRun::Baseline),
+                harness,
+                case.property,
+                not_applicable,
+            )?;
+            target_held(baseline, case.property)?;
+            same_run(
+                manifest,
+                patched,
+                &RunId::case(case, CaseRun::Patched),
+                harness,
+            )?;
+            inventory(manifest, patched, harness)?;
+            if patched.leaked != 0 {
+                return Err(format!("its patched run leaked {} tasks", patched.leaked));
+            }
+            missing_evidence(&patched.end, case.property, detail)?;
+            match violated(patched).next() {
+                Some(property) => Err(format!("its patched run violated {property}")),
+                None => Ok(()),
+            }
+        }
+        (
             Expected::IntegrityCaught {
                 patch,
                 history,
@@ -1385,6 +1433,7 @@ fn kind_of(actual: &Actual) -> &'static str {
         Actual::Run(_) => "run",
         Actual::Caught { .. } => "caught",
         Actual::MachineCaught { .. } => "machine-caught",
+        Actual::HarnessCaught { .. } => "harness-caught",
         Actual::IntegrityCaught { .. } => "integrity-caught",
         Actual::Replay { .. } => "replay",
         Actual::Test { .. } => "test",
@@ -1610,6 +1659,30 @@ fn caught_patched(
         (found, end) => return Err(format!("found {found:?}, its patched run ended {end:?}")),
     }
     exactly_violated(run, set)
+}
+
+/// Checks `end` is a harness failure of `property`'s missing evidence,
+/// `<property> lacks evidence after step <n>: <its detail>` as
+/// `HarnessFailure::MissingEvidence` writes it, whose detail says `detail`.
+fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), String> {
+    let End::HarnessFailure { diagnostic } = end else {
+        return Err(format!(
+            "its patched run ended {end:?}, not at a harness failure"
+        ));
+    };
+    let shown = diagnostic
+        .strip_prefix(property)
+        .and_then(|rest| rest.strip_prefix(" lacks evidence after step "))
+        .and_then(|rest| rest.split_once(": "))
+        .filter(|(step, _)| !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, shown)| shown);
+    match shown {
+        Some(shown) if shown.contains(detail) => Ok(()),
+        _ => Err(format!(
+            "its patched run's harness failure {diagnostic:?} isn't {property}'s missing \
+             evidence saying {detail:?}"
+        )),
+    }
 }
 
 /// A `Caught`'s `Draft` run: a completed counted run with the set as its

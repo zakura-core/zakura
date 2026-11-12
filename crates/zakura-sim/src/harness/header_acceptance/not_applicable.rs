@@ -643,6 +643,7 @@ const SHARED: &[Shared] = &[
         never: &["header-sync/peer-retirement-progress"],
         undeclared: STORAGE_UNDECLARED,
         cases: &[
+            ("header-sync/chunk-budget-bound", "release-relocks-budget"),
             (
                 "header-sync/commit-only-authorized",
                 "accepted-before-apply",

@@ -846,6 +846,29 @@ const C22_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C19's proving tests: its honest half, a live cut at an unread boundary
+/// that the drain reads past and concludes, and the registry's dry-end
+/// rule, which fails an unread boundary as missing evidence.
+const C19_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_node_capacity.rs",
+        "a_drain_reads_past_an_unread_boundary_at_the_cut",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_fails_an_unread_boundary_as_missing_evidence",
+    ),
+];
+
+/// C19's proving catch, its bug-only half through the real reactor:
+/// `release-relocks-budget`, whose reactor stays stopped mid-poll holding
+/// the budget's lock until a dry end, so its run ends at the missing
+/// evidence `HarnessCaught` names (Adam's ruling on question 7).
+const C19_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/chunk-budget-bound",
+    name: "release-relocks-budget",
+}];
+
 /// C2's proving catches: `idle-exit-drops-fault`, whose reactor walks
 /// away from owed work and whose owed penalty concludes `Violated` at the
 /// drain's end, as the end replay's `DroppedFault`, alone. Those are C2's
@@ -1183,8 +1206,8 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, C15 by hf-5 and C22 by hf-9 with its
-/// planted catches. Every other row's deliveries landed, and its state
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C19 and C22 by hf-4 and
+/// hf-9 with their planted catches. Every other row's deliveries landed, and its state
 /// names what's still missing: C4's and C21's proving tests pass, but don't
 /// yet prove them.
 pub fn contract_table() -> Vec<Contract> {
@@ -1355,13 +1378,16 @@ pub fn contract_table() -> Vec<Contract> {
             C18_PROVING,
             "E10",
         ),
-        waiting(
-            C19,
-            "Adam's harness",
-            "An unread final capacity boundary concludes under C1's drain or fails the run.",
-            "hf-4, with C2",
-            "hf-4's still-unreadable chunk-budget-bound case, which it left to a planted case",
-        ),
+        Contract {
+            proving_catches: C19_CATCHES,
+            ..satisfied(
+                C19,
+                "Adam's harness",
+                "An unread final capacity boundary concludes under C1's drain or fails the run.",
+                C19_PROVING,
+                "hf-4, with C2, and its planted case",
+            )
+        },
         Contract {
             id: C20,
             owner: "Adam's harness",
@@ -1573,8 +1599,9 @@ pub const NARROWING_FINGERPRINT: &str = "cbe285413fc88ad5";
 
 /// The [`Key::ContractTest`] and [`Key::ContractCatch`] results of each
 /// `Satisfied` contract: one `Passes` per proving test, and per proving
-/// catch the `Caught` a result of `rows` names for that case. A catch no
-/// row names gets no result, so its key stays uncovered and blocks.
+/// catch the `Caught` or `HarnessCaught` a result of `rows` names for that
+/// case. A catch no row names gets no result, so its key stays uncovered
+/// and blocks.
 pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec<ExpectedResult> {
     let satisfied = table
         .iter()
@@ -1589,7 +1616,11 @@ pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec
     let catches = satisfied.flat_map(|contract| {
         contract.proving_catches.iter().filter_map(|&case| {
             let caught = rows.iter().find_map(|result| match result.expected {
-                Expected::Caught { case: c, .. } if c == case => Some(result.expected.clone()),
+                Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
+                    if c == case =>
+                {
+                    Some(result.expected.clone())
+                }
                 _ => None,
             })?;
             Some(ExpectedResult {

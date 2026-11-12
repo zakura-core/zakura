@@ -373,11 +373,19 @@ fn committed_required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
             Some(((property.clone(), name.clone()), harness))
         })
         .collect();
+    let harness_caught: BTreeSet<(String, String)> = planted
+        .iter()
+        .filter(|(property, name)| {
+            header_acceptance::planted_harness_caught(&repo(), property, name).unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     required_keys(&Inventories {
         registered: &registered,
         needs: &needs,
         planted: &planted,
         planted_harnesses: &planted_harnesses,
+        harness_caught: &harness_caught,
         native: &native,
         coverage_tests: &coverage,
         contracts: &contracts,
@@ -1600,16 +1608,18 @@ fn case_errors(expected: &[ExpectedResult], cases: &[(String, String)]) -> Vec<S
     let mut named: BTreeMap<(String, String), Vec<(bool, &str)>> = BTreeMap::new();
     for result in expected {
         // A duplicate native mutation's key shares its covering case's
-        // catch, which the case's own row names.
+        // catch, which the case's own row names, and so does a contract's
+        // proving catch.
         if result
             .keys
             .iter()
-            .all(|key| matches!(key, Key::Native { .. }))
+            .all(|key| matches!(key, Key::Native { .. } | Key::ContractCatch { .. }))
         {
             continue;
         }
         let (case, machine, declared) = match result.expected {
-            Expected::Caught { case, harness, .. } => (case, false, harness),
+            Expected::Caught { case, harness, .. }
+            | Expected::HarnessCaught { case, harness, .. } => (case, false, harness),
             Expected::MachineCaught { case, harness } => (case, true, harness),
             _ => continue,
         };
@@ -2517,7 +2527,11 @@ fn catch_errors(manifest: &Manifest) -> Vec<String> {
                     .keys
                     .iter()
                     .any(|key| matches!(key, Key::Case { .. }))
-                    && matches!(result.expected, Expected::Caught { case: c, .. } if c == *case)
+                    && matches!(
+                        result.expected,
+                        Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
+                            if c == *case
+                    )
             });
             if !caught {
                 errors.push(format!(
@@ -5269,6 +5283,114 @@ fn the_evaluator_refuses_manifest_defects() {
     let evaluation = header_acceptance::evaluate(&manifest, &required(&manifest), &stray, SUBJECT);
     assert!(!evaluation.stray.is_empty());
     assert!(!evaluation.accepted());
+}
+
+/// A harness-caught case (Adam's ruling on question 7) verifies only with
+/// its baseline holding and its patched run ending at its own property's
+/// missing evidence that says its detail, violating nothing. Every other
+/// end blocks it, and a contract's proving catch may name it.
+#[test]
+fn the_evaluator_judges_a_harness_caught_case() {
+    const STUCK: CaseRef = CaseRef {
+        property: "t/a",
+        name: "stuck",
+    };
+    const DETAIL: &str = "with a boundary unread";
+    let key = Key::Case {
+        property: "t/a".into(),
+        name: "stuck".into(),
+    };
+    let caught = Expected::HarnessCaught {
+        case: STUCK,
+        harness: NODE,
+        detail: DETAIL,
+        not_applicable: &[],
+    };
+    let mut m = manifest();
+    m.expected
+        .push(er(vec![key.clone()], &[Gate::G2], caught.clone()));
+    let id = caught.id().unwrap();
+    let ended = |diagnostic: &str| {
+        let mut patched = execution(
+            RunId::case(STUCK, CaseRun::Patched),
+            NODE,
+            &[("t/a", na("harness-failed")), ("t/b", na("harness-failed"))],
+        );
+        patched.end = End::HarnessFailure {
+            diagnostic: diagnostic.into(),
+        };
+        patched
+    };
+    let with = |patched: Execution| {
+        let mut results = results();
+        results.results.push(ResultRecord {
+            expected: id.clone(),
+            commit: S.into(),
+            actual: Actual::HarnessCaught {
+                baseline: execution(
+                    RunId::case(STUCK, CaseRun::Baseline),
+                    NODE,
+                    &[("t/a", held()), ("t/b", held())],
+                ),
+                patched,
+            },
+        });
+        results
+    };
+    let missing = format!("t/a lacks evidence after step 9: the run ran dry after step 9 {DETAIL}");
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &key),
+        ObligationState::Verified
+    );
+
+    // Another property's missing evidence, another detail, another harness
+    // failure, no step, a completed run or a stop at a violation blocks it.
+    for diagnostic in [
+        format!("t/b lacks evidence after step 9: {DETAIL}"),
+        "t/a lacks evidence after step 9: a gap".to_owned(),
+        format!("t/a lacks evidence after step : {DETAIL}"),
+        format!("source 3's evidence failed: {DETAIL}"),
+    ] {
+        assert!(
+            blocked(&state(&m, &with(ended(&diagnostic)), &key)),
+            "{diagnostic}"
+        );
+    }
+    let mut completed = ended(&missing);
+    completed.end = End::Completed;
+    assert!(blocked(&state(&m, &with(completed), &key)));
+    let mut stopped = ended(&missing);
+    stopped.end = End::Violation {
+        property: "t/a".into(),
+    };
+    assert!(blocked(&state(&m, &with(stopped), &key)));
+    // A violation beside the missing evidence, or a leaked task, blocks it.
+    let mut violating = ended(&missing);
+    violating.reports.insert("t/b".into(), Report::Violated);
+    assert!(blocked(&state(&m, &with(violating), &key)));
+    let mut leaking = ended(&missing);
+    leaking.leaked = 1;
+    assert!(blocked(&state(&m, &with(leaking), &key)));
+    // A Caught's record never stands in for it.
+    let mut wrong = with(ended(&missing));
+    wrong.results.last_mut().unwrap().actual = caught_actual(STUCK, Found::AtStep);
+    assert!(blocked(&state(&m, &wrong, &key)));
+
+    // As a contract's proving catch, it decides that contract.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, STUCK);
+    m.contracts[0].proving_catches = &[STUCK];
+    m.expected.push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &catch_key),
+        ObligationState::Verified
+    );
+    let other = format!("t/b lacks evidence after step 9: {DETAIL}");
+    assert!(blocked(&state(&m, &with(ended(&other)), &catch_key)));
+    assert!(blocked(&state(
+        &m,
+        &with(ended(&other)),
+        &Key::passing("t/a")
+    )));
 }
 
 #[test]

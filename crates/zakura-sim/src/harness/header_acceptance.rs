@@ -252,6 +252,24 @@ pub fn planted_harness(
     }
 }
 
+/// Whether planted case `name` of `property`, under the repository `repo`,
+/// is harness-caught: its `.toml` names `missing_evidence`, as the planted
+/// runner reads it. An error says what can't be read.
+pub fn planted_harness_caught(
+    repo: &std::path::Path,
+    property: &str,
+    name: &str,
+) -> Result<bool, String> {
+    let path = repo
+        .join("qa/planted")
+        .join(property)
+        .join(format!("{name}.toml"));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let case: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(case.contains_key("missing_evidence"))
+}
+
 /// One result a row expects (Rule 20).
 #[derive(Clone, Debug)]
 pub enum Expected {
@@ -306,6 +324,24 @@ pub enum Expected {
         case: CaseRef,
         /// The machine harness.
         harness: &'static str,
+    },
+    /// A planted case whose patched run fails the harness, which Adam
+    /// allowed only for a missing-evidence end (question 7, 2026-11-12):
+    /// the baseline holds, and the patched run ends at a
+    /// `HarnessFailure::MissingEvidence` of the case's own property whose
+    /// detail carries `detail`, violating nothing. It has no `Draft` run,
+    /// since its patched run can't complete.
+    HarnessCaught {
+        /// The case.
+        case: CaseRef,
+        /// The harness its input runs on.
+        harness: &'static str,
+        /// What the missing evidence's detail must say, such as the
+        /// unread-boundary detail's `with a boundary unread`.
+        detail: &'static str,
+        /// Other properties of the harness expected `NotApplicable` on the
+        /// baseline.
+        not_applicable: &'static [ExpectedNa],
     },
     /// A retained integrity mutation: the patched history fails the run as a
     /// harness failure carrying exactly `diagnostic`.
@@ -568,6 +604,8 @@ pub enum ExpectedId {
     Caught(RunId),
     /// [`Expected::MachineCaught`] for this case's patched run.
     MachineCaught(RunId),
+    /// [`Expected::HarnessCaught`] for this case's patched run.
+    HarnessCaught(RunId),
     /// [`Expected::IntegrityCaught`] for this mutation's patched run.
     IntegrityCaught(RunId),
     /// [`Expected::Replays`] of this execution.
@@ -606,6 +644,9 @@ impl Expected {
             Expected::MachineCaught { case, .. } => {
                 ExpectedId::MachineCaught(RunId::case(case, CaseRun::Patched))
             }
+            Expected::HarnessCaught { case, .. } => {
+                ExpectedId::HarnessCaught(RunId::case(case, CaseRun::Patched))
+            }
             Expected::IntegrityCaught { patch, .. } => {
                 ExpectedId::IntegrityCaught(RunId::native(patch, CaseRun::Patched))
             }
@@ -626,6 +667,7 @@ impl Expected {
             Expected::StaysNotApplicable { .. } => ResultKind::StaysNotApplicable,
             Expected::Caught { .. } => ResultKind::Caught,
             Expected::MachineCaught { .. } => ResultKind::MachineCaught,
+            Expected::HarnessCaught { .. } => ResultKind::HarnessCaught,
             Expected::IntegrityCaught { .. } => ResultKind::IntegrityCaught,
             Expected::Replays { .. } => ResultKind::Replays,
             Expected::Passes { .. } => ResultKind::Passes,
@@ -668,13 +710,16 @@ impl Key {
             }
             (
                 Key::Case { property, name },
-                Expected::Caught { case, .. } | Expected::MachineCaught { case, .. },
+                Expected::Caught { case, .. }
+                | Expected::MachineCaught { case, .. }
+                | Expected::HarnessCaught { case, .. },
             ) => case.property == property && case.name == name,
-            // A contract's proving catch takes the `Caught` of exactly that
-            // case, and nothing else.
-            (Key::ContractCatch { property, name, .. }, Expected::Caught { case, .. }) => {
-                case.property == property && case.name == name
-            }
+            // A contract's proving catch takes the `Caught` or
+            // `HarnessCaught` of exactly that case, and nothing else.
+            (
+                Key::ContractCatch { property, name, .. },
+                Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. },
+            ) => case.property == property && case.name == name,
             (Key::Replay { run }, Expected::Replays { run: replayed }) => run == replayed,
             (
                 Key::History { run, target },
@@ -865,6 +910,8 @@ pub enum ResultKind {
     Caught,
     /// [`Expected::MachineCaught`].
     MachineCaught,
+    /// [`Expected::HarnessCaught`].
+    HarnessCaught,
     /// [`Expected::IntegrityCaught`].
     IntegrityCaught,
     /// [`Expected::Replays`].

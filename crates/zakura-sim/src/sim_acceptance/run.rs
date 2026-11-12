@@ -1417,7 +1417,7 @@ fn judge_planted(
             return blocked("`cargo xtask planted` recorded no runs".to_owned())
         }
         Ok(runs) => {
-            if let Some(why) = planted_runs_refusal(dir, binding, &runs) {
+            if let Some(why) = planted_runs_refusal(dir, binding, input, &runs) {
                 return blocked(why);
             }
         }
@@ -1474,10 +1474,10 @@ fn judge_planted(
         binding,
         harness,
         &[
-            ("record-baseline", &passes),
-            ("replay-baseline", &passes),
-            ("record-patched", &violates),
-            ("replay-patched", &violates),
+            ("record-baseline", &passes, Some(input)),
+            ("replay-baseline", &passes, Some(input)),
+            ("record-patched", &violates, Some(input)),
+            ("replay-patched", &violates, Some(input)),
         ],
     ) {
         return blocked(why);
@@ -1601,14 +1601,15 @@ fn run_records(dir: &Path, binding: &TaskBinding) -> Result<Vec<RunRecord>, Stri
 }
 
 /// Why a task's recorded runs under `<dir>/runs` don't pass, if they
-/// don't (Rule 11): every run is of `harness`, in one of `phases`, and
+/// don't (Rule 11): every run is of `harness`, in one of `phases`, of the
+/// input that phase names (or of none, for Plan bytes on a scenario), and
 /// passes through [`owned_run_passes`] with that phase's expected result,
 /// and every phase has exactly one run.
 fn runs_refusal(
     dir: &Path,
     binding: &TaskBinding,
     harness: &str,
-    phases: &[(&str, &RunExpect)],
+    phases: &[(&str, &RunExpect, Option<&str>)],
 ) -> Option<String> {
     let runs = match run_records(&dir.join("runs"), binding) {
         Ok(runs) => runs,
@@ -1620,7 +1621,8 @@ fn runs_refusal(
     let registered = registered(entry);
     let mut seen = BTreeSet::new();
     for run in &runs {
-        let Some((phase, expect)) = phases.iter().find(|(phase, _)| *phase == run.phase) else {
+        let Some((phase, expect, input)) = phases.iter().find(|(phase, ..)| *phase == run.phase)
+        else {
             return Some(format!(
                 "run {} is in an unaccounted phase {}",
                 run.stem, run.phase
@@ -1628,6 +1630,14 @@ fn runs_refusal(
         };
         if run.harness != harness {
             return Some(format!("run {} isn't a run of {harness}", run.stem));
+        }
+        // Each run names the input its phase runs, or none for a run of
+        // Plan bytes on a scenario.
+        if run.input.as_deref() != *input {
+            return Some(format!(
+                "run {} ({phase}) isn't a run of its input",
+                run.stem
+            ));
         }
         if let Err(why) = owned_run_passes(&run.end, &registered, expect) {
             return Some(format!("run {} ({phase}): {why}", run.stem));
@@ -1639,8 +1649,8 @@ fn runs_refusal(
     }
     phases
         .iter()
-        .find(|(phase, _)| !seen.contains(phase))
-        .map(|(phase, _)| format!("no {phase} run was recorded"))
+        .find(|(phase, ..)| !seen.contains(phase))
+        .map(|(phase, ..)| format!("no {phase} run was recorded"))
 }
 
 /// The registered properties of `entry`'s harness, with the ones a run may
@@ -1872,6 +1882,14 @@ fn judge_minimize(
                 run.stem, run.phase
             ));
         };
+        // Even a rejected candidate's run must be the harness on the input
+        // its phase names.
+        if run.input.as_deref() != Some(sha) || run.harness != harness {
+            return blocked(format!(
+                "run {} isn't the harness's run of input {sha}",
+                run.stem
+            ));
+        }
         if rejected.contains(sha) {
             continue;
         }
@@ -2057,7 +2075,12 @@ fn judge_target(
 /// lists ran exactly once, as a run that held or one the property's
 /// violation stopped; a replay is judged as the run it replays. No other
 /// role is allowed.
-fn planted_runs_refusal(dir: &Path, binding: &TaskBinding, runs: &[RunRecord]) -> Option<String> {
+fn planted_runs_refusal(
+    dir: &Path,
+    binding: &TaskBinding,
+    input: &str,
+    runs: &[RunRecord],
+) -> Option<String> {
     let campaign: Vec<String> = runner_json(dir, "planted-inventory.json", binding)
         .and_then(|inventory| serde_json::from_value(inventory.get("campaign")?.clone()).ok())
         .unwrap_or_default();
@@ -2076,10 +2099,28 @@ fn planted_runs_refusal(dir: &Path, binding: &TaskBinding, runs: &[RunRecord]) -
         let registered = registered(entry);
         let held = owned_run_passes(&run.end, &registered, &RunExpect::Passes);
         let caught = owned_run_passes(&run.end, &registered, &violates);
+        let named = run.input.as_deref();
+        let in_campaign = named.is_some_and(|named| campaign.iter().any(|c| c == named));
         let verdict = match run.phase.as_str() {
+            "baseline" | "patched" if named != Some(input) => {
+                return Some(format!(
+                    "planted run {} isn't of the case's input",
+                    run.stem
+                ));
+            }
             "baseline" => held,
             "patched" => caught,
-            "campaign" | "replay" => held.or(caught),
+            // The replay of the patched run must violate as it did.
+            "replay" if named == Some(input) => caught,
+            // A campaign run, or the replay of one that missed, holds or is
+            // stopped by the property's violation.
+            "campaign" | "replay" if in_campaign => held.or(caught),
+            "campaign" | "replay" => {
+                return Some(format!(
+                    "planted run {} isn't of the case's input or a listed campaign input",
+                    run.stem
+                ));
+            }
             other => {
                 return Some(format!(
                     "planted run {} has an unknown role {other}",
@@ -2090,35 +2131,29 @@ fn planted_runs_refusal(dir: &Path, binding: &TaskBinding, runs: &[RunRecord]) -
         if let Err(why) = verdict {
             return Some(format!("planted {} run {}: {why}", run.phase, run.stem));
         }
-        let input = (run.phase == "campaign")
-            .then_some(run.input.as_deref())
-            .flatten();
-        *counted.entry((run.phase.as_str(), input)).or_default() += 1;
+        *counted.entry((run.phase.as_str(), named)).or_default() += 1;
     }
     let count = |key: (&str, Option<&str>)| counted.get(&key).copied().unwrap_or(0);
-    if count(("baseline", None)) != 1 || count(("patched", None)) != 1 {
-        return Some(
-            "the planted runner didn't make exactly one baseline and one patched run".to_owned(),
-        );
-    }
-    let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
-    for input in &campaign {
-        *wanted.entry(input.as_str()).or_default() += 1;
-    }
-    for (input, want) in &wanted {
-        if count(("campaign", Some(input))) != *want {
+    // Exactly one baseline, one patched run and its one replay.
+    for role in ["baseline", "patched", "replay"] {
+        if count((role, Some(input))) != 1 {
             return Some(format!(
-                "campaign input {input} didn't run exactly {want} times"
+                "the planted runner didn't make exactly one {role} run of the case's input"
             ));
         }
     }
-    let campaign_runs: usize = counted
-        .iter()
-        .filter(|((phase, _), _)| *phase == "campaign")
-        .map(|(_, n)| n)
-        .sum();
-    (campaign_runs != campaign.len())
-        .then(|| "the planted campaign ran an input its inventory doesn't list".to_owned())
+    let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
+    for listed in &campaign {
+        *wanted.entry(listed.as_str()).or_default() += 1;
+    }
+    for (listed, want) in &wanted {
+        if count(("campaign", Some(listed))) != *want {
+            return Some(format!(
+                "campaign input {listed} didn't run exactly {want} times"
+            ));
+        }
+    }
+    None
 }
 
 /// The discovery agreement pair's verdict, from the planted task's runs in
@@ -2236,7 +2271,10 @@ fn judge_task(
                 dir,
                 binding,
                 harness,
-                &[("record", &passes), ("replay", &passes)],
+                &[
+                    ("record", &passes, Some(input.as_str())),
+                    ("replay", &passes, Some(input.as_str())),
+                ],
             ) {
                 return blocked(why);
             }
@@ -2298,7 +2336,10 @@ fn judge_task(
                 dir,
                 binding,
                 harness,
-                &[("record", &run_expect), ("replay", &run_expect)],
+                &[
+                    ("record", &run_expect, Some(input.as_str())),
+                    ("replay", &run_expect, Some(input.as_str())),
+                ],
             ) {
                 return blocked(why);
             }
@@ -2365,10 +2406,11 @@ fn judge_task(
                 binding,
                 harness,
                 &[
-                    ("record-base", &violates),
-                    ("replay-base", &violates),
-                    ("record-fixed", &passes),
-                    ("replay-fixed", &passes),
+                    ("record-base", &violates, Some(base_input.as_str())),
+                    ("replay-base", &violates, Some(base_input.as_str())),
+                    // The fixed run is Plan bytes on a scenario, not a full input.
+                    ("record-fixed", &passes, None),
+                    ("replay-fixed", &passes, None),
                 ],
             ) {
                 return blocked(why);
@@ -2498,7 +2540,9 @@ fn judge_task(
                         property: property.clone(),
                         also: Vec::new(),
                     });
-            if let Some(why) = runs_refusal(dir, binding, harness, &[("record", &expect)]) {
+            let planned = Some(input.as_deref().unwrap_or(EMPTY_SHA256));
+            if let Some(why) = runs_refusal(dir, binding, harness, &[("record", &expect, planned)])
+            {
                 return blocked(why);
             }
             judge_trace(

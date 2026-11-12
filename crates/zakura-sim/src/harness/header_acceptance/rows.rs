@@ -3042,7 +3042,15 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "short-cooldown",
         },
     },
-    to_move("short-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "short-payload",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case \
+                     commit-only-authorized/dropped-payload-header, which plants the same \
+                     entries.pop() in WorkPolicy::begin_prepare and on the forks-sharing-a-header \
+                     input first fails with the same WrongPayload at step 738",
+        },
+    },
     NativeMutation {
         patch: "shutdown-kept-queue",
         class: NativeClass::Moved {

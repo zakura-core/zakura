@@ -1845,10 +1845,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "short-cooldown",
         NativePin::Move("header-sync/header-fault-penalized", "hdr-14.4"),
     ),
-    (
-        "short-payload",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
-    ),
+    ("short-payload", NativePin::Retired),
     (
         "shutdown-kept-queue",
         NativePin::Move("header-sync/teardown-returns-baseline", "hdr-14.4"),

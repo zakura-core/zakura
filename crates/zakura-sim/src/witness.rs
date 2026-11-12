@@ -1390,7 +1390,9 @@ mod tests {
             )
         };
         assert_eq!(judged(Some(punished())), Ok(()));
-        let keys = assert_one_key_off(&punished(), |subject| judged(Some(subject.clone())).is_ok());
+        let keys = assert_one_key_off::<crate::check::FindingSubject>(&punished(), |subject| {
+            judged(Some(subject.clone())).is_ok()
+        });
         assert_eq!(keys, 8);
         assert_eq!(
             judged(None),

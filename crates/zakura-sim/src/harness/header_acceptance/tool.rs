@@ -4681,6 +4681,41 @@ mod tests {
         assert!(!witness_judges(dir.path(), MACHINE, "violated", &[]));
     }
 
+    /// A witness judges a run's trigger only on its whole [`TriggerRef`]
+    /// (Rule 25's template): a bound witness of the case's property
+    /// expecting `violated` beside two companions joins that ref, and the
+    /// ref with its property, its expectation or either companion moved
+    /// joins nothing.
+    #[test]
+    fn a_witness_judges_its_whole_trigger() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let dir = recorded();
+        let trigger = TriggerRef {
+            property: MACHINE.to_owned(),
+            expect: "violated".to_owned(),
+            also_violates: vec!["p/b".to_owned(), "p/c".to_owned()],
+        };
+        write_witness(
+            dir.path(),
+            serde_json::json!({
+                "passed": true,
+                "property": trigger.property,
+                "expect": trigger.expect,
+                "also_violates": trigger.also_violates,
+                "error": null,
+            }),
+        );
+        let keys = assert_one_key_off::<TriggerRef>(&trigger, |want| {
+            witness_judges(
+                dir.path(),
+                &want.property,
+                &want.expect,
+                &want.also_violates,
+            )
+        });
+        assert_eq!(keys, 4);
+    }
+
     /// A planted case's patched witness is the one the planted runner
     /// records: the nested `target-page-refused` and `wedged-run-loop` cases
     /// name a `set`, so their tasks expect `violated-set` with exactly that

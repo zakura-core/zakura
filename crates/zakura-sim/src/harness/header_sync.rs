@@ -54,7 +54,9 @@ use super::{
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         publication::{Arming, PublicationEvidence},
-        recovery::{RecoveryEvidence, RecoveryInputs, RecoveryProgress, RECOVERY_BOUND},
+        recovery::{
+            PrefixCutoff, RecoveryEvidence, RecoveryInputs, RecoveryProgress, RECOVERY_BOUND,
+        },
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
         round_life::RoundLifeEvidence,
@@ -1216,7 +1218,10 @@ impl Subsystem for Storage {
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
             recovery: if recovery_source(scenario).is_some() {
-                RecoveryEvidence::bounded(&scenario.policy.disruptions)
+                RecoveryEvidence::bounded(
+                    &scenario.policy.disruptions,
+                    PrefixCutoff::Steps(storage_config().budget),
+                )
             } else {
                 RecoveryEvidence::default()
             },
@@ -2220,12 +2225,13 @@ impl Storage {
 /// Ends a recovering `header-sync/storage` run once its recovery concludes,
 /// so it ends idle rather than at its budget (Rule 13): once
 /// `header-sync/bounded-adversary-progress` has nothing owed
-/// ([`RecoveryProgress::Concluded`]), once the clock has passed an owed
-/// recovery's deadline, which its expiry needs, or, with no `Recover`
-/// picked yet, once the run has taken [`storage_config`]'s budget, which a
-/// prefix whose recover never comes ran to before. Its pick begins the node
-/// under test's stop, as a `Shutdown` step's does, and a harness task then
-/// stops every node ([`Topology::finish`]). It offers no time boundary.
+/// ([`RecoveryProgress::Concluded`]), or once the clock has passed an owed
+/// recovery's deadline, which its expiry needs. It never ends a run whose
+/// `Recover` wasn't picked: the prefix ends at [`storage_config`]'s budget
+/// at the latest ([`PrefixCutoff`]), and the control source then offers the
+/// `Recover` whatever its trigger (#2355). Its pick begins the node under
+/// test's stop, as a `Shutdown` step's does, and a harness task then stops
+/// every node ([`Topology::finish`]). It offers no time boundary.
 ///
 /// A run that reaches [`RECOVERY_BUDGET`] after its `Recover` pick with no
 /// `recovered` pick yet fails as a harness failure instead. Recovery's
@@ -2244,7 +2250,7 @@ struct RecoveryFinish {
     topology: Rc<Topology>,
     /// Wakes the task that carries the finish out.
     to_task: watch::Sender<bool>,
-    /// The last step observed.
+    /// The last step observed, for [`RECOVERY_BUDGET`].
     step: u64,
     /// Set once the finish was picked.
     done: bool,
@@ -2260,9 +2266,7 @@ impl RecoveryFinish {
         match self.recovery.progress(&self.adoption, &self.ends) {
             RecoveryProgress::Concluded => true,
             RecoveryProgress::Owed { since } => now > recovery_deadline(since),
-            RecoveryProgress::Pending => {
-                self.recovery.started().is_none() && self.step >= storage_config().budget
-            }
+            RecoveryProgress::Pending => false,
         }
     }
 }
@@ -2285,7 +2289,7 @@ impl ActionSource for RecoveryFinish {
         self.to_task.send_replace(true);
     }
 
-    /// Notes the step, for the prefix's budget, and fails the run at
+    /// Notes the step, and fails the run at
     /// [`RECOVERY_BUDGET`] with the `recovered` pick still to come, as
     /// [`RecoveryFinish`] says.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {

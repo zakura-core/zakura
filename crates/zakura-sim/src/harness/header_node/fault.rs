@@ -491,14 +491,17 @@ impl Judge {
     }
 
     /// The failed operations that owe a penalty and whose reply reached the
-    /// reactor, in order: each it took, each still untaken, and, unless the
-    /// harness `stopped` the node, each its teardown dropped with its call.
-    fn delivered(&self, stopped: bool) -> Vec<u64> {
+    /// reactor, in order: each it took, each still untaken, and each the
+    /// reactor dropped with its call, unless that call's drop is `cleared`.
+    fn delivered(&self, cleared: &dyn Fn(u64) -> bool) -> Vec<u64> {
         let mut delivered: BTreeSet<u64> = self.owed.iter().map(|penalty| penalty.op).collect();
         delivered.extend(self.failed.keys());
-        if !stopped {
-            delivered.extend(self.dropped_failed.keys());
-        }
+        delivered.extend(
+            self.dropped_failed
+                .iter()
+                .filter(|(_, call)| !cleared(**call))
+                .map(|(op, _)| *op),
+        );
         delivered.into_iter().collect()
     }
 
@@ -811,7 +814,7 @@ impl FaultEvidence {
         let judge = Judge::over(Mode::Scan, &[], entries, &self.attributions);
         match judge.error {
             Some(why) => Err(why),
-            None => Ok(judge.delivered(self.stopped())),
+            None => Ok(judge.delivered(&|call| self.dropped_in_stop(call))),
         }
     }
 

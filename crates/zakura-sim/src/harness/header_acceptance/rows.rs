@@ -217,13 +217,13 @@ const GENERATED: [Generated; 32] = {
             "status/sender-cadence",
             EVERY,
             G34,
-            Open(SENDER_CADENCE_UNREACHED),
+            Case("pacing-floors-cut"),
         ),
         gen(
             "subscribe-headers/sender-within-live",
             EVERY,
             G3,
-            Open(SENDER_LIVE_UNREACHED),
+            Case("open-repeated"),
         ),
         gen(
             "subscribe-headers/sender-within-credit",
@@ -355,7 +355,7 @@ const GENERATED: [Generated; 32] = {
             "headers/bad-content-closes",
             HEADERS,
             G2,
-            Open(BAD_PAGE_UNREACHED),
+            Case("unlinked-page-dropped"),
         ),
         gen("headers/over-owed-closes", HEADERS, G23, Open(NOT_OWED)),
         gen(
@@ -419,25 +419,6 @@ const LONG_PAGE_UNREACHED: &str =
      past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
      precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
      refusals drains the page at 0 ns and breaks sim/no-livelock first";
-/// Why `headers/bad-content-closes` has no catch: its patch breaks a
-/// broader ID that `NESTS` doesn't list over it.
-const BAD_PAGE_UNREACHED: &str =
-    "each page content rule the adversary breaks, linkage and lower locator, puts headers the \
-     node didn't ask for on the page, so a patch that admits one has the node stage them and breaks \
-     header-sync/commit-only-authorized at that step, which NESTS doesn't list over this ID";
-/// Why `status/sender-cadence` has no catch: the run ends before a patched
-/// node empties the peer's bucket.
-const SENDER_CADENCE_UNREACHED: &str =
-    "the peer's Status bucket holds 602 frames and refills one every 500 ms, so breaking the rule \
-     takes over 600 Status frames from the node; with both its pacing floors cut to a millisecond, \
-     the reactor's publication interval and the cadence sender's send interval, a wire run sends \
-     about 213 before its 30,000-step budget ends";
-/// Why `subscribe-headers/sender-within-live` has no catch: the node's
-/// subscriber can't hold the subscriptions the rule's label needs.
-const SENDER_LIVE_UNREACHED: &str =
-    "the peer's models label a node Open over-live only beside two subscriptions the node holds \
-     on that peer, and the node's v9 subscriber state holds at most one live subscription per \
-     session, so no patch to one path makes the node send it";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1429,7 +1410,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
     };
     match generated.catch {
         GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 26, so the leak is
+            // Built once per case for a fixed set of 29, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
             expected.extend(caught(
@@ -1647,6 +1628,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "skipped-retirement",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-locator-round",
             STORAGE,
             &[RESET] as &'static [&'static str],
             Found::AtStep,
@@ -3335,9 +3322,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "stale-locator-round",
-        class: NativeClass::Duplicate {
+        class: NativeClass::Moved {
             property: RESET,
-            case: "awaiting-kept",
+            case: "stale-locator-round",
         },
     },
     NativeMutation {

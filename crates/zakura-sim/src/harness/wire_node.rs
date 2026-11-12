@@ -870,8 +870,10 @@ fn load(sample: &ConnectionSample) -> TransportFact {
                 kind: kind.kind,
                 raw_held: kind.raw_held,
                 raw_capacity: kind.raw_capacity,
+                raw_excess: kind.raw_excess,
                 output_held: kind.output_held,
                 output_capacity: kind.output_capacity,
+                output_excess: kind.output_excess,
             })
             .collect(),
     }

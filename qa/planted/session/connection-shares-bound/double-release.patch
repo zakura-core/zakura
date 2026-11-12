@@ -1,0 +1,35 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/slots.rs b/crates/zakura-network/src/zakura/regulation/slots.rs
+index eaaa177e66..c8b871e471 100644
+--- a/crates/zakura-network/src/zakura/regulation/slots.rs
++++ b/crates/zakura-network/src/zakura/regulation/slots.rs
+@@ -225,6 +225,12 @@ pub(crate) struct OutputGrant {
+ }
+ 
+ impl OutputGrant {
++    /// Return `bytes` to the budget while the grant keeps them.
++    pub(crate) fn release(&self, bytes: u32) {
++        // Widening u32 to usize is lossless on supported targets.
++        self.permit.semaphore().add_permits(bytes as usize);
++    }
++
+     /// Return every granted byte above `bytes`. A smaller grant stays as it is.
+     pub(crate) fn shrink_to(&mut self, bytes: u64) {
+         let keep = usize::try_from(bytes).unwrap_or(usize::MAX);
+diff --git a/crates/zakura-network/src/zakura/transport/lifetime.rs b/crates/zakura-network/src/zakura/transport/lifetime.rs
+index 9d847da912..8d0f9e80dd 100644
+--- a/crates/zakura-network/src/zakura/transport/lifetime.rs
++++ b/crates/zakura-network/src/zakura/transport/lifetime.rs
+@@ -714,6 +714,13 @@ impl FrameGrant {
+     }
+ }
+ 
++/// Returns the frame's charge, and then the grant's permit returns it again.
++impl Drop for FrameGrant {
++    fn drop(&mut self) {
++        self.granted.release(self.charge);
++    }
++}
++
+ /// The lifecycle phase of one handshake or stream owner.
+ #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+ pub(crate) enum OwnerPhase {

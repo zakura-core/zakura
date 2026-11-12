@@ -1,5 +1,12 @@
 # A stale locator read starts a round
 
+Retired as a duplicate of the planted case
+`qa/planted/header-sync/reset-invalidates-work/awaiting-kept`, which keeps
+every awaiting target past an adoption. On that case's held-locator input
+both first violate `header-sync/reset-invalidates-work` at step 207 with the
+same `ResetInvalidatesWork` finding, a slot still awaiting its locator under
+the old generation. The witness below is the retired mutation's own.
+
 `stale-locator-round.patch` drops the header-generation comparison from
 `AdvertisedHeaderTarget::is_current`. An adoption that changes the generation
 then no longer retires a target still awaiting its locator read, and the read,

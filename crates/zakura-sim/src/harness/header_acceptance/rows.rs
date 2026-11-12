@@ -3089,11 +3089,15 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "skipped-staging",
         },
     },
-    to_move(
-        "stale-locator-round",
-        "header-sync/reset-invalidates-work",
-        "hdr-9a.2",
-    ),
+    NativeMutation {
+        patch: "stale-locator-round",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case reset-invalidates-work/awaiting-kept, whose \
+                     adoption also keeps the awaiting target, and on the \
+                     header-reset-held-locator input first fails with the same \
+                     ResetInvalidatesWork at step 207",
+        },
+    },
     NativeMutation {
         patch: "stale-status-cache",
         class: NativeClass::Moved {

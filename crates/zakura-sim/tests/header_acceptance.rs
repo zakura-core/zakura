@@ -1856,10 +1856,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "skipped-staging",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
     ),
-    (
-        "stale-locator-round",
-        NativePin::Move("header-sync/reset-invalidates-work", "hdr-9a.2"),
-    ),
+    ("stale-locator-round", NativePin::Retired),
     (
         "stale-status-cache",
         NativePin::Move("header-sync/state-publication-consistent", "hdr-12b"),

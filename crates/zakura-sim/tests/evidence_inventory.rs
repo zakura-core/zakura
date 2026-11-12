@@ -293,6 +293,14 @@ const REGISTERED: &[Store] = &[
 /// The shared-state fields that aren't evidence, by file, struct and
 /// field, each with why.
 const ALLOWED: &[(&str, &str, &str, &str)] = &[
+    // The harness's prefix cutoff (#2355), a setting it fixes while it
+    // prepares the run.
+    (
+        "src/harness/header_node/recovery.rs",
+        "RecoveryEvidence",
+        "cutoff",
+        "where the harness ends a recovering scenario's prefix, set before the run, not a fact",
+    ),
     // The reactor tap's own state: what it hasn't delivered to the log yet,
     // and the checks whose facts go to registered stores.
     (

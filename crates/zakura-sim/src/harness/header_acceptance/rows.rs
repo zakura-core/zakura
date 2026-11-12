@@ -2022,6 +2022,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "secondary-reservation",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "spare-publisher",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
@@ -3015,7 +3021,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "reordered-payload",
         },
     },
-    to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
+    NativeMutation {
+        patch: "secondary-reservation",
+        class: NativeClass::Moved {
+            property: OUTSTANDING,
+            case: "secondary-reservation",
+        },
+    },
     NativeMutation {
         patch: "session-view",
         class: NativeClass::Moved {

@@ -1274,12 +1274,13 @@ pub fn contract_table() -> Vec<Contract> {
             "Evan",
             "The witness judge rejects any unrelated NotApplicable whose reason isn't benign, \
              except StoppedByViolation under the expected stop, or a missing report, and \
-             judges a nested case's exact set in both runs, each nested finding from the \
-             case's own break: the same peer and the same punished event or frame.",
+             judges a nested case's exact set in both runs, or on its Draft run for a set that \
+             breaks only after the case's own break, each nested finding from the case's own \
+             break: the same peer and the same punished event or frame.",
             "E2",
-            "a per-subject join, since E2 joins a nested finding to the case's break by step \
-             only, not by peer and punished event or frame, and a nested set judged on a \
-             Draft run's report",
+            "a per-subject join for findings at the break's step, which E2 still joins by step \
+             only, not by peer and punished event or frame. An end finding joins by its \
+             subject, and a set that breaks later is judged on the Draft run's report",
         ),
         satisfied(
             C7,

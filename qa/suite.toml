@@ -298,13 +298,13 @@ timeout-secs = 2700
 [[lane]]
 id = "sim-release/zakura-sim"
 build = "sim-release"
-args = "test --locked -p zakura-sim --release --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test replay_exact --test idle --test time"
+args = "test --locked -p zakura-sim --release --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test replay_exact --test idle --test time --test race_schedules"
 timeout-secs = 2700
 
 [[lane]]
 id = "sim-asan/zakura-sim"
 build = "sim-asan"
-args = "test --locked -p zakura-sim --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --lib --test draws --test race_fixtures --test discovery --test witness --test cli"
+args = "test --locked -p zakura-sim --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test race_schedules"
 timeout-secs = 2700
 
 # Fuzz targets. A `sim` target runs the one harness that

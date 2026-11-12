@@ -651,9 +651,10 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
 #[test]
 fn an_undeclared_fixture_opens_no_wake() {
     let scenario = WakeScenario::Release;
+    let prepared = ReleaseWake::prepare(&scenario);
     let ports = Ports {
-        wake: WakeEvidence::default(),
-        ..ReleaseWake::prepare(&scenario)
+        wake: WakeEvidence::new(&prepared.stores, None),
+        ..prepared
     };
     let wake = ports.wake.clone();
     let report = run_prepared::<ReleaseWake>(

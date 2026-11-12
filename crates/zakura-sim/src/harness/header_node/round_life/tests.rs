@@ -218,7 +218,7 @@ fn reset(generation: u64) -> StorageFact {
 /// A check on an engine at generation 1, fed `events` from the reactor,
 /// with `facts` from storage first, and the breaks its drain then finds.
 fn breaks(facts: &[StorageFact], events: &[ReactorEvent]) -> (Vec<String>, RoundLifeEvidence) {
-    let evidence = RoundLifeEvidence::default();
+    let evidence = RoundLifeEvidence::new(&EvidenceStores::default());
     let mut check = RoundLife::new(evidence.clone(), 1);
     check.storage(facts, 1);
     for event in std::iter::once(&open()).chain(events) {
@@ -371,7 +371,7 @@ fn a_start_off_its_locator_breaks() {
 /// A locator start whose read storage never reported is missing evidence.
 #[test]
 fn a_start_from_an_unreported_read_is_missing_evidence() {
-    let mut check = RoundLife::new(RoundLifeEvidence::default(), 1);
+    let mut check = RoundLife::new(RoundLifeEvidence::new(&EvidenceStores::default()), 1);
     for event in [
         adopted(1),
         locator(1, 1),
@@ -390,7 +390,7 @@ fn a_start_from_an_unreported_read_is_missing_evidence() {
 /// reports it ahead of the failure.
 #[test]
 fn a_break_survives_missing_evidence() {
-    let evidence = RoundLifeEvidence::default();
+    let evidence = RoundLifeEvidence::new(&EvidenceStores::default());
     let mut check = RoundLife::new(evidence.clone(), 1);
     check.storage(&[reset(1)], 1);
     for event in [
@@ -433,7 +433,7 @@ fn a_reset_must_advance_the_generation() {
 /// doesn't apply, and facts from another task are ignored.
 #[test]
 fn a_quiet_run_does_not_apply() {
-    let evidence = RoundLifeEvidence::default();
+    let evidence = RoundLifeEvidence::new(&EvidenceStores::default());
     let mut check = RoundLife::new(evidence.clone(), 1);
     check.observe(&adopted(1), true);
     check.observe(&started(1, 1), false);

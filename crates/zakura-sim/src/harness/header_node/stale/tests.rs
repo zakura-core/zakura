@@ -156,7 +156,7 @@ fn changed(owner: BudgetOwner, reserved_delta: i64, owned_delta: i64) -> Reactor
 
 /// A check fed `events` on the reactor's task, and its evidence.
 fn fed(events: impl IntoIterator<Item = ReactorEvent>) -> (StaleCheck, StaleEvidence) {
-    let evidence = StaleEvidence::default();
+    let evidence = StaleEvidence::new(&EvidenceStores::default());
     let mut check = StaleCheck::new(evidence.clone());
     for event in events {
         check.observe(&event, true);

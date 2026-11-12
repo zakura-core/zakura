@@ -869,7 +869,7 @@ mod tests {
     /// rather than header sync's.
     #[test]
     fn a_stuck_round_at_rest_violates_the_sync_teardown_rule() {
-        let rounds = SettlementEvidence::default();
+        let rounds = SettlementEvidence::new(&crate::stores::EvidenceStores::default());
         rounds.record(Settlement {
             step: 7,
             released: 2,

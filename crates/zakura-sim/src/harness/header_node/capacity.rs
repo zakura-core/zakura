@@ -37,11 +37,10 @@
 //!
 //! [`HeaderWorkLedger`]: zakura_network::zakura::observe::HeaderWorkLedger
 
-use std::sync::{Arc, Mutex, PoisonError};
-
 use zakura_network::zakura::observe::{HeaderResourceProbe, HeaderResources};
 
 use super::claim::Claim;
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// One probe read the tap checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,47 +91,57 @@ struct Store {
 
 /// One reactor's probe reads, shared by its tap and whoever reads them.
 /// Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct CapacityEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct CapacityEvidence(Registered<Store>);
+
+impl Snapshot for Store {
+    /// Every reading and boundary.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
 
 impl CapacityEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> CapacityEvidence {
+        CapacityEvidence(stores.register("capacity", Store::default()))
+    }
+
+    /// The handle that built the store, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
     /// Keeps `reading` unless it holds the last kept reading's values, and
     /// notes its boundary as read. Nothing else is called while the lock is
     /// held.
     pub(crate) fn record(&self, reading: CapacityReading) {
-        let mut store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        store.boundaries.push((reading.step, BoundaryRead::Read));
-        if store
-            .readings
-            .last()
-            .is_none_or(|last| !last.same_values(&reading))
-        {
-            store.readings.push(reading);
-        }
+        self.0.write(|store| {
+            store.boundaries.push((reading.step, BoundaryRead::Read));
+            if store
+                .readings
+                .last()
+                .is_none_or(|last| !last.same_values(&reading))
+            {
+                store.readings.push(reading);
+            }
+        });
     }
 
     /// Notes that the boundary after `step` went unread, as `read` says.
     pub(crate) fn unread(&self, step: u64, read: BoundaryRead) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .boundaries
-            .push((step, read));
+        self.0.write(|store| store.boundaries.push((step, read)));
     }
 
     /// Every reading kept so far, in order.
     pub fn readings(&self) -> Vec<CapacityReading> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .readings
-            .clone()
+        self.0.read(|store| store.readings.clone())
     }
 
     /// How the read at the boundary after `step` went, or `None` if the tap
     /// didn't try one there.
     pub fn boundary(&self, step: u64) -> Option<BoundaryRead> {
-        let store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = self.0.lock();
         store
             .boundaries
             .iter()
@@ -143,7 +152,7 @@ impl CapacityEvidence {
 
     /// The reading kept at the boundary after `step`, if one was.
     pub fn reading_at(&self, step: u64) -> Option<CapacityReading> {
-        let store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = self.0.lock();
         store
             .readings
             .iter()

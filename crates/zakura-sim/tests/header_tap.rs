@@ -12,6 +12,7 @@ use support::{config, inputs, run};
 use zakura_network::zakura::observe::{HeaderSyncObserver, ReactorEvent};
 use zakura_node_services::header_chain::Port;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -862,7 +863,7 @@ fn node_run(input: PlanInput, tapped: bool) -> RunReport {
         input,
         |sim| {
             let dispatch = DispatchFlag::default();
-            let effects = Effects::default();
+            let effects = Effects::new(&EvidenceStores::default());
             let storage =
                 PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
             let (observer, storage) = if tapped {

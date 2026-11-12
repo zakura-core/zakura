@@ -10,10 +10,9 @@
 //! nothing reported by the next drain, or by the run's end, fails the run,
 //! so a harness without the owning property still fails on it.
 
-use std::sync::{Arc, Mutex, PoisonError};
-
 use zakura_network::zakura::observe::ClaimRule;
 
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 use crate::RunEnd;
 
 /// A claim rule the tap checks.
@@ -168,22 +167,45 @@ struct SettlementStore {
     at_rest: bool,
 }
 
+impl Snapshot for SettlementStore {
+    /// Every settlement and whether it was read, and the run's end.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// One reactor's settlement at each drain, each with whether a property
 /// read it, and how the run ended, shared by its tap and whoever reads
 /// them. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct SettlementEvidence(Arc<Mutex<SettlementStore>>);
+#[derive(Clone, Debug)]
+pub struct SettlementEvidence(Registered<SettlementStore>);
 
 impl SettlementEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> SettlementEvidence {
+        SettlementEvidence(stores.register("rounds", SettlementStore::default()))
+    }
+
+    /// The handle that built the store, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
     /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
-    fn with<R>(&self, read: impl FnOnce(&mut SettlementStore) -> R) -> R {
-        read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    fn with<R>(&self, read: impl FnOnce(&SettlementStore) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut SettlementStore) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Keeps `rounds`, unread.
     pub(crate) fn record(&self, rounds: Settlement) {
-        self.with(|store| store.rows.push((rounds, false)));
+        self.change(|store| store.rows.push((rounds, false)));
     }
 
     /// Notes how the run ended: at rest when it ran dry at rest
@@ -191,14 +213,15 @@ impl SettlementEvidence {
     /// drain cut off at its bound included, or a worker-starved dry end.
     pub(crate) fn end(&self, end: &RunEnd) {
         let at_rest = end.at_rest();
-        self.with(|store| store.at_rest = at_rest);
+        self.change(|store| store.at_rest = at_rest);
     }
 
     /// The settlement the drain of `step` read, if it did, which this marks
     /// read. Only the property that reports it reads it this way.
     pub fn at(&self, step: u64) -> Option<Settlement> {
-        self.with(|store| {
-            store
+        let mut store = self.0.lock();
+        if let Some(live) = store.live() {
+            return live
                 .rows
                 .iter_mut()
                 .rev()
@@ -206,8 +229,14 @@ impl SettlementEvidence {
                 .map(|(row, read)| {
                     *read = true;
                     *row
-                })
-        })
+                });
+        }
+        store
+            .rows
+            .iter()
+            .rev()
+            .find(|(row, _)| row.step == step)
+            .map(|(row, _)| *row)
     }
 
     /// Every drain's settlement so far, in order.
@@ -253,32 +282,67 @@ pub struct ClaimRecord {
 
 /// One reactor's claim breaks, each with whether a property has read it,
 /// shared by its tap and whoever reads them. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct ClaimEvidence(Arc<Mutex<Vec<(ClaimRecord, bool)>>>);
+#[derive(Clone, Debug)]
+pub struct ClaimEvidence(Registered<Claims>);
+
+/// What [`ClaimEvidence`] holds: each break, in order, with whether a
+/// property reported it.
+#[derive(Debug, Default)]
+pub(crate) struct Claims(Vec<(ClaimRecord, bool)>);
+
+impl Snapshot for Claims {
+    /// Each break's fields, in order, with whether it was reported.
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::Value::from(
+            self.0
+                .iter()
+                .map(|(record, reported)| {
+                    serde_json::json!({
+                        "step": record.step,
+                        "claim": format!("{:?}", record.claim),
+                        "detail": record.detail,
+                        "reported": reported,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+}
 
 impl ClaimEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> ClaimEvidence {
+        ClaimEvidence(stores.register("claims", Claims::default()))
+    }
+
     /// Keeps `record`, unreported. Nothing else is called while the lock is
     /// held.
     pub(crate) fn record(&self, record: ClaimRecord) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((record, false));
+        self.0.write(|claims| claims.0.push((record, false)));
     }
 
     /// The breaks of `claims` that step `step`'s drain found, in order, which
-    /// this marks reported. Only the property that reports them reads them
-    /// this way.
+    /// this marks reported, unless the store is frozen. Only the property
+    /// that reports them reads them this way.
     pub fn at(&self, step: u64, claims: &[Claim]) -> Vec<ClaimRecord> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter_mut()
-            .filter(|(record, _)| record.step == step && claims.contains(&record.claim))
-            .map(|(record, reported)| {
-                *reported = true;
-                record.clone()
-            })
+        let found = |record: &ClaimRecord| record.step == step && claims.contains(&record.claim);
+        let mut store = self.0.lock();
+        if let Some(live) = store.live() {
+            return live
+                .0
+                .iter_mut()
+                .filter(|(record, _)| found(record))
+                .map(|(record, reported)| {
+                    *reported = true;
+                    record.clone()
+                })
+                .collect();
+        }
+        store
+            .0
+            .iter()
+            .filter(|(record, _)| found(record))
+            .map(|(record, _)| record.clone())
             .collect()
     }
 
@@ -287,7 +351,7 @@ impl ClaimEvidence {
     pub(super) fn unreported(&self, before: Option<u64>) -> Option<ClaimRecord> {
         self.0
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .0
             .iter()
             .find(|(record, reported)| !reported && before.is_none_or(|step| record.step < step))
             .map(|(record, _)| record.clone())
@@ -297,7 +361,7 @@ impl ClaimEvidence {
     pub(super) fn found_at(&self, step: u64) -> bool {
         self.0
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .0
             .iter()
             .any(|(record, _)| record.step == step)
     }
@@ -306,7 +370,7 @@ impl ClaimEvidence {
     pub fn records(&self) -> Vec<ClaimRecord> {
         self.0
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .0
             .iter()
             .map(|(record, _)| record.clone())
             .collect()

@@ -15,7 +15,7 @@ use crate::harness::header_node::ready;
 fn seeded() -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::default();
+    let evidence = PublicationEvidence::new(&EvidenceStores::default());
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }
@@ -270,7 +270,7 @@ fn status_queued(snapshot: &EngineSnapshot) -> ReactorEvent {
 fn armed(arming: Arming) -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::armed(arming);
+    let evidence = PublicationEvidence::armed(&EvidenceStores::default(), arming);
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }

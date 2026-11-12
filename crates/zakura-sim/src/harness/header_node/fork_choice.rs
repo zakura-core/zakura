@@ -57,10 +57,7 @@
 //! [`Claim::ExpectedChainSelected`](super::claim::Claim) at its drain. A
 //! reset run with no `Reset` fact is missing evidence, which fails the run.
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{block, work::difficulty::U256};
@@ -70,6 +67,7 @@ use zakura_storage::header::{
     fixture::HeaderFixture,
 };
 
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 use crate::{observe::StorageFact, storage::hash};
 
 /// What [`ForkChoiceEvidence`] keeps.
@@ -90,16 +88,34 @@ struct Store {
     settled_points: u64,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// When the fork-choice check first applied, shared by the tap and whoever
 /// reads it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct ForkChoiceEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct ForkChoiceEvidence(Registered<Store>);
 
 impl ForkChoiceEvidence {
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> ForkChoiceEvidence {
+        ForkChoiceEvidence(stores.register("fork_choice", Store::default()))
+    }
+
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -250,7 +266,7 @@ impl ForkChoice {
             (Some(settled), false) if step > 0 => settled.judge(self.selected, outside),
             _ => None,
         };
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             store.settled = verdict.map(|verdict| (step, verdict));
             if store.settled.is_some() {
                 store.settled_points = store.settled_points.saturating_add(1);
@@ -274,7 +290,7 @@ impl ForkChoice {
     pub(super) fn run(&mut self, run: &EngineRun, corrupt: bool) {
         if corrupt && !self.tainted {
             self.tainted = true;
-            self.evidence.with(|store| store.taint_pending = true);
+            self.evidence.change(|store| store.taint_pending = true);
         }
         let what = match &run.kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),
@@ -314,7 +330,7 @@ impl ForkChoice {
         }
         // Marked even with evidence missing, so a break the tap takes ahead
         // of that failure keeps its trigger history.
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -354,7 +370,7 @@ impl ForkChoice {
         let Some(placed) = self.place(state, clock) else {
             return;
         };
-        self.evidence.with(|store| store.pending = true);
+        self.evidence.change(|store| store.pending = true);
         let best = placed
             .values()
             .filter(|at| at.eligible)

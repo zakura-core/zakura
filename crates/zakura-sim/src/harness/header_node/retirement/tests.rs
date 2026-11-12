@@ -199,11 +199,11 @@ fn no_slots() -> ReactorEvent {
 /// The breaks `events` give, fed in order from the reactor, none inside a
 /// stale handler, and the evidence.
 fn breaks(events: &[ReactorEvent]) -> (Vec<String>, RetirementEvidence) {
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in events {
@@ -247,11 +247,11 @@ fn departed_session_work_breaks() {
 /// `header-sync/stale-completion-inert`'s, so it breaks nothing here.
 #[test]
 fn work_in_a_stale_handler_is_not_judged() {
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence,
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in [admitted(1, None), left(1)] {
@@ -424,11 +424,11 @@ fn a_kept_repair_slot_is_excused_until_its_calls_are_handled() {
 /// Facts from another task than the reactor's are ignored.
 #[test]
 fn facts_off_the_reactor_are_ignored() {
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in [admitted(1, None), left(1), started(ordinary(1))] {
@@ -502,11 +502,17 @@ fn admitted_on(peer: ZakuraPeerId, session_id: u64, connection: u64) -> ReactorE
 /// the owner linked on connection 1, the taker on 2 and relinked on 3. Its
 /// session and end evidence come back too.
 fn armed() -> (Retirement, RetirementEvidence, EndEvidence) {
-    let evidence = RetirementEvidence::armed(Roles {
-        owner: "mirror-0".to_owned(),
-        taker: "mirror-1".to_owned(),
-    });
-    let (sessions, ends) = (SessionEvidence::default(), EndEvidence::default());
+    let evidence = RetirementEvidence::armed(
+        &EvidenceStores::default(),
+        Roles {
+            owner: "mirror-0".to_owned(),
+            taker: "mirror-1".to_owned(),
+        },
+    );
+    let (sessions, ends) = (
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
+    );
     for (peer, name, connection) in [
         (mirror(), "mirror-0", 1),
         (other(), "mirror-1", 2),
@@ -755,11 +761,11 @@ fn only_the_owners_arms_once_ready_record() {
 /// evidence unjudged, until the next boundary.
 #[test]
 fn a_departure_is_unjudged_until_the_next_boundary() {
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in [
@@ -810,7 +816,7 @@ fn a_departed_sessions_read_counts_for_nothing() {
     let seq = published.clone();
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
         ends,
         Box::new(move || seq.load(std::sync::atomic::Ordering::SeqCst)),
     );
@@ -933,11 +939,11 @@ fn run_end(outcome: crate::Outcome, drain: Option<bool>) -> crate::RunEnd {
 #[test]
 fn a_settled_run_judges_an_unfinished_departure() {
     let left_with_slot = |end| {
-        let evidence = RetirementEvidence::default();
+        let evidence = RetirementEvidence::new(&EvidenceStores::default());
         let mut check = Retirement::new(
             evidence.clone(),
-            SessionEvidence::default(),
-            EndEvidence::default(),
+            SessionEvidence::new(&EvidenceStores::default()),
+            EndEvidence::new(&EvidenceStores::default()),
             no_port(),
         );
         for event in [
@@ -972,11 +978,11 @@ fn a_settled_run_judges_an_unfinished_departure() {
 #[test]
 fn an_expired_excuse_is_judged_at_a_settled_end() {
     let owner = repair(1);
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in [
@@ -1011,11 +1017,11 @@ fn an_expired_excuse_is_judged_at_a_settled_end() {
 #[test]
 fn a_kept_repair_is_excused_at_a_settled_end() {
     let owner = repair(1);
-    let evidence = RetirementEvidence::default();
+    let evidence = RetirementEvidence::new(&EvidenceStores::default());
     let mut check = Retirement::new(
         evidence.clone(),
-        SessionEvidence::default(),
-        EndEvidence::default(),
+        SessionEvidence::new(&EvidenceStores::default()),
+        EndEvidence::new(&EvidenceStores::default()),
         no_port(),
     );
     for event in [

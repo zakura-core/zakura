@@ -55,10 +55,7 @@
 //! locator `Started` whose read storage never reported is missing evidence,
 //! which fails the run.
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use zakura_chain::block;
 use zakura_network::zakura::{
@@ -68,6 +65,7 @@ use zakura_network::zakura::{
 
 use zakura_storage::header::controlled::{EngineRun, RunKind};
 
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 use crate::{
     observe::{StorageFact, StorageResult},
     storage::{hash, point},
@@ -136,16 +134,34 @@ struct Store {
     pending: bool,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// When the reset check first applied, shared by the tap and whoever reads
 /// it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct RoundLifeEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct RoundLifeEvidence(Registered<Store>);
 
 impl RoundLifeEvidence {
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> RoundLifeEvidence {
+        RoundLifeEvidence(stores.register("round_life", Store::default()))
+    }
+
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -483,7 +499,7 @@ impl RoundLife {
     pub(super) fn drain(&mut self, step: u64) -> Result<Vec<String>, String> {
         // Marked even with evidence missing, so a break the tap takes ahead
         // of that failure keeps its trigger history.
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -508,7 +524,7 @@ impl RoundLife {
 
     /// Notes that a fact made the check applicable.
     fn applies(&self) {
-        self.evidence.with(|store| store.pending = true);
+        self.evidence.change(|store| store.pending = true);
     }
 
     /// Whether a slot holds a current-started round.

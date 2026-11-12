@@ -62,11 +62,7 @@
 //! `NotApplicable` from that drain on, as `expected-chain-selected` does
 //! ([`super::fork_choice`]).
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
@@ -81,7 +77,10 @@ use super::{
     adoption::{Adoption, STATUS_CHANGE_BOUND},
     stamp::Stamps,
 };
-use crate::observe::StorageFact;
+use crate::{
+    observe::StorageFact,
+    stores::{debug_snapshot, sorted_snapshot, EvidenceStores, Registered, Snapshot},
+};
 
 /// How long a session in a status fixture may be owed its `Status`: the
 /// publisher's change bound ([`STATUS_CHANGE_BOUND`], its
@@ -160,8 +159,6 @@ struct Store {
     stamps: Stamps,
     /// Each stamped fact, in stamp order.
     facts: Vec<(u64, PublicationFact)>,
-    /// Set when the run's log froze. Facts after it are dropped.
-    frozen: bool,
     /// Each node's peer ID and harness name, which the harness's
     /// environment facts name it by.
     names: Vec<(ZakuraPeerId, String)>,
@@ -170,6 +167,42 @@ struct Store {
     /// Each subscription's `Open`, as its subscriber built it, by
     /// subscriber, session and subscription ([`SubscriberOpens`]).
     opens: HashMap<served::SubscriptionKey, served::Opened>,
+}
+
+impl Snapshot for Store {
+    /// Everything it holds, with each subscription's `Open` sorted.
+    fn snapshot(&self) -> serde_json::Value {
+        let Store {
+            applicable,
+            pending,
+            tainted,
+            taint_pending,
+            owed,
+            settled,
+            arming,
+            stamps,
+            facts,
+            names,
+            pages,
+            opens,
+        } = self;
+        serde_json::json!({
+            "fields": debug_snapshot(&(
+                applicable,
+                pending,
+                tainted,
+                taint_pending,
+                owed,
+                settled,
+                arming,
+                stamps,
+                facts,
+                names,
+                pages,
+            )),
+            "opens": sorted_snapshot(opens),
+        })
+    }
 }
 
 /// A page the served-page rule judged: what a witness reads of it.
@@ -191,17 +224,27 @@ pub struct ServedPage {
 
 /// When the publication check first applied, and the tip it still owes,
 /// shared by the tap and whoever reads it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct PublicationEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct PublicationEvidence(Registered<Store>);
 
 impl PublicationEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> PublicationEvidence {
+        PublicationEvidence(stores.register("publication", Store::default()))
+    }
+
     /// Evidence that also keeps the stamped facts `arming` asks for. The
     /// default keeps none.
-    pub fn armed(arming: Arming) -> PublicationEvidence {
-        PublicationEvidence(Arc::new(Mutex::new(Store {
-            arming,
-            ..Store::default()
-        })))
+    pub fn armed(stores: &EvidenceStores, arming: Arming) -> PublicationEvidence {
+        let evidence = PublicationEvidence::new(stores);
+        evidence.arm(arming);
+        evidence
+    }
+
+    /// Keeps the stamped facts `arming` asks for from now on, as
+    /// [`PublicationEvidence::armed`] does, on prepared ports.
+    pub fn arm(&self, arming: Arming) {
+        self.change(|store| store.arming = arming);
     }
 
     /// What the evidence keeps stamped facts for.
@@ -211,24 +254,18 @@ impl PublicationEvidence {
 
     /// Stamps facts from `stamps`, the node's, from now on.
     pub(super) fn stamp_with(&self, stamps: Stamps) {
-        self.with(|store| store.stamps = stamps);
-    }
-
-    /// Stops keeping facts. The harness calls it when the run's log
-    /// freezes, as [`super::adoption::AdoptionEvidence`] does.
-    pub fn freeze(&self) {
-        self.with(|store| store.frozen = true);
+        self.change(|store| store.stamps = stamps);
     }
 
     /// Keeps `fact` with the next stamp, if the evidence is armed, `status`
     /// facts only in a status fixture, and the log hasn't frozen.
     fn keep(&self, fact: PublicationFact) {
-        self.with(|store| {
+        self.change(|store| {
             let status = matches!(
                 fact,
                 PublicationFact::StatusOwed { .. } | PublicationFact::StatusPaid { .. }
             );
-            if store.arming.armed && (store.arming.status || !status) && !store.frozen {
+            if store.arming.armed && (store.arming.status || !status) {
                 let stamp = store.stamps.next();
                 store.facts.push((stamp, fact));
             }
@@ -269,7 +306,7 @@ impl PublicationEvidence {
     /// Notes each node's peer ID and harness name, so a debt's peer can be
     /// matched with the harness's environment facts, which name peers.
     pub fn name_peers(&self, names: Vec<(ZakuraPeerId, String)>) {
-        self.with(|store| store.names = names);
+        self.change(|store| store.names = names);
     }
 
     /// The harness name of the node with peer ID `peer`, if the harness
@@ -318,10 +355,16 @@ impl PublicationEvidence {
         })
     }
 
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -350,7 +393,7 @@ impl PublicationEvidence {
     /// Notes how the run ended: whether it settled, with no task left
     /// partway through a synchronous call ([`super::adoption::settled`]).
     pub fn end(&self, settled: bool) {
-        self.with(|store| store.settled = Some(settled));
+        self.change(|store| store.settled = Some(settled));
     }
 
     /// The adopted tip a settled run ended still owing on the tip watch, if
@@ -396,7 +439,7 @@ impl HeaderSyncObserver for SubscriberOpens {
                 locators: update.locator_hashes,
             };
             self.evidence
-                .with(|store| store.opens.insert(subscription, opened));
+                .change(|store| store.opens.insert(subscription, opened));
         }
     }
 
@@ -460,7 +503,7 @@ impl Publication {
         if corrupt && !self.tainted {
             self.tainted = true;
             self.committed.clear();
-            self.evidence.with(|store| store.taint_pending = true);
+            self.evidence.change(|store| store.taint_pending = true);
             self.evidence.keep(PublicationFact::Tainted);
         }
         if self.tainted {
@@ -553,7 +596,7 @@ impl Publication {
                     reaches_target: *reaches_target,
                     state_version: self.newest,
                 };
-                self.evidence.with(|store| store.pages.push(page));
+                self.evidence.change(|store| store.pages.push(page));
             }
             self.applies();
             self.breaks.extend(breaks);
@@ -621,7 +664,7 @@ impl Publication {
                         adopted.header_best
                     ));
                 }
-                self.evidence.with(|store| store.owed = None);
+                self.evidence.change(|store| store.owed = None);
             }
             _ => {}
         }
@@ -691,7 +734,7 @@ impl Publication {
             .is_none_or(|adopted| adopted.header_best != adoption.header_best);
         if changed {
             self.evidence
-                .with(|store| store.owed = Some(adoption.header_best));
+                .change(|store| store.owed = Some(adoption.header_best));
         }
         self.evidence.keep(PublicationFact::Adopted {
             state_version: version,
@@ -798,7 +841,7 @@ impl Publication {
         if step == 0 {
             return Vec::new();
         }
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -811,7 +854,7 @@ impl Publication {
 
     /// Notes that a fact made the check applicable.
     fn applies(&self) {
-        self.evidence.with(|store| store.pending = true);
+        self.evidence.change(|store| store.pending = true);
     }
 }
 

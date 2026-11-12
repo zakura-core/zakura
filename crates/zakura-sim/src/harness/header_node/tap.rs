@@ -125,6 +125,7 @@ use super::{
     stamp::Stamps,
     wake::{WakeCheck, WakeEvidence},
 };
+use crate::stores::EvidenceStores;
 use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
@@ -1156,7 +1157,8 @@ impl ReactorTap {
         port: &Arc<ControlledPort>,
         node: &str,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::with_sessions(sim, port, node, SessionEvidence::default())
+        let stores = EvidenceStores::default();
+        ReactorTap::with_sessions(sim, port, node, SessionEvidence::new(&stores))
     }
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
@@ -1192,8 +1194,9 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
-    /// `sessions`, which this tap's run binds and freezes with its log. Its
-    /// adoption evidence freezes with the log too.
+    /// `sessions`, which this tap's run binds, and every other store the tap
+    /// keeps built in its node's stores, `sessions`', which it attaches to
+    /// the run so they freeze with its log.
     ///
     /// # Panics
     ///
@@ -1204,22 +1207,29 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
+        let stores = sessions.stores().clone();
         ReactorTap::tapped(
             sim,
             port,
             node,
             sessions,
-            ReservationEvidence::default(),
+            ReservationEvidence::new(&stores),
             (
                 None,
-                SettlementEvidence::default(),
-                StaleEvidence::default(),
-                EndEvidence::default(),
+                SettlementEvidence::new(&stores),
+                StaleEvidence::new(&stores),
+                EndEvidence::new(&stores),
             ),
         )
     }
 
-    /// The tap [`ReactorTap::with_evidence`] makes.
+    /// The tap [`ReactorTap::with_evidence`] makes, which attaches its
+    /// node's stores, `ends`', to the run, so every store in them freezes
+    /// with its log.
+    ///
+    /// # Panics
+    ///
+    /// Outside a run, or if a store it's handed isn't in `ends`' stores.
     fn tapped(
         sim: &mut Sim,
         port: &Arc<ControlledPort>,
@@ -1234,26 +1244,31 @@ impl ReactorTap {
         ),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
+        let stores = ends.stores().clone();
+        for (store, handle) in [
+            ("sessions", sessions.stores()),
+            ("reservations", reservations.stores()),
+            ("rounds", rounds.stores()),
+            ("stale calls", stale_calls.stores()),
+        ]
+        .into_iter()
+        .chain(
+            capacity
+                .as_ref()
+                .map(|capacity| ("capacity", capacity.stores())),
+        ) {
+            assert!(
+                handle.same(&stores),
+                "a tap's {store} store is in its node's stores, the end facts'"
+            );
+        }
+        stores.attach(sim);
         sessions.bind(run);
-        sim.on_frozen({
-            let sessions = sessions.clone();
-            move || sessions.freeze()
-        });
         let stamps = ends.stamps();
-        sim.on_frozen({
-            let ends = ends.clone();
-            move || ends.freeze()
-        });
-        let adoption = AdoptionEvidence::stamped_by(stamps.clone());
-        sim.on_frozen({
-            let adoption = adoption.clone();
-            move || adoption.freeze()
-        });
-        let cooldowns = CooldownEvidence::default();
-        sim.on_frozen({
-            let cooldowns = cooldowns.clone();
-            move || cooldowns.freeze()
-        });
+        let adoption = AdoptionEvidence::stamped_by(&stores, stamps.clone());
+        let cooldowns = CooldownEvidence::new(&stores);
+        let claims = ClaimEvidence::new(&stores);
+        let wake_evidence = WakeEvidence::new(&stores, None);
         let wake_sessions = sessions.clone();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
@@ -1276,13 +1291,13 @@ impl ReactorTap {
                 capacity,
                 off_reactor: Mutex::default(),
                 cooldowns,
-                claims: ClaimEvidence::default(),
+                claims,
                 deferred: Arc::default(),
                 settled: AtomicBool::new(false),
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
-                wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
+                wake: Mutex::new(WakeCheck::new(wake_evidence, wake_sessions)),
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
                 outstanding: Mutex::default(),

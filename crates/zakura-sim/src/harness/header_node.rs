@@ -46,7 +46,7 @@ use std::{
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -92,6 +92,7 @@ use crate::{
     observe::StorageFact,
     sim::Generators,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
@@ -278,7 +279,7 @@ impl Policy {
 /// [`Trigger::Closed`], [`Trigger::Grown`], [`Trigger::Reset`] and
 /// [`Trigger::Released`], and the names it counts tapped reactor facts
 /// under.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Effects {
     /// Each node's peer identity and name, which [`Topology::new`] fills,
     /// so [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`]
@@ -303,8 +304,43 @@ pub struct Effects {
     /// When the node under test's header-sync session on each link ended,
     /// since the run's start, by connection ID. Each link's cancellation
     /// hooks record it, inside the `cancel` that ends the session, so no
-    /// harness read touches a token.
-    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+    /// harness read touches a token. It's evidence, kept in the node's
+    /// stores, so the scheduler's shutdown, which cancels every link, adds
+    /// nothing.
+    pub ended: Registered<SessionEnds>,
+}
+
+/// What [`Effects::ended`] holds: when each link's session ended, by
+/// connection ID.
+#[derive(Debug, Default)]
+pub struct SessionEnds(BTreeMap<u64, Duration>);
+
+impl Snapshot for SessionEnds {
+    /// Every end, by connection.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(&self.0)
+    }
+}
+
+impl Effects {
+    /// No effects yet, with the session ends kept in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> Effects {
+        Effects {
+            names: Rc::default(),
+            links: Rc::default(),
+            grown: Rc::default(),
+            reset: Rc::default(),
+            released: Rc::default(),
+            owned: Rc::default(),
+            failure: Rc::default(),
+            ended: stores.register("session_ends", SessionEnds::default()),
+        }
+    }
+
+    /// The node's stores, which keep its session ends.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.ended.stores()
+    }
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -344,8 +380,9 @@ impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
     /// `sim`. Its predicates count `effects` too.
     pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
+        let stores = effects.stores().clone();
         PolicySource {
-            storage: HeaderStorage::new(sim, port.clone()),
+            storage: HeaderStorage::in_stores(sim, port.clone(), &stores),
             tap: None,
             hold_wake: None,
             port,
@@ -360,7 +397,7 @@ impl PolicySource {
             grown: 0,
             reset: 0,
             released: 0,
-            recovery: RecoveryEvidence::default(),
+            recovery: RecoveryEvidence::new(&stores),
             drained: false,
         }
     }
@@ -1329,11 +1366,9 @@ impl Topology {
                 let Some(now) = zakura_scheduler::hooks::now() else {
                     return;
                 };
-                ended
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .entry(id)
-                    .or_insert(now.since_start());
+                ended.write(|ended| {
+                    ended.0.entry(id).or_insert(now.since_start());
+                });
             });
         };
         for token in &tokens {
@@ -1469,11 +1504,7 @@ impl Topology {
     /// admitted.
     pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let ended = self
-            .effects
-            .ended
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let ended = self.effects.ended.read(|ended| ended.0.clone());
         links
             .iter()
             .enumerate()

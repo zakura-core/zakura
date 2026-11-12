@@ -96,6 +96,7 @@ use crate::{
         Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
+    stores::EvidenceStores,
     table::{sender_properties, table_properties},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RunConfig, RunEnd, Sim,
 };
@@ -681,6 +682,9 @@ pub struct Ports {
     pub preloaded_at: chrono::DateTime<chrono::Utc>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
+    /// The node's evidence stores, which build every store below and
+    /// freeze with the run's log.
+    pub stores: EvidenceStores,
     /// The node's session view, which its tap and links fill during the run.
     pub sessions: SessionEvidence,
     /// The node's header capacity accounting, which its tap fills during the
@@ -737,6 +741,46 @@ pub struct Ports {
     /// concludes ([`RecoveryFinish`]). Set for a scenario with a `Recover`
     /// step. A harness with its own finish clears it.
     pub finishes: bool,
+}
+
+impl Ports {
+    /// Ports for `node` and `mirrors` from `fixture`, with `recovery`, and
+    /// every other store empty and inert, built in `stores`, the node's,
+    /// `recovery`'s too, no delayed page, and no recovery finish.
+    pub fn new(
+        fixture: HeaderFixture,
+        node: Arc<ControlledPort>,
+        preloaded_at: chrono::DateTime<chrono::Utc>,
+        mirrors: Vec<Arc<EnginePort>>,
+        stores: EvidenceStores,
+        recovery: RecoveryEvidence,
+    ) -> Ports {
+        Ports {
+            fixture,
+            node,
+            preloaded_at,
+            mirrors,
+            sessions: SessionEvidence::new(&stores),
+            reservations: ReservationEvidence::new(&stores),
+            capacity: CapacityEvidence::new(&stores),
+            rounds: SettlementEvidence::new(&stores),
+            stale_calls: StaleEvidence::new(&stores),
+            wake: WakeEvidence::new(&stores, None),
+            hold_wake: HoldWakeEvidence::new(&stores),
+            ends: EndEvidence::new(&stores),
+            round_life: RoundLifeEvidence::new(&stores),
+            retirement: RetirementEvidence::new(&stores),
+            chain_effect: ChainEffectEvidence::new(&stores),
+            authority: AuthorityEvidence::new(&stores),
+            outstanding: OutstandingEvidence::new(&stores),
+            recovery,
+            delayed_page: None,
+            fork_choice: ForkChoiceEvidence::new(&stores),
+            publication: PublicationEvidence::new(&stores),
+            finishes: false,
+            stores,
+        }
+    }
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -1197,42 +1241,25 @@ impl Subsystem for Storage {
                 port
             })
             .collect();
-        Ports {
-            fixture,
-            node,
-            preloaded_at,
-            mirrors,
-            sessions: SessionEvidence::default(),
-            reservations: ReservationEvidence::default(),
-            capacity: CapacityEvidence::default(),
-            rounds: SettlementEvidence::default(),
-            stale_calls: StaleEvidence::default(),
-            wake: WakeEvidence::default(),
-            hold_wake: HoldWakeEvidence::default(),
-            ends: EndEvidence::default(),
-            round_life: RoundLifeEvidence::default(),
-            retirement: RetirementEvidence::default(),
-            chain_effect: ChainEffectEvidence::default(),
-            authority: AuthorityEvidence::default(),
-            outstanding: OutstandingEvidence::default(),
-            recovery: if recovery_source(scenario).is_some() {
-                RecoveryEvidence::bounded(&scenario.policy.disruptions)
-            } else {
-                RecoveryEvidence::default()
-            },
-            delayed_page: None,
-            fork_choice: ForkChoiceEvidence::default(),
-            // A flood or churn scenario's adoption is the watch-flood
-            // properties' to judge, so it keeps no adoption facts there.
-            publication: PublicationEvidence::armed(Arming {
-                armed: !scenario
-                    .controls
-                    .iter()
-                    .any(|step| matches!(step.action, ControlAction::Flood | ControlAction::Churn)),
-                status: false,
-            }),
+        let stores = EvidenceStores::default();
+        let recovery = match recovery_source(scenario) {
+            Some(_) => RecoveryEvidence::bounded(&stores, &scenario.policy.disruptions),
+            None => RecoveryEvidence::new(&stores),
+        };
+        let ports = Ports {
             finishes: recovery_source(scenario).is_some(),
-        }
+            ..Ports::new(fixture, node, preloaded_at, mirrors, stores, recovery)
+        };
+        // A flood or churn scenario's adoption is the watch-flood
+        // properties' to judge, so it keeps no adoption facts there.
+        ports.publication.arm(Arming {
+            armed: !scenario
+                .controls
+                .iter()
+                .any(|step| matches!(step.action, ControlAction::Flood | ControlAction::Churn)),
+            status: false,
+        });
+        ports
     }
 
     /// Spawns the node on its controlled port under the scenario's policy,
@@ -1242,7 +1269,7 @@ impl Subsystem for Storage {
     /// and the links keep the node's session view in [`Ports::sessions`].
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
-        let effects = Effects::default();
+        let effects = Effects::new(&ports.stores);
         let recovery = ports.recovery.clone();
         let storage = PolicySource::new(
             sim,
@@ -1295,10 +1322,6 @@ impl Subsystem for Storage {
             fork_fixture(scenario),
         );
         tap.watch_publication(ports.publication.clone());
-        sim.on_frozen({
-            let publication = ports.publication.clone();
-            move || publication.freeze()
-        });
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1563,6 +1586,9 @@ pub struct WirePorts {
     /// The node's adoption facts, which its tap fills during the run, once
     /// the run builds it.
     pub adoption: Rc<RefCell<Option<AdoptionEvidence>>>,
+    /// The node's evidence stores, which build every store here and freeze
+    /// with the run's log.
+    pub stores: EvidenceStores,
     /// The node's session view, which its reactor and transport taps fill
     /// during the run, joined to own-9's facts. One prepared `WirePorts`
     /// serves one run.
@@ -1662,9 +1688,22 @@ pub struct HeaderWire {
     sessions: SessionEvidence,
     /// The peers that closed their own connection.
     closed: PeerCloses,
+    /// The stores of the checks the wire harness doesn't run, which its
+    /// view shows empty: outstanding work, recovery, fork choice and
+    /// publication.
+    inert: Inert,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
+}
+
+/// The stores [`HeaderWire`]'s view shows empty, built once in the node's
+/// stores, so its view copies no new store at each call.
+struct Inert {
+    outstanding: OutstandingEvidence,
+    recovery: RecoveryEvidence,
+    fork_choice: ForkChoiceEvidence,
+    publication: PublicationEvidence,
 }
 
 impl HasView for HeaderWire {
@@ -1693,12 +1732,12 @@ impl HasView for HeaderWire {
             retirement: self.retirement.clone(),
             chain_effect: self.chain_effect.clone(),
             authority: self.authority.clone(),
-            // The wire harness doesn't register outstanding-work-bounded.
-            outstanding: OutstandingEvidence::default(),
-            recovery: RecoveryEvidence::default(),
-            // The wire harness doesn't judge fork choice or publication.
-            fork_choice: ForkChoiceEvidence::default(),
-            publication: PublicationEvidence::default(),
+            // The wire harness doesn't register outstanding-work-bounded,
+            // recover, or judge fork choice or publication.
+            outstanding: self.inert.outstanding.clone(),
+            recovery: self.inert.recovery.clone(),
+            fork_choice: self.inert.fork_choice.clone(),
+            publication: self.inert.publication.clone(),
         }
     }
 
@@ -1794,26 +1833,28 @@ impl Subsystem for HeaderWire {
                 })
             })
             .collect();
+        let stores = EvidenceStores::default();
         WirePorts {
             fixture,
             node,
             chains,
             startup: Rc::default(),
             adoption: Rc::default(),
-            sessions: SessionEvidence::default(),
+            sessions: SessionEvidence::new(&stores),
             records: PeerRecords::default(),
             closed: PeerCloses::default(),
-            reservations: ReservationEvidence::default(),
-            capacity: CapacityEvidence::default(),
-            rounds: SettlementEvidence::default(),
-            stale_calls: StaleEvidence::default(),
-            wake: WakeEvidence::default(),
-            hold_wake: HoldWakeEvidence::default(),
-            ends: EndEvidence::default(),
-            round_life: RoundLifeEvidence::default(),
-            retirement: RetirementEvidence::default(),
-            chain_effect: ChainEffectEvidence::default(),
-            authority: AuthorityEvidence::default(),
+            reservations: ReservationEvidence::new(&stores),
+            capacity: CapacityEvidence::new(&stores),
+            rounds: SettlementEvidence::new(&stores),
+            stale_calls: StaleEvidence::new(&stores),
+            wake: WakeEvidence::new(&stores, None),
+            hold_wake: HoldWakeEvidence::new(&stores),
+            ends: EndEvidence::new(&stores),
+            round_life: RoundLifeEvidence::new(&stores),
+            retirement: RetirementEvidence::new(&stores),
+            chain_effect: ChainEffectEvidence::new(&stores),
+            authority: AuthorityEvidence::new(&stores),
+            stores,
         }
     }
 
@@ -1831,7 +1872,7 @@ impl Subsystem for HeaderWire {
             sim,
             ports.node.clone(),
             scenario.policy.clone(),
-            Effects::default(),
+            Effects::new(&ports.stores),
         );
         let names: Vec<String> = (0..scenario.peers.len())
             .map(|index| format!("peer-{index}"))
@@ -1970,6 +2011,12 @@ impl Subsystem for HeaderWire {
             faults,
             sessions: ports.sessions,
             closed: ports.closed,
+            inert: Inert {
+                outstanding: OutstandingEvidence::new(&ports.stores),
+                recovery: RecoveryEvidence::new(&ports.stores),
+                fork_choice: ForkChoiceEvidence::new(&ports.stores),
+                publication: PublicationEvidence::new(&ports.stores),
+            },
             _keep: Box::new(node),
         }
     }
@@ -2900,10 +2947,11 @@ mod tests {
     fn settled_faults(attributions: crate::storage::FaultAttributions) -> FaultEvidence {
         use crate::{IdleStatus, Outcome};
 
+        let stores = EvidenceStores::default();
         let faults = FaultEvidence::new(
             attributions,
-            Default::default(),
-            Default::default(),
+            crate::harness::header_node::fault::CooldownEvidence::new(&stores),
+            EndEvidence::new(&stores),
             std::time::Duration::ZERO,
         );
         faults.end(&RunEnd {
@@ -2932,7 +2980,7 @@ mod tests {
     /// [`HEADER_FAULT_PENALIZED`] end violation each.
     #[test]
     fn every_untaken_fault_is_an_end_violation() {
-        let attributions = crate::storage::FaultAttributions::default();
+        let attributions = crate::storage::FaultAttributions::new(&EvidenceStores::default());
         let mut log = ObservationLog::default();
         for id in [4, 7] {
             log_fault(&mut log, &attributions, id, false);
@@ -2970,7 +3018,10 @@ mod tests {
                 recovery: self.recovery.clone(),
                 adoption: self.adoption.clone(),
                 ends: self.ends.clone(),
-                ..FaultsOnly(FaultEvidence::default()).view()
+                ..FaultsOnly(settled_faults(crate::storage::FaultAttributions::new(
+                    &EvidenceStores::default(),
+                )))
+                .view()
             }
         }
     }
@@ -3041,25 +3092,25 @@ mod tests {
                 port: Arc::new(ControlledPort::new(&HeaderFixture::regtest())),
                 direct_dispatch_broken: false,
                 honest_peers: Rc::default(),
-                adoption: AdoptionEvidence::default(),
+                adoption: AdoptionEvidence::new(&EvidenceStores::default()),
                 sessions: Vec::new(),
                 faults: self.0.clone(),
-                capacity: CapacityEvidence::default(),
-                claims: ClaimEvidence::default(),
-                rounds: SettlementEvidence::default(),
-                stale_calls: StaleEvidence::default(),
-                wake: WakeEvidence::default(),
-                hold_wake: HoldWakeEvidence::default(),
-                ends: EndEvidence::default(),
+                capacity: CapacityEvidence::new(&EvidenceStores::default()),
+                claims: ClaimEvidence::new(&EvidenceStores::default()),
+                rounds: SettlementEvidence::new(&EvidenceStores::default()),
+                stale_calls: StaleEvidence::new(&EvidenceStores::default()),
+                wake: WakeEvidence::new(&EvidenceStores::default(), None),
+                hold_wake: HoldWakeEvidence::new(&EvidenceStores::default()),
+                ends: EndEvidence::new(&EvidenceStores::default()),
                 stamps: Stamps::default(),
-                round_life: RoundLifeEvidence::default(),
-                retirement: RetirementEvidence::default(),
-                chain_effect: ChainEffectEvidence::default(),
-                authority: AuthorityEvidence::default(),
-                outstanding: OutstandingEvidence::default(),
-                recovery: RecoveryEvidence::default(),
-                fork_choice: ForkChoiceEvidence::default(),
-                publication: PublicationEvidence::default(),
+                round_life: RoundLifeEvidence::new(&EvidenceStores::default()),
+                retirement: RetirementEvidence::new(&EvidenceStores::default()),
+                chain_effect: ChainEffectEvidence::new(&EvidenceStores::default()),
+                authority: AuthorityEvidence::new(&EvidenceStores::default()),
+                outstanding: OutstandingEvidence::new(&EvidenceStores::default()),
+                recovery: RecoveryEvidence::new(&EvidenceStores::default()),
+                fork_choice: ForkChoiceEvidence::new(&EvidenceStores::default()),
+                publication: PublicationEvidence::new(&EvidenceStores::default()),
             }
         }
     }
@@ -3074,7 +3125,7 @@ mod tests {
         use crate::check::{Phase, StepCtx};
         use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
 
-        let attributions = crate::storage::FaultAttributions::default();
+        let attributions = crate::storage::FaultAttributions::new(&EvidenceStores::default());
         let mut log = ObservationLog::default();
         for call in [1, 2] {
             log_fault(&mut log, &attributions, call, true);

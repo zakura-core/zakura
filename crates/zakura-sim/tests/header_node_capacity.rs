@@ -23,6 +23,7 @@ use zakura_sim::{
         header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::SettlementEvidence,
+            ends::EndEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
@@ -351,12 +352,12 @@ fn probe_failure(
         &mut sim,
         &ports.node,
         "node",
-        SessionEvidence::default(),
-        ReservationEvidence::default(),
-        CapacityEvidence::default(),
-        SettlementEvidence::default(),
-        StaleEvidence::default(),
-        Default::default(),
+        SessionEvidence::new(&ports.stores),
+        ReservationEvidence::new(&ports.stores),
+        CapacityEvidence::new(&ports.stores),
+        SettlementEvidence::new(&ports.stores),
+        StaleEvidence::new(&ports.stores),
+        EndEvidence::new(&ports.stores),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

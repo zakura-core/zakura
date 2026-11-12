@@ -1,6 +1,7 @@
 use zakura_scheduler::SimInstant;
 
 use super::{HoldWakeCheck, HoldWakeEvidence, HoldWakeFact};
+use crate::stores::EvidenceStores;
 use crate::{
     harness::header_node::{
         policy::{Allow, Hold, OpKind, Predicates, Select, Trigger},
@@ -53,7 +54,7 @@ fn setup(stamps: &Stamps) -> (Predicates, HoldWakeCheck, HoldWakeEvidence) {
         then: vec![Allow::Engine],
         deadline_ms: None,
     }]);
-    let evidence = HoldWakeEvidence::default();
+    let evidence = HoldWakeEvidence::new(&EvidenceStores::default());
     evidence.stamp_with(stamps.clone());
     (predicates, HoldWakeCheck::new(evidence.clone()), evidence)
 }
@@ -188,7 +189,7 @@ fn serving_setup(stamps: &Stamps) -> (Predicates, HoldWakeCheck, HoldWakeEvidenc
             })
             .to_vec(),
     );
-    let evidence = HoldWakeEvidence::default();
+    let evidence = HoldWakeEvidence::new(&EvidenceStores::default());
     evidence.stamp_with(stamps.clone());
     (predicates, HoldWakeCheck::new(evidence.clone()), evidence)
 }

@@ -946,9 +946,19 @@ impl Ctx<'_> {
         let harness = field(task, "harness")?;
         let input = self.root.join(field(task, "input")?);
         let cargo_path = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        // Every run it makes, at any depth, writes its records here.
+        // Every run it makes, at any depth, writes its records here, and the
+        // campaign's inputs, which S's planted runner derives from the
+        // property, are listed first as the campaign's required runs.
         let planted_runs = self.dir.join("planted-runs");
         fs::create_dir_all(&planted_runs)?;
+        let campaign: Vec<String> = crate::planted::campaign_inputs(property)
+            .iter()
+            .map(|input| sha256_hex(input))
+            .collect();
+        fs::write(
+            self.dir.join("planted-inventory.json"),
+            serde_json::to_string_pretty(&self.bound(json!({ "campaign": campaign }), json!({})))?,
+        )?;
         let mut verdict = Command::new(&cargo_path);
         verdict
             .args(["xtask", "planted", property])

@@ -1417,27 +1417,8 @@ fn judge_planted(
             return blocked("`cargo xtask planted` recorded no runs".to_owned())
         }
         Ok(runs) => {
-            // The case is sim-7's own, so each of its runs passes through the
-            // one judge: as a run that held, or one its property's
-            // violation stopped.
-            let property = DISCOVERY_CASE.0.to_owned();
-            for run in &runs {
-                let Ok(entry) = crate::harness::find(&run.harness) else {
-                    return blocked(format!("{} isn't a harness at S", run.harness));
-                };
-                let registered = registered(entry);
-                let held = owned_run_passes(&run.end, &registered, &RunExpect::Passes);
-                let caught = owned_run_passes(
-                    &run.end,
-                    &registered,
-                    &RunExpect::Violates {
-                        property: property.clone(),
-                        also: Vec::new(),
-                    },
-                );
-                if let (Err(why), Err(_)) = (held, caught) {
-                    return blocked(format!("a planted run ({}): {why}", run.stem));
-                }
+            if let Some(why) = planted_runs_refusal(dir, binding, &runs) {
+                return blocked(why);
             }
         }
         Err(why) => return blocked(why),
@@ -1533,8 +1514,42 @@ struct RunRecord {
     input: Option<String>,
     /// The tool phase it ran in.
     phase: String,
+    /// Its role in that phase, where its caller named one.
+    role: Option<String>,
     /// The `end` record it wrote.
     end: crate::record::EndRecord,
+}
+
+/// The one check of a run's identity: its begin and end records name the
+/// same full identity, its id is its records' file name `stem` (so a copy
+/// under another name is refused), and its binding is this task's in this
+/// run.
+fn bound_identity(
+    stem: &str,
+    begin: Value,
+    end: Value,
+    binding: &TaskBinding,
+) -> Result<crate::acceptance_runs::RunIdentity, String> {
+    use crate::acceptance_runs::RunIdentity;
+    let parse = |value: Value, which: &str| {
+        serde_json::from_value::<RunIdentity>(value)
+            .map_err(|error| format!("run {stem}'s {which} record: {error}"))
+    };
+    let (begin, end) = (parse(begin, "begin")?, parse(end, "end")?);
+    if begin != end {
+        return Err(format!("run {stem}'s begin and end name different runs"));
+    }
+    if end.id != stem {
+        return Err(format!("run {stem}'s records carry another run's id"));
+    }
+    let field = |name: &str| end.binding.get(name);
+    if field("run").and_then(Value::as_str) != Some(&binding.run)
+        || field("task").and_then(Value::as_u64) != u64::try_from(binding.index).ok()
+        || field("task_sha256").and_then(Value::as_str) != Some(&binding.task_sha256)
+    {
+        return Err(format!("run {stem} was recorded for another run or task"));
+    }
+    Ok(end)
 }
 
 /// Every run recorded under `dir`: each begin record must have its end,
@@ -1566,38 +1581,20 @@ fn run_records(dir: &Path, binding: &TaskBinding) -> Result<Vec<RunRecord>, Stri
             .get(stem)
             .and_then(|path| read(path))
             .ok_or_else(|| format!("run {stem} has no readable begin record"))?;
-        let end = read(path).ok_or_else(|| format!("run {stem}'s end record doesn't read"))?;
-        // A record's id is its file's name, so a copy under another name,
-        // standing in for a run that's missing, is refused.
-        if begin.get("id").and_then(Value::as_str) != Some(stem.as_str()) {
-            return Err(format!("run {stem}'s records carry another run's id"));
-        }
-        for field in ["id", "harness", "input_sha256", "phase", "binding"] {
-            if begin.get(field) != end.get(field) {
-                return Err(format!(
-                    "run {stem}'s begin and end name different {field}s"
-                ));
-            }
-        }
-        // Each record repeats the binding of the task whose child wrote it.
-        let names = end.get("binding");
-        let field = |name: &str| names.and_then(|n| n.get(name));
-        if field("run").and_then(Value::as_str) != Some(&binding.run)
-            || field("task").and_then(Value::as_u64) != u64::try_from(binding.index).ok()
-            || field("task_sha256").and_then(Value::as_str) != Some(&binding.task_sha256)
-        {
-            return Err(format!("run {stem} was recorded for another run or task"));
-        }
-        let text = |field: &str| end.get(field).and_then(Value::as_str).map(str::to_owned);
+        let mut end = read(path).ok_or_else(|| format!("run {stem}'s end record doesn't read"))?;
+        let record = end
+            .as_object_mut()
+            .and_then(|fields| fields.remove("end"))
+            .and_then(|record| serde_json::from_value(record).ok())
+            .ok_or_else(|| format!("run {stem} left no end record"))?;
+        let identity = bound_identity(stem, begin, end, binding)?;
         runs.push(RunRecord {
             stem: stem.clone(),
-            harness: text("harness").unwrap_or_default(),
-            input: text("input_sha256"),
-            phase: text("phase").unwrap_or_default(),
-            end: end
-                .get("end")
-                .and_then(|end| serde_json::from_value(end.clone()).ok())
-                .ok_or_else(|| format!("run {stem} left no end record"))?,
+            harness: identity.harness,
+            input: identity.input_sha256,
+            phase: identity.phase,
+            role: identity.role,
+            end: record,
         });
     }
     Ok(runs)
@@ -1861,7 +1858,7 @@ fn judge_minimize(
         .filter_map(|candidate| candidate.get("sha256")?.as_str().map(str::to_owned))
         .filter(|sha| sha != input && *sha != minimized)
         .collect();
-    let mut seen: BTreeMap<(&str, String), usize> = BTreeMap::new();
+    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
     for run in &runs {
         if run.phase == "search" {
             continue;
@@ -1894,17 +1891,44 @@ fn judge_minimize(
         if let Err(why) = owned_run_passes(&run.end, &registered, &expect) {
             return blocked(format!("run {} ({}): {why}", run.stem, run.phase));
         }
-        *seen.entry((phase, sha.to_owned())).or_default() += 1;
+        // Inside `zakura-sim confirm`, each run's role tells it apart.
+        let atom = match (phase, run.role.as_deref()) {
+            ("confirm", Some(role)) => format!("confirm/{role}"),
+            ("confirm", None) => {
+                return blocked(format!("confirmation run {} names no role", run.stem))
+            }
+            (phase, _) => phase.to_owned(),
+        };
+        *seen.entry((atom, sha.to_owned())).or_default() += 1;
     }
     // Each confirmation is one fuzz-target run, the four runs inside
     // `zakura-sim confirm` (its input run, witness rerun, recording and that
     // recording's replay) and one fresh replay, each exactly once.
+    let atoms = [
+        "confirm-target",
+        "confirm/input",
+        "confirm/witness",
+        "confirm/record",
+        "confirm/replay",
+        "replay",
+    ];
     for sha in [input, minimized.as_str()] {
-        for (phase, want) in [("confirm-target", 1), ("confirm", 4), ("replay", 1)] {
-            let got = seen.get(&(phase, sha.to_owned())).copied().unwrap_or(0);
-            if got != want {
-                return blocked(format!("input {sha} has {got} {phase} runs, not {want}"));
+        for atom in atoms {
+            let got = seen
+                .get(&(atom.to_owned(), sha.to_owned()))
+                .copied()
+                .unwrap_or(0);
+            if got != 1 {
+                return blocked(format!("input {sha} has {got} {atom} runs, not 1"));
             }
+        }
+        if seen
+            .keys()
+            .any(|(atom, at)| at == sha && !atoms.contains(&atom.as_str()))
+        {
+            return blocked(format!(
+                "input {sha} has a confirmation run of an unknown role"
+            ));
         }
     }
     Verdict::Verified
@@ -2023,6 +2047,77 @@ fn judge_target(
         return blocked(format!("{harness} has no admitted seed"));
     }
     Verdict::Verified
+}
+
+/// Why the planted runner's own runs don't pass, if they don't. The case is
+/// sim-7's own, so each run passes through [`owned_run_passes`] by its role:
+/// the baseline, exactly once, holds; the patched run, exactly once,
+/// violates the case's property; each campaign input the runner's inventory
+/// lists ran exactly once, as a run that held or one the property's
+/// violation stopped; a replay is judged as the run it replays. No other
+/// role is allowed.
+fn planted_runs_refusal(dir: &Path, binding: &TaskBinding, runs: &[RunRecord]) -> Option<String> {
+    let campaign: Vec<String> = runner_json(dir, "planted-inventory.json", binding)
+        .and_then(|inventory| serde_json::from_value(inventory.get("campaign")?.clone()).ok())
+        .unwrap_or_default();
+    if campaign.is_empty() {
+        return Some("the planted runner's campaign inventory is missing".to_owned());
+    }
+    let violates = RunExpect::Violates {
+        property: DISCOVERY_CASE.0.to_owned(),
+        also: Vec::new(),
+    };
+    let mut counted: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
+    for run in runs {
+        let Ok(entry) = crate::harness::find(&run.harness) else {
+            return Some(format!("{} isn't a harness at S", run.harness));
+        };
+        let registered = registered(entry);
+        let held = owned_run_passes(&run.end, &registered, &RunExpect::Passes);
+        let caught = owned_run_passes(&run.end, &registered, &violates);
+        let verdict = match run.phase.as_str() {
+            "baseline" => held,
+            "patched" => caught,
+            "campaign" | "replay" => held.or(caught),
+            other => {
+                return Some(format!(
+                    "planted run {} has an unknown role {other}",
+                    run.stem
+                ))
+            }
+        };
+        if let Err(why) = verdict {
+            return Some(format!("planted {} run {}: {why}", run.phase, run.stem));
+        }
+        let input = (run.phase == "campaign")
+            .then_some(run.input.as_deref())
+            .flatten();
+        *counted.entry((run.phase.as_str(), input)).or_default() += 1;
+    }
+    let count = |key: (&str, Option<&str>)| counted.get(&key).copied().unwrap_or(0);
+    if count(("baseline", None)) != 1 || count(("patched", None)) != 1 {
+        return Some(
+            "the planted runner didn't make exactly one baseline and one patched run".to_owned(),
+        );
+    }
+    let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
+    for input in &campaign {
+        *wanted.entry(input.as_str()).or_default() += 1;
+    }
+    for (input, want) in &wanted {
+        if count(("campaign", Some(input))) != *want {
+            return Some(format!(
+                "campaign input {input} didn't run exactly {want} times"
+            ));
+        }
+    }
+    let campaign_runs: usize = counted
+        .iter()
+        .filter(|((phase, _), _)| *phase == "campaign")
+        .map(|(_, n)| n)
+        .sum();
+    (campaign_runs != campaign.len())
+        .then(|| "the planted campaign ran an input its inventory doesn't list".to_owned())
 }
 
 /// The discovery agreement pair's verdict, from the planted task's runs in

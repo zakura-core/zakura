@@ -56,22 +56,81 @@ fn phase() -> &'static str {
     PHASE.get_or_init(|| std::env::var(PHASE_VAR).unwrap_or_else(|_| "in-process".to_owned()))
 }
 
+/// What a run's caller says about it: the full fuzz input it's of and the
+/// role it plays in its tool's step, such as `witness` inside `zakura-sim
+/// confirm`. It travels with the run onto any thread the run is moved to
+/// ([`current`], [`within`]).
+#[derive(Clone, Debug, Default)]
+pub struct Context {
+    /// The full input's SHA-256, if a caller named one.
+    input: Option<String>,
+    /// The role, if a caller named one.
+    role: Option<String>,
+}
+
 thread_local! {
-    /// The SHA-256 of the full fuzz input the thread's current run is of,
-    /// if its caller named one ([`with_input`]).
-    static INPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The thread's current [`Context`].
+    static CONTEXT: RefCell<Context> = RefCell::new(Context::default());
+}
+
+/// The thread's current context, to carry onto a thread a run moves to.
+pub fn current() -> Context {
+    CONTEXT.with(|slot| slot.borrow().clone())
+}
+
+/// Runs `f` with `context` as the thread's, restoring the old one after.
+pub fn within<T>(context: Context, f: impl FnOnce() -> T) -> T {
+    let previous = CONTEXT.with(|slot| slot.replace(context));
+    let out = f();
+    CONTEXT.with(|slot| *slot.borrow_mut() = previous);
+    out
 }
 
 /// Runs `f` with `input`, a full fuzz input, as the input of the runs it
-/// makes on this thread. Hashes nothing unless records are being written.
+/// makes. Hashes nothing unless records are being written.
 pub fn with_input<T>(input: &[u8], f: impl FnOnce() -> T) -> T {
     if dir().is_none() {
         return f();
     }
-    let previous = INPUT.with(|slot| slot.replace(Some(crate::seed::sha256(input))));
-    let out = f();
-    INPUT.with(|slot| *slot.borrow_mut() = previous);
-    out
+    let context = Context {
+        input: Some(crate::seed::sha256(input)),
+        ..current()
+    };
+    within(context, f)
+}
+
+/// Runs `f` with `role` as the role of the runs it makes.
+pub fn with_role<T>(role: &str, f: impl FnOnce() -> T) -> T {
+    if dir().is_none() {
+        return f();
+    }
+    let context = Context {
+        role: Some(role.to_owned()),
+        ..current()
+    };
+    within(context, f)
+}
+
+/// A run's full identity, which both its records carry: its id (its
+/// records' file name, so a copy under another name is refused), harness,
+/// input, the tool's phase, its role in that phase, and the acceptance
+/// task's binding. One type, written here and read by the acceptance
+/// evaluator.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunIdentity {
+    /// `<pid>-<start>-<n>`, the records' file stem.
+    pub id: String,
+    /// The harness.
+    pub harness: String,
+    /// The full input's SHA-256, where a caller named it.
+    pub input_sha256: Option<String>,
+    /// The tool's phase ([`PHASE_VAR`]), `in-process` when none is set.
+    pub phase: String,
+    /// The run's role in that phase, where its caller named one.
+    pub role: Option<String>,
+    /// The acceptance task's binding ([`BINDING_VAR`]).
+    pub binding: serde_json::Value,
 }
 
 /// One run's records: `<dir>/<pid>-<start>-<n>` with `.begin.json` or
@@ -99,17 +158,18 @@ pub(crate) fn begin(harness: &str) -> Option<Atom> {
     });
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let id = format!("{}-{start}-{n}", std::process::id());
+    let context = current();
+    let identity = RunIdentity {
+        id: id.clone(),
+        harness: harness.to_owned(),
+        input_sha256: context.input,
+        phase: phase().to_owned(),
+        role: context.role,
+        binding: binding().clone(),
+    };
     let atom = Atom {
         stem: dir.join(&id),
-        identity: serde_json::json!({
-            // Repeated inside, so a record copied under another run's name
-            // is refused.
-            "id": id,
-            "harness": harness,
-            "input_sha256": INPUT.with(|slot| slot.borrow().clone()),
-            "phase": phase(),
-            "binding": binding(),
-        }),
+        identity: serde_json::to_value(&identity).expect("an identity is plain data"),
     };
     write(&atom, "begin", &atom.identity);
     Some(atom)

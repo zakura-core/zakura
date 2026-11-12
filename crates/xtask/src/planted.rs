@@ -922,7 +922,7 @@ fn check_case(
     let harness = case.witness.harness(worktree)?;
     let input = case.witness.located(worktree);
     let baseline = record(
-        Command::new(baseline),
+        in_phase(Command::new(baseline), "baseline"),
         &harness,
         &input,
         &case.property,
@@ -1003,7 +1003,7 @@ fn judge_patched(
 ) -> Result<Verdict, BoxError> {
     let trace = scratch.join("patched");
     let patched = record(
-        Command::new(zakura_sim),
+        in_phase(Command::new(zakura_sim), "patched"),
         harness,
         input,
         &case.property,
@@ -1193,7 +1193,7 @@ fn campaign(
         let input = dir.join(format!("input-{index}.bin"));
         fs::write(&input, bytes)?;
         let run = record(
-            Command::new(binary),
+            in_phase(Command::new(binary), "campaign"),
             harness,
             &Located::Input(input.clone()),
             &case.property,
@@ -1223,7 +1223,7 @@ fn campaign(
 /// up to [`CAMPAIGN_INPUT_BYTES`], from a SplitMix64 stream that the
 /// property's ID seeds, so a case's campaign is the same on every run and
 /// doesn't move when other cases are added.
-fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
+pub(crate) fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
     // FNV-1a.
     let mut state = property
         .bytes()
@@ -1357,6 +1357,15 @@ impl Expect<'_> {
 /// `<out>.log`. A run past the deadline, or one that a signal killed, is
 /// [`Run::Killed`], whatever files it already wrote. A set flag kills the
 /// run and stops the pilot.
+/// `command` with its runs' acceptance phase set to `phase`, so sim-7's
+/// acceptance tool can tell the baseline, patched, campaign and replay runs
+/// apart. It changes nothing unless the tool also names a records
+/// directory.
+fn in_phase(mut command: Command, phase: &str) -> Command {
+    command.env("ZAKURA_SIM_ACCEPTANCE_PHASE", phase);
+    command
+}
+
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -1464,7 +1473,7 @@ fn replay_misses(
     deadline: Duration,
 ) -> Result<Option<String>, BoxError> {
     let log = trace.with_extension("replay.log");
-    let mut replay = Command::new(zakura_sim);
+    let mut replay = in_phase(Command::new(zakura_sim), "replay");
     replay.arg("replay").arg(trace);
     let end = sim_minimize::run_child(&mut replay, &log, Some(deadline), &NEVER_INTERRUPTED)?;
     Ok(match end {

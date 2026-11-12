@@ -1,0 +1,14 @@
+# Takes a second reservation from the budget for a peer that just
+# reserved, and forgets it outside `request_reservations`, so the queue's
+# accounting never ends it. The budget reports every reservation it makes,
+# so the ownership ledger sees the second one open while the peer still
+# holds its first. The required failure is `SecondReservation`.
+# `chunk-budget-bound/uncapped-secondary-reservation` plants the same
+# forgotten reservation unreported and uncapped, where the resource probe
+# catches it instead. The input's node reserves headers for its first
+# mirror.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides peer_work.rs, which the patch changes, the reactor decides when
+# the node first reserves. A change there can move the input off that
+# reservation.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -554,7 +554,8 @@ impl RecoveryEvidence {
                     EndFact::Environment {
                         peer, connection, ..
                     } => record.closes(&peer, connection, source_only),
-                    EndFact::ReactorExited { .. } => false,
+                    // The node's own end, not the environment's.
+                    EndFact::CallDropped { .. } | EndFact::ReactorExited { .. } => false,
                 }
         })
     }

@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_planted_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_authority.rs"
 test = "regenerate_authority_witnesses"
 run = false
@@ -172,6 +178,12 @@ file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
 test = "regenerate_late_fault_fixture"
 run = false
 reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_node_reservations.rs"
+test = "regenerate_overlapping_forks_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed overlapping-forks fixture from its builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"

@@ -31,6 +31,7 @@
 //! without its file and package, or a case's name without its property. The evaluator's controls change one field at a time and require
 //! the result to stop counting.
 
+pub mod companions;
 pub mod contracts;
 pub mod evaluate;
 pub mod inventory;
@@ -624,12 +625,14 @@ impl Key {
     /// A passing key takes a `Holds` or `StaysNotApplicable` of its own
     /// property, a catch key a `Caught` whose case is under its property and
     /// whose set contains it, or a `MachineCaught` of its property, a case
-    /// key the catch of exactly that case, a replay key the replay of exactly
-    /// that execution, a test key the `Passes` of exactly that test, and a
-    /// requirement key what its [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS)
-    /// entry permits. Any other key also takes an `Open`, which blocks until
-    /// approved. A narrowing test key is matched against `narrowing`,
-    /// the manifest's entries.
+    /// key the catch of exactly that case, a duplicate native mutation's key
+    /// the catch of the case its classification names, a replay key the
+    /// replay of exactly that execution, a test key the `Passes` of exactly
+    /// that test, and a requirement key what its
+    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits. Any
+    /// other key also takes an `Open`, which blocks until approved. A
+    /// narrowing test key is matched against `narrowing`, the manifest's
+    /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
         let test_is = |package: &str, file: &str, name: &str, test: &TestRef| {
             test.package == package && test.file == file && test.test == name
@@ -684,6 +687,18 @@ impl Key {
                                     not_applicable,
                                 }
                     })
+            }
+            // A duplicate native mutation's key takes the catch of exactly
+            // the planted case its classification names.
+            (Key::Native { patch }, Expected::Caught { case, .. }) => {
+                NATIVE_MUTATIONS.iter().any(|mutation| {
+                    mutation.patch == patch
+                        && mutation.class
+                            == NativeClass::Duplicate {
+                                property: case.property,
+                                case: case.name,
+                            }
+                })
             }
             (Key::Cleanup { run }, Expected::Open { .. }) => {
                 let machine =
@@ -907,7 +922,8 @@ impl Manifest {
         expected.extend(rows::counted_results(&expected.clone()));
         expected.extend(rows::requirement_results());
         expected.extend(rows::witness_results(&rows));
-        expected.extend(rows::native_results());
+        let native = rows::native_results(&expected);
+        expected.extend(native);
         let contracts = contract_table();
         expected.extend(contracts::contract_test_results(&contracts));
         expected.extend(contracts::narrowing_test_results(NARROWING));

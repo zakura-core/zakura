@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/wire.rs b/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
+index b8c47d9755..3ae74bea3e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
+@@ -567,9 +567,7 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
+ 
+     /// Check a `Status` against the protocol limits and its own heights.
+     fn check_status(status: &Status) -> Result<(), WireError> {
+-        if status.work_anchor_height > status.selected_tip_height {
+-            return Err(WireError::OutOfRange("status work anchor"));
+-        }
++        // Mutation: a work anchor above the selected tip is no longer refused.
+         if status.oldest_retained_height > status.selected_tip_height {
+             return Err(WireError::OutOfRange("status retention floor"));
+         }

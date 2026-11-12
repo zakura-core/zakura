@@ -19,7 +19,7 @@
 
 use std::{
     fmt::Debug,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
 };
 
 use serde_json::{json, Value};
@@ -123,6 +123,48 @@ impl<T> Debug for Registered<T> {
     }
 }
 
+/// A [`Registered`] store's handle that doesn't own it
+/// ([`Registered::downgrade`]), for a store that reads another. A store
+/// holding an owning handle would own its own registry, which owns it, so
+/// neither would ever drop.
+pub struct WeakRegistered<T> {
+    cell: Weak<Cell<T>>,
+}
+
+impl<T> Clone for WeakRegistered<T> {
+    /// Another non-owning handle to the same store.
+    fn clone(&self) -> Self {
+        WeakRegistered {
+            cell: Weak::clone(&self.cell),
+        }
+    }
+}
+
+impl<T> Debug for WeakRegistered<T> {
+    /// The store's name, if it's still alive.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cell.upgrade() {
+            Some(cell) => write!(formatter, "WeakRegistered({})", cell.name),
+            None => write!(formatter, "WeakRegistered(dropped)"),
+        }
+    }
+}
+
+impl<T> WeakRegistered<T> {
+    /// Runs `read` on the value, or returns `None` if the store dropped.
+    pub(crate) fn read<R>(&self, read: impl FnOnce(&T) -> R) -> Option<R> {
+        self.cell.upgrade().map(|cell| read(&cell.lock().value))
+    }
+
+    /// Runs `write` on the value, as [`Registered::write`] does, or returns
+    /// `None` if the store dropped.
+    pub(crate) fn write<R>(&self, write: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let cell = self.cell.upgrade()?;
+        let mut slot = cell.lock();
+        (!slot.frozen).then(|| write(&mut slot.value))
+    }
+}
+
 /// A store's value, locked: read through `Deref`, changed only through
 /// [`Guard::live`], which a frozen store refuses.
 pub(crate) struct Guard<'a, T>(MutexGuard<'a, Slot<T>>);
@@ -170,6 +212,13 @@ impl<T> Registered<T> {
     /// The handle that built the store.
     pub fn stores(&self) -> &EvidenceStores {
         &self.stores
+    }
+
+    /// A handle on the store that doesn't keep it alive.
+    pub fn downgrade(&self) -> WeakRegistered<T> {
+        WeakRegistered {
+            cell: Arc::downgrade(&self.cell),
+        }
     }
 }
 
@@ -240,6 +289,12 @@ impl EvidenceStores {
     /// Whether `other` is this handle.
     pub fn same(&self, other: &EvidenceStores) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A handle that doesn't keep the stores alive, so a reader can tell
+    /// when the last owning handle dropped them.
+    pub fn downgrade(&self) -> WeakEvidenceStores {
+        WeakEvidenceStores(Arc::downgrade(&self.0))
     }
 
     /// Freezes every store in `sim`'s run once its log freezes
@@ -332,33 +387,46 @@ impl EvidenceStores {
     }
 }
 
+/// An [`EvidenceStores`] handle that doesn't own its stores
+/// ([`EvidenceStores::downgrade`]).
+#[derive(Clone, Debug)]
+pub struct WeakEvidenceStores(Weak<Mutex<Registry>>);
+
+impl WeakEvidenceStores {
+    /// The owning handle, or `None` once every owning handle dropped.
+    pub fn upgrade(&self) -> Option<EvidenceStores> {
+        self.0.upgrade().map(EvidenceStores)
+    }
+}
+
 /// Checks that the store `make` builds keeps `write` before its handle
-/// freezes and drops it after: before the freeze the write changes the
-/// store's `facts`, and after it the same write changes neither them nor
-/// the handle's snapshot. Each store type's post-freeze unit test calls it
-/// with a representative write through the store's own record path.
+/// freezes and drops it after. The control is a live store, on which the
+/// write changes the store's `facts`. The check is a second store, frozen
+/// before any write, on which the same write changes neither its facts
+/// nor its handle's snapshot. Since the frozen store never took the write,
+/// an idempotent one that the freeze let through would still change it.
+/// Each store type's post-freeze unit test calls it with a representative
+/// write through the store's own record path.
 #[cfg(test)]
 pub(crate) fn assert_freeze_drops_writes<S, F: PartialEq + Debug>(
-    make: impl FnOnce(&EvidenceStores) -> S,
+    make: impl Fn(&EvidenceStores) -> S,
     write: impl Fn(&S),
     facts: impl Fn(&S) -> F,
 ) {
+    let control = make(&EvidenceStores::default());
+    let before = facts(&control);
+    write(&control);
+    assert_ne!(
+        facts(&control),
+        before,
+        "the control: a write on a live store lands"
+    );
     let stores = EvidenceStores::default();
     let store = make(&stores);
-    let before = facts(&store);
-    write(&store);
-    let written = facts(&store);
-    assert_ne!(
-        written, before,
-        "the control: a write before the freeze lands"
-    );
+    assert_eq!(facts(&store), before, "both stores start alike");
     stores.freeze();
     write(&store);
-    assert_eq!(
-        facts(&store),
-        written,
-        "a write after the freeze is dropped"
-    );
+    assert_eq!(facts(&store), before, "a write after the freeze is dropped");
     assert_eq!(stores.drift(), None, "and leaves the snapshot as it froze");
 }
 

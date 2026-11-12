@@ -602,6 +602,67 @@ fn the_reader_rejects_before_the_payload() {
     }
 }
 
+/// Runs each content rule of `row` from its setup history, as [`check`]
+/// does, and requires the node to close the frame's connection with a
+/// fault cause. That close is header sync's consequence for a subscriber's
+/// content rejection, where the generic `bad-content-closes` would also
+/// take a `Misbehavior` alone, which leaves the peer connected. Each rule's
+/// `bad-content-closes` holds, applied, beside it.
+fn bad_content_closes_with_a_fault(row: Row) {
+    let rules: Vec<ContentRule> = ContentRule::ALL
+        .into_iter()
+        .filter(|rule| rule.row() == row)
+        .collect();
+    assert!(!rules.is_empty(), "{row:?} has a content rule");
+    for rule in rules {
+        let act = Act::BadContent { rule };
+        let checked = check(act, false, Plan::from_fuzz(&[]));
+        let cause = close_cause(&checked.report, checked.frame.connection)
+            .unwrap_or_else(|| panic!("{act:?}: no close"));
+        assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
+    }
+}
+
+/// A `Status` that breaks a content rule closes its connection with a
+/// fault ([`bad_content_closes_with_a_fault`]).
+///
+/// This fails if the reader answers it with a `Misbehavior` and leaves the
+/// connection open.
+#[test]
+fn status_bad_content_closes_with_a_fault() {
+    bad_content_closes_with_a_fault(Row::Status);
+}
+
+/// An update that breaks a content rule closes its connection with a
+/// fault ([`bad_content_closes_with_a_fault`]).
+///
+/// This fails if the reader answers it with a `Misbehavior` and leaves the
+/// connection open.
+#[test]
+fn subscribe_headers_bad_content_closes_with_a_fault() {
+    bad_content_closes_with_a_fault(Row::SubscribeHeaders);
+}
+
+/// A page that breaks a content rule closes its connection with a fault
+/// ([`bad_content_closes_with_a_fault`]).
+///
+/// This fails if the subscriber answers it with a `Misbehavior` and leaves
+/// the connection open.
+#[test]
+fn headers_bad_content_closes_with_a_fault() {
+    bad_content_closes_with_a_fault(Row::Headers);
+}
+
+/// An ending that breaks a content rule closes its connection with a fault
+/// ([`bad_content_closes_with_a_fault`]).
+///
+/// This fails if the subscriber answers it with a `Misbehavior` and leaves
+/// the connection open.
+#[test]
+fn headers_outcome_bad_content_closes_with_a_fault() {
+    bad_content_closes_with_a_fault(Row::HeadersOutcome);
+}
+
 /// One act per frame-stage guard class, whose frame only that guard
 /// refuses: a third `Open` (live-subscription admission), a page one
 /// object over credit (object-credit claims), a duplicate ending read

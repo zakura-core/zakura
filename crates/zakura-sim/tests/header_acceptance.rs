@@ -628,7 +628,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
     // only another owner, or only another reason.
     for key in [
         Key::Native {
-            patch: "foreign-leases".into(),
+            patch: "own9-join".into(),
         },
         Key::NarrowingTest { entry: "N1".into() },
     ] {
@@ -837,7 +837,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
         let at = covering(
             m,
             &Key::Native {
-                patch: "foreign-leases".into(),
+                patch: "own9-join".into(),
             },
         );
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
@@ -1572,6 +1572,15 @@ fn case_harness(property: &str, name: &str) -> Result<String, String> {
 fn case_errors(expected: &[ExpectedResult], cases: &[(String, String)]) -> Vec<String> {
     let mut named: BTreeMap<(String, String), Vec<(bool, &str)>> = BTreeMap::new();
     for result in expected {
+        // A duplicate native mutation's key shares its covering case's
+        // catch, which the case's own row names.
+        if result
+            .keys
+            .iter()
+            .all(|key| matches!(key, Key::Native { .. }))
+        {
+            continue;
+        }
         let (case, machine, declared) = match result.expected {
             Expected::Caught { case, harness, .. } => (case, false, harness),
             Expected::MachineCaught { case, harness } => (case, true, harness),
@@ -1684,7 +1693,8 @@ fn every_planted_case_is_named_by_one_row_of_its_kind() {
 /// Every problem with `mutations` against the native directories `dirs`,
 /// the planted `cases` and `expected`: an unlisted directory, a moved
 /// mutation whose directory remains or whose planted case is missing or
-/// named by no catch, and a stale move.
+/// named by no catch, a duplicate whose covering case is, and a stale
+/// move.
 fn native_errors(
     mutations: &[rows::NativeMutation],
     dirs: &[String],
@@ -1752,6 +1762,18 @@ fn native_errors(
                     errors.push(format!("{}: no reason", mutation.patch));
                 }
             }
+            NativeClass::Duplicate { property, case } => {
+                let named = expected.iter().any(|result| {
+                    matches!(result.expected, Expected::Caught { case: c, .. }
+                        if c.property == property && c.name == case)
+                });
+                if !cases.contains(&(property.to_owned(), case.to_owned())) || !named {
+                    errors.push(format!(
+                        "{}: its covering case {property}/{case} is missing or unnamed",
+                        mutation.patch
+                    ));
+                }
+            }
         }
     }
     errors
@@ -1767,6 +1789,9 @@ enum NativePin {
     Integrity(HistoryRef, &'static str),
     /// It's retired.
     Retired,
+    /// It's retired as a duplicate of this planted case: its property,
+    /// then its name.
+    Duplicate(&'static str, &'static str),
 }
 
 /// The probe-accounting history the integrity mutations run, written from
@@ -1810,7 +1835,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "misstored-page",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
+        NativePin::Duplicate("header-sync/commit-only-authorized", "stored-order"),
     ),
     (
         "own9-join",
@@ -1847,7 +1872,10 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "short-payload",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
+        NativePin::Duplicate(
+            "header-sync/commit-only-authorized",
+            "dropped-payload-header",
+        ),
     ),
     (
         "shutdown-kept-queue",
@@ -1859,7 +1887,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "skipped-retention",
-        NativePin::Move("header-sync/outstanding-work-bounded", "hdr-9d.1"),
+        NativePin::Duplicate("header-sync/outstanding-work-bounded", "retention-skipped"),
     ),
     (
         "skipped-staging",
@@ -1867,7 +1895,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "stale-locator-round",
-        NativePin::Move("header-sync/reset-invalidates-work", "hdr-9a.2"),
+        NativePin::Duplicate("header-sync/reset-invalidates-work", "awaiting-kept"),
     ),
     (
         "stale-status-cache",
@@ -1911,6 +1939,9 @@ fn native_pin_errors(mutations: &[rows::NativeMutation]) -> Vec<String> {
                 Some(NativePin::Integrity(pinned, pinned_diagnostic)),
             ) => history == pinned && diagnostic == pinned_diagnostic,
             (NativeClass::Retired { .. }, Some(NativePin::Retired)) => true,
+            (NativeClass::Duplicate { property, case }, Some(NativePin::Duplicate(p, c))) => {
+                property == p && case == c
+            }
             _ => false,
         };
         if !ok {
@@ -1938,10 +1969,7 @@ fn every_native_mutation_is_classified() {
         ("hdr-9c.2a", "header-sync/teardown-returns-baseline"),
     ] {
         let mut changed = NATIVE_MUTATIONS.to_vec();
-        let at = changed
-            .iter()
-            .position(|m| m.patch == "foreign-leases")
-            .unwrap();
+        let at = changed.iter().position(|m| m.patch == "own9-join").unwrap();
         changed[at].class = NativeClass::ToMove { property, until };
         assert_eq!(native_pin_errors(&changed).len(), 1, "{property} {until}");
     }
@@ -2001,6 +2029,8 @@ fn every_native_mutation_is_classified() {
                         ..
                     },
                 ) => {}
+                (NativeClass::Duplicate { property, case }, Expected::Caught { case: c, .. })
+                    if c.property == property && c.name == case => {}
                 (class, expected) => panic!("{patch}: {class:?} as {:?}", expected.kind()),
             }
         }
@@ -2013,28 +2043,81 @@ fn every_native_mutation_is_classified() {
         }),
         Some(&BTreeSet::from([Gate::G6]))
     );
+    // A duplicate keeps its directory, so it stays a required key on gate
+    // 6, which only its covering case's catch verifies. It's refused when
+    // that case is missing or no catch names it, and its pin refuses it
+    // reclassified as a plain retirement or onto another case.
+    assert_eq!(
+        committed_required(&manifest).get(&Key::Native {
+            patch: "short-payload".into(),
+        }),
+        Some(&BTreeSet::from([Gate::G6]))
+    );
+    let covering = (
+        "header-sync/commit-only-authorized".to_owned(),
+        "dropped-payload-header".to_owned(),
+    );
+    let uncovered: Vec<(String, String)> =
+        cases.iter().filter(|c| **c != covering).cloned().collect();
+    assert_eq!(
+        native_errors(
+            NATIVE_MUTATIONS,
+            &native_dirs(),
+            &uncovered,
+            &manifest.expected
+        )
+        .len(),
+        1
+    );
+    let unnamed: Vec<ExpectedResult> = manifest
+        .expected
+        .iter()
+        .filter(|r| {
+            !matches!(r.expected, Expected::Caught { case, .. }
+                if case.property == covering.0 && case.name == covering.1)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        native_errors(NATIVE_MUTATIONS, &native_dirs(), &cases, &unnamed).len(),
+        1
+    );
+    for class in [
+        NativeClass::Retired {
+            reason: "a duplicate",
+        },
+        NativeClass::Duplicate {
+            property: "header-sync/commit-only-authorized",
+            case: "stored-order",
+        },
+    ] {
+        let mut changed = NATIVE_MUTATIONS.to_vec();
+        let at = changed
+            .iter()
+            .position(|m| m.patch == "short-payload")
+            .unwrap();
+        changed[at].class = class;
+        assert_eq!(native_pin_errors(&changed).len(), 1, "{class:?}");
+    }
     // A mutation whose directory and classification are both removed is
     // refused, since the inventory still names it.
     let dropped: Vec<rows::NativeMutation> = NATIVE_MUTATIONS
         .iter()
-        .filter(|m| m.patch != "foreign-leases")
+        .filter(|m| m.patch != "own9-join")
         .copied()
         .collect();
     let fewer: Vec<String> = native_dirs()
         .into_iter()
-        .filter(|dir| dir != "foreign-leases")
+        .filter(|dir| dir != "own9-join")
         .collect();
     assert!(!native_errors(&dropped, &fewer, &cases, &manifest.expected).is_empty());
     // A move's record outlives its directory: once moved, its planted case
     // must exist under its property and a catch must name it.
     let mut moved = NATIVE_MUTATIONS.to_vec();
-    let at = moved
-        .iter()
-        .position(|m| m.patch == "foreign-leases")
-        .unwrap();
+    let at = moved.iter().position(|m| m.patch == "own9-join").unwrap();
     let dirs: Vec<String> = native_dirs()
         .into_iter()
-        .filter(|dir| dir != "foreign-leases")
+        .filter(|dir| dir != "own9-join")
         .collect();
     // Moved, it needs a planted case of its own name under its property,
     // named by a Caught. An existing, caught case of another name doesn't
@@ -2042,7 +2125,7 @@ fn every_native_mutation_is_classified() {
     let mut with_case = cases.clone();
     with_case.push((
         "header-sync/commit-only-authorized".into(),
-        "foreign-leases".into(),
+        "own9-join".into(),
     ));
     let mut named = manifest.expected.clone();
     let caught = named
@@ -2055,13 +2138,13 @@ fn every_native_mutation_is_classified() {
         .clone();
     let mut own = caught;
     if let Expected::Caught { case, .. } = &mut own.expected {
-        case.name = "foreign-leases";
+        case.name = "own9-join";
     }
     named.push(own);
     for (property, case, cases, expected, ok) in [
         (
             "header-sync/commit-only-authorized",
-            "foreign-leases",
+            "own9-join",
             &with_case,
             &named,
             true,
@@ -2075,14 +2158,14 @@ fn every_native_mutation_is_classified() {
         ),
         (
             "header-sync/commit-only-authorized",
-            "foreign-leases",
+            "own9-join",
             &cases,
             &manifest.expected,
             false,
         ),
         (
             "header-sync/teardown-returns-baseline",
-            "foreign-leases",
+            "own9-join",
             &with_case,
             &named,
             false,
@@ -2813,7 +2896,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let flags = "header-sync/s5v9/status/reserved-flags-closes";
+    let panic = "sim/no-task-panic";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -2834,17 +2917,17 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: flags.into(),
-            name: "reserved-flags".into(),
+            property: panic.into(),
+            name: "task-panic".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: flags,
-                name: "reserved-flags",
+                property: panic,
+                name: "task-panic",
             },
             harness,
-            set: &["header-sync/s5v9/status/reserved-flags-closes"],
+            set: &["sim/no-task-panic"],
             found,
             not_applicable,
             companions,
@@ -2935,6 +3018,37 @@ fn the_gate_requirements_match_their_obligations() {
         name: "gate-3/crossing/crossing-close".into(),
     };
     assert!(!crossing.covers(&standing.expected, NARROWING));
+    // Each row's bad-content requirement is that row's fault-close test,
+    // since a content rejection owes the close. Another row's test doesn't
+    // satisfy it, nor does its old transitional Open, nor the
+    // disconnect-mid-prepare witness: a fault found after an environment
+    // disconnect owes the penalty, not a close.
+    for (row, own) in BAD_CONTENT_CLOSES {
+        let key = Key::Requirement {
+            name: format!("gate-2/bad-content-fault-close/{row}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{row}"
+        );
+        for (other, test) in BAD_CONTENT_CLOSES {
+            if other != row {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{row}");
+            }
+        }
+        assert!(
+            !key.covers(&Expected::Passes { test: MID_PREPARE }, NARROWING),
+            "{row}"
+        );
+        let transitional = Expected::Open {
+            reason: "the bad-content history carries the fault-close assertion where the close \
+                     is owed",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{row}");
+    }
     // A requirement's own Open with only its owner changed.
     for name in ["gate-2/bad-content-close-claim", "gate-1/a-a-and-a-b-a"] {
         let requirement = GATE_REQUIREMENTS.iter().find(|r| r.name == name).unwrap();
@@ -2949,6 +3063,45 @@ fn the_gate_requirements_match_their_obligations() {
 
 /// The wire witness file.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
+
+/// Each row's bad-content fault-close test, by row.
+const BAD_CONTENT_CLOSES: [(&str, TestRef); 4] = [
+    (
+        "status",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "subscribe-headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers-outcome",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        ),
+    ),
+];
+
+/// The disconnect-mid-prepare witness, whose fault came after its session
+/// ended, so it owes the penalty and no close.
+const MID_PREPARE: TestRef = sim_test(
+    "tests/header_wire_prepare_fault.rs",
+    "a_disconnect_mid_prepare_is_still_penalized",
+);
 
 /// Each history a row judges for an ID other than the one it's run for, as
 /// `(history, ID)`: `both-ways`, run for `conformant-never-closes`,
@@ -4177,6 +4330,95 @@ fn results() -> ResultFile {
     }
 }
 
+/// A native mutation retired as a duplicate, a real one, since
+/// `Key::Native` binds to its classification.
+const DUPLICATE: &str = "short-payload";
+/// The planted case its classification names as covering it.
+const DUPLICATE_CASE: CaseRef = CaseRef {
+    property: "header-sync/commit-only-authorized",
+    name: "dropped-payload-header",
+};
+/// The node harness the covering case runs on here.
+const DUPLICATE_NODE: &str = "t/commit-node";
+
+/// The duplicate's native key.
+fn duplicate_key() -> Key {
+    Key::Native {
+        patch: DUPLICATE.into(),
+    }
+}
+
+/// The covering case's catch.
+fn duplicate_caught() -> Expected {
+    Expected::Caught {
+        case: DUPLICATE_CASE,
+        harness: DUPLICATE_NODE,
+        set: &[DUPLICATE_CASE.property],
+        found: Found::AtStep,
+        companions: &[],
+        not_applicable: &[],
+    }
+}
+
+/// The test manifest and its genuine results with the duplicate added: the
+/// covering case's catch on its case key, the duplicate's native key on
+/// gate 6 sharing that catch, and the catch's three runs.
+fn with_duplicate() -> (Manifest, ResultFile) {
+    let mut manifest = manifest();
+    manifest.expected.push(er(
+        vec![Key::Case {
+            property: DUPLICATE_CASE.property.into(),
+            name: DUPLICATE_CASE.name.into(),
+        }],
+        &[Gate::G2],
+        duplicate_caught(),
+    ));
+    manifest
+        .expected
+        .push(er(vec![duplicate_key()], &[Gate::G6], duplicate_caught()));
+    manifest
+        .matrix
+        .push((DUPLICATE_NODE, DUPLICATE_CASE.property, Status::Active));
+    let property = DUPLICATE_CASE.property;
+    let run = |which, report| {
+        execution(
+            RunId::case(DUPLICATE_CASE, which),
+            DUPLICATE_NODE,
+            &[(property, report)],
+        )
+    };
+    let mut patched = run(CaseRun::Patched, Report::Violated);
+    patched.end = End::Violation {
+        property: property.into(),
+    };
+    patched.actions = Actions::Prefix;
+    let mut draft = run(CaseRun::Draft, Report::Violated);
+    draft.meta.draft_override = vec![property.into()];
+    let mut results = results();
+    results.results.push(ResultRecord {
+        expected: duplicate_caught().id().unwrap(),
+        commit: S.into(),
+        actual: Actual::Caught {
+            baseline: run(CaseRun::Baseline, held()),
+            patched,
+            draft,
+            companions: Vec::new(),
+        },
+    });
+    (manifest, results)
+}
+
+/// The state [`with_duplicate`]'s evaluation gives the duplicate's key
+/// once `defect` changes its manifest or results, against the keys the
+/// unchanged manifest requires.
+fn duplicate_state(defect: impl FnOnce(&mut Manifest, &mut ResultFile)) -> ObligationState {
+    let (mut manifest, mut results) = with_duplicate();
+    let required = required(&manifest);
+    defect(&mut manifest, &mut results);
+    header_acceptance::evaluate(&manifest, &required, &results, SUBJECT).keys[&duplicate_key()]
+        .clone()
+}
+
 /// The state the test manifest's evaluation gives `key`.
 fn state(manifest: &Manifest, results: &ResultFile, key: &Key) -> ObligationState {
     header_acceptance::evaluate(manifest, &required(manifest), results, SUBJECT)
@@ -4281,6 +4523,48 @@ fn the_evaluator_accepts_genuine_results() {
         "the standing exclusion is excluded"
     );
     assert!(evaluation.gates.values().all(|passes| *passes));
+
+    // A duplicate native mutation's key shares its covering case's catch,
+    // and that catch verifies it.
+    let (with, results_with) = with_duplicate();
+    let evaluation = header_acceptance::evaluate(&with, &required(&with), &results_with, SUBJECT);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    assert_eq!(evaluation.keys[&duplicate_key()], ObligationState::Verified);
+    assert!(evaluation.gates[&Gate::G6]);
+
+    // A bad-content close requirement verifies on its row's fault-close
+    // test, beside the disconnect-mid-prepare witness, which owes the
+    // penalty and no close and verifies on its own key. Swapping the
+    // requirement onto that witness's pass blocks it.
+    let (row, close) = BAD_CONTENT_CLOSES[2];
+    let requirement = Key::Requirement {
+        name: format!("gate-2/bad-content-fault-close/{row}"),
+    };
+    let mut owed = manifest.clone();
+    owed.expected.push(er(
+        vec![requirement.clone()],
+        &[Gate::G2],
+        Expected::Passes { test: close },
+    ));
+    owed.expected.push(er(
+        vec![witness_key(MID_PREPARE)],
+        &[Gate::G2],
+        Expected::Passes { test: MID_PREPARE },
+    ));
+    let mut passed = results();
+    passed.results.push(test_record(close));
+    passed.results.push(test_record(MID_PREPARE));
+    for key in [&requirement, &witness_key(MID_PREPARE)] {
+        assert_eq!(
+            state(&owed, &passed, key),
+            ObligationState::Verified,
+            "{key:?}"
+        );
+    }
+    let mut swapped = owed.clone();
+    let at = covering(&swapped, &requirement);
+    swapped.expected[at].expected = Expected::Passes { test: MID_PREPARE };
+    assert!(blocked(&state(&swapped, &passed, &requirement)));
 
     // A catch stopped at a step is a prefix: another property may still be
     // open there.
@@ -4735,6 +5019,38 @@ fn the_evaluator_refuses_each_single_defect() {
     refused(&Key::passing("t/a"), |r| {
         run_of(r, &holds_id()).meta.input = Some(HISTORY.into())
     });
+    // A duplicate native mutation blocks unless its covering case is
+    // caught: the case never ran, its patched run held, the catch covering
+    // it is gone, or it shares another case's catch.
+    let covering = duplicate_caught().id().unwrap();
+    for state in [
+        duplicate_state(|_, r| r.results.retain(|record| record.expected != covering)),
+        duplicate_state(|_, r| {
+            let patched = caught_runs(r, DUPLICATE_CASE).1;
+            patched.end = End::Completed;
+            patched.actions = Actions::Complete;
+            patched
+                .reports
+                .insert(DUPLICATE_CASE.property.into(), held());
+        }),
+        duplicate_state(|m, _| m.expected.retain(|e| e.keys != [duplicate_key()])),
+        duplicate_state(|m, _| {
+            let other = m
+                .expected
+                .iter()
+                .find(|e| matches!(e.expected, Expected::Caught { case, .. } if case == CASE))
+                .unwrap()
+                .expected
+                .clone();
+            for result in &mut m.expected {
+                if result.keys == [duplicate_key()] {
+                    result.expected = other.clone();
+                }
+            }
+        }),
+    ] {
+        assert!(blocked(&state), "{state:?}");
+    }
 }
 
 /// Manifest-side defects: each must block the key it touches.

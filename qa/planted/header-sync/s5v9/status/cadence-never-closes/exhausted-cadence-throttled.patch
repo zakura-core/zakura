@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index d58ffec1c8..856c356471 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -2771,6 +2771,8 @@ fn admit_inbound_message(
+                 None,
+                 None,
+             );
++            // Mutation: an exhausted cadence bucket throttles the frame.
++            return InboundMessageAdmission::Throttled;
+         }
+         return InboundMessageAdmission::Admit;
+     }

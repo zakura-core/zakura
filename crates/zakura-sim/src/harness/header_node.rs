@@ -1365,8 +1365,10 @@ impl Topology {
         // cancelled, or when the node cancels its own session token alone, as
         // it does to refuse or retire the session. A hook runs inside that
         // `cancel` and is no scheduling point, so it records the instant.
+        // It holds the store weakly: a store can hold the token, and so the
+        // hook, which would otherwise own the registry that owns the store.
         let ended = |token: &CancellationToken| {
-            let ended = self.effects.ended.clone();
+            let ended = self.effects.ended.downgrade();
             token.on_cancel(move || {
                 // The run's own teardown cancels after its evidence froze.
                 let Some(now) = zakura_scheduler::hooks::now() else {

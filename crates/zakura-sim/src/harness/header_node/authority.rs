@@ -52,6 +52,7 @@ use zakura_network::zakura::{
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
+pub(crate) use finding::ledger_record;
 use finding::{spell_frontier, spell_hash, spell_hashes};
 pub use finding::{
     Attribution, AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, EngineRunRef,
@@ -227,6 +228,8 @@ impl Authority {
                 self.started.insert(subscription);
             }
             ReactorEvent::PageStaged {
+                from_peer,
+                from_session,
                 request,
                 subscription,
                 ancestor,
@@ -235,14 +238,18 @@ impl Authority {
                 ..
             } => {
                 self.applies();
-                let subscription = (request.peer.clone(), request.session_id, *subscription);
-                self.path(
-                    request.incarnation,
-                    &subscription,
-                    *ancestor,
+                // The round's whole identity, its request's, finds the path
+                // it asked for, so a foreign page's own subscription ID never
+                // reads or moves another `Open`'s path. The finding names the
+                // page where it arrived, as the ledger's `ForeignPage` does,
+                // which differs only for a foreign page.
+                let requested = (request.peer.clone(), request.session_id, request.request_id);
+                let page = AuthoritySubject::page(
+                    &(from_peer.clone(), *from_session, *subscription),
                     hashes,
                     *frame,
                 );
+                self.path(request.incarnation, &requested, page, *ancestor, hashes);
             }
             _ => {}
         }
@@ -363,18 +370,17 @@ impl Authority {
         }
     }
 
-    /// Judges the page round `incarnation` staged on `subscription`, which
-    /// came in `frame`, declared `ancestor` and carried `hashes`, against
-    /// the fixture and the subscription's `Open`.
+    /// Judges `subject`, the page round `incarnation` staged on
+    /// `subscription`, its round's, which declared `ancestor` and carried
+    /// `hashes`, against the fixture and the subscription's `Open`.
     fn path(
         &mut self,
         incarnation: u64,
         subscription: &Subscription,
+        subject: AuthoritySubject,
         ancestor: Frontier,
         hashes: &[block::Hash],
-        frame: Option<u64>,
     ) {
-        let subject = AuthoritySubject::page(subscription, hashes, frame);
         let Some(open) = self.opens.get(subscription).cloned() else {
             self.breaks.push(AuthorityFinding::new(
                 AuthorityRule::Path,

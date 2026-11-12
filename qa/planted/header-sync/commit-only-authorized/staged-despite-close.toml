@@ -1,0 +1,13 @@
+# The subscriber keeps its linkage fault for the unlinked page, so the
+# reader still closes the connection with it, but admits the page first,
+# forwards it to the reactor and yields before raising the fault, so the
+# page stages despite the close (hdr-14 gap 6). Closing right after the
+# forward lets the session's teardown drop the page unstaged.
+# The input is the saved bad-content Plan, whose act is that page. The
+# case's row also judges its Draft run's three companions: the fault close
+# of the page's connection, the page's PageStaged, and the catch as that
+# page's path break.
+input = "crates/zakura-sim/tests/fixtures/header-wire-bad-content.bin"
+# The subscriber, the reader and the reactor decide whether the act's page
+# is refused, closed or staged, so a change there can move the input off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

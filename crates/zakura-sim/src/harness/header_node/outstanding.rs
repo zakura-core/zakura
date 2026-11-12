@@ -436,8 +436,9 @@ pub(super) struct Outstanding {
     now: Option<Duration>,
     /// Each admitted peer's current session.
     admitted: HashMap<ZakuraPeerId, u64>,
-    /// Each dispatched call with no `CallEnded`.
-    calls: HashMap<u64, Open>,
+    /// Each dispatched call with no `CallEnded`, by call, so breaks about
+    /// them come in call order.
+    calls: BTreeMap<u64, Open>,
     /// Each call holding headers by a `HeadersHeld` with no `HeadersEnded`,
     /// with how many.
     holding: HashMap<u64, usize>,
@@ -514,7 +515,7 @@ impl Outstanding {
             departed_limit,
             now: None,
             admitted: HashMap::new(),
-            calls: HashMap::new(),
+            calls: BTreeMap::new(),
             holding: HashMap::new(),
             pages: HashMap::new(),
             completed: HashSet::new(),
@@ -1159,12 +1160,17 @@ impl Outstanding {
                 ));
             }
         }
-        let mut reads: HashMap<&BodyWorkOwner, usize> = HashMap::new();
+        // Each owner's open reads, in the order of its first call, so the
+        // breaks don't follow a hash order.
+        let mut reads: Vec<(&BodyWorkOwner, usize)> = Vec::new();
         for open in self.calls.values() {
             let Open::VctContext(owner, dispatched) = open else {
                 continue;
             };
-            *reads.entry(owner).or_default() += 1;
+            match reads.iter_mut().find(|(read, _)| *read == owner) {
+                Some((_, count)) => *count += 1,
+                None => reads.push((owner, 1)),
+            }
             // See the module docs: the shutdown unit's reads aren't judged
             // by age.
             if self.shut_down {
@@ -1181,7 +1187,10 @@ impl Outstanding {
                 ));
             }
         }
-        self.peak("repair context reads", reads.values().sum());
+        self.peak(
+            "repair context reads",
+            reads.iter().map(|(_, count)| count).sum(),
+        );
         for (owner, count) in reads {
             if count > 1 {
                 found.push(format!(
@@ -1569,7 +1578,9 @@ impl Outstanding {
     /// applicable at `step` if a `Sizes` was judged since the last call.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
         if !self.unseen_tips.is_empty() {
-            let unseen = std::mem::take(&mut self.unseen_tips);
+            let mut unseen: Vec<block::Hash> =
+                std::mem::take(&mut self.unseen_tips).into_iter().collect();
+            unseen.sort_unstable_by_key(|tip| tip.0);
             if let Some(held) = (self.held.0)() {
                 for tip in unseen {
                     if held.contains(&tip) {

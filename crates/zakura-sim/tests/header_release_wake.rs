@@ -22,6 +22,7 @@ use std::{
 };
 
 use serde_json::Value;
+use support::patched::{run_ok, Worktree};
 use tempfile::TempDir;
 use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
@@ -1165,50 +1166,6 @@ const WAKE_BYPASSES: [(&str, &str); 2] = [
     ("missed-refill-deadline", "header-release-wake-deferred.bin"),
 ];
 
-/// Runs `command`, and panics with its output unless it exits 0.
-fn run_ok(command: &mut Command) {
-    let output = command.output().expect("the command runs");
-    assert!(
-        output.status.success(),
-        "{command:?} exited with {}:\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-/// `git` in `dir`.
-fn git(dir: &Path) -> Command {
-    let mut git = Command::new("git");
-    git.arg("-C").arg(dir);
-    git
-}
-
-/// Removes the scratch worktree at `worktree` from `repo`, if there is one.
-fn remove_worktree(repo: &Path, worktree: &Path) {
-    if worktree.exists() {
-        run_ok(
-            git(repo)
-                .args(["worktree", "remove", "--force"])
-                .arg(worktree),
-        );
-    }
-}
-
-/// Removes its scratch worktree when dropped, so a failed assertion leaves
-/// none behind.
-struct Worktree<'a> {
-    repo: &'a Path,
-    path: PathBuf,
-}
-
-impl Drop for Worktree<'_> {
-    /// Removes the worktree.
-    fn drop(&mut self) {
-        remove_worktree(self.repo, &self.path);
-    }
-}
-
 /// C15 (hf-5): a planted wake bypass's patched run settles, on each wake
 /// fixture. Each case of [`WAKE_BYPASSES`] is applied in a scratch worktree
 /// of `HEAD`, beside the planted runner's, and built as the runner builds a
@@ -1225,50 +1182,12 @@ impl Drop for Worktree<'_> {
 /// matches exactly.
 #[test]
 fn a_bypassed_wake_s_patched_draft_run_settles() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("the repository root resolves");
     let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("release-wake-bypass");
-    let worktree = work.join("worktree");
-    remove_worktree(&repo, &worktree);
-    fs::create_dir_all(&work).expect("the scratch directory is writable");
-    run_ok(
-        git(&repo)
-            .args(["worktree", "add", "--detach"])
-            .arg(&worktree)
-            .arg("HEAD"),
-    );
-    let worktree = Worktree {
-        repo: &repo,
-        path: worktree,
-    };
-    let target = work.join("target");
+    let worktree = Worktree::of_head(&work);
     for (case, input) in WAKE_BYPASSES {
-        run_ok(git(&worktree.path).args(["reset", "--hard", "--quiet", "HEAD"]));
-        run_ok(git(&worktree.path).arg("apply").arg(format!(
+        let patched = worktree.build_patched(&format!(
             "qa/planted/header-sync/capacity-release-wakes/{case}.patch"
-        )));
-        run_ok(
-            Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-                .current_dir(&worktree.path)
-                .env("RUSTFLAGS", "--cfg zakura_sim")
-                .env("CARGO_TARGET_DIR", &target)
-                // The bypass can leave code unused, as the planted runner
-                // allows.
-                .env("CARGO_BUILD_WARNINGS", "warn")
-                .args([
-                    "build",
-                    "--locked",
-                    "--profile",
-                    "planted",
-                    "-p",
-                    "zakura-sim",
-                    "--bin",
-                    "zakura-sim",
-                ]),
-        );
-        let patched = target.join("planted").join("zakura-sim");
+        ));
         let out = work.join(case);
         if out.exists() {
             fs::remove_dir_all(&out).expect("the old recording is removable");

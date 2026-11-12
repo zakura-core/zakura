@@ -144,6 +144,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_reserved_flags_twice_script"
+run = false
+reason = "a tool, not a test: it rewrites the committed two-frame reserved-flags script from its builder"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_authority.rs"
 test = "regenerate_authority_witnesses"
 run = false

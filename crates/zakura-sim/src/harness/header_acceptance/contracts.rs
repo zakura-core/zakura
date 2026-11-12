@@ -900,8 +900,18 @@ const LATER_ANCESTOR: CaseRef = CaseRef {
 /// C21's proving catches: [`LATER_ANCESTOR`], the real-tap two-finding
 /// history the claim-reading tests can't give, since `ClaimRun` and the
 /// scripted claim cases insert their claim records themselves (Adam's
-/// ruling on question 8).
-const C21_CATCHES: &[CaseRef] = &[LATER_ANCESTOR];
+/// ruling on question 8), and `two-reserved-flags-skipped`, the generated
+/// receiver checks' two findings at one boundary through the real reader,
+/// which C21_PROVING's
+/// `two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary`
+/// reads from its `Draft` run's full report.
+const C21_CATCHES: &[CaseRef] = &[
+    LATER_ANCESTOR,
+    CaseRef {
+        property: "header-sync/s5v9/status/reserved-flags-closes",
+        name: "two-reserved-flags-skipped",
+    },
+];
 
 /// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]'s
 /// two findings at one boundary, and `overgrant`, whose patched `Draft`
@@ -944,7 +954,14 @@ const C15_PROVING: &[TestRef] = &[
 /// claim-reading checks share one test, and `commit-only-authorized` and
 /// `header-fault-penalized` are C22's and C13's. `honest-progress` and
 /// `bounded-adversary-progress` find at most one failure in a run, as their
-/// checks say, so they have none.
+/// checks say, so they have none. The generated receiver checks' is the
+/// reserved-flags case's patched `Draft` run.
+///
+/// The last two are the unit-level proof that stays for what C21 excludes
+/// as a real-path two-finding catch: `check_honest_never_punished` and
+/// `downstream::check_with`, which the sender templates share, record
+/// every finding at a step after the first, shown on scripted
+/// observations.
 const C21_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_sync.rs",
@@ -981,6 +998,18 @@ const C21_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_sync.rs",
         "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+    sim_test(
+        "tests/header_wire_witness.rs",
+        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
+    ),
+    sim_test(
+        "tests/header_wire_witness.rs",
+        "every_punishment_of_an_honest_peer_at_a_step_is_reported",
+    ),
+    sim_test(
+        "tests/sender_properties.rs",
+        "every_sender_violation_at_a_step_is_reported",
     ),
 ];
 
@@ -1216,10 +1245,10 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C19 and C22 by hf-4 and
-/// hf-9 with their planted catches. Every other row's deliveries landed, and its state
-/// names what's still missing: C4's and C21's proving tests pass, but don't
-/// yet prove them.
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C19, C21 and C22 by hf-4,
+/// hf-8 and hf-9 with their planted catches, C21 narrowed. Every other
+/// row's deliveries landed, and its state names what's still missing: C4's
+/// proving tests pass, but don't yet prove it.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1408,20 +1437,26 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
+        // Narrowed by Adam, 2026-11-12: two exclusions from its real-path
+        // proof, each with its unit-level proof kept (C21_PROVING's last two).
         Contract {
             proving_catches: C21_CATCHES,
-            ..proved_short(
+            ..satisfied(
                 C21,
                 "Adam's harness",
-                "Every header check keeps every finding at a boundary, not just its first.",
+                "Every header check keeps every finding at a boundary, not just its first: the \
+                 node checks, with commit-only-authorized through later-ancestor's real-tap \
+                 catch, and the generated `header-sync/s5v9` receiver checks, through \
+                 status/reserved-flags-closes' two-reserved-flags-skipped. It excludes two \
+                 things as real-path two-finding proof. `session/honest-never-punished`: \
+                 production closes one connection per task, so two punishments never share \
+                 a step. The generated `sender-*` templates: the sender case was untried. \
+                 Their unit-level proof stays: `check_honest_never_punished` and \
+                 `downstream::check_with` keep every finding at a step, as \
+                 every_punishment_of_an_honest_peer_at_a_step_is_reported and \
+                 every_sender_violation_at_a_step_is_reported show.",
                 C21_PROVING,
-                "hf-8",
-                "a planted case whose patched Draft run gives two findings at one boundary, \
-                 as C21_CATCHES' does for commit-only-authorized, for the generated \
-                 `header-sync/s5v9` receiver and sender checks and for \
-                 `session/honest-never-punished`, which `wire_properties` registers and which \
-                 can each find several failures at one boundary. No planted case's run does \
-                 that yet",
+                "hf-8, with its planted catches",
             )
         },
         Contract {

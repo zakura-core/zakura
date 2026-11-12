@@ -13,6 +13,7 @@ use std::{collections::BTreeSet, rc::Rc};
 
 use support::{
     inputs,
+    patched::{run_ok, Worktree},
     script::{run_scripted, run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::v9::RegtestMessage;
@@ -1059,9 +1060,11 @@ const DEFAULT_PLAN: &str = "header-wire-default.plan";
 
 /// The committed scenarios of the generated IDs' typed planted cases
 /// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
-/// focused scenario ([`act_scenario`]) for each act no saved Plan takes, an
-/// adversary serving the node its chain and the held subscription, both
-/// with no act, and the node serving an honest subscriber. The saved Plans' inputs serve the other cases.
+/// focused scenario ([`act_scenario`]) for each act no saved Plan takes,
+/// the status bursts' cut at the 20th, an adversary serving the node its chain and the held subscription, both
+/// with no act, the node serving an honest subscriber, and two reserved
+/// flags `Status` frames over fixed 0 ms links, the two-finding case's.
+/// The saved Plans' inputs serve the other cases.
 fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     let act = |name, act| (name, act_scenario(act));
     let mut held = act_scenario(Act::MinPayload {
@@ -1070,6 +1073,11 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     held.peers[0].script.clear();
     let mut serving = act_scenario(Act::ExtraEnding);
     serving.peers[0].script.clear();
+    // The 20th burst's frame is the first to find the `Status` bucket
+    // empty, so `exhausted-cadence-throttled`'s script ends there, leaving
+    // its patched close no burst to try on the closed connection.
+    let mut burst = act_scenario(Act::StatusBurst);
+    burst.peers[0].script.truncate(20);
     vec![
         act(
             "status-bad-content",
@@ -1077,7 +1085,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
                 rule: ContentRule::StatusAnchor,
             },
         ),
-        act("status-burst", Act::StatusBurst),
+        ("status-burst", burst),
         act(
             "subscribe-headers-reserved-flags",
             Act::ReservedFlags {
@@ -1148,6 +1156,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
         ("serving-adversary", serving),
         ("held-subscription", held),
         ("served-subscription", served_subscription()),
+        ("status-reserved-flags-twice", reserved_flags_twice()),
     ]
 }
 
@@ -1172,6 +1181,172 @@ fn served_subscription() -> WireScenario {
         policy: Policy::converging(),
         ..WireScenario::default()
     }
+}
+
+/// Two reserved flags `Status` frames from one adversary holding the
+/// node's chain, over fixed 0 ms links, so the script alone decides when
+/// each frame arrives: the two-finding case's scenario.
+fn reserved_flags_twice() -> WireScenario {
+    let reserved = Act::ReservedFlags {
+        row: Row::Status,
+        bit: 0,
+    };
+    let mut twice = act_scenario(reserved);
+    twice.peers[0].script = vec![PeerAction::Act { act: reserved }; 2];
+    twice.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        ..twice.net.default_link
+    };
+    twice
+}
+
+/// The two-finding case's committed script.
+const RESERVED_FLAGS_TWICE_SCRIPT: &str =
+    "header-wire-planted-status-reserved-flags-twice.script.json";
+
+/// The adversary's datagram link to the node, as `deliver:` names it.
+const PEER_TO_NODE: &str = "10.1.0.1:4000->10.0.0.1:4000";
+
+/// Whether `identity`, as the next pick after `log`, would let the two
+/// reserved flags frames reach the node's reader together:
+///
+/// - the second act, while no datagram has left the peer since the first
+///   act ran, so both frames would ride one packet;
+/// - the delivery of a datagram the peer sent after its second act, while
+///   the node's reader hasn't judged the first frame, so both would be
+///   judged at one step.
+fn joins_the_frames(log: &[zakura_sim::observe::Entry], identity: &str) -> bool {
+    let position = |found: &dyn Fn(&Observation) -> bool| -> Vec<usize> {
+        log.iter()
+            .enumerate()
+            .filter(|(_, entry)| found(&entry.obs))
+            .map(|(at, _)| at)
+            .collect()
+    };
+    let ran =
+        position(&|obs| matches!(obs, Observation::ActRan { act, .. } if act == "reserved-flags"));
+    let started = log.iter().any(|entry| {
+        matches!(
+            entry.obs,
+            Observation::PeerFrame {
+                label: Label::ReservedFlags,
+                ..
+            }
+        )
+    });
+    let sent_after = |at: usize| {
+        log[at..].iter().any(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Datagram { link, outcome: zakura_sim::observe::DatagramOutcome::Sent, .. }
+                    if link == PEER_TO_NODE
+            )
+        })
+    };
+    if identity == "peer:peer-0:reserved-flags" {
+        return started && ran.first().is_none_or(|&first| !sent_after(first));
+    }
+    let Some(id) = identity
+        .strip_prefix(&format!("deliver:{PEER_TO_NODE}:"))
+        .and_then(|id| id.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let Some(&second) = ran.get(1) else {
+        return false;
+    };
+    let carries_second = log[second..].iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::Datagram { id: sent, link, .. } if *sent == id && link == PEER_TO_NODE
+        )
+    });
+    let first_frame = log.iter().find_map(|entry| match entry.obs {
+        Observation::PeerFrame {
+            seq,
+            label: Label::ReservedFlags,
+            ..
+        } => Some(seq),
+        _ => None,
+    });
+    let judged = log.iter().any(|entry| {
+        matches!(entry.obs, Observation::FrameJudged { seq, .. } if Some(seq) == first_frame)
+    });
+    carries_second && !judged
+}
+
+/// The default Plan on `header-sync/wire`, steered over
+/// [`reserved_flags_twice`] so the two frames ride two packets and the
+/// node's reader judges them at two steps ([`joins_the_frames`]): the
+/// script the two-finding case runs.
+fn reserved_flags_twice_script() -> Plan {
+    use support::steer::{before, steer, Steer};
+    use zakura_sim::{Checker, MemorySink};
+    let scenario = reserved_flags_twice();
+    let rule = |cx: &zakura_sim::StepCtx<'_>| -> Result<Steer, String> {
+        let log = before(cx);
+        if !joins_the_frames(log, &cx.pick.to_string()) {
+            return Ok(Steer::Fine);
+        }
+        cx.enabled
+            .iter()
+            .map(|enabled| enabled.identity.to_string())
+            .find(|identity| !joins_the_frames(log, identity))
+            .map(Steer::Pick)
+            .ok_or_else(|| "every enabled pick joins the frames".to_owned())
+    };
+    let mut run = |plan: PlanInput, checker: &mut dyn Checker| {
+        let mut sink = MemorySink::default();
+        let report = match run_prepared::<HeaderWire>(
+            &scenario,
+            HeaderWire::prepare(&scenario),
+            plan,
+            &mut sink,
+            Some(checker),
+        ) {
+            Ok(report) => report,
+            Err(HarnessError::Run { report, .. }) => *report,
+            Err(error) => panic!("{error}"),
+        };
+        (report, sink.lines())
+    };
+    let (_, plan, _) = steer(Plan::from_fuzz(&[]), &rule, &mut run);
+    let PlanInput::Script(plan) = plan else {
+        panic!("the default Plan sends both frames in one packet, so steering scripts it");
+    };
+    plan
+}
+
+/// The two-finding case's committed script is what its builder gives.
+///
+/// This fails if the `header-sync/wire` schedule moves; after a deliberate
+/// change, run `regenerate_reserved_flags_twice_script`.
+#[test]
+fn the_reserved_flags_twice_script_matches_its_builder() {
+    let committed: Plan = serde_json::from_str(
+        &std::fs::read_to_string(fixture_file(RESERVED_FLAGS_TWICE_SCRIPT))
+            .expect("the script reads"),
+    )
+    .expect("a scripted Plan");
+    assert_eq!(
+        committed,
+        reserved_flags_twice_script(),
+        "run `regenerate_reserved_flags_twice_script`"
+    );
+}
+
+/// Rewrites the two-finding case's script from its builder. Run it with
+/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
+/// header_wire_witness -- --ignored regenerate_reserved_flags_twice_script`.
+#[test]
+#[ignore = "rewrites the committed two-finding script"]
+fn regenerate_reserved_flags_twice_script() {
+    let json =
+        serde_json::to_string_pretty(&reserved_flags_twice_script()).expect("Plans serialize");
+    std::fs::write(fixture_file(RESERVED_FLAGS_TWICE_SCRIPT), json + "\n")
+        .expect("the fixture directory exists");
 }
 
 /// The committed fixture file `name`.
@@ -1219,4 +1394,78 @@ fn regenerate_planted_scenarios() {
         std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
     }
     std::fs::write(fixture_file(DEFAULT_PLAN), "").expect("the fixture directory exists");
+}
+
+/// C21 for the generated receiver checks: reserved flags' two-frame planted
+/// case's patched `Draft` run keeps two distinct findings of the ID at one
+/// boundary, through the real reader and registry. The case's patch is
+/// applied in a scratch worktree of `HEAD` and built as the planted runner
+/// builds it ([`Worktree::build_patched`]), and that build records the
+/// case's scripted input as a `Draft` run of the ID, so the run goes on
+/// past the first finding.
+///
+/// The reader skips both reserved-flags `Status` frames, each at its own
+/// step, so the ID is the only one violated, and the run's full report
+/// beside its trace holds two of its findings at one step, the quiescence
+/// that concludes both open closes, each naming its own frame's step. A
+/// fresh replay by the same build matches exactly.
+#[test]
+fn two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary() {
+    use serde_json::Value;
+    const ID: &str = "header-sync/s5v9/status/reserved-flags-closes";
+    let case =
+        "qa/planted/header-sync/s5v9/status/reserved-flags-closes/two-reserved-flags-skipped";
+    let work = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("reserved-flags-twice");
+    let worktree = Worktree::of_head(&work);
+    let patched = worktree.build_patched(&format!("{case}.patch"));
+    let file: toml::Table = toml::from_str(
+        &std::fs::read_to_string(worktree.path.join(format!("{case}.toml")))
+            .expect("the case file reads"),
+    )
+    .expect("a case file");
+    let typed = file["typed"].as_table().expect("a typed case");
+    let input = |key: &str| worktree.path.join(typed[key].as_str().expect("a path"));
+    let out = work.join("draft");
+    if out.exists() {
+        std::fs::remove_dir_all(&out).expect("the old recording is removable");
+    }
+    run_ok(
+        std::process::Command::new(&patched)
+            .args(["record", "--sim", HeaderWire::NAME, "--scenario"])
+            .arg(std::fs::read_to_string(input("scenario")).expect("the scenario reads"))
+            .arg("--script")
+            .arg(input("script"))
+            .args(["--draft", ID, "--out"])
+            .arg(&out),
+    );
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join(zakura_sim::record::FULL_REPORT_FILE))
+            .expect("the run wrote its full report"),
+    )
+    .expect("the full report is JSON");
+    let properties = report["properties"]
+        .as_array()
+        .expect("the report lists each property");
+    let violated: Vec<&str> = properties
+        .iter()
+        .filter(|property| property["outcome"].get("violated").is_some())
+        .filter_map(|property| property["property"].as_str())
+        .collect();
+    assert_eq!(violated, [ID], "only the skipped frames' ID is violated");
+    let findings = properties
+        .iter()
+        .find(|property| property["property"] == ID)
+        .and_then(|property| property["violations"].as_array())
+        .expect("the ID lists its findings");
+    let [first, second] = &findings[..] else {
+        panic!("two findings: {findings:?}");
+    };
+    assert_eq!(first["step"], second["step"], "both at one boundary");
+    let opened = |finding: &Value| finding["witness"][0].as_u64().expect("an opening step");
+    assert!(
+        opened(first) < opened(second) && opened(second) < first["step"].as_u64().unwrap(),
+        "each opened at its own frame's step, before the boundary: {findings:?}"
+    );
+    assert_ne!(first["actual"], second["actual"], "two distinct findings");
+    run_ok(std::process::Command::new(&patched).arg("replay").arg(&out));
 }

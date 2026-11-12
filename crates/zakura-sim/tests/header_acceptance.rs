@@ -4778,9 +4778,12 @@ fn the_evaluator_accepts_genuine_results() {
 
     // A set judged on the Draft run: the patched run stops at the case's
     // own ID alone, and the Draft run, with the whole set as its override,
-    // violates every member by its end. The patched run with the broader ID
-    // violated too, or stopped by it, and a Draft run that doesn't violate
-    // it, each block the case.
+    // violates every member by its end, which the baseline doesn't (the
+    // Draft-set rule, `evaluate::caught_draft`). The patched run with the
+    // broader ID violated too, or stopped by it, a Draft run that doesn't
+    // violate it, and a baseline that violates a member each block the
+    // case. That last one is the reviewers' unrelated bug: a member broken
+    // in both runs isn't the patch's doing.
     let late = Key::Case {
         property: "t/a".into(),
         name: "late-bug".into(),
@@ -4791,9 +4794,10 @@ fn the_evaluator_accepts_genuine_results() {
         *set = &["t/a", "t/b"];
         *found = Found::AtStepSetOnDraft;
     }
-    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+    let judged_with = |stopped_by: &str, baseline_b: Report, patched_b: Report, draft_b: Report| {
         let mut file = results();
-        let (_, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        let (baseline, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        baseline.reports.insert("t/b".into(), baseline_b);
         patched.end = End::Violation {
             property: stopped_by.into(),
         };
@@ -4803,6 +4807,9 @@ fn the_evaluator_accepts_genuine_results() {
         draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
         state(&later, &file, &late)
     };
+    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+        judged_with(stopped_by, held(), patched_b, draft_b)
+    };
     assert_eq!(
         judged("t/a", held(), Report::Violated),
         ObligationState::Verified
@@ -4810,6 +4817,12 @@ fn the_evaluator_accepts_genuine_results() {
     assert!(blocked(&judged("t/a", Report::Violated, Report::Violated)));
     assert!(blocked(&judged("t/b", held(), Report::Violated)));
     assert!(blocked(&judged("t/a", held(), held())));
+    assert!(blocked(&judged_with(
+        "t/a",
+        Report::Violated,
+        held(),
+        Report::Violated
+    )));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on

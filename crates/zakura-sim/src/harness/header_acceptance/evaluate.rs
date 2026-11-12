@@ -1194,7 +1194,7 @@ fn judge(
             // The patched build's completed runs go on past the break.
             let past_break = patched_not_applicable.unwrap_or(not_applicable);
             caught_patched(manifest, patched, case, harness, set, found, past_break)?;
-            caught_draft(manifest, draft, case, harness, set, past_break)?;
+            caught_draft(manifest, baseline, draft, case, harness, set, past_break)?;
             companions_shown(companions, shown, draft)
         }
         (
@@ -1725,11 +1725,32 @@ fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), Strin
     }
 }
 
-/// A `Caught`'s `Draft` run: a completed counted run with the set as its
-/// override, every member violated, and every other property held or
-/// expected `NotApplicable`.
+/// A `Caught`'s `Draft` run, the one Draft-set judge: a completed counted
+/// run with the set as its override, judged as a counterfactual of the
+/// case's `baseline` on one input (Adam, 2026-11-12). The set passes only
+/// if all of these hold:
+///
+/// 1. the `Draft` run and the baseline ran the same harness, input,
+///    scenario and Plan, the `Draft` run from the case's patched build and
+///    the baseline from the unpatched build of the same base. The tool
+///    binds the two traces so before it counts the `Draft` run
+///    ([`counterfactual_refusal`](super::tool::counterfactual_refusal)),
+///    and fails it otherwise;
+/// 2. every member of the set is violated in the `Draft` run;
+/// 3. no member is violated in the baseline, which may hold one or never
+///    apply it;
+/// 4. nothing outside the set is violated in the `Draft` run, and every
+///    other property held or stayed `NotApplicable` as its row expects.
+///
+/// The runs are deterministic and differ only by the patch, so a member
+/// the `Draft` run breaks and the baseline doesn't is the patch's doing,
+/// however late it breaks, and needs no subject joining it to the case's
+/// own break. An independent bug would break it in the baseline too, and
+/// fail rule 3. The planted runner's `classify_draft_set` applies the same
+/// rule to its own runs.
 fn caught_draft(
     manifest: &Manifest,
+    baseline: &Execution,
     run: &Execution,
     case: super::CaseRef,
     harness: &str,
@@ -1739,6 +1760,11 @@ fn caught_draft(
     same_run(manifest, run, &RunId::case(case, CaseRun::Draft), harness)?;
     completed(run)?;
     inventory(manifest, run, harness)?;
+    if let Some(member) = violated(baseline).find(|id| set.contains(id)) {
+        return Err(format!(
+            "its baseline violates {member} of its set, so the patch didn't cause it"
+        ));
+    }
     exactly_violated(run, set)?;
     others_pass(run, set, not_applicable)
 }

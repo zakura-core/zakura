@@ -1454,7 +1454,10 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                         Actual::HarnessCaught { baseline, patched }
                     }
                     (false, Some(_)) => {
-                        let draft = checks.draft(case(CaseRun::Draft));
+                        let mut draft = checks.draft(case(CaseRun::Draft));
+                        if let Some(why) = rebuild_refusal(repo, patch, subject, &dir) {
+                            fail(&mut draft, why);
+                        }
                         let companions = companions_of(&dir, &draft, companions);
                         Actual::Caught {
                             baseline,
@@ -1609,8 +1612,9 @@ impl CaseChecks<'_> {
     /// The case's `Draft` run, as `run`, which the tool records itself with
     /// the case's rebuilt binary (C9): it must have run the committed input,
     /// from the binary the provenance check measured, which must have
-    /// passed. Its override is read from its meta, and the evaluator checks
-    /// it's the case's set.
+    /// passed, and be its baseline's counterfactual
+    /// ([`counterfactual_refusal`]). Its override is read from its meta,
+    /// and the evaluator judges its set (`evaluate::caught_draft`).
     fn draft(&self, run: RunId) -> Execution {
         let dir = self.dir.join("draft");
         let mut execution = execution(&dir, run, self.harness, RunBy::Tool);
@@ -1630,8 +1634,59 @@ impl CaseChecks<'_> {
                 format!("its trace's build source isn't the measured patched checkout's: {why}"),
             );
         }
+        if let Some(why) = counterfactual_refusal(self.dir, self.subject_source) {
+            fail(&mut execution, why);
+        }
         execution
     }
+}
+
+/// Why the `Draft` run in case directory `dir` isn't its baseline's
+/// counterfactual, rule 1 of the Draft-set judge (`evaluate::caught_draft`):
+/// the baseline isn't from S's own build, `subject_source`, or the `Draft`
+/// run is, or the two didn't run one harness, input, scenario and Plan
+/// ([`same_run_input`]). The `Draft` run's own build is the measured
+/// patched checkout's, which [`CaseChecks::draft`] binds.
+pub(super) fn counterfactual_refusal(dir: &Path, subject_source: &str) -> Option<String> {
+    let check = || -> Result<(), String> {
+        let (baseline, draft) = (dir.join("baseline"), dir.join("draft"));
+        binding::check_trace(
+            &baseline,
+            &Expect::new().with(Field::Source, subject_source),
+        )
+        .map_err(|why| format!("its baseline isn't from the unpatched build: {why}"))?;
+        let draft_meta = binding::trace_meta(&draft)?;
+        if draft_meta.pointer("/build/source").and_then(Value::as_str) == Some(subject_source) {
+            return Err("it ran on the unpatched build, as its baseline did".to_owned());
+        }
+        same_run_input(&binding::trace_meta(&baseline)?, &draft_meta)
+    };
+    check()
+        .err()
+        .map(|why| format!("it isn't its baseline's counterfactual: {why}"))
+}
+
+/// Whether `draft`, a trace's meta, ran what `baseline`'s did: the same
+/// harness, input, scenario and Plan, each as [`binding::TRACE_META`]
+/// carries it, one that names none expecting none.
+fn same_run_input(baseline: &Value, draft: &Value) -> Result<(), String> {
+    let expect = binding::TRACE_META
+        .carries
+        .iter()
+        .filter(|(field, _)| {
+            matches!(
+                field,
+                Field::Harness
+                    | Field::InputSha256
+                    | Field::InputLen
+                    | Field::Scenario
+                    | Field::Plan
+            )
+        })
+        .fold(Expect::new(), |expect, &(field, pointer)| {
+            expect.with(field, baseline.pointer(pointer).unwrap_or(&Value::Null))
+        });
+    binding::check(&binding::TRACE_META, draft, &expect)
 }
 
 /// The companions judged on `draft`, the case's `Draft` run in `dir`, from
@@ -4512,6 +4567,61 @@ mod tests {
             .expect("the trace reads")
             .id;
         assert!(read(&trace).is_empty());
+    }
+
+    /// A `Draft` run counts only as its baseline's counterfactual: the
+    /// baseline from S's build and the `Draft` run from another, both of
+    /// one harness, input, scenario and Plan. A baseline from another build,
+    /// a `Draft` run from S's, and a `Draft` run of another input or
+    /// scenario are each refused, and so is the `Draft` run's meta with any
+    /// one key of what it ran moved (Rule 25's template).
+    #[test]
+    fn a_draft_run_is_its_baseline_s_counterfactual() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let case = tempfile::tempdir().expect("a temp dir can be created");
+        record_into(&case.path().join("baseline"), "s");
+        record_into(&case.path().join("draft"), "patched");
+        assert_eq!(counterfactual_refusal(case.path(), "s"), None);
+        assert!(counterfactual_refusal(case.path(), "another").is_some());
+        let unpatched = tempfile::tempdir().expect("a temp dir can be created");
+        record_into(&unpatched.path().join("baseline"), "s");
+        record_into(&unpatched.path().join("draft"), "s");
+        assert!(counterfactual_refusal(unpatched.path(), "s").is_some());
+        for (pointer, value) in [
+            ("/input/sha256", serde_json::json!("0".repeat(64))),
+            ("/scenario", serde_json::json!({ "another": 1 })),
+        ] {
+            let moved = tempfile::tempdir().expect("a temp dir can be created");
+            record_into(&moved.path().join("baseline"), "s");
+            record_into(&moved.path().join("draft"), "patched");
+            // Only the meta line changes: the counterfactual reads it alone.
+            let path = moved.path().join("draft/trace.jsonl");
+            let text = fs::read_to_string(&path).expect("the trace is readable");
+            let (first, rest) = text.split_once('\n').expect("the trace has lines");
+            let mut meta: Value = serde_json::from_str(first).expect("the meta line is JSON");
+            *meta["meta"]
+                .pointer_mut(pointer)
+                .expect("the meta names it") = value;
+            fs::write(&path, format!("{meta}\n{rest}")).expect("the temp dir is writable");
+            assert!(
+                counterfactual_refusal(moved.path(), "s").is_some(),
+                "{pointer}"
+            );
+        }
+        let baseline = binding::trace_meta(&case.path().join("baseline")).expect("it reads");
+        let draft = binding::trace_meta(&case.path().join("draft")).expect("it reads");
+        let ran: serde_json::Map<String, Value> = ["sim", "input", "scenario", "plan"]
+            .into_iter()
+            .filter_map(|key| Some((key.to_owned(), baseline.get(key)?.clone())))
+            .collect();
+        let keys = assert_one_key_off(&Value::Object(ran), |ran| {
+            let mut moved = draft.clone();
+            for (key, value) in ran.as_object().expect("an object") {
+                moved[key] = value.clone();
+            }
+            same_run_input(&baseline, &moved).is_ok()
+        });
+        assert!(keys >= 3, "{keys}");
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task

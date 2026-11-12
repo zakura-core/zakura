@@ -3258,6 +3258,89 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     Ok(())
 }
 
+/// The mempool announces a new block and returns before removing that block's transactions,
+/// so tasks the announcement woke can run first. It removes them on its next poll.
+#[tokio::test]
+async fn mempool_yields_after_announcing_a_new_block() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _changes,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+    let mut snapshots = mempool.snapshots();
+
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
+    )
+    .await?;
+    mempool.dummy_call().await;
+
+    // Both transactions expire at block 2, so applying block 2 removes them.
+    for index in 1..=2 {
+        mempool.storage().insert(
+            expiry_fixture_transaction(index, Height(2), None),
+            Vec::new(),
+            Some(Height(1)),
+        )?;
+    }
+
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block2.clone(),
+        ),
+    )
+    .await?;
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        mempool.poll_ready(&mut cx).is_pending(),
+        "the mempool returns after announcing the block"
+    );
+    let progress = snapshots
+        .progress_on_tip(block2.hash())
+        .await
+        .expect("the mempool is still running");
+    assert!(
+        matches!(
+            progress.stage,
+            MempoolTipStage::Reconciling(work) if work.mempool_transactions == 2
+        ),
+        "the announcement reports what the mempool held: {progress:?}"
+    );
+    assert_eq!(
+        mempool.storage().transaction_count(),
+        2,
+        "the block's work has not started"
+    );
+
+    assert!(mempool.poll_ready(&mut cx).is_ready());
+    assert_eq!(mempool.storage().transaction_count(), 0);
+    assert_eq!(
+        snapshots.progress_on_tip(block2.hash()).await,
+        Some(MempoolTipProgress {
+            tip_hash: block2.hash(),
+            stage: MempoolTipStage::Reconciled,
+        })
+    );
+
+    Ok(())
+}
+
 /// Checks that the mempool service responds to AwaitOutput requests after verifying transactions
 /// that create those outputs, or immediately if the outputs had been created by transaction that
 /// are already in the mempool.

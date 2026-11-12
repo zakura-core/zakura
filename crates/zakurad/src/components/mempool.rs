@@ -574,6 +574,17 @@ impl ActiveState {
     }
 }
 
+/// A best tip change announced to snapshot readers but not applied yet.
+#[derive(Debug)]
+struct AnnouncedTip {
+    /// The change to apply.
+    tip_action: TipAction,
+    /// Whether reading the change enabled the mempool.
+    is_state_changed: bool,
+    /// What the mempool held and published when it announced the change.
+    started: TipStarted,
+}
+
 /// Mempool async management and query service.
 ///
 /// The mempool is the set of all verified transactions that this node is aware
@@ -648,6 +659,10 @@ pub struct Mempool {
 
     /// Records how the mempool applies each best tip change.
     trace: MempoolTrace,
+
+    /// A best tip change the mempool has announced to snapshot readers and will apply on its
+    /// next poll.
+    announced_tip: Option<AnnouncedTip>,
 }
 
 impl Mempool {
@@ -693,6 +708,7 @@ impl Mempool {
             verification_finished: Arc::new(Notify::new()),
             snapshot_sender: MempoolSnapshotSender::new(),
             trace: MempoolTrace::default(),
+            announced_tip: None,
         };
 
         // Make sure `is_enabled` is accurate.
@@ -960,29 +976,55 @@ impl Service<Request> for Mempool {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let is_caught_up_to_start = self.is_caught_up_to_start();
-        let should_check_tip = self.is_enabled() || is_caught_up_to_start;
-        let tip_action = should_check_tip
-            .then(|| self.chain_tip_change.last_tip_change())
-            .flatten();
+        let (tip_action, is_state_changed, tip_started) = match self.announced_tip.take() {
+            // The block announced on the previous poll: do its work now.
+            Some(AnnouncedTip {
+                tip_action,
+                is_state_changed,
+                started,
+            }) => (Some(tip_action), is_state_changed, Some(started)),
 
-        let is_state_changed = self.update_state(tip_action.as_ref(), is_caught_up_to_start);
+            None => {
+                let is_caught_up_to_start = self.is_caught_up_to_start();
+                let should_check_tip = self.is_enabled() || is_caught_up_to_start;
+                let tip_action = should_check_tip
+                    .then(|| self.chain_tip_change.last_tip_change())
+                    .flatten();
+
+                let is_state_changed =
+                    self.update_state(tip_action.as_ref(), is_caught_up_to_start);
+
+                tracing::trace!(is_enabled = ?self.is_enabled(), ?is_state_changed, "started polling the mempool...");
+
+                // When the mempool is disabled we still return that the service is ready.
+                // Otherwise, callers could block waiting for the mempool to be enabled.
+                if !self.is_enabled() {
+                    self.publish_snapshot(true);
+                    return Poll::Ready(Ok(()));
+                }
+
+                // Say how much work the new block is before doing any of it, then let the
+                // tasks that announcement woke run before the work starts. A task woken from
+                // inside this poll waits in a slot of this worker thread that other threads
+                // do not take, so a mining long poll would otherwise only see the
+                // announcement after the whole removal, too late to answer at once.
+                if let Some(tip_action) = tip_action {
+                    let started = self
+                        .publish_tip_started(&tip_action)
+                        .expect("the mempool is enabled, checked above");
+                    self.announced_tip = Some(AnnouncedTip {
+                        tip_action,
+                        is_state_changed,
+                        started,
+                    });
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                (None, is_state_changed, None)
+            }
+        };
         let publish_for_tip = is_state_changed || tip_action.is_some();
-
-        tracing::trace!(is_enabled = ?self.is_enabled(), ?is_state_changed, "started polling the mempool...");
-
-        // When the mempool is disabled we still return that the service is ready.
-        // Otherwise, callers could block waiting for the mempool to be enabled.
-        if !self.is_enabled() {
-            self.publish_snapshot(true);
-            return Poll::Ready(Ok(()));
-        }
-
-        // Say how much work the new block is before doing any of it: a mining long poll
-        // answers without the mempool's transactions rather than wait out a long removal.
-        let tip_started = tip_action
-            .as_ref()
-            .and_then(|tip_action| self.publish_tip_started(tip_action));
 
         // How the tip change was applied, traced once its result is published.
         let mut applied = None;

@@ -22,8 +22,10 @@ pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 /// The bound keeps a lagging mempool from holding back work on the new tip. On a Mainnet node
 /// running this code, over 46 new blocks with up to 7 transactions waiting, we have not
 /// observed worse than 3.5 ms from the node seeing a new block to returning the full template.
-/// The mempool's part of that was at most 0.3 ms.
-pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+/// The mempool's part of that was at most 0.3 ms. A long poll only waits when the mempool
+/// reports light work (see [`NEW_TIP_MEMPOOL_LIGHT_WORK`]), so a short bound costs few full
+/// first answers.
+pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The most work the mempool may report for a new block for a long poll answered on that tip
 /// to wait for the mempool's transactions. Above it, the long poll answers with the
@@ -36,15 +38,12 @@ pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_
 /// number predicts how long it takes to have its transactions for the block ready.
 ///
 /// The limit is set so that the wait is only started when the mempool is expected to finish
-/// within [`NEW_TIP_MEMPOOL_WAIT`]: at 100 to 200 ns for each part, this much work takes 5 to
-/// 10 ms. A long poll that waits and then answers coinbase-only delays work on the new tip
-/// for nothing: on blocks the mempool needed 63 to 100 ms for, every waiting long poll spent
-/// the whole wait and still answered coinbase-only.
-///
-/// Provisional: for each block, the mempool trace records the work in its separate parts and
-/// `ready_us`, the time from reporting the work to publishing the block's transactions, which
-/// is the time a waiting long poll sees. Measurements of both set this value.
-pub const NEW_TIP_MEMPOOL_LIGHT_WORK: usize = 50_000;
+/// within [`NEW_TIP_MEMPOOL_WAIT`]. On an isolated regtest node, the time from reporting the
+/// work to publishing the block's transactions was 1.1 to 1.5 µs for each part: 1,817 parts
+/// took 1.1 ms, 39,276 parts 54 to 59 ms, and 79,275 parts 80 to 93 ms. At the slowest rate,
+/// this limit is about 4.5 ms. A long poll that waits and then answers coinbase-only delays
+/// work on the new tip for nothing.
+pub const NEW_TIP_MEMPOOL_LIGHT_WORK: usize = 3_000;
 
 /// How many long polls answered on a new tip may build a full template at the same time.
 ///

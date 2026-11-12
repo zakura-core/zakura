@@ -4051,6 +4051,10 @@ fn rpc_counting_mempool_requests(
     (rpc, requests)
 }
 
+/// Part of the wait for the mempool on a new tip, in whole milliseconds, since tokio's timers
+/// round up to the millisecond.
+const PART_OF_NEW_TIP_WAIT: Duration = Duration::from_millis(2);
+
 /// The work a mempool holding `mempool_transactions` reports for a block, `work` in all.
 fn reported_work(mempool_transactions: usize, work: usize) -> mempool::MempoolTipWork {
     let reported = mempool::MempoolTipWork {
@@ -4079,7 +4083,7 @@ async fn first_answer_on_new_tip_waits_for_the_mempool_to_process_the_block() {
     let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
     tokio::pin!(populated_mempool);
     assert!(
-        tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
+        tokio::time::timeout(PART_OF_NEW_TIP_WAIT, &mut populated_mempool)
             .await
             .is_err(),
         "the old tip's transactions are not offered for the new tip"
@@ -4117,7 +4121,7 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
     let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
     tokio::pin!(populated_mempool);
     assert!(
-        tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
+        tokio::time::timeout(PART_OF_NEW_TIP_WAIT, &mut populated_mempool)
             .await
             .is_err(),
         "a mempool that has reported nothing on the new tip is waited for"
@@ -4133,7 +4137,7 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
     );
     assert_eq!(
         started.elapsed(),
-        NEW_TIP_MEMPOOL_WAIT / 2,
+        PART_OF_NEW_TIP_WAIT,
         "the wait ends when the mempool reports the work"
     );
 
@@ -4200,7 +4204,7 @@ async fn first_answer_on_new_tip_waits_for_a_mempool_with_light_work() {
     let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
     tokio::pin!(populated_mempool);
     assert!(
-        tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT / 2, &mut populated_mempool)
+        tokio::time::timeout(PART_OF_NEW_TIP_WAIT, &mut populated_mempool)
             .await
             .is_err(),
         "light work is waited for"
@@ -4283,6 +4287,44 @@ async fn first_answer_on_new_tip_waits_out_heavy_work_on_another_block_and_a_fin
         EmptyReason::MempoolWaitElapsed
     );
     assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
+}
+
+/// A long poll that only runs after its wait has ended answers coinbase-only, even when the
+/// mempool has published the tip's transactions by then. On a node this happens when the
+/// mempool's work on the block holds the thread the long poll was woken on: taking the
+/// transactions then would start a full template build long after the wait.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_keeps_its_deadline_when_it_runs_late() {
+    let _init_guard = zakura_test::init();
+    let mempool_tx = fake_verified_mempool_tx();
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_OLD_TIP,
+        vec![mempool_tx.clone()],
+    )));
+    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+
+    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    tokio::pin!(populated_mempool);
+    assert!(
+        futures::poll!(&mut populated_mempool).is_pending(),
+        "the mempool has not reported on the new tip"
+    );
+
+    // The long poll is not polled again until well after its wait, by which time the mempool
+    // has finished the block and published its transactions.
+    tokio::time::advance(NEW_TIP_MEMPOOL_WAIT * 10).await;
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, reported_work(1, 2));
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_NEW_TIP,
+        vec![mempool_tx.clone()],
+    )));
+    mempool_snapshots.finish_tip(LONG_POLL_NEW_TIP);
+
+    assert_eq!(
+        populated_mempool.await.unwrap_err(),
+        EmptyReason::MempoolWaitElapsed
+    );
 }
 
 /// A long poll that reaches a new tip stops waiting for a mempool that neither answers nor

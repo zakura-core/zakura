@@ -2067,6 +2067,7 @@ where
         tip_hash: block::Hash,
     ) -> std::result::Result<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>), EmptyReason>
     {
+        let deadline = tokio::time::Instant::now() + NEW_TIP_MEMPOOL_WAIT;
         let mut mempool_snapshots = self.mempool_snapshots.clone();
 
         let mempool = tokio::select! {
@@ -2086,10 +2087,21 @@ where
                 );
                 return Err(reason);
             }
-            mempool = tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, self.mempool_on_tip(tip_hash)) => {
+            mempool = tokio::time::timeout_at(deadline, self.mempool_on_tip(tip_hash)) => {
                 mempool
             }
         };
+
+        // This task may run long after it was woken, for example while the mempool's work on
+        // the block holds the thread it was woken on. Transactions that arrive after the wait
+        // would start a full template build late, so the wait decides whenever it ends.
+        if tokio::time::Instant::now() > deadline {
+            tracing::debug!(
+                ?NEW_TIP_MEMPOOL_WAIT,
+                "the wait for the mempool on a new tip ended before this long poll ran; answering with the coinbase-only template"
+            );
+            return Err(EmptyReason::MempoolWaitElapsed);
+        }
 
         match mempool {
             Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {

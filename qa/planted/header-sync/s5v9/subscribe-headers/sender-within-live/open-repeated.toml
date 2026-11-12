@@ -11,4 +11,9 @@
 # when the node subscribes and how its updates reach the wire. A change
 # there can move the input off its `Open`.
 input = "crates/zakura-sim/tests/fixtures/header-wire-honest-sync.bin"
+# The honest peer then refuses the second `Open` and the node punishes it,
+# which breaks `conformant-never-closes` and `honest-never-punished` only
+# later, past the stop, so the case's set is judged on its Draft run
+# (`draft_set`).
+draft_set = ["header-sync/s5v9/conformant-never-closes", "session/honest-never-punished"]
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

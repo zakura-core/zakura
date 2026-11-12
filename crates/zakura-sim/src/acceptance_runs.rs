@@ -34,6 +34,22 @@ fn dir() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// The variable carrying the acceptance task's binding (its run, index and
+/// `task.json` digest), which each record repeats so a record from another
+/// run or task is refused.
+pub const BINDING_VAR: &str = "ZAKURA_SIM_ACCEPTANCE_BINDING";
+
+/// [`BINDING_VAR`]'s JSON, read once per process.
+fn binding() -> &'static serde_json::Value {
+    static BINDING: OnceLock<serde_json::Value> = OnceLock::new();
+    BINDING.get_or_init(|| {
+        std::env::var(BINDING_VAR)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null)
+    })
+}
+
 /// [`PHASE_VAR`], read once per process.
 fn phase() -> &'static str {
     static PHASE: OnceLock<String> = OnceLock::new();
@@ -88,6 +104,7 @@ pub(crate) fn begin(harness: &str) -> Option<Atom> {
             "harness": harness,
             "input_sha256": INPUT.with(|slot| slot.borrow().clone()),
             "phase": phase(),
+            "binding": binding(),
         }),
     };
     write(&atom, "begin", &atom.identity);

@@ -613,6 +613,9 @@ impl Ctx<'_> {
                 .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &runs)
                 .env("ZAKURA_SIM_ACCEPTANCE_PHASE", name);
         }
+        // Every record a child writes, at any depth, repeats the task's
+        // binding.
+        command.env("ZAKURA_SIM_ACCEPTANCE_BINDING", self.binding.to_string());
         let log = self.dir.join(format!("{name}.log"));
         let ended = child(command, &log, self.run.deadline);
         stop_if_interrupted()?;

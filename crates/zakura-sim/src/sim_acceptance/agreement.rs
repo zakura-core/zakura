@@ -291,10 +291,11 @@ pub fn first_differing_step(before: &[StepView], after: &[StepView], map: &HunkM
 }
 
 /// Checks that `before` and `after` agree up to their first differing
-/// step, and that the difference is at `site` on `after`'s side: either an
-/// observation `site` names that `before`'s step doesn't hold, or `site`'s
-/// pick, with the same draws on both sides, followed by an observation of
-/// the picked task that `before`'s step doesn't hold. A site that's merely present beside an unrelated
+/// step, and that the step's first difference, in order (pick, then
+/// draws, then the first differing observation), is at `site` on
+/// `after`'s side: an observation `site` names that `before`'s step
+/// doesn't hold, or `site`'s pick, either differing itself or followed by
+/// a first differing observation of the picked task. A site that's merely present beside an unrelated
 /// difference doesn't count.
 pub fn agreement(
     before: &[StepView],
@@ -308,35 +309,45 @@ pub fn agreement(
         obs.get("site").and_then(Value::as_str) == Some(site.at.as_str())
             || reached(obs).as_deref() == Some(site.at.as_str())
     };
+    // The task a pick site picks: `task:<task>:<point>`.
+    let picked = site
+        .at
+        .strip_prefix("task:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .map(|(task, _)| task);
+    let of_picked =
+        |obs: &Value| picked.is_some() && obs.get("task").and_then(Value::as_str) == picked;
     let before_view = before.iter().find(|view| view.step == step);
     let before_obs: Vec<Value> = before_view
         .map(|view| view.obs.iter().map(|o| mapped(o, map)).collect())
         .unwrap_or_default();
-    let at_site = after
-        .iter()
-        .find(|view| view.step == step)
-        .is_some_and(|view| {
-            let changed_obs = view
-                .obs
-                .iter()
-                .any(|obs| names(obs) && !before_obs.contains(obs));
-            // After the site's pick, the change must be the picked task's:
-            // one of its observations that the other run's step doesn't hold.
-            let picked = site
-                .at
-                .strip_prefix("task:")
-                .and_then(|rest| rest.rsplit_once(':'))
-                .map(|(task, _)| task);
-            let changed_by_pick = view.obs.iter().any(|obs| {
-                picked.is_some()
-                    && obs.get("task").and_then(Value::as_str) == picked
-                    && !before_obs.contains(obs)
+    // The step's first difference, in order: the pick, then the draws, then
+    // the first observation that differs. It must be the site.
+    let at_site =
+        after
+            .iter()
+            .find(|view| view.step == step)
+            .is_some_and(|view| match before_view {
+                Some(b) if b.pick == view.pick && b.draws != view.draws => false,
+                Some(b) if b.pick == view.pick => {
+                    let first = (0..before_obs.len().max(view.obs.len()))
+                        .find(|&i| before_obs.get(i) != view.obs.get(i))
+                        .and_then(|i| view.obs.get(i));
+                    first.is_some_and(|obs| {
+                        (names(obs) && !before_obs.contains(obs))
+                            || (view.pick == site.at && of_picked(obs))
+                    })
+                }
+                // The picks differ, or the other run has no such step: the
+                // pick is the difference, and the picked task's change follows.
+                _ => {
+                    view.pick == site.at
+                        && view
+                            .obs
+                            .iter()
+                            .any(|obs| of_picked(obs) && !before_obs.contains(obs))
+                }
             });
-            let after_pick = view.pick == site.at
-                && changed_by_pick
-                && before_view.is_some_and(|b| b.pick != view.pick || b.draws == view.draws);
-            changed_obs || after_pick
-        });
     if at_site {
         Ok(step)
     } else {

@@ -1406,7 +1406,7 @@ fn judge_planted(
     // Every run the planted runner made, at any depth, is a consumed run:
     // its own classifier judged the outcome, and its cleanup is judged
     // here by the one rule.
-    match run_records(&dir.join("planted-runs")) {
+    match run_records(&dir.join("planted-runs"), binding) {
         Ok(runs) if runs.is_empty() => {
             return blocked("`cargo xtask planted` recorded no runs".to_owned())
         }
@@ -1484,6 +1484,7 @@ fn judge_planted(
     );
     if let Some(why) = runs_refusal(
         dir,
+        binding,
         harness,
         &[
             ("record-baseline", &passes),
@@ -1531,19 +1532,9 @@ struct RunRecord {
 }
 
 /// Every run recorded under `dir`: each begin record must have its end,
-/// each end its begin, and the two must name the same harness, input and
-/// phase.
-fn run_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
-    run_records_allowing(dir, |_| false)
-}
-
-/// [`run_records`], with a begin record that has no end allowed where
-/// `unended` says its phase may leave one, such as a minimizer's search
-/// candidate that crashed.
-fn run_records_allowing(
-    dir: &Path,
-    unended: impl Fn(&str) -> bool,
-) -> Result<Vec<RunRecord>, String> {
+/// each end its begin, the two must name the same harness, input, phase
+/// and binding, and that binding must be this task's in this run.
+fn run_records(dir: &Path, binding: &TaskBinding) -> Result<Vec<RunRecord>, String> {
     let entries = fs::read_dir(dir).map_err(|_| "the tool left no run records".to_owned())?;
     let read = |path: &Path| -> Option<Value> {
         serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
@@ -1560,16 +1551,8 @@ fn run_records_allowing(
             return Err(format!("{file} isn't a run record"));
         }
     }
-    for (stem, path) in &begins {
-        if ends.contains_key(stem) {
-            continue;
-        }
-        let phase = read(path)
-            .and_then(|begin| begin.get("phase")?.as_str().map(str::to_owned))
-            .unwrap_or_default();
-        if !unended(&phase) {
-            return Err(format!("run {stem} began but never ended"));
-        }
+    if let Some(stem) = begins.keys().find(|stem| !ends.contains_key(*stem)) {
+        return Err(format!("run {stem} began but never ended"));
     }
     let mut runs = Vec::new();
     for (stem, path) in &ends {
@@ -1578,12 +1561,21 @@ fn run_records_allowing(
             .and_then(|path| read(path))
             .ok_or_else(|| format!("run {stem} has no readable begin record"))?;
         let end = read(path).ok_or_else(|| format!("run {stem}'s end record doesn't read"))?;
-        for field in ["harness", "input_sha256", "phase"] {
+        for field in ["harness", "input_sha256", "phase", "binding"] {
             if begin.get(field) != end.get(field) {
                 return Err(format!(
                     "run {stem}'s begin and end name different {field}s"
                 ));
             }
+        }
+        // Each record repeats the binding of the task whose child wrote it.
+        let names = end.get("binding");
+        let field = |name: &str| names.and_then(|n| n.get(name));
+        if field("run").and_then(Value::as_str) != Some(&binding.run)
+            || field("task").and_then(Value::as_u64) != u64::try_from(binding.index).ok()
+            || field("task_sha256").and_then(Value::as_str) != Some(&binding.task_sha256)
+        {
+            return Err(format!("run {stem} was recorded for another run or task"));
         }
         let text = |field: &str| end.get(field).and_then(Value::as_str).map(str::to_owned);
         runs.push(RunRecord {
@@ -1604,8 +1596,13 @@ fn run_records_allowing(
 /// don't (Rule 11): every run is of `harness`, in one of `phases`, and
 /// passes through [`owned_run_passes`] with that phase's expected result,
 /// and every phase has at least one run.
-fn runs_refusal(dir: &Path, harness: &str, phases: &[(&str, &RunExpect)]) -> Option<String> {
-    let runs = match run_records(&dir.join("runs")) {
+fn runs_refusal(
+    dir: &Path,
+    binding: &TaskBinding,
+    harness: &str,
+    phases: &[(&str, &RunExpect)],
+) -> Option<String> {
+    let runs = match run_records(&dir.join("runs"), binding) {
         Ok(runs) => runs,
         Err(why) => return Some(why),
     };
@@ -1690,9 +1687,10 @@ fn minimize_build_refusal(dir: &Path, bound: &Bound<'_>, target: &str) -> Option
 /// minimized candidate of the case's own input, property and harness, and
 /// for the original and the minimized input each, the fuzz target's run,
 /// every run inside `zakura-sim confirm` and the fresh `zakura-sim replay`
-/// all violate the property and pass through [`owned_run_passes`]. The
-/// search's runs are accounted for but needn't pass, and may crash before
-/// their end. Any run in another phase blocks.
+/// all violate the property and pass through [`owned_run_passes`], each
+/// exactly once. The search's runs, and a rejected candidate's, are
+/// accounted for but needn't pass. Every run must have ended and the
+/// reduction completed. Any run in another phase blocks.
 fn judge_minimize(
     dir: &Path,
     binding: &TaskBinding,
@@ -1721,10 +1719,19 @@ fn judge_minimize(
     {
         return blocked("sim-minimize didn't minimize the case's own input".to_owned());
     }
+    // A search cut off at its deadline can leave a run unfinished, so the
+    // reduction must have completed.
+    if report
+        .pointer("/reduction/completed")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return blocked("sim-minimize's reduction didn't complete".to_owned());
+    }
     let Some(minimized) = text("/minimized/sha256").map(str::to_owned) else {
         return blocked("sim-minimize's report names no minimized input".to_owned());
     };
-    let runs = match run_records_allowing(&dir.join("runs"), |phase| phase == "search") {
+    let runs = match run_records(&dir.join("runs"), binding) {
         Ok(runs) => runs,
         Err(why) => return blocked(why),
     };
@@ -1846,7 +1853,7 @@ fn judge_target(
         return blocked(format!("{harness} isn't a harness at S"));
     };
     let registered = registered(entry);
-    let runs = match run_records(&dir.join("runs")) {
+    let runs = match run_records(&dir.join("runs"), binding) {
         Ok(runs) => runs,
         Err(why) => return blocked(why),
     };
@@ -2021,9 +2028,12 @@ fn judge_task(
                 return blocked(why);
             }
             let passes = RunExpect::Passes;
-            if let Some(why) =
-                runs_refusal(dir, harness, &[("record", &passes), ("replay", &passes)])
-            {
+            if let Some(why) = runs_refusal(
+                dir,
+                binding,
+                harness,
+                &[("record", &passes), ("replay", &passes)],
+            ) {
                 return blocked(why);
             }
             judge_trace(
@@ -2082,6 +2092,7 @@ fn judge_task(
             };
             if let Some(why) = runs_refusal(
                 dir,
+                binding,
                 harness,
                 &[("record", &run_expect), ("replay", &run_expect)],
             ) {
@@ -2147,6 +2158,7 @@ fn judge_task(
             );
             if let Some(why) = runs_refusal(
                 dir,
+                binding,
                 harness,
                 &[
                     ("record-base", &violates),
@@ -2282,7 +2294,7 @@ fn judge_task(
                         property: property.clone(),
                         also: Vec::new(),
                     });
-            if let Some(why) = runs_refusal(dir, harness, &[("record", &expect)]) {
+            if let Some(why) = runs_refusal(dir, binding, harness, &[("record", &expect)]) {
                 return blocked(why);
             }
             judge_trace(

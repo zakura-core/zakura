@@ -707,6 +707,23 @@ mod schedule_agreement {
             agreement(&other_pick, &before, &map, &pick).is_err(),
             "a pick that only differs, with nothing of the picked task's changed"
         );
+        let mut earlier: Vec<StepView> = after.to_vec();
+        earlier[0]
+            .obs
+            .insert(0, json!({ "obs": "task-waiting", "task": "u" }));
+        let at = Site {
+            at: "t:lock#1".to_owned(),
+        };
+        let mut moved = before.to_vec();
+        moved[0].obs[0]["at"] = json!("lock#0");
+        let mut site_after_other: Vec<StepView> = before.to_vec();
+        site_after_other[0]
+            .obs
+            .insert(0, json!({ "obs": "task-waiting", "task": "u" }));
+        assert!(
+            agreement(&moved, &site_after_other, &map, &at).is_err(),
+            "an earlier different observation in the same step than the site's"
+        );
         let shared = Site {
             at: "src/a.rs:1".to_owned(),
         };

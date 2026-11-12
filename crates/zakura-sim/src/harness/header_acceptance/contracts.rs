@@ -717,7 +717,9 @@ const C18_PROVING: &[TestRef] = &[
 /// C5's proving tests: a stale-binary control for a catch, whose baseline
 /// must come from S's build and its patched run from the checkout its
 /// provenance check measured, one for a standalone witness history, whose
-/// trace and witness test must both come from S's build, and one for a
+/// trace and witness test must both come from S's build, one for an
+/// integrity catch, whose patched test and history must come from the
+/// measured build of S with the mutation's committed patch, and one for a
 /// contract test, C5's own, whose binary must embed the subject's source,
 /// each with an unknown digest matching nothing, even on both sides, and a
 /// dirty checkout's agreeing digests anchoring nothing. Each runs in a
@@ -731,6 +733,10 @@ const C5_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_acceptance/tool.rs",
         "harness::header_acceptance::tool::tests::a_history_from_a_stale_binary_is_refused",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_stale_integrity_build_is_refused",
     ),
     sim_test(
         super::rows::ACCEPTANCE_TESTS,

@@ -75,7 +75,13 @@
 //!   history's witness test as for `history` in `<i>/<run>`, with
 //!   [`TEST_FILE`] and `declared`, and `<i>/<run>/history`, the declaration
 //!   named by the task's `case`, recorded by that checkout's own
-//!   `zakura-sim` with no witness.
+//!   `zakura-sim` with no witness. `<i>/patched` also holds
+//!   [`PATCHED_BUILD_FILE`], a [`PatchedBuild`] the runner measures once it
+//!   has applied the patch: `base`, the commit its checkout was made from,
+//!   which must be S, `patch_sha256`, the SHA-256 of the patch it applied,
+//!   which must be the task's `patch_file` at S, and `source`, the patched
+//!   checkout's source digest, which the patched run's test binary and
+//!   checkout and its `history` recording must all name.
 //!
 //! Every recorded run's report and store snapshot come from its
 //! `full-report.json`, never from the trace's `end` record, which keeps no
@@ -691,6 +697,25 @@ pub struct TestRun {
 /// What [`TestRun::binary_source`] holds when the binary doesn't embed the
 /// subject's source digest.
 pub const NOT_EMBEDDED: &str = "not-embedded";
+
+/// An integrity mutation's patched run's artifact: the build the runner
+/// measured in its patched checkout ([`PatchedBuild`]).
+pub const PATCHED_BUILD_FILE: &str = "build.json";
+
+/// What [`PATCHED_BUILD_FILE`] holds, as the runner measures it once it has
+/// applied the mutation's patch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchedBuild {
+    /// The commit the patched checkout was made from, which must be S.
+    pub base: String,
+    /// The SHA-256 of the patch it applied, which must be the mutation's
+    /// committed patch at S.
+    pub patch_sha256: String,
+    /// The patched checkout's source digest, which its test binary, its
+    /// checkout and its recorded history must all name.
+    pub source: String,
+}
 
 /// A planted case's provenance artifact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1402,6 +1427,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             }
             Task::Integrity {
                 patch,
+                patch_file,
                 harness,
                 case,
                 package,
@@ -1430,9 +1456,15 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                         subject_source,
                     )
                 };
+                let mut patched = read("patched", CaseRun::Patched);
+                if let Some(why) =
+                    patched_build_refusal(repo, patch_file, subject, &dir.join("patched"))
+                {
+                    fail(&mut patched, why);
+                }
                 Actual::IntegrityCaught {
                     unpatched: read("unpatched", CaseRun::Unpatched),
-                    patched: read("patched", CaseRun::Patched),
+                    patched,
                     restored: read("restored", CaseRun::Restored),
                 }
             }
@@ -1782,6 +1814,50 @@ fn target_of(targets: &BTreeMap<String, String>, harness: &str) -> Option<String
         .iter()
         .find(|(_, runs)| runs.as_str() == harness)
         .map(|(target, _)| target.clone())
+}
+
+/// Why the integrity mutation's patched run in `dir` isn't S with its
+/// committed patch `patch_file` (a path under `repo`) applied: its
+/// [`PatchedBuild`] is missing, names a base other than `subject` or a
+/// patch other than `patch_file`'s, or its test binary, checkout or
+/// recorded history doesn't name the source it measured. A previous
+/// patched directory for the same mutation, from another source, then
+/// never counts.
+fn patched_build_refusal(
+    repo: &Path,
+    patch_file: &str,
+    subject: &str,
+    dir: &Path,
+) -> Option<String> {
+    let Some(build) = read_json::<PatchedBuild>(&dir.join(PATCHED_BUILD_FILE)) else {
+        return Some("no patched build measurement".to_owned());
+    };
+    if build.base != subject {
+        return Some(format!(
+            "its patched checkout was made from {}, not S, {subject}",
+            build.base
+        ));
+    }
+    let committed = digest(&repo.join(patch_file));
+    if committed == "missing" || build.patch_sha256 != committed {
+        return Some(format!(
+            "its patched checkout applied a patch with SHA-256 {}, and {patch_file} is \
+             {committed}",
+            build.patch_sha256
+        ));
+    }
+    let measured = Some(build.source.as_str());
+    let test = read_json::<TestRun>(&dir.join(TEST_FILE));
+    let ran = test.as_ref().is_some_and(|test| {
+        test.binary_source.as_deref() == measured && test.checkout_source.as_deref() == measured
+    });
+    if !known(measured) || !ran || trace_source(&dir.join("history")).as_deref() != measured {
+        return Some(format!(
+            "its test and recorded history aren't from the measured patched source {}",
+            build.source
+        ));
+    }
+    None
 }
 
 /// Why case `dir`'s provenance check isn't for its committed patch at
@@ -2580,6 +2656,7 @@ fn links(
                                 format!("{index}/{run}/history/{FULL_REPORT_FILE}"),
                             ]
                         })
+                        .chain([format!("{index}/patched/{PATCHED_BUILD_FILE}")])
                         .collect(),
                     ..Links::default()
                 },
@@ -5135,6 +5212,148 @@ mod tests {
                     .end
                 ),
                 "{test:?}"
+            );
+        }
+    }
+
+    /// C5: an integrity catch counts only from a patched build of S with
+    /// the mutation's committed patch, as the runner measured it, whose test
+    /// binary, checkout and recorded history all come from that measured
+    /// source. A previous patched directory for the same mutation, whose
+    /// source differs from S but isn't the measured one, is refused, as is
+    /// a patched run with no measurement or one of another base or patch.
+    #[test]
+    fn a_stale_integrity_build_is_refused() {
+        let manifest = Manifest::committed();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&manifest, &repo).expect("the committed manifest plans");
+        let run = RunBinding {
+            run_id: "run-1".into(),
+            subject: "s".into(),
+            subject_source: "subject".into(),
+            containment: Containment::Subreaper,
+        };
+        let (index, task) = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, task)| matches!(task, Task::Integrity { .. }))
+            .expect("the plan has an integrity mutation");
+        let Task::Integrity {
+            expected,
+            patch_file,
+            package,
+            file,
+            case,
+            test,
+            diagnostic,
+            ..
+        } = task
+        else {
+            unreachable!("it was found as one");
+        };
+        let committed = digest(&repo.join(patch_file));
+        // The runner's three runs, the patched one from a checkout of
+        // source `ran`, beside the patched build `build` it measured.
+        let patched = |build: Option<PatchedBuild>, ran: &str| {
+            let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+            fs::write(
+                artifacts.path().join(RUN_FILE),
+                serde_json::to_string(&run).expect("a binding serializes"),
+            )
+            .expect("the temp dir is writable");
+            let dir = artifacts.path().join(index.to_string());
+            fs::create_dir_all(&dir).expect("the temp dir is writable");
+            fs::write(dir.join(TASK_FILE), task_binding(index, task).to_string())
+                .expect("the temp dir is writable");
+            for (name, source, result) in [
+                ("unpatched", "subject", "ok"),
+                ("patched", ran, "FAILED"),
+                ("restored", "subject", "ok"),
+            ] {
+                let at = dir.join(name);
+                let failed = result == "FAILED";
+                let failure =
+                    format!("storage:header's evidence failed: {diagnostic}: at a quiet boundary");
+                declare_and_record(&at, test, case, source, failed.then_some(&failure));
+                let artifact = TestRun {
+                    package: package.clone(),
+                    file: file.clone(),
+                    tests: vec![(test.clone(), result.into())],
+                    killed: false,
+                    exited_ok: !failed,
+                    log: if failed {
+                        format!("the run hit a harness failure: {failure}\n")
+                    } else {
+                        String::new()
+                    },
+                    binary_source: Some(source.into()),
+                    checkout_source: Some(source.into()),
+                };
+                fs::write(
+                    at.join(TEST_FILE),
+                    serde_json::to_string(&artifact).expect("a test run serializes"),
+                )
+                .expect("the temp dir is writable");
+            }
+            if let Some(build) = build {
+                fs::write(
+                    dir.join("patched").join(PATCHED_BUILD_FILE),
+                    serde_json::to_string(&build).expect("a build serializes"),
+                )
+                .expect("the temp dir is writable");
+            }
+            let results = assemble(&repo, &plan, artifacts.path(), &run).results;
+            let record = results
+                .into_iter()
+                .find(|record| record.expected == *expected)
+                .expect("the integrity task gives a result");
+            let Actual::IntegrityCaught {
+                unpatched,
+                patched,
+                restored,
+            } = record.actual
+            else {
+                panic!("an integrity task gives an integrity result");
+            };
+            assert_eq!(
+                (unpatched.end, restored.end),
+                (End::Completed, End::Completed)
+            );
+            patched.end
+        };
+        let measured = |base: &str, patch_sha256: &str, source: &str| PatchedBuild {
+            base: base.into(),
+            patch_sha256: patch_sha256.into(),
+            source: source.into(),
+        };
+        assert_eq!(
+            patched(Some(measured("s", &committed, "patched")), "patched"),
+            End::HarnessFailure {
+                diagnostic: diagnostic.clone()
+            }
+        );
+        for (defect, build, ran) in [
+            (
+                "a previous patched directory",
+                Some(measured("s", &committed, "patched")),
+                "patched-before",
+            ),
+            ("no measurement", None, "patched"),
+            (
+                "another base",
+                Some(measured("older", &committed, "patched")),
+                "patched",
+            ),
+            (
+                "another patch",
+                Some(measured("s", &"00".repeat(32), "patched")),
+                "patched",
+            ),
+        ] {
+            assert!(
+                matches!(patched(build, ran), End::Failed { .. }),
+                "{defect}"
             );
         }
     }

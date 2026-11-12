@@ -169,8 +169,8 @@ struct Generated {
 enum GeneratedCatch {
     /// The case's name. Its set is the ID alone, and it's found at a step.
     Case(&'static str),
-    /// The `Open`'s reason, pending Adam's approval.
-    Open(&'static str),
+    /// The `Open`'s reason and its approval.
+    Open(&'static str, Approval),
 }
 
 /// The honest witness, and the check that the witnesses list every ID.
@@ -343,7 +343,7 @@ const GENERATED: [Generated; 32] = {
             "headers/long-payload-closes",
             HEADERS,
             G2,
-            Open(LONG_PAGE_UNREACHED),
+            Open(LONG_PAGE_UNREACHED, HDR_14_5_RULING),
         ),
         gen(
             "headers/unsolicited-closes",
@@ -357,7 +357,12 @@ const GENERATED: [Generated; 32] = {
             G2,
             Case("unlinked-page-dropped"),
         ),
-        gen("headers/over-owed-closes", HEADERS, G23, Open(NOT_OWED)),
+        gen(
+            "headers/over-owed-closes",
+            HEADERS,
+            G23,
+            Open(NOT_OWED, Approval::Pending),
+        ),
         gen(
             "headers-outcome/reserved-flags-closes",
             OUTCOME,
@@ -392,7 +397,7 @@ const GENERATED: [Generated; 32] = {
             "headers-outcome/over-owed-closes",
             OUTCOME,
             G23,
-            Open(NOT_OWED),
+            Open(NOT_OWED, Approval::Pending),
         ),
     ]
 };
@@ -412,13 +417,19 @@ const fn gen(
     }
 }
 
+/// Adam's hdr-14.5 ruling on the generated IDs' open catches.
+const HDR_14_5_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.5 ruling",
+};
+
 /// Why `headers/long-payload-closes` has no catch: no patch to one path
 /// breaks it alone.
 const LONG_PAGE_UNREACHED: &str =
-    "the node grants a subscription less byte credit than the headers row's maximum, so a page \
-     past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
-     precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
-     refusals drains the page at 0 ns and breaks sim/no-livelock first";
+    "on the simulator's Regtest headers the node grants a subscription at most 4,000 smallest \
+     pages of byte credit, about 1 MiB, which is less than the headers row's 2 MiB maximum, so a \
+     page past that maximum is past its credit too, as the act's two labels say, and the \
+     subscriber's precheck refuses it before the frame filter's cap does; a patch that has the \
+     reader skip both refusals drains the page at 0 ns and breaks sim/no-livelock first";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1257,9 +1268,15 @@ pub struct StandingExclusion {
 }
 
 /// The approved standing exclusions of passing, catch and missing-source
-/// keys. None is approved on `main`: the two `over-owed-closes` catch
-/// exclusions still await approval, so they block.
-pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[];
+/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling.
+/// The two `over-owed-closes` catch exclusions still await approval, so
+/// they block.
+pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[StandingExclusion {
+    key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
+    owner: "hdr-14",
+    reason: LONG_PAGE_UNREACHED,
+    approval: HDR_14_5_RULING,
+}];
 
 /// Whether `exclusions` grants `key` exactly the standing `Open` `expected`.
 pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: &Expected) -> bool {
@@ -1380,8 +1397,8 @@ fn generated_ids() -> &'static [&'static str] {
 }
 
 /// A generated ID's row: its passing history, or its approval-pending
-/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or an
-/// approval-pending `Open`.
+/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or its
+/// `Open` under the approval its entry names.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
         let results = vec![result(
@@ -1422,13 +1439,13 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
                 true,
             ));
         }
-        GeneratedCatch::Open(reason) => expected.push(result(
+        GeneratedCatch::Open(reason, approval) => expected.push(result(
             vec![Key::catch(property)],
             generated.gates,
             Expected::Open {
                 reason,
                 owner: "hdr-14",
-                approval: Approval::Pending,
+                approval,
                 until: None,
             },
         )),

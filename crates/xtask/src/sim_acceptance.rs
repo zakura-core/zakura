@@ -1,4 +1,5 @@
-//! `cargo xtask sim-acceptance --subject <S> --header-out <dir> --out <dir>`:
+//! `cargo xtask sim-acceptance --subject <S> --header-out <dir> --out <dir>
+//! [--deadline-secs <n>] [--only <text>]...`:
 //! sim-7's acceptance run (the sim-7 plan, "sim-7.4's tool").
 //!
 //! It keeps the shared runner's rules ([`crate::acceptance`]): one run at a
@@ -58,6 +59,10 @@ const RUN_TARGETS: [&str; 6] = [
 
 /// What the run reads from its arguments.
 struct Args {
+    /// Run only tasks whose expected result contains one of these, for a
+    /// smoke run. Every skipped task's result blocks, so such a run is never
+    /// accepted.
+    only: Vec<String>,
     subject: String,
     header_out: PathBuf,
     out: PathBuf,
@@ -67,14 +72,20 @@ struct Args {
 /// `--subject <S> --header-out <dir> --out <dir> [--deadline-secs <n>]`.
 fn args(mut args: impl Iterator<Item = String>) -> Result<Args, BoxError> {
     let mut flags: BTreeMap<String, String> = BTreeMap::new();
+    let mut only = Vec::new();
     while let Some(flag) = args.next() {
         let value = args
             .next()
             .ok_or(UsageError("every sim-acceptance flag takes a value"))?;
+        if flag == "--only" {
+            only.push(value);
+            continue;
+        }
         if !["--subject", "--header-out", "--out", "--deadline-secs"].contains(&flag.as_str()) {
-            return Err(
-                UsageError("expected --subject, --header-out, --out or --deadline-secs").into(),
-            );
+            return Err(UsageError(
+                "expected --subject, --header-out, --out, --deadline-secs or --only",
+            )
+            .into());
         }
         if flags.insert(flag, value).is_some() {
             return Err(UsageError("a sim-acceptance flag is given twice").into());
@@ -92,6 +103,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args, BoxError> {
         None => DEFAULT_DEADLINE_SECS,
     };
     Ok(Args {
+        only,
         subject: take(&mut flags, "--subject")?,
         header_out: PathBuf::from(take(&mut flags, "--header-out")?),
         out: PathBuf::from(take(&mut flags, "--out")?),
@@ -265,6 +277,20 @@ fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<Strin
         .ok_or("the plan has no tasks")?;
     for (index, task) in tasks.iter().enumerate() {
         stop_if_interrupted()?;
+        let expected = task
+            .as_object()
+            .and_then(|object| object.values().next())
+            .and_then(|fields| fields.get("expected"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !args.only.is_empty()
+            && !args
+                .only
+                .iter()
+                .any(|only| expected.contains(only.as_str()))
+        {
+            continue;
+        }
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("task.json"), serde_json::to_string_pretty(task)?)?;

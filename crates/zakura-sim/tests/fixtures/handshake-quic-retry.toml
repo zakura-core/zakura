@@ -1,0 +1,9 @@
+harness = "handshake/wire"
+generator = 8
+sha256 = "b220c25fc88e6c0e81c9d55fa0a70a31855138b498d25bb5fa0897170663c265"
+scenario_sha256 = "7c715c5794ab6020140d3be8c96770f7f5b5551b362672edabf791c8198b5003"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/quic/retry-before-unvalidated-accept"
+expect = "holds"

@@ -1,0 +1,9 @@
+harness = "handshake/wire"
+generator = 8
+sha256 = "b085b33924d18f3f0f8ac5203a798160376c5068474c7035574fee6ce3c1b183"
+scenario_sha256 = "6c4781a4d9b85e6da0a04a2747161329ca1661e72ec96f8a58ed65e2df453e47"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/prelude/request-without-id-closes"
+expect = "holds"

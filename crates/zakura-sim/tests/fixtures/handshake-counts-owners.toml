@@ -1,0 +1,10 @@
+# One host's connection moves through QUIC, control and registration.
+harness = "handshake/counts"
+generator = 3
+sha256 = "4f8d47ce110ea8ee48fb449222e24703cb019439c44ed2c49a265292f99cadbe"
+scenario_sha256 = "d81d9d7aecf4c736d682c939fda2837e367362eda44d5b5638f4e606a13bcc80"
+source = "crates/zakura-sim/tests/handshake.rs"
+
+[[witness]]
+property = "handshake/counts-match-permits"
+expect = "holds"

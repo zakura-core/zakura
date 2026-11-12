@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::Serialize;
-use support::storage_witnesses;
+use support::{handshake_seeds, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -70,6 +70,12 @@ fn committed_seeds_validate() {
 fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
+    }
+    if let Some(curated) = handshake_seeds::handshake_seeds()
+        .into_iter()
+        .find(|curated| curated.stem == stem)
+    {
+        return value(curated.scenario);
     }
     if stem == "handshake-partial-session" {
         use zakura_sim::{
@@ -173,6 +179,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
+        }),
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],

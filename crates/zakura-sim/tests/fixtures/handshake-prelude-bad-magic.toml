@@ -1,0 +1,9 @@
+harness = "handshake/wire"
+generator = 8
+sha256 = "c6ca5bc8d1aab3d4e89c7dc4fd160af1f4cb0e5817466782304f2181951b8246"
+scenario_sha256 = "513a3a952566728e858a70d90659961ad5d7b3cafc052d62507f019df2a9ccf3"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/prelude/bad-magic-resets"
+expect = "holds"

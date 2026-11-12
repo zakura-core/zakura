@@ -1,0 +1,61 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/peer.rs b/crates/zakura-network/src/zakura/header_sync/peer.rs
+index 730bf23d81..7f37104507 100644
+--- a/crates/zakura-network/src/zakura/header_sync/peer.rs
++++ b/crates/zakura-network/src/zakura/header_sync/peer.rs
+@@ -52,7 +52,10 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
+                 None => return Ok(()),
+             },
+         };
+-        let input = admit::<HEADER_BYTES>(&handle, &session, frame)?;
++        // Mutation: a dropped page leaves the reader reading.
++        let Some(input) = admit::<HEADER_BYTES>(&handle, &session, frame)? else {
++            continue;
++        };
+         match state.on_input(input) {
+             PeerOutput::Apply(update) => {
+                 publisher
+@@ -84,7 +87,7 @@ fn admit<const HEADER_BYTES: usize>(
+     handle: &HeaderSyncHandle,
+     session: &PeerSession,
+     frame: Frame,
+-) -> Result<PeerInput, SinkReject> {
++) -> Result<Option<PeerInput>, SinkReject> {
+     let payload_len = frame.payload.len();
+     if admits_before_decode(frame.message_type) {
+         session
+@@ -94,7 +97,7 @@ fn admit<const HEADER_BYTES: usize>(
+     }
+     let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
+         .map_err(|error| violation(handle, session, "malformed_message", error))?;
+-    Ok(match message {
++    Ok(Some(match message {
+         Message::Status(status) => {
+             session.subscriber().observe(&status);
+             PeerInput::Status(status)
+@@ -103,10 +106,13 @@ fn admit<const HEADER_BYTES: usize>(
+         Message::Headers(page) => {
+             check_records(&page, &handle.network)
+                 .map_err(|error| violation(handle, session, "malformed_message", error))?;
+-            let admitted = session
+-                .subscriber()
+-                .receive_page(&page, payload_len)
+-                .map_err(|fault| violation(handle, session, fault.label(), fault))?;
++            let admitted = match session.subscriber().receive_page(&page, payload_len) {
++                // Mutation: an unlinked page is dropped, and the session stays open.
++                Err(fault) if fault.label() == "linkage" => return Ok(None),
++                admitted => {
++                    admitted.map_err(|fault| violation(handle, session, fault.label(), fault))?
++                }
++            };
+             PeerInput::Page { page, admitted }
+         }
+         Message::HeadersOutcome(outcome) => {
+@@ -116,7 +122,7 @@ fn admit<const HEADER_BYTES: usize>(
+                 .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+             PeerInput::Outcome(ended)
+         }
+-    })
++    }))
+ }
+ 
+ /// Check each schema-1 record against its header's height and the network's

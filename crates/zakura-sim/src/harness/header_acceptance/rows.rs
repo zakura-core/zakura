@@ -355,7 +355,7 @@ const GENERATED: [Generated; 32] = {
             "headers/bad-content-closes",
             HEADERS,
             G2,
-            Open(BAD_PAGE_UNREACHED),
+            Case("unlinked-page-dropped"),
         ),
         gen("headers/over-owed-closes", HEADERS, G23, Open(NOT_OWED)),
         gen(
@@ -419,12 +419,6 @@ const LONG_PAGE_UNREACHED: &str =
      past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
      precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
      refusals drains the page at 0 ns and breaks sim/no-livelock first";
-/// Why `headers/bad-content-closes` has no catch: its patch breaks a
-/// broader ID that `NESTS` doesn't list over it.
-const BAD_PAGE_UNREACHED: &str =
-    "each page content rule the adversary breaks, linkage and lower locator, puts headers the \
-     node didn't ask for on the page, so a patch that admits one has the node stage them and breaks \
-     header-sync/commit-only-authorized at that step, which NESTS doesn't list over this ID";
 /// Why `status/sender-cadence` has no catch: the run ends before a patched
 /// node empties the peer's bucket.
 const SENDER_CADENCE_UNREACHED: &str =
@@ -1429,7 +1423,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
     };
     match generated.catch {
         GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 26, so the leak is
+            // Built once per case for a fixed set of 27, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
             expected.extend(caught(

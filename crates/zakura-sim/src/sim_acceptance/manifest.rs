@@ -572,14 +572,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "sched-4/release-and-asan",
             true,
-            [
-                "sim-release/zakura-rt-zakura-scheduler",
-                "sim-asan/zakura-rt-zakura-scheduler",
-                "sim-release/zakura-sim",
-                "sim-asan/zakura-sim",
-            ]
-            .map(Expected::Lane)
-            .to_vec(),
+            LANES.iter().map(|lane| Expected::Lane(lane.id)).collect(),
         ),
         row(
             "sim-7/self-checks",
@@ -819,6 +812,44 @@ fn self_tests(text: &str) -> Vec<String> {
     }
     tests
 }
+
+/// One `qa/suite.toml` lane sim-7 runs, with what it must test whatever its
+/// command selects (Rule 11), so dropping a `-p` or a `--test` from the
+/// command makes the lane block instead of shrinking what it owes.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneObligation {
+    /// The lane's ID.
+    pub id: &'static str,
+    /// The packages whose library and test targets it must run.
+    pub packages: &'static [&'static str],
+    /// For a one-package lane that names targets, those integration
+    /// targets; otherwise every top-level `tests/*.rs` of each package.
+    pub targets: Option<&'static [&'static str]>,
+}
+
+/// Every lane sim-7 runs.
+pub const LANES: &[LaneObligation] = &[
+    LaneObligation {
+        id: "sim-release/zakura-rt-zakura-scheduler",
+        packages: &["zakura-rt", "zakura-scheduler"],
+        targets: None,
+    },
+    LaneObligation {
+        id: "sim-asan/zakura-rt-zakura-scheduler",
+        packages: &["zakura-rt", "zakura-scheduler"],
+        targets: None,
+    },
+    LaneObligation {
+        id: "sim-release/zakura-sim",
+        packages: &["zakura-sim"],
+        targets: Some(SCHED4_RELEASE_TARGETS),
+    },
+    LaneObligation {
+        id: "sim-asan/zakura-sim",
+        packages: &["zakura-sim"],
+        targets: Some(SCHED4_ASAN_TARGETS),
+    },
+];
 
 /// The `zakura-sim` test targets the release lane must run: every target a
 /// sched-4 row maps, plus the other replay and time targets the plan names.

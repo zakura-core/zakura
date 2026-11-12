@@ -18,7 +18,7 @@ use super::{
     evaluate::{evaluate, header_refusal, Evaluation, HeaderRecordFacts, RowSpec, Verdict},
     header::{consumed_cleanup, verify, Published},
     judge::{owned_run_passes, Registered, RunExpect},
-    manifest::{derive, problems, rows, Expected},
+    manifest::{derive, problems, rows, Expected, LANES},
 };
 use crate::{
     check::PropertyOutcome,
@@ -330,27 +330,23 @@ pub fn plan(repo: &Path) -> Sim7Plan {
     plan
 }
 
-/// `lane`'s task, from `qa/suite.toml` at `repo`. Its required targets
-/// come from the packages, not from what the command happens to select: a
-/// lane naming `--test` targets requires those and its packages' libraries,
-/// and one that doesn't requires every top-level `tests/*.rs` of each
-/// package and its library. A library a `sim-package` row marks `lib =
-/// false` is expected empty, so it isn't required (Rule 11).
+/// `lane`'s task, its command from `qa/suite.toml` at `repo` and its
+/// required targets from [`LANES`], never from what the command happens to
+/// select: each package's library, and the lane's named targets or else
+/// every top-level `tests/*.rs` of each package. A library a `sim-package`
+/// row marks `lib = false` is expected empty, so it isn't required
+/// (Rule 11).
 fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
+    let obligation = LANES.iter().find(|obligation| obligation.id == lane)?;
     let text = fs::read_to_string(repo.join(crate::suite::SUITE_FILE)).ok()?;
     let suite: crate::suite::SuiteFile = toml::from_str(&text).ok()?;
     let row = suite.lane.iter().find(|row| row.id == lane)?;
     let (subcommand, args) = row.args.split_once(' ').unwrap_or((&row.args, ""));
-    let words: Vec<&str> = args.split_whitespace().collect();
-    let packages: Vec<&str> = words
-        .windows(2)
-        .filter(|pair| pair[0] == "-p")
-        .map(|pair| pair[1])
-        .collect();
-    let named = row.test_targets();
+    let packages = obligation.packages;
+    let named = obligation.targets.unwrap_or_default();
     let mut required = Vec::new();
     let mut empty = Vec::new();
-    for package in &packages {
+    for package in packages {
         let empty_lib = suite
             .sim_package
             .iter()
@@ -375,7 +371,7 @@ fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
             required.extend(stems.into_iter().map(|stem| format!("{package}/{stem}")));
         }
     }
-    if let [package] = packages[..] {
+    if let [package] = packages {
         required.extend(named.iter().map(|target| format!("{package}/{target}")));
     }
     // `run = true` ignored tests in the lane's targets must run too.
@@ -425,6 +421,13 @@ pub struct Sim7Record {
     pub unsupported: Vec<(String, String)>,
     /// Every row's verdict.
     pub evaluation: Evaluation,
+    /// Each task's expected result with its artifact directory, relative
+    /// to the run directory, and the binaries that produced it.
+    pub evidence: BTreeMap<String, Evidence>,
+    /// Each measured recording's `measure.json`, by expected result.
+    pub measurements: BTreeMap<String, Value>,
+    /// The SHA-256 of hdr-14's `record.json` this record consumed.
+    pub header_record_sha256: Option<String>,
     /// Every narrowing of the spec, and whether it's signed off.
     pub deviations: Vec<(String, bool)>,
     /// No row blocked, no manifest problem, the plan S's own, the run
@@ -432,6 +435,104 @@ pub struct Sim7Record {
     pub accepted: bool,
     /// Accepted, nothing excluded, and every deviation signed off.
     pub fully_accepted: bool,
+}
+
+/// Where one expected result's evidence is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    /// The task's artifact directory, relative to the run directory.
+    pub artifact: String,
+    /// The SHA-256 of each binary that produced it: the trace's recording
+    /// executable, the test's binary, or each lane target's test binary.
+    pub binaries: Vec<String>,
+    /// The property applications its passing run credited.
+    pub applicable: u64,
+}
+
+/// The directory under the artifacts where the xtask keeps the release
+/// seed inventory: `inventory.json` with the child's outcome and
+/// `report.json` with what it reported.
+pub const SEED_INVENTORY: &str = "seeds";
+
+/// The SHA-256 of empty input, which a measure with no committed seed runs.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Why the release seed inventory doesn't admit `file` with full input
+/// `input`, or `None` if it does. With no `file`, any admitted seed with
+/// that input counts. The inventory must also have exited 0.
+fn seed_inventory_refusal(artifacts: &Path, file: Option<&str>, input: &str) -> Option<String> {
+    let dir = artifacts.join(SEED_INVENTORY);
+    let read = |name: &str| -> Option<Value> {
+        serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
+    };
+    if !exited(read("inventory.json")) {
+        return Some("the release `zakura-sim seeds --report` didn't exit 0".to_owned());
+    }
+    let report = read("report.json").unwrap_or_default();
+    let admitted = report
+        .get("seeds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("status").and_then(Value::as_str) == Some("admitted"))
+        .any(|row| {
+            row.get("input_sha256").and_then(Value::as_str) == Some(input)
+                && file.is_none_or(|file| row.get("file").and_then(Value::as_str) == Some(file))
+        });
+    (!admitted).then(|| format!("the release seed inventory doesn't admit input {input}"))
+}
+
+/// The SHA-256 of the file at `path`, if it reads.
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// The binaries a task's artifacts in `dir` name, as [`Evidence::binaries`].
+fn task_binaries(task: &Task, dir: &Path) -> Vec<String> {
+    let json = |name: &str| -> Option<Value> {
+        serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
+    };
+    match task {
+        // hdr-14's runner owns `test.json`, so the xtask keeps a test
+        // row's digest beside it.
+        Task::Test { .. } => json("binary.json")
+            .and_then(|binary| binary.get("sha256")?.as_str().map(str::to_owned))
+            .into_iter()
+            .collect(),
+        Task::FuzzTest { .. } => json("test.json")
+            .and_then(|test| test.get("binary")?.as_str().map(str::to_owned))
+            .into_iter()
+            .collect(),
+        Task::Lane { .. } => json("lane.json")
+            .and_then(|lane| {
+                serde_json::from_value::<BTreeMap<String, String>>(lane.get("binaries")?.clone())
+                    .ok()
+            })
+            .map(|binaries| {
+                binaries
+                    .into_values()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Task::Seed { .. } | Task::SeedWitness { .. } | Task::Measure { .. } => {
+            TraceReader::open(&dir.join("trace"))
+                .ok()
+                .map(|trace| trace.meta.build.binary)
+                .into_iter()
+                .collect()
+        }
+        Task::Command { .. } => Vec::new(),
+    }
 }
 
 /// Where the header record and its run are, as the evaluator reads them.
@@ -469,21 +570,53 @@ pub fn record(
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut applicable = 0u64;
     let mut seed_traces: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+    let mut evidence = BTreeMap::new();
+    let mut measurements = BTreeMap::new();
+    let artifacts_name = artifacts
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
         let recorded = fs::read_to_string(dir.join("task.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<Task>(&text).ok());
-        let verdict = if recorded.as_ref() == Some(task) {
-            judge_task(task, &dir, &bound, &mut applicable)
-        } else {
+        // A seed or witness counts only on an input the release build's own
+        // inventory admitted.
+        let refusal = match task {
+            Task::Seed { file, input, .. } => seed_inventory_refusal(artifacts, Some(file), input),
+            Task::SeedWitness { input, .. } => seed_inventory_refusal(artifacts, None, input),
+            _ => None,
+        };
+        let before = applicable;
+        let verdict = if recorded.as_ref() != Some(task) {
             Verdict::Blocked {
                 why: "the artifact directory's task.json isn't this task".to_owned(),
             }
+        } else if let Some(why) = refusal {
+            Verdict::Blocked { why }
+        } else {
+            judge_task(task, &dir, &bound, &mut applicable)
         };
-        if let Task::Seed { file, .. } = task {
+        // An end record is judged only from a seed run that passed.
+        if let (Task::Seed { file, .. }, Verdict::Verified) = (task, &verdict) {
             seed_traces.insert(file.clone(), dir.join("trace"));
         }
+        if let Task::Measure { expected, .. } = task {
+            if let Some(measure) = fs::read_to_string(dir.join("measure.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            {
+                measurements.insert(expected.clone(), measure);
+            }
+        }
+        evidence.insert(
+            task.expected().to_owned(),
+            Evidence {
+                artifact: format!("{artifacts_name}/{index}"),
+                binaries: task_binaries(task, &dir),
+                applicable: applicable - before,
+            },
+        );
         verdicts.insert(task.expected().to_owned(), verdict);
     }
     for (id, why) in &plan.unsupported {
@@ -502,7 +635,7 @@ pub fn record(
                 let verdict = match seed.and_then(|seed| seed_traces.get(&seed).cloned()) {
                     Some(trace) => end_record_matches(repo, file, &trace),
                     None => Verdict::Blocked {
-                        why: "no seed run produced this end record's trace".to_owned(),
+                        why: "no passing seed run produced this end record's trace".to_owned(),
                     },
                 };
                 verdicts.insert(expected.to_string(), verdict);
@@ -544,9 +677,7 @@ pub fn record(
     let fully_accepted =
         accepted && evaluation.fully_accepted && deviations.iter().all(|(_, signed)| *signed);
     Sim7Record {
-        artifacts: artifacts
-            .file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        artifacts: artifacts_name,
         subject: subject.to_owned(),
         subject_source: subject_source.to_owned(),
         containment: containment.to_owned(),
@@ -554,6 +685,9 @@ pub fn record(
         problems,
         unsupported: plan.unsupported.clone(),
         evaluation,
+        evidence,
+        measurements,
+        header_record_sha256: file_sha256(&header.out.join("record.json")),
         deviations,
         accepted,
         fully_accepted,
@@ -604,6 +738,11 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             exactly_one_passed(&result, test)
         }
         Task::FuzzTest { test, .. } => match json("test.json") {
+            Some(result)
+                if result.get("checkout_source").and_then(Value::as_str) != Some(source) =>
+            {
+                blocked("the fuzz test didn't run from this run's checkout of S".to_owned())
+            }
             Some(result) => exactly_one_passed(&result, test),
             None => blocked("the test left no test.json".to_owned()),
         },
@@ -613,7 +752,10 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             ignored_run,
             ..
         } => match json("lane.json") {
-            Some(lane) => lane_passed(&lane, required, empty, ignored_run),
+            Some(lane) => match lane_bound(&lane, source) {
+                Some(why) => blocked(why),
+                None => lane_passed(&lane, required, empty, ignored_run),
+            },
             None => blocked("the lane left no lane.json".to_owned()),
         },
         Task::Seed { harness, input, .. } => {
@@ -710,7 +852,7 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             judge_trace(
                 &trace,
                 bound,
-                (harness, input.as_deref()),
+                (harness, Some(input.as_deref().unwrap_or(EMPTY_SHA256))),
                 &RunExpect::Passes,
                 &mut 0,
             )
@@ -757,6 +899,28 @@ struct LaneRun {
     list_failures: Vec<String>,
 }
 
+/// Why a lane's artifacts aren't bound to S, if they aren't: the lane must
+/// have run from this run's checkout, and every `zakura-sim` test binary,
+/// which embeds the simulator's source digest, must embed S's.
+fn lane_bound(lane: &Value, source: &str) -> Option<String> {
+    if lane.get("checkout_source").and_then(Value::as_str) != Some(source) {
+        return Some("the lane didn't run from this run's checkout of S".to_owned());
+    }
+    let sources: BTreeMap<String, String> = lane
+        .get("binary_sources")
+        .and_then(|sources| serde_json::from_value(sources.clone()).ok())
+        .unwrap_or_default();
+    let binaries: BTreeMap<String, String> = lane
+        .get("binaries")
+        .and_then(|binaries| serde_json::from_value(binaries.clone()).ok())
+        .unwrap_or_default();
+    binaries
+        .keys()
+        .filter(|target| target.starts_with("zakura-sim/"))
+        .find(|target| sources.get(*target).map(String::as_str) != Some(source))
+        .map(|target| format!("{target}'s test binary doesn't embed S's source digest"))
+}
+
 /// A lane passes when its command exited 0, its binaries listed cleanly
 /// before it ran, every required target was built and every test it lists
 /// ran and passed, every expected-empty target listed none, every `run =
@@ -798,12 +962,10 @@ fn lane_passed(
         }
     }
     for target in empty {
-        if run
-            .listed
-            .get(target)
-            .is_some_and(|listed| !listed.is_empty())
-        {
-            return blocked(format!("{target} is expected empty but lists tests"));
+        let lists = run.listed.get(target).is_some_and(|l| !l.is_empty());
+        let ran = run.targets.get(target).is_some_and(|t| !t.is_empty());
+        if lists || ran {
+            return blocked(format!("{target} is expected empty but has tests"));
         }
     }
     for test in ignored_run {
@@ -1102,6 +1264,12 @@ mod tests {
             &lane(json!({})),
             &["zakura-sim/draws::slow".to_owned()]
         )));
+        let ran_empty = lane(json!({ "targets": {
+            "zakura-sim/draws": [["a", "ok"]], "zakura-rt/lib": [["hidden", "ok"]] } }));
+        assert!(
+            blocked(&judge(&ran_empty, &none)),
+            "an expected-empty target that runs a test blocks"
+        );
         let panics =
             lane(json!({ "targets": { "zakura-sim/draws": [["a - should panic", "ok"]] } }));
         assert_eq!(

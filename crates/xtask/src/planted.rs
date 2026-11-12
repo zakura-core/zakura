@@ -1157,7 +1157,7 @@ fn built_from(binary: &Path, checkout: &Path) -> Result<Result<(), String>, BoxE
 /// digest as `zakura-sim`'s build script computes it, so it was built from
 /// that source and not reused from an earlier one. A digest git couldn't
 /// compute names no source.
-pub(super) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+pub(crate) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
     if source == provenance::UNKNOWN {
         return Err("git couldn't compute the patched checkout's source digest".to_owned());
     }

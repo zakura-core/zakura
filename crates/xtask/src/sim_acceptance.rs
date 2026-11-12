@@ -175,6 +175,7 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
             fs::remove_dir_all(target)?;
         }
     }
+    write_checksums(&run_dir)?;
     publish_record(&args.out, &run_dir)?;
     println!("{summary}");
     println!("record: {}", args.out.join(RECORD).display());
@@ -263,17 +264,29 @@ fn run_at(
     let plan: Value = serde_json::from_str(&fs::read_to_string(&plan_file)?)?;
 
     // Every seed, in one report, then each harness's full inputs written to
-    // one corpus by their SHA-256 (`--out` holds one harness's seeds).
+    // one corpus by their SHA-256 (`--out` holds one harness's seeds). The
+    // report and the child's outcome are artifacts: the evaluator counts a
+    // seed only if this release inventory exited 0 and admitted it.
     let corpus = run.out.join("corpus");
+    let inventory = artifacts.join("seeds");
+    fs::create_dir_all(&inventory)?;
     let mut seeds = Command::new(&release);
     seeds
         .arg("seeds")
         .arg("--report")
-        .arg(run.out.join("seeds.json"))
+        .arg(inventory.join("report.json"))
         .current_dir(root);
-    let _ = child(&mut seeds, &logs.join("seeds.log"), run.deadline);
+    let ended = child(&mut seeds, &inventory.join("inventory.log"), run.deadline);
+    stop_if_interrupted()?;
+    fs::write(
+        inventory.join("inventory.json"),
+        serde_json::to_string_pretty(&json!({
+            "exited_ok": ended.exited(),
+            "killed": ended.killed(),
+        }))?,
+    )?;
     let report: Value = serde_json::from_str(
-        &fs::read_to_string(run.out.join("seeds.json")).unwrap_or_else(|_| "{}".to_owned()),
+        &fs::read_to_string(inventory.join("report.json")).unwrap_or_else(|_| "{}".to_owned()),
     )?;
     let harnesses: BTreeSet<&str> = report
         .get("seeds")
@@ -324,16 +337,33 @@ fn run_at(
             dir: &dir,
             release: &release,
             corpus: &corpus,
+            source,
         };
         match kind.as_str() {
-            "test" => run_test(
-                root,
-                run,
-                Some(source),
-                fields,
-                &dir,
-                &run.out.join("tests"),
-            )?,
+            "test" => {
+                run_test(
+                    root,
+                    run,
+                    Some(source),
+                    fields,
+                    &dir,
+                    &run.out.join("tests"),
+                )?;
+                // hdr-14's runner writes the build's messages beside its
+                // `test.json`, so the binary it ran is the one test binary
+                // they name.
+                let built = test_executables(
+                    &fs::read_to_string(dir.join("build.log")).unwrap_or_default(),
+                );
+                if let [(_, executable, _)] = &built[..] {
+                    fs::write(
+                        dir.join("binary.json"),
+                        serde_json::to_string_pretty(&json!({
+                            "sha256": sha256_file(executable)?,
+                        }))?,
+                    )?;
+                }
+            }
             "fuzz-test" => ctx.fuzz_test(fields)?,
             "lane" => ctx.lane(fields)?,
             "seed" => ctx.seed(fields)?,
@@ -379,6 +409,8 @@ struct Ctx<'a> {
     dir: &'a Path,
     release: &'a Path,
     corpus: &'a Path,
+    /// S's source digest, which the checkout's own digest gave.
+    source: &'a str,
 }
 
 /// `field` of a task, as text.
@@ -428,9 +460,16 @@ impl Ctx<'_> {
         let ended = child(&mut cargo, &log, self.run.deadline);
         stop_if_interrupted()?;
         let text = fs::read_to_string(&log).unwrap_or_default();
+        let binary = text
+            .lines()
+            .filter_map(running_binary)
+            .map(|path| sha256_file(Path::new(path)))
+            .collect::<Result<Vec<_>, _>>()?;
         fs::write(
             self.dir.join("test.json"),
             serde_json::to_string_pretty(&json!({
+                "checkout_source": self.source,
+                "binary": binary.first(),
                 "tests": libtest(&text),
                 "killed": ended.killed(),
                 "exited_ok": ended.exited(),
@@ -444,9 +483,10 @@ impl Ctx<'_> {
     /// First the same command with `--no-run --message-format=json` builds
     /// its test binaries and names each one's package and target, and each
     /// binary is listed with `--list` before anything runs. Then the lane
-    /// runs, and each binary's results are matched to its target by path.
-    /// `lane.json` holds the outcome, each target's results and listed
-    /// tests, and the targets whose listing failed (Rule 11).
+    /// runs, each binary's results are matched to its target by path, and
+    /// each `run = true` ignored test runs alone by its exact name.
+    /// `lane.json` holds the outcome, each target's results, listed tests
+    /// and binary digest, and the targets whose inventory failed (Rule 11).
     fn lane(&self, task: &Value) -> Result<(), BoxError> {
         let command = field(task, "command")?;
         let mut build = Command::new("sh");
@@ -456,38 +496,29 @@ impl Ctx<'_> {
         let build_log = self.dir.join("inventory.log");
         let built = child(&mut build, &build_log, self.run.deadline);
         stop_if_interrupted()?;
-        let mut inventory: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for line in fs::read_to_string(&build_log).unwrap_or_default().lines() {
-            let Ok(message) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
-                continue;
+        let mut inventory: BTreeMap<String, (PathBuf, PathBuf)> = BTreeMap::new();
+        let mut list_failures = Vec::new();
+        for (target, executable, package_dir) in
+            test_executables(&fs::read_to_string(&build_log).unwrap_or_default())
+        {
+            if inventory
+                .insert(target.clone(), (executable, package_dir))
+                .is_some()
+            {
+                list_failures.push(format!("{target} names two test binaries"));
             }
-            let (Some(executable), Some(manifest)) = (
-                message.get("executable").and_then(Value::as_str),
-                message.get("manifest_path").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            let package = Path::new(manifest)
-                .parent()
-                .and_then(Path::file_name)
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-            let kind = message
-                .pointer("/target/kind/0")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let name = message
-                .pointer("/target/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let target = if kind == "test" { name } else { "lib" };
-            inventory.insert(format!("{package}/{target}"), PathBuf::from(executable));
         }
         let mut listed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut list_failures = Vec::new();
-        for (target, binary) in &inventory {
+        let mut binaries: BTreeMap<String, String> = BTreeMap::new();
+        let mut binary_sources: BTreeMap<String, &str> = BTreeMap::new();
+        for (target, (binary, _)) in &inventory {
+            let bytes = fs::read(binary)?;
+            binaries.insert(target.clone(), sha256_hex(&bytes));
+            let embeds = crate::planted::names_source(&bytes, self.source).is_ok();
+            binary_sources.insert(
+                target.clone(),
+                if embeds { self.source } else { "not-embedded" },
+            );
             match (
                 list_tests(binary, false, self),
                 list_tests(binary, true, self),
@@ -495,7 +526,7 @@ impl Ctx<'_> {
                 (Some(all), Some(ignored)) => {
                     listed.insert(target.clone(), all.difference(&ignored).cloned().collect());
                 }
-                _ => list_failures.push(target.clone()),
+                _ => list_failures.push(format!("{target}'s binary didn't list its tests")),
             }
         }
         let mut sh = Command::new("sh");
@@ -506,7 +537,9 @@ impl Ctx<'_> {
         let text = fs::read_to_string(&log).unwrap_or_default();
         let by_file: BTreeMap<std::ffi::OsString, String> = inventory
             .iter()
-            .filter_map(|(target, binary)| Some((binary.file_name()?.to_owned(), target.clone())))
+            .filter_map(|(target, (binary, _))| {
+                Some((binary.file_name()?.to_owned(), target.clone()))
+            })
             .collect();
         let mut targets: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         let mut current: Option<String> = None;
@@ -520,13 +553,11 @@ impl Ctx<'_> {
             }
         };
         for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("Running ") {
+            if let Some(path) = running_binary(line) {
                 flush(&current, &section);
                 section.clear();
-                current = rest
-                    .rsplit_once('(')
-                    .map(|(_, path)| path.trim_end_matches(')'))
-                    .and_then(|path| Path::new(path).file_name())
+                current = Path::new(path)
+                    .file_name()
                     .and_then(|file| by_file.get(file).cloned());
             } else {
                 section.push_str(line);
@@ -534,6 +565,35 @@ impl Ctx<'_> {
             }
         }
         flush(&current, &section);
+        // Each `run = true` ignored test, alone, as `cargo test` runs a
+        // binary: from its package's directory.
+        let ignored_run: Vec<String> =
+            serde_json::from_value(task.get("ignored_run").cloned().unwrap_or_default())?;
+        for (index, test) in ignored_run.iter().enumerate() {
+            let Some((target, name)) = test.split_once("::") else {
+                continue;
+            };
+            let Some((binary, package_dir)) = inventory.get(target) else {
+                continue;
+            };
+            let mut run = Command::new(binary);
+            run.args(["--ignored", "--exact", name])
+                .current_dir(package_dir)
+                .env("CARGO_MANIFEST_DIR", package_dir);
+            let log = self.dir.join(format!("ignored-{index}.log"));
+            let ended = child(&mut run, &log, self.run.deadline);
+            stop_if_interrupted()?;
+            let results = libtest(&fs::read_to_string(&log).unwrap_or_default());
+            let results = if ended.exited() {
+                results
+            } else {
+                vec![(name.to_owned(), "FAILED".to_owned())]
+            };
+            targets
+                .entry(target.to_owned())
+                .or_default()
+                .extend(results);
+        }
         fs::write(
             self.dir.join("lane.json"),
             serde_json::to_string_pretty(&json!({
@@ -541,6 +601,9 @@ impl Ctx<'_> {
                 "killed": ended.killed() || built.killed(),
                 "targets": targets,
                 "listed": listed,
+                "binaries": binaries,
+                "binary_sources": binary_sources,
+                "checkout_source": self.source,
                 "list_failures": list_failures,
                 "log": text,
             }))?,
@@ -634,6 +697,109 @@ impl Ctx<'_> {
     }
 }
 
+/// The path in a `cargo test` line `Running <target> (<path>)`.
+fn running_binary(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("Running ")?;
+    let (_, path) = rest.rsplit_once('(')?;
+    Some(path.trim_end_matches(')'))
+}
+
+/// Each test binary a `cargo test --no-run --message-format=json` build
+/// names in `messages`, as `<package>/<target>` with its executable and its
+/// package's directory. The target is `lib` for a library's unit tests, the
+/// name for an integration test, and `<kind>:<name>` for any other kind.
+/// Only test-profile artifacts count, so a normal binary an integration
+/// test needs isn't taken for one.
+fn test_executables(messages: &str) -> Vec<(String, PathBuf, PathBuf)> {
+    let mut built = Vec::new();
+    for line in messages.lines() {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact")
+            || message.pointer("/profile/test").and_then(Value::as_bool) != Some(true)
+        {
+            continue;
+        }
+        let (Some(executable), Some(manifest)) = (
+            message.get("executable").and_then(Value::as_str),
+            message.get("manifest_path").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let package_dir = Path::new(manifest)
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let package = package_dir
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let kind = message
+            .pointer("/target/kind/0")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = message
+            .pointer("/target/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let target = match kind {
+            "test" => name.to_owned(),
+            "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro" => "lib".to_owned(),
+            other => format!("{other}:{name}"),
+        };
+        built.push((
+            format!("{package}/{target}"),
+            PathBuf::from(executable),
+            package_dir,
+        ));
+    }
+    built
+}
+
+/// `bytes`' SHA-256 in lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A file's SHA-256 in lowercase hex.
+fn sha256_file(path: &Path) -> Result<String, BoxError> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Writes `<run>/checksums.json`: every file left in the run directory,
+/// by its path relative to it, with its SHA-256, so an archive of the run
+/// can be checked file by file. Links aren't followed.
+fn write_checksums(run_dir: &Path) -> Result<(), BoxError> {
+    let mut sums = BTreeMap::new();
+    let mut pending = vec![run_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                let relative = path
+                    .strip_prefix(run_dir)
+                    .expect("every walked path is under the run directory")
+                    .display()
+                    .to_string();
+                sums.insert(relative, sha256_file(&path)?);
+            }
+        }
+    }
+    fs::write(
+        run_dir.join("checksums.json"),
+        serde_json::to_string_pretty(&sums)?,
+    )?;
+    Ok(())
+}
+
 /// Copies the run's recording executables, the release and debug
 /// `zakura-sim`, to `<run>/bin/<sha256>/zakura-sim`, with `bin/index.json`
 /// naming which is which, before their build directories go: every trace
@@ -689,4 +855,47 @@ fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> Option<BTreeSet<St
             .map(str::to_owned)
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::test_executables;
+
+    /// A normal binary built for an integration test isn't taken for the
+    /// library's test binary, and each target keeps its kind and name.
+    #[test]
+    fn the_inventory_takes_only_test_binaries() {
+        let artifact = |kind: &str, name: &str, test: bool, exe: &str| {
+            json!({
+                "reason": "compiler-artifact",
+                "manifest_path": "/repo/crates/zakura-sim/Cargo.toml",
+                "target": { "kind": [kind], "name": name },
+                "profile": { "test": test },
+                "executable": exe,
+            })
+            .to_string()
+        };
+        let messages = [
+            artifact("lib", "zakura_sim", true, "/t/deps/zakura_sim-1"),
+            artifact("bin", "zakura-sim", false, "/t/zakura-sim"),
+            artifact("test", "draws", true, "/t/deps/draws-2"),
+            artifact("bin", "zakura-sim", true, "/t/deps/zakura_sim-3"),
+        ]
+        .join("\n");
+        let targets: Vec<(String, String)> = test_executables(&messages)
+            .into_iter()
+            .map(|(target, exe, _)| (target, exe.display().to_string()))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("zakura-sim/lib", "/t/deps/zakura_sim-1"),
+                ("zakura-sim/draws", "/t/deps/draws-2"),
+                ("zakura-sim/bin:zakura-sim", "/t/deps/zakura_sim-3"),
+            ]
+            .map(|(target, exe)| (target.to_owned(), exe.to_owned()))
+        );
+    }
 }

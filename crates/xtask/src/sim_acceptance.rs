@@ -372,6 +372,7 @@ fn run_at(
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
         }
+        ctx.check_checkout()?;
     }
 
     // Before the evaluator, which binds each trace to the kept release build.
@@ -667,6 +668,37 @@ impl Ctx<'_> {
         }
         cargo.args(&args);
         self.record(&mut cargo, "command")?;
+        // What ran, so the evaluator can tell one command's result from
+        // another's.
+        let file = self.dir.join("command.json");
+        let mut result: Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
+        result["args"] = json!(args);
+        result["sim"] = json!(sim);
+        result["checkout_source"] = json!(self.source);
+        fs::write(&file, serde_json::to_string_pretty(&result)?)?;
+        Ok(())
+    }
+
+    /// Writes `<dir>/checkout.json`: whether the subject checkout is still
+    /// clean after the task, tracked and untracked files alike, since every
+    /// later task builds from it. The evaluator blocks a task that left it
+    /// dirty and every task after it.
+    fn check_checkout(&self) -> Result<(), BoxError> {
+        let mut status = Command::new("git");
+        status
+            .args(["status", "--porcelain", "--ignored=no"])
+            .current_dir(self.root);
+        let log = self.dir.join("checkout.log");
+        let ended = child(&mut status, &log, self.run.deadline);
+        stop_if_interrupted()?;
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        fs::write(
+            self.dir.join("checkout.json"),
+            serde_json::to_string_pretty(&json!({
+                "clean": ended.exited() && text.trim().is_empty(),
+                "status": text,
+            }))?,
+        )?;
         Ok(())
     }
 

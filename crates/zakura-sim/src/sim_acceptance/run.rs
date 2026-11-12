@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::{
     deviations::DEVIATIONS,
     evaluate::{evaluate, header_refusal, Evaluation, HeaderRecordFacts, RowSpec, Verdict},
-    header::{consumed_cleanup, verify, Published},
+    header::{self, consumed_cleanup, verify, Published},
     judge::{owned_run_passes, Registered, RunExpect},
     manifest::{derive, problems, rows, Expected, LANES},
 };
@@ -428,8 +428,9 @@ pub struct Sim7Record {
     pub measurements: BTreeMap<String, Value>,
     /// The SHA-256 of hdr-14's `record.json` this record consumed.
     pub header_record_sha256: Option<String>,
-    /// Every narrowing of the spec, and whether it's signed off.
-    pub deviations: Vec<(String, bool)>,
+    /// Every narrowing of the spec, with its quote, claim and approval,
+    /// and whether it's signed off.
+    pub deviations: Vec<DeviationEntry>,
     /// No row blocked, no manifest problem, the plan S's own, the run
     /// contained under a subreaper, and the header record consumed.
     pub accepted: bool,
@@ -448,6 +449,27 @@ pub struct Evidence {
     pub binaries: Vec<String>,
     /// The property applications its passing run credited.
     pub applicable: u64,
+    /// Each registered property's outcome in its trace's end record, for a
+    /// result with a trace.
+    pub properties: BTreeMap<String, Value>,
+}
+
+/// One [`super::deviations::Deviation`] as the record exports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviationEntry {
+    /// Its ID.
+    pub id: String,
+    /// The spec text it narrows.
+    pub spec: String,
+    /// The narrower claim.
+    pub claim: String,
+    /// Who approved it, and when.
+    pub approval: Option<String>,
+    /// Evan's sign-off state.
+    pub evan: String,
+    /// Whether it's signed off.
+    pub signed_off: bool,
 }
 
 /// The directory under the artifacts where the xtask keeps the release
@@ -483,16 +505,48 @@ fn seed_inventory_refusal(artifacts: &Path, file: Option<&str>, input: &str) -> 
     (!admitted).then(|| format!("the release seed inventory doesn't admit input {input}"))
 }
 
-/// The SHA-256 of the file at `path`, if it reads.
-fn file_sha256(path: &Path) -> Option<String> {
+/// `bytes`' SHA-256 in lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
-    let bytes = fs::read(path).ok()?;
-    Some(
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The JSON in the regular file at `path`, read without following a link
+/// and within the artifact limit, if it reads and parses.
+fn bounded_json(path: &Path) -> Option<Value> {
+    let bytes = crate::trace::read::read_bounded(path, header::MAX_ARTIFACT_BYTES)
+        .ok()
+        .flatten()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Each registered property's outcome in the end record of the trace a
+/// trace-backed task left in `dir`, as [`Evidence::properties`].
+fn trace_properties(task: &Task, dir: &Path) -> BTreeMap<String, Value> {
+    if !matches!(
+        task,
+        Task::Seed { .. } | Task::SeedWitness { .. } | Task::Measure { .. }
+    ) {
+        return BTreeMap::new();
+    }
+    TraceReader::open(&dir.join("trace"))
+        .ok()
+        .and_then(|trace| trace.end)
+        .map(|end| {
+            end.properties
+                .iter()
+                .filter_map(|report| {
+                    Some((
+                        report.property.clone(),
+                        serde_json::to_value(&report.outcome).ok()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The binaries a task's artifacts in `dir` name, as [`Evidence::binaries`].
@@ -563,23 +617,41 @@ pub fn record(
         source: subject_source,
         release: artifacts
             .parent()
-            .and_then(|run| fs::read_to_string(run.join("bin/index.json")).ok())
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|run| bounded_json(&run.join("bin/index.json")))
             .and_then(|index| index.get("release")?.as_str().map(str::to_owned)),
     };
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut applicable = 0u64;
-    let mut seed_traces: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+    let mut seed_traces: BTreeMap<String, (std::path::PathBuf, usize)> = BTreeMap::new();
     let mut evidence = BTreeMap::new();
     let mut measurements = BTreeMap::new();
     let artifacts_name = artifacts
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    // Every file below is read only once the whole tree is safe to read.
+    let unsafe_tree = header::tree_refusal(artifacts);
+    // The task that changed the subject checkout, which every later task's
+    // build would have read.
+    let mut dirtied: Option<usize> = None;
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
+        if let Some(why) = &unsafe_tree {
+            verdicts.insert(
+                task.expected().to_owned(),
+                Verdict::Blocked {
+                    why: format!("the artifacts aren't safe to read: {why}"),
+                },
+            );
+            continue;
+        }
         let recorded = fs::read_to_string(dir.join("task.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<Task>(&text).ok());
+        let clean = fs::read_to_string(dir.join("checkout.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|checkout| checkout.get("clean")?.as_bool())
+            == Some(true);
         // A seed or witness counts only on an input the release build's own
         // inventory admitted.
         let refusal = match task {
@@ -587,19 +659,37 @@ pub fn record(
             Task::SeedWitness { input, .. } => seed_inventory_refusal(artifacts, None, input),
             _ => None,
         };
-        let before = applicable;
+        let mut credited = 0u64;
+        let binaries = task_binaries(task, &dir);
         let verdict = if recorded.as_ref() != Some(task) {
             Verdict::Blocked {
                 why: "the artifact directory's task.json isn't this task".to_owned(),
             }
+        } else if let Some(earlier) = dirtied {
+            Verdict::Blocked {
+                why: format!("task {earlier} changed the subject checkout"),
+            }
+        } else if !clean {
+            dirtied = Some(index);
+            Verdict::Blocked {
+                why: "the subject checkout wasn't clean after this task".to_owned(),
+            }
         } else if let Some(why) = refusal {
             Verdict::Blocked { why }
+        } else if binaries.is_empty() && !matches!(task, Task::Command { .. }) {
+            Verdict::Blocked {
+                why: "the artifacts name no binary that produced this result".to_owned(),
+            }
         } else {
-            judge_task(task, &dir, &bound, &mut applicable)
+            judge_task(task, &dir, &bound, &mut credited)
         };
+        // The suite's applicability total is the fixed corpus's.
+        if matches!(task, Task::Seed { .. }) {
+            applicable += credited;
+        }
         // An end record is judged only from a seed run that passed.
         if let (Task::Seed { file, .. }, Verdict::Verified) = (task, &verdict) {
-            seed_traces.insert(file.clone(), dir.join("trace"));
+            seed_traces.insert(file.clone(), (dir.join("trace"), index));
         }
         if let Task::Measure { expected, .. } = task {
             if let Some(measure) = fs::read_to_string(dir.join("measure.json"))
@@ -613,8 +703,9 @@ pub fn record(
             task.expected().to_owned(),
             Evidence {
                 artifact: format!("{artifacts_name}/{index}"),
-                binaries: task_binaries(task, &dir),
-                applicable: applicable - before,
+                binaries,
+                applicable: credited,
+                properties: trace_properties(task, &dir),
             },
         );
         verdicts.insert(task.expected().to_owned(), verdict);
@@ -632,12 +723,28 @@ pub fn record(
                 let seed = file
                     .strip_suffix(".end.json")
                     .map(|stem| format!("{stem}.bin"));
-                let verdict = match seed.and_then(|seed| seed_traces.get(&seed).cloned()) {
-                    Some(trace) => end_record_matches(repo, file, &trace),
+                let seed = seed.and_then(|seed| Some((seed_traces.get(&seed)?.clone(), seed)));
+                let verdict = match &seed {
+                    Some(((trace, _), _)) => end_record_matches(repo, file, trace),
                     None => Verdict::Blocked {
                         why: "no passing seed run produced this end record's trace".to_owned(),
                     },
                 };
+                // Its evidence is the seed run's.
+                let seed_evidence = seed
+                    .as_ref()
+                    .and_then(|((_, index), _)| plan.tasks.get(*index))
+                    .and_then(|task| evidence.get(task.expected()))
+                    .cloned();
+                if let Some(seed_evidence) = seed_evidence {
+                    evidence.insert(
+                        expected.to_string(),
+                        Evidence {
+                            applicable: 0,
+                            ..seed_evidence
+                        },
+                    );
+                }
                 verdicts.insert(expected.to_string(), verdict);
             }
         }
@@ -653,6 +760,15 @@ pub fn record(
                         why: "no header record".to_owned(),
                     },
                 };
+                evidence.insert(
+                    expected.to_string(),
+                    Evidence {
+                        artifact: "header-acceptance:record.json".to_owned(),
+                        binaries: Vec::new(),
+                        applicable: 0,
+                        properties: BTreeMap::new(),
+                    },
+                );
                 verdicts.insert(expected.to_string(), verdict);
             }
         }
@@ -666,16 +782,23 @@ pub fn record(
         })
         .collect();
     let evaluation = evaluate(&specs, &verdicts, applicable);
-    let deviations: Vec<(String, bool)> = DEVIATIONS
+    let deviations: Vec<DeviationEntry> = DEVIATIONS
         .iter()
-        .map(|d| (d.id.to_owned(), d.is_signed_off()))
+        .map(|d| DeviationEntry {
+            id: d.id.to_owned(),
+            spec: d.spec.to_owned(),
+            claim: d.claim.to_owned(),
+            approval: d.approval.map(str::to_owned),
+            evan: format!("{:?}", d.evan),
+            signed_off: d.is_signed_off(),
+        })
         .collect();
     let accepted = evaluation.accepted
         && problems.is_empty()
         && refusal.is_none()
         && containment == "subreaper";
     let fully_accepted =
-        accepted && evaluation.fully_accepted && deviations.iter().all(|(_, signed)| *signed);
+        accepted && evaluation.fully_accepted && deviations.iter().all(|d| d.signed_off);
     Sim7Record {
         artifacts: artifacts_name,
         subject: subject.to_owned(),
@@ -687,7 +810,13 @@ pub fn record(
         evaluation,
         evidence,
         measurements,
-        header_record_sha256: file_sha256(&header.out.join("record.json")),
+        header_record_sha256: crate::trace::read::read_bounded(
+            &header.out.join("record.json"),
+            header::MAX_ARTIFACT_BYTES,
+        )
+        .ok()
+        .flatten()
+        .map(|bytes| sha256_hex(&bytes)),
         deviations,
         accepted,
         fully_accepted,
@@ -819,10 +948,17 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
                 bound,
                 (harness, Some(input)),
                 &run_expect,
-                &mut 0,
+                applicable,
             )
         }
-        Task::Command { args, .. } => match json("command.json") {
+        Task::Command { args, sim, .. } => match json("command.json") {
+            Some(command)
+                if command.get("args") != Some(&serde_json::json!(args))
+                    || command.get("sim").and_then(Value::as_bool) != Some(*sim)
+                    || command.get("checkout_source").and_then(Value::as_str) != Some(source) =>
+            {
+                blocked("command.json isn't this command's run from S".to_owned())
+            }
             Some(command) => command_passed(&command, args),
             None => blocked("the command left no command.json".to_owned()),
         },
@@ -854,7 +990,7 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
                 bound,
                 (harness, Some(input.as_deref().unwrap_or(EMPTY_SHA256))),
                 &RunExpect::Passes,
-                &mut 0,
+                applicable,
             )
         }
     }
@@ -914,6 +1050,18 @@ fn lane_bound(lane: &Value, source: &str) -> Option<String> {
         .get("binaries")
         .and_then(|binaries| serde_json::from_value(binaries.clone()).ok())
         .unwrap_or_default();
+    let mut targets: BTreeSet<String> = BTreeSet::new();
+    for field in ["listed", "targets"] {
+        if let Some(map) = lane.get(field).and_then(Value::as_object) {
+            targets.extend(map.keys().cloned());
+        }
+    }
+    if let Some(target) = targets
+        .iter()
+        .find(|target| !binaries.contains_key(*target) || !sources.contains_key(*target))
+    {
+        return Some(format!("{target} has no recorded test binary"));
+    }
     binaries
         .keys()
         .filter(|target| target.starts_with("zakura-sim/"))
@@ -1141,13 +1289,21 @@ fn header_record(
 ) -> (Option<String>, Option<Record>) {
     let read =
         |path: &Path| fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
-    let record: Record = match read(&header.out.join("record.json"))
-        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+    let record: Record = match bounded_json(&header.out.join("record.json"))
+        .and_then(|value| serde_json::from_value(value).ok())
     {
-        Ok(record) => record,
-        Err(why) => return (Some(format!("the header record doesn't read: {why}")), None),
+        Some(record) => record,
+        None => return (Some("the header record doesn't read".to_owned()), None),
     };
     let artifacts = header.out.join(&record.artifacts);
+    // Its run's whole tree, plan and traces, is checked once before anything
+    // in it is read.
+    if let Some(why) = artifacts.parent().and_then(header::tree_refusal) {
+        return (
+            Some(format!("the header run isn't safe to read: {why}")),
+            Some(record),
+        );
+    }
     let run_dir = artifacts.parent().unwrap_or(header.out).to_owned();
     let run_id = run_dir
         .file_name()
@@ -1198,7 +1354,7 @@ fn header_key_verdict(record: &Record, key: &crate::harness::header_acceptance::
 mod tests {
     use serde_json::json;
 
-    use super::{command_passed, exactly_one_passed, lane_passed, Verdict};
+    use super::{command_passed, exactly_one_passed, lane_bound, lane_passed, Verdict};
 
     fn blocked(verdict: &Verdict) -> bool {
         matches!(verdict, Verdict::Blocked { .. })
@@ -1280,6 +1436,40 @@ mod tests {
         let failed =
             lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["c", "FAILED"]] } }));
         assert!(blocked(&judge(&failed, &none)));
+    }
+
+    /// A lane binds to S only when every target it listed or ran names its
+    /// test binary, and each `zakura-sim` binary embeds S's digest.
+    #[test]
+    fn a_lane_needs_a_binary_for_every_target() {
+        let bound = json!({
+            "checkout_source": "s",
+            "listed": { "zakura-sim/draws": ["a"] },
+            "targets": { "zakura-sim/draws": [["a", "ok"]] },
+            "binaries": { "zakura-sim/draws": "d" },
+            "binary_sources": { "zakura-sim/draws": "s" },
+        });
+        assert_eq!(lane_bound(&bound, "s"), None);
+        for field in ["binaries", "binary_sources"] {
+            let mut stripped = bound.clone();
+            stripped.as_object_mut().unwrap().remove(field);
+            assert!(lane_bound(&stripped, "s").is_some(), "no {field} blocks");
+        }
+        let mut other = bound.clone();
+        other["binary_sources"]["zakura-sim/draws"] = json!("not-embedded");
+        assert!(lane_bound(&other, "s").is_some());
+        assert!(lane_bound(&bound, "t").is_some(), "another checkout blocks");
+    }
+
+    /// An artifact tree holding a link isn't read.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_tree_with_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("task.json"), "{}").unwrap();
+        assert_eq!(super::header::tree_refusal(dir.path()), None);
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("trace.jsonl")).unwrap();
+        assert!(super::header::tree_refusal(dir.path()).is_some());
     }
 
     /// `cargo tree` passes only on exit 0, with the zakura root, and no

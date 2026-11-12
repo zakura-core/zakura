@@ -89,26 +89,94 @@ fn join(key: &str, rest: &str) -> String {
     }
 }
 
-/// Every simulator execution `actual` holds. The match names every
-/// variant, so a new one fails to compile until it's walked here (the
-/// sim-7 plan's Rule 10).
-pub fn executions(actual: &Actual) -> Vec<&Execution> {
+/// The trace digest of every simulator run `actual` holds: each
+/// `Execution`, and each planted case's companion runs. The match names
+/// every variant and every field, so a new variant or field fails to
+/// compile until it's walked here (the sim-7 plan's Rule 10).
+pub fn executed_traces(actual: &Actual) -> Vec<&str> {
+    /// The trace digests of `executions`.
+    fn traces<'a>(executions: &[&'a Execution]) -> Vec<&'a str> {
+        executions.iter().map(|e| e.trace.as_str()).collect()
+    }
     match actual {
-        Actual::Run(run) => vec![run],
+        Actual::Run(run) => traces(&[run]),
         Actual::Caught {
             baseline,
             patched,
             draft,
-            ..
-        } => vec![baseline, patched, draft],
-        Actual::MachineCaught { baseline, patched } => vec![baseline, patched],
+            companions,
+        } => {
+            let mut all = traces(&[baseline, patched, draft]);
+            all.extend(companions.iter().map(|c| c.trace.as_str()));
+            all
+        }
+        Actual::MachineCaught { baseline, patched } => traces(&[baseline, patched]),
         Actual::IntegrityCaught {
             unpatched,
             patched,
             restored,
-        } => vec![unpatched, patched, restored],
-        Actual::Replay { .. } | Actual::Test { .. } => Vec::new(),
+        } => traces(&[unpatched, patched, restored]),
+        // A replay reruns a run walked under its own result, and a test
+        // result is a named `cargo test` execution with no trace.
+        Actual::Replay {
+            run: _,
+            of: _,
+            meta: _,
+            exact: _,
+            reports_equal: _,
+            stores_equal: _,
+            fresh: _,
+        }
+        | Actual::Test {
+            ran: _,
+            binary_source: _,
+        } => Vec::new(),
     }
+}
+
+/// The most entries an artifact tree may hold.
+const MAX_ARTIFACT_ENTRIES: usize = 1 << 20;
+
+/// The largest file an artifact tree may hold, which bounds every read
+/// the evaluator makes from it.
+pub const MAX_ARTIFACT_BYTES: u64 = 1 << 30;
+
+/// Why the tree at `dir` isn't safe to read, if it isn't: it and every
+/// entry under it must be a directory or a regular file of at most
+/// [`MAX_ARTIFACT_BYTES`], with no link, FIFO or device, and at most
+/// [`MAX_ARTIFACT_ENTRIES`] entries in all. The evaluator checks each tree
+/// once, here, before it reads any file in it, so a link to `/dev/zero` or
+/// a FIFO can't exhaust or hang it.
+pub fn tree_refusal(dir: &Path) -> Option<String> {
+    let mut pending = vec![dir.to_path_buf()];
+    let mut entries = 0usize;
+    while let Some(path) = pending.pop() {
+        entries += 1;
+        if entries > MAX_ARTIFACT_ENTRIES {
+            return Some(format!("{} holds too many entries", dir.display()));
+        }
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(error) => return Some(format!("{}: {error}", path.display())),
+        };
+        if meta.is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(children) => pending.extend(children.flatten().map(|entry| entry.path())),
+                Err(error) => return Some(format!("{}: {error}", path.display())),
+            }
+        } else if !meta.is_file() {
+            return Some(format!(
+                "{} isn't a regular file or directory",
+                path.display()
+            ));
+        } else if meta.len() > MAX_ARTIFACT_BYTES {
+            return Some(format!(
+                "{} is larger than the artifact limit",
+                path.display()
+            ));
+        }
+    }
+    None
 }
 
 /// Judges the cleanup of every execution in `results` from its trace's end
@@ -120,23 +188,17 @@ pub fn consumed_cleanup(results: &ResultFile, artifacts: &Path) -> Result<(), St
     let mut traces = std::collections::BTreeMap::new();
     index_traces(artifacts, &mut traces);
     for result in &results.results {
-        for execution in executions(&result.actual) {
-            let dir = traces.get(&execution.trace).ok_or_else(|| {
-                format!(
-                    "the header run's trace {} isn't in its artifacts",
-                    execution.trace
-                )
-            })?;
+        for digest in executed_traces(&result.actual) {
+            let dir = traces
+                .get(digest)
+                .ok_or_else(|| format!("the header run's trace {digest} isn't in its artifacts"))?;
             let trace = TraceReader::open(dir)
                 .map_err(|error| format!("the header trace in {}: {error}", dir.display()))?;
             let end = trace
                 .end
                 .ok_or_else(|| format!("the header trace in {} has no end", dir.display()))?;
             if let Some(fault) = super::judge::cleanup_fault(&end.cleanup) {
-                return Err(format!(
-                    "a consumed header run ({}): {fault}",
-                    execution.trace
-                ));
+                return Err(format!("a consumed header run ({digest}): {fault}"));
             }
         }
     }

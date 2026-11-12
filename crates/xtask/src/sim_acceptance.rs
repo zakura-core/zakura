@@ -248,13 +248,12 @@ fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<Strin
         .map_err(|end| format!("`sim-acceptance plan` {end}"))?;
     let plan: Value = serde_json::from_str(&fs::read_to_string(&plan_file)?)?;
 
-    // Every seed's full input, by its SHA-256, and which harness it's for.
+    // Every seed, in one report, then each harness's full inputs written to
+    // one corpus by their SHA-256 (`--out` holds one harness's seeds).
     let corpus = run.out.join("corpus");
     let mut seeds = Command::new(&release);
     seeds
         .arg("seeds")
-        .arg("--out")
-        .arg(&corpus)
         .arg("--report")
         .arg(run.out.join("seeds.json"))
         .current_dir(root);
@@ -262,6 +261,21 @@ fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<Strin
     let report: Value = serde_json::from_str(
         &fs::read_to_string(run.out.join("seeds.json")).unwrap_or_else(|_| "{}".to_owned()),
     )?;
+    let harnesses: BTreeSet<&str> = report
+        .get("seeds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.pointer("/sidecar/harness")?.as_str())
+        .collect();
+    for harness in harnesses {
+        let mut fill = Command::new(&release);
+        fill.args(["seeds", "--sim", harness, "--out"])
+            .arg(&corpus)
+            .current_dir(root);
+        let log = logs.join(format!("seeds-{}.log", harness.replace('/', "-")));
+        let _ = child(&mut fill, &log, run.deadline);
+    }
     let seed_of = |harness: &str| -> Option<PathBuf> {
         report.get("seeds")?.as_array()?.iter().find_map(|row| {
             if row.pointer("/sidecar/harness")?.as_str()? != harness {

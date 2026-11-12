@@ -144,7 +144,19 @@ pub struct Sim7Plan {
 /// The three S4.6 commands, by ID, as `cargo` arguments.
 pub fn command_args(id: &str) -> Option<Vec<String>> {
     let args: &[&str] = match id {
-        "cargo-tree-excludes-simulator" => &["tree", "--locked", "-p", "zakurad", "-e", "normal"],
+        // As the lint step reads it: the node's package is `zakura`.
+        "cargo-tree-excludes-simulator" => &[
+            "tree",
+            "--locked",
+            "-p",
+            "zakura",
+            "-e",
+            "normal,build",
+            "--target",
+            "all",
+            "--prefix",
+            "none",
+        ],
         "check-workspace-normal" => &["check", "--workspace", "--locked"],
         "check-sim-packages" => &[
             "check",
@@ -569,8 +581,8 @@ fn lane_passed(lane: &Value, required: &[String]) -> Verdict {
 }
 
 /// An S4.6 command passes when it exited 0, and the dependency-graph one
-/// also when its output shows the `zakurad` root and none of the
-/// simulator crates.
+/// also when its output shows the node's `zakura` root and none of the
+/// simulator crates the lint step denies.
 fn command_passed(command: &Value, args: &[String]) -> Verdict {
     let exited = command.get("exited_ok").and_then(Value::as_bool) == Some(true);
     let output = command
@@ -583,14 +595,19 @@ fn command_passed(command: &Value, args: &[String]) -> Verdict {
         };
     }
     if args.first().map(String::as_str) == Some("tree") {
-        if !output.lines().any(|line| line.starts_with("zakurad ")) {
+        if !output.lines().any(|line| line.starts_with("zakura v")) {
             return Verdict::Blocked {
-                why: "`cargo tree`'s output has no zakurad root".to_owned(),
+                why: "`cargo tree`'s output has no zakura root".to_owned(),
             };
         }
-        if let Some(denied) = ["zakura-scheduler ", "zakura-sim ", "corosensei "]
-            .iter()
-            .find(|name| output.contains(*name))
+        if let Some(denied) = [
+            "zakura-scheduler ",
+            "zakura-sim ",
+            "zakura-storage ",
+            "corosensei ",
+        ]
+        .iter()
+        .find(|name| output.lines().any(|line| line.starts_with(*name)))
         {
             return Verdict::Blocked {
                 why: format!("the production graph has {}", denied.trim()),
@@ -782,13 +799,13 @@ mod tests {
         );
     }
 
-    /// `cargo tree` passes only on exit 0, with the zakurad root, and no
+    /// `cargo tree` passes only on exit 0, with the zakura root, and no
     /// simulator crate in the graph.
     #[test]
     fn the_dependency_graph_row_reads_cargo_tree_itself() {
         let tree = ["tree".to_owned()];
         let clean =
-            json!({ "exited_ok": true, "log": "zakurad v5.0.0 (/repo)\n├── zakura-chain v5\n" });
+            json!({ "exited_ok": true, "log": "zakura v5.0.0 (/repo)\nzakura-chain v5.0.0\n" });
         assert_eq!(command_passed(&clean, &tree), Verdict::Verified);
         let failed = json!({ "exited_ok": false, "log": "" });
         assert!(blocked(&command_passed(&failed, &tree)));
@@ -797,7 +814,7 @@ mod tests {
             blocked(&command_passed(&empty, &tree)),
             "no root means it checked nothing"
         );
-        let sim = json!({ "exited_ok": true, "log": "zakurad v5.0.0\n└── zakura-sim v0.0.0\n" });
+        let sim = json!({ "exited_ok": true, "log": "zakura v5.0.0\nzakura-sim v0.0.0\n" });
         assert!(blocked(&command_passed(&sim, &tree)));
     }
 }

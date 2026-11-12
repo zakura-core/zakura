@@ -374,6 +374,7 @@ pub fn act_scenario(act: Act) -> WireScenario {
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
+        budget: None,
     }
 }
 

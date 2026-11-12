@@ -144,7 +144,7 @@ pub fn executed_traces(actual: &Actual) -> Vec<&str> {
             restored,
         } => traces(&[unpatched, patched, restored]),
         // A replay reruns a run walked under its own result, and a test
-        // result is a named `cargo test` execution with no trace.
+        // result or a unit catch is `cargo test` executions with no trace.
         Actual::Replay {
             run: _,
             of: _,
@@ -158,7 +158,8 @@ pub fn executed_traces(actual: &Actual) -> Vec<&str> {
             ran: _,
             binary_source: _,
             checkout_source: _,
-        } => Vec::new(),
+        }
+        | Actual::UnitCaught { refused: _ } => Vec::new(),
     }
 }
 

@@ -707,10 +707,6 @@ mod schedule_agreement {
             agreement(&other_pick, &before, &map, &pick).is_err(),
             "a pick that only differs, with nothing of the picked task's changed"
         );
-        let mut earlier: Vec<StepView> = after.to_vec();
-        earlier[0]
-            .obs
-            .insert(0, json!({ "obs": "task-waiting", "task": "u" }));
         let at = Site {
             at: "t:lock#1".to_owned(),
         };

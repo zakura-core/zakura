@@ -1103,6 +1103,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         let transfer_block_sync = block_sync.clone();
         let transfer_trace = trace.clone();
         let abandon = abandon_accepted.clone();
+        let claim = handoff.announced_blocks().take(pending.block.hash());
         let apply = apply_block_sync_body(
             block_verifier.clone(),
             latest_chain_tip.clone(),
@@ -1113,6 +1114,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             pending.source,
             pending.token,
             pending.block,
+            claim,
             class,
             trace.clone(),
             throughput_probe.clone(),
@@ -1346,6 +1348,7 @@ where
         pending.source,
         pending.token,
         pending.block,
+        None,
         pending.class,
         trace,
         Some(throughput_probe),
@@ -1378,6 +1381,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: BlockHandle,
+    claim: Option<zakura_consensus::ReceiptClaim>,
     class: BlockApplyClass,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
@@ -1421,6 +1425,7 @@ where
             commit_block_sync_body_with_stall_trace(
                 block_verifier.clone(),
                 block,
+                claim,
                 class,
                 &trace,
                 owner,
@@ -1473,6 +1478,7 @@ where
 async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: BlockHandle,
+    claim: Option<zakura_consensus::ReceiptClaim>,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
     owner: zakura_header_chain::BodyWorkOwner,
@@ -1487,9 +1493,11 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    let commit = block_verifier
-        .clone()
-        .oneshot(zakura_consensus::Request::Commit(block));
+    let request = match claim {
+        Some(claim) => zakura_consensus::Request::CommitAnnounced { block, claim },
+        None => zakura_consensus::Request::Commit(block),
+    };
+    let commit = block_verifier.clone().oneshot(request);
 
     tokio::pin!(commit);
     tokio::select! {
@@ -2048,6 +2056,40 @@ mod tests {
 
     fn test_source() -> zakura_header_chain::SourceId {
         zakura_header_chain::SourceId::from_digest([2; 32])
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_carries_the_claim_header_sync_made_for_it() {
+        let (claimed_tx, mut claimed_rx) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let claimed_tx = claimed_tx.clone();
+            async move {
+                claimed_tx
+                    .send(request.claim().is_some())
+                    .expect("the test outlives the verifier");
+                Ok::<_, zakura_consensus::BoxError>(request.block().hash())
+            }
+        });
+        let handoff = SyncCoordinator::new();
+        let driver = spawn_checkpoint_driver(verifier, handoff.clone(), ZakuraTrace::noop());
+        let mut next_claimed = async || {
+            tokio::time::timeout(Duration::from_secs(1), claimed_rx.recv())
+                .await
+                .expect("the body reaches the verifier")
+                .expect("the verifier is still alive")
+        };
+
+        handoff
+            .announced_blocks()
+            .announce(mainnet_block(&BLOCK_MAINNET_1_BYTES).hash());
+        submit_checkpoint(&driver, 1).await;
+        assert!(next_claimed().await, "an announced body carries its claim");
+
+        // The claim was taken with the first delivery, so a redelivery has none.
+        submit_checkpoint(&driver, 2).await;
+        assert!(!next_claimed().await, "a claim is used once");
+
+        driver.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

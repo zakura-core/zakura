@@ -896,6 +896,11 @@ where
                 .clone()
         });
 
+        // An advertised block keeps this place in receipt order if its body follows promptly, so
+        // a larger body is not overtaken by a smaller one advertised later.
+        let claim = matches!(kind, DownloadKind::Advertised)
+            .then(|| zakura_consensus::ReceiptClaim::announce(hash));
+
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
@@ -1156,8 +1161,12 @@ where
                 None => None,
             };
 
+            let request = match claim {
+                Some(claim) => zakura_consensus::Request::CommitAnnounced { block, claim },
+                None => zakura_consensus::Request::Commit(block),
+            };
             verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
+                .oneshot(request)
                 .await
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
@@ -1466,7 +1475,9 @@ mod tests {
                 let release_rx = release_rx.clone();
 
                 async move {
-                    let zakura_consensus::Request::Commit(block) = request else {
+                    let (zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitAnnounced { block, .. }) = request
+                    else {
                         return Err("unexpected verifier request".into());
                     };
                     let hash = block.hash();
@@ -1582,6 +1593,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_advertised_block_reaches_the_verifier_with_its_announcement_claim(
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let network = BoxCloneService::new(service_fn(move |_request: zn::Request| {
+            let block = block.clone();
+            async move { Ok(zn::Response::Blocks(vec![Available((block.into(), None))])) }
+        }));
+        let (claimed_tx, mut claimed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let claimed_tx = claimed_tx.clone();
+                async move {
+                    claimed_tx.send(request.claim().is_some())?;
+                    Ok(request.block().hash())
+                }
+            }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        let committed = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("download completes")
+            .expect("downloads stream is open")
+            .expect("download succeeds");
+        assert_eq!(committed, hash);
+        assert_eq!(
+            claimed_rx.try_recv(),
+            Ok(true),
+            "the claim made when the advertisement was admitted travels with the body",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn zakura_advertiser_source_is_sent_to_network_download_request() {
         let hash = hash(9);
         let peer_id =
@@ -1666,7 +1732,9 @@ mod tests {
         // The verifier would happily commit whatever block it is handed.
         let verifier = BoxCloneService::new(service_fn(
             |request: zakura_consensus::Request| async move {
-                let zakura_consensus::Request::Commit(block) = request else {
+                let (zakura_consensus::Request::Commit(block)
+                | zakura_consensus::Request::CommitAnnounced { block, .. }) = request
+                else {
                     return Err("unexpected verifier request".into());
                 };
                 Ok(block.hash())

@@ -130,6 +130,7 @@ where
             header_chain_authority,
             network.clone(),
             committed_snapshots,
+            coordinator.announced_blocks().clone(),
         )),
     })
 }
@@ -324,17 +325,20 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     network: zakura_chain::parameters::Network,
     adapter_key: port::AdapterKey,
     selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    announced_blocks: zakura_consensus::AnnouncementClaims,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
     /// Build the port over the state services. `selected_chain` is state's
-    /// committed snapshot watch, which [`Port::selected_chain`] hands out.
+    /// committed snapshot watch, which [`Port::selected_chain`] hands out. `announced_blocks`
+    /// receives a claim for each header that passes context-free validation.
     pub(crate) fn new(
         state: State,
         read_state: ReadState,
         authority: zakura_state::HeaderChainBodyEvidenceAuthority,
         network: zakura_chain::parameters::Network,
         selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        announced_blocks: zakura_consensus::AnnouncementClaims,
     ) -> Self {
         Self {
             state,
@@ -343,6 +347,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
             network,
             adapter_key: port::AdapterKey::new(),
             selected_chain,
+            announced_blocks,
         }
     }
 }
@@ -455,7 +460,10 @@ where
     ) -> HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
         let read_state = self.read_state.clone();
         let adapter_key = self.adapter_key.clone();
-        Box::pin(async move { prepare_header_target(read_state, adapter_key, request).await })
+        let announced_blocks = self.announced_blocks.clone();
+        Box::pin(async move {
+            prepare_header_target(read_state, adapter_key, announced_blocks, request).await
+        })
     }
 
     fn apply_header_target(
@@ -590,6 +598,7 @@ fn classify_body_size_hint_failure(
 async fn prepare_header_target<ReadState>(
     read_state: ReadState,
     adapter_key: port::AdapterKey,
+    announced_blocks: zakura_consensus::AnnouncementClaims,
     request: port::PrepareHeaderTarget,
 ) -> port::PrepareHeaderTargetReply
 where
@@ -710,6 +719,11 @@ where
             ));
         }
     };
+    // These headers have valid proof of work, so their blocks keep this place in receipt order
+    // if block sync delivers the bodies promptly.
+    for header in batch.headers() {
+        announced_blocks.announce(header.hash);
+    }
 
     Ok(port::PreparedHeaderTarget::from_insert(
         &adapter_key,

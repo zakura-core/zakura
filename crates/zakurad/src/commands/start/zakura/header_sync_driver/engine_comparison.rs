@@ -137,6 +137,7 @@ impl ProductionState {
             self.authority.clone(),
             self.network.clone(),
             snapshots,
+            Default::default(),
         ))
     }
 }
@@ -756,6 +757,7 @@ async fn adapter_deadlines_match_the_contract() {
         network: HeaderFixture::regtest().network().clone(),
         adapter_key: key.clone(),
         selected_chain: tokio::sync::watch::channel(None).1,
+        announced_blocks: Default::default(),
     };
     let anchor = HeaderFixture::regtest().anchor();
     let scope = HeaderWorkAuthority {

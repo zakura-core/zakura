@@ -194,7 +194,9 @@ impl Harness {
                 let commits_tx = commits_tx.clone();
 
                 async move {
-                    let zakura_consensus::Request::Commit(block) = request else {
+                    let (zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitAnnounced { block, .. }) = request
+                    else {
                         return Err("unexpected verifier request".into());
                     };
                     let hash = block.hash();

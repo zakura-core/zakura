@@ -3,6 +3,8 @@
 use zakura_node_services::block_memory::BlockHandle;
 use zakura_state::BlockAdmission;
 
+use super::receipt::ReceiptClaim;
+
 /// Identifies who supplied a prepared mining candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedCandidateSource {
@@ -17,6 +19,13 @@ pub enum PreparedCandidateSource {
 pub enum Request {
     /// Performs semantic validation, then asks the state to perform contextual validation and commit the block
     Commit(BlockHandle),
+    /// Like [`Request::Commit`], for a block that was announced before its body arrived.
+    CommitAnnounced {
+        /// The complete block.
+        block: BlockHandle,
+        /// The place in receipt order reserved when the block was first announced.
+        claim: ReceiptClaim,
+    },
     /// Reuses prepared mining work when possible, then commits the solved block.
     CommitMined {
         /// The solved block.
@@ -53,6 +62,7 @@ impl Request {
     pub fn block(&self) -> BlockHandle {
         match self {
             Request::Commit(block) => block,
+            Request::CommitAnnounced { block, .. } => block,
             Request::CommitMined { block, .. } => block,
             Request::CheckProposal(block) => block,
             Request::Prepare { block, .. } => block,
@@ -63,7 +73,9 @@ impl Request {
     /// Returns `true` if the request is a proposal
     pub fn is_proposal(&self) -> bool {
         match self {
-            Request::Commit(_) | Request::CommitMined { .. } => false,
+            Request::Commit(_) | Request::CommitAnnounced { .. } | Request::CommitMined { .. } => {
+                false
+            }
             Request::CheckProposal(_) | Request::Prepare { .. } => true,
         }
     }
@@ -72,6 +84,14 @@ impl Request {
     pub fn admission(&self) -> Option<BlockAdmission> {
         match self {
             Request::CommitMined { admission, .. } => Some(admission.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the announcement claim carried by the request.
+    pub fn claim(&self) -> Option<&ReceiptClaim> {
+        match self {
+            Request::CommitAnnounced { claim, .. } => Some(claim),
             _ => None,
         }
     }

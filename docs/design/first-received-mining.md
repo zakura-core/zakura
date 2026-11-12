@@ -4,10 +4,46 @@
 
 The fully verified chain with greatest cumulative work is the mining chain.
 On equal work, an explicit `preciousblock` preference wins. Otherwise, the tip
-received first by the full-block verifier wins. Receipt
+with the earlier receipt order wins. Receipt
 order is assigned before asynchronous verification, so a later block cannot gain
 priority by finishing validation faster. Only valid blocks enter chain selection.
 A greater-work chain still replaces an earlier equal-work winner.
+
+## Announcement priority
+
+A block's receipt order is drawn when its complete body reaches the full-block
+verifier. A block that was announced first keeps the order drawn at its
+announcement instead, provided its body reaches the verifier within
+`ANNOUNCEMENT_PRIORITY_WINDOW` (2 seconds). An announcement is either a legacy
+block advertisement admitted for download, or a native header that passed its
+proof-of-work checks. Locally submitted blocks have no announcement and draw
+their order at submission.
+
+Without this, a block full of transactions can lose an equal-work race to an
+empty block announced later, because the larger body takes longer to transfer.
+That penalizes including transactions.
+
+The window is what keeps the rule safe. A block hash commits to its header and
+proof of work, so a claim cannot be made for a block that does not exist yet.
+A miner can still announce a real block and withhold its body. With no bound,
+that miner would win every equal-work tie against blocks found while it
+withheld, which makes withholding profitable at any hashrate. Inside the
+window, withholding is indistinguishable from slow honest delivery, so the
+window is both the transfer delay forgiven for large blocks and the most a
+withholder can gain. A body that arrives after the window takes a fresh order,
+as if it had never been announced. The 2 second value is an estimate of honest
+full-block delivery. The `sync.block.announcement_claim` counter and the
+`sync.block.announcement_claim.age.seconds` histogram record how claims
+resolve.
+
+For example, A is announced before B, but B's smaller body arrives and
+validates first. Mining uses B until A validates. If A's body arrived within
+the window, equal-work selection then chooses A. If it arrived later, B stays.
+
+A claim never makes a block eligible. Mining still waits for full validation.
+A claim is lost on restart, when a legacy download is dropped, or when more
+than 64 native headers are announced before their bodies arrive. In each case
+the block draws its order at body arrival.
 
 [Fork retention](../specs/fork-aware-header-chain-engine.md#lc-retain-01)
 keeps newly accepted parents available for extension and evicted bodies eligible
@@ -53,6 +89,13 @@ A stronger fork or loss of eligibility changes selection. Raw hash resolves ties
 when no selected tip remains competitive. Headers-only mode retains raw-hash
 ordering. This prevents equal-work arrivals from repeatedly replacing an active
 body download. Header arrival order and full-block receipt order can still differ.
+
+The header engine's preference has no time bound. If the selected equal-work
+header's body is withheld, the engine keeps that header selected and raises the
+body-unavailable alarm, and native block sync does not fetch the competing
+body. Legacy gossip can still deliver the competitor. Bounding this preference
+the way the announcement priority window bounds full-state priority is
+follow-up work.
 
 Peers also serve retained bodies on the selected header branch. A node can keep
 mining on the earlier block A while serving an equal-work side-fork block B to a

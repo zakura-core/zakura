@@ -4303,3 +4303,81 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .await
     .expect("duplicate receipt regression must finish");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_announced_block_keeps_its_place_only_inside_the_window() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for body_is_prompt in [true, false] {
+            let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+            let zakura_state::InitializedState {
+                state,
+                latest_chain_tip: tip,
+                ..
+            } = zs::init_test_services(&network).await;
+            let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            state
+                .clone()
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                    genesis.clone().into(),
+                ))
+                .await
+                .unwrap();
+            let mut a = nu5_prepared_test_block(&network, None);
+            let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                &a.auth_data_root(),
+            );
+            let header = Arc::make_mut(&mut a.header);
+            header.previous_block_hash = genesis.hash();
+            header.time = genesis.header.time + chrono::Duration::seconds(150);
+            header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+            let a = Arc::new(a);
+            let mut b = a.as_ref().clone();
+            Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+            let b = Arc::new(b);
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let mut verifier = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state.clone()),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            );
+
+            // A is announced first, but B's body arrives and commits while A's is in transit.
+            let claim = ReceiptClaim::announce(a.hash());
+            verifier
+                .call(Request::Commit(b.clone().into()))
+                .await
+                .unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(b.hash()));
+
+            if !body_is_prompt {
+                tokio::time::sleep(
+                    ANNOUNCEMENT_PRIORITY_WINDOW + std::time::Duration::from_millis(50),
+                )
+                .await;
+            }
+            verifier
+                .call(Request::CommitAnnounced {
+                    block: a.clone().into(),
+                    claim,
+                })
+                .await
+                .unwrap();
+            let expected = if body_is_prompt { &a } else { &b };
+            assert_eq!(
+                tip.best_tip_hash(),
+                Some(expected.hash()),
+                "body_is_prompt: {body_is_prompt}",
+            );
+        }
+    })
+    .await
+    .expect("announcement priority test must finish");
+}

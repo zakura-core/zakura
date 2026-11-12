@@ -40,6 +40,7 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
+pub use receipt::{AnnouncementClaims, ReceiptClaim, ANNOUNCEMENT_PRIORITY_WINDOW};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -438,7 +439,8 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
+        let receipt = (!request.is_proposal())
+            .then(|| self.receipt_orders.register(hash, &block, request.claim()));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -460,7 +462,9 @@ where
                 let (mined, prepared_source) = match &request {
                     Request::CommitMined { admission, .. } => (Some(admission.clone()), None),
                     Request::Prepare { source, .. } => (None, Some(*source)),
-                    Request::Commit(_) | Request::CheckProposal(_) => (None, None),
+                    Request::Commit(_)
+                    | Request::CommitAnnounced { .. }
+                    | Request::CheckProposal(_) => (None, None),
                 };
                 // Check that this block is actually a new block.
                 tracing::trace!("checking that block is not already in state");

@@ -771,10 +771,8 @@ impl Mempool {
 
     /// Replaces the active state with a freshly-initialised [`ActiveState::Enabled`],
     /// using `tip_action`'s best tip hash as the `last_seen_tip_hash`.
-    fn enable_at_tip(&mut self, tip_action: &TipAction, reason: &'static str) {
-        let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
-
-        info!(?tip_height, reason, "activating mempool");
+    fn enable_at_tip(&mut self, tip_action: &TipAction) {
+        let last_seen_tip_hash = tip_action.best_tip_hash();
 
         let tx_downloads = Box::pin(TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
@@ -819,14 +817,19 @@ impl Mempool {
 
             // Enable state - there should be a chain tip when Zakura is close
             // to the network tip.
-            (true, _, false, Some(tip_action)) => self.enable_at_tip(
-                tip_action,
-                if self.is_enabled_by_debug() {
+            (true, _, false, Some(tip_action)) => {
+                let reason = if self.is_enabled_by_debug() {
                     "debug height reached"
                 } else {
                     "estimated close to the network tip"
-                },
-            ),
+                };
+                info!(
+                    tip_height = ?tip_action.best_tip_height(),
+                    reason,
+                    "activating mempool"
+                );
+                self.enable_at_tip(tip_action);
+            }
 
             // Disable once the same clock estimate used for activation falls
             // outside the rollback window.
@@ -892,14 +895,15 @@ impl Service<Request> for Mempool {
         // But if the mempool was just freshly enabled,
         // skip resetting and removing mined transactions for this tip.
         if !is_state_changed && matches!(tip_action, Some(TipAction::Reset { .. })) {
-            info!(
-                tip_height = ?tip_action.as_ref().unwrap().best_tip_height(),
-                "resetting mempool: switched best chain, skipped blocks, or activated network upgrade"
-            );
             let reset_started = Instant::now();
 
             let previous_state = self.active_state.take();
             let tx_retries = previous_state.transaction_retry_requests();
+            info!(
+                tip_height = ?tip_action.as_ref().unwrap().best_tip_height(),
+                requeued_transactions = tx_retries.len(),
+                "resetting mempool: switched best chain, skipped blocks, or activated network upgrade"
+            );
 
             // Use the same code for dropping and resetting the mempool,
             // to avoid subtle bugs.
@@ -915,7 +919,7 @@ impl Service<Request> for Mempool {
             let tip_action = tip_action
                 .as_ref()
                 .expect("this branch only matches when tip_action is a Reset");
-            self.enable_at_tip(tip_action, "chain tip reset");
+            self.enable_at_tip(tip_action);
 
             // Re-verify the transactions that were pending or valid at the previous tip.
             // This saves us the time and data needed to re-download them.
@@ -926,11 +930,6 @@ impl Service<Request> for Mempool {
             } = &mut self.active_state
             {
                 let requeued = tx_retries.len();
-                info!(
-                    transactions = requeued,
-                    "re-verifying mempool transactions after a chain fork"
-                );
-
                 for (tx, source) in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.

@@ -171,7 +171,6 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
     resources.admitted();
     let (inbound, receiver) = framed_channel(16);
     let (sender, mut outbound) = framed_channel(2);
-    let connected_at = time::Instant::now();
     harness.service.add_peer(Peer::new_with_service_streams(
         0,
         peer(0xeb),
@@ -212,6 +211,16 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
         }))
         .await
         .expect("tip growth queues");
+    // A new tip goes out without waiting for the Status interval.
+    let frame = time::timeout(Duration::from_secs(3), outbound.recv())
+        .await
+        .expect("a new tip is sent a second after the previous Status")
+        .expect("the outbound stream stays open");
+    let tip_sent = time::Instant::now();
+    let BlockSyncMessage::Status(tip) = BlockSyncMessage::decode_frame(frame).unwrap() else {
+        panic!("the new tip is a Status");
+    };
+    assert_eq!(tip.servable_high, block::Height(4));
     let retained = harness.retained.as_ref().expect("publisher exists");
     retained.send(block::Height(2)).expect("reactor subscribes");
     await_until("first correction", Duration::from_secs(1), || {
@@ -228,7 +237,7 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
 
     // The reactor uses wall time, so exercise the real connection deadline.
     assert!(
-        time::timeout_at(connected_at + Duration::from_secs(29), outbound.recv())
+        time::timeout_at(tip_sent + Duration::from_secs(29), outbound.recv())
             .await
             .is_err(),
         "range corrections must obey the shared Status cadence"

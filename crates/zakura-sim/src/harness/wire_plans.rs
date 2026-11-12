@@ -7,16 +7,24 @@
 //! Each act's setup history is the one `tests/header_wire_table.rs` gives
 //! it, with every header fault's payload sent. [`act_scenario`] builds it
 //! for any act, so P3d's witnesses reuse it.
+//!
+//! fuzz-13 adds the session-replacement histories that fuzz-5's required
+//! states need on this harness: a header stream reopened on one connection
+//! ([`reopen_scenario`]) and an old session's page judged after that reopen
+//! ([`old_page_scenario`]).
 
 use super::{
-    header_node::{Base, Chain, Policy},
+    header_node::{
+        policy::{Allow, Hold, OpKind, Select, Trigger},
+        Base, Chain, Policy,
+    },
     header_sync::{WireScenario, PROGRESS_LINK, PROGRESS_STORAGE_BOUND_MS},
-    NetScenario,
+    LinkEntry, LinkSpec, NetScenario,
 };
 use crate::peer::{
-    adversary::{Act, AdversarySpec, ContentRule, CursorField, Row},
+    adversary::{Act, AdversarySpec, ContentRule, CursorField, Row, CROSSING_LINK_MS},
     honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
-    PeerAction, PeerSpec,
+    peer_addr, PeerAction, PeerSpec, NODE_ADDR,
 };
 
 /// The node's chain at the start of most saved runs.
@@ -44,6 +52,12 @@ pub enum SavedPlan {
     /// holding one header past the node's 50 dials it
     /// ([`progress_scenario`]).
     HonestProgress,
+    /// The node reopens its header stream to one peer on the same
+    /// connection ([`reopen_scenario`]): fuzz-5's stream replacement.
+    Reopen,
+    /// An old session's invalid page is judged after the node reopens its
+    /// header stream ([`old_page_scenario`]): fuzz-5's old-session traffic.
+    OldPageAfterReopen,
 }
 
 impl SavedPlan {
@@ -51,9 +65,9 @@ impl SavedPlan {
     /// category of the action table: a stateless fault on `status`, and
     /// for `bad-cursor` and `bad-content` the case M5-E1's guard test
     /// takes. M5-E1 marks no category unreachable. Then the progress
-    /// fixture and a lower-locator page, last so the earlier plans keep
-    /// their tags.
-    pub const ALL: [SavedPlan; 16] = [
+    /// fixture, a lower-locator page, and fuzz-13's reopen, old page and
+    /// crossing, each appended so the earlier plans keep their tags.
+    pub const ALL: [SavedPlan; 19] = [
         SavedPlan::HonestSync,
         SavedPlan::Act(Act::ShortPayload { row: Row::Status }),
         SavedPlan::Act(Act::LongPayload { row: Row::Status }),
@@ -79,11 +93,14 @@ impl SavedPlan {
         SavedPlan::Act(Act::BadContent {
             rule: ContentRule::LowerLocator,
         }),
+        SavedPlan::Reopen,
+        SavedPlan::OldPageAfterReopen,
+        SavedPlan::Act(Act::OutcomeCrossing),
     ];
 
     /// The fixture's name, `header-wire-<name>.bin`: `honest-sync`, the
     /// act's identity name, `lower-locator` for that content rule's act,
-    /// or `honest-progress`.
+    /// `honest-progress`, `reopen` or `old-page-after-reopen`.
     pub fn name(self) -> &'static str {
         match self {
             SavedPlan::HonestSync => "honest-sync",
@@ -92,6 +109,8 @@ impl SavedPlan {
             }) => "lower-locator",
             SavedPlan::Act(act) => act.name(),
             SavedPlan::HonestProgress => "honest-progress",
+            SavedPlan::Reopen => "reopen",
+            SavedPlan::OldPageAfterReopen => "old-page-after-reopen",
         }
     }
 
@@ -102,7 +121,7 @@ impl SavedPlan {
             .iter()
             .position(|plan| *plan == self)
             .expect("every saved Plan is listed");
-        // 16 plans fit a byte.
+        // `ALL` has 19 plans, so an index from 1 fits a byte.
         [TAG, (index + 1) as u8]
     }
 
@@ -130,7 +149,79 @@ impl SavedPlan {
             },
             SavedPlan::Act(act) => act_scenario(act),
             SavedPlan::HonestProgress => progress_scenario(),
+            SavedPlan::Reopen => reopen_scenario(),
+            SavedPlan::OldPageAfterReopen => old_page_scenario(),
         }
+    }
+}
+
+/// hdr-5's two-generation history: the node at 50 dials `peer-0`, an honest
+/// peer holding 120 headers, and both subscribe. Once both subscriptions
+/// end, the peer finishes its header stream, so the node reopens it on the
+/// same connection. The node's second locator is held, so its second
+/// subscription doesn't race the finish.
+pub fn reopen_scenario() -> WireScenario {
+    let subscribe = SubscribeSpec {
+        start: 0,
+        open: CreditSpec {
+            objects: 250,
+            bytes: 65_750,
+        },
+        grants: GrantPolicy::Immediate,
+    };
+    WireScenario {
+        node: Chain::main(PRELOAD),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: 120,
+                subscribe: Some(subscribe),
+            }),
+            script: vec![PeerAction::FinishHeader],
+            ..PeerSpec::listening()
+        }],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 2),
+                until: Trigger::VirtualTime(3_600_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..WireScenario::default()
+    }
+}
+
+/// An old session's page judged after the node reopens its header stream:
+/// the node at 50 dials `peer-0`, which serves 120 headers whose tip is
+/// invalid. The node's page reaches its target, so the reactor closes the
+/// subscription and submits the page's preparation, which is held until the
+/// reactor admits the peer's second session. Meanwhile the peer finishes its
+/// header stream, which it may once its subscriptions end, and the node
+/// reopens it on the same connection. The held preparation then fails, and
+/// the node judges the old session's page on the old stream.
+pub fn old_page_scenario() -> WireScenario {
+    WireScenario {
+        node: Chain::main(PRELOAD),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: 120,
+                subscribe: None,
+            }),
+            invalid_tip: true,
+            script: vec![PeerAction::FinishHeader],
+            ..PeerSpec::listening()
+        }],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Prepare, 1),
+                until: Trigger::Count(2, Box::new(Trigger::SessionAdmitted("peer-0".to_owned()))),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..WireScenario::default()
     }
 }
 
@@ -199,6 +290,8 @@ fn adversary(
 ///   first. A conformant `subscribe-headers` frame renews that
 ///   subscription.
 /// - `status-burst`: 30 bursts, which empty the `Status` bucket.
+/// - `outcome-crossing`: an unretained `Open` first, on a slow link from
+///   the node, so the crossing `Grant` meets the node's ending in flight.
 /// - The rest: the peer holds the node's 50 headers, so nobody subscribes.
 pub fn act_scenario(act: Act) -> WireScenario {
     let quiet = AdversarySpec {
@@ -219,6 +312,7 @@ pub fn act_scenario(act: Act) -> WireScenario {
         // 602 tokens, in bursts of 40 with two more each second, as
         // `tests/header_wire_table.rs` sends them.
         Act::StatusBurst => vec![Act::StatusBurst; 30],
+        Act::OutcomeCrossing => vec![Act::UnretainedOpen, Act::OutcomeCrossing],
         act => vec![act],
     };
     let (node, peer) = match act {
@@ -261,11 +355,25 @@ pub fn act_scenario(act: Act) -> WireScenario {
         }
         _ => (PRELOAD, adversary(PRELOAD, None, quiet, script)),
     };
+    let mut net = NetScenario::default();
+    if matches!(act, Act::UnretainedOpen | Act::OutcomeCrossing) {
+        // The node's ending takes longer to arrive than the crossing
+        // `Grant` waits, so the `Grant` crosses it in flight.
+        net.links.push(LinkEntry {
+            src: NODE_ADDR,
+            dst: peer_addr(0, 0),
+            model: LinkSpec {
+                min_delay_ms: CROSSING_LINK_MS,
+                max_delay_ms: CROSSING_LINK_MS + 100,
+                ..LinkSpec::default()
+            },
+        });
+    }
     WireScenario {
+        net,
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
-        ..WireScenario::default()
     }
 }
 

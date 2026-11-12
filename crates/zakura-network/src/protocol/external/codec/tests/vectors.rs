@@ -861,3 +861,43 @@ fn unknown_command_is_escaped_in_debug_log() {
         "raw newlines from the command must not reach the log output: {log_output:?}",
     );
 }
+
+/// A warm-up ping encodes as `ping` with its padding after the nonce, decodes as a plain
+/// `Ping` because receivers ignore the trailing bytes, and fits the protocol message limit
+/// at its largest padding.
+#[test]
+fn warmup_ping_encodes_as_padded_ping() {
+    let _init_guard = zakura_test::init();
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    let nonce = Nonce(0x0123_4567_89ab_cdef);
+
+    for padding in [0, 1, 16 * 1024, crate::constants::MAX_PING_PADDING] {
+        let mut bytes = BytesMut::new();
+        codec
+            .encode(Message::PaddedPing { nonce, padding }, &mut bytes)
+            .expect("a warm-up ping within the message limit encodes");
+
+        assert_eq!(&bytes[4..16], b"ping\0\0\0\0\0\0\0\0");
+        let body_len = 8 + usize::try_from(padding).expect("padding fits in usize");
+        assert_eq!(bytes.len(), HEADER_LEN + body_len);
+        assert!(bytes[HEADER_LEN + 8..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            codec.decode(&mut bytes).expect("a padded ping decodes"),
+            Some(Message::Ping(nonce)),
+        );
+        assert!(bytes.is_empty(), "the decoder consumes the padding");
+    }
+
+    let mut bytes = BytesMut::new();
+    codec
+        .encode(
+            Message::PaddedPing {
+                nonce,
+                padding: crate::constants::MAX_PING_PADDING + 1,
+            },
+            &mut bytes,
+        )
+        .expect_err("a warm-up ping over the message limit does not encode");
+}

@@ -2448,7 +2448,7 @@ pub const FAMILY: &str = "header-sync";
 /// [`OUTSTANDING_WORK_BOUNDED`], whose tap only the storage harness
 /// watches, then
 /// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
-/// sender properties (M5-Q13), then `session/honest-never-punished`, then
+/// sender properties (M5-Q13), each judged by its trigger history (C7), then `session/honest-never-punished`, then
 /// `header-sync/honest-progress` (hdr-8), which only the
 /// [`progress_fixture`] can apply. Header sync's adapter observes none of the downstream templates' effects, so it
 /// registers none of them. `header-sync/storage` doesn't register
@@ -2458,11 +2458,24 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
     properties.retain(|property| property.id.as_str() != OUTSTANDING_WORK_BOUNDED);
     properties.push(header_fault_penalized());
-    properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
-    properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
+    let generated = table_properties(FAMILY, &RegtestMessage::LAYOUT)
+        .into_iter()
+        .chain(sender_properties(FAMILY, &RegtestMessage::LAYOUT))
+        .map(|property| Property {
+            witness: Some(TriggerHistory::LogOf(generated_trigger)),
+            ..property
+        });
+    properties.extend(generated);
     properties.push(honest_never_punished());
     properties.push(crate::domain::header_sync_progress::honest_progress());
     properties
+}
+
+/// Whether `log` reaches the trigger history of header sync's generated
+/// property `id`, over the layout [`wire_properties`] registers it from
+/// ([`crate::table::generated_trigger`]).
+fn generated_trigger(id: &PropertyId, log: &ObservationLog) -> bool {
+    crate::table::generated_trigger(&RegtestMessage::LAYOUT, id, log)
 }
 
 /// The mirror `scenario`'s `Recover` step names, if it has one.

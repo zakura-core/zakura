@@ -22,7 +22,6 @@ bytes = { workspace = true }
 curve25519-dalek = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
-libc = { workspace = true }
 metrics = { workspace = true }
 quinn-proto = { workspace = true }
 ring = { workspace = true }
@@ -35,6 +34,9 @@ tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
 zeroize = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }

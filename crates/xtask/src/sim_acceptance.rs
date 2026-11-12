@@ -263,48 +263,70 @@ fn run_at(
         .map_err(|end| format!("`sim-acceptance plan` {end}"))?;
     let plan: Value = serde_json::from_str(&fs::read_to_string(&plan_file)?)?;
 
-    // Every seed, in one report, then each harness's full inputs written to
-    // one corpus by their SHA-256 (`--out` holds one harness's seeds). The
-    // report and the child's outcome are artifacts: the evaluator counts a
-    // seed only if this release inventory exited 0 and admitted it.
+    // The committed seeds, then sched-4's saved race schedules, each in one
+    // report, then each harness's full inputs written to one corpus by their
+    // SHA-256 (`--out` holds one harness's seeds). Each report and its
+    // child's outcome are artifacts: the evaluator counts a seed or schedule
+    // only if its release inventory exited 0 and admitted it.
     let corpus = run.out.join("corpus");
-    let inventory = artifacts.join("seeds");
-    fs::create_dir_all(&inventory)?;
-    let mut seeds = Command::new(&release);
-    seeds
-        .arg("seeds")
-        .arg("--report")
-        .arg(inventory.join("report.json"))
-        .current_dir(root);
-    let ended = child(&mut seeds, &inventory.join("inventory.log"), run.deadline);
-    stop_if_interrupted()?;
-    fs::write(
-        inventory.join("inventory.json"),
-        serde_json::to_string_pretty(&json!({
-            "exited_ok": ended.exited(),
-            "killed": ended.killed(),
-        }))?,
-    )?;
-    let report: Value = serde_json::from_str(
-        &fs::read_to_string(inventory.join("report.json")).unwrap_or_else(|_| "{}".to_owned()),
-    )?;
-    let harnesses: BTreeSet<&str> = report
-        .get("seeds")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row.pointer("/sidecar/harness")?.as_str())
-        .collect();
-    for harness in harnesses {
-        let mut fill = Command::new(&release);
-        fill.args(["seeds", "--sim", harness, "--out"])
-            .arg(&corpus)
-            .current_dir(root);
-        let log = logs.join(format!("seeds-{}.log", harness.replace('/', "-")));
-        let _ = child(&mut fill, &log, run.deadline);
+    let run_name = run
+        .out
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let release_sha256 = sha256_file(&release)?;
+    for (name, fixtures) in [
+        ("seeds", None),
+        (
+            "race-schedules",
+            Some("crates/zakura-sim/tests/fixtures/race-schedules"),
+        ),
+    ] {
+        let inventory = artifacts.join(name);
+        fs::create_dir_all(&inventory)?;
+        let mut seeds = Command::new(&release);
+        seeds.arg("seeds").current_dir(root);
+        if let Some(fixtures) = fixtures {
+            seeds.args(["--fixtures", fixtures]);
+        }
+        seeds.arg("--report").arg(inventory.join("report.json"));
+        let ended = child(&mut seeds, &inventory.join("inventory.log"), run.deadline);
+        stop_if_interrupted()?;
+        // Bound to this run, the executable and the report it wrote.
+        fs::write(
+            inventory.join("inventory.json"),
+            serde_json::to_string_pretty(&json!({
+                "exited_ok": ended.exited(),
+                "killed": ended.killed(),
+                "binding": {
+                    "run": run_name,
+                    "inventory": name,
+                    "executable_sha256": release_sha256,
+                    "report_sha256": sha256_file(&inventory.join("report.json")).ok(),
+                },
+            }))?,
+        )?;
+        let report: Value = serde_json::from_str(
+            &fs::read_to_string(inventory.join("report.json")).unwrap_or_else(|_| "{}".to_owned()),
+        )?;
+        let harnesses: BTreeSet<&str> = report
+            .get("seeds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.pointer("/sidecar/harness")?.as_str())
+            .collect();
+        for harness in harnesses {
+            let mut fill = Command::new(&release);
+            fill.arg("seeds").current_dir(root);
+            if let Some(fixtures) = fixtures {
+                fill.args(["--fixtures", fixtures]);
+            }
+            fill.args(["--sim", harness, "--out"]).arg(&corpus);
+            let log = logs.join(format!("{name}-{}.log", harness.replace('/', "-")));
+            let _ = child(&mut fill, &log, run.deadline);
+        }
     }
 
-    let release_sha256 = sha256_file(&release)?;
     let tasks = plan
         .get("tasks")
         .and_then(Value::as_array)
@@ -341,7 +363,11 @@ fn run_at(
             corpus: &corpus,
             source,
             release_sha256: &release_sha256,
-            binding: json!({ "task": index, "task_sha256": sha256_hex(task_json.as_bytes()) }),
+            binding: json!({
+                "run": run_name,
+                "task": index,
+                "task_sha256": sha256_hex(task_json.as_bytes()),
+            }),
         };
         match kind.as_str() {
             "test" => {
@@ -362,16 +388,21 @@ fn run_at(
                 if let [(_, executable, _)] = &built[..] {
                     fs::write(
                         dir.join("binary.json"),
-                        serde_json::to_string_pretty(
-                            &ctx.bound(json!({ "sha256": sha256_file(executable)? }), json!({})),
-                        )?,
+                        serde_json::to_string_pretty(&ctx.bound(
+                            json!({
+                                "sha256": sha256_file(executable)?,
+                                "test_json_sha256": sha256_file(&dir.join("test.json"))?,
+                            }),
+                            json!({}),
+                        ))?,
                     )?;
                 }
             }
             "fuzz-test" => ctx.fuzz_test(fields)?,
             "lane" => ctx.lane(fields)?,
             "seed" => ctx.seed(fields)?,
-            "seed-witness" => ctx.seed_witness(fields)?,
+            // A saved race schedule runs as a seed witness does.
+            "seed-witness" | "race-schedule" => ctx.seed_witness(fields)?,
             "command" => ctx.command(fields)?,
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
@@ -418,8 +449,8 @@ struct Ctx<'a> {
     source: &'a str,
     /// The release `zakura-sim`'s SHA-256.
     release_sha256: &'a str,
-    /// The task's index and its `task.json`'s SHA-256, which every file the
-    /// runner writes for the task carries as its `binding`.
+    /// The run's ID, the task's index and its `task.json`'s SHA-256, which
+    /// every file the runner writes for the task carries as its `binding`.
     binding: Value,
 }
 

@@ -16,6 +16,9 @@ use crate::harness::header_acceptance::{
     CaseRun, Key, Manifest, RunId,
 };
 
+/// sched-4's saved race schedules, outside the seed loader's directory.
+pub const RACE_SCHEDULES: &str = "crates/zakura-sim/tests/fixtures/race-schedules";
+
 /// The planted case the downstream item's production bypass is (hdr-14.6's
 /// despite-close case), whose catch's replay downstream requires.
 const DESPITE_CLOSE: (&str, &str) = ("header-sync/commit-only-authorized", "staged-despite-close");
@@ -649,7 +652,7 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
             repo.join(&end).is_file().then(|| end.display().to_string())
         })
         .collect();
-    let schedules = repo.join("crates/zakura-sim/tests/fixtures/race-schedules");
+    let schedules = repo.join(RACE_SCHEDULES);
     let race_schedules: BTreeSet<String> = std::fs::read_dir(&schedules)
         .map_err(|error| vec![format!("{}: {error}", schedules.display())])?
         .filter_map(|entry| {

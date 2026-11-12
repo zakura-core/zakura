@@ -18,7 +18,7 @@ use super::{
     evaluate::{evaluate, header_refusal, Evaluation, HeaderRecordFacts, RowSpec, Verdict},
     header::{self, consumed_cleanup, verify, Published},
     judge::{owned_run_passes, Registered, RunExpect},
-    manifest::{derive, problems, rows, Expected, LANES},
+    manifest::{derive, problems, rows, Expected, LANES, RACE_SCHEDULES},
 };
 use crate::{
     check::PropertyOutcome,
@@ -98,6 +98,20 @@ pub enum Task {
         /// The expectation, as the sidecar spells it.
         expect: String,
     },
+    /// One saved race schedule (S4.4) recorded with its `violated`
+    /// witness, then its trace replayed fresh, as a seed witness is.
+    RaceSchedule {
+        /// The expected result it produces.
+        expected: String,
+        /// The race fixture's harness.
+        harness: String,
+        /// Its full input's SHA-256, its file name in the run's corpus.
+        input: String,
+        /// The witnessed property.
+        property: String,
+        /// The expectation, as the sidecar spells it.
+        expect: String,
+    },
     /// One S4.6 command, which writes `command.json`.
     Command {
         /// The expected result it produces.
@@ -128,6 +142,7 @@ impl Task {
             | Task::Lane { expected, .. }
             | Task::Seed { expected, .. }
             | Task::SeedWitness { expected, .. }
+            | Task::RaceSchedule { expected, .. }
             | Task::Command { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
@@ -226,6 +241,31 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 .collect()
         })
         .unwrap_or_default();
+    // Each saved race schedule's harness, full input and one witness.
+    let race_schedules: BTreeMap<String, (String, String, String, String)> =
+        crate::seed::load(&[repo.join(RACE_SCHEDULES)], None)
+            .map(|report| {
+                report
+                    .admitted
+                    .iter()
+                    .filter_map(|seed| {
+                        let name = seed.path.file_stem()?.to_str()?.to_owned();
+                        let [witness] = &seed.sidecar.witness[..] else {
+                            return None;
+                        };
+                        Some((
+                            name,
+                            (
+                                seed.sidecar.harness.clone(),
+                                seed.input_sha256(),
+                                witness.property.clone(),
+                                witness.expect.clone(),
+                            ),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     let mut plan = Sim7Plan {
         problems: problems(&rows(&derived), &derived),
         ..Sim7Plan::default()
@@ -274,6 +314,17 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                         expect: row.witness.clone(),
                     })
                 }),
+                Expected::RaceSchedule(name) => {
+                    race_schedules
+                        .get(name)
+                        .map(|(harness, input, property, expect)| Task::RaceSchedule {
+                            expected: id.clone(),
+                            harness: harness.clone(),
+                            input: input.clone(),
+                            property: property.clone(),
+                            expect: expect.clone(),
+                        })
+                }
                 Expected::Command(command) => {
                     command_args(repo, command).map(|args| Task::Command {
                         expected: id.clone(),
@@ -300,7 +351,6 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 // The planted runner's verdict alone isn't evidence (Rule 11):
                 // it blocks until each of its runs is kept and judged.
                 Expected::Planted(_)
-                | Expected::RaceSchedule(_)
                 | Expected::Target(_)
                 | Expected::Minimize(_)
                 | Expected::Agreement(_) => {
@@ -316,7 +366,6 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                     Expected::HeaderKey(_)
                         | Expected::EndRecord { .. }
                         | Expected::Planted(_)
-                        | Expected::RaceSchedule(_)
                         | Expected::Target(_)
                         | Expected::Minimize(_)
                         | Expected::Agreement(_)
@@ -481,19 +530,50 @@ pub struct DeviationEntry {
 /// `report.json` with what it reported.
 pub const SEED_INVENTORY: &str = "seeds";
 
+/// The directory under the artifacts where the xtask keeps the release
+/// inventory of the saved race schedules, as [`SEED_INVENTORY`] does the
+/// committed seeds'.
+pub const RACE_INVENTORY: &str = "race-schedules";
+
 /// The SHA-256 of empty input, which a measure with no committed seed runs.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// Why the release seed inventory doesn't admit `file` with full input
-/// `input`, or `None` if it does. With no `file`, any admitted seed with
+/// Why the release seed inventory under `inventory` doesn't admit `file`
+/// with full input `input`, or `None` if it does. With no `file`, any admitted seed with
 /// that input counts. The inventory must also have exited 0.
-fn seed_inventory_refusal(artifacts: &Path, file: Option<&str>, input: &str) -> Option<String> {
-    let dir = artifacts.join(SEED_INVENTORY);
+fn seed_inventory_refusal(
+    artifacts: &Path,
+    inventory: &str,
+    bound: &Bound<'_>,
+    file: Option<&str>,
+    input: &str,
+) -> Option<String> {
+    let dir = artifacts.join(inventory);
     let read = |name: &str| -> Option<Value> {
         serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
     };
-    if !exited(read("inventory.json")) {
+    let outcome = read("inventory.json");
+    if !exited(outcome.clone()) {
         return Some("the release `zakura-sim seeds --report` didn't exit 0".to_owned());
+    }
+    // The outcome must be this run's inventory, by the run's release
+    // executable, of the report beside it.
+    let run = artifacts.parent().and_then(Path::file_name);
+    let names = outcome.as_ref().and_then(|o| o.get("binding"));
+    let field = |name: &str| names.and_then(|n| n.get(name)).and_then(Value::as_str);
+    let report_sha = fs::read(dir.join("report.json"))
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    if run.and_then(|run| run.to_str()) != field("run")
+        || field("inventory") != Some(inventory)
+        || bound.release.is_none()
+        || field("executable_sha256") != bound.release.as_deref()
+        || report_sha.is_none()
+        || field("report_sha256") != report_sha.as_deref()
+    {
+        return Some(format!(
+            "the {inventory} inventory isn't bound to this run's report"
+        ));
     }
     let report = read("report.json").unwrap_or_default();
     let admitted = report
@@ -529,7 +609,10 @@ fn bounded_json(path: &Path) -> Option<Value> {
 fn trace_properties(task: &Task, dir: &Path) -> BTreeMap<String, Value> {
     if !matches!(
         task,
-        Task::Seed { .. } | Task::SeedWitness { .. } | Task::Measure { .. }
+        Task::Seed { .. }
+            | Task::SeedWitness { .. }
+            | Task::RaceSchedule { .. }
+            | Task::Measure { .. }
     ) {
         return BTreeMap::new();
     }
@@ -551,10 +634,13 @@ fn trace_properties(task: &Task, dir: &Path) -> BTreeMap<String, Value> {
 }
 
 /// What every file the runner writes for a task must name, under its
-/// `binding`, to count for that task: the task's index and its
+/// `binding`, to count for that task: the run, the task's index and its
 /// `task.json`'s SHA-256. Without it, one task's file could stand in for
 /// another's.
 struct TaskBinding {
+    /// The run's ID, its run directory's name, so a file from another run
+    /// of the same plan doesn't count.
+    run: String,
     /// The task's index in the plan.
     index: usize,
     /// The SHA-256 of the task's `task.json`.
@@ -567,7 +653,8 @@ struct TaskBinding {
 fn runner_json(dir: &Path, name: &str, binding: &TaskBinding) -> Option<Value> {
     let value: Value = serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()?;
     let names = value.get("binding")?;
-    let same = names.get("task").and_then(Value::as_u64) == u64::try_from(binding.index).ok()
+    let same = names.get("run").and_then(Value::as_str) == Some(&binding.run)
+        && names.get("task").and_then(Value::as_u64) == u64::try_from(binding.index).ok()
         && names.get("task_sha256").and_then(Value::as_str) == Some(&binding.task_sha256);
     same.then_some(value)
 }
@@ -630,13 +717,14 @@ fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> 
                     .collect()
             })
             .unwrap_or_default(),
-        Task::Seed { .. } | Task::SeedWitness { .. } | Task::Measure { .. } => {
-            TraceReader::open(&dir.join("trace"))
-                .ok()
-                .map(|trace| trace.meta.build.binary)
-                .into_iter()
-                .collect()
-        }
+        Task::Seed { .. }
+        | Task::SeedWitness { .. }
+        | Task::RaceSchedule { .. }
+        | Task::Measure { .. } => TraceReader::open(&dir.join("trace"))
+            .ok()
+            .map(|trace| trace.meta.build.binary)
+            .into_iter()
+            .collect(),
         Task::Command { .. } => Vec::new(),
     }
 }
@@ -692,6 +780,10 @@ pub fn record(
     let artifacts_name = artifacts
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run_name = artifacts
+        .parent()
+        .and_then(Path::file_name)
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     // Every file below is read only once the whole tree is safe to read.
     let unsafe_tree = header::tree_refusal(artifacts);
     // The task that changed the subject checkout, which every later task's
@@ -711,6 +803,7 @@ pub fn record(
         let task_text = fs::read_to_string(dir.join("task.json")).unwrap_or_default();
         let recorded = serde_json::from_str::<Task>(&task_text).ok();
         let binding = TaskBinding {
+            run: run_name.clone(),
             index,
             task_sha256: sha256_hex(task_text.as_bytes()),
         };
@@ -720,8 +813,15 @@ pub fn record(
         // A seed or witness counts only on an input the release build's own
         // inventory admitted.
         let refusal = match task {
-            Task::Seed { file, input, .. } => seed_inventory_refusal(artifacts, Some(file), input),
-            Task::SeedWitness { input, .. } => seed_inventory_refusal(artifacts, None, input),
+            Task::Seed { file, input, .. } => {
+                seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, Some(file), input)
+            }
+            Task::SeedWitness { input, .. } => {
+                seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, None, input)
+            }
+            Task::RaceSchedule { input, .. } => {
+                seed_inventory_refusal(artifacts, RACE_INVENTORY, &bound, None, input)
+            }
             _ => None,
         };
         let mut credited = 0u64;
@@ -939,6 +1039,14 @@ fn judge_task(
             let Some(result) = own("test.json") else {
                 return blocked("the test left no test.json".to_owned());
             };
+            let test_sha = fs::read(dir.join("test.json"))
+                .ok()
+                .map(|bytes| sha256_hex(&bytes));
+            let named = json("binary.json")
+                .and_then(|b| b.get("test_json_sha256")?.as_str().map(str::to_owned));
+            if test_sha.is_none() || named != test_sha {
+                return blocked("test.json isn't the one this run's binary.json binds".to_owned());
+            }
             let same = result.get("package").and_then(Value::as_str) == Some(package)
                 && result.get("file").and_then(Value::as_str) == Some(file);
             if !same {
@@ -994,6 +1102,13 @@ fn judge_task(
             )
         }
         Task::SeedWitness {
+            harness,
+            input,
+            property,
+            expect,
+            ..
+        }
+        | Task::RaceSchedule {
             harness,
             input,
             property,
@@ -1609,6 +1724,25 @@ mod tests {
             lane_bound(&bound, "t", "cargo test").is_some(),
             "another checkout blocks"
         );
+    }
+
+    /// A runner file counts only for its own run and task: the same task's
+    /// file from another run of the same plan is refused.
+    #[test]
+    fn a_runner_file_from_another_run_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let binding = |run: &str| super::TaskBinding {
+            run: run.to_owned(),
+            index: 3,
+            task_sha256: "t".to_owned(),
+        };
+        let file = json!({
+            "exited_ok": true,
+            "binding": { "run": "run-a", "task": 3, "task_sha256": "t" },
+        });
+        std::fs::write(dir.path().join("lane.json"), file.to_string()).unwrap();
+        assert!(super::runner_json(dir.path(), "lane.json", &binding("run-a")).is_some());
+        assert!(super::runner_json(dir.path(), "lane.json", &binding("run-b")).is_none());
     }
 
     /// An artifact tree holding a link isn't read.

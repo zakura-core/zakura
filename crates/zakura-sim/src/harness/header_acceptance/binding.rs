@@ -59,6 +59,10 @@ pub enum Field {
     Case,
     /// A fuzz target.
     Target,
+    /// The scenario a run ran, as its harness describes it.
+    Scenario,
+    /// The Plan a run took its choices from, other than a fuzz input.
+    Plan,
 }
 
 impl Field {
@@ -83,6 +87,18 @@ impl Field {
             Field::Property => "judges the property",
             Field::Case => "judges the case",
             Field::Target => "names the target",
+            Field::Scenario => "ran the scenario",
+            Field::Plan => "ran the Plan",
+        }
+    }
+
+    /// What an artifact that leaves this field out carries: no override
+    /// for [`Field::Draft`], which a trace's meta omits when it's empty,
+    /// and `null` for any other.
+    fn absent(self) -> Value {
+        match self {
+            Field::Draft => Value::Array(Vec::new()),
+            _ => Value::Null,
         }
     }
 }
@@ -231,8 +247,8 @@ pub const TASK: Kind = Kind {
     closed: true,
 };
 
-/// A trace's own `meta` line, which names the build, harness, override
-/// and input its run used. Readers expect what they know of the run.
+/// A trace's own `meta` line, which names the build, harness, override,
+/// scenario and input or Plan its run used. Readers expect what they know of the run.
 pub const TRACE_META: Kind = Kind {
     name: "its trace",
     carries: &[
@@ -241,6 +257,8 @@ pub const TRACE_META: Kind = Kind {
         (Field::Draft, "/draft"),
         (Field::InputSha256, "/input/sha256"),
         (Field::InputLen, "/input/len"),
+        (Field::Scenario, "/scenario"),
+        (Field::Plan, "/plan"),
     ],
     required: &[],
     closed: false,
@@ -329,7 +347,8 @@ fn shown(value: Option<&Value>) -> String {
 /// if it is: the one comparison of every identity field any artifact
 /// carries. Each field `kind` requires must be expected, and each carried
 /// field that's expected must equal the expectation, a [`Field::Source`]
-/// on both sides a [`known`] one. A closed kind holds nothing else.
+/// on both sides a [`known`] one. A field the artifact leaves out is
+/// [`Field::absent`]'s value. A closed kind holds nothing else.
 pub fn check(kind: &Kind, artifact: &Value, expect: &Expect) -> Result<(), String> {
     if kind.closed {
         let carried: Vec<&str> = kind
@@ -356,21 +375,22 @@ pub fn check(kind: &Kind, artifact: &Value, expect: &Expect) -> Result<(), Strin
             Some(Err(why)) => return Err(format!("{}: {why}", kind.name)),
             Some(Ok(want)) => want,
         };
-        let found = artifact.pointer(pointer);
+        let absent = field.absent();
+        let found = artifact.pointer(pointer).unwrap_or(&absent);
         let mut why = String::new();
         if field == Field::Source {
             if !known(want.as_str()) {
                 let _ = write!(why, " (its reader knows no source)");
-            } else if !known(found.and_then(Value::as_str)) {
+            } else if !known(found.as_str()) {
                 let _ = write!(why, " (which names no source)");
             }
         }
-        if found != Some(want) || !why.is_empty() {
+        if found != want || !why.is_empty() {
             return Err(format!(
                 "{} {} {}, not {}{why}",
                 kind.name,
                 field.says(),
-                shown(found),
+                shown(Some(found)),
                 shown(Some(want))
             ));
         }
@@ -403,7 +423,8 @@ pub fn trace_meta(dir: &Path) -> Result<Value, String> {
         .ok_or_else(|| format!("{}: no meta line", path.display()))
 }
 
-/// [`check`] of [`TRACE_META`] for the trace in `dir`.
+/// [`check`] of [`TRACE_META`] for the trace in `dir`'s `meta` line
+/// ([`trace_meta`]).
 pub fn check_trace(dir: &Path, expect: &Expect) -> Result<(), String> {
     check(&TRACE_META, &trace_meta(dir)?, expect)
 }

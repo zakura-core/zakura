@@ -43,6 +43,8 @@ use zakura_rt::{
     time::Instant,
 };
 
+#[cfg(any(test, zakura_sim))]
+use super::block_sync_observe::RegistryWriter;
 use super::{
     state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER, BlockSyncStatus, ServicePeerDirection,
     ZakuraPeerId,
@@ -102,7 +104,69 @@ pub(super) struct Entry {
     pub(super) outbound: Option<crate::zakura::regulation::SlotBudget>,
 }
 
+/// The fields of an entry that a registry write can change, in test and
+/// simulator builds: its owner, claims, session state, status and slot
+/// diagnostics.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug, PartialEq)]
+pub(super) struct EntryFingerprint {
+    generation: u64,
+    conn_id: Option<ZakuraConnId>,
+    session_closed: bool,
+    has_outbound: bool,
+    status: (bool, block::Height, block::Height, u32, u32, u32),
+    claims: Vec<(
+        block::Height,
+        zakura_header_chain::BodyWorkOwner,
+        block::Hash,
+        u64,
+        Instant,
+        Instant,
+    )>,
+    slots: (usize, usize, usize, usize, Option<u64>),
+}
+
 impl Entry {
+    /// This entry's fingerprint.
+    #[cfg(any(test, zakura_sim))]
+    fn fingerprint(&self) -> EntryFingerprint {
+        EntryFingerprint {
+            generation: self.generation,
+            conn_id: self.conn_id,
+            session_closed: self.session_closed,
+            has_outbound: self.outbound.is_some(),
+            status: (
+                self.received_status,
+                self.servable_low,
+                self.servable_high,
+                self.max_blocks_per_response,
+                self.max_inflight_requests,
+                self.max_response_bytes,
+            ),
+            claims: self
+                .outstanding
+                .iter()
+                .map(|(height, meta)| {
+                    (
+                        *height,
+                        meta.owner,
+                        meta.hash,
+                        meta.estimated_bytes,
+                        meta.queued_at,
+                        meta.deadline,
+                    )
+                })
+                .collect(),
+            slots: (
+                self.slots.hard_capacity,
+                self.slots.effective_window,
+                self.slots.available_slots,
+                self.slots.outstanding_requests,
+                self.slots.bbr_rtprop_ms,
+            ),
+        }
+    }
+
     fn new(
         direction: ServicePeerDirection,
         config: &super::ZakuraBlockSyncConfig,
@@ -231,6 +295,28 @@ pub(super) struct OutstandingClaim {
     pub(super) peer: ZakuraPeerId,
     pub(super) height: block::Height,
     pub(super) meta: OutstandingMeta,
+}
+
+/// Runs `$write` on the registry's peer table under the registry lock, and
+/// returns its result once the lock is released. `$generation` is the
+/// routine generation the call comes from. Test and simulator builds
+/// fingerprint `$peer`'s entry before and after `$write`, under the same
+/// lock, and report a change to an entry another generation owns, whether
+/// or not the writer reports itself.
+macro_rules! gated_write {
+    ($registry:expr, $peer:expr, $writer:ident, $generation:expr, |$table:ident| $write:expr) => {{
+        let mut peers = $registry.lock();
+        #[cfg(any(test, zakura_sim))]
+        let before = peers.state.fingerprint($peer);
+        let $table = &mut peers.state;
+        let written = $write;
+        #[cfg(any(test, zakura_sim))]
+        peers
+            .state
+            .report_stale_change($peer, RegistryWriter::$writer, $generation, before);
+        drop(peers);
+        written
+    }};
 }
 
 /// Keeps pure peer facts and live handoff flags under the same registry lock.
@@ -606,7 +692,9 @@ impl PeerRegistry {
     /// refuses an admission it already registered. A newer generation is left
     /// open.
     pub(super) fn close_session(&self, peer: &ZakuraPeerId, generation: u64) {
-        self.lock().state.close_session(peer, generation);
+        gated_write!(self, peer, CloseSession, generation, |table| {
+            table.close_session(peer, generation)
+        });
     }
 
     /// Remove a peer's entry if its session is closed (see
@@ -652,7 +740,9 @@ impl PeerRegistry {
         generation: u64,
         status: BlockSyncStatus,
     ) {
-        let eligibility_changed = self.lock().state.upsert_status(peer, generation, status);
+        let eligibility_changed = gated_write!(self, peer, UpsertStatus, generation, |table| {
+            table.upsert_status(peer, generation, status)
+        });
         if eligibility_changed {
             // A servable-range change can add or remove the preferred floor carrier.
             self.floor_ranking_changed.notify_waiters();
@@ -669,9 +759,9 @@ impl PeerRegistry {
         generation: u64,
         claims: impl IntoIterator<Item = (block::Height, OutstandingMeta)>,
     ) {
-        self.lock()
-            .state
-            .insert_outstanding(peer, generation, claims);
+        gated_write!(self, peer, InsertOutstanding, generation, |table| {
+            table.insert_outstanding(peer, generation, claims)
+        });
     }
 
     /// Remove `owner`'s claims at `heights`, generation-gated as in
@@ -684,15 +774,17 @@ impl PeerRegistry {
         owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) {
-        self.lock()
-            .state
-            .remove_outstanding_for_owner(peer, generation, owner, heights);
+        gated_write!(self, peer, RemoveOutstanding, generation, |table| {
+            table.remove_outstanding_for_owner(peer, generation, owner, heights)
+        });
     }
 
     /// Clear the peer's outstanding set (it has no live requests), generation-gated
     /// as in [`insert_outstanding`](Self::insert_outstanding).
     pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
-        let detached = self.lock().state.take_outstanding(peer, generation);
+        let detached = gated_write!(self, peer, TakeOutstanding, generation, |table| {
+            table.take_outstanding(peer, generation)
+        });
         // Drop the detached claims after releasing the lock.
         drop(detached);
     }
@@ -705,7 +797,9 @@ impl PeerRegistry {
         generation: u64,
         slots: SlotDiagnostics,
     ) {
-        let ranking_changed = self.lock().state.publish_slots(peer, generation, slots);
+        let ranking_changed = gated_write!(self, peer, PublishSlots, generation, |table| {
+            table.publish_slots(peer, generation, slots)
+        });
         if ranking_changed {
             // A previous deferrer may now be the preferred carrier. Updating the
             // table alone leaves its routine asleep until an unrelated wake.
@@ -728,9 +822,9 @@ impl PeerRegistry {
         generation: u64,
         outbound: &crate::zakura::FramedSend,
     ) {
-        self.lock()
-            .state
-            .attach_outbound(peer, generation, outbound.capacity_probe());
+        gated_write!(self, peer, AttachOutbound, generation, |table| {
+            table.attach_outbound(peer, generation, outbound.capacity_probe())
+        });
     }
 
     /// The handoff flag of `generation`'s entry, which its routine sets while
@@ -924,9 +1018,13 @@ impl PeerRegistry {
         height: block::Height,
         owner: zakura_header_chain::BodyWorkOwner,
     ) -> bool {
-        self.lock()
-            .state
-            .clear_outstanding_height_for_owner(peer, height, owner)
+        gated_write!(
+            self,
+            peer,
+            ClearOutstandingHeight,
+            owner.session_id,
+            |table| table.clear_outstanding_height_for_owner(peer, height, owner)
+        )
     }
 
     /// Hard-exclude this peer from re-taking `height` until `until` after the
@@ -2152,6 +2250,86 @@ mod floor_bias_tests {
         assert!(reg.peer_has_outstanding_height(&peer, second));
         reg.clear_outstanding(&peer, new_generation);
         assert!(!reg.peer_has_outstanding_height(&peer, second));
+    }
+
+    #[test]
+    fn a_stale_change_reports_only_a_change_to_another_generations_entry() {
+        #[derive(Debug, Default)]
+        struct Log(std::sync::Mutex<Vec<super::super::block_sync_observe::BlockEvent>>);
+        impl super::super::block_sync_observe::BlockSyncObserver for Log {
+            fn observe(&self, event: super::super::block_sync_observe::BlockEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let changes = |log: &Log| {
+            log.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    super::super::block_sync_observe::BlockEvent::StaleRegistryChange {
+                        writer,
+                        generation,
+                        entry_generation,
+                        ..
+                    } => Some((*writer, *generation, *entry_generation)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let log = Arc::new(Log::default());
+        let reg = PeerRegistry::new().with_observer(
+            super::super::block_sync_observe::ObserverSlot(Some(log.clone())),
+        );
+        let peer = peer(1);
+        let admit = || {
+            reg.admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation()
+        };
+        let old_generation = admit();
+        let new_generation = admit();
+        let claim = OutstandingMeta {
+            owner: super::super::test_work_owner(),
+            hash: block::Hash([1; 32]),
+            estimated_bytes: 100,
+            queued_at: Instant::now(),
+            deadline: Instant::now(),
+        };
+        reg.insert_outstanding(&peer, new_generation, [(block::Height(1), claim)]);
+
+        // A gate that refuses the superseded routine leaves the entry as it was.
+        reg.clear_outstanding(&peer, old_generation);
+        assert_eq!(changes(&log), []);
+
+        // A writer that matches the entry by peer ID alone, and reports
+        // nothing itself, still shows in the entry's fingerprints.
+        let detached = gated_write!(reg, &peer, TakeOutstanding, old_generation, |table| {
+            table
+                .get_mut(&peer)
+                .map(|entry| std::mem::take(&mut entry.outstanding))
+        });
+        assert_eq!(detached.map(|claims| claims.len()), Some(1));
+        assert_eq!(
+            changes(&log),
+            [(
+                RegistryWriter::TakeOutstanding,
+                old_generation,
+                new_generation
+            )]
+        );
+
+        // The owning generation's writes report nothing.
+        reg.insert_outstanding(&peer, new_generation, [(block::Height(1), claim)]);
+        reg.clear_outstanding(&peer, new_generation);
+        assert_eq!(changes(&log).len(), 1);
     }
 
     #[test]

@@ -1440,6 +1440,19 @@ pub enum BlockSyncFact {
         /// Whether the write landed.
         landed: bool,
     },
+    /// A peer-registry call from one routine generation changed the peer's
+    /// entry while another generation owned it, as the registry's
+    /// fingerprints of the entry before and after the call show.
+    StaleRegistryChange {
+        /// The entry's peer.
+        peer: String,
+        /// The call, as the peer registry's method names it.
+        writer: String,
+        /// The generation the call came from.
+        generation: u64,
+        /// The generation that owned the entry.
+        entry_generation: u64,
+    },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
         /// The sending peer.

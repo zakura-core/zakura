@@ -19,13 +19,17 @@ mod support;
 
 use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
 
+use serde::{Deserialize, Serialize};
 use support::{
     byte_inputs, inputs,
+    one_key_off::assert_one_key_off,
     storage_witnesses::{hold, mirror, step, NODE, SOURCE},
 };
-use zakura_header_chain::{HeaderGeneration, HeaderSyncWorkOwner};
 use zakura_network::zakura::observe::ReactorEvent;
-use zakura_sim::harness::header_acceptance::history::run_declared;
+use zakura_sim::harness::header_acceptance::{
+    history::run_declared,
+    refs::{joined, Ref, WorkRef},
+};
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync::{
@@ -163,6 +167,44 @@ fn mixed_resources() -> StorageScenario {
     }
 }
 
+/// A reactor call's dispatch of a prepare: the call and the prepare's
+/// owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Dispatch {
+    call: u64,
+    owner: WorkOwner,
+}
+impl Ref for Dispatch {}
+
+/// A reactor call paired with the storage operation it submitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Paired {
+    call: u64,
+    op: u64,
+}
+impl Ref for Paired {}
+
+/// A stale window: its call, and whether it was an apply's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StaleCall {
+    call: u64,
+    apply: bool,
+}
+impl Ref for StaleCall {}
+
+/// `bytes` in lowercase hex, as a peer's key.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A round's release, by its peer, in hex, and incarnation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Release {
+    peer: String,
+    incarnation: u64,
+}
+impl Ref for Release {}
+
 /// One run of the scenario and the evidence its node left.
 struct Run {
     report: RunReport,
@@ -272,15 +314,9 @@ impl Selected {
         self.obs.iter().position(is)
     }
 
-    /// Checks the scenario's held first prepare is the one that ended stale
-    /// and whose round was released, joined through its identities: its
-    /// storage operation, submitted by a reactor call that dispatched a
-    /// prepare for the same owner and ended paired with that operation, a
-    /// stale window of that prepare call, the round of that same owner, in
-    /// full (its kind, header generation, branch, session and request),
-    /// retired before the call ended and backed by a reservation, and the
-    /// queue's release of that round, by its peer and incarnation.
-    fn held_prepare_joined(&self) -> Result<(), String> {
+    /// The first prepare's operation, the reactor call that submitted it
+    /// and its owner, or why there's none.
+    fn held_prepare(&self) -> Result<(u64, u64, WorkOwner), String> {
         let (op, call, owner) = self
             .first_submitted(|request| match request {
                 StorageRequest::PrepareHeaderTarget { owner, .. } => Some(owner),
@@ -288,69 +324,144 @@ impl Selected {
             })
             .ok_or("no prepare was submitted")?;
         let call = call.ok_or(format!("prepare {op} names no reactor call"))?;
-        self.position(|obs| {
-            matches!(obs, Observation::Reactor {
-                event: ReactorFact::Dispatched {
-                    call: c,
-                    port: ReactorCall::Prepare { owner: o, .. },
-                },
+        Ok((op, call, owner))
+    }
+
+    /// Whether a reactor call dispatched `want`.
+    fn dispatched(&self, want: &Dispatch) -> bool {
+        let of = |obs: &Observation| match obs {
+            Observation::Reactor {
+                event:
+                    ReactorFact::Dispatched {
+                        call,
+                        port: ReactorCall::Prepare { owner, .. },
+                    },
                 ..
-            } if *c == call && *o == owner)
+            } => Some(Dispatch {
+                call: *call,
+                owner: owner.clone(),
+            }),
+            _ => None,
+        };
+        !joined(&self.obs, of, want).is_empty()
+    }
+
+    /// The position of the first observation of a call ending paired with
+    /// its operation, `want`.
+    fn ended(&self, want: &Paired) -> Option<usize> {
+        self.obs.iter().position(|obs| match obs {
+            Observation::Reactor {
+                event: ReactorFact::CallEnded { call, op, .. },
+                ..
+            } => op.map(|op| Paired { call: *call, op }).as_ref() == Some(want),
+            _ => false,
         })
-        .ok_or(format!("call {call} dispatched no prepare for {owner:?}"))?;
-        let ended = self
-            .position(|obs| {
-                matches!(obs, Observation::Reactor {
-                    event: ReactorFact::CallEnded { call: c, op: o, .. },
-                    ..
-                } if *c == call && *o == Some(op))
+    }
+
+    /// Whether `want`'s stale window ended at a step's drain.
+    fn ended_stale(&self, want: &StaleCall) -> bool {
+        let of = |window: &StaleWindow| {
+            Some(StaleCall {
+                call: window.call,
+                apply: window.apply,
             })
-            .ok_or(format!(
-                "call {call} never ended paired with operation {op}"
-            ))?;
-        if !self
-            .stale
+        };
+        joined(&self.stale, of, want)
             .iter()
-            .any(|window| window.call == call && !window.apply && window.step.is_some())
-        {
+            .any(|window| window.step.is_some())
+    }
+
+    /// Whether `want`'s round retired before the observation at `ended`.
+    fn retired_before(&self, want: &WorkRef, ended: usize) -> bool {
+        let of = |obs: &Observation| match obs {
+            Observation::Reactor {
+                event: ReactorFact::Retired { request, .. },
+                ..
+            } => Some(WorkRef {
+                owner: request.owner.clone(),
+                session_id: request.session_id,
+                request_id: request.request_id,
+            }),
+            _ => None,
+        };
+        !joined(&self.obs[..ended], of, want).is_empty()
+    }
+
+    /// The round a reservation backs for `want`, by its peer and
+    /// incarnation.
+    fn reserved(&self, want: &WorkRef) -> Option<Release> {
+        let of = |event: &ReactorEvent| match event {
+            ReactorEvent::ReservationBound { request, .. } => Some(WorkRef {
+                owner: work_owner(request.owner),
+                session_id: request.session_id,
+                request_id: request.request_id,
+            }),
+            _ => None,
+        };
+        joined(&self.accounting, of, want)
+            .into_iter()
+            .find_map(|event| match event {
+                ReactorEvent::ReservationBound { request, .. } => Some(Release {
+                    peer: hex(request.peer.as_bytes()),
+                    incarnation: request.incarnation,
+                }),
+                _ => None,
+            })
+    }
+
+    /// Whether the queue released `want`.
+    fn released(&self, want: &Release) -> bool {
+        let of = |event: &ReactorEvent| match event {
+            ReactorEvent::RoundReleased {
+                peer, incarnation, ..
+            } => Some(Release {
+                peer: hex(peer.as_bytes()),
+                incarnation: *incarnation,
+            }),
+            _ => None,
+        };
+        !joined(&self.accounting, of, want).is_empty()
+    }
+
+    /// Checks the scenario's held first prepare is the one that ended stale
+    /// and whose round was released, joined through its identities, each a
+    /// whole ref: its storage operation, submitted by a reactor call that
+    /// dispatched a prepare for the same owner ([`Dispatch`]) and ended
+    /// paired with that operation ([`Paired`]), a stale window of that
+    /// prepare call ([`StaleCall`]), the round of that same owner, in full
+    /// ([`WorkRef`]), retired before the call ended and backed by a
+    /// reservation, and the queue's release of that round ([`Release`]).
+    fn held_prepare_joined(&self) -> Result<(), String> {
+        let (op, call, owner) = self.held_prepare()?;
+        let dispatch = Dispatch {
+            call,
+            owner: owner.clone(),
+        };
+        if !self.dispatched(&dispatch) {
+            return Err(format!("no call dispatched {dispatch:?}"));
+        }
+        let ended = self.ended(&Paired { call, op }).ok_or(format!(
+            "call {call} never ended paired with operation {op}"
+        ))?;
+        if !self.ended_stale(&StaleCall { call, apply: false }) {
             return Err(format!(
                 "prepare call {call} didn't end stale: {:?}",
                 self.stale
             ));
         }
-        self.obs[..ended]
-            .iter()
-            .find(|obs| {
-                matches!(obs, Observation::Reactor {
-                    event: ReactorFact::Retired { request, .. },
-                    ..
-                } if request.owner == owner
-                    && (request.session_id, request.request_id)
-                        == (owner.session_id, owner.request_id))
-            })
-            .ok_or(format!(
-                "{owner:?}'s round didn't retire before call {call} ended"
-            ))?;
-        let round = self
-            .accounting
-            .iter()
-            .find_map(|event| match event {
-                ReactorEvent::ReservationBound { request, .. }
-                    if work_owner(request.owner) == owner
-                        && (request.session_id, request.request_id)
-                            == (owner.session_id, owner.request_id) =>
-                {
-                    Some((request.peer.clone(), request.incarnation))
-                }
-                _ => None,
-            })
-            .ok_or(format!("no reservation backs {owner:?}'s round"))?;
-        let released = self.accounting.iter().any(|event| {
-            matches!(event, ReactorEvent::RoundReleased { peer, incarnation, .. }
-                if (peer, *incarnation) == (&round.0, round.1))
-        });
-        if !released {
-            return Err(format!("round {} was never released", round.1));
+        let round = WorkRef {
+            session_id: owner.session_id,
+            request_id: owner.request_id,
+            owner,
+        };
+        if !self.retired_before(&round, ended) {
+            return Err(format!("{round:?} didn't retire before call {call} ended"));
+        }
+        let release = self
+            .reserved(&round)
+            .ok_or(format!("no reservation backs {round:?}"))?;
+        if !self.released(&release) {
+            return Err(format!("{release:?} was never released"));
         }
         Ok(())
     }
@@ -543,13 +654,12 @@ fn the_mixed_scenario_holds_under_generated_plans() {
     }
 }
 
-/// The held prepare's join and the apply reply's crossing each fail when
-/// one identity changes on its own: the storage operation the call ended
-/// paired with, the reactor call the operation names, the owner the call
-/// dispatched for, the stale window's call, the retired round's owner, by
-/// its request, header generation or branch, the reserved round's owner,
-/// by its header generation or branch, and the released round's
-/// incarnation, and for the apply, a reply delivered before the reset.
+/// Each of the held prepare's joins, and so the witness, fails when any
+/// one key of its ref moves on its own (Rule 25's template): the call's
+/// dispatch of the prepare's owner, every field of it, the call paired
+/// with the operation, the prepare's stale window, the round retired and
+/// reserved for the owner in full, and the round's release. The apply
+/// reply's crossing fails for a reply delivered before the reset.
 #[test]
 fn the_mixed_joins_fail_one_identity_off() {
     let committed: StorageScenario = serde_json::from_str(
@@ -564,150 +674,28 @@ fn the_mixed_joins_fail_one_identity_off() {
     selected
         .apply_reply_crosses_reset()
         .expect("the committed reply crosses");
-    let (op, call, _) = selected
-        .first_submitted(|request| match request {
-            StorageRequest::PrepareHeaderTarget { owner, .. } => Some(owner),
-            _ => None,
-        })
-        .expect("a prepare was submitted");
-    let call = call.expect("a reactor call submitted it");
+    let (op, call, owner) = selected.held_prepare().expect("a prepare was submitted");
 
-    /// `selected` with `change` applied to each observation.
-    fn each_obs(selected: &Selected, change: impl Fn(&mut Observation)) -> Selected {
-        let mut changed = selected.clone();
-        changed.obs.iter_mut().for_each(change);
-        changed
-    }
-    let off: Vec<(&str, Selected)> = vec![
-        (
-            "operation",
-            each_obs(&selected, |obs| {
-                if let Observation::Reactor {
-                    event: ReactorFact::CallEnded { call: c, op: o, .. },
-                    ..
-                } = obs
-                {
-                    if *c == call && *o == Some(op) {
-                        *o = Some(op + 1000);
-                    }
-                }
-            }),
-        ),
-        (
-            "call",
-            each_obs(&selected, |obs| {
-                if let Observation::Storage {
-                    fact: StorageFact::Submitted { id, call: c, .. },
-                    ..
-                } = obs
-                {
-                    if *id == op {
-                        *c = c.map(|c| c + 1000);
-                    }
-                }
-            }),
-        ),
-        (
-            "owner",
-            each_obs(&selected, |obs| {
-                if let Observation::Reactor {
-                    event:
-                        ReactorFact::Dispatched {
-                            call: c,
-                            port: ReactorCall::Prepare { owner, .. },
-                        },
-                    ..
-                } = obs
-                {
-                    if *c == call {
-                        owner.request_id += 1000;
-                    }
-                }
-            }),
-        ),
-        ("stale call", {
-            let mut changed = selected.clone();
-            for window in &mut changed.stale {
-                if window.call == call {
-                    window.call += 1000;
-                }
-            }
-            changed
-        }),
-        (
-            "retired owner",
-            each_obs(&selected, |obs| {
-                if let Observation::Reactor {
-                    event: ReactorFact::Retired { request, .. },
-                    ..
-                } = obs
-                {
-                    request.owner.request_id += 1000;
-                }
-            }),
-        ),
-        (
-            "retired generation",
-            each_obs(&selected, |obs| {
-                if let Observation::Reactor {
-                    event: ReactorFact::Retired { request, .. },
-                    ..
-                } = obs
-                {
-                    request.owner.scope.header_generation += 1000;
-                }
-            }),
-        ),
-        (
-            "retired branch",
-            each_obs(&selected, |obs| {
-                if let Observation::Reactor {
-                    event: ReactorFact::Retired { request, .. },
-                    ..
-                } = obs
-                {
-                    request.owner.scope.branch.target = "another target".into();
-                }
-            }),
-        ),
-        ("reserved generation", {
-            let mut changed = selected.clone();
-            for event in &mut changed.accounting {
-                if let ReactorEvent::ReservationBound { request, .. } = event {
-                    if let HeaderSyncWorkOwner::Header(owner) = &mut request.owner {
-                        let generation = owner.authority.header_generation.get();
-                        owner.authority.header_generation =
-                            HeaderGeneration::new(generation + 1000);
-                    }
-                }
-            }
-            changed
-        }),
-        ("reserved branch", {
-            let mut changed = selected.clone();
-            for event in &mut changed.accounting {
-                if let ReactorEvent::ReservationBound { request, .. } = event {
-                    if let HeaderSyncWorkOwner::Header(owner) = &mut request.owner {
-                        owner.authority.branch.target_tip_hash = owner.authority.branch.anchor_hash;
-                    }
-                }
-            }
-            changed
-        }),
-        ("released round", {
-            let mut changed = selected.clone();
-            for event in &mut changed.accounting {
-                if let ReactorEvent::RoundReleased { incarnation, .. } = event {
-                    *incarnation += 1000;
-                }
-            }
-            changed
-        }),
-    ];
-    for (identity, changed) in off {
-        assert!(changed.held_prepare_joined().is_err(), "{identity}");
-        assert!(changed.apply_reply_crosses_reset().is_ok(), "{identity}");
-    }
+    let dispatch = Dispatch {
+        call,
+        owner: owner.clone(),
+    };
+    assert_one_key_off(&dispatch, |dispatch| selected.dispatched(dispatch));
+    let paired = Paired { call, op };
+    let ended = selected.ended(&paired).expect("the call ended paired");
+    assert_one_key_off(&paired, |paired| selected.ended(paired).is_some());
+    assert_one_key_off(&StaleCall { call, apply: false }, |stale| {
+        selected.ended_stale(stale)
+    });
+    let round = WorkRef {
+        session_id: owner.session_id,
+        request_id: owner.request_id,
+        owner,
+    };
+    assert_one_key_off(&round, |round| selected.retired_before(round, ended));
+    let release = selected.reserved(&round).expect("a reservation backs it");
+    assert_one_key_off(&round, |round| selected.reserved(round).is_some());
+    assert_one_key_off(&release, |release| selected.released(release));
 
     let (apply, ..) = selected
         .first_submitted(|request| match request {

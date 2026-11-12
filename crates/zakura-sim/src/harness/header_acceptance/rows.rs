@@ -1769,6 +1769,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "skewed-remaining",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "skipped-sequence",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -3032,7 +3038,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "shutdown-kept-queue",
         },
     },
-    to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
+    NativeMutation {
+        patch: "skewed-remaining",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skewed-remaining",
+        },
+    },
     to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
     NativeMutation {
         patch: "skipped-staging",

@@ -129,7 +129,8 @@ mod cli {
              `--scenario` and `--script` run a scripted Plan, as JSON, against it.\n\
              The trace's meta names the Plan bytes or script by digest.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
-             result to witness.json beside the trace, and exits 1 if the test fails.\n\
+             result to witness.json beside the trace, naming that trace's digest and\n\
+             this build's source, and exits 1 if the test fails.\n\
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
              test or `confirm` expects violated beside the property, as a planted bug's\n\
@@ -332,11 +333,15 @@ mod cli {
         .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
         let error = result.as_ref().err().map(ToString::to_string);
+        // `trace` and `source` name the trace this judged and the build
+        // that judged it, so the result never counts for another run.
         let file = json!({
             "property": property,
             "expect": expect.name(),
             "also_violates": also_violates,
             "draft": draft,
+            "trace": trace.id,
+            "source": trace::BuildInfo::current().source,
             "passed": result.is_ok(),
             "error": error,
         });

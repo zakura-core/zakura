@@ -3889,8 +3889,9 @@ const NATIVE_HISTORY: HistoryRef = HistoryRef {
 };
 /// The harness the native mutation's history runs on.
 const NATIVE_HARNESS: &str = "header-sync/storage";
-/// Why `t/b` doesn't apply on [`HISTORY`].
-const UNREACHED: &str = "unreached here";
+/// Why `t/b` doesn't apply on [`HISTORY`]: a benign reason, since a
+/// completed counted run accepts no other for a non-target property.
+const UNREACHED: &str = "never-applied";
 /// Why `t/b` never applies.
 const NEVER: &str = "never applies";
 /// `t/b`'s expected `NotApplicable` on [`HISTORY`].

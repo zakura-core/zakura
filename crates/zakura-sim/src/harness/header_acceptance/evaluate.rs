@@ -1448,8 +1448,8 @@ fn target_held(run: &Execution, target: &str) -> Result<(), String> {
 /// The whole-report rule for a completed counted run: the execution is the
 /// expected one, it completed with every declared action, leaked no task,
 /// reports exactly its harness's properties, and every one other than
-/// `target` held, or stayed `NotApplicable` with the reason the row lists
-/// for it. The caller judges `target`.
+/// `target` held, or stayed `NotApplicable` with the benign reason the row
+/// lists for it ([`others_pass`]). The caller judges `target`.
 fn whole_report(
     manifest: &Manifest,
     run: &Execution,
@@ -1464,10 +1464,13 @@ fn whole_report(
     others_pass(run, &[target], not_applicable)
 }
 
-/// Checks every property of `run` outside `skip` held, or stayed
-/// `NotApplicable` with the reason `not_applicable` lists for it. A listed
-/// property that held, an unlisted one that didn't apply, a wrong reason and
-/// a violation each fail.
+/// Checks every property of `run`, a completed counted run, outside `skip`
+/// held, or stayed `NotApplicable` with the reason `not_applicable` lists
+/// for it, which must be benign ([`benign`]). A listed property that held,
+/// an unlisted one that didn't apply, a wrong reason and a violation each
+/// fail. So does an incomplete reason, such as `unsettled:watch-open`,
+/// whatever a list says: it's evidence the run left open, not a property
+/// with nothing to check, so no list can accept it (C6).
 fn others_pass(
     run: &Execution,
     skip: &[&str],
@@ -1490,6 +1493,11 @@ fn others_pass(
             .find(|na| na.property == property.as_str());
         match (report, listed) {
             (Report::Held { .. }, None) => {}
+            (Report::NotApplicable { reason }, _) if !benign(reason) => {
+                return Err(format!(
+                    "{property} is NotApplicable({reason}), whose evidence is incomplete"
+                ))
+            }
             (Report::NotApplicable { reason: given }, Some(na)) if given == na.reason => {}
             (report, listed) => {
                 return Err(format!(
@@ -1503,6 +1511,18 @@ fn others_pass(
         }
     }
     Ok(())
+}
+
+/// Whether `reason`, a `NotApplicable` report's reason by name, says there
+/// was nothing to judge ([`NaReason::is_benign`](crate::NaReason::is_benign))
+/// rather than that the run's observations were incomplete. A name no
+/// reason a header ID can carry has isn't benign.
+fn benign(reason: &str) -> bool {
+    super::reasons::NA_REASONS
+        .iter()
+        .map(|entry| entry.reason)
+        .chain(super::reasons::NOT_HEADER.iter().map(|&(reason, _)| reason))
+        .any(|known| known.is_benign() && known.name() == reason)
 }
 
 /// Checks `run` completed: no stopping violation, no harness failure, every

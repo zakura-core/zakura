@@ -169,7 +169,6 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
                 .into(),
         );
     }
-    keep_executables(&run_dir)?;
     for target in RUN_TARGETS {
         let target = run_dir.join(target);
         if target.exists() {
@@ -291,14 +290,6 @@ fn run_at(
         let log = logs.join(format!("seeds-{}.log", harness.replace('/', "-")));
         let _ = child(&mut fill, &log, run.deadline);
     }
-    let seed_of = |harness: &str| -> Option<PathBuf> {
-        report.get("seeds")?.as_array()?.iter().find_map(|row| {
-            if row.pointer("/sidecar/harness")?.as_str()? != harness {
-                return None;
-            }
-            Some(corpus.join(row.get("input_sha256")?.as_str()?))
-        })
-    };
 
     let tasks = plan
         .get("tasks")
@@ -348,11 +339,13 @@ fn run_at(
             "seed" => ctx.seed(fields)?,
             "seed-witness" => ctx.seed_witness(fields)?,
             "command" => ctx.command(fields)?,
-            "measure" => ctx.measure(fields, &seed_of)?,
+            "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
         }
     }
 
+    // Before the evaluator, which binds each trace to the kept release build.
+    keep_executables(&run.out)?;
     let mut evaluate = Command::new(&tool);
     evaluate
         .arg("evaluate")
@@ -447,82 +440,108 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// One lane's command, through `sh -c` as `qa/suite.toml` spells it,
-    /// then each test binary it ran listed with `--list`, so `lane.json`
-    /// says which listed test didn't run and pass (Rule 11).
+    /// One lane's command, through `sh -c` as `qa/suite.toml` spells it.
+    /// First the same command with `--no-run --message-format=json` builds
+    /// its test binaries and names each one's package and target, and each
+    /// binary is listed with `--list` before anything runs. Then the lane
+    /// runs, and each binary's results are matched to its target by path.
+    /// `lane.json` holds the outcome, each target's results and listed
+    /// tests, and the targets whose listing failed (Rule 11).
     fn lane(&self, task: &Value) -> Result<(), BoxError> {
         let command = field(task, "command")?;
-        let package = command
-            .split_whitespace()
-            .skip_while(|word| *word != "-p")
-            .nth(1)
-            .unwrap_or_default()
-            .to_owned();
+        let mut build = Command::new("sh");
+        build
+            .args(["-c", &format!("{command} --no-run --message-format=json")])
+            .current_dir(self.root);
+        let build_log = self.dir.join("inventory.log");
+        let built = child(&mut build, &build_log, self.run.deadline);
+        stop_if_interrupted()?;
+        let mut inventory: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for line in fs::read_to_string(&build_log).unwrap_or_default().lines() {
+            let Ok(message) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if message.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
+                continue;
+            }
+            let (Some(executable), Some(manifest)) = (
+                message.get("executable").and_then(Value::as_str),
+                message.get("manifest_path").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let package = Path::new(manifest)
+                .parent()
+                .and_then(Path::file_name)
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            let kind = message
+                .pointer("/target/kind/0")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = message
+                .pointer("/target/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let target = if kind == "test" { name } else { "lib" };
+            inventory.insert(format!("{package}/{target}"), PathBuf::from(executable));
+        }
+        let mut listed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut list_failures = Vec::new();
+        for (target, binary) in &inventory {
+            match (
+                list_tests(binary, false, self),
+                list_tests(binary, true, self),
+            ) {
+                (Some(all), Some(ignored)) => {
+                    listed.insert(target.clone(), all.difference(&ignored).cloned().collect());
+                }
+                _ => list_failures.push(target.clone()),
+            }
+        }
         let mut sh = Command::new("sh");
         sh.args(["-c", command]).current_dir(self.root);
         let log = self.dir.join("lane.log");
         let ended = child(&mut sh, &log, self.run.deadline);
         stop_if_interrupted()?;
         let text = fs::read_to_string(&log).unwrap_or_default();
+        let by_file: BTreeMap<std::ffi::OsString, String> = inventory
+            .iter()
+            .filter_map(|(target, binary)| Some((binary.file_name()?.to_owned(), target.clone())))
+            .collect();
         let mut targets: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        let mut binaries: Vec<(String, PathBuf)> = Vec::new();
-        let mut current = String::new();
+        let mut current: Option<String> = None;
         let mut section = String::new();
-        let flush = |target: &str, section: &str, targets: &mut BTreeMap<_, Vec<_>>| {
-            if !target.is_empty() {
+        let mut flush = |current: &Option<String>, section: &str| {
+            if let Some(target) = current {
                 targets
-                    .entry(target.to_owned())
+                    .entry(target.clone())
                     .or_default()
                     .extend(libtest(section));
             }
         };
         for line in text.lines() {
             if let Some(rest) = line.trim().strip_prefix("Running ") {
-                flush(&current, &section, &mut targets);
+                flush(&current, &section);
                 section.clear();
-                current = lane_target(&package, rest);
-                if let Some(path) = rest.rsplit_once('(').map(|(_, p)| p.trim_end_matches(')')) {
-                    binaries.push((current.clone(), self.root.join(path)));
-                }
+                current = rest
+                    .rsplit_once('(')
+                    .map(|(_, path)| path.trim_end_matches(')'))
+                    .and_then(|path| Path::new(path).file_name())
+                    .and_then(|file| by_file.get(file).cloned());
             } else {
                 section.push_str(line);
                 section.push('\n');
             }
         }
-        flush(&current, &section, &mut targets);
-        let mut unrun = Vec::new();
-        for (target, binary) in &binaries {
-            let (Some(listed), Some(ignored)) = (
-                list_tests(binary, false, self),
-                list_tests(binary, true, self),
-            ) else {
-                unrun.push(format!("{target}: its binary's --list failed"));
-                continue;
-            };
-            let ran: BTreeSet<&str> = targets
-                .get(target)
-                .map(|tests| {
-                    tests
-                        .iter()
-                        .filter(|(_, outcome)| outcome == "ok")
-                        .map(|(name, _)| name.as_str())
-                        .collect()
-                })
-                .unwrap_or_default();
-            unrun.extend(
-                listed
-                    .difference(&ignored)
-                    .filter(|name| !ran.contains(name.as_str()))
-                    .map(|name| format!("{target}::{name}")),
-            );
-        }
+        flush(&current, &section);
         fs::write(
             self.dir.join("lane.json"),
             serde_json::to_string_pretty(&json!({
-                "exited_ok": ended.exited(),
-                "killed": ended.killed(),
+                "exited_ok": ended.exited() && built.exited(),
+                "killed": ended.killed() || built.killed(),
                 "targets": targets,
-                "unrun": unrun,
+                "listed": listed,
+                "list_failures": list_failures,
                 "log": text,
             }))?,
         )?;
@@ -578,8 +597,9 @@ impl Ctx<'_> {
     fn command(&self, task: &Value) -> Result<(), BoxError> {
         let args: Vec<String> =
             serde_json::from_value(task.get("args").cloned().unwrap_or_default())?;
+        let sim = task.get("sim").and_then(Value::as_bool).unwrap_or(false);
         let mut cargo = cargo(self.root, &self.run.out.join("commands"));
-        if !args.iter().any(|arg| arg == "zakura-sim") {
+        if !sim {
             cargo.env_remove("RUSTFLAGS");
         }
         cargo.args(&args);
@@ -587,16 +607,13 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// One measured recording of `harness`, on its first committed seed or
-    /// on empty input if it has none: `trace/` and `measure.json`.
-    fn measure(
-        &self,
-        task: &Value,
-        seed_of: &dyn Fn(&str) -> Option<PathBuf>,
-    ) -> Result<(), BoxError> {
+    /// One measured recording of `harness`, on the input the plan chose
+    /// from the corpus, or on empty input when it chose none: `trace/` and
+    /// `measure.json`.
+    fn measure(&self, task: &Value) -> Result<(), BoxError> {
         let harness = field(task, "harness")?;
-        let input = match seed_of(harness) {
-            Some(input) => input,
+        let input = match task.get("input").and_then(Value::as_str) {
+            Some(input) => self.corpus.join(input),
             None => {
                 let empty = self.dir.join("empty.bin");
                 fs::write(&empty, [])?;
@@ -651,19 +668,6 @@ fn keep_executables(run_dir: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A lane's target name from cargo's `Running` line: `<package>/lib` for
-/// the library's unit tests, `<package>/<stem>` for an integration test.
-fn lane_target(package: &str, running: &str) -> String {
-    let what = running.split(" (").next().unwrap_or(running).trim();
-    if what.starts_with("unittests") {
-        return format!("{package}/lib");
-    }
-    let stem = Path::new(what)
-        .file_stem()
-        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-    format!("{package}/{stem}")
-}
-
 /// The tests `binary --list` names, or with `ignored` only the ignored
 /// ones, or `None` if the listing didn't exit 0.
 fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> Option<BTreeSet<String>> {
@@ -685,27 +689,4 @@ fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> Option<BTreeSet<St
             .map(str::to_owned)
             .collect(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::lane_target;
-
-    #[test]
-    fn running_lines_name_their_targets() {
-        assert_eq!(
-            lane_target(
-                "zakura-sim",
-                "unittests src/lib.rs (target/sim-release/release/deps/zakura_sim-1)"
-            ),
-            "zakura-sim/lib"
-        );
-        assert_eq!(
-            lane_target(
-                "zakura-sim",
-                "tests/draws.rs (target/sim-release/release/deps/draws-2)"
-            ),
-            "zakura-sim/draws"
-        );
-    }
 }

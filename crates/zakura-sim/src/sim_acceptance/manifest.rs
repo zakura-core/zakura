@@ -114,6 +114,9 @@ pub struct Derived {
     pub race_schedules: Vec<String>,
     /// Every generated `header-sync/s5v9/…` property hdr-14 requires.
     pub table_properties: Vec<String>,
+    /// Every fresh-replay key hdr-14 requires, each header history's and
+    /// catch's replay, for M7.2.
+    pub replay_keys: Vec<Key>,
     /// Every `qa/suite.toml` `sim-package` row's package, each one S4.6
     /// compile command.
     pub sim_packages: Vec<String>,
@@ -211,6 +214,12 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                         "changed_setup_observation_is_nondeterministic",
                     ],
                 ),
+                derived
+                    .replay_keys
+                    .iter()
+                    .cloned()
+                    .map(Expected::HeaderKey)
+                    .collect(),
                 vec![
                     sim("net", "recorded_steps_tell_equal_length_payloads_apart"),
                     sim("full_report", "record_keeps_the_full_report_and_replay_matches_it"),
@@ -587,7 +596,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                 .chain(
                     [
                         "sim_acceptance::run::tests::a_test_row_needs_exactly_its_test",
-                        "sim_acceptance::run::tests::a_lane_needs_every_required_target_and_no_failure",
+                        "sim_acceptance::run::tests::a_lane_needs_its_whole_inventory",
                         "sim_acceptance::run::tests::the_dependency_graph_row_reads_cargo_tree_itself",
                     ]
                     .map(|path| Expected::UnitTest {
@@ -634,7 +643,13 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
             (path.extension()? == "bin").then(|| path.file_stem()?.to_str().map(str::to_owned))?
         })
         .collect();
-    let table_properties = committed_required(repo, &Manifest::committed())
+    let required = committed_required(repo, &Manifest::committed());
+    let replay_keys = required
+        .keys()
+        .filter(|key| matches!(key, Key::Replay { .. }))
+        .cloned()
+        .collect();
+    let table_properties = required
         .into_keys()
         .filter_map(|key| match key {
             Key::Passing { property } if property.starts_with("header-sync/s5v9/") => {
@@ -653,6 +668,7 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
             .map_err(|error| vec![format!("tests/sim_acceptance.rs: {error}")])?,
     );
     Ok(Derived {
+        replay_keys,
         sim_packages: suite
             .sim_package
             .iter()
@@ -746,6 +762,24 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
     if !selves.is_subset(&held("sim-7/self-checks")) || selves.is_empty() {
         problems.push("the self-check row doesn't hold every sim-7 static check".to_owned());
     }
+    let replays: BTreeSet<String> = derived
+        .replay_keys
+        .iter()
+        .map(|key| Expected::HeaderKey(key.clone()).to_string())
+        .collect();
+    if !replays.is_subset(&held("M7.2")) || replays.is_empty() {
+        problems.push("M7.2 doesn't hold every header replay key".to_owned());
+    }
+    for (lane, targets) in [
+        ("sim-release/zakura-sim", SCHED4_RELEASE_TARGETS),
+        ("sim-asan/zakura-sim", SCHED4_ASAN_TARGETS),
+    ] {
+        for target in sched4_sim_targets(rows) {
+            if !targets.contains(&target.as_str()) {
+                problems.push(format!("{lane}'s target list doesn't have {target}"));
+            }
+        }
+    }
     if held("corpus/header-table-pairs") != pairs {
         problems.push("the header table row doesn't hold exactly the generated IDs".to_owned());
     }
@@ -784,4 +818,42 @@ fn self_tests(text: &str) -> Vec<String> {
         }
     }
     tests
+}
+
+/// The `zakura-sim` test targets the release lane must run: every target a
+/// sched-4 row maps, plus the other replay and time targets the plan names.
+pub const SCHED4_RELEASE_TARGETS: &[&str] = &[
+    "draws",
+    "race_fixtures",
+    "discovery",
+    "witness",
+    "cli",
+    "replay_exact",
+    "idle",
+    "time",
+    "race_schedules",
+];
+
+/// The `zakura-sim` test targets the ASan lane must run: every target a
+/// sched-4 row maps.
+pub const SCHED4_ASAN_TARGETS: &[&str] = &[
+    "draws",
+    "race_fixtures",
+    "discovery",
+    "witness",
+    "cli",
+    "race_schedules",
+];
+
+/// Every `zakura-sim` integration test target `rows`' sched-4 rows (S4.x)
+/// name, so a lane list can't drift from the mapping.
+pub fn sched4_sim_targets(rows: &[Row]) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|row| row.id.starts_with("S4."))
+        .flat_map(|row| &row.expected)
+        .filter_map(|expected| match expected {
+            Expected::Test(test) if test.package == "zakura-sim" => Some(test.file.to_owned()),
+            _ => None,
+        })
+        .collect()
 }

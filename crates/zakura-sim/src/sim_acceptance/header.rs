@@ -144,14 +144,18 @@ pub fn consumed_cleanup(results: &ResultFile, artifacts: &Path) -> Result<(), St
 }
 
 /// Adds every trace directory under `dir` to `traces`, by its trace's ID,
-/// the SHA-256 of its `trace.jsonl`.
+/// the SHA-256 of its `trace.jsonl`, without following links.
 fn index_traces(dir: &Path, traces: &mut std::collections::BTreeMap<String, std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // A link is never followed, so a cyclic link can't recurse forever.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
             index_traces(&path, traces);
         } else if path.file_name().is_some_and(|name| name == TRACE_FILE) {
             if let Ok(bytes) = std::fs::read(&path) {

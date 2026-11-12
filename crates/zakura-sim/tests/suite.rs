@@ -823,29 +823,7 @@ fn the_manifest_doesnt_depend_on_the_executable() {
     assert!(manifests[0] == manifests[1], "the two manifests differ");
 }
 
-/// The test targets sched-4's certification rows map that the release lane
-/// runs (sim-7.2).
-const SCHED4_RELEASE_TARGETS: &[&str] = &[
-    "draws",
-    "race_fixtures",
-    "discovery",
-    "witness",
-    "cli",
-    "replay_exact",
-    "idle",
-    "time",
-    "race_schedules",
-];
-
-/// The sched-4 test targets the ASan lane runs (sim-7.2).
-const SCHED4_ASAN_TARGETS: &[&str] = &[
-    "draws",
-    "race_fixtures",
-    "discovery",
-    "witness",
-    "cli",
-    "race_schedules",
-];
+use zakura_sim::sim_acceptance::manifest::{SCHED4_ASAN_TARGETS, SCHED4_RELEASE_TARGETS};
 
 /// The committed lane `id`.
 fn lane(suite: &SuiteFile, id: &str) -> zakura_sim::suite::Lane {

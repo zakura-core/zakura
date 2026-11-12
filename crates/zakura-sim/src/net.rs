@@ -58,6 +58,9 @@ impl Net {
     /// time the source can't know.
     pub fn new(sim: SimNet, loss_after_admission: bool) -> Self {
         let sim_origin = hooks::now().expect("a Net is made inside a run, after Sim::new");
+        // Set before setup can send, so a send during setup is hashed when,
+        // and only when, the run records its steps.
+        sim.set_payload_digests(RECORDS_STEPS.with(std::cell::Cell::get));
         let std_origin = zakura_rt::time::Instant::now().into_std();
         assert!(
             !sim.events()
@@ -273,5 +276,31 @@ impl ActionSource for Net {
     /// `recovery` reports that window.
     fn holds_work(&self) -> Option<String> {
         None
+    }
+}
+
+std::thread_local! {
+    /// Whether the run being set up on this thread records its steps, so
+    /// [`Net::new`] can turn payload hashing on or off before setup sends.
+    /// True outside a [`RecordsSteps`], for a run built by hand.
+    static RECORDS_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// While alive, has [`Net::new`] hash payloads only if the run being set
+/// up on this thread records its steps. Dropping it restores the previous
+/// setting, even on a panic.
+pub(crate) struct RecordsSteps(bool);
+
+impl RecordsSteps {
+    /// Sets the setting to `records_steps` until the guard drops.
+    pub(crate) fn set(records_steps: bool) -> Self {
+        RecordsSteps(RECORDS_STEPS.with(|cell| cell.replace(records_steps)))
+    }
+}
+
+impl Drop for RecordsSteps {
+    /// Puts the previous setting back.
+    fn drop(&mut self) {
+        RECORDS_STEPS.with(|cell| cell.set(self.0));
     }
 }

@@ -60,8 +60,15 @@ pub enum Task {
         /// The lane's whole command line, as `qa/suite.toml`'s build
         /// prefixes it.
         command: String,
-        /// The test targets it must run, as `<package>/<target>`.
+        /// The test targets it must run, as `<package>/<target>`, with
+        /// `lib` for a library's unit tests.
         required: Vec<String>,
+        /// The targets it selects that must list no test, as a `sim-package`
+        /// row's `lib = false` says.
+        empty: Vec<String>,
+        /// The ignored tests `qa/suite.toml` marks `run = true` in its
+        /// targets, as `<package>/<target>::<test>`, each of which must run.
+        ignored_run: Vec<String>,
     },
     /// One committed seed's full input recorded in the release sim build,
     /// then replayed fresh, which writes `trace/` and `replay.json`.
@@ -97,6 +104,8 @@ pub enum Task {
         expected: String,
         /// Its arguments after `cargo`.
         args: Vec<String>,
+        /// Whether it runs in the simulator build, `--cfg zakura_sim`.
+        sim: bool,
     },
     /// One measured recording, which writes `trace/` and `measure.json`.
     Measure {
@@ -104,6 +113,9 @@ pub enum Task {
         expected: String,
         /// The harness.
         harness: String,
+        /// The full input's SHA-256 in the run's corpus, the harness's first
+        /// committed seed, or `None` for empty input when it has none.
+        input: Option<String>,
     },
 }
 
@@ -266,6 +278,7 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                     command_args(repo, command).map(|args| Task::Command {
                         expected: id.clone(),
                         args,
+                        sim: command.starts_with("check-sim-package/"),
                     })
                 }
                 Expected::SelfTest(path) => Some(Task::Test {
@@ -277,6 +290,10 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 Expected::Measure(harness) => Some(Task::Measure {
                     expected: id.clone(),
                     harness: (*harness).to_owned(),
+                    input: seed_inputs
+                        .values()
+                        .find(|(seed_harness, _)| seed_harness == harness)
+                        .map(|(_, input)| input.clone()),
                 }),
                 // Judged from the header record and from seed tasks.
                 Expected::HeaderKey(_) | Expected::EndRecord { .. } => None,
@@ -332,12 +349,15 @@ fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
         .collect();
     let named = row.test_targets();
     let mut required = Vec::new();
+    let mut empty = Vec::new();
     for package in &packages {
         let empty_lib = suite
             .sim_package
             .iter()
             .any(|p| p.name == *package && !p.lib);
-        if !empty_lib {
+        if empty_lib {
+            empty.push(format!("{package}/lib"));
+        } else {
             required.push(format!("{package}/lib"));
         }
         if named.is_empty() {
@@ -358,11 +378,28 @@ fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
     if let [package] = packages[..] {
         required.extend(named.iter().map(|target| format!("{package}/{target}")));
     }
+    // `run = true` ignored tests in the lane's targets must run too.
+    let ignored_run = suite
+        .ignored
+        .iter()
+        .filter(|row| row.run)
+        .filter_map(|row| {
+            let path = Path::new(&row.file);
+            let package = path.iter().nth(1)?.to_str()?;
+            let stem = path.file_stem()?.to_str()?;
+            let target = format!("{package}/{stem}");
+            required
+                .contains(&target)
+                .then(|| format!("{target}::{}", row.test))
+        })
+        .collect();
     Some(Task::Lane {
         expected: expected.to_owned(),
         id: lane.to_owned(),
         command: row.build.command(subcommand, args),
         required,
+        empty,
+        ignored_run,
     })
 }
 
@@ -421,16 +458,24 @@ pub fn record(
     if &self::plan(repo) != plan {
         problems.push("the supplied plan isn't the plan the manifest at S makes".to_owned());
     }
+    let bound = Bound {
+        source: subject_source,
+        release: artifacts
+            .parent()
+            .and_then(|run| fs::read_to_string(run.join("bin/index.json")).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|index| index.get("release")?.as_str().map(str::to_owned)),
+    };
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut applicable = 0u64;
     let mut seed_traces: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
-        let bound = fs::read_to_string(dir.join("task.json"))
+        let recorded = fs::read_to_string(dir.join("task.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<Task>(&text).ok());
-        let verdict = if bound.as_ref() == Some(task) {
-            judge_task(task, &dir, subject_source, &mut applicable)
+        let verdict = if recorded.as_ref() == Some(task) {
+            judge_task(task, &dir, &bound, &mut applicable)
         } else {
             Verdict::Blocked {
                 why: "the artifact directory's task.json isn't this task".to_owned(),
@@ -515,8 +560,18 @@ pub fn record(
     }
 }
 
+/// What every judged artifact must be bound to.
+struct Bound<'a> {
+    /// S's source digest.
+    source: &'a str,
+    /// The SHA-256 of the release `zakura-sim` the run kept, which every
+    /// seed, witness and measured trace must have been recorded by.
+    release: Option<String>,
+}
+
 /// One task's verdict from its artifacts in `dir`.
-fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Verdict {
+fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) -> Verdict {
+    let source = bound.source;
     let blocked = |why: String| Verdict::Blocked { why };
     let json = |name: &str| -> Option<Value> {
         serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
@@ -536,6 +591,9 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
             if !same {
                 return blocked(format!("test.json isn't {package} {file}'s"));
             }
+            if result.get("checkout_source").and_then(Value::as_str) != Some(source) {
+                return blocked("the test didn't run from this run's checkout of S".to_owned());
+            }
             // zakura-sim's binaries embed S's source digest, so theirs must
             // match. The others carry none, and are the run's own build.
             if package == "zakura-sim"
@@ -549,8 +607,13 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
             Some(result) => exactly_one_passed(&result, test),
             None => blocked("the test left no test.json".to_owned()),
         },
-        Task::Lane { required, .. } => match json("lane.json") {
-            Some(lane) => lane_passed(&lane, required),
+        Task::Lane {
+            required,
+            empty,
+            ignored_run,
+            ..
+        } => match json("lane.json") {
+            Some(lane) => lane_passed(&lane, required, empty, ignored_run),
             None => blocked("the lane left no lane.json".to_owned()),
         },
         Task::Seed { harness, input, .. } => {
@@ -564,7 +627,7 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
             }
             judge_trace(
                 &dir.join("trace"),
-                source,
+                bound,
                 (harness, Some(input)),
                 &RunExpect::Passes,
                 applicable,
@@ -611,7 +674,7 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
             };
             judge_trace(
                 &dir.join("trace"),
-                source,
+                bound,
                 (harness, Some(input)),
                 &run_expect,
                 &mut 0,
@@ -621,21 +684,37 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
             Some(command) => command_passed(&command, args),
             None => blocked("the command left no command.json".to_owned()),
         },
-        Task::Measure { harness, .. } => match json("measure.json") {
-            Some(measure)
-                if exited(json("record.json"))
-                    && measure.get("steps").and_then(Value::as_u64).is_some() =>
-            {
-                judge_trace(
-                    &dir.join("trace"),
-                    source,
-                    (harness, None),
-                    &RunExpect::Passes,
-                    &mut 0,
-                )
+        Task::Measure { harness, input, .. } => {
+            let Some(measure) = json("measure.json") else {
+                return blocked("the recording left no measure.json".to_owned());
+            };
+            if !exited(json("record.json")) {
+                return blocked("the measured recording didn't exit 0".to_owned());
             }
-            _ => blocked("the recording left no measure.json".to_owned()),
-        },
+            let trace = dir.join("trace");
+            let ended = TraceReader::open(&trace)
+                .ok()
+                .and_then(|trace| trace.end.map(|end| end.steps));
+            let bytes = fs::metadata(trace.join(crate::trace::TRACE_FILE))
+                .ok()
+                .map(|meta| meta.len());
+            let whole = ["wall_ns", "steps_per_sec", "stack_pool"]
+                .iter()
+                .all(|field| measure.get(*field).is_some());
+            if measure.get("steps").and_then(Value::as_u64) != ended
+                || measure.get("trace_bytes").and_then(Value::as_u64) != bytes
+                || !whole
+            {
+                return blocked("measure.json doesn't match its trace".to_owned());
+            }
+            judge_trace(
+                &trace,
+                bound,
+                (harness, input.as_deref()),
+                &RunExpect::Passes,
+                &mut 0,
+            )
+        }
     }
 }
 
@@ -655,45 +734,81 @@ fn exactly_one_passed(result: &Value, test: &str) -> Verdict {
     }
 }
 
-/// A lane passes when its command exited 0, every required target ran at
-/// least one test that passed, no test of any target failed, and no test a
-/// target's binary lists (`--list`, less its ignored ones) went unrun
-/// (Rule 11).
-fn lane_passed(lane: &Value, required: &[String]) -> Verdict {
-    let exited = lane.get("exited_ok").and_then(Value::as_bool) == Some(true);
-    let unrun: Vec<String> = lane
-        .get("unrun")
-        .and_then(|u| serde_json::from_value(u.clone()).ok())
-        .unwrap_or_default();
-    let targets: BTreeMap<String, Vec<(String, String)>> = lane
-        .get("targets")
-        .and_then(|t| serde_json::from_value(t.clone()).ok())
-        .unwrap_or_default();
-    if !exited {
-        return Verdict::Blocked {
-            why: "the lane's command failed".to_owned(),
-        };
+/// What a lane's runner records: its command's outcome, every test each
+/// target ran with its outcome, every non-ignored test each target's binary
+/// listed before the run, and each target whose listing failed.
+#[derive(Debug, Default, Deserialize)]
+struct LaneRun {
+    #[serde(default)]
+    exited_ok: bool,
+    #[serde(default)]
+    targets: BTreeMap<String, Vec<(String, String)>>,
+    #[serde(default)]
+    listed: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    list_failures: Vec<String>,
+}
+
+/// A lane passes when its command exited 0, its binaries listed cleanly
+/// before it ran, every required target was built and every test it lists
+/// ran and passed, every expected-empty target listed none, every `run =
+/// true` ignored test ran and passed, and no test failed (Rule 11).
+fn lane_passed(
+    lane: &Value,
+    required: &[String],
+    empty: &[String],
+    ignored_run: &[String],
+) -> Verdict {
+    let blocked = |why: String| Verdict::Blocked { why };
+    let run: LaneRun = serde_json::from_value(lane.clone()).unwrap_or_default();
+    if !run.exited_ok {
+        return blocked("the lane's command failed".to_owned());
     }
-    if let Some(test) = unrun.first() {
-        return Verdict::Blocked {
-            why: format!("{test} is listed but didn't run and pass"),
-        };
+    if let Some(target) = run.list_failures.first() {
+        return blocked(format!("{target}'s binary didn't list its tests"));
     }
+    let passed = |target: &str, name: &str| {
+        run.targets.get(target).is_some_and(|tests| {
+            tests
+                .iter()
+                .any(|(n, outcome)| n == name && outcome == "ok")
+        })
+    };
     for target in required {
-        let ran = targets.get(target).map_or(0, |tests| {
-            tests.iter().filter(|(_, outcome)| outcome == "ok").count()
-        });
-        if ran == 0 {
-            return Verdict::Blocked {
-                why: format!("required target {target} ran no test"),
-            };
+        let Some(listed) = run.listed.get(target) else {
+            return blocked(format!("required target {target} wasn't built"));
+        };
+        if listed.is_empty() {
+            return blocked(format!("required target {target} lists no test"));
         }
     }
-    for (target, tests) in &targets {
+    for (target, listed) in &run.listed {
+        if let Some(name) = listed.iter().find(|name| !passed(target, name)) {
+            return blocked(format!(
+                "{target}::{name} is listed but didn't run and pass"
+            ));
+        }
+    }
+    for target in empty {
+        if run
+            .listed
+            .get(target)
+            .is_some_and(|listed| !listed.is_empty())
+        {
+            return blocked(format!("{target} is expected empty but lists tests"));
+        }
+    }
+    for test in ignored_run {
+        let (target, name) = test.split_once("::").unwrap_or((test, ""));
+        if !passed(target, name) {
+            return blocked(format!(
+                "{test} is marked `run = true` but didn't run and pass"
+            ));
+        }
+    }
+    for (target, tests) in &run.targets {
         if let Some((name, outcome)) = tests.iter().find(|(_, outcome)| outcome == "FAILED") {
-            return Verdict::Blocked {
-                why: format!("{target}: {name} {outcome}"),
-            };
+            return blocked(format!("{target}: {name} {outcome}"));
         }
     }
     Verdict::Verified
@@ -741,14 +856,15 @@ fn exited(child: Option<Value>) -> bool {
     child.and_then(|c| c.get("exited_ok").and_then(Value::as_bool)) == Some(true)
 }
 
-/// Judges the trace in `dir` with `owned_run_passes`, taking its
-/// registered properties and statuses from its own meta. It must be a run
-/// of `binding`'s harness, on its full input's SHA-256 where one is given,
-/// from a build that embeds `source`. A passing run's applicable counts are
-/// added to `applicable`.
+/// Judges the trace in `dir` with `owned_run_passes`, taking the
+/// registered properties and their statuses from the harness registry at
+/// S, not from the trace. It must be a run of `binding`'s harness, on its
+/// full input's SHA-256 where one is given, recorded by the release
+/// executable the run kept, from a build that embeds S's source. A passing
+/// run's applicable counts are added to `applicable`.
 fn judge_trace(
     dir: &Path,
-    source: &str,
+    bound: &Bound<'_>,
     binding: (&str, Option<&str>),
     expect: &RunExpect,
     applicable: &mut u64,
@@ -774,6 +890,15 @@ fn judge_trace(
             };
         }
     }
+    let source = bound.source;
+    if bound.release.as_deref() != Some(trace.meta.build.binary.as_str()) {
+        return Verdict::Blocked {
+            why: format!(
+                "the trace was recorded by {}, not the run's release zakura-sim",
+                trace.meta.build.binary
+            ),
+        };
+    }
     if trace.meta.build.source != source {
         return Verdict::Blocked {
             why: format!(
@@ -787,11 +912,15 @@ fn judge_trace(
             why: "the trace has no end record".to_owned(),
         };
     };
+    let Ok(entry) = crate::harness::find(harness) else {
+        return Verdict::Blocked {
+            why: format!("{harness} isn't a harness at S"),
+        };
+    };
+    let properties = (entry.properties)();
     let registered = Registered {
-        ids: trace.meta.properties.iter().map(|p| p.id.clone()).collect(),
-        tolerated: trace
-            .meta
-            .properties
+        ids: properties.iter().map(|p| p.id.clone()).collect(),
+        tolerated: properties
             .iter()
             .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
             .map(|p| p.id.clone())
@@ -918,30 +1047,56 @@ mod tests {
         assert!(blocked(&exactly_one_passed(&other, "t")));
     }
 
-    /// A lane blocks on a failed command, a required target that ran no
-    /// test, or any failed test.
+    /// A lane blocks on a failed command or listing, a required target
+    /// that wasn't built or lists nothing, a listed test that didn't run and
+    /// pass (a `--skip`), a nonempty expected-empty target, an unrun
+    /// `run = true` ignored test, or any failure.
     #[test]
-    fn a_lane_needs_every_required_target_and_no_failure() {
+    fn a_lane_needs_its_whole_inventory() {
         let required = ["zakura-sim/draws".to_owned()];
-        let good = json!({ "exited_ok": true, "targets": { "zakura-sim/draws": [["a", "ok"]] } });
-        assert_eq!(lane_passed(&good, &required), Verdict::Verified);
-        let skipped = json!({ "exited_ok": true, "targets": { "zakura-sim/lib": [["a", "ok"]] } });
-        assert!(blocked(&lane_passed(&skipped, &required)));
-        let failed = json!({ "exited_ok": true, "targets": {
-            "zakura-sim/draws": [["a", "ok"]], "zakura-sim/lib": [["b", "FAILED"]] } });
-        assert!(blocked(&lane_passed(&failed, &required)));
-        let exited =
-            json!({ "exited_ok": false, "targets": { "zakura-sim/draws": [["a", "ok"]] } });
-        assert!(blocked(&lane_passed(&exited, &required)));
-        let ignored = json!({ "exited_ok": true, "targets": {
-            "zakura-sim/draws": [["a", "ok"], ["regenerate", "ignored"]] } });
-        assert_eq!(lane_passed(&ignored, &required), Verdict::Verified);
-        let skipped_one = json!({ "exited_ok": true, "unrun": ["zakura-sim/draws::b"],
-            "targets": { "zakura-sim/draws": [["a", "ok"]] } });
+        let empty = ["zakura-rt/lib".to_owned()];
+        let none: [String; 0] = [];
+        let lane = |extra: serde_json::Value| {
+            let mut lane = json!({
+                "exited_ok": true,
+                "listed": { "zakura-sim/draws": ["a"], "zakura-rt/lib": [] },
+                "targets": { "zakura-sim/draws": [["a", "ok"], ["slow", "ignored"]] },
+                "list_failures": [],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                lane[key] = value.clone();
+            }
+            lane
+        };
+        let judge = |lane: &serde_json::Value, ignored_run: &[String]| {
+            lane_passed(lane, &required, &empty, ignored_run)
+        };
+        assert_eq!(judge(&lane(json!({})), &none), Verdict::Verified);
+        assert!(blocked(&judge(&lane(json!({ "exited_ok": false })), &none)));
+        assert!(blocked(&judge(
+            &lane(json!({ "list_failures": ["zakura-sim/draws"] })),
+            &none
+        )));
+        assert!(blocked(&judge(
+            &lane(json!({ "listed": { "zakura-rt/lib": [] } })),
+            &none
+        )));
+        let skipped =
+            lane(json!({ "listed": { "zakura-sim/draws": ["a", "b"], "zakura-rt/lib": [] } }));
         assert!(
-            blocked(&lane_passed(&skipped_one, &required)),
+            blocked(&judge(&skipped, &none)),
             "a --skip of one listed test blocks"
         );
+        let nonempty =
+            lane(json!({ "listed": { "zakura-sim/draws": ["a"], "zakura-rt/lib": ["x"] } }));
+        assert!(blocked(&judge(&nonempty, &none)));
+        assert!(blocked(&judge(
+            &lane(json!({})),
+            &["zakura-sim/draws::slow".to_owned()]
+        )));
+        let failed =
+            lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["c", "FAILED"]] } }));
+        assert!(blocked(&judge(&failed, &none)));
     }
 
     /// `cargo tree` passes only on exit 0, with the zakura root, and no

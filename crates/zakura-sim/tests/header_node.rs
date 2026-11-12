@@ -55,15 +55,18 @@ use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture}
 /// Runs `scenario` under `input`, and returns the report with the ports,
 /// which outlive the run.
 fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Ports) {
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, Ports) {
     let ports = Storage::prepare(scenario);
-    let report = run_prepared::<Storage>(
-        scenario,
-        ports.clone(),
-        input,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<Storage>(scenario, ports.clone(), input, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     (report, ports)
 }
@@ -120,13 +123,13 @@ fn node_syncs_from_a_mirror_on_controlled_storage() {
     for (index, input) in inputs(32, 256).into_iter().enumerate() {
         // Each run is a manifest history, which the acceptance tool
         // records from this declaration (C18).
-        zakura_sim::harness::header_acceptance::history::declare(
+        let (report, ports) = zakura_sim::harness::header_acceptance::history::run_declared(
             Storage::NAME,
             &format!("plan {index} of inputs(32, 256)"),
             &scenario,
-            &input,
+            input,
+            run_into,
         );
-        let (report, ports) = run(&scenario, input);
         for property in [OPERATION_IDS, DIRECT_DISPATCH] {
             assert!(
                 matches!(

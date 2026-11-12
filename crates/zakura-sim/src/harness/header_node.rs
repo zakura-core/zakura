@@ -1647,7 +1647,7 @@ pub enum Reset {
 
 impl ControlAction {
     /// The action's name in its identity.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",

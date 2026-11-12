@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //!     [--report <file>]
@@ -101,10 +101,10 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \

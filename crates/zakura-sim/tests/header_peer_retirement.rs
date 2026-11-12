@@ -13,6 +13,7 @@ use std::{fs, path::PathBuf, process::Command};
 use zakura_network::zakura::observe::HeaderTargetPhase;
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -61,10 +62,19 @@ fn outcome<'r>(report: &'r RunReport, property: &str) -> &'r PropertyOutcome {
 /// failure. Returns the report, the harness's end facts and the hand-off
 /// facts.
 fn run(fixture: LivenessScenario, input: PlanInput) -> (RunReport, Vec<EndFact>, Vec<HandoffFact>) {
+    run_into(fixture, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    fixture: LivenessScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, Vec<EndFact>, Vec<HandoffFact>) {
     let ports = Liveness::prepare(&fixture);
     let ends = ports.ends.clone();
     let handoffs = ports.retirement.clone();
-    let report = run_prepared::<Liveness>(&fixture, ports, input, &mut MemorySink::default(), None)
+    let report = run_prepared::<Liveness>(&fixture, ports, input, sink, None)
         .unwrap_or_else(|error| panic!("{fixture:?}: {error}"));
     assert!(
         matches!(report.end.outcome, Outcome::Idle { .. }),
@@ -455,7 +465,15 @@ fn the_committed_fixtures_match_their_names() {
             committed_plan(),
             "{name}: run `regenerate_retirement_fixtures`"
         );
-        let (report, _, _) = run(fixture, zakura_sim::Plan::from_fuzz(&plan));
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let (report, _, _) = run_declared(
+            Liveness::NAME,
+            &format!("header-retire-{name}"),
+            &fixture,
+            zakura_sim::Plan::from_fuzz(&plan),
+            |fixture, input, sink| run_into(*fixture, input, sink),
+        );
         assert!(
             matches!(
                 outcome(&report, PEER_RETIREMENT_PROGRESS),

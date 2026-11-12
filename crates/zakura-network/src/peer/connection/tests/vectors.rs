@@ -175,6 +175,7 @@ async fn failed_connection_notifies_gossip_before_writer_close() {
         let (sender, receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
         connection.block_advert_rx = receiver;
         let gossip = BlockGossipPeer {
+            announced: Default::default(),
             sender,
             address: None,
             uploads: connection.block_uploads.clone(),
@@ -1381,6 +1382,7 @@ async fn block_gossip_tracks_connection_write() {
         sender: block_advert_tx,
         address: None,
         uploads: connection.block_uploads.clone(),
+        announced: Default::default(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,
@@ -1496,6 +1498,7 @@ async fn truncated_block_request_fails_gossip_tracking() {
         sender: block_advert_tx,
         address: None,
         uploads: connection.block_uploads.clone(),
+        announced: Default::default(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,

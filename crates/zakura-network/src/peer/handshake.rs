@@ -42,8 +42,8 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
-        HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
+        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests,
+        ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -1795,6 +1795,9 @@ where
             // (This significantly improves performance, by reducing time system calls.)
             let inbound_ts_collector = address_book_updater.clone();
             let inbound_inv_collector = inv_collector.clone();
+            // Block gossip skips this peer for the blocks it announces to us.
+            let announced_blocks = AnnouncedBlocks::default();
+            let inbound_announced_blocks = announced_blocks.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
             let peer_rx = peer_rx
@@ -1848,9 +1851,15 @@ where
                 })
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
+                    let inbound_announced_blocks = inbound_announced_blocks.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
-                    register_inventory_status(msg, connected_addr, inbound_inv_collector)
-                        .instrument(span)
+                    register_inventory_status(
+                        msg,
+                        connected_addr,
+                        inbound_inv_collector,
+                        inbound_announced_blocks,
+                    )
+                    .instrument(span)
                 })
                 .boxed();
 
@@ -1938,6 +1947,7 @@ where
             );
 
             let client = Client {
+                announced_blocks,
                 block_uploads,
                 request_slot,
                 peer_registry_updater: client_peer_registry_updater,
@@ -1981,11 +1991,28 @@ where
 }
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
+///
+/// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
+/// a peer that already has the block. Unlike the inventory registry, this covers every block
+/// `inv`, solicited or not, and connections without a transient address. Requests for block
+/// bodies withdraw the peer's earlier claim to have those blocks.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
+    announced_blocks: AnnouncedBlocks,
 ) -> Result<Message, SerializationError> {
+    match &msg {
+        Ok(Message::Inv(items)) => {
+            announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
+        }
+        // A request for the body or a missing response contradicts an earlier announcement.
+        Ok(Message::GetData(items) | Message::NotFound(items)) => {
+            announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));
+        }
+        _ => {}
+    }
+
     match (&msg, connected_addr.get_transient_addr()) {
         (Ok(Message::Inv(advertised)), Some(transient_addr)) => {
             // We ignore inventory messages with more than one

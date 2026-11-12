@@ -121,6 +121,7 @@ impl ConnectedClient {
         });
 
         let client = Client {
+            announced_blocks: Default::default(),
             block_uploads,
             request_slot,
             peer_registry_updater: None,

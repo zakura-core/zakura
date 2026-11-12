@@ -1111,3 +1111,122 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }
+
+/// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
+/// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
+/// connections without a transient address.
+#[tokio::test]
+async fn inbound_invs_record_announced_blocks() {
+    let blocks: Vec<_> = (1..=4).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+
+    for (addressed, message, expected) in [
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+        (
+            true,
+            Message::Inv(
+                blocks[..3]
+                    .iter()
+                    .copied()
+                    .map(InventoryHash::Block)
+                    .collect(),
+            ),
+            blocks[..3].to_vec(),
+        ),
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[3]), transaction]),
+            vec![blocks[3]],
+        ),
+        (true, Message::Inv(vec![transaction]), Vec::new()),
+        (
+            // An isolated connection has no transient address, but still has announcements.
+            false,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+    ] {
+        let connected_addr = if addressed {
+            ConnectedAddr::new_inbound_direct(peer_addr(38233))
+        } else {
+            ConnectedAddr::new_isolated()
+        };
+        let announced = AnnouncedBlocks::default();
+        let returned = register_inventory_status(
+            Ok(message.clone()),
+            connected_addr,
+            broadcast::channel(16).0,
+            announced.clone(),
+        )
+        .await
+        .expect("the filter passes the message through");
+        assert_eq!(returned, message);
+        for block in &blocks {
+            assert_eq!(
+                announced.announced(*block),
+                expected.contains(block),
+                "{message:?} recorded {block:?} incorrectly"
+            );
+        }
+    }
+
+    // A `notfound` withdraws the peer's claim, so the block is advertised to it again.
+    let announced = AnnouncedBlocks::default();
+    announced.record(blocks.iter().copied());
+    register_inventory_status(
+        Ok(Message::NotFound(vec![
+            InventoryHash::Block(blocks[0]),
+            transaction,
+        ])),
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        broadcast::channel(16).0,
+        announced.clone(),
+    )
+    .await
+    .expect("the filter passes the message through");
+    assert!(!announced.announced(blocks[0]));
+    assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
+}
+
+/// A body request contradicts only the requested blocks' earlier announcements.
+#[tokio::test]
+async fn body_requests_withdraw_only_requested_block_announcements() {
+    let blocks = [block::Hash([41; 32]), block::Hash([42; 32])];
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    for connected_addr in [
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        ConnectedAddr::new_isolated(),
+    ] {
+        for items in [
+            vec![],
+            vec![transaction],
+            vec![InventoryHash::Block(blocks[0])],
+            vec![InventoryHash::Block(blocks[0]), transaction],
+            blocks.iter().copied().map(InventoryHash::Block).collect(),
+        ] {
+            let announced = AnnouncedBlocks::default();
+            announced.record(blocks);
+            let message = Message::GetData(items.clone());
+            let returned = register_inventory_status(
+                Ok(message.clone()),
+                connected_addr,
+                broadcast::channel(16).0,
+                announced.clone(),
+            )
+            .await
+            .expect("the filter passes the request through");
+            assert_eq!(returned, message);
+            for hash in blocks {
+                assert_eq!(
+                    announced.announced(hash),
+                    !items.contains(&InventoryHash::Block(hash)),
+                    "a body request withdraws only the requested block: {message:?}"
+                );
+            }
+        }
+    }
+}

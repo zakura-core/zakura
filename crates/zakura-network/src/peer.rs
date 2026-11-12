@@ -1,5 +1,6 @@
 //! Peer connection handling.
 
+mod announced_blocks;
 pub(crate) mod block_gossip;
 mod client;
 mod connection;
@@ -21,6 +22,8 @@ pub(crate) use client::tests::connected::ConnectedClient;
 pub(crate) use client::tests::ReceiveRequestAttempt;
 #[cfg(test)]
 pub(crate) use handshake::register_inventory_status;
+
+pub(crate) use announced_blocks::AnnouncedBlocks;
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 

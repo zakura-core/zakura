@@ -18,7 +18,10 @@
 //! # The runner's artifacts
 //!
 //! Every path below is under the task's directory `<i>`, which holds its
-//! [`TASK_FILE`] first. A file a child didn't write is missing, and a child
+//! [`TASK_FILE`] first: the run's ID, as the root's [`RUN_FILE`] names it,
+//! the task's index and the task itself ([`task_binding`]). A directory
+//! whose task file names another run, such as one kept from an earlier
+//! attempt, isn't read. A file a child didn't write is missing, and a child
 //! killed at its deadline leaves [`KILLED_FILE`] in its directory. A
 //! missing or killed artifact gives its execution no result, so it blocks.
 //!
@@ -141,11 +144,19 @@ pub const RUN_FILE: &str = "run.json";
 /// [`task_binding`] gives it.
 pub const TASK_FILE: &str = "task.json";
 
-/// What a task directory's [`TASK_FILE`] must hold: its index in the plan
-/// and the plan's task itself, so a directory is read only as the task the
-/// runner wrote it for, never by its position alone.
-pub fn task_binding(index: usize, task: &Task) -> serde_json::Value {
-    serde_json::json!({ "index": index, "task": task })
+/// What a task directory's [`TASK_FILE`] must hold: the ID of the run that
+/// wrote it (`run_id`), its index in the plan and the plan's task itself,
+/// so a directory is read only as the task this run's runner wrote it for,
+/// never by its position alone, and never as another attempt's.
+pub fn task_binding(run_id: &str, index: usize, task: &Task) -> serde_json::Value {
+    serde_json::json!({ "run_id": run_id, "index": index, "task": task })
+}
+
+/// Whether `artifacts`' directory for `task`, at `index`, is the one the
+/// run `run_id` wrote for it ([`task_binding`]).
+fn task_bound(artifacts: &Path, run_id: &str, index: usize, task: &Task) -> bool {
+    read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
+        == Some(task_binding(run_id, index, task))
 }
 
 /// What an artifacts directory says of the run that wrote it, at its root.
@@ -1366,10 +1377,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             results,
         };
     }
-    let bound = |index: usize, task: &Task| {
-        read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
-            == Some(task_binding(index, task))
-    };
+    let bound = |index: usize, task: &Task| task_bound(artifacts, &run.run_id, index, task);
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
         // A directory the runner didn't write for this task gives it no
@@ -2883,8 +2891,7 @@ pub fn record(
 ) -> Record {
     let links = match refusal {
         None => links(manifest, plan, |index, task| {
-            read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
-                == Some(task_binding(index, task))
+            task_bound(artifacts, &run.run_id, index, task)
         }),
         Some(_) => BTreeMap::new(),
     };
@@ -4354,8 +4361,9 @@ mod tests {
 
     /// An artifacts directory counts only for the run of S it names: one
     /// with no `run.json`, or another subject's, gives no result, so every
-    /// obligation blocks. A case's provenance check must be for its
-    /// committed patch.
+    /// obligation blocks, and a task directory another attempt wrote gives
+    /// its task none. A case's provenance check must be for its committed
+    /// patch.
     #[test]
     fn artifacts_count_only_for_their_own_run_and_patch() {
         let manifest = Manifest::committed();
@@ -4431,14 +4439,43 @@ mod tests {
         let write_task = |index: usize, task: &Task| {
             let dir = artifacts.path().join(index.to_string());
             fs::create_dir_all(&dir).expect("the temp dir is writable");
-            fs::write(dir.join(TASK_FILE), task_binding(index, task).to_string())
-                .expect("the temp dir is writable");
+            fs::write(
+                dir.join(TASK_FILE),
+                task_binding("run-1", index, task).to_string(),
+            )
+            .expect("the temp dir is writable");
         };
         for (index, task) in plan.tasks.iter().enumerate() {
             write_task(index, task);
         }
         let all = results(artifacts.path(), &plan);
         assert!(all > 0);
+        // A task directory kept from an earlier attempt at S, under this
+        // run's `run.json`: only its run ID differs, and it gives no result
+        // and links nothing.
+        let kept = plan
+            .tasks
+            .iter()
+            .position(|task| matches!(task, Task::Test { .. }))
+            .expect("the plan has a test task");
+        fs::write(
+            artifacts.path().join(kept.to_string()).join(TASK_FILE),
+            task_binding("run-0", kept, &plan.tasks[kept]).to_string(),
+        )
+        .expect("the temp dir is writable");
+        assert_eq!(results(artifacts.path(), &plan), all - 1);
+        let (_, record) = evaluate_artifacts(&repo, &plan, artifacts.path(), &run);
+        let prefix = format!("{kept}/");
+        assert!(![&record.verified, &record.excluded, &record.blocked]
+            .into_iter()
+            .flatten()
+            .any(|entry| entry
+                .links
+                .artifacts
+                .iter()
+                .any(|path| path.starts_with(&prefix))));
+        write_task(kept, &plan.tasks[kept]);
+        assert_eq!(results(artifacts.path(), &plan), all);
         // Two test tasks' directories swapped: each names the other task,
         // so neither gives a result.
         let tests: Vec<usize> = plan
@@ -4475,7 +4512,7 @@ mod tests {
         // The right task at the wrong index.
         fs::write(
             artifacts.path().join(a.to_string()).join(TASK_FILE),
-            task_binding(b, &plan.tasks[a]).to_string(),
+            task_binding("run-1", b, &plan.tasks[a]).to_string(),
         )
         .expect("the temp dir is writable");
         assert_eq!(results(artifacts.path(), &plan), all - 2);
@@ -5084,45 +5121,43 @@ mod tests {
     #[test]
     fn a_history_from_a_stale_binary_is_refused() {
         type Measured<'a> = Option<Option<&'a str>>;
-        let read = |subject: &str,
-                    trace: Option<&str>,
-                    binary: Option<&str>,
-                    checkout: Measured| {
-            let dir = tempfile::tempdir().expect("a temp dir can be created");
-            history_task_dir(dir.path(), None);
-            if let Some(source) = trace {
-                rewrite(&dir.path().join("run"), |lines| {
-                    lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
-                });
-            }
-            if let Some(source) = binary {
-                let path = dir.path().join(TEST_FILE);
-                let mut ran: TestRun =
-                    serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
-                        .expect("it reads back");
-                ran.binary_source = Some(source.to_owned());
-                fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
-                    .expect("the temp dir is writable");
-            }
-            if let Some(source) = checkout {
-                let path = dir.path().join(TEST_FILE);
-                let mut ran: TestRun =
-                    serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
-                        .expect("it reads back");
-                ran.checkout_source = source.map(str::to_owned);
-                fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
-                    .expect("the temp dir is writable");
-            }
-            history_execution(
-                dir.path(),
-                history_run(),
-                NODE,
-                ("p/a", None),
-                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
-                subject,
-            )
-            .end
-        };
+        let read =
+            |subject: &str, trace: Option<&str>, binary: Option<&str>, checkout: Measured| {
+                let dir = tempfile::tempdir().expect("a temp dir can be created");
+                history_task_dir(dir.path(), None);
+                if let Some(source) = trace {
+                    rewrite(&dir.path().join("run"), |lines| {
+                        lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
+                    });
+                }
+                if let Some(source) = binary {
+                    let path = dir.path().join(TEST_FILE);
+                    let mut ran: TestRun =
+                        serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                            .expect("it reads back");
+                    ran.binary_source = Some(source.to_owned());
+                    fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                        .expect("the temp dir is writable");
+                }
+                if let Some(source) = checkout {
+                    let path = dir.path().join(TEST_FILE);
+                    let mut ran: TestRun =
+                        serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                            .expect("it reads back");
+                    ran.checkout_source = source.map(str::to_owned);
+                    fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                        .expect("the temp dir is writable");
+                }
+                history_execution(
+                    dir.path(),
+                    history_run(),
+                    NODE,
+                    ("p/a", None),
+                    ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                    subject,
+                )
+                .end
+            };
         let fresh = read("s", None, None, None);
         assert!(!matches!(fresh, End::Failed { .. }), "{fresh:?}");
         let refused = |end: End, why: &str| {
@@ -5629,8 +5664,11 @@ mod tests {
             .expect("the temp dir is writable");
             let dir = artifacts.path().join(index.to_string());
             fs::create_dir_all(&dir).expect("the temp dir is writable");
-            fs::write(dir.join(TASK_FILE), task_binding(index, task).to_string())
-                .expect("the temp dir is writable");
+            fs::write(
+                dir.join(TASK_FILE),
+                task_binding(&run.run_id, index, task).to_string(),
+            )
+            .expect("the temp dir is writable");
             for (name, source, result) in [
                 ("unpatched", "subject", "ok"),
                 ("patched", ran, "FAILED"),

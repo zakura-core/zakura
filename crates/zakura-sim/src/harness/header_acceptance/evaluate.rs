@@ -1639,9 +1639,10 @@ fn completed(run: &Execution) -> Result<(), String> {
     Ok(())
 }
 
-/// A `Caught`'s patched run: exactly `set` violated where `found` says,
-/// with its trigger history, a complete inventory, no harness failure and
-/// no leaked task. A run stopped at a step is judged as a prefix, so other
+/// A `Caught`'s patched run: exactly `set` violated where `found` says, or
+/// the case's own ID alone for [`Found::AtStepSetOnDraft`], with its
+/// trigger history, a complete inventory, no harness failure and no leaked
+/// task. A run stopped at a step is judged as a prefix, so other
 /// properties may still have work pending there.
 fn caught_patched(
     manifest: &Manifest,
@@ -1665,6 +1666,14 @@ fn caught_patched(
             if run.actions == Actions::Incomplete {
                 return Err("its patched run's actions don't match its declared prefix".into());
             }
+        }
+        // The set breaks only after the stop, so the patched run shows the
+        // case's own ID alone, and its Draft run shows the set.
+        (Found::AtStepSetOnDraft, End::Violation { property }) if *property == case.property => {
+            if run.actions == Actions::Incomplete {
+                return Err("its patched run's actions don't match its declared prefix".into());
+            }
+            return exactly_violated(run, &[case.property]);
         }
         // A completed run gets the whole-report rule outside its set.
         (Found::AtEnd, End::Completed) => {

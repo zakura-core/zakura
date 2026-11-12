@@ -195,6 +195,12 @@ pub enum Found {
     /// At the end: an obligation the drain concludes or an end finding, with
     /// no stopping violation.
     AtEnd,
+    /// At a step, by the case's own ID alone: the run stops at the case's
+    /// own break, before the rest of its set breaks. The set is judged on
+    /// the case's `Draft` run instead, which goes on past the break, and
+    /// must have every member violated by its end and nothing else (Adam,
+    /// 2026-11-12).
+    AtStepSetOnDraft,
 }
 
 /// A property that a history's row expects to stay `NotApplicable`, with

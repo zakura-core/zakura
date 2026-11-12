@@ -15,6 +15,12 @@ use super::{
     DownloadWindow, RequestKey, ZakuraBlockSyncConfig,
 };
 
+/// How often a peer's Status may change what this node applies, with one extra
+/// range change per window. Senders pace tip announcements to this bound, so it
+/// is protocol behaviour rather than local tuning, and a configured
+/// `status_refresh_interval`, which paces only our replies, cannot shorten it.
+const STATUS_APPLY_INTERVAL: Duration = Duration::from_secs(1);
+
 mod liveness;
 mod requests;
 mod status;
@@ -135,9 +141,7 @@ impl PeerState {
             request_pool_waiting: false,
             allow_no_progress_park,
             status_pacing: InboundStatusPacing {
-                apply_meter: RateMeter::new(
-                    config.status_refresh_interval.min(Duration::from_secs(1)),
-                ),
+                apply_meter: RateMeter::new(STATUS_APPLY_INTERVAL),
                 reply_meter: RateMeter::new(config.status_refresh_interval),
                 range_bypass_available: false,
                 pending: None,

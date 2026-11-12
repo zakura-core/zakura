@@ -697,6 +697,29 @@ const WITNESS: &[u8] = &[
     5, 0, 0, 0, 0, 2, 0, 0, 6, 0, 0, 0,
 ];
 
+/// A sub-second or zero `status_refresh_interval` paces only our replies; a
+/// peer's Status still applies at most once a second.
+#[test]
+fn a_short_status_refresh_interval_keeps_the_status_apply_bound() {
+    for interval in [
+        Duration::ZERO,
+        Duration::from_millis(50),
+        Duration::from_secs(60),
+    ] {
+        let config = ZakuraBlockSyncConfig {
+            status_refresh_interval: interval,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let state = PeerState::new(&config, true, 0, 0);
+        assert_eq!(
+            state.status_pacing.apply_meter.interval,
+            Duration::from_secs(1),
+            "status_refresh_interval {interval:?}"
+        );
+        assert_eq!(state.status_pacing.reply_meter.interval, interval);
+    }
+}
+
 #[test]
 #[allow(
     clippy::print_stdout,

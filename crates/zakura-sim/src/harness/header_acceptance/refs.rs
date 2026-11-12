@@ -143,3 +143,39 @@ pub struct TriggerRef {
     pub also_violates: Vec<String>,
 }
 impl Ref for TriggerRef {}
+
+/// The one-key-off template, shared with the integration tests.
+#[cfg(test)]
+#[path = "../../../tests/support/one_key_off.rs"]
+pub(crate) mod one_key_off;
+
+#[cfg(test)]
+mod tests {
+    use super::{one_key_off::assert_one_key_off, *};
+
+    /// The template moves every key of a ref, at any depth, and each moved
+    /// copy fails a join the ref itself passes: a page's subscription's
+    /// peer, session and ID, its frame and each header.
+    #[test]
+    fn the_template_moves_every_key() {
+        let page = PageRef {
+            subscription: SubscriptionRef {
+                peer: "ab".into(),
+                session: 11,
+                subscription: 7,
+            },
+            frame: 3,
+            headers: vec!["01".into(), "02".into()],
+        };
+        let staged = [page.clone()];
+        let joins = |want: &PageRef| joined(&staged, |page| Some(page.clone()), want).len() == 1;
+        assert_eq!(assert_one_key_off(&page, joins), 6);
+        let frame = FrameRef {
+            connection: 1,
+            quic_stream: 4,
+            inbound: true,
+            seq: 3,
+        };
+        assert_eq!(assert_one_key_off(&frame, |want| *want == frame), 4);
+    }
+}

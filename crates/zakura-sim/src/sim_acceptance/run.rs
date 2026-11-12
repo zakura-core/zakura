@@ -727,11 +727,19 @@ fn exactly_one_passed(result: &Value, test: &str) -> Verdict {
         .unwrap_or_default();
     let exited = result.get("exited_ok").and_then(Value::as_bool) == Some(true);
     match &ran[..] {
-        [(name, outcome)] if exited && name == test && outcome == "ok" => Verdict::Verified,
+        [(name, outcome)] if exited && test_name(name) == test && outcome == "ok" => {
+            Verdict::Verified
+        }
         _ => Verdict::Blocked {
             why: format!("expected {test} alone to run and pass, but ran {ran:?}"),
         },
     }
+}
+
+/// A test's name as `--list` gives it: libtest reports a `#[should_panic]`
+/// test's result as `name - should panic`.
+fn test_name(reported: &str) -> &str {
+    reported.strip_suffix(" - should panic").unwrap_or(reported)
 }
 
 /// What a lane's runner records: its command's outcome, every test each
@@ -771,7 +779,7 @@ fn lane_passed(
         run.targets.get(target).is_some_and(|tests| {
             tests
                 .iter()
-                .any(|(n, outcome)| n == name && outcome == "ok")
+                .any(|(n, outcome)| test_name(n) == name && outcome == "ok")
         })
     };
     for target in required {
@@ -1094,6 +1102,13 @@ mod tests {
             &lane(json!({})),
             &["zakura-sim/draws::slow".to_owned()]
         )));
+        let panics =
+            lane(json!({ "targets": { "zakura-sim/draws": [["a - should panic", "ok"]] } }));
+        assert_eq!(
+            judge(&panics, &none),
+            Verdict::Verified,
+            "a should-panic test counts as run"
+        );
         let failed =
             lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["c", "FAILED"]] } }));
         assert!(blocked(&judge(&failed, &none)));

@@ -1458,6 +1458,25 @@ fn judge_planted(
         }
     }
     let property = DISCOVERY_CASE.0.to_owned();
+    let (violates, passes) = (
+        RunExpect::Violates {
+            property: property.clone(),
+            also: Vec::new(),
+        },
+        RunExpect::Passes,
+    );
+    if let Some(why) = runs_refusal(
+        dir,
+        harness,
+        &[
+            ("record-baseline", &passes),
+            ("replay-baseline", &passes),
+            ("record-patched", &violates),
+            ("replay-patched", &violates),
+        ],
+    ) {
+        return blocked(why);
+    }
     let baseline = judge_trace(
         &dir.join("baseline"),
         bound,
@@ -1564,6 +1583,55 @@ fn run_records_allowing(
     Ok(runs)
 }
 
+/// Why a task's recorded runs under `<dir>/runs` don't pass, if they
+/// don't (Rule 11): every run is of `harness`, in one of `phases`, and
+/// passes through [`owned_run_passes`] with that phase's expected result,
+/// and every phase has at least one run.
+fn runs_refusal(dir: &Path, harness: &str, phases: &[(&str, &RunExpect)]) -> Option<String> {
+    let runs = match run_records(&dir.join("runs")) {
+        Ok(runs) => runs,
+        Err(why) => return Some(why),
+    };
+    let Ok(entry) = crate::harness::find(harness) else {
+        return Some(format!("{harness} isn't a harness at S"));
+    };
+    let registered = registered(entry);
+    let mut seen = BTreeSet::new();
+    for run in &runs {
+        let Some((phase, expect)) = phases.iter().find(|(phase, _)| *phase == run.phase) else {
+            return Some(format!(
+                "run {} is in an unaccounted phase {}",
+                run.stem, run.phase
+            ));
+        };
+        if run.harness != harness {
+            return Some(format!("run {} isn't a run of {harness}", run.stem));
+        }
+        if let Err(why) = owned_run_passes(&run.end, &registered, expect) {
+            return Some(format!("run {} ({phase}): {why}", run.stem));
+        }
+        seen.insert(*phase);
+    }
+    phases
+        .iter()
+        .find(|(phase, _)| !seen.contains(phase))
+        .map(|(phase, _)| format!("no {phase} run was recorded"))
+}
+
+/// The registered properties of `entry`'s harness, with the ones a run may
+/// violate without failing (`Known` and `Draft`).
+fn registered(entry: &crate::harness::HarnessEntry) -> Registered {
+    let properties = (entry.properties)();
+    Registered {
+        ids: properties.iter().map(|p| p.id.clone()).collect(),
+        tolerated: properties
+            .iter()
+            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
+            .map(|p| p.id.clone())
+            .collect(),
+    }
+}
+
 /// The minimization's verdict (Rule 11): `sim-minimize` reported a
 /// minimized candidate of the case's own input, property and harness, and
 /// for the original and the minimized input each, the fuzz target's run,
@@ -1606,15 +1674,7 @@ fn judge_minimize(
     let Ok(entry) = crate::harness::find(harness) else {
         return blocked(format!("{harness} isn't a harness at S"));
     };
-    let properties = (entry.properties)();
-    let registered = Registered {
-        ids: properties.iter().map(|p| p.id.clone()).collect(),
-        tolerated: properties
-            .iter()
-            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
-            .map(|p| p.id.clone())
-            .collect(),
-    };
+    let registered = registered(entry);
     let expect = RunExpect::Violates {
         property: property.to_owned(),
         also: Vec::new(),
@@ -1704,23 +1764,24 @@ fn judge_target(
     let Ok(entry) = crate::harness::find(harness) else {
         return blocked(format!("{harness} isn't a harness at S"));
     };
-    let properties = (entry.properties)();
-    let registered = Registered {
-        ids: properties.iter().map(|p| p.id.clone()).collect(),
-        tolerated: properties
-            .iter()
-            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
-            .map(|p| p.id.clone())
-            .collect(),
-    };
+    let registered = registered(entry);
     let runs = match run_records(&dir.join("runs")) {
         Ok(runs) => runs,
         Err(why) => return blocked(why),
     };
-    // Every run is the harness on one of its seeds, and passes; each seed
-    // ran both in `targets`' own process and as a fuzz-target iteration.
-    let mut ran: BTreeSet<(String, String)> = BTreeSet::new();
+    // Every run is the harness on one of its seeds, in `targets`' own
+    // process or as a fuzz-target iteration, and passes. Each seed ran in
+    // process once per seed file holding its bytes, and as an iteration at
+    // least that often, and the iterations number what libFuzzer counted
+    // (its reruns are observed atoms).
+    let mut ran: BTreeMap<(String, String), usize> = BTreeMap::new();
     for run in &runs {
+        if run.phase != "in-process" && run.phase != "fuzz-target" {
+            return blocked(format!(
+                "run {} is in an unaccounted phase {}",
+                run.stem, run.phase
+            ));
+        }
         let input = run.input.as_deref();
         if run.harness != harness || !input.is_some_and(|input| seeds.iter().any(|s| s == input)) {
             return blocked(format!(
@@ -1731,15 +1792,36 @@ fn judge_target(
         if let Err(why) = owned_run_passes(&run.end, &registered, &RunExpect::Passes) {
             return blocked(format!("run {}: {why}", run.stem));
         }
-        ran.insert((run.phase.clone(), input.unwrap_or_default().to_owned()));
+        *ran.entry((run.phase.clone(), input.unwrap_or_default().to_owned()))
+            .or_default() += 1;
     }
-    for phase in ["in-process", "fuzz-target"] {
-        if let Some(seed) = seeds
-            .iter()
-            .find(|seed| !ran.contains(&(phase.to_owned(), (*seed).clone())))
-        {
-            return blocked(format!("the target's {phase} runs never ran seed {seed}"));
+    let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
+    for seed in seeds {
+        *wanted.entry(seed.as_str()).or_default() += 1;
+    }
+    let count = |phase: &str, seed: &str| {
+        ran.get(&(phase.to_owned(), seed.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    };
+    for (seed, files) in &wanted {
+        if count("in-process", seed) != *files {
+            return blocked(format!(
+                "the target ran seed {seed} in process other than {files} times"
+            ));
         }
+        if count("fuzz-target", seed) < *files {
+            return blocked(format!(
+                "the fuzz target ran seed {seed} fewer than {files} times"
+            ));
+        }
+    }
+    let iterations: usize = runs.iter().filter(|run| run.phase == "fuzz-target").count();
+    let counted = row.get("fuzzer_runs").and_then(Value::as_u64);
+    if counted.and_then(|n| usize::try_from(n).ok()) != Some(iterations) {
+        return blocked(format!(
+            "the fuzz target recorded {iterations} runs, but libFuzzer counted {counted:?}"
+        ));
     }
     if seeds.is_empty() {
         return blocked(format!("{harness} has no admitted seed"));
@@ -1857,6 +1939,12 @@ fn judge_task(
             if let Some(why) = replay_refusal(dir, ("trace", "replay.json"), binding, bound) {
                 return blocked(why);
             }
+            let passes = RunExpect::Passes;
+            if let Some(why) =
+                runs_refusal(dir, harness, &[("record", &passes), ("replay", &passes)])
+            {
+                return blocked(why);
+            }
             judge_trace(
                 &dir.join("trace"),
                 bound,
@@ -1911,6 +1999,13 @@ fn judge_task(
             } else {
                 RunExpect::Passes
             };
+            if let Some(why) = runs_refusal(
+                dir,
+                harness,
+                &[("record", &run_expect), ("replay", &run_expect)],
+            ) {
+                return blocked(why);
+            }
             let verdict = judge_trace(
                 &dir.join("trace"),
                 bound,
@@ -1962,6 +2057,25 @@ fn judge_task(
             }
             // Each run passes through the one judge: the planted race must
             // violate its property, and the fix must hold.
+            let (violates, passes) = (
+                RunExpect::Violates {
+                    property: harness.clone(),
+                    also: Vec::new(),
+                },
+                RunExpect::Passes,
+            );
+            if let Some(why) = runs_refusal(
+                dir,
+                harness,
+                &[
+                    ("record-base", &violates),
+                    ("replay-base", &violates),
+                    ("record-fixed", &passes),
+                    ("replay-fixed", &passes),
+                ],
+            ) {
+                return blocked(why);
+            }
             let base = judge_trace(
                 &dir.join("base"),
                 bound,
@@ -2072,6 +2186,16 @@ fn judge_task(
                 || !whole
             {
                 return blocked("measure.json doesn't match its trace".to_owned());
+            }
+            let expect =
+                violates
+                    .as_ref()
+                    .map_or(RunExpect::Passes, |property| RunExpect::Violates {
+                        property: property.clone(),
+                        also: Vec::new(),
+                    });
+            if let Some(why) = runs_refusal(dir, harness, &[("record", &expect)]) {
+                return blocked(why);
             }
             judge_trace(
                 &trace,
@@ -2351,15 +2475,7 @@ fn judge_trace(
             why: format!("{harness} isn't a harness at S"),
         };
     };
-    let properties = (entry.properties)();
-    let registered = Registered {
-        ids: properties.iter().map(|p| p.id.clone()).collect(),
-        tolerated: properties
-            .iter()
-            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
-            .map(|p| p.id.clone())
-            .collect(),
-    };
+    let registered = registered(entry);
     match owned_run_passes(end, &registered, expect) {
         Ok(()) => {
             *applicable += end

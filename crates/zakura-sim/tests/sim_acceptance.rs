@@ -701,6 +701,12 @@ mod schedule_agreement {
             agreement(&before, &other_task, &map, &pick).is_err(),
             "a change after the site's pick that isn't the picked task's"
         );
+        let mut other_pick: Vec<StepView> = before.to_vec();
+        other_pick[0].pick = "task:u:poll#1".to_owned();
+        assert!(
+            agreement(&other_pick, &before, &map, &pick).is_err(),
+            "a pick that only differs, with nothing of the picked task's changed"
+        );
         let shared = Site {
             at: "src/a.rs:1".to_owned(),
         };

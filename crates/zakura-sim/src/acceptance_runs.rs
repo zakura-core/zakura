@@ -3,7 +3,10 @@
 //! writes its own). They're written only when [`RUNS_VAR`] names a
 //! directory, so an ordinary run pays one read of an unset variable per
 //! process. Every harness run passes through
-//! [`crate::harness::run_reading`], which writes them.
+//! [`crate::harness::run_reading`] or, for a machine harness,
+//! `harness::machine::run_checked`, which write them. Beside them,
+//! [`crate::trace::end_records`] writes end records alone for the mutation
+//! runner, which needs no begin, input or phase.
 
 use std::{
     cell::RefCell,
@@ -55,7 +58,9 @@ pub fn with_input<T>(input: &[u8], f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// One run's records: `<dir>/<pid>-<n>` with `.begin.json` or `.end.json`.
+/// One run's records: `<dir>/<pid>-<start>-<n>` with `.begin.json` or
+/// `.end.json`, where `<start>` is when this process first wrote one, so a
+/// reused process ID names other files.
 pub(crate) struct Atom {
     /// The records' path without their suffix.
     stem: PathBuf,
@@ -69,10 +74,16 @@ pub(crate) struct Atom {
 /// a run.
 pub(crate) fn begin(harness: &str) -> Option<Atom> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    static START: OnceLock<u128> = OnceLock::new();
     let dir = dir()?;
+    let start = START.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    });
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let atom = Atom {
-        stem: dir.join(format!("{}-{n}", std::process::id())),
+        stem: dir.join(format!("{}-{start}-{n}", std::process::id())),
         identity: serde_json::json!({
             "harness": harness,
             "input_sha256": INPUT.with(|slot| slot.borrow().clone()),
@@ -93,9 +104,15 @@ pub(crate) fn end(atom: Option<Atom>, report: &RunReport) {
     write(&atom, "end", &record);
 }
 
-/// Writes `record` as `atom`'s `<kind>.json`.
+/// Writes `record` as `atom`'s new `<kind>.json`. A file already there,
+/// another run's, panics rather than be overwritten.
 fn write(atom: &Atom, kind: &str, record: &serde_json::Value) {
+    use std::io::Write as _;
     let path = atom.stem.with_extension(format!("{kind}.json"));
-    std::fs::write(&path, record.to_string())
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(record.to_string().as_bytes()))
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }

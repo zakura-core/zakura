@@ -597,6 +597,22 @@ impl Ctx<'_> {
     /// exited 0, whether it was killed, its output, and its binding with
     /// `extra` added.
     fn record(&self, command: &mut Command, name: &str, extra: Value) -> Result<String, BoxError> {
+        // Every simulation run a `zakura-sim` child makes writes its begin
+        // and end records under `runs/`, in the phase `name` (Rule 11),
+        // unless the command names its own records directory.
+        let names_runs = command
+            .get_envs()
+            .any(|(key, _)| key == "ZAKURA_SIM_ACCEPTANCE_RUNS");
+        if !names_runs
+            && Path::new(command.get_program()).file_name()
+                == Some(std::ffi::OsStr::new("zakura-sim"))
+        {
+            let runs = self.dir.join("runs");
+            fs::create_dir_all(&runs)?;
+            command
+                .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &runs)
+                .env("ZAKURA_SIM_ACCEPTANCE_PHASE", name);
+        }
         let log = self.dir.join(format!("{name}.log"));
         let ended = child(command, &log, self.run.deadline);
         stop_if_interrupted()?;
@@ -714,7 +730,15 @@ impl Ctx<'_> {
     /// `lane.json` holds the outcome, each target's results, listed tests
     /// and binary digest, and the targets whose inventory failed (Rule 11).
     fn lane(&self, task: &Value) -> Result<(), BoxError> {
-        let command = field(task, "command")?;
+        let original = field(task, "command")?;
+        // Cargo runs each test binary from its package's directory, so a
+        // sanitizer file the command names relative to the checkout's root
+        // is made absolute.
+        let rooted = original.replace(
+            "suppressions=.",
+            &format!("suppressions={}/.", self.root.display()),
+        );
+        let command = rooted.as_str();
         let mut build = Command::new("sh");
         build
             .args(["-c", &format!("{command} --no-run --message-format=json")])
@@ -834,7 +858,7 @@ impl Ctx<'_> {
                     "list_failures": list_failures,
                     "log": text,
                 }),
-                json!({ "command": command }),
+                json!({ "command": original }),
             ))?,
         )?;
         Ok(())

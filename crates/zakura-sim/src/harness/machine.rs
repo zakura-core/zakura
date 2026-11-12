@@ -262,6 +262,7 @@ fn run_checked(
     mut extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
     let scenario = scenario(value)?;
+    let atom = crate::acceptance_runs::begin(machine.name);
     let history = (machine.history)(&scenario.input);
     let handle = Rc::new(Handle {
         step: RefCell::new(None),
@@ -423,6 +424,7 @@ fn run_checked(
     };
     let record = report.end_record();
     crate::trace::end_records::write_end(&record);
+    crate::acceptance_runs::end(atom, &report);
     sink.record(Record::End(record));
     sink.report(&FullReport::new(&report.properties, None));
     match report.end.harness.clone() {

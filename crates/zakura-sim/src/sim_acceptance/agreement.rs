@@ -333,9 +333,8 @@ pub fn agreement(
                     && !before_obs.contains(obs)
             });
             let after_pick = view.pick == site.at
-                && before_view.is_some_and(|b| {
-                    b.pick != view.pick || (b.draws == view.draws && changed_by_pick)
-                });
+                && changed_by_pick
+                && before_view.is_some_and(|b| b.pick != view.pick || b.draws == view.draws);
             changed_obs || after_pick
         });
     if at_site {

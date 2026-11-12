@@ -170,6 +170,7 @@ impl<const UNCOOLED: bool> HasView for Watching<UNCOOLED> {
                     FaultEvidence::new(
                         view.faults.attributions().clone(),
                         CooldownEvidence::default(),
+                        view.faults.ends().clone(),
                         ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
                     )
                 })

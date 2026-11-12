@@ -88,6 +88,7 @@ fn attempt(
             faults = Some(FaultEvidence::new(
                 storage.attributions(),
                 CooldownEvidence::default(),
+                Default::default(),
                 Duration::ZERO,
             ));
             sim.add_source(Box::new(storage));

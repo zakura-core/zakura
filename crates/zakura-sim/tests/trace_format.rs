@@ -249,6 +249,7 @@ fn file_sink_never_overwrites() {
 fn violates_at_5(witness: Vec<u64>) -> impl Checker {
     check::after_step(move |cx: &StepCtx<'_>| {
         (cx.step == 5).then(|| Violation {
+            subject: None,
             property: "test/fails-at-5".into(),
             step: 5,
             witness: witness.clone(),

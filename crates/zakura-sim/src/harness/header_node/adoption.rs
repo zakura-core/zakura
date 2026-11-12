@@ -285,6 +285,17 @@ pub enum WatchRead {
     Broken(Vec<String>),
 }
 
+/// What answered one publication under the watch rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationRead {
+    /// A watch read at or past it.
+    Read,
+    /// A third event from the queue, first: its break.
+    Broken,
+    /// Neither, yet.
+    Open,
+}
+
 /// What a check found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Acceptance {
@@ -430,44 +441,20 @@ impl AdoptionEvidence {
     /// is [`WatchRead::Open`]. Each publication whose third event came
     /// first is its own break.
     pub fn watch_read(&self, queue: EventQueue) -> WatchRead {
-        let store = self.store();
         let mut found = WatchRead::Nothing;
         let mut breaks = Vec::new();
-        for (index, published) in store.facts.iter().enumerate() {
-            let AdoptionFact::Published { state_version, .. } = published.fact else {
-                continue;
-            };
-            let mut taken = 0;
-            let mut answered = false;
-            let mut broken = false;
-            for later in &store.facts[index + 1..] {
-                match &later.fact {
-                    AdoptionFact::WatchObserved {
-                        state_version: read,
-                    } if *read >= state_version => {
-                        answered = true;
-                        break;
-                    }
-                    AdoptionFact::EventTaken { queue: from, .. } if *from == queue => {
-                        taken += 1;
-                        if taken == WATCH_READ_EVENTS + 1 {
-                            breaks.push(format!(
-                                "the reactor took {taken} {queue:?} events after state \
-                                 {state_version:?} was published, with no watch read of it"
-                            ));
-                            broken = true;
-                            break;
-                        }
-                    }
-                    _ => {}
+        for (state_version, read) in self.publication_reads(queue) {
+            found = match (read, found) {
+                (PublicationRead::Broken, found) => {
+                    breaks.push(format!(
+                        "the reactor took {} {queue:?} events after state {state_version:?} \
+                         was published, with no watch read of it",
+                        WATCH_READ_EVENTS + 1
+                    ));
+                    found
                 }
-            }
-            if broken {
-                continue;
-            }
-            found = match (answered, found) {
-                (false, _) | (_, WatchRead::Open) => WatchRead::Open,
-                (true, _) => WatchRead::Holds,
+                (PublicationRead::Open, _) | (_, WatchRead::Open) => WatchRead::Open,
+                (PublicationRead::Read, _) => WatchRead::Holds,
             };
         }
         if breaks.is_empty() {
@@ -475,6 +462,51 @@ impl AdoptionEvidence {
         } else {
             WatchRead::Broken(breaks)
         }
+    }
+
+    /// The first published state still waiting for its watch read under
+    /// `queue` ([`WatchRead::Open`]), which an unread end names as its
+    /// subject.
+    pub fn unread_publication(&self, queue: EventQueue) -> Option<StateVersion> {
+        self.publication_reads(queue)
+            .into_iter()
+            .find_map(|(state_version, read)| {
+                (read == PublicationRead::Open).then_some(state_version)
+            })
+    }
+
+    /// Each `Published` state in order, with what answered it under
+    /// `queue` ([`AdoptionEvidence::watch_read`]'s rule).
+    fn publication_reads(&self, queue: EventQueue) -> Vec<(StateVersion, PublicationRead)> {
+        let store = self.store();
+        let mut reads = Vec::new();
+        for (index, published) in store.facts.iter().enumerate() {
+            let AdoptionFact::Published { state_version, .. } = published.fact else {
+                continue;
+            };
+            let mut taken = 0;
+            let mut read = PublicationRead::Open;
+            for later in &store.facts[index + 1..] {
+                match &later.fact {
+                    AdoptionFact::WatchObserved {
+                        state_version: observed,
+                    } if *observed >= state_version => {
+                        read = PublicationRead::Read;
+                        break;
+                    }
+                    AdoptionFact::EventTaken { queue: from, .. } if *from == queue => {
+                        taken += 1;
+                        if taken == WATCH_READ_EVENTS + 1 {
+                            read = PublicationRead::Broken;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            reads.push((state_version, read));
+        }
+        reads
     }
 
     /// Whether some published state had `queue` compete with its watch
@@ -913,6 +945,7 @@ mod tests {
             let full = sidecar::<Adoptions>(&lifecycle, &[]);
             let found = findings(&full, flooded);
             let violation = |version: u64| crate::Violation {
+                subject: None,
                 property: flooded.to_owned(),
                 step: 1,
                 witness: vec![1],

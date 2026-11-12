@@ -17,13 +17,14 @@
 //! found at the end, go on past the break, so they can apply other IDs, or
 //! never reach some the baseline applies. Where a case's recorded runs
 //! there do, [`PATCHED`] names how, and [`patched_expected`] spells out
-//! their own list. Three cases' `Draft` runs don't fit any list, and keep
-//! their baselines' lists: on `outcome-window-unchecked`'s,
-//! `headers-outcome/unsolicited-closes` stops the run; on
-//! `page-past-credit`'s, `sim/no-livelock` does; and on `open-repeated`'s,
-//! `conformant-never-closes` does, with `session/honest-never-punished`
-//! broken too. [`super::rows::NESTS`] allows none of those sets, so each
-//! stays blocked until its owner decides.
+//! their own list. Three cases break a broader ID on their `Draft` runs
+//! after their own break: on `outcome-window-unchecked`'s,
+//! `headers-outcome/unsolicited-closes`; on `page-past-credit`'s,
+//! `sim/no-livelock`; and on `open-repeated`'s, `conformant-never-closes`
+//! and `session/honest-never-punished`. Each names those as its set, judged
+//! on that `Draft` run ([`super::Found::AtStepSetOnDraft`]), and the
+//! last two of those `Draft` runs report otherwise than their baselines,
+//! as [`PATCHED`] says.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
@@ -1254,6 +1255,26 @@ struct PatchedNa {
 /// each patched run found at the end, report otherwise than their
 /// baselines.
 const PATCHED: &[PatchedNa] = &[
+    // Its recorded Draft run, past the over-credit page, applies the
+    // bad-cursor close, which its baseline never does, and never applies
+    // the answers-open rule its baseline applies.
+    PatchedNa {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        name: "page-past-credit",
+        applies: &["header-sync/s5v9/subscribe-headers/bad-cursor-closes"],
+        never: &["header-sync/s5v9/headers/sender-answers-open"],
+        other: &[],
+    },
+    // Its recorded Draft run, past the repeated `Open`, closes the honest
+    // peer and never applies the stale-completion rule its baseline
+    // applies.
+    PatchedNa {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-live",
+        name: "open-repeated",
+        applies: &[],
+        never: &["header-sync/stale-completion-inert"],
+        other: &[],
+    },
     // Past the refused page, the node closes the peer, so it retires it and
     // never reaches a stale completion or chain effect.
     PatchedNa {
@@ -1312,9 +1333,8 @@ const PATCHED: &[PatchedNa] = &[
         other: &[],
     },
     // Found at the end: the wedged loop never tears down or reaches a stale
-    // chain effect. It also leaves the other flood's watch read open, which
-    // ends `unsettled:watch-open`: incomplete evidence no list accepts, so
-    // the case blocks until its owner decides what the other watch owes.
+    // chain effect. The other flood's watch rule breaks at the same settled
+    // end, on the same publication, so it's in the case's set.
     PatchedNa {
         property: "header-sync/watch-observed-under-flood",
         name: "wedged-run-loop",
@@ -1325,8 +1345,8 @@ const PATCHED: &[PatchedNa] = &[
         ],
         other: &[],
     },
-    // Found at the end: the wedged loop never touches storage, and leaves
-    // the other flood's watch read open, as above.
+    // Found at the end: the wedged loop never touches storage, and breaks
+    // the other flood's watch rule too, as above.
     PatchedNa {
         property: "header-sync/watch-observed-under-lifecycle-flood",
         name: "wedged-run-loop",

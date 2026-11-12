@@ -2842,6 +2842,7 @@ fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<End
             },
         )
         .map(|actual| EndViolation {
+            subject: None,
             property: PropertyId::new(HEADER_FAULT_PENALIZED),
             expected: FAULT_PENALIZED_EXPECTED.to_owned(),
             actual,
@@ -4028,6 +4029,7 @@ mod tests {
             crate::PropertyOutcome::Violated { witness: vec![2] }
         );
         let found = |expected: &str, actual: &str| crate::Violation {
+            subject: None,
             property: OPERATION_IDS.to_owned(),
             step: 2,
             witness: vec![2],
@@ -4128,6 +4130,7 @@ mod tests {
         let full = sidecar::<OperationIdRun>(&(), &[]);
         let found = findings(&full, OPERATION_IDS);
         let violation = |expected: &str, actual: &str| crate::Violation {
+            subject: None,
             property: OPERATION_IDS.to_owned(),
             step: 2,
             witness: vec![2],

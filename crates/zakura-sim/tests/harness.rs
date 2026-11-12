@@ -381,6 +381,7 @@ fn a_spin_at_another_violations_step_is_still_reported() {
         .step;
     let mut other = check::after_step(|cx: &StepCtx<'_>| {
         (cx.step == spin).then(|| Violation {
+            subject: None,
             property: "test/other".to_owned(),
             step: cx.step,
             witness: vec![cx.step],

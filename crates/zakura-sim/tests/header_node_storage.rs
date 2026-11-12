@@ -966,6 +966,7 @@ fn run_end_returns_every_permit_and_lease() {
                 .any(|op| op.op == zakura_storage::header::HeaderOp::ContinuationLocator);
             last.set((locator, port.engine().live_leases()));
             (cx.step == budget).then(|| zakura_sim::Violation {
+                subject: None,
                 property: "test/stop".to_owned(),
                 step: cx.step,
                 witness: vec![cx.step],

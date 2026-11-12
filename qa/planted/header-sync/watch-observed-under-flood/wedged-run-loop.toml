@@ -7,6 +7,7 @@ input = "crates/zakura-sim/tests/fixtures/header-flood-wire.bin"
 # Besides reactor.rs, which the patch changes, the session receiver and the
 # queues decide how fast wire events arrive and when the commit lands.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
-# The wedge leaves a publication unread under either fixture, so a campaign
-# input on the lifecycle fixture breaks that fixture's rule instead.
-also_violates = ["header-sync/watch-observed-under-lifecycle-flood"]
+# The wedge leaves the same publication unread under both queues' watch
+# rules, so the settled end breaks the other fixture's rule too, about that
+# publication: the case's set is both (C6's per-subject end join).
+set = ["header-sync/watch-observed-under-lifecycle-flood"]

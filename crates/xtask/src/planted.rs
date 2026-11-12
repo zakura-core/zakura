@@ -242,6 +242,12 @@ struct Case {
     /// input must violate too, and nothing else (C4). Empty for a case that
     /// breaks its property alone.
     set: Vec<String>,
+    /// A nested case's set when its broader properties break only after
+    /// the case's own break: every patched run must break the case's
+    /// property alone, and the committed input's `Draft` run, which goes on
+    /// past the break, must violate it and every one of these by its end,
+    /// and nothing else ([`classify_draft_set`]). Empty for any other case.
+    draft_set: Vec<String>,
     /// A harness-caught case's named diagnostic: what the missing evidence
     /// its patched runs must end at says ([`classify_missing_evidence`]).
     /// `None` for a case caught by a violation.
@@ -408,6 +414,14 @@ struct CaseFile {
     /// case names `set` or `also_violates`, not both.
     #[serde(default)]
     set: Vec<String>,
+    /// A nested case's set whose broader properties break only after the
+    /// case's own break, by ID: its patched runs must break the case's
+    /// property alone, at its stopping step, and the committed input's
+    /// `Draft` run must break the case's property and each of these by its
+    /// end, and nothing else (Adam, 2026-11-12). A case that names this
+    /// names no `set`, `also_violates` or `missing_evidence`.
+    #[serde(default)]
+    draft_set: Vec<String>,
     /// A harness-caught case's named diagnostic (Adam's ruling on C19,
     /// 2026-11-12): its patched run must end at a missing-evidence harness
     /// failure of the case's property whose detail says this, such as
@@ -737,6 +751,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 checks,
                 also_violates,
                 set,
+                draft_set,
                 missing_evidence,
             } = toml::from_str(
                 &fs::read_to_string(&case_file)
@@ -779,6 +794,16 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 )
                 .into());
             }
+            if !draft_set.is_empty()
+                && (!set.is_empty() || !also_violates.is_empty() || missing_evidence.is_some())
+            {
+                return Err(format!(
+                    "{}: a case that names `draft_set` names no `set`, `also_violates` or \
+                     `missing_evidence`",
+                    case_file.display()
+                )
+                .into());
+            }
             // No fuzz target confirms a harness failure, and a nested or
             // co-violating case is caught by its violations.
             let harness_caught_alone = matches!(witness, Witness::Typed { .. })
@@ -798,6 +823,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 checks,
                 also_violates,
                 set,
+                draft_set,
                 missing_evidence,
                 target: None,
             })
@@ -1058,7 +1084,9 @@ fn apply_case_patch(worktree: &Path, case: &Case) -> Result<Option<Verdict>, Box
 
 /// Records `input` on `harness` with the patched `zakura_sim` binary into
 /// `scratch`'s `patched`, and judges it: the patched run's verdict, then,
-/// for a catch, the campaign's, then the patched trace's fresh replay's.
+/// for a catch, a `draft_set` case's `Draft` run's in `scratch`'s `draft`
+/// ([`classify_draft_set`]), the campaign's, then the patched trace's fresh
+/// replay's.
 /// Each run gets `deadline`.
 fn judge_patched(
     zakura_sim: &Path,
@@ -1079,6 +1107,30 @@ fn judge_patched(
         Some((deadline, &NEVER_INTERRUPTED)),
     )?;
     let verdict = match case.classify(&patched) {
+        Verdict::Caught(None) if !case.draft_set.is_empty() => {
+            let draft = record(
+                Command::new(zakura_sim),
+                harness,
+                input,
+                &case.property,
+                Expect::ViolatedOnDraft {
+                    property: &case.property,
+                    set: &case.draft_set,
+                },
+                &scratch.join("draft"),
+                Some((deadline, &NEVER_INTERRUPTED)),
+            )?;
+            match classify_draft_set(&case.property, &case.draft_set, &draft) {
+                Verdict::Caught(None) => campaign(
+                    zakura_sim,
+                    harness,
+                    case,
+                    &scratch.join("campaign"),
+                    deadline,
+                )?,
+                verdict => return Ok(verdict),
+            }
+        }
         Verdict::Caught(None) => campaign(
             zakura_sim,
             harness,
@@ -1394,6 +1446,17 @@ enum Expect<'a> {
     /// The property and every listed one, the case's `set`, are violated,
     /// and no other property is.
     ViolatedSet(&'a [String]),
+    /// The run's `Draft` override is the property and its `set`, a case's
+    /// `draft_set`, so it goes on past the case's break, and the property
+    /// is violated beside no other but the set's. The witness doesn't
+    /// require each member, which breaks after the case's own break and so
+    /// can't join it: [`classify_draft_set`] does.
+    ViolatedOnDraft {
+        /// The case's property.
+        property: &'a str,
+        /// Its `draft_set`.
+        set: &'a [String],
+    },
 }
 
 impl Expect<'_> {
@@ -1414,6 +1477,17 @@ impl Expect<'_> {
                 "violated-set".to_owned(),
                 "--also-violates".to_owned(),
                 set.join(","),
+            ],
+            Expect::ViolatedOnDraft { property, set } => vec![
+                "--expect".to_owned(),
+                "violated".to_owned(),
+                "--also-violates".to_owned(),
+                set.join(","),
+                "--draft".to_owned(),
+                std::iter::once(property)
+                    .chain(set.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(","),
             ],
         }
     }
@@ -1713,6 +1787,53 @@ fn classify_set(
         .find(|member| !violated().any(|id| id == *member))
     {
         return Verdict::NotCaught(format!("violated, but not {missing} of its set"));
+    }
+    match witness {
+        Some(why) => Verdict::WitnessFails(why.clone()),
+        None => Verdict::Caught(None),
+    }
+}
+
+/// What `draft`, a `draft_set` case's `Draft` run of its committed input,
+/// shows about the case's nested set: a catch only if it went on past the
+/// case's break and violated `property` and every member of `set` by its
+/// end, nothing else, with its witness passing. A member it didn't violate
+/// misses the set, and any other violation is [`Verdict::Unrelated`].
+fn classify_draft_set(property: &str, set: &[String], draft: &Run) -> Verdict {
+    let (violation, others_violated, outcome, witness) = match draft {
+        Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
+        Run::Ended {
+            harness: Some(failure),
+            ..
+        } => return Verdict::Harness(failure.clone()),
+        Run::Ended {
+            violation,
+            others_violated,
+            outcome,
+            witness,
+            ..
+        } => (violation, others_violated, outcome, witness),
+    };
+    let expected = |id: &String| id == property || set.contains(id);
+    if let Some(unrelated) = violation
+        .iter()
+        .chain(others_violated)
+        .find(|id| !expected(id))
+    {
+        return Verdict::Unrelated(unrelated.clone());
+    }
+    if !matches!(outcome, Some(EndOutcome::Violated {})) {
+        return Verdict::NotCaught(format!(
+            "its Draft run left {property} {}",
+            outcome
+                .as_ref()
+                .map_or_else(|| "unreported".to_owned(), ToString::to_string)
+        ));
+    }
+    if let Some(missing) = set.iter().find(|member| !others_violated.contains(member)) {
+        return Verdict::NotCaught(format!(
+            "its Draft run violated {property}, but not {missing} of its draft set"
+        ));
     }
     match witness {
         Some(why) => Verdict::WitnessFails(why.clone()),
@@ -2387,6 +2508,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: None,
         };
@@ -2783,6 +2905,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: None,
         };
@@ -2860,6 +2983,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: None,
         };
@@ -2972,6 +3096,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: None,
         };
@@ -3027,6 +3152,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: None,
         };
@@ -3163,6 +3289,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: set.to_vec(),
+            draft_set: Vec::new(),
             missing_evidence: None,
             target: Some("header_sync".to_owned()),
         };
@@ -3176,6 +3303,59 @@ mod tests {
             .expect_err("a case names a set or co-violations")
             .to_string();
         assert!(error.contains("not both"), "{error}");
+    }
+
+    /// A `draft_set` case's set is judged on its `Draft` run alone: every
+    /// member and the case's property violated by its end is a catch, a
+    /// member it didn't violate misses, and anything else violated is
+    /// unrelated. The run records with the case's property and its set as
+    /// the override, and a case naming a `set` beside it is refused.
+    #[test]
+    fn a_draft_set_is_judged_on_the_draft_run() {
+        const LATER: &str = "sim/no-livelock";
+        let set = [LATER.to_owned()];
+        let judged = |others: &[&str]| {
+            let mut reports = vec![(ID, VIOLATED)];
+            reports.extend(others.iter().map(|id| (*id, VIOLATED)));
+            classify_draft_set(ID, &set, &run(None, &reports))
+        };
+        assert_eq!(judged(&[LATER]), Verdict::Caught(None));
+        assert!(
+            matches!(judged(&[]), Verdict::NotCaught(why) if why.contains(LATER)),
+            "a member the Draft run didn't violate misses the set"
+        );
+        assert_eq!(
+            judged(&[LATER, "test/other"]),
+            Verdict::Unrelated("test/other".to_owned())
+        );
+        assert!(matches!(
+            classify_draft_set(ID, &set, &run(None, &[(ID, HELD), (LATER, VIOLATED)])),
+            Verdict::NotCaught(_)
+        ));
+        assert_eq!(
+            Expect::ViolatedOnDraft {
+                property: ID,
+                set: &set
+            }
+            .args(),
+            [
+                "--expect",
+                "violated",
+                "--also-violates",
+                LATER,
+                "--draft",
+                &format!("{ID},{LATER}")
+            ]
+        );
+        let both = r#"
+            input = "a.bin"
+            set = ["x/broader"]
+            draft_set = ["x/later"]
+        "#;
+        let error = parse_case(both)
+            .expect_err("a draft set stands alone")
+            .to_string();
+        assert!(error.contains("draft_set"), "{error}");
     }
 
     /// A typed case watches its scenario and Plan file, and runs with

@@ -32,7 +32,7 @@ use crate::{
         remove_worktrees_under, resolved, run_id, source_digest, stop_if_interrupted,
         track_sessions, Options, Tool, ESCAPED, RECORD, RUNS, SOURCE_DIGEST, SUBJECT_DIR,
     },
-    header_acceptance::{cargo, clean_build_env, libtest, run_test},
+    header_acceptance::{cargo, clean_build_env, libtest, run_test, TaskId},
     planted::provenance,
     sim_minimize, BoxError, UsageError,
 };
@@ -489,7 +489,14 @@ fn run_at(
                     run,
                     Some(source),
                     fields,
-                    &dir,
+                    (
+                        &dir,
+                        TaskId {
+                            run_id: &run_name,
+                            index,
+                        },
+                        "",
+                    ),
                     (&run.out.join("tests"), None, true),
                 )?;
                 // hdr-14's runner writes the build's messages beside its

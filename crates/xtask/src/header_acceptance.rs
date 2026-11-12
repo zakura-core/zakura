@@ -638,11 +638,11 @@ struct Tools {
 /// artifact the runner writes there names beside its role, as the
 /// reader's `TaskAt` reads it.
 #[derive(Clone, Copy, Debug)]
-struct TaskId<'a> {
+pub(crate) struct TaskId<'a> {
     /// The run's ID.
-    run_id: &'a str,
+    pub(crate) run_id: &'a str,
     /// The task's index in its plan.
-    index: usize,
+    pub(crate) index: usize,
 }
 
 impl TaskId<'_> {

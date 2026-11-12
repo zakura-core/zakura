@@ -11,8 +11,12 @@
 use std::{cell::RefCell, collections::BTreeSet};
 
 use zakura_sim::{
-    domain::header_sync::{
-        capacity_release_wakes, watch_observed_under_flood, watch_observed_under_lifecycle_flood,
+    domain::{
+        header_sync::{
+            capacity_release_wakes, watch_observed_under_flood,
+            watch_observed_under_lifecycle_flood,
+        },
+        header_sync_progress::bounded_adversary_progress,
     },
     harness::{
         header_acceptance,
@@ -61,9 +65,11 @@ impl Own for Smoke {
 }
 
 impl Own for Storage {
-    /// The storage harness's.
+    /// The storage harness's, then `bounded-adversary-progress`.
     fn own() -> Vec<Property<Without<Self>>> {
-        storage_properties()
+        let mut properties = storage_properties();
+        properties.push(bounded_adversary_progress());
+        properties
     }
 }
 

@@ -62,12 +62,21 @@ pub enum Effect {
     AtPick,
     /// A task carries it out after its pick, recording an `Environment`
     /// fact for `peer` with `action` (`Close`, `Relink` or `Shutdown`) in
-    /// the node's `ends` store as it acts. A flood or churn step relinks.
+    /// the node's `ends` store as it acts, which names the step's position
+    /// in the control script as its cause. A flood or churn step relinks.
+    /// The fact's connection must be one the `sessions` store shows opened
+    /// to `peer` (a shutdown names none), and no two relinks name one
+    /// connection, since each opens a new link.
     Environment {
         /// The peer the fact names.
         peer: String,
         /// The fact's action.
         action: &'static str,
+        /// Whether the control task records it at the step's turn: a close,
+        /// relink or flood, whose facts therefore follow every earlier such
+        /// step's. A churn's task relinks alongside later steps, and a
+        /// shutdown is recorded at its pick.
+        in_turn: bool,
     },
     /// The control task carries it out after its pick and no store records
     /// it, so it's shown only by a later step of the same script whose
@@ -92,6 +101,9 @@ pub struct Declared {
     /// Which script it belongs to, whose actions are picked in order: the
     /// control script, or one peer's.
     pub script: String,
+    /// Its position in the control script, for a control step, which the
+    /// `ends` store names as the cause of each fact its execution records.
+    pub control: Option<usize>,
     /// What shows it took effect.
     pub effect: Effect,
 }
@@ -131,10 +143,15 @@ fn controls(scenario: &StorageScenario) -> Vec<Declared> {
     scenario
         .controls
         .iter()
-        .map(|step| {
+        .enumerate()
+        .map(|(position, step)| {
             let environment = |action| Effect::Environment {
                 peer: step.peer.clone(),
                 action,
+                in_turn: matches!(
+                    step.action,
+                    ControlAction::Close | ControlAction::Relink | ControlAction::Flood
+                ),
             };
             let effect = match step.action {
                 ControlAction::Close => environment("Close"),
@@ -153,6 +170,7 @@ fn controls(scenario: &StorageScenario) -> Vec<Declared> {
             Declared {
                 pick: format!("peer:{}:{}", step.peer, step.action.name()),
                 script: "control".to_owned(),
+                control: Some(position),
                 effect,
             }
         })
@@ -168,6 +186,7 @@ fn peers(scenario: &WireScenario) -> Vec<Declared> {
             declared.push(Declared {
                 pick: format!("peer:{name}:{}", action.name()),
                 script: name.clone(),
+                control: None,
                 effect: match action {
                     PeerAction::Act { .. } => Effect::ActRan,
                     _ => Effect::Unshown,
@@ -178,34 +197,116 @@ fn peers(scenario: &WireScenario) -> Vec<Declared> {
     declared
 }
 
-/// The `(peer, action)` of every `Environment` fact the full report's
-/// `ends` store holds, in order, read from its snapshot.
-fn environment_facts(report: &FullReport) -> Vec<(String, String)> {
-    let Some(stores) = report.snapshot.as_ref().and_then(Value::as_array) else {
+/// One `Environment` fact of the node's `ends` store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fact {
+    /// Its stamp.
+    stamp: u64,
+    /// The peer it names.
+    peer: String,
+    /// The connection it names, if any.
+    connection: Option<u64>,
+    /// Its action, as `Close`, `Relink` or `Shutdown`.
+    action: String,
+    /// The position in the control script of the step whose execution
+    /// recorded it, if one did.
+    control: Option<usize>,
+}
+
+/// The stores' snapshots in `report`, by name.
+fn snapshot<'a>(report: &'a FullReport, name: &str) -> Option<&'a Value> {
+    report
+        .snapshot
+        .as_ref()?
+        .as_array()?
+        .iter()
+        .find(|store| store.get("store").and_then(Value::as_str) == Some(name))?
+        .get("snapshot")
+}
+
+/// The number at the start of `text`, after any spaces.
+fn leading_number<T: std::str::FromStr>(text: &str) -> Option<T> {
+    let text = text.trim_start();
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    text[..end].parse().ok()
+}
+
+/// Every `Environment` fact the full report's `ends` store holds, in stamp
+/// order, with its stamp, connection and cause, read from its `Debug`
+/// snapshot: `facts: [(<stamp>, Environment { peer: "<peer>", connection:
+/// Some(<id>) | None, action: <action> }), ...], causes: [(<stamp>,
+/// <position>), ...]`. Empty if the store isn't there.
+fn environment_facts(report: &FullReport) -> Vec<Fact> {
+    let Some(text) = snapshot(report, "ends").and_then(Value::as_str) else {
         return Vec::new();
     };
-    let mut facts = Vec::new();
-    for store in stores {
-        if store.get("store").and_then(Value::as_str) != Some("ends") {
-            continue;
-        }
-        let Some(text) = store.get("snapshot").and_then(Value::as_str) else {
+    let (facts, causes) = text.split_once("causes: [").unwrap_or((text, ""));
+    let causes: Vec<(u64, usize)> = causes
+        .split(']')
+        .next()
+        .unwrap_or("")
+        .split('(')
+        .skip(1)
+        .filter_map(|pair| {
+            let (stamp, position) = pair.split_once(',')?;
+            Some((leading_number(stamp)?, leading_number(position)?))
+        })
+        .collect();
+    let mut found = Vec::new();
+    let mut chunks = facts.split("Environment { peer: \"");
+    let mut before = chunks.next().unwrap_or("");
+    for fact in chunks {
+        let stamp = before
+            .rfind('(')
+            .and_then(|at| leading_number::<u64>(&before[at + 1..]));
+        before = fact;
+        let (Some(stamp), Some((peer, rest))) = (stamp, fact.split_once('"')) else {
             continue;
         };
-        for fact in text.split("Environment { peer: \"").skip(1) {
-            let Some((peer, rest)) = fact.split_once('"') else {
-                continue;
-            };
-            let Some(action) = rest
-                .split_once("action: ")
-                .map(|(_, action)| action.split([' ', '}', ',']).next().unwrap_or(""))
-            else {
-                continue;
-            };
-            facts.push((peer.to_owned(), action.to_owned()));
-        }
+        let connection = rest
+            .split_once("connection: Some(")
+            .filter(|(gap, _)| !gap.contains('}'))
+            .and_then(|(_, id)| leading_number(id));
+        let Some(action) = rest
+            .split_once("action: ")
+            .map(|(_, action)| action.split([' ', '}', ',']).next().unwrap_or(""))
+        else {
+            continue;
+        };
+        found.push(Fact {
+            stamp,
+            peer: peer.to_owned(),
+            connection,
+            action: action.to_owned(),
+            control: causes
+                .iter()
+                .find(|(at, _)| *at == stamp)
+                .map(|&(_, position)| position),
+        });
     }
+    found
+}
+
+/// Every link the full report's `sessions` store shows opened, as its peer
+/// and connection, read from its `LinkOpened` facts.
+fn opened_links(report: &FullReport) -> Vec<(String, u64)> {
+    let Some(facts) = snapshot(report, "sessions")
+        .and_then(|sessions| sessions.get("facts"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
     facts
+        .split("LinkOpened { peer: \"")
+        .skip(1)
+        .filter_map(|fact| {
+            let (peer, rest) = fact.split_once('"')?;
+            let (_, id) = rest.split_once("connection: ")?;
+            Some((peer.to_owned(), leading_number(id)?))
+        })
+        .collect()
 }
 
 /// Whether `run`, a node history's recording that ended `end`, carried
@@ -258,15 +359,49 @@ pub fn judge(
     if picked.iter().any(|picked| !picked) {
         return Actions::Incomplete;
     }
-    let mut facts = environment_facts(report);
+    let facts = environment_facts(report);
+    let links = opened_links(report);
+    // Each relink opens a new link, so two naming one connection can't
+    // both be the connection their step made.
+    let mut relinked = std::collections::BTreeSet::new();
+    if facts
+        .iter()
+        .filter(|fact| fact.action == "Relink")
+        .any(|fact| fact.connection.is_none_or(|id| !relinked.insert(id)))
+    {
+        return Actions::Incomplete;
+    }
+    // A fact names its connection's link, and a shutdown none.
+    let linked = |fact: &Fact| match (fact.action.as_str(), fact.connection) {
+        ("Shutdown", None) => true,
+        ("Close" | "Relink", Some(id)) => links.iter().any(|(p, c)| *p == fact.peer && *c == id),
+        _ => false,
+    };
+    // Each in-turn step's effect, its first fact, follows the one before.
+    let mut turn = 0;
     let mut shown: Vec<bool> = declared
         .iter()
-        .map(|action| match &action.effect {
+        .map(|declared| match &declared.effect {
             Effect::AtPick => true,
-            Effect::Environment { peer, action } => {
-                match facts.iter().position(|(p, a)| p == peer && a == action) {
-                    Some(at) => {
-                        facts.remove(at);
+            // The effect is the one its own step's execution recorded.
+            Effect::Environment {
+                peer,
+                action,
+                in_turn,
+            } => {
+                let own = facts.iter().find(|fact| {
+                    fact.control.is_some()
+                        && fact.control == declared.control
+                        && fact.peer == *peer
+                        && fact.action == *action
+                        && linked(fact)
+                });
+                match own {
+                    Some(fact) if *in_turn && fact.stamp <= turn => false,
+                    Some(fact) => {
+                        if *in_turn {
+                            turn = fact.stamp;
+                        }
                         true
                     }
                     None => false,

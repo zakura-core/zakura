@@ -59,16 +59,19 @@ pub struct DeclaredHistory {
 }
 
 /// What [`RAN_FILE`] holds: how many steps a run took and the digest of
-/// each step's pick and observation digest, in order. A step's input
-/// offset and draws are left out, since a full fuzz input and its split
-/// scenario and Plan bytes place the same picks at different offsets.
+/// each step's pick, observation digest and typed machine evidence, in
+/// order. A machine step has no observation digest and its pick names only
+/// the machine and operation number, so its evidence is what tells two
+/// same-length machine runs apart. A step's input offset and draws are left
+/// out, since a full fuzz input and its split scenario and Plan bytes place
+/// the same picks at different offsets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ran {
     /// The steps the run took.
     pub steps: u64,
-    /// The SHA-256, in hex, of each step's `pick`, a tab and its `obs`,
-    /// one line per step.
+    /// The SHA-256, in hex, of each step's `pick`, its `obs` and its
+    /// `machine` evidence as JSON, tab separated, one line per step.
     pub digest: String,
 }
 
@@ -88,9 +91,19 @@ impl Ran {
     }
 }
 
-/// One step's line in a [`Ran`] digest.
+/// One step's line in a [`Ran`] digest. Machine evidence is plain structs
+/// and enums, so its JSON is the same wherever it's written.
 fn step_line(step: &StepRecord) -> String {
-    format!("{}\t{}\n", step.pick, step.obs.as_deref().unwrap_or(""))
+    let machine = step
+        .machine
+        .as_deref()
+        .map(|machine| serde_json::to_string(machine).expect("machine evidence serializes"))
+        .unwrap_or_default();
+    format!(
+        "{}\t{}\t{machine}\n",
+        step.pick,
+        step.obs.as_deref().unwrap_or("")
+    )
 }
 
 /// `hasher`'s digest in lowercase hex.
@@ -309,5 +322,34 @@ mod tests {
         fs::write(found[1].0.join(HISTORY_FILE), "not json").unwrap();
         assert_eq!(declared(root.path()).len(), 1);
         assert!(declared(&root.path().join("missing")).is_empty());
+    }
+
+    /// Two machine runs with the same picks and step count but a different
+    /// operation have different [`Ran`]s, so one can't stand for the other.
+    #[test]
+    fn machine_operations_change_the_ran_digest() {
+        use crate::{
+            plan::By,
+            record::machine::{FixtureStep, MachineStep},
+        };
+        let step = |input: u8| StepRecord {
+            step: 1,
+            pick: "machine:fixture:1".into(),
+            key: None,
+            options: 1,
+            by: By::Forced,
+            offset: None,
+            draws: Vec::new(),
+            obs: None,
+            machine: Some(Box::new(MachineStep::Fixture(FixtureStep {
+                input: vec![input],
+                failure: None,
+            }))),
+        };
+        let first = Ran::of(&[step(0)]);
+        assert_eq!(first, Ran::of(&[step(0)]));
+        let other = Ran::of(&[step(1)]);
+        assert_eq!(first.steps, other.steps);
+        assert_ne!(first, other);
     }
 }

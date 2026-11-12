@@ -30,7 +30,7 @@
 use std::{collections::BTreeMap, sync::OnceLock};
 
 use super::{rows::harness_matrix, CaseRef, ExpectedNa};
-use crate::{property::Pending, NaReason};
+use crate::NaReason;
 
 /// `header-sync/wire`.
 const WIRE: &str = "header-sync/wire";
@@ -1310,8 +1310,10 @@ const PATCHED: &[PatchedNa] = &[
         ],
         other: &[],
     },
-    // Found at the end: the wedged loop leaves the other flood's watch read
-    // open, and never tears down or reaches a stale chain effect.
+    // Found at the end: the wedged loop never tears down or reaches a stale
+    // chain effect. It also leaves the other flood's watch read open, which
+    // ends `unsettled:watch-open`: incomplete evidence no list accepts, so
+    // the case blocks until its owner decides what the other watch owes.
     PatchedNa {
         property: "header-sync/watch-observed-under-flood",
         name: "wedged-run-loop",
@@ -1320,26 +1322,16 @@ const PATCHED: &[PatchedNa] = &[
             "header-sync/stale-chain-effect-inert",
             "header-sync/teardown-returns-baseline",
         ],
-        other: &[(
-            "header-sync/watch-observed-under-lifecycle-flood",
-            NaReason::Unsettled {
-                site: Pending::WatchOpen,
-            },
-        )],
+        other: &[],
     },
-    // Found at the end: the wedged loop leaves the other flood's watch read
-    // open, and never touches storage.
+    // Found at the end: the wedged loop never touches storage, and leaves
+    // the other flood's watch read open, as above.
     PatchedNa {
         property: "header-sync/watch-observed-under-lifecycle-flood",
         name: "wedged-run-loop",
         applies: &[],
         never: &["header-sync/storage-operation-ids"],
-        other: &[(
-            "header-sync/watch-observed-under-flood",
-            NaReason::Unsettled {
-                site: Pending::WatchOpen,
-            },
-        )],
+        other: &[],
     },
     // Found at the end: the reactor returns before it takes the late
     // failure, so no completion ends stale.

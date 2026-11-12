@@ -416,6 +416,7 @@ fn two_planted_cases_run_through_the_tool() {
         let Task::Case {
             harness,
             input,
+            patched: witness,
             patch,
             draft: Some(set),
             companions,
@@ -436,7 +437,14 @@ fn two_planted_cases_run_through_the_tool() {
             replay(&dir.join(out));
         };
         record("baseline", &["--witness", property, "--expect", "holds"]);
-        record("patched", &["--witness", property, "--expect", "violated"]);
+        // The patched run expects what the case's task names, as the
+        // planted runner records it.
+        let beside = witness.beside.join(",");
+        let mut patched = vec!["--witness", property, "--expect", &witness.expect];
+        if !beside.is_empty() {
+            patched.extend(["--also-violates", &beside]);
+        }
+        record("patched", &patched);
         record("draft", &["--draft", &set.join(",")]);
         let checks = [
             (

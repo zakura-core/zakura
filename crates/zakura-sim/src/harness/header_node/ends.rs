@@ -27,6 +27,11 @@
 //! Each fact takes the node's next stamp ([`super::stamp`]). The store
 //! holds the node's stamps, which the tap it's handed to shares with every
 //! other store it keeps.
+//!
+//! An environment fact a scripted `Control` step's execution recorded also
+//! names that step, by its position in the control script, in the store's
+//! causes, so each fact is joined to the pick that made it: a churn's
+//! relinks to the churn step, never to a later `Relink`.
 
 use super::stamp::Stamps;
 use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
@@ -81,6 +86,10 @@ struct Store {
     stamps: Stamps,
     /// Each fact with its stamp, in stamp order.
     facts: Vec<(u64, EndFact)>,
+    /// Each fact a scripted control step's execution recorded, by its
+    /// stamp, with that step's position in the control script, in stamp
+    /// order.
+    causes: Vec<(u64, usize)>,
 }
 
 impl Snapshot for Store {
@@ -119,10 +128,26 @@ impl EndEvidence {
 
     /// Keeps `fact` with the next stamp, unless the store is frozen.
     pub(super) fn record(&self, fact: EndFact) {
+        self.record_caused(fact, None);
+    }
+
+    /// [`EndEvidence::record`], naming `control`, the position in the
+    /// control script of the step whose execution recorded `fact`, if one
+    /// did.
+    pub(super) fn record_caused(&self, fact: EndFact, control: Option<usize>) {
         self.0.write(|store| {
             let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
+            if let Some(control) = control {
+                store.causes.push((stamp, control));
+            }
         });
+    }
+
+    /// Every fact a scripted control step's execution recorded, by its
+    /// stamp, with that step's position in the control script.
+    pub fn causes(&self) -> Vec<(u64, usize)> {
+        self.with(|store| store.causes.clone())
     }
 
     /// Every fact so far, with its stamp, in stamp order.
@@ -170,9 +195,14 @@ mod tests {
             connection: Some(4),
             action: EnvironmentAction::Close,
         };
-        ends.record(close.clone());
+        ends.record_caused(close.clone(), Some(0));
         assert_eq!(stamps.next(), 2, "another store's fact");
         ends.record(EndFact::ReactorExited { step: 9 });
+        assert_eq!(
+            ends.causes(),
+            [(1, 0)],
+            "only a control step's fact names it"
+        );
         assert_eq!(
             ends.facts(),
             [(1, close.clone()), (3, EndFact::ReactorExited { step: 9 })]

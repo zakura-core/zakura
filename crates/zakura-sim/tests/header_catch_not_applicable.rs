@@ -369,6 +369,90 @@ fn the_patched_list_judges_the_draft_run() {
     assert!(blocked(&judged(&committed, &result, &reports, &outside)));
 }
 
+/// A completed counted run's `NotApplicable` reports must be benign
+/// whatever its lists say. `target-page-refused`'s `Draft` run verifies
+/// reporting its patched list, and blocks once its patched list accepts an
+/// ID's incomplete `unsettled:watch-open` and the run reports exactly that.
+/// No committed list, counted or patched, names a reason that isn't benign.
+#[test]
+fn no_list_accepts_an_incomplete_reason() {
+    let committed = Manifest::committed();
+    let case = CaseRef {
+        property: "header-sync/s5v9/conformant-never-closes",
+        name: "target-page-refused",
+    };
+    let result = caught(&committed, case);
+    let Expected::Caught {
+        set,
+        not_applicable,
+        patched_not_applicable,
+        ..
+    } = result.expected
+    else {
+        unreachable!("found as a Caught");
+    };
+    let patched = patched_not_applicable.expect("its Draft run reports otherwise");
+    let reports = baseline(case, WIRE);
+    let draft_of = |list: &[ExpectedNa]| -> Vec<(String, Report)> {
+        reports
+            .iter()
+            .map(|(id, _)| {
+                let report = if set.contains(&id.as_str()) {
+                    Report::Violated
+                } else if let Some(na) = list.iter().find(|na| na.property == id) {
+                    Report::NotApplicable {
+                        reason: na.reason.into(),
+                    }
+                } else {
+                    Report::Held { applicable: 1 }
+                };
+                (id.clone(), report)
+            })
+            .collect()
+    };
+    assert_eq!(
+        judged(&committed, &result, &reports, &draft_of(patched)),
+        ObligationState::Verified
+    );
+    let open = reports
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .find(|id| !set.contains(id) && !patched.iter().any(|na| na.property == *id))
+        .expect("some ID holds past the break");
+    let open: &'static str = Box::leak(open.to_owned().into_boxed_str());
+    let mut listed = patched.to_vec();
+    listed.push(ExpectedNa {
+        property: open,
+        reason: "unsettled:watch-open",
+    });
+    let listed: &'static [ExpectedNa] = Box::leak(listed.into_boxed_slice());
+    let accepting = with_lists(&result, not_applicable, Some(listed));
+    assert!(blocked(&judged(
+        &committed,
+        &accepting,
+        &reports,
+        &draft_of(listed)
+    )));
+    let benign = ["never-applied", "undeclared", "excluded"];
+    for result in &committed.expected {
+        let Expected::Caught {
+            case,
+            not_applicable,
+            patched_not_applicable,
+            ..
+        } = result.expected
+        else {
+            continue;
+        };
+        for na in not_applicable
+            .iter()
+            .chain(patched_not_applicable.unwrap_or_default())
+        {
+            assert!(benign.contains(&na.reason), "{case:?}: {na:?}");
+        }
+    }
+}
+
 /// Every node catch declares its runs' `NotApplicable` reports, each an ID
 /// its harness registers other than the target, and any patched list names
 /// no member of its set.

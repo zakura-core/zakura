@@ -323,6 +323,13 @@ impl EvidenceStores {
             .find(|(frozen, now)| frozen != now)
             .map(|(_, now)| now["store"].as_str().unwrap_or("?").to_owned())
     }
+
+    /// Adds `store` as [`EvidenceStores::register`] does, for a test's
+    /// store whose freeze can be broken.
+    #[cfg(test)]
+    fn enroll(&self, store: Arc<dyn Store>) {
+        self.registry().stores.push(store);
+    }
 }
 
 /// Each of `stores`' snapshots, named, in order.
@@ -337,17 +344,151 @@ fn snapshot_of(stores: &[Arc<dyn Store>]) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{debug_snapshot, sorted_snapshot, EvidenceStores, Snapshot};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::Value;
+
+    use super::{debug_snapshot, sorted_snapshot, EvidenceStores, Snapshot, Store};
+    use crate::{
+        harness::cleanup::{compare, Drift},
+        MemorySink, NoChecks, ObservationLog, Plan, RunConfig, Sim,
+    };
 
     impl Snapshot for Vec<u64> {
         /// The values, in order.
-        fn snapshot(&self) -> serde_json::Value {
+        fn snapshot(&self) -> Value {
             debug_snapshot(self)
         }
     }
 
-    /// A store registered after the freeze starts frozen, and the drift
-    /// check counts it as a change.
+    /// A store whose freeze does nothing, the negative control's.
+    struct Unfrozen(Mutex<Vec<u64>>);
+
+    impl Store for Unfrozen {
+        /// Its name.
+        fn name(&self) -> &'static str {
+            "unfrozen"
+        }
+
+        /// Nothing: this store's freeze is skipped.
+        fn freeze(&self) {}
+
+        /// Its values.
+        fn snapshot(&self) -> Value {
+            debug_snapshot(&*self.0.lock().expect("no test panics while holding it"))
+        }
+    }
+
+    /// Runs its write when dropped, as a task stopped partway does when the
+    /// scheduler's shutdown drops it.
+    struct OnDrop<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        /// Runs the write.
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    /// Runs a run whose one task waits forever holding `cleanup`, which
+    /// the scheduler's shutdown drops, with `stores` attached. Returns the
+    /// log at the freeze and the run's report.
+    fn run_with_cleanup(
+        stores: &EvidenceStores,
+        cleanup: impl FnMut() + 'static,
+    ) -> (ObservationLog, crate::RunReport) {
+        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        stores.attach(&mut sim);
+        let frozen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        sim.on_end({
+            let frozen = frozen.clone();
+            move |_, _, log| *frozen.borrow_mut() = Some(log.clone())
+        });
+        let guard = OnDrop(cleanup);
+        sim.scheduler().spawn_root("cleanup", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let report = sim.run(&mut NoChecks, &mut MemorySink::default());
+        let log = frozen
+            .borrow_mut()
+            .take()
+            .expect("`Sim::run` runs its end hooks");
+        (log, report)
+    }
+
+    /// A registered store drops the write a cleanup task makes after the
+    /// freeze, so the stores and the log compare equal after the run.
+    #[test]
+    fn a_registered_store_keeps_its_freeze_through_cleanup() {
+        let stores = EvidenceStores::default();
+        let values = stores.register("values", vec![1_u64]);
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (log, report) = run_with_cleanup(&stores, {
+            let (values, cleaned) = (values.clone(), cleaned.clone());
+            move || {
+                cleaned.store(true, std::sync::atomic::Ordering::Relaxed);
+                values.write(|values| values.push(2));
+            }
+        });
+        assert!(
+            cleaned.load(std::sync::atomic::Ordering::Relaxed),
+            "the shutdown dropped the task, which wrote"
+        );
+        assert!(values.is_frozen());
+        assert_eq!(values.read(Vec::clone), [1]);
+        assert_eq!(compare(&stores, &log, &report.log), None);
+    }
+
+    /// Negative control: a store registered with its freeze skipped keeps
+    /// the cleanup task's write, and the comparison names it.
+    #[test]
+    fn a_store_whose_freeze_is_skipped_fails_the_comparison() {
+        let stores = EvidenceStores::default();
+        let _kept = stores.register("values", vec![1_u64]);
+        let unfrozen = Arc::new(Unfrozen(Mutex::new(vec![1])));
+        stores.enroll(unfrozen.clone());
+        let (log, report) = run_with_cleanup(&stores, {
+            let unfrozen = unfrozen.clone();
+            move || {
+                unfrozen
+                    .0
+                    .lock()
+                    .expect("no test panics while holding it")
+                    .push(2);
+            }
+        });
+        assert_eq!(
+            compare(&stores, &log, &report.log),
+            Some(Drift::Store("unfrozen".to_owned()))
+        );
+    }
+
+    /// Negative control: an append to the log after its freeze fails the
+    /// comparison, even with every store unchanged. Nothing in cleanup can
+    /// reach the run's log today, since `Sim::run` owns it, so the control
+    /// thaws the returned log and appends as such a path would.
+    #[test]
+    fn an_append_to_the_log_during_cleanup_fails_the_comparison() {
+        let stores = EvidenceStores::default();
+        let _kept = stores.register("values", vec![1_u64]);
+        let (log, mut report) = run_with_cleanup(&stores, || {});
+        assert_eq!(compare(&stores, &log, &report.log), None);
+        report.log.thaw();
+        report.log.push(crate::Observation::TaskWaiting {
+            task: "cleanup".to_owned(),
+        });
+        assert_eq!(
+            compare(&stores, &log, &report.log),
+            Some(Drift::Log {
+                frozen: log.entries().len(),
+                returned: log.entries().len() + 1,
+            })
+        );
+    }
+
+    /// A store registered after the freeze starts frozen, and the
+    /// comparison counts it as a change.
     #[test]
     fn a_store_registered_after_the_freeze_starts_frozen() {
         let stores = EvidenceStores::default();

@@ -19,11 +19,14 @@ use super::{BlockTemplateLimits, SelectedMempoolTx};
 /// transactions fit in the gap and scanning for them is not worth the time.
 pub(super) const SELECTION_STOP_BYTES: usize = 3_000;
 
-/// Packing only runs when the primary pass leaves more than this many bytes.
-pub(super) const PACKING_THRESHOLD_BYTES: usize = 50_000;
+/// Once the template is within this many bytes of full, selection gives up
+/// after [`MAX_CONSECUTIVE_MISFITS`] packages in a row do not fit.
+pub(super) const NEARLY_FULL_BYTES: usize = 50_000;
 
-/// Packing visits at most this many baseline entries after the primary pass.
-pub(super) const MAX_PACKING_SCAN_ENTRIES: usize = 100;
+/// Consecutive packages that may fail to fit in a nearly full template before
+/// selection gives up, bounding the scan of a large mempool for a small gap.
+/// Matches Bitcoin Core's `MAX_CONSECUTIVE_FAILURES`.
+pub(super) const MAX_CONSECUTIVE_MISFITS: usize = 1_000;
 
 /// An ancestor-package score: highest fee per cost first, then the oldest
 /// insertion time, then the lowest TXID.
@@ -151,7 +154,6 @@ pub(super) struct IndexedSelector {
     updates: BTreeSet<Priority>,
     update_keys: HashMap<transaction::Hash, Priority>,
     cursor: usize,
-    minimum_size: usize,
     limits: BlockTemplateLimits,
 }
 
@@ -166,10 +168,8 @@ impl IndexedSelector {
     ) -> Self {
         let mut pool = HashMap::with_capacity(txs.len());
         let mut order = Vec::with_capacity(txs.len());
-        let mut minimum_size = usize::MAX;
         for tx in txs {
             let id = tx.transaction.id().mined_id();
-            minimum_size = minimum_size.min(tx.transaction.size());
             order.push(id);
             pool.insert(id, tx);
         }
@@ -184,36 +184,37 @@ impl IndexedSelector {
             updates: BTreeSet::new(),
             update_keys: HashMap::new(),
             cursor: 0,
-            minimum_size,
             limits,
         }
     }
 
-    /// Runs the primary pass, then bounded packing, and returns the
-    /// selected transactions, parents before children.
+    /// Selects packages in priority order and returns the selected
+    /// transactions, parents before children.
+    ///
+    /// A package that does not fit is skipped, so smaller packages and
+    /// packages that need a different limit can still fill the template.
+    /// Selection ends when at most [`SELECTION_STOP_BYTES`] remain, when no
+    /// candidate remains, or after [`MAX_CONSECUTIVE_MISFITS`] packages in a
+    /// row do not fit once the template is within [`NEARLY_FULL_BYTES`] of
+    /// full.
     pub(super) fn select(mut self) -> Vec<SelectedMempoolTx> {
-        self.select_primary();
-        self.pack();
-        self.selected
-    }
-
-    /// Selects packages in priority order until the template is nearly full,
-    /// the best remaining package does not fit, or no candidate remains.
-    pub(super) fn select_primary(&mut self) {
+        let mut consecutive_misfits = 0;
         while self.limits.remaining_bytes > SELECTION_STOP_BYTES {
             let Some(package) = self.best() else {
-                return;
+                break;
             };
-            if !self.add_package(package) {
-                return;
+            if self.add_package(package) {
+                consecutive_misfits = 0;
+                continue;
+            }
+            consecutive_misfits += 1;
+            if consecutive_misfits >= MAX_CONSECUTIVE_MISFITS
+                && self.limits.remaining_bytes <= NEARLY_FULL_BYTES
+            {
+                break;
             }
         }
-    }
-
-    /// Returns the transactions selected so far.
-    #[cfg(test)]
-    pub(super) fn selected(&self) -> &[SelectedMempoolTx] {
-        &self.selected
+        self.selected
     }
 
     /// Returns the required package of `id` and its score, or `None` if an
@@ -262,6 +263,8 @@ impl IndexedSelector {
 
     /// Adds `package` if every member fits, then rescores its descendants.
     /// Returns `false` and leaves the template unchanged if it does not fit.
+    /// A skipped package's members stay candidates: an ancestor can still be
+    /// selected on its own, and its descendants are then rescored.
     fn add_package(&mut self, package: Vec<transaction::Hash>) -> bool {
         let mut limits = self.limits.clone();
         if !package.iter().all(|id| limits.try_add(&self.pool[id])) {
@@ -327,42 +330,5 @@ impl IndexedSelector {
 
         #[cfg(not(test))]
         self.selected.push(tx);
-    }
-
-    /// Fills a large remaining gap with transactions from the next few
-    /// baseline entries whose parents are already selected. Returns the
-    /// number of entries visited.
-    pub(super) fn pack(&mut self) -> usize {
-        if self.limits.remaining_bytes <= PACKING_THRESHOLD_BYTES {
-            return 0;
-        }
-
-        let mut scanned = 0;
-        let scan_end = self
-            .cursor
-            .saturating_add(MAX_PACKING_SCAN_ENTRIES)
-            .min(self.order.len());
-
-        // Every visited entry counts, including selected or ineligible ones.
-        for offset in self.cursor..scan_end {
-            if self.limits.remaining_bytes <= SELECTION_STOP_BYTES
-                || self.limits.remaining_bytes < self.minimum_size
-            {
-                break;
-            }
-            scanned += 1;
-
-            let id = self.order[offset];
-            let Some(tx) = self.pool.get(&id) else {
-                continue;
-            };
-            if parents(&self.deps, &id).all(|parent| self.selected_depths.contains_key(&parent))
-                && self.limits.try_add(tx)
-            {
-                self.emit(id);
-            }
-        }
-
-        scanned
     }
 }

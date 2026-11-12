@@ -1,30 +1,39 @@
 //! Test-only selection variants, for comparing against the production
 //! selector in the GBT benchmark.
 //!
-//! Each variant mirrors [`super::indexed::IndexedSelector`] (ancestor
+//! [`VariantSelector`] mirrors [`super::indexed::IndexedSelector`] (ancestor
 //! packages, descendant rescoring, merge of baseline order and updates), but
 //! changes the package score or what happens when a package does not fit.
+//! [`weighted_random`] is the selector that preceded the indexed one.
 
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
 };
 
+use rand_10::{
+    distr::{Distribution, Open01},
+    Rng,
+};
 use zakura_chain::{
     block::MAX_BLOCK_BYTES,
     transaction::{self, VerifiedUnminedTx},
 };
-use zakura_consensus::MAX_BLOCK_SIGOPS;
 use zakura_node_services::mempool::TransactionDependencies;
 
 use super::{
-    indexed::{package, parents, Pool, SELECTION_STOP_BYTES},
+    indexed::{
+        package, parents, Pool, MAX_CONSECUTIVE_MISFITS, NEARLY_FULL_BYTES, SELECTION_STOP_BYTES,
+    },
     BlockTemplateLimits, SelectedMempoolTx,
 };
 
-/// Block bytes per block sigop, so a transaction's sigops can be priced in
-/// the same unit as its size.
-const BYTES_PER_SIGOP: u64 = MAX_BLOCK_BYTES / MAX_BLOCK_SIGOPS as u64;
+/// The previous production selector packed only when more than this many
+/// bytes were left after the main pass.
+const PACKING_THRESHOLD_BYTES: usize = 50_000;
+
+/// The previous production selector packed from at most this many entries.
+const MAX_PACKING_SCAN_ENTRIES: usize = 100;
 
 /// What a package's fee is divided by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,34 +41,86 @@ pub(super) enum Score {
     /// ZIP-401 cost: serialized size with a 10,000 floor. Matches the
     /// mempool mining index and the production selector.
     Zip401Cost,
-    /// Serialized size, without the floor.
-    Size,
     /// The larger of serialized size and sigops priced at the block's
     /// bytes-per-sigop ratio.
     SigopAdjustedSize,
-}
-
-impl Score {
-    fn weight(self, tx: &VerifiedUnminedTx) -> u64 {
-        let size = u64::try_from(tx.transaction.size()).expect("transaction sizes fit in u64");
-        match self {
-            Self::Zip401Cost => tx.cost(),
-            Self::Size => size,
-            Self::SigopAdjustedSize => {
-                size.max(u64::from(tx.block_sigop_count()) * BYTES_PER_SIGOP)
-            }
-        }
-    }
+    /// The largest share of any block limit the transaction uses (bytes,
+    /// sigops, and the ZIP 218 shielded limits when active), scaled to bytes.
+    ResourceAdjustedSize,
 }
 
 /// What the main pass does when the best package does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Misfit {
-    /// End the main pass, like the production selector.
-    Stop,
-    /// Skip the package and keep going until the template is nearly full or
-    /// candidates run out.
+    /// End the main pass, then pack from the next entries. The selector
+    /// before skip-and-continue.
+    StopThenPack,
+    /// Skip the package with the production stop rule.
     Skip,
+}
+
+/// Block capacity after the coinbase, for pricing each limit in bytes.
+#[derive(Clone, Copy)]
+struct Capacity {
+    bytes: f64,
+    sigops: f64,
+    /// `None` while the ZIP 218 limits are inactive.
+    shielded: Option<[f64; 5]>,
+}
+
+impl Capacity {
+    fn new(limits: &BlockTemplateLimits) -> Self {
+        let shielded = (limits.remaining_shielded_cost != u32::MAX).then(|| {
+            [
+                limits.remaining_orchard_actions,
+                limits.remaining_ironwood_actions,
+                limits.remaining_sapling_ios,
+                limits.remaining_sprout_joinsplits,
+                limits.remaining_shielded_cost,
+            ]
+            .map(f64::from)
+        });
+        Self {
+            bytes: limits.remaining_bytes as f64,
+            sigops: f64::from(limits.remaining_sigops),
+            shielded,
+        }
+    }
+}
+
+impl Score {
+    fn weight(self, tx: &VerifiedUnminedTx, capacity: &Capacity) -> u64 {
+        let size = u64::try_from(tx.transaction.size()).expect("transaction sizes fit in u64");
+        match self {
+            Self::Zip401Cost => tx.cost(),
+            Self::SigopAdjustedSize => {
+                let bytes_per_sigop =
+                    MAX_BLOCK_BYTES / u64::from(zakura_consensus::MAX_BLOCK_SIGOPS);
+                size.max(u64::from(tx.block_sigop_count()) * bytes_per_sigop)
+            }
+            Self::ResourceAdjustedSize => {
+                let mut share = size as f64 / capacity.bytes;
+                share = share.max(f64::from(tx.block_sigop_count()) / capacity.sigops);
+                if let Some(shielded) = capacity.shielded {
+                    let counts = tx.transaction.transaction().shielded_action_counts();
+                    let used = [
+                        counts.orchard_actions,
+                        counts.ironwood_actions,
+                        counts.sapling_ios,
+                        counts.sprout_joinsplits,
+                        counts.cost(),
+                    ];
+                    for (used, capacity) in used.into_iter().zip(shielded) {
+                        if capacity > 0.0 {
+                            share = share.max(f64::from(used) / capacity);
+                        }
+                    }
+                }
+                // At least one byte, so every weight is positive.
+                ((share * capacity.bytes).ceil() as u64).max(1)
+            }
+        }
+    }
 }
 
 /// A package score under a [`Score`]: highest fee per weight first, then the
@@ -114,6 +175,7 @@ pub(super) struct VariantSelector {
     update_keys: HashMap<transaction::Hash, Key>,
     cursor: usize,
     limits: BlockTemplateLimits,
+    capacity: Capacity,
     score: Score,
     misfit: Misfit,
     misfits: usize,
@@ -138,6 +200,7 @@ impl VariantSelector {
             pool.insert(id, tx);
         }
 
+        let capacity = Capacity::new(&limits);
         let mut selector = Self {
             pool,
             order,
@@ -149,6 +212,7 @@ impl VariantSelector {
             update_keys: HashMap::new(),
             cursor: 0,
             limits,
+            capacity,
             score,
             misfit,
             misfits: 0,
@@ -174,23 +238,71 @@ impl VariantSelector {
         selector
     }
 
-    /// Runs the main pass. There is no separate packing pass.
+    /// Runs the main pass, and packing for [`Misfit::StopThenPack`].
     pub(super) fn select(mut self) -> VariantSelection {
+        let mut consecutive_misfits = 0;
         while self.limits.remaining_bytes > SELECTION_STOP_BYTES {
             let Some(package) = self.best() else {
                 break;
             };
-            if !self.add_package(package) {
-                self.misfits += 1;
-                if self.misfit == Misfit::Stop {
-                    break;
+            if self.add_package(package) {
+                consecutive_misfits = 0;
+                continue;
+            }
+            self.misfits += 1;
+            consecutive_misfits += 1;
+            match self.misfit {
+                Misfit::StopThenPack => break,
+                Misfit::Skip => {
+                    if consecutive_misfits >= MAX_CONSECUTIVE_MISFITS
+                        && self.limits.remaining_bytes <= NEARLY_FULL_BYTES
+                    {
+                        break;
+                    }
                 }
             }
+        }
+
+        if self.misfit == Misfit::StopThenPack {
+            self.pack();
         }
 
         VariantSelection {
             txs: self.selected,
             misfits: self.misfits,
+        }
+    }
+
+    /// The previous production packing pass.
+    fn pack(&mut self) {
+        if self.limits.remaining_bytes <= PACKING_THRESHOLD_BYTES {
+            return;
+        }
+        let minimum_size = self
+            .pool
+            .values()
+            .map(|tx| tx.transaction.size())
+            .min()
+            .unwrap_or(usize::MAX);
+        let scan_end = self
+            .cursor
+            .saturating_add(MAX_PACKING_SCAN_ENTRIES)
+            .min(self.order.len());
+        for offset in self.cursor..scan_end {
+            if self.limits.remaining_bytes <= SELECTION_STOP_BYTES
+                || self.limits.remaining_bytes < minimum_size
+            {
+                break;
+            }
+            let id = self.order[offset];
+            let Some(tx) = self.pool.get(&id) else {
+                continue;
+            };
+            if parents(&self.deps, &id).all(|parent| self.selected_depths.contains_key(&parent))
+                && self.limits.try_add(tx)
+            {
+                self.emit(id);
+            }
         }
     }
 
@@ -202,7 +314,7 @@ impl VariantSelector {
             let tx = &self.pool[member];
             let member_fee: u64 = tx.miner_fee.into();
             fee = fee.checked_add(member_fee)?;
-            weight = weight.checked_add(self.score.weight(tx))?;
+            weight = weight.checked_add(self.score.weight(tx, &self.capacity))?;
         }
         let key = Key {
             fee,
@@ -296,4 +408,69 @@ impl VariantSelector {
         let tx = self.pool.remove(&id).expect("emitted from the pool");
         self.selected.push((depth, tx));
     }
+}
+
+/// The weighted-random selector from main before this change: conventional-fee
+/// independent transactions in fee-weighted random order, each followed by
+/// dependents whose dependencies are all selected, then low-fee ones.
+pub(super) fn weighted_random(
+    txs: Vec<VerifiedUnminedTx>,
+    deps: &TransactionDependencies,
+    mut limits: BlockTemplateLimits,
+    rng: &mut impl Rng,
+) -> Vec<SelectedMempoolTx> {
+    let dependencies = deps.dependencies();
+    let (independent, mut dependent): (HashMap<_, _>, HashMap<_, _>) = txs
+        .into_iter()
+        .map(|tx| (tx.transaction.id().mined_id(), tx))
+        .partition(|(id, _)| !dependencies.contains_key(id));
+    let (conventional, low_fee): (Vec<_>, Vec<_>) = independent
+        .into_values()
+        .partition(VerifiedUnminedTx::pays_conventional_fee);
+
+    let mut selected: Vec<SelectedMempoolTx> = Vec::new();
+    let mut selected_ids = HashSet::new();
+    for candidates in [conventional, low_fee] {
+        let mut clocks: Vec<_> = candidates
+            .into_iter()
+            .map(|tx| {
+                let uniform: f64 = Open01.sample(rng);
+                (-uniform.ln() / f64::from(tx.fee_weight_ratio), tx)
+            })
+            .collect();
+        clocks.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+
+        for (_, candidate) in clocks {
+            if !limits.try_add(&candidate) {
+                continue;
+            }
+            let id = candidate.transaction.id().mined_id();
+            selected_ids.insert(id);
+            selected.push((0, candidate));
+
+            let mut level = deps.direct_dependents(&id);
+            while !level.is_empty() {
+                let mut next = HashSet::new();
+                for dependent_id in &level {
+                    let ready = dependencies
+                        .get(dependent_id)
+                        .is_none_or(|parents| parents.iter().all(|p| selected_ids.contains(p)));
+                    if !ready {
+                        continue;
+                    }
+                    let Some(tx) = dependent.remove(dependent_id) else {
+                        continue;
+                    };
+                    if !tx.pays_conventional_fee() || !limits.try_add(&tx) {
+                        continue;
+                    }
+                    selected_ids.insert(*dependent_id);
+                    selected.push((1, tx));
+                    next.extend(deps.direct_dependents(dependent_id));
+                }
+                level = next;
+            }
+        }
+    }
+    selected
 }

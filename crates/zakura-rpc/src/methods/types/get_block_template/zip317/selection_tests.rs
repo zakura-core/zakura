@@ -11,6 +11,7 @@ use std::{
 };
 
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
+use rand_10::{rngs::StdRng, SeedableRng};
 use zcash_transparent::address::TransparentAddress;
 
 use zakura_chain::{
@@ -28,10 +29,10 @@ use zakura_state::GetBlockTemplateChainInfo;
 
 use super::{
     indexed::{
-        parents, priority, IndexedSelector, Pool, Priority, MAX_PACKING_SCAN_ENTRIES,
-        PACKING_THRESHOLD_BYTES, SELECTION_STOP_BYTES,
+        parents, priority, IndexedSelector, Pool, Priority, MAX_CONSECUTIVE_MISFITS,
+        NEARLY_FULL_BYTES, SELECTION_STOP_BYTES,
     },
-    selection_variants::{Misfit, Score, VariantSelector},
+    selection_variants::{weighted_random, Misfit, Score, VariantSelector},
     *,
 };
 use crate::methods::types::get_block_template::{
@@ -56,35 +57,21 @@ fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTempla
     BlockTemplateLimits::initial(network, height, coinbase)
 }
 
-/// Selected transactions, the number of entries packing visited, the time
-/// packing took, and how many best packages did not fit.
+/// Selected transactions, and how many best packages did not fit when the
+/// selector reports it.
 struct Selection {
     txs: Vec<SelectedMempoolTx>,
-    packing_scanned: usize,
-    packing_elapsed: Duration,
     misfits: usize,
 }
 
-/// Runs the primary passes, then packing if `pack` is set.
+/// Runs the production selector.
 fn run(
     txs: Vec<VerifiedUnminedTx>,
     deps: TransactionDependencies,
     limits: BlockTemplateLimits,
-    pack: bool,
 ) -> Selection {
-    let mut selector = IndexedSelector::new(txs, deps, limits);
-    selector.select_primary();
-    let (packing_scanned, packing_elapsed) = if pack {
-        let start = Instant::now();
-        let scanned = selector.pack();
-        (scanned, start.elapsed())
-    } else {
-        (0, Duration::ZERO)
-    };
     Selection {
-        txs: selector.selected().to_vec(),
-        packing_scanned,
-        packing_elapsed,
+        txs: IndexedSelector::new(txs, deps, limits).select(),
         misfits: 0,
     }
 }
@@ -328,34 +315,35 @@ impl Fixture {
 /// A selector configuration compared by the benchmark.
 #[derive(Clone, Copy, Debug)]
 enum Mode {
-    /// Production main pass, without packing.
-    Indexed,
-    /// Production selector: main pass and bounded packing.
-    IndexedPack,
-    /// Skip packages that do not fit, ranked by ZIP-401 cost.
-    SkipZip401,
-    /// Skip packages that do not fit, ranked by serialized size.
-    SkipSize,
-    /// Skip packages that do not fit, ranked by sigop-adjusted size.
-    SkipSigopAdjusted,
+    /// Weighted-random selection, as on main before the indexed selector.
+    Random,
+    /// The indexed selector before skip-and-continue: stop at the first
+    /// package that does not fit, then pack from the next 100 entries.
+    StopThenPack,
+    /// The production selector.
+    Production,
+    /// Skip-and-continue ranked by sigop-adjusted size.
+    SigopAdjusted,
+    /// Skip-and-continue ranked by the largest share of any block limit.
+    ResourceAdjusted,
 }
 
 impl Mode {
     const ALL: [Self; 5] = [
-        Self::Indexed,
-        Self::IndexedPack,
-        Self::SkipZip401,
-        Self::SkipSize,
-        Self::SkipSigopAdjusted,
+        Self::Random,
+        Self::StopThenPack,
+        Self::Production,
+        Self::SigopAdjusted,
+        Self::ResourceAdjusted,
     ];
 
     fn name(self) -> &'static str {
         match self {
-            Self::Indexed => "indexed",
-            Self::IndexedPack => "indexed_pack",
-            Self::SkipZip401 => "skip_zip401",
-            Self::SkipSize => "skip_size",
-            Self::SkipSigopAdjusted => "skip_sigop_adjusted",
+            Self::Random => "random",
+            Self::StopThenPack => "stop_then_pack",
+            Self::Production => "production",
+            Self::SigopAdjusted => "sigop_adjusted",
+            Self::ResourceAdjusted => "resource_adjusted",
         }
     }
 }
@@ -370,14 +358,19 @@ fn select(
     miner: &MinerParams,
 ) -> Selection {
     let limits = limits(network, height, miner);
-    let score = match mode {
-        Mode::Indexed => return run(txs, deps, limits, false),
-        Mode::IndexedPack => return run(txs, deps, limits, true),
-        Mode::SkipZip401 => Score::Zip401Cost,
-        Mode::SkipSize => Score::Size,
-        Mode::SkipSigopAdjusted => Score::SigopAdjustedSize,
+    let (score, misfit) = match mode {
+        Mode::Random => {
+            return Selection {
+                txs: weighted_random(txs, &deps, limits, &mut rand_10::rng()),
+                misfits: 0,
+            }
+        }
+        Mode::Production => return run(txs, deps, limits),
+        Mode::StopThenPack => (Score::Zip401Cost, Misfit::StopThenPack),
+        Mode::SigopAdjusted => (Score::SigopAdjustedSize, Misfit::Skip),
+        Mode::ResourceAdjusted => (Score::ResourceAdjustedSize, Misfit::Skip),
     };
-    variant(txs, deps, limits, score, Misfit::Skip)
+    variant(txs, deps, limits, score, misfit)
 }
 
 fn variant(
@@ -390,8 +383,6 @@ fn variant(
     let selection = VariantSelector::new(txs, deps, limits, score, misfit).select();
     Selection {
         txs: selection.txs,
-        packing_scanned: 0,
-        packing_elapsed: Duration::ZERO,
         misfits: selection.misfits,
     }
 }
@@ -402,10 +393,9 @@ struct Stats {
     bytes: usize,
     fees: u64,
     remaining: usize,
-    scanned: usize,
-    packing_ns: u64,
     misfits: usize,
     sigops_left: u32,
+    shielded_left: u32,
 }
 fn validate(
     selection: &Selection,
@@ -414,7 +404,6 @@ fn validate(
     height: Height,
     miner: &MinerParams,
 ) -> Stats {
-    assert!(selection.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
     let mut limits = limits(network, height, miner);
     let mut selected = std::collections::HashSet::new();
     let mut bytes = 0;
@@ -434,16 +423,28 @@ fn validate(
         bytes,
         fees,
         remaining: limits.remaining_bytes,
-        scanned: selection.packing_scanned,
-        packing_ns: selection.packing_elapsed.as_nanos().try_into().unwrap(),
         misfits: selection.misfits,
         sigops_left: limits.remaining_sigops,
+        shielded_left: limits.remaining_shielded_cost,
     }
 }
 
+/// Benchmark eras: before NU7, and with the ZIP 218 shielded limits active,
+/// as on Mainnet today.
+const ERAS: [(&str, NetworkUpgrade); 2] = [
+    ("pre_nu7", NetworkUpgrade::Nu6_3),
+    ("nu7", NetworkUpgrade::Nu7),
+];
+
 fn context() -> (Network, Height, MinerParams, GetBlockTemplateChainInfo) {
+    context_at(NetworkUpgrade::Nu6_3)
+}
+
+fn context_at(
+    upgrade: NetworkUpgrade,
+) -> (Network, Height, MinerParams, GetBlockTemplateChainInfo) {
     let network = Network::Mainnet;
-    let height = NetworkUpgrade::Nu6_3.activation_height(&network).unwrap();
+    let height = upgrade.activation_height(&network).unwrap();
     let miner = MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
         [0x7e; 20],
     )));
@@ -472,7 +473,7 @@ fn indexed_rescores_surviving_children_after_parent_selection() {
     let independent_id = independent.transaction.id().mined_id();
     let fixture = Fixture::from_transactions(vec![parent, child_a, child_b, independent]);
     let (txs, deps) = fixture.snapshot();
-    let selection = select(Mode::Indexed, txs, deps, &network, height, &miner);
+    let selection = select(Mode::Production, txs, deps, &network, height, &miner);
     validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(selection.txs[0].1.transaction.id().mined_id(), parent_id);
     assert_eq!(
@@ -482,63 +483,76 @@ fn indexed_rescores_surviving_children_after_parent_selection() {
 }
 
 #[test]
-fn indexed_packing_preserves_priority_prefix_and_fills_the_gap() {
+fn indexed_skips_packages_that_do_not_fit_beyond_any_scan_bound() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
-    let mut txs: Vec<_> = (0..12).map(|_| factory.tx(64, 10, Vec::new(), 1)).collect();
-    txs.extend((0..40).map(|_| factory.tx(1, 1, Vec::new(), 1)));
-    let fixture = Fixture::from_transactions(txs);
-    let (txs, deps) = fixture.snapshot();
-    let plain = select(Mode::Indexed, txs, deps, &network, height, &miner);
-    let plain_stats = validate(&plain, &fixture, &network, height, &miner);
-    assert!(plain_stats.remaining > PACKING_THRESHOLD_BYTES);
-    let (txs, deps) = fixture.snapshot();
-    let packed = select(Mode::IndexedPack, txs, deps, &network, height, &miner);
-    let packed_stats = validate(&packed, &fixture, &network, height, &miner);
-    assert!(packed.txs.starts_with(&plain.txs));
-    assert!(packed_stats.remaining < plain_stats.remaining);
-    assert!(packed.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
-}
-
-#[test]
-fn indexed_packing_stops_after_one_hundred_entries() {
-    let (network, height, miner, _) = context();
-    let mut factory = Factory::new();
-    let mut txs: Vec<_> = (0..=MAX_PACKING_SCAN_ENTRIES)
+    // More large, high-priority transactions than the old packing scan
+    // visited, ahead of one small transaction that fits.
+    let mut txs: Vec<_> = (0..110)
         .map(|_| factory.tx(64, 10, Vec::new(), 1))
         .collect();
     let small = factory.tx(1, 1, Vec::new(), 1);
+    let small_size = small.transaction.size();
     let small_id = small.transaction.id().mined_id();
+    assert!(txs[0].transaction.size() > small_size + SELECTION_STOP_BYTES);
     txs.push(small);
     let fixture = Fixture::from_transactions(txs);
-    let run = |mut txs: Vec<VerifiedUnminedTx>, deps, remove_first| {
-        if remove_first {
-            txs.remove(0);
-        }
+    let limits_for_gap = || {
         let mut limits = limits(&network, height, &miner);
-        limits.remaining_bytes = PACKING_THRESHOLD_BYTES + 1;
-        run(txs, deps, limits, true)
+        limits.remaining_bytes = small_size + SELECTION_STOP_BYTES + 1;
+        limits
     };
 
-    // The small transaction follows 100 oversized entries after the blocked
-    // priority candidate. It must not be visited as entry 101.
     let (txs, deps) = fixture.snapshot();
-    let bounded = run(txs, deps, false);
-    assert_eq!(bounded.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
-    assert!(bounded.txs.is_empty());
+    let selection = run(txs, deps, limits_for_gap());
+    validate(&selection, &fixture, &network, height, &miner);
+    assert_eq!(ids(&selection), [small_id]);
 
-    // Removing one oversized transaction puts the fitting candidate exactly at
-    // the scan boundary, proving entry 100 is still considered.
+    // The previous selector stopped at the first large transaction and had
+    // too little space left to pack.
     let (txs, deps) = fixture.snapshot();
-    let boundary = run(txs, deps, true);
-    validate(&boundary, &fixture, &network, height, &miner);
-    assert_eq!(boundary.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
-    assert_eq!(boundary.txs.len(), 1);
-    assert_eq!(boundary.txs[0].1.transaction.id().mined_id(), small_id);
+    let stopped = variant(
+        txs,
+        deps,
+        limits_for_gap(),
+        Score::Zip401Cost,
+        Misfit::StopThenPack,
+    );
+    assert!(stopped.txs.is_empty());
 }
 
 #[test]
-fn indexed_primary_stops_at_three_kilobytes() {
+fn indexed_gives_up_after_consecutive_misfits_once_nearly_full() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let small = factory.tx(0, 1, Vec::new(), 1);
+    let small_size = small.transaction.size();
+    let small_id = small.transaction.id().mined_id();
+    let large: Vec<_> = (0..MAX_CONSECUTIVE_MISFITS)
+        .map(|_| factory.tx(1, 10, Vec::new(), 1))
+        .collect();
+    let remaining = SELECTION_STOP_BYTES + small_size;
+    assert!(remaining <= NEARLY_FULL_BYTES);
+    assert!(large.iter().all(|tx| tx.transaction.size() > remaining));
+
+    let run_with = |large: &[VerifiedUnminedTx]| {
+        let mut txs = large.to_vec();
+        txs.push(small.clone());
+        let fixture = Fixture::from_transactions(txs);
+        let (txs, deps) = fixture.snapshot();
+        let mut limits = limits(&network, height, &miner);
+        limits.remaining_bytes = remaining;
+        ids(&run(txs, deps, limits))
+    };
+
+    // The small transaction ranks after every large one. It is reached after
+    // one fewer than the bound, and not after the full bound.
+    assert_eq!(run_with(&large[1..]), [small_id]);
+    assert!(run_with(&large).is_empty());
+}
+
+#[test]
+fn indexed_stops_at_three_kilobytes() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let first = factory.tx(0, 10, Vec::new(), 1);
@@ -547,27 +561,22 @@ fn indexed_primary_stops_at_three_kilobytes() {
     let tail = factory.tx(0, 1, Vec::new(), 2);
     assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
     let fixture = Fixture::from_transactions(vec![first, tail]);
-    for pack in [false, true] {
-        for remaining in [SELECTION_STOP_BYTES - 1, SELECTION_STOP_BYTES] {
-            let (txs, deps) = fixture.snapshot();
-            let mut limits = limits(&network, height, &miner);
-            limits.remaining_bytes = remaining;
-            let selection = run(txs, deps, limits, pack);
-            assert!(selection.txs.is_empty());
-            assert_eq!(selection.packing_scanned, 0);
-        }
+    for remaining in [SELECTION_STOP_BYTES - 1, SELECTION_STOP_BYTES] {
         let (txs, deps) = fixture.snapshot();
         let mut limits = limits(&network, height, &miner);
-        limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
-        let selection = run(txs, deps, limits, pack);
-        validate(&selection, &fixture, &network, height, &miner);
-        assert_eq!(selection.txs.len(), 1);
-        assert_eq!(selection.txs[0].1.transaction.id().mined_id(), first_id);
+        limits.remaining_bytes = remaining;
+        assert!(run(txs, deps, limits).txs.is_empty());
     }
+    let (txs, deps) = fixture.snapshot();
+    let mut limits = limits(&network, height, &miner);
+    limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
+    let selection = run(txs, deps, limits);
+    validate(&selection, &fixture, &network, height, &miner);
+    assert_eq!(ids(&selection), [first_id]);
 }
 
 #[test]
-fn indexed_packing_stops_at_three_kilobytes() {
+fn indexed_stops_at_three_kilobytes_after_skipping() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let mut txs = vec![factory.tx(64, 10, Vec::new(), 1)];
@@ -577,7 +586,7 @@ fn indexed_packing_stops_at_three_kilobytes() {
         .map(|tx| tx.transaction.size())
         .sum::<usize>()
         + SELECTION_STOP_BYTES;
-    assert!(remaining > PACKING_THRESHOLD_BYTES);
+    assert!(txs[0].transaction.size() > remaining);
     let tail = factory.tx(0, 1, Vec::new(), 1);
     let tail_id = tail.transaction.id().mined_id();
     assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
@@ -586,15 +595,13 @@ fn indexed_packing_stops_at_three_kilobytes() {
     let (txs, deps) = fixture.snapshot();
     let mut limits = limits(&network, height, &miner);
     limits.remaining_bytes = remaining;
-    let selection = run(txs, deps, limits, true);
+    // The large transaction is skipped, the eight mid-priority ones fill the
+    // template to exactly the stop threshold, and the tail is never reached.
+    let selection = run(txs, deps, limits);
     let stats = validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(remaining - stats.bytes, SELECTION_STOP_BYTES);
-    assert_eq!(selection.packing_scanned, 8);
     assert_eq!(selection.txs.len(), 8);
-    assert!(selection
-        .txs
-        .iter()
-        .all(|(_, tx)| tx.transaction.id().mined_id() != tail_id));
+    assert!(!ids(&selection).contains(&tail_id));
 }
 
 #[test]
@@ -623,7 +630,7 @@ fn indexed_selection_is_repeatable_and_orders_package_parents_by_txid() {
     let runs: Vec<_> = (0..8)
         .map(|_| {
             let (txs, deps) = fixture.snapshot();
-            let selection = select(Mode::IndexedPack, txs, deps, &network, height, &miner);
+            let selection = select(Mode::Production, txs, deps, &network, height, &miner);
             validate(&selection, &fixture, &network, height, &miner);
             ids(&selection)
         })
@@ -661,7 +668,7 @@ fn indexed_skips_candidates_with_unavailable_ancestors() {
 
     // The orphan comes first, as its baseline score would rank it.
     let selection = select(
-        Mode::IndexedPack,
+        Mode::Production,
         vec![orphan, available],
         deps,
         &network,
@@ -672,37 +679,51 @@ fn indexed_skips_candidates_with_unavailable_ancestors() {
 }
 
 /// The variant selector with the production score and misfit rule selects
-/// exactly what the production main pass selects, so benchmark differences
-/// come from the variant settings alone. Every variant's output is valid.
+/// exactly what production selects, so benchmark differences come from the
+/// variant settings alone. Every mode's output is valid in both eras.
 #[test]
 fn selection_variants_match_production_and_respect_limits() {
-    let (network, height, miner, _) = context();
-    for kind in [
-        "uniform",
-        "mixed",
-        "packages",
-        "mixed_packages",
-        "transparent",
-        "mixed_transparent",
-    ] {
-        // Large enough that every fixture overfills a block.
-        let fixture = Fixture::full(kind, 12_000_000);
-        let (txs, deps) = fixture.snapshot();
-        let production = select(Mode::Indexed, txs, deps, &network, height, &miner);
-        let (txs, deps) = fixture.snapshot();
-        let mirrored = variant(
-            txs,
-            deps,
-            limits(&network, height, &miner),
-            Score::Zip401Cost,
-            Misfit::Stop,
-        );
-        assert_eq!(ids(&production), ids(&mirrored), "{kind}");
-
-        for mode in Mode::ALL {
+    for (era, upgrade) in ERAS {
+        let (network, height, miner, _) = context_at(upgrade);
+        for kind in [
+            "uniform",
+            "mixed",
+            "packages",
+            "mixed_packages",
+            "transparent",
+            "mixed_transparent",
+        ] {
+            // Large enough that every fixture overfills a block.
+            let fixture = Fixture::full(kind, 12_000_000);
             let (txs, deps) = fixture.snapshot();
-            let selection = select(mode, txs, deps, &network, height, &miner);
-            validate(&selection, &fixture, &network, height, &miner);
+            let production = select(Mode::Production, txs, deps, &network, height, &miner);
+            let (txs, deps) = fixture.snapshot();
+            let mirrored = variant(
+                txs,
+                deps,
+                limits(&network, height, &miner),
+                Score::Zip401Cost,
+                Misfit::Skip,
+            );
+            assert_eq!(ids(&production), ids(&mirrored), "{era} {kind}");
+
+            for mode in Mode::ALL {
+                let (txs, deps) = fixture.snapshot();
+                let selection = if matches!(mode, Mode::Random) {
+                    Selection {
+                        txs: weighted_random(
+                            txs,
+                            &deps,
+                            limits(&network, height, &miner),
+                            &mut StdRng::seed_from_u64(317),
+                        ),
+                        misfits: 0,
+                    }
+                } else {
+                    select(mode, txs, deps, &network, height, &miner)
+                };
+                validate(&selection, &fixture, &network, height, &miner);
+            }
         }
     }
 }
@@ -716,104 +737,110 @@ fn benchmark_full_mempool_gbt_selection() {
         return;
     };
     let cost_limit: u64 = cost_limit.parse().unwrap();
-    let (network, height, miner, chain) = context();
-    let fixtures = std::env::var("ZAKURA_GBT_BENCH_FIXTURES").ok();
-    let kinds = [
-        "uniform",
-        "mixed",
-        "packages",
-        "mixed_packages",
-        "transparent",
-        "mixed_transparent",
-    ];
-    for kind in kinds.into_iter().filter(|kind| {
-        fixtures
-            .as_deref()
-            .is_none_or(|fixtures| fixtures.split(',').any(|fixture| fixture == *kind))
+    let eras = std::env::var("ZAKURA_GBT_BENCH_ERAS").ok();
+    for (era, upgrade) in ERAS.into_iter().filter(|(era, _)| {
+        eras.as_deref()
+            .is_none_or(|eras| eras.split(',').any(|selected| selected == *era))
     }) {
-        let fixture = Fixture::full(kind, cost_limit);
-        for phase in ["selection", "template_json"] {
-            let modes = Mode::ALL;
-            let mut results: [Vec<(Duration, Stats)>; Mode::ALL.len()] = Default::default();
-            // Sample 0 warms caches and is discarded.
-            for sample in 0..=SAMPLES {
-                // Rotate and alternate the mode order, balancing position
-                // and warm-cache effects between modes.
-                let mut order: Vec<_> = (0..modes.len())
-                    .map(|index| (index + sample) % modes.len())
-                    .collect();
-                if sample % 2 == 1 {
-                    order.reverse();
-                }
-                for index in order {
-                    let mode = modes[index];
-                    let mut elapsed = Duration::ZERO;
-                    let selection = if phase == "selection" {
-                        let (txs, deps) = fixture.snapshot();
-                        let start = Instant::now();
-                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
-                        elapsed += start.elapsed();
-                        result
-                    } else {
-                        let start = Instant::now();
-                        let (txs, deps) = fixture.snapshot();
-                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
-                        elapsed += start.elapsed();
-                        result
-                    };
-                    let stats = validate(&selection, &fixture, &network, height, &miner);
-                    if phase == "template_json" {
-                        let start = Instant::now();
-                        let template = BlockTemplateResponse::new_internal(
-                            &network,
-                            None,
-                            &miner,
-                            &chain,
-                            "0".repeat(46).parse().unwrap(),
-                            selection.txs,
-                            None,
-                        )
-                        .unwrap();
-                        black_box(serde_json::to_vec(&template).unwrap());
-                        elapsed += start.elapsed();
-                        let block =
-                            proposal_block_from_template(&template, None, &network).unwrap();
-                        assert!(
-                            u64::try_from(block.zcash_serialized_size()).unwrap()
-                                <= MAX_BLOCK_BYTES
-                        );
+        let (network, height, miner, chain) = context_at(upgrade);
+        let fixtures = std::env::var("ZAKURA_GBT_BENCH_FIXTURES").ok();
+        let kinds = [
+            "uniform",
+            "mixed",
+            "packages",
+            "mixed_packages",
+            "transparent",
+            "mixed_transparent",
+        ];
+        for kind in kinds.into_iter().filter(|kind| {
+            fixtures
+                .as_deref()
+                .is_none_or(|fixtures| fixtures.split(',').any(|fixture| fixture == *kind))
+        }) {
+            let fixture = Fixture::full(kind, cost_limit);
+            for phase in ["selection", "template_json"] {
+                let modes = Mode::ALL;
+                let mut results: [Vec<(Duration, Stats)>; Mode::ALL.len()] = Default::default();
+                // Sample 0 warms caches and is discarded.
+                for sample in 0..=SAMPLES {
+                    // Rotate and alternate the mode order, balancing position
+                    // and warm-cache effects between modes.
+                    let mut order: Vec<_> = (0..modes.len())
+                        .map(|index| (index + sample) % modes.len())
+                        .collect();
+                    if sample % 2 == 1 {
+                        order.reverse();
                     }
-                    if sample > 0 {
-                        results[index].push((elapsed, stats));
+                    for index in order {
+                        let mode = modes[index];
+                        let mut elapsed = Duration::ZERO;
+                        let selection = if phase == "selection" {
+                            let (txs, deps) = fixture.snapshot();
+                            let start = Instant::now();
+                            let result =
+                                black_box(select(mode, txs, deps, &network, height, &miner));
+                            elapsed += start.elapsed();
+                            result
+                        } else {
+                            let start = Instant::now();
+                            let (txs, deps) = fixture.snapshot();
+                            let result =
+                                black_box(select(mode, txs, deps, &network, height, &miner));
+                            elapsed += start.elapsed();
+                            result
+                        };
+                        let stats = validate(&selection, &fixture, &network, height, &miner);
+                        if phase == "template_json" {
+                            let start = Instant::now();
+                            let template = BlockTemplateResponse::new_internal(
+                                &network,
+                                None,
+                                &miner,
+                                &chain,
+                                "0".repeat(46).parse().unwrap(),
+                                selection.txs,
+                                None,
+                            )
+                            .unwrap();
+                            black_box(serde_json::to_vec(&template).unwrap());
+                            elapsed += start.elapsed();
+                            let block =
+                                proposal_block_from_template(&template, None, &network).unwrap();
+                            assert!(
+                                u64::try_from(block.zcash_serialized_size()).unwrap()
+                                    <= MAX_BLOCK_BYTES
+                            );
+                        }
+                        if sample > 0 {
+                            results[index].push((elapsed, stats));
+                        }
                     }
                 }
-            }
 
-            for (mode, mut result) in modes.into_iter().zip(results) {
-                let mode = mode.name();
-                result.sort_by_key(|(elapsed, _)| *elapsed);
-                let median =
-                    (result[SAMPLES / 2 - 1].0.as_nanos() + result[SAMPLES / 2].0.as_nanos()) / 2;
-                let mut packing_times: Vec<_> =
-                    result.iter().map(|(_, stats)| stats.packing_ns).collect();
-                packing_times.sort();
-                let packing_ns = (packing_times[SAMPLES / 2 - 1] + packing_times[SAMPLES / 2]) / 2;
-                let values = |extract: fn(Stats) -> u64| -> (u64, u64) {
-                    let mut values: Vec<_> =
-                        result.iter().map(|(_, stats)| extract(*stats)).collect();
-                    values.sort();
-                    (values[0], values[values.len() - 1])
-                };
-                let (selected_min, selected_max) = values(|s| u64::try_from(s.selected).unwrap());
-                let (bytes_min, bytes_max) = values(|s| u64::try_from(s.bytes).unwrap());
-                let (fees_min, fees_max) = values(|s| s.fees);
-                let (remaining_min, remaining_max) =
-                    values(|s| u64::try_from(s.remaining).unwrap());
-                let (scanned_min, scanned_max) = values(|s| u64::try_from(s.scanned).unwrap());
-                let (_, misfits) = values(|s| u64::try_from(s.misfits).unwrap());
-                let (sigops_left, _) = values(|s| u64::from(s.sigops_left));
-                println!("gbt fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={mode} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} scanned_min={scanned_min} scanned_max={scanned_max} packing_ns={packing_ns} misfits={misfits} sigops_left={sigops_left}",
+                for (mode, mut result) in modes.into_iter().zip(results) {
+                    let mode = mode.name();
+                    result.sort_by_key(|(elapsed, _)| *elapsed);
+                    let median = (result[SAMPLES / 2 - 1].0.as_nanos()
+                        + result[SAMPLES / 2].0.as_nanos())
+                        / 2;
+                    let values = |extract: fn(Stats) -> u64| -> (u64, u64) {
+                        let mut values: Vec<_> =
+                            result.iter().map(|(_, stats)| extract(*stats)).collect();
+                        values.sort();
+                        (values[0], values[values.len() - 1])
+                    };
+                    let (selected_min, selected_max) =
+                        values(|s| u64::try_from(s.selected).unwrap());
+                    let (bytes_min, bytes_max) = values(|s| u64::try_from(s.bytes).unwrap());
+                    let (fees_min, fees_max) = values(|s| s.fees);
+                    let (remaining_min, remaining_max) =
+                        values(|s| u64::try_from(s.remaining).unwrap());
+                    let (_, misfits) = values(|s| u64::try_from(s.misfits).unwrap());
+                    let (sigops_left, _) = values(|s| u64::from(s.sigops_left));
+                    let (shielded_left, _) = values(|s| u64::from(s.shielded_left));
+                    println!("gbt era={era} fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={mode} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} misfits={misfits} sigops_left={sigops_left} shielded_left={shielded_left}",
                     fixture.cost, fixture.pool.len(), result[0].0.as_nanos(), result[SAMPLES-1].0.as_nanos());
+                }
             }
         }
     }

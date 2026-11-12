@@ -1606,7 +1606,7 @@ fn run_records(dir: &Path, binding: &TaskBinding) -> Result<Vec<RunRecord>, Stri
 /// Why a task's recorded runs under `<dir>/runs` don't pass, if they
 /// don't (Rule 11): every run is of `harness`, in one of `phases`, and
 /// passes through [`owned_run_passes`] with that phase's expected result,
-/// and every phase has at least one run.
+/// and every phase has exactly one run.
 fn runs_refusal(
     dir: &Path,
     binding: &TaskBinding,
@@ -1635,7 +1635,10 @@ fn runs_refusal(
         if let Err(why) = owned_run_passes(&run.end, &registered, expect) {
             return Some(format!("run {} ({phase}): {why}", run.stem));
         }
-        seen.insert(*phase);
+        // Each phase is one child making one run: a second is unaccounted.
+        if !seen.insert(*phase) {
+            return Some(format!("{phase} recorded more than one run"));
+        }
     }
     phases
         .iter()
@@ -1746,13 +1749,41 @@ fn minimized_bundle_refusal(
         return Some("the kept minimized input's confirmation doesn't confirm it".to_owned());
     }
     let pinned = report.pointer("/build/sim_binary").and_then(Value::as_str);
-    let bound = TraceReader::open(&trace).ok().is_some_and(|trace| {
-        trace.meta.input.as_ref().map(|i| i.sha256.as_str()) == Some(minimized)
-            && Some(trace.meta.build.binary.as_str()) == pinned
-    });
-    (!bound).then(|| {
-        "the kept trace isn't the pinned simulator's run of the minimized input".to_owned()
-    })
+    let Ok(kept) = TraceReader::open(&trace) else {
+        return Some("the kept minimized trace doesn't read".to_owned());
+    };
+    let bound = kept.meta.input.as_ref().map(|i| i.sha256.as_str()) == Some(minimized)
+        && Some(kept.meta.build.binary.as_str()) == pinned
+        && confirmation
+            .as_ref()
+            .and_then(|c| c.get("trace_id"))
+            .and_then(Value::as_str)
+            == Some(kept.id.as_str());
+    if !bound {
+        return Some(
+            "the kept trace isn't its confirmation's run of the minimized input".to_owned(),
+        );
+    }
+    // The trace itself passes the one judge, expecting the property.
+    let Ok(entry) = crate::harness::find(&kept.meta.sim) else {
+        return Some(format!(
+            "the kept trace's harness {} isn't one at S",
+            kept.meta.sim
+        ));
+    };
+    let Some(end) = kept.end.as_ref() else {
+        return Some("the kept minimized trace has no end record".to_owned());
+    };
+    owned_run_passes(
+        end,
+        &registered(entry),
+        &RunExpect::Violates {
+            property: property.to_owned(),
+            also: Vec::new(),
+        },
+    )
+    .err()
+    .map(|why| format!("the kept minimized trace: {why}"))
 }
 
 /// The minimization's verdict (Rule 11): `sim-minimize` reported a

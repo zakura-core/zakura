@@ -224,16 +224,21 @@ pub fn consumed_cleanup(results: &ResultFile, artifacts: &Path) -> Result<(), St
     index_traces(artifacts, &mut traces);
     for result in &results.results {
         for digest in executed_traces(&result.actual) {
-            let dir = traces
+            // Every trace with this digest is judged: integrity runs from the
+            // same source can leave identical test artifacts beside
+            // histories whose cleanup differs.
+            let dirs: &Vec<std::path::PathBuf> = traces
                 .get(digest)
                 .ok_or_else(|| format!("the header run's trace {digest} isn't in its artifacts"))?;
-            let trace = TraceReader::open(dir)
-                .map_err(|error| format!("the header trace in {}: {error}", dir.display()))?;
-            let end = trace
-                .end
-                .ok_or_else(|| format!("the header trace in {} has no end", dir.display()))?;
-            if let Some(fault) = super::judge::cleanup_fault(&end.cleanup) {
-                return Err(format!("a consumed header run ({digest}): {fault}"));
+            for dir in dirs {
+                let trace = TraceReader::open(dir)
+                    .map_err(|error| format!("the header trace in {}: {error}", dir.display()))?;
+                let end = trace
+                    .end
+                    .ok_or_else(|| format!("the header trace in {} has no end", dir.display()))?;
+                if let Some(fault) = super::judge::cleanup_fault(&end.cleanup) {
+                    return Err(format!("a consumed header run ({digest}): {fault}"));
+                }
             }
         }
     }
@@ -242,7 +247,10 @@ pub fn consumed_cleanup(results: &ResultFile, artifacts: &Path) -> Result<(), St
 
 /// Adds every trace directory under `dir` to `traces`, by its trace's ID,
 /// the SHA-256 of its `trace.jsonl`, without following links.
-fn index_traces(dir: &Path, traces: &mut std::collections::BTreeMap<String, std::path::PathBuf>) {
+fn index_traces(
+    dir: &Path,
+    traces: &mut std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -268,7 +276,7 @@ fn index_traces(dir: &Path, traces: &mut std::collections::BTreeMap<String, std:
             {
                 use sha2::{Digest, Sha256};
                 let id = crate::trace::meta::hex(&Sha256::digest(&bytes));
-                traces.insert(id, dir.join("history"));
+                traces.entry(id).or_default().push(dir.join("history"));
             }
         } else if kind.is_file() && path.file_name().is_some_and(|name| name == TRACE_FILE) {
             // A regular file only, read without following a link and within
@@ -279,7 +287,7 @@ fn index_traces(dir: &Path, traces: &mut std::collections::BTreeMap<String, std:
             {
                 use sha2::{Digest, Sha256};
                 let id = crate::trace::meta::hex(&Sha256::digest(&bytes));
-                traces.insert(id, dir.to_owned());
+                traces.entry(id).or_default().push(dir.to_owned());
             }
         }
     }

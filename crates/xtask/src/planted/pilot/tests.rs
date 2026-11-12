@@ -145,9 +145,10 @@ fn sensitivity_rejects_missing_witnesses() {
 
     let why = confirmed_trace(
         ChildEnd::Exited(1),
-        Some(&serde_json::json!({"status": "witness-lost", "detail": null})),
+        Some(&serde_json::json!({"status": "witness-lost", "detail": null, "trace": "t"})),
+        Confirm::Witness,
     )
-    .expect_err("a lost witness doesn't confirm");
+    .expect_err("a lost witness doesn't confirm a witness");
     assert!(why.starts_with("missing witness"), "{why}");
     let caught = run(Some(ID), &[(ID, VIOLATED)]);
     assert_eq!(
@@ -673,22 +674,45 @@ fn traces_give_their_facts() {
     assert!(parse_trace(r#"{"step":1}"#, ID).is_err());
 }
 
-/// A confirmation must say `confirmed`, exit 0 and name its trace.
+/// A confirmation must say `confirmed`, exit 0 and name its trace. A kill
+/// also confirms on a trace that is no witness, and says so.
 #[test]
 fn confirmations_must_confirm() {
     let confirmed = serde_json::json!({"status": "confirmed", "trace": "traces/a/b"});
-    assert_eq!(
-        confirmed_trace(ChildEnd::Exited(0), Some(&confirmed)),
-        Ok(PathBuf::from("traces/a/b"))
-    );
-    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed)).is_err());
-    assert!(confirmed_trace(ChildEnd::Exited(1), None).is_err());
-    let other = serde_json::json!({"status": "other-property", "detail": OTHER});
-    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other))
-        .expect_err("another property doesn't confirm")
-        .contains(OTHER));
-    let untraced = serde_json::json!({"status": "confirmed"});
-    assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced)).is_err());
+    for need in [Confirm::Witness, Confirm::Kill] {
+        assert_eq!(
+            confirmed_trace(ChildEnd::Exited(0), Some(&confirmed), need),
+            Ok(ConfirmedTrace {
+                dir: PathBuf::from("traces/a/b"),
+                missing_witness: None,
+            })
+        );
+        assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed), need).is_err());
+        assert!(confirmed_trace(ChildEnd::Exited(1), None, need).is_err());
+        let other = serde_json::json!({"status": "other-property", "detail": OTHER});
+        assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other), need)
+            .expect_err("another property doesn't confirm")
+            .contains(OTHER));
+        let untraced = serde_json::json!({"status": "confirmed"});
+        assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced), need).is_err());
+    }
+
+    let lost = serde_json::json!({
+        "status": "witness-lost",
+        "detail": "lost its trigger history",
+        "trace": "traces/a/b",
+    });
+    let kill = confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Kill)
+        .expect("a kill confirms without a witness");
+    assert_eq!(kill.dir, PathBuf::from("traces/a/b"));
+    assert!(kill
+        .missing_witness
+        .expect("the kill says it's no witness")
+        .contains("lost its trigger history"));
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Witness).is_err());
+    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&lost), Confirm::Kill).is_err());
+    let untraced = serde_json::json!({"status": "witness-unsupported"});
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&untraced), Confirm::Kill).is_err());
 }
 
 /// A patch must change exactly its declared production files.

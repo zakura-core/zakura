@@ -20,7 +20,7 @@ use super::{
         Reason, Record, Trigger,
     },
     generate::{
-        baseline_lane, campaign_class, co_violations, confirmed, judge_unpatched,
+        baseline_lane, campaign_class, co_violations, confirm_child, confirmed, judge_unpatched,
         no_generator as no_generator_of, plan, shrink_wall, unpatched_class, write_exclusions,
         FollowUp, GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure,
         GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched, PropertyFinding, Search, Searched,
@@ -1333,6 +1333,17 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
         lane.finding().unwrap().log,
         std::path::PathBuf::from("mutants/x/unpatched-Confirmed-replay.log"),
         "an unshrunk violation is a finding too"
+    );
+}
+
+/// A kill's confirm or replay child gets ten of its search's runs, and at
+/// least five minutes.
+#[test]
+fn a_slow_harness_gets_a_longer_confirmation() {
+    assert_eq!(confirm_child(Duration::ZERO), Duration::from_secs(300));
+    assert_eq!(
+        confirm_child(Duration::from_secs(105)),
+        Duration::from_secs(1050)
     );
 }
 

@@ -70,12 +70,12 @@ mod tests;
 
 use super::lane::{
     self, confirm_and_replay, run_lane_child, sim_build_failure, BuildFailure, CampaignBounds,
-    CampaignFacts, LaneError, LaneSpec,
+    CampaignFacts, Confirm, LaneError, LaneSpec,
 };
 #[cfg(test)]
 use super::lane::{
     campaign_facts, confirmed_trace, failure_kind, fuzz_build_failure, start_args,
-    stop_on_interrupt, Failure,
+    stop_on_interrupt, ConfirmedTrace, Failure,
 };
 use classify::{
     Class, Classified, DiscoveryRun, NoCampaign, Recorded, SensitivityRun, Summary, TraceFacts,
@@ -615,6 +615,7 @@ fn sensitivity_case(
                             &tree.join(&case.witness),
                             &case.property,
                             &[],
+                            Confirm::Witness,
                             &dir.join("confirmation"),
                             child,
                         )?
@@ -923,6 +924,7 @@ fn discovery_case(
                                     &lane_dir.join("store").join(input),
                                     &case.property,
                                     &[],
+                                    Confirm::Witness,
                                     &lane_dir.join("confirmation"),
                                     child,
                                 )?

@@ -160,6 +160,7 @@ pub fn progress_scenario() -> WireScenario {
             reply_holds: Vec::new(),
             disruptions: Vec::new(),
         },
+        budget: None,
     }
 }
 

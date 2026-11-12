@@ -160,6 +160,11 @@ const C3_PROVING: &[TestRef] = &[
     sim_test(REPLAY_EXACT, "drain_picks_replay"),
     sim_test(REPLAY_EXACT, "harness_failure_before_a_prefix_ends_fails"),
     sim_test(REPLAY_EXACT, "planted_host_clock_is_nondeterministic"),
+    sim_test(REPLAY_EXACT, "planted_payload_byte_is_nondeterministic"),
+    sim_test(
+        REPLAY_EXACT,
+        "changed_setup_observation_is_nondeterministic",
+    ),
     sim_test(REPLAY_EXACT, "effects_replay_child"),
     sim_test(REPLAY_EXACT, "effects_replay_in_a_fresh_process"),
     sim_test(REPLAY_EXACT, "replay_returns_the_violations_end_leaves_out"),
@@ -578,6 +583,9 @@ pub struct Narrowing {
     pub test: NarrowingTest,
 }
 
+/// The narrowing entries' tests' file.
+pub const NARROWING_TESTS: &str = "tests/header_acceptance_narrowing.rs";
+
 /// The node harnesses with no peers.
 const PEERLESS: &[&str] = &[
     "header-sync/smoke",
@@ -596,8 +604,9 @@ fn every_execution(ctx: &ResultCtx, each: impl Fn(bool, RunBy) -> bool) -> bool 
             .all(|&(empty_override, run_by)| each(empty_override, run_by))
 }
 
-/// The only narrowing entries. Each is pending until hdr-14.7b, whose tool
-/// produces the results their tests judge, so none releases anything yet.
+/// The only narrowing entries, each with its test in [`NARROWING_TESTS`],
+/// which takes the results it releases from the committed manifest and
+/// fails if their runs carry the contract's evidence.
 pub const NARROWING: &[Narrowing] = &[
     Narrowing {
         entry: "N1",
@@ -610,14 +619,20 @@ pub const NARROWING: &[Narrowing] = &[
                     .is_some_and(|harness| PEERLESS.contains(&harness))
         },
         reason: "those harnesses build no peers, so no PeerRecords exist",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n1_peerless_and_machine_results_read_no_peer_evidence",
+        )),
     },
     Narrowing {
         entry: "N2",
         contracts: &[ContractId::C9],
         releases: |ctx| ctx.kind != ResultKind::Caught && every_execution(ctx, |empty, _| empty),
         reason: "only Draft recordings and their replays read the override",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n2_released_results_carry_no_draft_override",
+        )),
     },
     Narrowing {
         entry: "N3",
@@ -630,7 +645,10 @@ pub const NARROWING: &[Narrowing] = &[
                     .is_some_and(|harness| harness != "header-sync/release-wake")
         },
         reason: "only header-sync/release-wake builds the release-wake fixtures",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n3_only_release_wake_runs_a_wake_fixture",
+        )),
     },
     Narrowing {
         entry: "N4",
@@ -646,7 +664,10 @@ pub const NARROWING: &[Narrowing] = &[
         releases: |ctx| ctx.machine,
         reason: "machine histories run a transport-free loop, not Sim::run, its drain, \
                  checkpoints or stores",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n4_machine_results_run_no_sim_drain_or_stores",
+        )),
     },
     Narrowing {
         entry: "N5",
@@ -657,7 +678,10 @@ pub const NARROWING: &[Narrowing] = &[
         },
         reason: "the planted runner performs and replays its own cases, so only \
                  independently run histories are free of it",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n5_released_results_are_recorded_by_the_tool",
+        )),
     },
 ];
 
@@ -670,7 +694,7 @@ pub const NARROWING: &[Narrowing] = &[
 /// can't compare, so a widened release, such as a harness added to
 /// `PEERLESS`, moves this one, and needs a reread of what each entry
 /// releases. Callees outside this file are their owners' contracts.
-pub const NARROWING_FINGERPRINT: &str = "409050b93c616bb3";
+pub const NARROWING_FINGERPRINT: &str = "cbe285413fc88ad5";
 
 /// The [`Key::ContractTest`] results: one `Passes` per proving test of each
 /// `Satisfied` contract.

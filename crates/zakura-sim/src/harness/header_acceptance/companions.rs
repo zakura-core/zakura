@@ -10,20 +10,26 @@
 //!
 //! - [`FAULT_CLOSE`]: the node closed the rejected frame's connection with a
 //!   cause in [`FAULT_CAUSES`](crate::model::FAULT_CAUSES), after it judged
-//!   that frame. It joins on the connection.
+//!   that frame, and the session's reader refused a frame for the page's
+//!   content fault, [`CONTENT_FAULT`]. It joins on the connection and the
+//!   session, so a close for another fault doesn't count.
 //! - [`STAGED`]: exactly one `PageStaged` came from that frame. It joins on
 //!   the session the frame's connection and QUIC stream carry, the
 //!   subscription the frame names, and the frame's position among the
-//!   stream's reads. Subscription IDs are per session, so the subscription
-//!   alone doesn't name a page.
+//!   stream's reads, and it carries the frame's peer and the hashes the peer
+//!   sent. Subscription IDs are per session, so the subscription alone
+//!   doesn't name a page.
 //! - [`PATH_BREAK`]: the retained `commit-only-authorized` violation is a
-//!   `path` break whose subject is that staged page: its peer, session,
+//!   `path` break whose subject is that page: its peer, session,
 //!   subscription, frame and header hashes, which C22 adds to each page
 //!   finding.
 //!
 //! The rejected page is found from the run's own log: the one `headers`
 //! frame the peer's models labelled `BadContent` that the node judged
-//! ([`rejected_page`]).
+//! ([`rejected_page`]). Its peer and hashes come from the frame's own
+//! evidence, apart from anything the node staged ([`sent_page`]): the peer
+//! its connection's `Session` row names, and the hashes the peer put in the
+//! frame, so a substituted page satisfies neither companion.
 
 use serde_json::Value;
 use zakura_network::zakura::observe::ReactorEvent;
@@ -32,6 +38,7 @@ use super::CaseRef;
 use crate::{
     harness::header_node::authority::{Attribution, AuthorityRule, AuthoritySubject},
     model::{is_fault_cause, Label},
+    peer::SentPages,
     Observation, PropertyOutcome, PropertyReport,
 };
 
@@ -53,8 +60,43 @@ pub const PATH_BREAK: &str = "rejected-page-path-break";
 /// The case's companions, in the order its row names them.
 pub const COMPANIONS: &[&str] = &[FAULT_CLOSE, STAGED, PATH_BREAK];
 
+/// The subscriber's fault for the case's unlinked page, as the reader names
+/// it when it refuses the frame.
+pub const CONTENT_FAULT: &str = "linkage";
+
+/// A frame a session's reader refused as a protocol violation, as its
+/// `FrameRefused` reports it, with the peer in hex as findings spell it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The peer.
+    pub peer: String,
+    /// The session the reader read it on.
+    pub session: u64,
+    /// The fault, such as `linkage`.
+    pub reason: String,
+}
+
+impl Refusal {
+    /// The refusal `event` reports, if it's a `FrameRefused`.
+    pub fn of(event: &ReactorEvent) -> Option<Refusal> {
+        let ReactorEvent::FrameRefused {
+            peer,
+            session_id,
+            reason,
+        } = event
+        else {
+            return None;
+        };
+        Some(Refusal {
+            peer: crate::harness::header_node::tap::peer(peer),
+            session: *session_id,
+            reason: (*reason).to_owned(),
+        })
+    }
+}
+
 /// The rejected page's frame, as the run's log names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedPage {
     /// The connection it came on.
     pub connection: u64,
@@ -67,6 +109,18 @@ pub struct RejectedPage {
     pub session: u64,
     /// The subscription it names.
     pub subscription: u64,
+    /// The peer its connection's `Session` row names, by harness name.
+    pub peer: String,
+}
+
+/// What the peer sent as the rejected page, from the frame's evidence: its
+/// peer and its header hashes, in hex as findings spell them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentPage {
+    /// The peer.
+    pub peer: String,
+    /// The page's header hashes, in order.
+    pub hashes: Vec<String>,
 }
 
 /// A `PageStaged` fact, with peers and hashes in hex as findings spell
@@ -144,7 +198,7 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
     };
     let subscription =
         exchange.ok_or_else(|| format!("the rejected page {frame} names no subscription"))?;
-    let sessions: Vec<u64> = observations
+    let sessions: Vec<(u64, &str)> = observations
         .iter()
         .filter_map(|obs| match obs {
             Observation::Session {
@@ -153,12 +207,12 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
                 kind: 5,
                 version: 9,
                 session_id,
-                ..
-            } if (*c, *s) == (connection, quic_stream) => Some(*session_id),
+                peer,
+            } if (*c, *s) == (connection, quic_stream) => Some((*session_id, peer.as_str())),
             _ => None,
         })
         .collect();
-    let [session] = sessions[..] else {
+    let [(session, peer)] = sessions[..] else {
         return Err(format!(
             "connection {connection} stream {quic_stream} carries sessions {sessions:?}, not one"
         ));
@@ -169,12 +223,38 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
         frame,
         session,
         subscription,
+        peer: peer.to_owned(),
     })
 }
 
+/// What the peer sent as `page`: the peer `peers` names for its harness
+/// name, by `(name, peer)`, and the header hashes `sent` holds for its
+/// frame. An error says which is missing.
+pub fn sent_page(
+    page: &RejectedPage,
+    peers: &[(String, String)],
+    sent: &SentPages,
+) -> Result<SentPage, String> {
+    let peer = peers
+        .iter()
+        .find(|(name, _)| *name == page.peer)
+        .map(|(_, peer)| peer.clone())
+        .ok_or_else(|| format!("no peer is named {}", page.peer))?;
+    let hashes = sent
+        .page(page.connection, page.quic_stream, page.frame)
+        .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
+    Ok(SentPage { peer, hashes })
+}
+
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
-/// after it judged `page`'s frame, with a fault cause.
-pub fn fault_close(observations: &[Observation], page: &RejectedPage) -> Result<(), String> {
+/// after it judged `page`'s frame, with a fault cause, and `refusals` hold
+/// exactly one of `page`'s session, for [`CONTENT_FAULT`]. A reader ends its
+/// session at its first refusal, so that one is the close's.
+pub fn fault_close(
+    observations: &[Observation],
+    refusals: &[Refusal],
+    page: &RejectedPage,
+) -> Result<(), String> {
     let judged = observations
         .iter()
         .position(|obs| {
@@ -203,13 +283,30 @@ pub fn fault_close(observations: &[Observation], page: &RejectedPage) -> Result<
             "connection {} closed with {cause}, not a fault cause",
             page.connection
         )),
-        Some(_) => Ok(()),
+        Some(_) => {
+            let of_session: Vec<&Refusal> = refusals
+                .iter()
+                .filter(|refusal| refusal.session == page.session)
+                .collect();
+            match of_session[..] {
+                [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
+                _ => Err(format!(
+                    "session {}'s reader refused {of_session:?}, not one frame for {CONTENT_FAULT}",
+                    page.session
+                )),
+            }
+        }
     }
 }
 
 /// [`STAGED`]: exactly one of `staged` came from `page`'s frame, on its
-/// session and subscription, and carries headers. Returns it.
-pub fn staged_page(staged: &[StagedPage], page: &RejectedPage) -> Result<StagedPage, String> {
+/// session and subscription, and it carries `sent`'s peer and its headers,
+/// which aren't none.
+pub fn staged_page(
+    staged: &[StagedPage],
+    page: &RejectedPage,
+    sent: &SentPage,
+) -> Result<(), String> {
     let from: Vec<&StagedPage> = staged
         .iter()
         .filter(|fact| {
@@ -219,8 +316,13 @@ pub fn staged_page(staged: &[StagedPage], page: &RejectedPage) -> Result<StagedP
         })
         .collect();
     match from[..] {
-        [fact] if !fact.hashes.is_empty() => Ok(fact.clone()),
-        [fact] => Err(format!("the rejected page staged no header: {fact:?}")),
+        [fact] if fact.hashes.is_empty() => {
+            Err(format!("the rejected page staged no header: {fact:?}"))
+        }
+        [fact] if fact.peer != sent.peer || fact.hashes != sent.hashes => Err(format!(
+            "the page staged from the rejected frame is {fact:?}, not the peer's {sent:?}"
+        )),
+        [_] => Ok(()),
         _ => Err(format!(
             "{} pages staged from session {} subscription {} frame {}, not one",
             from.len(),
@@ -233,11 +335,13 @@ pub fn staged_page(staged: &[StagedPage], page: &RejectedPage) -> Result<StagedP
 
 /// [`PATH_BREAK`]: `commit-only-authorized` is violated in `properties`,
 /// and one of its violations is the claim record in `claims`, the claim
-/// store's snapshot, whose attribution is a `path` break of `staged`.
+/// store's snapshot, whose attribution is a `path` break of `page` as the
+/// peer sent it, `sent`.
 pub fn path_break(
     properties: &[PropertyReport],
     claims: &Value,
-    staged: &StagedPage,
+    page: &RejectedPage,
+    sent: &SentPage,
 ) -> Result<(), String> {
     let report = properties
         .iter()
@@ -249,11 +353,11 @@ pub fn path_break(
     let expected = serde_json::to_value(Attribution {
         rule: AuthorityRule::Path,
         subject: AuthoritySubject::Page {
-            peer: staged.peer.clone(),
-            session: staged.session,
-            subscription: staged.subscription,
-            headers: staged.hashes.clone(),
-            frame: staged.frame,
+            peer: sent.peer.clone(),
+            session: page.session,
+            subscription: page.subscription,
+            headers: sent.hashes.clone(),
+            frame: Some(page.frame),
         },
     })
     .map_err(|error| format!("the expected attribution doesn't serialize: {error}"))?;
@@ -287,32 +391,48 @@ pub struct DraftEvidence {
     pub observations: Vec<Observation>,
     /// Every `PageStaged` the node's work queue reported, in order.
     pub staged: Vec<StagedPage>,
+    /// Every frame the node's session readers refused, in order.
+    pub refusals: Vec<Refusal>,
+    /// Each scenario peer's harness name and its peer in hex, by the
+    /// identity the harness gave it.
+    pub peers: Vec<(String, String)>,
+    /// The header hashes of each page the peers sent.
+    pub sent: SentPages,
     /// Each property's report.
     pub properties: Vec<PropertyReport>,
     /// The claim store's snapshot, `Null` if the run kept none.
     pub claims: Value,
 }
 
+/// Each companion's name with its verdict: `Ok` if it held, else why not.
+pub type Verdicts = Vec<(&'static str, Result<(), String>)>;
+
 /// Judges each of [`COMPANIONS`] on `evidence`, in order: `Ok` if it held,
 /// else why not. Each finds the rejected page itself, so a run with no
 /// single one fails all three.
-pub fn judge(evidence: &DraftEvidence) -> Vec<(&'static str, Result<(), String>)> {
+pub fn judge(evidence: &DraftEvidence) -> Verdicts {
     let page = rejected_page(&evidence.observations);
-    let staged = page
+    let sent = page
         .as_ref()
         .map_err(Clone::clone)
-        .and_then(|page| staged_page(&evidence.staged, page));
+        .and_then(|page| sent_page(page, &evidence.peers, &evidence.sent).map(|sent| (page, sent)));
     vec![
         (
             FAULT_CLOSE,
             page.as_ref()
                 .map_err(Clone::clone)
-                .and_then(|page| fault_close(&evidence.observations, page)),
+                .and_then(|page| fault_close(&evidence.observations, &evidence.refusals, page)),
         ),
-        (STAGED, staged.clone().map(|_| ())),
+        (
+            STAGED,
+            sent.clone()
+                .and_then(|(page, sent)| staged_page(&evidence.staged, page, &sent)),
+        ),
         (
             PATH_BREAK,
-            staged.and_then(|staged| path_break(&evidence.properties, &evidence.claims, &staged)),
+            sent.and_then(|(page, sent)| {
+                path_break(&evidence.properties, &evidence.claims, page, &sent)
+            }),
         ),
     ]
 }
@@ -335,16 +455,77 @@ impl crate::record::RecordSink for KeepReport {
 /// `commit-only-authorized` as `Draft`, as the case's `Draft` run does, and
 /// returns what [`judge`] reads. An error says why the run gave none.
 pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
+    use crate::harness::{header_sync::HeaderWire, Subsystem};
+    let entry = crate::harness::find(HeaderWire::NAME).map_err(|error| error.to_string())?;
+    let plan = crate::Plan::from_fuzz(&input[entry.scenario_bytes.min(input.len())..]);
+    draft_run(&entry.scenario(input), plan).map(|(evidence, _)| evidence)
+}
+
+/// Judges each of [`COMPANIONS`] on the case's recorded `Draft` run in
+/// `dir` (C9), as [`judge`] does. The trace must be `header-sync/wire`'s
+/// with `commit-only-authorized` as its whole `Draft` override. It's rerun
+/// here following the trace's own picks and draws, and the rerun's full
+/// report, every violation and the stores' snapshot, must equal the one
+/// recorded beside the trace, so what's judged is that run. So this must
+/// run in the build that recorded the trace, the case's own patched one,
+/// where a patched behavior replays. An error says why there's no verdict.
+pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
+    use crate::harness::{header_sync::HeaderWire, Subsystem};
+    let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
+    if trace.meta.sim != HeaderWire::NAME {
+        return Err(format!(
+            "the trace ran {}, not {}",
+            trace.meta.sim,
+            HeaderWire::NAME
+        ));
+    }
+    if trace.meta.draft != [COMMIT] {
+        return Err(format!(
+            "the trace's Draft override is {:?}, not [{COMMIT}]",
+            trace.meta.draft
+        ));
+    }
+    let script = crate::plan::TraceScript::new(&trace, false).map_err(|error| error.to_string())?;
+    let (evidence, rerun) = draft_run(&trace.meta.scenario, crate::PlanInput::Trace(script))?;
+    let recorded = std::fs::read_to_string(dir.join(crate::record::FULL_REPORT_FILE))
+        .map_err(|error| format!("its full report: {error}"))
+        .and_then(|text| {
+            serde_json::from_str::<crate::record::FullReport>(&text)
+                .map_err(|error| format!("its full report: {error}"))
+        })?;
+    if rerun.as_ref() != Some(&recorded) {
+        return Err("the rerun's full report isn't the recorded one".to_owned());
+    }
+    Ok(judge(&evidence))
+}
+
+/// Runs `scenario` on `header-sync/wire` under `plan` with
+/// `commit-only-authorized` as `Draft`, and returns what [`judge`] reads
+/// with the run's full report.
+fn draft_run(
+    scenario: &Value,
+    plan: crate::PlanInput,
+) -> Result<(DraftEvidence, Option<crate::record::FullReport>), String> {
     use crate::harness::{
         header_sync::{HeaderWire, WireScenario},
         run_prepared, with_draft, HarnessError, Subsystem,
     };
-    let entry = crate::harness::find(HeaderWire::NAME).map_err(|error| error.to_string())?;
     let scenario: WireScenario =
-        serde_json::from_value(entry.scenario(input)).map_err(|error| error.to_string())?;
-    let plan = crate::Plan::from_fuzz(&input[entry.scenario_bytes.min(input.len())..]);
+        serde_json::from_value(scenario.clone()).map_err(|error| error.to_string())?;
     let ports = HeaderWire::prepare(&scenario);
     let reservations = ports.reservations.clone();
+    let sent = ports.sent_pages.clone();
+    let peers = (0..scenario.peers.len())
+        .map(|index| {
+            (
+                format!("peer-{index}"),
+                crate::harness::header_node::tap::peer(&crate::peer::peer_id(
+                    scenario.net.seed,
+                    index,
+                )),
+            )
+        })
+        .collect();
     let mut sink = KeepReport::default();
     let report = with_draft(&[COMMIT.to_owned()], || {
         match run_prepared::<HeaderWire>(&scenario, ports, plan, &mut sink, None) {
@@ -355,7 +536,8 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
     })?;
     let claims = sink
         .0
-        .and_then(|full| full.snapshot)
+        .as_ref()
+        .and_then(|full| full.snapshot.as_ref())
         .and_then(|snapshot| {
             snapshot.as_array().and_then(|stores| {
                 stores
@@ -365,7 +547,7 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
             })
         })
         .unwrap_or(Value::Null);
-    Ok(DraftEvidence {
+    let evidence = DraftEvidence {
         observations: report
             .log
             .entries()
@@ -377,9 +559,17 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
             .iter()
             .filter_map(StagedPage::of)
             .collect(),
+        refusals: reservations
+            .facts()
+            .iter()
+            .filter_map(Refusal::of)
+            .collect(),
+        peers,
+        sent,
         properties: report.properties,
         claims,
-    })
+    };
+    Ok((evidence, sink.0))
 }
 
 #[cfg(test)]
@@ -477,11 +667,84 @@ mod tests {
         (claims, vec![report])
     }
 
-    /// The fault-close companion joins the rejected frame's connection: a
-    /// fault close there holds, and the same close of another connection,
-    /// or a close there with a cause that isn't a fault, doesn't.
+    /// The reader's refusal of session 11's frame for `reason`.
+    fn refused(reason: &str) -> Vec<Refusal> {
+        vec![Refusal {
+            peer: "ab".into(),
+            session: 11,
+            reason: reason.into(),
+        }]
+    }
+
+    /// The case's committed input recorded as its `Draft` run, unpatched,
+    /// into a fresh directory.
+    fn draft_recording() -> tempfile::TempDir {
+        let input = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/header-wire-bad-content.bin"),
+        )
+        .expect("the committed input is readable");
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::with_draft(&[COMMIT.to_owned()], || {
+            crate::harness::record(
+                crate::harness::find("header-sync/wire").expect("the wire harness is registered"),
+                crate::harness::RecordInput::Input(&input),
+                dir.path(),
+            )
+        })
+        .expect("the Draft run records");
+        dir
+    }
+
+    /// The trace judge reruns a recorded `Draft` run and judges the same
+    /// evidence the in-process run gives: unpatched, the subscriber refuses
+    /// the page and closes its connection, so only the fault close holds.
+    /// It refuses a
+    /// trace whose recorded full report isn't the rerun's, and one recorded
+    /// without the case's override.
+    #[test]
+    fn the_trace_judge_judges_the_recorded_draft_run() {
+        let dir = draft_recording();
+        let verdicts = judge_trace(dir.path()).expect("the recorded Draft run reruns");
+        let names: Vec<&str> = verdicts.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, COMPANIONS);
+        let input = std::fs::read(dir.path().join(crate::trace::INPUT_FILE))
+            .expect("record keeps the input");
+        let direct = judge(&run_draft(&input).expect("the input runs"));
+        assert_eq!(verdicts, direct);
+        // The unpatched node closes the rejected page's connection with its
+        // fault, and stages nothing.
+        assert!(
+            verdicts[0].1.is_ok() && verdicts[1].1.is_err(),
+            "{verdicts:?}"
+        );
+
+        let path = dir.path().join(crate::record::FULL_REPORT_FILE);
+        let mut report: crate::record::FullReport =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("it exists"))
+                .expect("it reads");
+        report.snapshot = Some(json!([]));
+        std::fs::write(&path, report.to_line()).expect("the temp dir is writable");
+        assert!(judge_trace(dir.path()).is_err());
+
+        let plain = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::record(
+            crate::harness::find("header-sync/wire").expect("the wire harness is registered"),
+            crate::harness::RecordInput::Input(&input),
+            plain.path(),
+        )
+        .expect("the run records");
+        assert!(judge_trace(plain.path()).is_err());
+    }
+
+    /// The fault-close companion joins the rejected frame's connection and
+    /// its content refusal: a fault close there after the session's reader
+    /// refused a frame for linkage holds, and the same close of another
+    /// connection, a close there with a cause that isn't a fault, or a close
+    /// after a refusal for another fault, or none, doesn't.
     #[test]
     fn the_fault_close_joins_the_rejected_frames_connection() {
+        let linkage = refused(CONTENT_FAULT);
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         assert_eq!(
             page,
@@ -491,42 +754,98 @@ mod tests {
                 frame: 3,
                 session: 11,
                 subscription: 7,
+                peer: "peer-0".into(),
             }
         );
-        assert_eq!(
-            fault_close(&log(1, 1, "service_protocol_reject"), &page),
-            Ok(())
-        );
-        assert!(fault_close(&log(1, 2, "service_protocol_reject"), &page).is_err());
-        assert!(fault_close(&log(1, 1, "service_local_shutdown"), &page).is_err());
+        let closed = log(1, 1, "service_protocol_reject");
+        assert_eq!(fault_close(&closed, &linkage, &page), Ok(()));
+        assert!(fault_close(&log(1, 2, "service_protocol_reject"), &linkage, &page).is_err());
+        assert!(fault_close(&log(1, 1, "service_local_shutdown"), &linkage, &page).is_err());
+        // Another fault's refusal closes the same connection.
+        assert!(fault_close(&closed, &refused("over_credit"), &page).is_err());
+        assert!(fault_close(&closed, &[], &page).is_err());
+        // The linkage refusal of another session isn't this page's.
+        let mut other = linkage.clone();
+        other[0].session = 12;
+        assert!(fault_close(&closed, &other, &page).is_err());
+    }
+
+    /// What peer `ab` sent as the rejected page: headers `01` and `02`.
+    fn sent() -> SentPage {
+        SentPage {
+            peer: "ab".into(),
+            hashes: vec!["01".into(), "02".into()],
+        }
+    }
+
+    /// `sent` with only its peer moved, then with only its hashes moved.
+    fn one_key_off() -> [SentPage; 2] {
+        [
+            SentPage {
+                peer: "cd".into(),
+                ..sent()
+            },
+            SentPage {
+                hashes: vec!["01".into(), "03".into()],
+                ..sent()
+            },
+        ]
+    }
+
+    /// The rejected page's peer and hashes come from its frame's evidence:
+    /// the peer its `Session` row names, and the page the peer sent there.
+    #[test]
+    fn the_sent_page_comes_from_the_frames_evidence() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let peers = vec![("peer-0".to_owned(), "ab".to_owned())];
+        let pages = SentPages::new(&crate::stores::EvidenceStores::default());
+        assert!(sent_page(&page, &peers, &pages).is_err());
+        pages.record((1, 4, 3), sent().hashes);
+        assert_eq!(sent_page(&page, &peers, &pages), Ok(sent()));
+        assert!(sent_page(&page, &[], &pages).is_err());
     }
 
     /// The staging companion joins the page's session, subscription and
-    /// frame: the page staged from that frame holds, and another page on
-    /// the same subscription, or the same page on another session, doesn't.
+    /// frame, and the peer and hashes the peer sent: the page staged from
+    /// that frame holds, and another page on the same subscription, the
+    /// same page on another session, or the same frame with only its peer
+    /// or only its hashes changed, doesn't.
     #[test]
     fn the_staged_page_joins_the_rejected_frame() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
-        assert_eq!(staged_page(&[staged(11, 3)], &page), Ok(staged(11, 3)));
-        assert!(staged_page(&[staged(11, 5)], &page).is_err());
-        assert!(staged_page(&[staged(12, 3)], &page).is_err());
-        assert!(staged_page(&[], &page).is_err());
+        assert_eq!(staged_page(&[staged(11, 3)], &page, &sent()), Ok(()));
+        assert!(staged_page(&[staged(11, 5)], &page, &sent()).is_err());
+        assert!(staged_page(&[staged(12, 3)], &page, &sent()).is_err());
+        assert!(staged_page(&[], &page, &sent()).is_err());
+        for off in one_key_off() {
+            assert!(
+                staged_page(&[staged(11, 3)], &page, &off).is_err(),
+                "{off:?}"
+            );
+        }
     }
 
     /// The path-break companion requires the retained violation to be a
-    /// `path` break of exactly the staged page: another rule, another frame
-    /// or an unretained break doesn't count.
+    /// `path` break of exactly the page the peer sent: another rule,
+    /// another frame, another peer, other hashes or an unretained break
+    /// doesn't count.
     #[test]
-    fn the_path_break_names_the_staged_page() {
-        let page = staged(11, 3);
+    fn the_path_break_names_the_sent_page() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let (store, properties) = claims("path", 3);
-        assert_eq!(path_break(&properties, &store, &page), Ok(()));
+        assert_eq!(path_break(&properties, &store, &page, &sent()), Ok(()));
+        for off in one_key_off() {
+            assert!(
+                path_break(&properties, &store, &page, &off).is_err(),
+                "{off:?}"
+            );
+        }
         let (store, properties) = claims("credit", 3);
-        assert!(path_break(&properties, &store, &page).is_err());
+        assert!(path_break(&properties, &store, &page, &sent()).is_err());
         let (store, properties) = claims("path", 4);
-        assert!(path_break(&properties, &store, &page).is_err());
+        assert!(path_break(&properties, &store, &page, &sent()).is_err());
         let (store, mut properties) = claims("path", 3);
         properties[0].violations.clear();
-        assert!(path_break(&properties, &store, &page).is_err());
+        assert!(path_break(&properties, &store, &page, &sent()).is_err());
     }
 }

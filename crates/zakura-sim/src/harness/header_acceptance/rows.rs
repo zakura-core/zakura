@@ -146,6 +146,10 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
 /// The file of `header-sync/wire`'s generated witnesses.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
+/// The file of `header-sync/wire`'s receiver-direction table checks, whose
+/// per-row content tests carry the fault close a content rejection owes.
+const TABLE_TESTS: &str = "tests/header_wire_table.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
 /// names its passing history, and the gates it serves.
 struct Generated {
@@ -2689,41 +2693,35 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-2/bad-content-fault-close/status",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "status_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "subscribe_headers_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "headers_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "headers_outcome_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {

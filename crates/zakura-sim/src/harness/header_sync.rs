@@ -1351,7 +1351,12 @@ impl Subsystem for Storage {
             ));
         }
         let cooldown = nodes[0].startup.config.unproductive_peer_cooldown;
-        let faults = FaultEvidence::new(attributions, cooldowns.clone(), cooldown);
+        let faults = FaultEvidence::new(
+            attributions,
+            cooldowns.clone(),
+            ports.ends.clone(),
+            cooldown,
+        );
         let names: Vec<_> = nodes
             .iter()
             .map(|node| (node.id.clone(), node.name.clone()))
@@ -1891,6 +1896,7 @@ impl Subsystem for HeaderWire {
         let faults = FaultEvidence::new(
             attributions,
             cooldowns,
+            ports.ends.clone(),
             header.startup.config.unproductive_peer_cooldown,
         );
         let (observer, tap) = TransportTap::with_sessions(
@@ -2898,8 +2904,12 @@ mod tests {
     fn settled_faults(attributions: crate::storage::FaultAttributions) -> FaultEvidence {
         use crate::{IdleStatus, Outcome};
 
-        let faults =
-            FaultEvidence::new(attributions, Default::default(), std::time::Duration::ZERO);
+        let faults = FaultEvidence::new(
+            attributions,
+            Default::default(),
+            Default::default(),
+            std::time::Duration::ZERO,
+        );
         faults.end(&RunEnd {
             outcome: Outcome::Idle {
                 status: IdleStatus::Quiescent,

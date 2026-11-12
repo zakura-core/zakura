@@ -17,10 +17,17 @@
 //! [`FaultEvidence::penalized`] judges a finished run.
 //!
 //! A failure whose reply never reached the reactor owes nothing: no caller
-//! was waiting for it, or the reactor's teardown dropped the call that
-//! submitted it (`CallEnded` `dropped`). A prepare or apply can't time out.
-//! So a failure whose reply reached the reactor and is still untaken when a
-//! settled run ends means the reactor lost it, and breaks the rule.
+//! was waiting for it, or its call was dropped before it completed. A
+//! prepare or apply can't time out. So a failure whose reply reached the
+//! reactor and is still untaken when a settled run ends means the reactor
+//! lost it, and breaks the rule.
+//!
+//! The reactor's teardown drops each call still pending (`CallEnded`
+//! `dropped`), with any reply it holds. That clears the reply's fault only
+//! if the harness stopped the node: [`EndEvidence`] shows its `Shutdown` and
+//! no exit of the reactor's own. A reactor that returned by itself and
+//! dropped a failed reply lost it, which breaks the rule as an untaken
+//! reply does.
 
 use std::{
     cell::RefCell,
@@ -30,7 +37,10 @@ use std::{
     time::Duration,
 };
 
-use super::adoption::settled;
+use super::{
+    adoption::settled,
+    ends::{EndEvidence, EndFact, EnvironmentAction},
+};
 use crate::{
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
@@ -88,8 +98,9 @@ pub fn owed(
 
 /// The operations in `entries` that failed with a fault that would owe a
 /// penalty, and whose reply reached the reactor, which hasn't taken it by
-/// the log's end. A failure whose reply never reached it isn't listed (see
-/// the module docs).
+/// the log's end. A failure whose reply never reached it isn't listed, and
+/// nor is one whose call the reactor's teardown dropped (see the module
+/// docs).
 pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
     let judge = Judge::over(Mode::Scan, &[], entries, attributions);
     match judge.error {
@@ -171,6 +182,10 @@ struct Judge {
     /// before dropping the future, so the operation can still complete
     /// after it.
     dropped: BTreeSet<u64>,
+    /// Each failure that was in [`Judge::failed`] when the reactor's
+    /// teardown dropped its call, by operation, with the call. Only the
+    /// harness's stop clears it (see the module docs).
+    dropped_failed: BTreeMap<u64, u64>,
     /// Every penalty owed so far, in the order the replies were taken.
     owed: Vec<OwedPenalty>,
     /// The penalties in [`Judge::owed`] whose call's handling hasn't ended,
@@ -394,8 +409,14 @@ impl Judge {
             // A dropped call is never handled, and never takes its reply.
             ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
                 self.dropped.insert(*call);
-                self.failed
-                    .retain(|_, (request, _)| request.call != Some(*call));
+                let dropped_failed = &mut self.dropped_failed;
+                self.failed.retain(|op, (request, _)| {
+                    let held = request.call == Some(*call);
+                    if held {
+                        dropped_failed.insert(*op, *call);
+                    }
+                    !held
+                });
             }
             ReactorFact::CallEnded { call, .. } => {
                 self.windows.entry(*call).or_default();
@@ -467,28 +488,34 @@ impl Judge {
         self.failed.keys().copied().collect()
     }
 
-    /// Why the rule can't judge everything it read yet, if it can't: a
-    /// penalty whose call's handling hasn't ended, or a failure whose reply
-    /// reached the reactor, which hasn't taken it. The first of
-    /// [`Judge::open_at_end`]'s findings.
-    fn open(&self) -> Option<String> {
-        match self.pending.first() {
-            Some(&index) => Some(unhandled(&self.owed[index])),
-            None => self.untaken_findings().into_iter().next(),
-        }
+    /// Why the rule can't judge everything it read yet, if it can't. The
+    /// first of [`Judge::open_at_end`]'s findings.
+    fn open(&self, stopped: bool) -> Option<String> {
+        self.open_at_end(stopped).into_iter().next()
     }
 
     /// Every finding still open when the run ends, each once: each penalty
     /// whose call's handling never ended, in the order its reply was taken,
     /// then each failure whose reply reached the reactor and was never
-    /// taken, by operation.
-    fn open_at_end(&self) -> Vec<String> {
+    /// taken, by operation, then, unless the harness `stopped` the node,
+    /// each failure whose reply the reactor's teardown dropped with its
+    /// call, by operation.
+    fn open_at_end(&self, stopped: bool) -> Vec<String> {
         let mut findings: Vec<String> = self
             .pending
             .iter()
             .map(|&index| unhandled(&self.owed[index]))
             .collect();
         findings.extend(self.untaken_findings());
+        if !stopped {
+            findings.extend(self.dropped_failed.iter().map(|(op, call)| {
+                format!(
+                    "DroppedFault: operation {op} failed with a header-peer fault whose reply \
+                     reached the reactor, and the reactor's teardown dropped call {call}, \
+                     which held it, without the harness stopping the node"
+                )
+            }));
+        }
         findings
     }
 
@@ -678,6 +705,8 @@ impl CooldownEvidence {
 pub struct FaultEvidence {
     attributions: FaultAttributions,
     cooldowns: CooldownEvidence,
+    /// The node's end facts, which say whether the harness stopped it.
+    ends: EndEvidence,
     /// The node's configured readmission cooldown.
     cooldown: Duration,
     settled: Rc<std::cell::Cell<Option<bool>>>,
@@ -707,19 +736,38 @@ pub enum FaultCheck {
 }
 
 impl FaultEvidence {
-    /// Evidence that reads `attributions` and `cooldowns`, for a node whose
-    /// config sets a readmission cooldown of `cooldown`.
+    /// Evidence that reads `attributions`, `cooldowns` and `ends`, the
+    /// node's end facts, for a node whose config sets a readmission
+    /// cooldown of `cooldown`.
     pub fn new(
         attributions: FaultAttributions,
         cooldowns: CooldownEvidence,
+        ends: EndEvidence,
         cooldown: Duration,
     ) -> Self {
         FaultEvidence {
             attributions,
             cooldowns,
+            ends,
             cooldown,
             ..FaultEvidence::default()
         }
+    }
+
+    /// Whether the harness stopped the node: its `Shutdown` began, and the
+    /// reactor didn't return by itself. Only then does a dropped call
+    /// clear the failed reply it held (see the module docs).
+    fn stopped(&self) -> bool {
+        self.ends.reactor_exited().is_none()
+            && self.ends.facts().iter().any(|(_, fact)| {
+                matches!(
+                    fact,
+                    EndFact::Environment {
+                        action: EnvironmentAction::Shutdown,
+                        ..
+                    }
+                )
+            })
     }
 
     /// Whom each failed prepare and apply blamed.
@@ -731,6 +779,11 @@ impl FaultEvidence {
     /// refused.
     pub fn cooldowns(&self) -> &CooldownEvidence {
         &self.cooldowns
+    }
+
+    /// The node's end facts.
+    pub fn ends(&self) -> &EndEvidence {
+        &self.ends
     }
 
     /// Records how the run ended, and whether it [`settled`].
@@ -765,7 +818,7 @@ impl FaultEvidence {
         });
         judge.cooldowns(&self.cooldowns.facts_after(judge.facts_read));
         judge.read(entries, &self.attributions);
-        let open = judge.open();
+        let open = judge.open(self.stopped());
         let breaks = judge.unreported();
         if !breaks.is_empty() {
             return FaultCheck::Broken { breaks, open };
@@ -798,8 +851,10 @@ impl FaultEvidence {
     /// `entries`, with every distinct finding. A break of the rule is
     /// violated at any end. What's still open is a break once a settled run
     /// ends, one finding each: every penalty whose call's handling never
-    /// ended, and every failure whose reply reached the reactor and was
-    /// never taken ([`untaken`]). Open at any other end, or before the run
+    /// ended, every failure whose reply reached the reactor and was
+    /// never taken ([`untaken`]), and, unless the harness stopped the node,
+    /// every failure whose reply the reactor's teardown dropped with its
+    /// call. Open at any other end, or before the run
     /// has ended, each stays open. Every break comes first, in the
     /// order the judge read them (every cooldown fact, then the log), then
     /// the evidence error that stopped its reading of the log, if one did.
@@ -817,7 +872,7 @@ impl FaultEvidence {
                 open_findings: Vec::new(),
             };
         }
-        let open = judge.open_at_end();
+        let open = judge.open_at_end(self.stopped());
         match self.settled.get() {
             Some(true) => {
                 violated.extend(open);
@@ -1006,15 +1061,37 @@ mod tests {
         entries
     }
 
-    /// Fault evidence for a settled run, where each operation in `blamed`
-    /// blamed its source.
+    /// Fault evidence for a settled run the harness stopped, where each
+    /// operation in `blamed` blamed its source.
     fn evidence(blamed: &[(u64, Blame)]) -> FaultEvidence {
+        evidence_ending(blamed, &[shutdown()])
+    }
+
+    /// The harness's `Shutdown` of the node.
+    fn shutdown() -> EndFact {
+        EndFact::Environment {
+            peer: "node".to_owned(),
+            connection: None,
+            action: EnvironmentAction::Shutdown,
+        }
+    }
+
+    /// [`evidence`], with `ends` as the node's end facts.
+    fn evidence_ending(blamed: &[(u64, Blame)], ends: &[EndFact]) -> FaultEvidence {
         let attributions = FaultAttributions::default();
         for (id, blame) in blamed {
             attributions.insert(NODE, *id, blame.clone());
         }
-        let evidence =
-            FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
+        let store = EndEvidence::default();
+        for fact in ends {
+            store.record(fact.clone());
+        }
+        let evidence = FaultEvidence::new(
+            attributions,
+            CooldownEvidence::default(),
+            store,
+            Duration::ZERO,
+        );
         evidence.settled.set(Some(true));
         evidence
     }
@@ -1166,7 +1243,8 @@ mod tests {
 
     /// A fault whose reply never reached the reactor owes nothing, even in a
     /// settled run: no caller waited for it, or the reactor's teardown
-    /// dropped its call, before or after the operation completed.
+    /// dropped its call, before the operation completed or, in a run the
+    /// harness stopped, after.
     #[test]
     fn a_fault_that_never_reached_the_reactor_owes_nothing() {
         let attributed = evidence(&[(1, blame("aa"))]);
@@ -1198,8 +1276,57 @@ mod tests {
                 Vec::<u64>::new()
             );
             assert_eq!(attributed.penalized(&log), FaultEnd::default(), "{log:?}");
-            assert_eq!(cooled(Vec::new()).check(&log), FaultCheck::Nothing);
+            assert_eq!(attributed.check(&log), FaultCheck::Nothing);
         }
+    }
+
+    /// The reply of a failure the reactor's teardown dropped with its call
+    /// is cleared only when the harness stopped the node. At the same
+    /// point, a reactor that returned by itself lost it, and so did one
+    /// whose run shows no stop at all, even if the harness's `Shutdown`
+    /// came after the reactor's own exit. Until the end it's open.
+    #[test]
+    fn only_the_harness_stop_clears_a_dropped_fault() {
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        log.push(reactor(ReactorFact::CallEnded {
+            call: 1,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        }));
+        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        let blamed = [(1, blame("aa"))];
+        let stopped = evidence_ending(&blamed, &[shutdown()]);
+        assert_eq!(stopped.penalized(&log), FaultEnd::default());
+        assert_eq!(stopped.check(&log), FaultCheck::Nothing);
+
+        let finding = "DroppedFault: operation 1 failed with a header-peer fault whose reply \
+                       reached the reactor, and the reactor's teardown dropped call 1, which \
+                       held it, without the harness stopping the node";
+        let exited = EndFact::ReactorExited { step: 9 };
+        for ends in [vec![exited.clone()], vec![exited, shutdown()], Vec::new()] {
+            let lost = evidence_ending(&blamed, &ends);
+            assert_eq!(
+                violated(lost.penalized(&log)).as_deref(),
+                Some(finding),
+                "{ends:?}"
+            );
+            assert_eq!(
+                lost.check(&log),
+                FaultCheck::Open(finding.to_owned()),
+                "{ends:?}"
+            );
+            lost.settled.set(Some(false));
+            assert!(
+                matches!(open_finding(lost.penalized(&log)), Some(why) if why.ends_with(finding)),
+                "{ends:?}"
+            );
+        }
+        assert_eq!(
+            untaken(&log, stopped.attributions()).unwrap(),
+            Vec::<u64>::new(),
+            "a dropped reply isn't an untaken one"
+        );
     }
 
     /// A settled run's end reports every open finding, not just the
@@ -1280,7 +1407,12 @@ mod tests {
         let cooldowns = CooldownEvidence::default();
         cooldowns.record(started("aa", 9, 60, 2, 99));
         cooldowns.record(admitted("aa", 4, 30));
-        let evidence = FaultEvidence::new(attributions, cooldowns, Duration::from_secs(60));
+        let evidence = FaultEvidence::new(
+            attributions,
+            cooldowns,
+            EndEvidence::default(),
+            Duration::from_secs(60),
+        );
         evidence.settled.set(Some(true));
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
@@ -1358,8 +1490,12 @@ mod tests {
             attributions.insert(NODE, id, blame("aa"));
         }
         let cooldowns = CooldownEvidence::default();
-        let attributed =
-            FaultEvidence::new(attributions, cooldowns.clone(), Duration::from_secs(60));
+        let attributed = FaultEvidence::new(
+            attributions,
+            cooldowns.clone(),
+            EndEvidence::default(),
+            Duration::from_secs(60),
+        );
         attributed.settled.set(Some(true));
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.extend(handled(1, Vec::new()));
@@ -1452,7 +1588,12 @@ mod tests {
         for fact in facts {
             cooldowns.record(fact);
         }
-        let evidence = FaultEvidence::new(attributions, cooldowns, Duration::from_secs(60));
+        let evidence = FaultEvidence::new(
+            attributions,
+            cooldowns,
+            EndEvidence::default(),
+            Duration::from_secs(60),
+        );
         evidence.settled.set(Some(true));
         evidence
     }
@@ -1568,8 +1709,12 @@ mod tests {
         let mut third = failed_prepare(3, "aa", 3, "invalid_header");
         third.pop();
         log.extend(third);
-        let evidence =
-            FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
+        let evidence = FaultEvidence::new(
+            attributions,
+            CooldownEvidence::default(),
+            EndEvidence::default(),
+            Duration::ZERO,
+        );
         let end = evidence.penalized(&log);
         assert!(
             matches!(end.violated.as_slice(), [why] if why.contains("operation 1")),

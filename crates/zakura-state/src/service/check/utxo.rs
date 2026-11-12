@@ -9,10 +9,7 @@ use zakura_chain::{
 
 use crate::{
     constants::MIN_TRANSPARENT_COINBASE_MATURITY,
-    service::{
-        finalized_state::ZakuraDb,
-        non_finalized_state::{SharedMap, SpendingTransactionId},
-    },
+    service::{finalized_state::ZakuraDb, non_finalized_state::Chain},
     SemanticallyVerifiedBlock,
     ValidateContextError::{
         self, DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
@@ -39,15 +36,11 @@ use crate::{
 /// - spends of an immature transparent coinbase output,
 /// - unshielded spends of a transparent coinbase output.
 ///
-/// `non_finalized_chain_created_utxos` includes outputs that were later spent
-/// by the non-finalized chain. `non_finalized_chain_spent_utxos` takes
-/// precedence over it.
-pub fn transparent_spend<'chain>(
+/// `non_finalized_chain` is the parent chain the block extends, if the parent isn't the
+/// finalized tip.
+pub(crate) fn transparent_spend(
     semantically_verified: &SemanticallyVerifiedBlock,
-    non_finalized_chain_created_utxos: impl Fn(
-        &transparent::OutPoint,
-    ) -> Option<&'chain transparent::OrderedUtxo>,
-    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain: Option<&Chain>,
     finalized_state: &ZakuraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
@@ -70,8 +63,7 @@ pub fn transparent_spend<'chain>(
                 spend,
                 spend_tx_index_in_block,
                 &semantically_verified.new_outputs,
-                &non_finalized_chain_created_utxos,
-                non_finalized_chain_spent_utxos,
+                non_finalized_chain,
                 finalized_state,
             )?;
 
@@ -135,14 +127,11 @@ pub fn transparent_spend<'chain>(
 /// > or a previous transaction in the same block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
-fn transparent_spend_chain_order<'chain>(
+fn transparent_spend_chain_order(
     spend: transparent::OutPoint,
     spend_tx_index_in_block: usize,
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    non_finalized_chain_created_utxos: &impl Fn(
-        &transparent::OutPoint,
-    ) -> Option<&'chain transparent::OrderedUtxo>,
-    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain: Option<&Chain>,
     finalized_state: &ZakuraDb,
 ) -> Result<transparent::OrderedUtxo, ValidateContextError> {
     if let Some(output) = block_new_outputs.get(&spend) {
@@ -162,7 +151,7 @@ fn transparent_spend_chain_order<'chain>(
         }
     }
 
-    if non_finalized_chain_spent_utxos.contains_key(&spend) {
+    if non_finalized_chain.is_some_and(|chain| chain.spent_utxo(&spend).is_some()) {
         // reject the spend if its UTXO is already spent in the
         // non-finalized parent chain
         return Err(DuplicateTransparentSpend {
@@ -172,7 +161,8 @@ fn transparent_spend_chain_order<'chain>(
     }
 
     // This lookup is unspent because the spent index was checked first.
-    non_finalized_chain_created_utxos(&spend)
+    non_finalized_chain
+        .and_then(|chain| chain.created_ordered_utxo(&spend))
         .cloned()
         // TODO: if finalized UTXO disk reads show up in profiles, fetch missing
         // UTXOs in parallel.

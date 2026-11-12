@@ -103,7 +103,7 @@ fn finalized_transparent_balance(
 ///
 /// If the addresses do not exist in the non-finalized `chain`, returns zero.
 fn chain_transparent_balance_change(
-    mut chain: Arc<Chain>,
+    chain: Arc<Chain>,
     addresses: &HashSet<transparent::Address>,
     finalized_tip: Option<Height>,
 ) -> (Amount<NegativeAllowed>, u64) {
@@ -116,29 +116,15 @@ fn chain_transparent_balance_change(
         .map(|tip| (tip + 1).unwrap())
         .unwrap_or(Height(0));
 
-    let chain = Arc::make_mut(&mut chain);
-
     assert!(
         chain.non_finalized_root_height() <= required_chain_root,
         "unexpected chain gap: the best chain is updated after its previous root is finalized"
     );
 
-    let chain_tip = chain.non_finalized_tip_height();
-
-    // If we've already committed this entire chain, ignore its balance changes.
-    // This is more likely if the non-finalized state is just getting started.
-    if chain_tip < required_chain_root {
-        return (Amount::zero(), 0);
-    }
-
-    // Correctness: some balances might have duplicate creates or spends,
-    // so we pop root blocks from `chain` until the chain root is a child of the finalized tip.
-    while chain.non_finalized_root_height() < required_chain_root {
-        // TODO: just revert the transparent balances, to improve performance
-        chain.pop_root();
-    }
-
-    chain.partial_transparent_balance_change(addresses)
+    // Correctness: blocks below `required_chain_root` are already in the finalized balance,
+    // so only the blocks from the child of the finalized tip are added.
+    // If we've already committed this entire chain, there are none.
+    chain.partial_transparent_balance_change(addresses, required_chain_root)
 }
 
 /// Add the supplied finalized and non-finalized balances together,

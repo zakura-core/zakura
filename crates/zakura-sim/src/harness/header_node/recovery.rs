@@ -43,7 +43,7 @@
 //! events before its pick ([`Prefix`]), and its prefix ends at its
 //! harness's cutoff at the latest ([`PrefixCutoff`]).
 
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use zakura_header_chain::{Frontier, SuffixWork};
@@ -58,7 +58,11 @@ use super::{
     session::{SessionEvidence, SessionFact},
     tap,
 };
-use crate::{property::Assume, Identity};
+use crate::{
+    property::Assume,
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
+    Identity,
+};
 
 /// How long after the later of its submission, or its commit for a held
 /// reply, and the `Recover` pick each storage operation must complete.
@@ -133,23 +137,35 @@ pub enum Hostile {
 /// `Recover` step, holds catch nothing new, and completions offer only what
 /// the success-only base would. Past its cutoff ([`PrefixCutoff`]) the
 /// control source offers only the `Recover` step too, but holds and faults
-/// go on until its pick, within the bound. Below the bound the record changes nothing
-/// a run offers. A scenario without a `Recover` step is unbounded and keeps
-/// nothing. Cloning shares it.
-#[derive(Clone, Default)]
-pub struct Prefix(Rc<RefCell<Option<Vec<HostileEvent>>>>);
+/// go on until its pick, within the bound. Below the bound the record
+/// changes nothing a run offers. A scenario without a `Recover` step is
+/// unbounded and keeps nothing. Cloning shares it.
+#[derive(Clone)]
+pub struct Prefix(Registered<Option<Vec<HostileEvent>>>);
+
+impl Snapshot for Option<Vec<HostileEvent>> {
+    /// Every hostile event, or that the prefix is unbounded.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
 
 impl Prefix {
-    /// A bounded prefix, for a scenario with a `Recover` step, with nothing
-    /// executed yet.
-    pub fn bounded() -> Self {
-        Prefix(Rc::new(RefCell::new(Some(Vec::new()))))
+    /// A bounded prefix in `stores`, the node's, for a scenario with a
+    /// `Recover` step, with nothing executed yet.
+    pub fn bounded(stores: &EvidenceStores) -> Self {
+        Prefix(stores.register("prefix", Some(Vec::new())))
+    }
+
+    /// An unbounded prefix in `stores`, which keeps nothing.
+    pub fn unbounded(stores: &EvidenceStores) -> Self {
+        Prefix(stores.register("prefix", None))
     }
 
     /// How many hostile events executed, or `None` for an unbounded prefix.
     pub fn spent(&self) -> Option<u32> {
         self.0
-            .borrow()
+            .lock()
             .as_ref()
             .map(|events| u32::try_from(events.len()).expect("the bound keeps the record short"))
     }
@@ -157,7 +173,7 @@ impl Prefix {
     /// The hostile events that executed, in order, or `None` for an
     /// unbounded prefix.
     pub fn events(&self) -> Option<Vec<HostileEvent>> {
-        self.0.borrow().clone()
+        self.0.read(Clone::clone)
     }
 
     /// Whether [`PREFIX_BOUND`] hostile events executed, so no more may.
@@ -168,9 +184,11 @@ impl Prefix {
     /// Records `hostile`, executed at `step`. Does nothing for an unbounded
     /// prefix.
     pub(super) fn spend(&self, step: u64, hostile: Hostile) {
-        if let Some(events) = self.0.borrow_mut().as_mut() {
-            events.push(HostileEvent { step, hostile });
-        }
+        self.0.write(|events| {
+            if let Some(events) = events.as_mut() {
+                events.push(HostileEvent { step, hostile });
+            }
+        });
     }
 }
 
@@ -345,16 +363,15 @@ pub enum Disruption {
 /// A run's recovery, shared by the control source, the storage source and
 /// the harness's view: the recovery, empty until a `Recover` step is
 /// picked, the hostile prefix before it and its cutoff, and the disruptions
-/// the scenario declares. Cloning shares the recovery and the prefix. The
-/// cutoff and disruptions are fixed once the harness has prepared the
-/// evidence, so a clone carries the same ones ([`Self::with_cutoff`]).
-#[derive(Clone, Default)]
+/// the scenario declares. Cloning shares them.
+#[derive(Clone)]
 pub struct RecoveryEvidence {
-    recovery: Rc<RefCell<Option<Recovery>>>,
+    recovery: Registered<Option<Recovery>>,
     prefix: Prefix,
     disruptions: Rc<[Disruption]>,
-    /// Set for a scenario with a `Recover` step.
-    cutoff: Option<PrefixCutoff>,
+    /// Set for a scenario with a `Recover` step. The harness's own setting,
+    /// fixed before the run, so it isn't an evidence store.
+    cutoff: Rc<Cell<Option<PrefixCutoff>>>,
 }
 
 /// One recovery: its source, when it started, and where it is.
@@ -370,25 +387,47 @@ pub struct Recovery {
     pub state: RecoveryState,
 }
 
+impl Snapshot for Option<Recovery> {
+    /// The recovery, if one started.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 impl RecoveryEvidence {
-    /// The evidence for a scenario with a `Recover` step, whose prefix is
-    /// bounded and ends at `cutoff` at the latest, with the `disruptions` it
-    /// declares.
-    pub fn bounded(disruptions: &[Disruption], cutoff: PrefixCutoff) -> Self {
+    /// The evidence in `stores`, the node's, for a scenario with no
+    /// `Recover` step, whose prefix is unbounded and has no cutoff.
+    pub fn new(stores: &EvidenceStores) -> Self {
         RecoveryEvidence {
-            recovery: Rc::default(),
-            prefix: Prefix::bounded(),
-            disruptions: disruptions.into(),
-            cutoff: Some(cutoff),
+            recovery: stores.register("recovery", None),
+            prefix: Prefix::unbounded(stores),
+            disruptions: Rc::default(),
+            cutoff: Rc::default(),
         }
     }
 
-    /// This evidence with its prefix ending at `cutoff` instead. Call it
-    /// before anything shares the evidence, since the cutoff isn't shared.
-    pub fn with_cutoff(self, cutoff: PrefixCutoff) -> Self {
+    /// The evidence in `stores` for a scenario with a `Recover` step, whose
+    /// prefix is bounded and ends at `cutoff` at the latest, with the
+    /// `disruptions` it declares.
+    pub fn bounded(
+        stores: &EvidenceStores,
+        disruptions: &[Disruption],
+        cutoff: PrefixCutoff,
+    ) -> Self {
         RecoveryEvidence {
-            cutoff: self.cutoff.map(|_| cutoff),
-            ..self
+            recovery: stores.register("recovery", None),
+            prefix: Prefix::bounded(stores),
+            disruptions: disruptions.into(),
+            cutoff: Rc::new(Cell::new(Some(cutoff))),
+        }
+    }
+
+    /// Ends a bounded prefix at `cutoff` instead, for every clone. Does
+    /// nothing for a scenario with no `Recover` step. A harness calls it
+    /// while it prepares the run, before any source reads the cutoff.
+    pub fn cut_off_at(&self, cutoff: PrefixCutoff) {
+        if self.cutoff.get().is_some() {
+            self.cutoff.set(Some(cutoff));
         }
     }
 
@@ -399,7 +438,7 @@ impl RecoveryEvidence {
 
     /// The prefix's cutoff, for a scenario with a `Recover` step.
     pub fn cutoff(&self) -> Option<PrefixCutoff> {
-        self.cutoff
+        self.cutoff.get()
     }
 
     /// Whether the prefix is open but has ended, at `now` with `step` the
@@ -410,7 +449,10 @@ impl RecoveryEvidence {
     /// with nothing owed (#2355).
     pub fn prefix_ended(&self, now: SimInstant, step: u64) -> bool {
         self.in_prefix()
-            && (self.prefix.full() || self.cutoff.is_some_and(|cutoff| cutoff.reached(now, step)))
+            && (self.prefix.full()
+                || self
+                    .cutoff()
+                    .is_some_and(|cutoff| cutoff.reached(now, step)))
     }
 
     /// Whether the scenario declares `disruption`.
@@ -426,20 +468,20 @@ impl RecoveryEvidence {
 
     /// The recovery, if a `Recover` step was picked.
     pub fn get(&self) -> Option<Recovery> {
-        self.recovery.borrow().clone()
+        self.recovery.read(Clone::clone)
     }
 
     /// When the `Recover` step was picked, if one was.
     pub fn started(&self) -> Option<SimInstant> {
         self.recovery
-            .borrow()
+            .lock()
             .as_ref()
             .map(|recovery| recovery.started)
     }
 
     /// The record, once the `recovered` pick wrote it.
     pub fn record(&self) -> Option<RecoveryRecord> {
-        match &self.recovery.borrow().as_ref()?.state {
+        match &self.recovery.lock().as_ref()?.state {
             RecoveryState::Recovered(record) => Some((**record).clone()),
             RecoveryState::Establishing { .. } | RecoveryState::Unreached { .. } => None,
         }
@@ -568,7 +610,7 @@ impl RecoveryEvidence {
     /// The node's baseline, once a `Recover` step was picked.
     pub fn baseline(&self) -> Option<Baseline> {
         self.recovery
-            .borrow()
+            .lock()
             .as_ref()
             .map(|recovery| recovery.baseline.clone())
     }
@@ -581,7 +623,7 @@ impl RecoveryEvidence {
 
     /// The step that ended recovery unreached, if it did.
     pub fn unreached_at(&self) -> Option<u64> {
-        match self.recovery.borrow().as_ref()?.state {
+        match self.recovery.lock().as_ref()?.state {
             RecoveryState::Unreached { step } => Some(step),
             RecoveryState::Establishing { .. } | RecoveryState::Recovered(_) => None,
         }
@@ -590,35 +632,50 @@ impl RecoveryEvidence {
     /// Counts a relink picked at `at`, as virtual time since the run's
     /// start, and returns the source to relink.
     pub(super) fn relinked(&self, at: Duration) -> String {
-        let mut recovery = self.recovery.borrow_mut();
-        let recovery = recovery
-            .as_mut()
-            .expect("a relink is offered only while recovery establishes");
-        if let RecoveryState::Establishing { relinks, last } = &mut recovery.state {
-            *relinks += 1;
-            *last = Some(at);
-        }
-        recovery.source.clone()
+        let source = self
+            .get()
+            .expect("a relink is offered only while recovery establishes")
+            .source;
+        self.recovery.write(|recovery| {
+            if let Some(Recovery {
+                state: RecoveryState::Establishing { relinks, last },
+                ..
+            }) = recovery.as_mut()
+            {
+                *relinks += 1;
+                *last = Some(at);
+            }
+        });
+        source
     }
 
     /// Ends recovery unreached, at the `recovery-unreached` pick at `step`.
     pub(super) fn give_up(&self, step: u64) {
-        if let Some(recovery) = self.recovery.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Unreached { step };
-        }
+        self.set_state(RecoveryState::Unreached { step });
     }
 
     /// Starts recovery from `source` at `started`, from the node's
     /// `baseline`.
     pub(super) fn start(&self, source: String, started: SimInstant, baseline: Baseline) {
-        *self.recovery.borrow_mut() = Some(Recovery {
-            source,
-            started,
-            baseline,
-            state: RecoveryState::Establishing {
-                relinks: 0,
-                last: None,
-            },
+        self.recovery.write(|recovery| {
+            *recovery = Some(Recovery {
+                source,
+                started,
+                baseline,
+                state: RecoveryState::Establishing {
+                    relinks: 0,
+                    last: None,
+                },
+            });
+        });
+    }
+
+    /// Moves a started recovery to `state`. Does nothing before a start.
+    fn set_state(&self, state: RecoveryState) {
+        self.recovery.write(|recovery| {
+            if let Some(recovery) = recovery.as_mut() {
+                recovery.state = state;
+            }
         });
     }
 }
@@ -949,9 +1006,8 @@ impl Driver {
         let at = zakura_scheduler::hooks::now()
             .ok_or_else(|| "a recovery is recorded inside a run".to_owned())?;
         let record = self.inputs.record((step, at), &source, session)?;
-        if let Some(recovery) = self.evidence.recovery.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Recovered(Box::new(record));
-        }
+        self.evidence
+            .set_state(RecoveryState::Recovered(Box::new(record)));
         Ok(())
     }
 }
@@ -1130,7 +1186,11 @@ pub(crate) mod tests {
         ends: &EndEvidence,
         disruptions: &[Disruption],
     ) -> RecoveryEvidence {
-        let recovery = RecoveryEvidence::bounded(disruptions, PrefixCutoff::Steps(u64::MAX));
+        let recovery = RecoveryEvidence::bounded(
+            &EvidenceStores::default(),
+            disruptions,
+            PrefixCutoff::Steps(u64::MAX),
+        );
         recovery.start("mirror-0".into(), at(0), empty());
         let source = Member {
             peer: "mirror-0".into(),
@@ -1157,16 +1217,14 @@ pub(crate) mod tests {
                 .map(|member| link_of(&sessions.facts(), member.session_id))
                 .collect(),
         };
-        if let Some(recovery) = recovery.recovery.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Recovered(Box::new(record));
-        }
+        recovery.set_state(RecoveryState::Recovered(Box::new(record)));
         recovery
     }
 
     /// A session view with `mirror-0`'s session 1 and `mirror-1`'s session 2
     /// live.
     fn two_links() -> SessionEvidence {
-        let sessions = SessionEvidence::default();
+        let sessions = SessionEvidence::new(&EvidenceStores::default());
         link(&sessions, 2, "mirror-0", 1);
         link(&sessions, 3, "mirror-1", 2);
         sessions
@@ -1186,8 +1244,8 @@ pub(crate) mod tests {
         // Before the `recovered` pick none holds: with no recovery, or while
         // it establishes.
         let sessions = two_links();
-        let ends = EndEvidence::default();
-        let recovery = RecoveryEvidence::default();
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let recovery = RecoveryEvidence::new(&EvidenceStores::default());
         assert_eq!(holding(&recovery, &ends), []);
         recovery.start("mirror-0".into(), at(0), empty());
         assert_eq!(holding(&recovery, &ends), []);
@@ -1196,7 +1254,7 @@ pub(crate) mod tests {
         // began stopping the node first.
         recovery.give_up(9);
         assert_eq!(holding(&recovery, &ends), DECLARED);
-        let stopped = EndEvidence::default();
+        let stopped = EndEvidence::new(&EvidenceStores::default());
         stopped.record(environment("node", EnvironmentAction::Shutdown));
         assert_eq!(holding(&recovery, &stopped), []);
 
@@ -1214,7 +1272,7 @@ pub(crate) mod tests {
         ];
         let honest: Vec<Assume> = [Assume::HonestPeer].into_iter().chain(rest).collect();
         for action in [EnvironmentAction::Close, EnvironmentAction::Relink] {
-            let ends = EndEvidence::default();
+            let ends = EndEvidence::new(&EvidenceStores::default());
             let recovery = recovered(&sessions, &ends);
             ends.record(environment("mirror-1", action));
             assert_eq!(holding(&recovery, &ends), honest, "{action:?}");
@@ -1228,7 +1286,7 @@ pub(crate) mod tests {
             connection: Some(connection),
             action: EnvironmentAction::Close,
         };
-        let ends = EndEvidence::default();
+        let ends = EndEvidence::new(&EvidenceStores::default());
         let recovery = recovered(&sessions, &ends);
         ends.record(close(9));
         assert_eq!(holding(&recovery, &ends), DECLARED);
@@ -1238,7 +1296,7 @@ pub(crate) mod tests {
         // Closing a peer that was no member at the pick changes nothing
         // recorded, so all five keep holding, and relinking one admits a
         // session, which ends `StableMembership`.
-        let ends = EndEvidence::default();
+        let ends = EndEvidence::new(&EvidenceStores::default());
         let recovery = recovered(&sessions, &ends);
         ends.record(environment("mirror-2", EnvironmentAction::Close));
         assert_eq!(holding(&recovery, &ends), DECLARED);
@@ -1252,7 +1310,7 @@ pub(crate) mod tests {
             ("mirror-0", EnvironmentAction::Relink),
             ("node", EnvironmentAction::Shutdown),
         ] {
-            let ends = EndEvidence::default();
+            let ends = EndEvidence::new(&EvidenceStores::default());
             let recovery = recovered(&sessions, &ends);
             ends.record(environment(peer, action));
             assert_eq!(holding(&recovery, &ends), rest, "{peer} {action:?}");
@@ -1262,7 +1320,7 @@ pub(crate) mod tests {
         // the source's session, a link the source closed itself, another
         // peer admitted, and the reactor exiting by itself. Each would hide
         // a node that drops its honest source.
-        let ends = EndEvidence::default();
+        let ends = EndEvidence::new(&EvidenceStores::default());
         let recovery = recovered(&sessions, &ends);
         sessions.reactor(&ReactorEvent::SessionEnded {
             peer: id(2),
@@ -1281,7 +1339,7 @@ pub(crate) mod tests {
     /// hold.
     #[test]
     fn only_an_unfair_recovery_loses_fair_scheduling() {
-        let (sessions, ends) = (two_links(), EndEvidence::default());
+        let (sessions, ends) = (two_links(), EndEvidence::new(&EvidenceStores::default()));
         let unfair = recovered_with(&sessions, &ends, &[Disruption::Unfair]);
         let rest: Vec<Assume> = DECLARED
             .into_iter()
@@ -1410,7 +1468,7 @@ pub(crate) mod tests {
             Next::GiveUp,
             "no time boundary once every relink is spent"
         );
-        let evidence = RecoveryEvidence::default();
+        let evidence = RecoveryEvidence::new(&EvidenceStores::default());
         evidence.start("mirror-0".into(), at(0), empty());
         for _ in 0..RECOVERY_RELINKS {
             assert_eq!(evidence.relinked(Duration::ZERO), "mirror-0");
@@ -1562,23 +1620,21 @@ pub(crate) mod tests {
     /// `adoption`'s and `ends`' facts so far are in, with its source at 4
     /// and `mirror-1` at 3.
     fn owing(ends: &EndEvidence) -> RecoveryEvidence {
-        let recovery = RecoveryEvidence::default();
+        let recovery = RecoveryEvidence::new(&EvidenceStores::default());
         recovery.start("mirror-0".into(), at(0), chain(3, 0, 0));
         let record = RecoveryRecord {
             stamp: ends.stamps().issued(),
             ..record_of(vec![chain(4, 0, 0), chain(3, 0, 0)], chain(3, 0, 0))
         };
-        if let Some(recovery) = recovery.recovery.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Recovered(Box::new(record));
-        }
+        recovery.set_state(RecoveryState::Recovered(Box::new(record)));
         recovery
     }
 
     /// [`owing`]'s recovery with the node adopted at its baseline, so it
     /// owes its successor, and the adoption and end evidence it reads.
     pub(crate) fn owed() -> (RecoveryEvidence, AdoptionEvidence, EndEvidence) {
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
         adopt(&adoption, 3);
         (owing(&ends), adoption, ends)
     }
@@ -1590,9 +1646,9 @@ pub(crate) mod tests {
     /// answers nothing.
     #[test]
     fn progress_is_owed_from_the_record_until_met_or_ended() {
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
-        let pending = RecoveryEvidence::default();
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
+        let pending = RecoveryEvidence::new(&EvidenceStores::default());
         assert_eq!(
             pending.progress(&adoption, &ends),
             RecoveryProgress::Pending
@@ -1625,23 +1681,23 @@ pub(crate) mod tests {
 
         // The node already at the successor at the pick meets it there. An
         // older adoption at the pick doesn't.
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
         adopt(&adoption, 4);
         assert_eq!(
             owing(&ends).progress(&adoption, &ends),
             RecoveryProgress::Concluded
         );
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
         adopt(&adoption, 4);
         adopt(&adoption, 3);
         assert_eq!(owing(&ends).progress(&adoption, &ends), owed);
 
         // The environment closing a member after the pick ends what's owed,
         // and the node ending the source's session doesn't.
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
         let recovery = owing(&ends);
         ends.record(EndFact::ReactorExited { step: 9 });
         assert_eq!(recovery.progress(&adoption, &ends), owed);
@@ -1668,29 +1724,52 @@ pub(crate) mod tests {
         fn view(&self) -> Self::View {
             use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
+            use super::super::{
+                authority::AuthorityEvidence,
+                capacity::CapacityEvidence,
+                chain_effect::ChainEffectEvidence,
+                claim::{ClaimEvidence, SettlementEvidence},
+                fault::FaultEvidence,
+                fork_choice::ForkChoiceEvidence,
+                hold_wake::HoldWakeEvidence,
+                outstanding::OutstandingEvidence,
+                publication::PublicationEvidence,
+                retirement::RetirementEvidence,
+                round_life::RoundLifeEvidence,
+                stale::StaleEvidence,
+                wake::WakeEvidence,
+            };
+            use crate::storage::FaultAttributions;
+
+            let stores = self.ends.stores();
             crate::harness::header_sync::StorageView {
                 port: Arc::new(ControlledPort::new(&HeaderFixture::regtest())),
                 direct_dispatch_broken: false,
                 honest_peers: Default::default(),
                 adoption: self.adoption.clone(),
                 sessions: Vec::new(),
-                faults: Default::default(),
-                capacity: Default::default(),
-                claims: Default::default(),
-                rounds: Default::default(),
-                stale_calls: Default::default(),
-                wake: Default::default(),
-                hold_wake: Default::default(),
+                faults: FaultEvidence::new(
+                    FaultAttributions::new(stores),
+                    CooldownEvidence::new(stores),
+                    self.ends.clone(),
+                    Duration::ZERO,
+                ),
+                capacity: CapacityEvidence::new(stores),
+                claims: ClaimEvidence::new(stores),
+                rounds: SettlementEvidence::new(stores),
+                stale_calls: StaleEvidence::new(stores),
+                wake: WakeEvidence::new(stores, None),
+                hold_wake: HoldWakeEvidence::new(stores),
                 ends: self.ends.clone(),
                 stamps: self.ends.stamps(),
-                round_life: Default::default(),
-                retirement: Default::default(),
-                chain_effect: Default::default(),
-                authority: Default::default(),
-                outstanding: Default::default(),
+                round_life: RoundLifeEvidence::new(stores),
+                retirement: RetirementEvidence::new(stores),
+                chain_effect: ChainEffectEvidence::new(stores),
+                authority: AuthorityEvidence::new(stores),
+                outstanding: OutstandingEvidence::new(stores),
                 recovery: self.recovery.clone(),
-                fork_choice: Default::default(),
-                publication: Default::default(),
+                fork_choice: ForkChoiceEvidence::new(stores),
+                publication: PublicationEvidence::new(stores),
             }
         }
     }
@@ -1708,8 +1787,8 @@ pub(crate) mod tests {
             property::{CheckCtx, FactAnswer, HasView, Verdict},
         };
 
-        let ends = EndEvidence::default();
-        let adoption = AdoptionEvidence::stamped_by(ends.stamps());
+        let ends = EndEvidence::new(&EvidenceStores::default());
+        let adoption = AdoptionEvidence::stamped_by(ends.stores(), ends.stamps());
         adopt(&adoption, 3);
         let harness = RecoveryOnly {
             recovery: owing(&ends),
@@ -1748,5 +1827,20 @@ pub(crate) mod tests {
         assert_eq!(answer(), FactAnswer::Unrelated, "not an adoption");
         adopt(&adoption, 4);
         assert_eq!(answer(), FactAnswer::Discharges, "the successor");
+    }
+
+    /// A recovery started, and a hostile event spent, after the node's stores froze are dropped.
+    #[test]
+    fn frozen_recovery_stores_drop_a_start_and_a_spend() {
+        crate::stores::assert_freeze_drops_writes(
+            RecoveryEvidence::new,
+            |recovery| recovery.start("mirror-0".into(), at(0), chain(3, 0, 0)),
+            RecoveryEvidence::get,
+        );
+        crate::stores::assert_freeze_drops_writes(
+            Prefix::bounded,
+            |prefix| prefix.spend(1, Hostile::Step(0)),
+            Prefix::events,
+        );
     }
 }

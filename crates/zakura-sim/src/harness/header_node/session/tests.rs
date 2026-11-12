@@ -1,5 +1,7 @@
 //! Each rule of the session view, fed by hand.
 
+use std::sync::Arc;
+
 use super::*;
 
 /// The mirror's peer ID.
@@ -30,7 +32,7 @@ fn admitted(session_id: u64, replaced: Option<u64>, origin: Option<SessionOrigin
 /// A view that joins, with the mirror's links on connections `links`, each
 /// dialed by the mirror.
 fn linked(links: &[u64]) -> SessionEvidence {
-    let view = SessionEvidence::default();
+    let view = SessionEvidence::new(&EvidenceStores::default());
     view.expect_links();
     for id in links {
         view.link_opened(
@@ -188,7 +190,7 @@ fn every_join_mismatch_breaks() {
 /// Without links reported, the view keeps the facts and doesn't join.
 #[test]
 fn a_view_without_links_does_not_join() {
-    let view = SessionEvidence::default();
+    let view = SessionEvidence::new(&EvidenceStores::default());
     assert_eq!(broken(&view, &[admitted(1, None, None)]), None);
 }
 
@@ -206,14 +208,13 @@ fn wire(connection: u64, quic_stream: u64, generation: u64) -> Option<SessionOri
 /// registered connection 1 from its address. Connection 1 has a header
 /// `Session` row on stream 8 for session 5, and installed generation 5.
 fn own9() -> SessionEvidence {
-    let view = SessionEvidence::default();
+    let view = SessionEvidence::new(&EvidenceStores::default());
     view.expect_transport(vec![(mirror(), "peer-0".to_owned())]);
-    {
-        let mut ledger = view.ledger();
+    view.change(|ledger| {
         ledger.registered(1, crate::peer::peer_addr(0, 0));
         ledger.session_row(1, 8, ZAKURA_STREAM_HEADER_SYNC, 5);
         ledger.generation_installed(1, 5);
-    }
+    });
     view
 }
 
@@ -234,10 +235,10 @@ fn an_admission_joins_own9_and_its_end_waits_for_retirement() {
         view.end_check(),
         EndCheck::Open(vec![("peer-0".to_owned(), 5)])
     );
-    view.ledger().retire(1, Some(4));
+    view.change(|ledger| ledger.retire(1, Some(4)));
     assert_ne!(view.end_check(), EndCheck::Complete, "another generation");
-    view.ledger().retire(1, Some(5));
-    view.ledger().retire(1, None);
+    view.change(|ledger| ledger.retire(1, Some(5)));
+    view.change(|ledger| ledger.retire(1, None));
     assert_eq!(view.end_check(), EndCheck::Complete);
     let retired: Vec<_> = view
         .facts()
@@ -264,11 +265,10 @@ fn own9_retires_a_session_in_either_order() {
         (None, Retirement::TornDown),
     ] {
         let view = own9();
-        view.ledger()
-            .session_row(1, 12, ZAKURA_STREAM_HEADER_SYNC, 6);
-        view.ledger().generation_installed(1, 6);
+        view.change(|ledger| ledger.session_row(1, 12, ZAKURA_STREAM_HEADER_SYNC, 6));
+        view.change(|ledger| ledger.generation_installed(1, 6));
         assert_eq!(broken(&view, &[admitted(5, None, wire(1, 8, 5))]), None);
-        view.ledger().retire(1, retire);
+        view.change(|ledger| ledger.retire(1, retire));
         assert_eq!(broken(&view, &[admitted(6, Some(5), wire(1, 12, 6))]), None);
         assert!(
             view.facts().contains(&SessionFact::SessionRetired {
@@ -293,7 +293,7 @@ fn own9_retires_a_session_in_either_order() {
 fn every_own9_mismatch_breaks() {
     let own9_with = |change: &dyn Fn(&mut SessionLedger)| {
         let view = own9();
-        change(&mut view.ledger());
+        view.change(change);
         view
     };
     let cases: Vec<(SessionEvidence, ReactorEvent, &str)> = vec![
@@ -365,9 +365,8 @@ fn every_own9_mismatch_breaks() {
     }
     let late = own9();
     let rule = broken(&late, &[admitted(6, None, wire(1, 9, 6))]).expect("no row yet");
-    late.ledger()
-        .session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6);
-    late.ledger().generation_installed(1, 6);
+    late.change(|ledger| ledger.session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6));
+    late.change(|ledger| ledger.generation_installed(1, 6));
     assert_eq!(late.broken(), Some(rule), "a later row joins nothing");
 }
 
@@ -495,7 +494,7 @@ fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
             view.end(end);
         }
         assert_eq!(view.end_check(), check, "{end:?}");
-        view.ledger().retire(1, None);
+        view.change(|ledger| ledger.retire(1, None));
         assert_eq!(view.end_check(), EndCheck::Complete, "{end:?}");
     }
 }
@@ -532,4 +531,14 @@ fn a_refused_session_joins_its_own9_row() {
     assert_eq!(broken(&own9(), &[refused(5)]), None);
     let why = broken(&own9(), &[refused(6)]).expect("no row has session 6");
     assert!(why.starts_with("Own9Join:"), "{why}");
+}
+
+/// A reactor event fed after the node's stores froze changes no fact.
+#[test]
+fn a_frozen_session_view_drops_an_event() {
+    crate::stores::assert_freeze_drops_writes(
+        SessionEvidence::new,
+        |view| view.reactor(&admitted(5, None, None)),
+        SessionEvidence::facts,
+    );
 }

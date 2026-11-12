@@ -285,6 +285,11 @@ impl Sim {
         }
     }
 
+    /// This run's ID, unique within the process.
+    pub(crate) fn run_id(&self) -> u64 {
+        self.run_id
+    }
+
     /// The run's generator list, for a task that spawns one
     /// ([`Generators::spawn`]).
     pub fn generators(&self) -> Rc<Generators> {

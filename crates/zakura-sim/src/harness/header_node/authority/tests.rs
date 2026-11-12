@@ -222,7 +222,7 @@ fn breaks_declaring(
     events: &[ReactorEvent],
 ) -> Vec<String> {
     let mut check = Authority::new(
-        AuthorityEvidence::default(),
+        AuthorityEvidence::new(&EvidenceStores::default()),
         HeaderFixture::regtest(),
         [0, 1, 2],
         declared.iter().copied(),
@@ -246,7 +246,7 @@ fn credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
 /// it.
 fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
     let mut check = Authority::new(
-        AuthorityEvidence::default(),
+        AuthorityEvidence::new(&EvidenceStores::default()),
         HeaderFixture::regtest(),
         [0],
         [],
@@ -307,7 +307,7 @@ fn a_page_on_a_scenario_branch_holds() {
     ];
     let with = |branches: &[u8]| {
         let mut check = Authority::new(
-            AuthorityEvidence::default(),
+            AuthorityEvidence::new(&EvidenceStores::default()),
             HeaderFixture::regtest(),
             branches.iter().copied(),
             [],
@@ -960,7 +960,7 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
     let chain = main_chain(4);
     let genesis = HeaderFixture::regtest().anchor();
     let mut check = Authority::new(
-        AuthorityEvidence::default(),
+        AuthorityEvidence::new(&EvidenceStores::default()),
         HeaderFixture::regtest(),
         [0],
         [],
@@ -1213,7 +1213,7 @@ fn an_open_starts_where_storage_put_its_first_locator() {
     let open = open(chain[3], &[genesis.hash]);
     let with = |read: Option<block::Height>| {
         let mut check = Authority::new(
-            AuthorityEvidence::default(),
+            AuthorityEvidence::new(&EvidenceStores::default()),
             HeaderFixture::regtest(),
             [0],
             [],
@@ -1246,7 +1246,7 @@ fn a_submission_of_another_kind_breaks_at_once() {
     let genesis = HeaderFixture::regtest().anchor();
     let round = request(1, chain[1].hash, genesis.hash);
     let mut check = Authority::new(
-        AuthorityEvidence::default(),
+        AuthorityEvidence::new(&EvidenceStores::default()),
         HeaderFixture::regtest(),
         [0],
         [],
@@ -1292,7 +1292,7 @@ fn a_second_submission_from_one_call_breaks_at_once() {
     let genesis = HeaderFixture::regtest().anchor();
     let round = request(1, chain[1].hash, genesis.hash);
     let mut check = Authority::new(
-        AuthorityEvidence::default(),
+        AuthorityEvidence::new(&EvidenceStores::default()),
         HeaderFixture::regtest(),
         [0],
         [],
@@ -1398,7 +1398,7 @@ fn an_apply_is_judged_with_or_without_a_handoff() {
     };
     let new_check = || {
         Authority::new(
-            AuthorityEvidence::default(),
+            AuthorityEvidence::new(&EvidenceStores::default()),
             HeaderFixture::regtest(),
             [0],
             [],
@@ -1531,5 +1531,17 @@ fn a_v1_page_is_charged_its_auxiliary_records() {
     assert!(
         found.iter().any(|found| found.contains("which takes")),
         "{found:?}"
+    );
+}
+
+/// A drain's applicability noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_authority_store_drops_its_applicability() {
+    crate::stores::assert_freeze_drops_writes(
+        AuthorityEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.applicable = Some(1));
+        },
+        AuthorityEvidence::any,
     );
 }

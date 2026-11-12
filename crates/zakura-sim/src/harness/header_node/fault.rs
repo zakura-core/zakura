@@ -33,7 +33,6 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
-    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -44,6 +43,7 @@ use super::{
 use crate::{
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
+    stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     Observation, RunEnd,
 };
 
@@ -656,34 +656,35 @@ pub enum CooldownFact {
 #[derive(Debug, Default)]
 struct CooldownStore {
     facts: Vec<CooldownFact>,
-    /// Set when the run's log froze. Facts after it are dropped.
-    frozen: bool,
+}
+
+impl Snapshot for CooldownStore {
+    /// Every fact.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
 }
 
 /// The reactor's cooldown facts, shared by its tap and the harness's view.
 /// Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct CooldownEvidence(Arc<Mutex<CooldownStore>>);
+#[derive(Clone, Debug)]
+pub struct CooldownEvidence(Registered<CooldownStore>);
 
 impl CooldownEvidence {
-    /// Locks the store. Every change completes under the lock, and nothing
-    /// else is called while it's held.
-    fn store(&self) -> std::sync::MutexGuard<'_, CooldownStore> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> CooldownEvidence {
+        CooldownEvidence(stores.register("cooldowns", CooldownStore::default()))
+    }
+
+    /// Locks the store for reading. Nothing else is called while it's
+    /// held.
+    fn store(&self) -> Guard<'_, CooldownStore> {
+        self.0.lock()
     }
 
     /// Records `fact`, unless the evidence is frozen.
     pub(super) fn record(&self, fact: CooldownFact) {
-        let mut store = self.store();
-        if !store.frozen {
-            store.facts.push(fact);
-        }
-    }
-
-    /// Stops recording facts, when the run's log freezes, as the adoption
-    /// evidence does.
-    pub(super) fn freeze(&self) {
-        self.store().frozen = true;
+        self.0.write(|store| store.facts.push(fact));
     }
 
     /// Every fact so far, in the order the reactor reported them.
@@ -701,7 +702,7 @@ impl CooldownEvidence {
 /// cooldowns its reactor started and the sessions it admitted or refused,
 /// the cooldown its config sets, and, once the run ends, whether it
 /// settled. Cloning shares all of it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FaultEvidence {
     attributions: FaultAttributions,
     cooldowns: CooldownEvidence,
@@ -750,7 +751,8 @@ impl FaultEvidence {
             cooldowns,
             ends,
             cooldown,
-            ..FaultEvidence::default()
+            settled: Rc::default(),
+            judge: Rc::default(),
         }
     }
 
@@ -1078,17 +1080,17 @@ mod tests {
 
     /// [`evidence`], with `ends` as the node's end facts.
     fn evidence_ending(blamed: &[(u64, Blame)], ends: &[EndFact]) -> FaultEvidence {
-        let attributions = FaultAttributions::default();
+        let attributions = FaultAttributions::new(&EvidenceStores::default());
         for (id, blame) in blamed {
             attributions.insert(NODE, *id, blame.clone());
         }
-        let store = EndEvidence::default();
+        let store = EndEvidence::new(&EvidenceStores::default());
         for fact in ends {
             store.record(fact.clone());
         }
         let evidence = FaultEvidence::new(
             attributions,
-            CooldownEvidence::default(),
+            CooldownEvidence::new(&EvidenceStores::default()),
             store,
             Duration::ZERO,
         );
@@ -1137,7 +1139,7 @@ mod tests {
             attribution: Attribution::HeaderPeer(SourceId::from_digest([blamed; 32])),
         };
         let log = failed_prepare(1, &digest(0xaa), 3, "invalid_header");
-        let projected = FaultAttributions::default();
+        let projected = FaultAttributions::new(&EvidenceStores::default());
         projected.record_result(NODE, 1, &failed(0xbb));
         assert_eq!(projected.get(NODE, 1), Some(blame(&digest(0xbb))));
         assert_eq!(owed(&log, &projected).unwrap(), Vec::new());
@@ -1400,17 +1402,17 @@ mod tests {
     /// settled end. A later check reports none of them again.
     #[test]
     fn every_break_is_reported_once() {
-        let attributions = FaultAttributions::default();
+        let attributions = FaultAttributions::new(&EvidenceStores::default());
         for id in 1..=2 {
             attributions.insert(NODE, id, blame("aa"));
         }
-        let cooldowns = CooldownEvidence::default();
+        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
         cooldowns.record(started("aa", 9, 60, 2, 99));
         cooldowns.record(admitted("aa", 4, 30));
         let evidence = FaultEvidence::new(
             attributions,
             cooldowns,
-            EndEvidence::default(),
+            EndEvidence::new(&EvidenceStores::default()),
             Duration::from_secs(60),
         );
         evidence.settled.set(Some(true));
@@ -1485,15 +1487,15 @@ mod tests {
     fn an_evidence_error_stops_the_judge_after_the_breaks_before_it() {
         // Operation 2 has no attribution. Operation 3's unpenalized fault
         // comes after it, so it's never read.
-        let attributions = FaultAttributions::default();
+        let attributions = FaultAttributions::new(&EvidenceStores::default());
         for id in [1, 3, 4] {
             attributions.insert(NODE, id, blame("aa"));
         }
-        let cooldowns = CooldownEvidence::default();
+        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
         let attributed = FaultEvidence::new(
             attributions,
             cooldowns.clone(),
-            EndEvidence::default(),
+            EndEvidence::new(&EvidenceStores::default()),
             Duration::from_secs(60),
         );
         attributed.settled.set(Some(true));
@@ -1582,16 +1584,16 @@ mod tests {
     /// Fault evidence for a settled run of a node with a 60 s cooldown,
     /// where operation 1 blamed `aa` and the reactor reported `facts`.
     fn cooled(facts: Vec<CooldownFact>) -> FaultEvidence {
-        let attributions = FaultAttributions::default();
+        let attributions = FaultAttributions::new(&EvidenceStores::default());
         attributions.insert(NODE, 1, blame("aa"));
-        let cooldowns = CooldownEvidence::default();
+        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
         for fact in facts {
             cooldowns.record(fact);
         }
         let evidence = FaultEvidence::new(
             attributions,
             cooldowns,
-            EndEvidence::default(),
+            EndEvidence::new(&EvidenceStores::default()),
             Duration::from_secs(60),
         );
         evidence.settled.set(Some(true));
@@ -1699,7 +1701,7 @@ mod tests {
     /// one went unpenalized, which the penalty rule calls a break.
     #[test]
     fn the_lists_go_on_past_an_unpenalized_fault() {
-        let attributions = FaultAttributions::default();
+        let attributions = FaultAttributions::new(&EvidenceStores::default());
         for id in 1..=3 {
             attributions.insert(NODE, id, blame("aa"));
         }
@@ -1711,8 +1713,8 @@ mod tests {
         log.extend(third);
         let evidence = FaultEvidence::new(
             attributions,
-            CooldownEvidence::default(),
-            EndEvidence::default(),
+            CooldownEvidence::new(&EvidenceStores::default()),
+            EndEvidence::new(&EvidenceStores::default()),
             Duration::ZERO,
         );
         let end = evidence.penalized(&log);
@@ -1751,5 +1753,21 @@ mod tests {
             FaultCheck::Broken { breaks, open: None }
                 if matches!(breaks.as_slice(), [why] if why.starts_with("ReadmittedInCooldown"))
         ));
+    }
+
+    /// A cooldown fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_cooldown_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            CooldownEvidence::new,
+            |cooldowns| {
+                cooldowns.record(CooldownFact::Admitted {
+                    peer: "mirror-0".to_owned(),
+                    session_id: 1,
+                    at: Duration::ZERO,
+                });
+            },
+            CooldownEvidence::facts,
+        );
     }
 }

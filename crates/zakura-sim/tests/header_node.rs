@@ -5,15 +5,34 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use support::{config, inputs};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::mpsc;
 use zakura_scheduler::SimInstant;
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::{
+        header_node::{
+            adoption::AdoptionEvidence,
+            authority::AuthorityEvidence,
+            capacity::CapacityEvidence,
+            chain_effect::ChainEffectEvidence,
+            claim::{ClaimEvidence, SettlementEvidence},
+            ends::EndEvidence,
+            fault::{CooldownEvidence, FaultEvidence},
+            fork_choice::ForkChoiceEvidence,
+            hold_wake::HoldWakeEvidence,
+            outstanding::OutstandingEvidence,
+            publication::PublicationEvidence,
+            recovery::RecoveryEvidence,
+            retirement::RetirementEvidence,
+            round_life::RoundLifeEvidence,
+            stale::StaleEvidence,
+            wake::WakeEvidence,
+        },
         header_node::{
             guard_dispatch,
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -27,6 +46,7 @@ use zakura_sim::{
     },
     observe::{StorageFact, StorageRequest, StorageResult},
     property::{HasView, Property, Sources},
+    storage::FaultAttributions,
     ActionSource, Boundary, Identity, MemorySink, Observation, ObservationLog, PlanInput,
     PropertyOutcome, RunConfig, RunReport, Sim,
 };
@@ -303,31 +323,38 @@ struct Planted {
 impl HasView for Planted {
     type View = StorageView;
 
-    /// An untouched port and the guard's flag.
+    /// An untouched port, the guard's flag, and empty stores.
     fn view(&self) -> StorageView {
+        // A fresh handle per view, which no run attaches: nothing writes these.
+        let stores = EvidenceStores::default();
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Default::default(),
-            adoption: Default::default(),
+            adoption: AdoptionEvidence::new(&stores),
             sessions: Default::default(),
-            faults: Default::default(),
-            capacity: Default::default(),
-            claims: Default::default(),
-            rounds: Default::default(),
-            stale_calls: Default::default(),
-            wake: Default::default(),
-            hold_wake: Default::default(),
-            ends: Default::default(),
+            faults: FaultEvidence::new(
+                FaultAttributions::new(&stores),
+                CooldownEvidence::new(&stores),
+                EndEvidence::new(&stores),
+                Duration::ZERO,
+            ),
+            capacity: CapacityEvidence::new(&stores),
+            claims: ClaimEvidence::new(&stores),
+            rounds: SettlementEvidence::new(&stores),
+            stale_calls: StaleEvidence::new(&stores),
+            wake: WakeEvidence::new(&stores, None),
+            hold_wake: HoldWakeEvidence::new(&stores),
+            ends: EndEvidence::new(&stores),
             stamps: Default::default(),
-            round_life: Default::default(),
-            retirement: Default::default(),
-            chain_effect: Default::default(),
-            authority: Default::default(),
-            outstanding: Default::default(),
-            recovery: Default::default(),
-            fork_choice: Default::default(),
-            publication: Default::default(),
+            round_life: RoundLifeEvidence::new(&stores),
+            retirement: RetirementEvidence::new(&stores),
+            chain_effect: ChainEffectEvidence::new(&stores),
+            authority: AuthorityEvidence::new(&stores),
+            outstanding: OutstandingEvidence::new(&stores),
+            recovery: RecoveryEvidence::new(&stores),
+            fork_choice: ForkChoiceEvidence::new(&stores),
+            publication: PublicationEvidence::new(&stores),
         }
     }
 }

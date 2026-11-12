@@ -15,7 +15,7 @@ use crate::harness::header_node::ready;
 fn seeded() -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::default();
+    let evidence = PublicationEvidence::new(&EvidenceStores::default());
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }
@@ -270,7 +270,7 @@ fn status_queued(snapshot: &EngineSnapshot) -> ReactorEvent {
 fn armed(arming: Arming) -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::armed(arming);
+    let evidence = PublicationEvidence::armed(&EvidenceStores::default(), arming);
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }
@@ -486,4 +486,27 @@ fn a_store_must_be_the_whole_record() {
     let breaks = check.drain(2);
     assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(breaks[0].contains("whose engine record is"), "{breaks:?}");
+}
+
+/// A publication fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_publication_store_drops_a_fact() {
+    crate::stores::assert_freeze_drops_writes(
+        |stores| {
+            PublicationEvidence::armed(
+                stores,
+                Arming {
+                    armed: true,
+                    status: false,
+                },
+            )
+        },
+        |evidence| {
+            evidence.keep(PublicationFact::Committed {
+                state_version: 1,
+                at: SimInstant::ZERO,
+            });
+        },
+        PublicationEvidence::facts,
+    );
 }

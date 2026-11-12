@@ -2355,7 +2355,7 @@ pub struct Entry {
 }
 
 /// Every observation of a run, in order.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObservationLog {
     entries: Vec<Entry>,
     step: u64,
@@ -2414,5 +2414,12 @@ impl ObservationLog {
     /// Stops recording. Live observations end before cleanup starts.
     pub(crate) fn freeze(&mut self) {
         self.frozen = true;
+    }
+
+    /// Starts recording again, for a test that stands in for a path that
+    /// appends to a frozen log.
+    #[cfg(test)]
+    pub(crate) fn thaw(&mut self) {
+        self.frozen = false;
     }
 }

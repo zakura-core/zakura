@@ -20,7 +20,7 @@ use zakura_sim::{
     harness::{
         header_node::{
             ends::{EndFact, EnvironmentAction},
-            hold_wake::{HoldWakeEvidence, HoldWakeFact},
+            hold_wake::HoldWakeFact,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Policy,
         },
@@ -434,10 +434,9 @@ impl Subsystem for Probe {
 
     /// The storage harness's ports, with the hold-wake evidence armed.
     fn prepare(scenario: &StorageScenario) -> Ports {
-        Ports {
-            hold_wake: HoldWakeEvidence::armed(),
-            ..Storage::prepare(scenario)
-        }
+        let ports = Storage::prepare(scenario);
+        ports.hold_wake.arm();
+        ports
     }
 
     /// The storage harness.
@@ -668,10 +667,9 @@ impl Subsystem for Spinning {
 
     /// The storage harness's ports, with the hold-wake evidence armed.
     fn prepare(scenario: &StorageScenario) -> Ports {
-        Ports {
-            hold_wake: HoldWakeEvidence::armed(),
-            ..Storage::prepare(scenario)
-        }
+        let ports = Storage::prepare(scenario);
+        ports.hold_wake.arm();
+        ports
     }
 
     /// The storage harness, then the spinning task.

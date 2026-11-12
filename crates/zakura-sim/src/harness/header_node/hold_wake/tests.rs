@@ -1,6 +1,7 @@
 use zakura_scheduler::SimInstant;
 
 use super::{HoldWakeCheck, HoldWakeEvidence, HoldWakeFact};
+use crate::stores::EvidenceStores;
 use crate::{
     harness::header_node::{
         policy::{Allow, Hold, OpKind, Predicates, Select, Trigger},
@@ -53,7 +54,7 @@ fn setup(stamps: &Stamps) -> (Predicates, HoldWakeCheck, HoldWakeEvidence) {
         then: vec![Allow::Engine],
         deadline_ms: None,
     }]);
-    let evidence = HoldWakeEvidence::default();
+    let evidence = HoldWakeEvidence::new(&EvidenceStores::default());
     evidence.stamp_with(stamps.clone());
     (predicates, HoldWakeCheck::new(evidence.clone()), evidence)
 }
@@ -188,7 +189,7 @@ fn serving_setup(stamps: &Stamps) -> (Predicates, HoldWakeCheck, HoldWakeEvidenc
             })
             .to_vec(),
     );
-    let evidence = HoldWakeEvidence::default();
+    let evidence = HoldWakeEvidence::new(&EvidenceStores::default());
     evidence.stamp_with(stamps.clone());
     (predicates, HoldWakeCheck::new(evidence.clone()), evidence)
 }
@@ -259,4 +260,20 @@ fn a_failed_undelivered_or_unnamed_read_opens_nothing() {
     unnamed_check.queued("aa", 7, 1);
     assert!(evidence.facts().is_empty());
     assert!(unnamed.facts().is_empty());
+}
+
+/// A hold-wake fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_hold_wake_store_drops_a_fact() {
+    crate::stores::assert_freeze_drops_writes(
+        HoldWakeEvidence::armed,
+        |evidence| {
+            evidence.push(HoldWakeFact::Opened {
+                call: 1,
+                op: 2,
+                at: SimInstant::ZERO,
+            });
+        },
+        HoldWakeEvidence::facts,
+    );
 }

@@ -53,7 +53,7 @@ fn seeded(
     port: &EnginePort,
     snapshot: &EngineSnapshot,
 ) -> (ForkChoice, ForkChoiceEvidence, Result<Vec<String>, String>) {
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence.clone(),
         fixture.clone(),
@@ -160,7 +160,7 @@ fn the_seeds_copied_score_is_judged() {
     let mut state = port.durable_state();
     state.metadata.header_best_score = snapshot.header_best_score;
     let mut check = ForkChoice::new(
-        ForkChoiceEvidence::default(),
+        ForkChoiceEvidence::new(&EvidenceStores::default()),
         fixture,
         [1, 2],
         &state,
@@ -282,7 +282,7 @@ fn a_header_outside_the_fixture_is_not_judged() {
     let mut foreign = key.0;
     foreign[0] ^= 1;
     state.graph.nodes.insert(block::Hash(foreign), node);
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let snapshot = selecting(port.snapshot(), tip(&fixture, 1, 5), work(&fixture, 1, 5));
     let mut check = ForkChoice::new(evidence.clone(), fixture, [1, 2], &state, &snapshot, now());
     assert_eq!(check.drain(1), Ok(Vec::new()));
@@ -400,7 +400,7 @@ fn a_deferred_admission_stays_ineligible() {
         .expect("a valid time");
     let lighter = selecting(port.snapshot(), tip(&fixture, 1, 5), work(&fixture, 1, 5));
     let anchor = selecting(port.snapshot(), fixture.anchor(), U256::zero());
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence,
         fixture.clone(),
@@ -427,7 +427,7 @@ fn a_deferred_admission_stays_ineligible() {
 fn the_seed_waits_for_step_one() {
     let (fixture, port) = weighted();
     let wrong = selecting(port.snapshot(), tip(&fixture, 2, 3), U256::zero());
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence.clone(),
         fixture,
@@ -440,4 +440,16 @@ fn the_seed_waits_for_step_one() {
     assert!(!evidence.any());
     assert_eq!(check.drain(1).expect("no evidence is missing").len(), 1);
     assert!(evidence.applicable_by(1));
+}
+
+/// A settled point counted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_fork_choice_store_drops_a_settled_point() {
+    crate::stores::assert_freeze_drops_writes(
+        ForkChoiceEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.settled_points += 1);
+        },
+        ForkChoiceEvidence::settled_points,
+    );
 }

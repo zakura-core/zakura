@@ -9,16 +9,37 @@
 //!
 //! [`HeaderWorkLedger`]: zakura_network::zakura::observe::HeaderWorkLedger
 
-use std::sync::{Arc, Mutex, PoisonError};
-
 use zakura_network::zakura::observe::ReactorEvent;
+
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
+
+/// What [`ReservationEvidence`] holds: each accounting fact, in order.
+#[derive(Debug, Default)]
+pub(crate) struct Facts(Vec<ReactorEvent>);
+
+impl Snapshot for Facts {
+    /// Every fact, in order.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(&self.0)
+    }
+}
 
 /// One reactor's accounting facts, shared by its tap and whoever reads them.
 /// Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct ReservationEvidence(Arc<Mutex<Vec<ReactorEvent>>>);
+#[derive(Clone, Debug)]
+pub struct ReservationEvidence(Registered<Facts>);
 
 impl ReservationEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> ReservationEvidence {
+        ReservationEvidence(stores.register("reservations", Facts::default()))
+    }
+
+    /// The handle that built the store, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
     /// Whether this store keeps `event`: a reservation's opening, binding or
     /// end, a staged page, a returned lease, or a round's release.
     pub(super) fn keeps(event: &ReactorEvent) -> bool {
@@ -35,18 +56,12 @@ impl ReservationEvidence {
 
     /// Records `event`. Nothing else is called while the lock is held.
     pub(super) fn record(&self, event: &ReactorEvent) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event.clone());
+        self.0.write(|facts| facts.0.push(event.clone()));
     }
 
     /// Every fact so far, in the order the queue reported them.
     pub fn facts(&self) -> Vec<ReactorEvent> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.0.read(|facts| facts.0.clone())
     }
 }
 
@@ -61,9 +76,12 @@ mod tests {
     use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
     use super::ReservationEvidence;
-    use crate::harness::header_node::{
-        capacity::CapacityEvidence, claim::SettlementEvidence, session::SessionEvidence,
-        stale::StaleEvidence, tap::ReactorTap,
+    use crate::{
+        harness::header_node::{
+            capacity::CapacityEvidence, claim::SettlementEvidence, ends::EndEvidence,
+            session::SessionEvidence, stale::StaleEvidence, tap::ReactorTap,
+        },
+        stores::EvidenceStores,
     };
 
     /// A tap keeps every accounting fact it's handed, through its capacity
@@ -75,17 +93,18 @@ mod tests {
             crate::PlanInput::Bytes(Vec::new()),
         );
         let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-        let evidence = ReservationEvidence::default();
+        let stores = EvidenceStores::default();
+        let evidence = ReservationEvidence::new(&stores);
         let (observer, _tap) = ReactorTap::with_evidence(
             &mut sim,
             &port,
             "node",
-            SessionEvidence::default(),
+            SessionEvidence::new(&stores),
             evidence.clone(),
-            CapacityEvidence::default(),
-            SettlementEvidence::default(),
-            StaleEvidence::default(),
-            Default::default(),
+            CapacityEvidence::new(&stores),
+            SettlementEvidence::new(&stores),
+            StaleEvidence::new(&stores),
+            EndEvidence::new(&stores),
         );
         let capacity = observer
             .capacity_observer()
@@ -108,5 +127,20 @@ mod tests {
         observer.observe(ended.clone());
 
         assert_eq!(evidence.facts(), [opened, ended]);
+    }
+
+    /// An accounting fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_reservation_store_drops_a_fact() {
+        let event = ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 2,
+            cause: ReservationEnd::Cancelled,
+        };
+        crate::stores::assert_freeze_drops_writes(
+            ReservationEvidence::new,
+            |reservations| reservations.record(&event),
+            ReservationEvidence::facts,
+        );
     }
 }

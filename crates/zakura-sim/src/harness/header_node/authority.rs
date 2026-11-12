@@ -41,10 +41,7 @@
 //! rule is a claim break, which the tap hands
 //! [`Claim::CommitOnlyAuthorized`](super::claim::Claim) at its drain.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
 
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
@@ -55,6 +52,7 @@ use zakura_network::zakura::{
 use zakura_storage::header::fixture::HeaderFixture;
 
 use crate::observe::StorageFact;
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// A subscription, by its peer, session and ID.
 type Subscription = (ZakuraPeerId, u64, u64);
@@ -76,16 +74,34 @@ struct Store {
     pending: bool,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// When the authority check first applied, shared by the tap and whoever
 /// reads it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct AuthorityEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct AuthorityEvidence(Registered<Store>);
 
 impl AuthorityEvidence {
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> AuthorityEvidence {
+        AuthorityEvidence(stores.register("authority", Store::default()))
+    }
+
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -221,7 +237,7 @@ impl Authority {
     /// The breaks found since the last call. Marks the check applicable at
     /// `step` if a fact since the last call made it so.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -266,7 +282,7 @@ impl Authority {
 
     /// Notes that a fact made the check applicable.
     pub(super) fn applies(&self) {
-        self.evidence.with(|store| store.pending = true);
+        self.evidence.change(|store| store.pending = true);
     }
 
     /// Judges round `incarnation`'s owner binding to its subscription's

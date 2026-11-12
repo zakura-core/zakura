@@ -36,6 +36,7 @@ use zakura_node_services::header_chain::{
     ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
 use zakura_scheduler::SimInstant;
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -174,7 +175,13 @@ fn held_vct_source(sim: &mut Sim, port: &Arc<ControlledPort>, tap: ReactorTap) -
         }],
         ..Policy::converging()
     };
-    PolicySource::new(sim, port.clone(), held, Effects::default()).with_tap(tap)
+    PolicySource::new(
+        sim,
+        port.clone(),
+        held,
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap)
 }
 
 /// How [`dropped_call_run`] ends the reactor.
@@ -202,17 +209,18 @@ fn dropped_call_run_reading(
 ) -> (RunReport, EndEvidence, (CapacityEvidence, ClaimEvidence)) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let capacity = CapacityEvidence::default();
+    let stores = EvidenceStores::default();
+    let capacity = CapacityEvidence::new(&stores);
     let (observer, tap) = ReactorTap::with_evidence(
         &mut sim,
         &port,
         "node",
-        SessionEvidence::default(),
-        ReservationEvidence::default(),
+        SessionEvidence::new(&stores),
+        ReservationEvidence::new(&stores),
         capacity.clone(),
-        SettlementEvidence::default(),
-        StaleEvidence::default(),
-        EndEvidence::default(),
+        SettlementEvidence::new(&stores),
+        StaleEvidence::new(&stores),
+        EndEvidence::new(&stores),
     );
     let ends = tap.ends();
     let claims = tap.claims();
@@ -340,7 +348,7 @@ fn a_drop_with_no_receipt_fails_at_teardown() {
         &mut sim,
         port.clone(),
         Policy::converging(),
-        Effects::default(),
+        Effects::new(&EvidenceStores::default()),
     )
     .with_tap(tap);
     sim.add_source(Box::new(source));
@@ -489,8 +497,13 @@ fn teardown_ends(
     if noticed {
         tap.shutdown().begin();
     }
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         for event in events {
@@ -551,8 +564,13 @@ fn a_leaked_reservation_fails_at_teardown() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let capacity = observer
@@ -628,8 +646,13 @@ fn a_run_that_ends_mid_stop_fails() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -653,8 +676,13 @@ fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let rounds = tap.rounds();
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -700,8 +728,13 @@ fn a_cut_off_stop_with_no_property_still_fails() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -970,7 +1003,7 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
                 sim.add_source(Box::new(FailsOnPanic(panicking.clone())));
             }
             let dispatch = DispatchFlag::default();
-            let effects = Effects::default();
+            let effects = Effects::new(&EvidenceStores::default());
             let policy = Policy {
                 holds,
                 ..Policy::converging()
@@ -1181,7 +1214,7 @@ fn observer_panic_run(input: PlanInput) -> RunReport {
         input,
         |sim| {
             let dispatch = DispatchFlag::default();
-            let effects = Effects::default();
+            let effects = Effects::new(&EvidenceStores::default());
             let storage =
                 PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
             let (observer, tap) = ReactorTap::new(sim, &node, "node");
@@ -1321,8 +1354,13 @@ fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let claims = tap.claims();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         for event in events {

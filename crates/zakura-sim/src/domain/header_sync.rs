@@ -1912,7 +1912,7 @@ mod tests {
             (SchedulerStatus::WorkerStarved, false),
             (SchedulerStatus::Deadlock, true),
         ] {
-            let rounds = SettlementEvidence::default();
+            let rounds = SettlementEvidence::new(&crate::stores::EvidenceStores::default());
             rounds.record(Settlement {
                 step: 3,
                 released: 1,
@@ -1949,12 +1949,25 @@ mod tests {
     }
 
     /// A probe's and a ledger's evidence with no tap behind it.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Probe {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
         stale_calls: StaleEvidence,
+    }
+
+    impl Default for Probe {
+        /// Empty stores in one handle of their own.
+        fn default() -> Self {
+            let stores = crate::stores::EvidenceStores::default();
+            Probe {
+                capacity: CapacityEvidence::new(&stores),
+                claims: ClaimEvidence::new(&stores),
+                rounds: SettlementEvidence::new(&stores),
+                stale_calls: StaleEvidence::new(&stores),
+            }
+        }
     }
 
     impl StaleView for Probe {

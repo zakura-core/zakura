@@ -197,10 +197,38 @@ pub enum CaseInput {
         /// The Plan bytes.
         plan: String,
     },
+    /// A typed scenario and a scripted Plan, for a history no Plan bytes
+    /// reach, such as one a test steers to.
+    Scripted {
+        /// The scenario, as the harness's JSON.
+        scenario: String,
+        /// The scripted Plan, as JSON.
+        script: String,
+    },
+}
+
+impl CaseInput {
+    /// Its committed input, or a typed case's scenario.
+    fn input(&self) -> &str {
+        match self {
+            CaseInput::Fuzz { input } => input,
+            CaseInput::Typed { scenario, .. } | CaseInput::Scripted { scenario, .. } => scenario,
+        }
+    }
+
+    /// A typed case's Plan file: its Plan bytes or its script.
+    fn plan(&self) -> Option<&str> {
+        match self {
+            CaseInput::Fuzz { .. } => None,
+            CaseInput::Typed { plan, .. } => Some(plan),
+            CaseInput::Scripted { script, .. } => Some(script),
+        }
+    }
 }
 
 /// What a planted case's `.toml` runs: its `input`, or its `[typed]`
-/// table's scenario and Plan. A case names exactly one.
+/// table's scenario and Plan, its `plan` bytes or its `script`. A case
+/// names exactly one input, and a typed one exactly one Plan.
 fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
     let file = repo
         .join("qa/planted")
@@ -224,10 +252,21 @@ fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
             let typed = typed
                 .as_table()
                 .ok_or_else(|| format!("{}: `typed` isn't a table", file.display()))?;
-            Ok(CaseInput::Typed {
-                scenario: path(typed, "scenario")?,
-                plan: path(typed, "plan")?,
-            })
+            let scenario = path(typed, "scenario")?;
+            match (typed.get("plan"), typed.get("script")) {
+                (Some(_), None) => Ok(CaseInput::Typed {
+                    scenario,
+                    plan: path(typed, "plan")?,
+                }),
+                (None, Some(_)) => Ok(CaseInput::Scripted {
+                    scenario,
+                    script: path(typed, "script")?,
+                }),
+                _ => Err(format!(
+                    "{}: a typed case names either `plan` or `script`",
+                    file.display()
+                )),
+            }
         }
         _ => Err(format!(
             "{}: a case names either `input` or `[typed]`",
@@ -274,7 +313,7 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
                 if matches!(
                     task,
                     Task::Case {
-                        input: CaseInput::Typed { .. },
+                        input: CaseInput::Typed { .. } | CaseInput::Scripted { .. },
                         ..
                     }
                 ) {
@@ -1255,7 +1294,7 @@ pub struct Links {
     pub harness: Option<String>,
     /// The committed input, or a typed case's scenario.
     pub input: Option<String>,
-    /// A typed case's Plan bytes.
+    /// A typed case's Plan file: its Plan bytes or its script.
     pub plan: Option<String>,
     /// The property whose trigger history it judged.
     pub trigger: Option<String>,
@@ -1392,14 +1431,8 @@ fn links(
                 expected.clone(),
                 Links {
                     harness: Some(harness.clone()),
-                    input: Some(match input {
-                        CaseInput::Fuzz { input } => input.clone(),
-                        CaseInput::Typed { scenario, .. } => scenario.clone(),
-                    }),
-                    plan: match input {
-                        CaseInput::Typed { plan, .. } => Some(plan.clone()),
-                        CaseInput::Fuzz { .. } => None,
-                    },
+                    input: Some(input.input().to_owned()),
+                    plan: input.plan().map(str::to_owned),
                     trigger: Some(property.clone()),
                     // A node case's result needs its Draft run, and a typed
                     // case's C18's binding, so the tool writes none, but
@@ -1523,14 +1556,10 @@ fn replay_links(run: &RunId, cases: &BTreeMap<(&str, &str), (usize, &Task)>) -> 
                 CaseRun::Patched => Some("patched"),
                 _ => None,
             };
-            let (input, plan) = match input {
-                CaseInput::Fuzz { input } => (Some(input.clone()), None),
-                CaseInput::Typed { scenario, plan } => (Some(scenario.clone()), Some(plan.clone())),
-            };
             Links {
                 harness: Some(harness.clone()),
-                input,
-                plan,
+                input: Some(input.input().to_owned()),
+                plan: input.plan().map(str::to_owned),
                 history: Some(run.clone()),
                 trigger: Some(property.clone()),
                 artifacts: dir
@@ -2040,8 +2069,9 @@ mod tests {
 
     /// A typed planted case plans beside a fuzz-input one: both get tasks,
     /// the typed one's result is listed unsupported until C18 binds its
-    /// scenario and Plan, and its links name both. A case naming both forms,
-    /// or neither, is refused.
+    /// scenario and Plan, and its links name both. A typed case's Plan is
+    /// its bytes or its script. A case naming both forms, or neither, is
+    /// refused, and so is a typed case naming both Plans.
     #[test]
     fn a_typed_case_is_planned_beside_a_fuzz_case() {
         let repo = tempfile::tempdir().expect("a temp dir can be created");
@@ -2053,7 +2083,15 @@ mod tests {
                 "typed",
                 "[typed]\nharness = \"header/reactor-policy\"\nscenario = \"s.json\"\nplan = \"p.bin\"\n",
             ),
+            (
+                "scripted",
+                "[typed]\nharness = \"header/reactor-policy\"\nscenario = \"s.json\"\nscript = \"p.json\"\n",
+            ),
             ("both", "input = \"in.bin\"\n[typed]\nharness = \"h\"\nscenario = \"s\"\nplan = \"p\"\n"),
+            (
+                "both-plans",
+                "[typed]\nharness = \"h\"\nscenario = \"s\"\nplan = \"p\"\nscript = \"p.json\"\n",
+            ),
         ] {
             fs::write(dir.join(format!("{name}.toml")), toml).expect("the temp dir is writable");
         }
@@ -2069,10 +2107,10 @@ mod tests {
             },
         };
         let manifest = Manifest {
-            expected: vec![caught("fuzz"), caught("typed")],
+            expected: vec![caught("fuzz"), caught("typed"), caught("scripted")],
             ..Manifest::committed()
         };
-        let planned = plan(&manifest, repo.path()).expect("both cases plan");
+        let planned = plan(&manifest, repo.path()).expect("every case plans");
         let inputs: Vec<&CaseInput> = planned
             .tasks
             .iter()
@@ -2091,23 +2129,34 @@ mod tests {
                     scenario: "s.json".into(),
                     plan: "p.bin".into()
                 },
+                &CaseInput::Scripted {
+                    scenario: "s.json".into(),
+                    script: "p.json".into()
+                },
             ]
         );
-        let typed_id = caught("typed").expected.id();
-        assert!(planned
-            .unsupported
-            .iter()
-            .any(|(id, _)| Some(id) == typed_id.as_ref()));
+        for typed in ["typed", "scripted"] {
+            let typed_id = caught(typed).expected.id();
+            assert!(
+                planned
+                    .unsupported
+                    .iter()
+                    .any(|(id, _)| Some(id) == typed_id.as_ref()),
+                "{typed}"
+            );
+        }
         let fuzz_id = caught("fuzz").expected.id();
         assert!(!planned
             .unsupported
             .iter()
             .any(|(id, _)| Some(id) == fuzz_id.as_ref()));
-        let both = Manifest {
-            expected: vec![caught("both")],
-            ..Manifest::committed()
-        };
-        assert!(plan(&both, repo.path()).is_err());
+        for refused in ["both", "both-plans"] {
+            let both = Manifest {
+                expected: vec![caught(refused)],
+                ..Manifest::committed()
+            };
+            assert!(plan(&both, repo.path()).is_err(), "{refused}");
+        }
     }
 
     /// An artifacts directory counts only for the run of S it names: one
@@ -2777,7 +2826,18 @@ mod tests {
                 },
             ),
         );
-        let cases = BTreeMap::from([(("p", "a"), (3, &a)), (("p", "a-b"), (4, &b))]);
+        let scripted = task(
+            "s",
+            CaseInput::Scripted {
+                scenario: "s.json".into(),
+                script: "p.json".into(),
+            },
+        );
+        let cases = BTreeMap::from([
+            (("p", "a"), (3, &a)),
+            (("p", "a-b"), (4, &b)),
+            (("p", "s"), (5, &scripted)),
+        ]);
         let run = |name: &str, role| RunId::Case {
             property: "p".into(),
             name: name.into(),
@@ -2795,6 +2855,9 @@ mod tests {
         let typed = replay_links(&run("a-b", CaseRun::Patched), &cases);
         assert_eq!(typed.input.as_deref(), Some("s.json"));
         assert_eq!(typed.plan.as_deref(), Some("p.bin"));
+        let scripted = replay_links(&run("s", CaseRun::Patched), &cases);
+        assert_eq!(scripted.input.as_deref(), Some("s.json"));
+        assert_eq!(scripted.plan.as_deref(), Some("p.json"));
         assert_eq!(
             replay_links(&run("a-b", CaseRun::Baseline), &cases).artifacts,
             ["4/baseline/trace.jsonl", "4/baseline/witness.json"]

@@ -48,8 +48,9 @@ const TOOL: Tool = Tool {
 const DEFAULT_DEADLINE_SECS: u64 = 7200;
 
 /// A run directory's build directories, dropped once the run succeeds.
-const RUN_TARGETS: [&str; 7] = [
+const RUN_TARGETS: [&str; 8] = [
     "xtask-target",
+    "fuzz-target",
     "build",
     "build-release",
     "tests",
@@ -514,6 +515,7 @@ fn run_at(
             "seed-witness" | "race-schedule" => ctx.seed_witness(fields)?,
             "agreement" => ctx.agreement(fields)?,
             "planted" => ctx.planted(fields)?,
+            "target" => ctx.target(fields)?,
             "command" => ctx.command(fields)?,
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
@@ -850,6 +852,52 @@ impl Ctx<'_> {
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
         self.record(&mut record, "record", json!({}))?;
         self.replay()
+    }
+
+    /// One fuzz target's readiness: the release `zakura-sim targets` on it,
+    /// building the fuzz binary under `<run>/fuzz-target/`, never the shared
+    /// `target/sim-fuzz`, with the report in `targets/` and every
+    /// fuzz-target run's begin and end records in `runs/`, which the
+    /// adapter writes only when the acceptance tool names that directory.
+    fn target(&self, task: &Value) -> Result<(), BoxError> {
+        let runs = self.dir.join("runs");
+        fs::create_dir_all(&runs)?;
+        let mut targets = Command::new(self.release);
+        targets
+            .args(["targets", "--target", field(task, "name")?, "--out"])
+            .arg(self.dir.join("targets"))
+            .arg("--target-dir")
+            .arg(self.run.out.join("fuzz-target"))
+            .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &runs)
+            .current_dir(self.root);
+        self.record(&mut targets, "targets", json!({}))?;
+        // The fuzz binary the run built, by its `[[bin]]` name.
+        let name = field(task, "name")?;
+        let mut pending = vec![self.run.out.join("fuzz-target")];
+        let mut built = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                } else if kind.is_file()
+                    && entry.file_name() == name
+                    && entry.path().parent().and_then(Path::file_name)
+                        == Some(std::ffi::OsStr::new("release"))
+                {
+                    built.push(entry.path());
+                }
+            }
+        }
+        if let [binary] = &built[..] {
+            fs::write(
+                self.dir.join("fuzz-binary.json"),
+                serde_json::to_string_pretty(
+                    &self.bound(json!({ "sha256": sha256_file(binary)? }), json!({})),
+                )?,
+            )?;
+        }
+        Ok(())
     }
 
     /// The discovery planted case: `cargo xtask planted <property>` for its

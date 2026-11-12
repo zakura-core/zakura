@@ -157,6 +157,21 @@ pub enum Task {
         /// The case's patch, relative to the repository's root.
         patch: String,
     },
+    /// One simulator fuzz target's readiness (M7.5): the run's own
+    /// `zakura-sim targets` on it, built in the run's directory, with each
+    /// fuzz-target run's begin and end records under `runs/` and the report
+    /// under `targets/`.
+    Target {
+        /// The expected result it produces.
+        expected: String,
+        /// The target's `[[bin]]` name.
+        name: String,
+        /// The harness `qa/suite.toml` maps it to.
+        harness: String,
+        /// The full-input SHA-256 of each admitted seed of that harness: the
+        /// runs the target must make, each at least once.
+        seeds: Vec<String>,
+    },
     /// One S4.6 command, which writes `command.json`.
     Command {
         /// The expected result it produces.
@@ -195,6 +210,7 @@ impl Task {
             | Task::RaceSchedule { expected, .. }
             | Task::Agreement { expected, .. }
             | Task::Planted { expected, .. }
+            | Task::Target { expected, .. }
             | Task::Command { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
@@ -467,10 +483,25 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 Expected::Planted(property) if *property == DISCOVERY_CASE.0 => {
                     planted_task(repo, &id)
                 }
-                Expected::Planted(_)
-                | Expected::Target(_)
-                | Expected::Minimize(_)
-                | Expected::Agreement(_) => {
+                Expected::Target(name) => manifest.as_ref().and_then(|m| {
+                    let harness = m
+                        .targets
+                        .iter()
+                        .find(|row| row.name == *name)?
+                        .harness
+                        .clone()?;
+                    Some(Task::Target {
+                        expected: id.clone(),
+                        name: (*name).to_owned(),
+                        seeds: seed_inputs
+                            .values()
+                            .filter(|(seed_harness, _)| *seed_harness == harness)
+                            .map(|(_, input)| input.clone())
+                            .collect(),
+                        harness,
+                    })
+                }),
+                Expected::Planted(_) | Expected::Minimize(_) | Expected::Agreement(_) => {
                     plan.unsupported
                         .push((id.clone(), "the tool can't run this result yet".to_owned()));
                     None
@@ -883,6 +914,10 @@ fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> 
                     .map(|trace| trace.meta.build.binary)
             })
             .collect(),
+        Task::Target { .. } => json("fuzz-binary.json")
+            .and_then(|binary| binary.get("sha256")?.as_str().map(str::to_owned))
+            .into_iter()
+            .collect(),
         Task::Command { .. } => Vec::new(),
     }
 }
@@ -927,6 +962,7 @@ pub fn record(
         (sha256_hex(&kept) == digest).then_some(digest)
     });
     let bound = Bound {
+        commit: subject,
         source: subject_source,
         release,
     };
@@ -1231,6 +1267,8 @@ pub fn record(
 
 /// What every judged artifact must be bound to.
 struct Bound<'a> {
+    /// S's commit.
+    commit: &'a str,
     /// S's source digest.
     source: &'a str,
     /// The SHA-256 of the release `zakura-sim` the run kept, which every
@@ -1280,6 +1318,7 @@ fn judge_planted(
     // The patched build embeds its own source, S plus the patch, so its
     // trace is bound to that build and to S's commit rather than S's digest.
     let patched_bound = Bound {
+        commit: bound.commit,
         source: &patched.meta.build.source,
         release: Some(patched_sha),
     };
@@ -1325,6 +1364,115 @@ fn judge_planted(
         },
         applicable,
     )
+}
+
+/// A fuzz target's verdict (Rule 11): `zakura-sim targets` reported it
+/// ready, from a fuzz binary built from S's clean source, and every run the target
+/// made is accounted for. Each begin record has its end, each run is of
+/// the target's harness on one of its admitted seeds (libFuzzer may rerun
+/// a seed, an observed atom), every seed ran at least once, and every run
+/// passes through [`owned_run_passes`], cleanup included.
+fn judge_target(
+    dir: &Path,
+    binding: &TaskBinding,
+    bound: &Bound<'_>,
+    name: &str,
+    harness: &str,
+    seeds: &[String],
+) -> Verdict {
+    let blocked = |why: String| Verdict::Blocked { why };
+    if !exited(runner_json(dir, "targets.json", binding)) {
+        return blocked("`zakura-sim targets` didn't report the target ready".to_owned());
+    }
+    let readiness: Option<Value> =
+        fs::read_to_string(dir.join("targets").join(crate::campaign::READINESS_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+    let row = readiness
+        .as_ref()
+        .and_then(|r| r.get("targets")?.as_array())
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("target").and_then(Value::as_str) == Some(name))
+        });
+    let Some(row) = row else {
+        return blocked(format!("the readiness report has no row for {name}"));
+    };
+    if row.get("status").and_then(Value::as_str) != Some("ready") {
+        return blocked(format!("{name} isn't ready"));
+    }
+    if row.pointer("/build/git").and_then(Value::as_str) != Some(bound.commit)
+        || row.pointer("/build/dirty").and_then(Value::as_bool) != Some(false)
+        || row.pointer("/build/source").and_then(Value::as_str) != Some(bound.source)
+    {
+        return blocked(format!("{name}'s fuzz binary wasn't built from S's commit"));
+    }
+    let Ok(entry) = crate::harness::find(harness) else {
+        return blocked(format!("{harness} isn't a harness at S"));
+    };
+    let properties = (entry.properties)();
+    let registered = Registered {
+        ids: properties.iter().map(|p| p.id.clone()).collect(),
+        tolerated: properties
+            .iter()
+            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
+            .map(|p| p.id.clone())
+            .collect(),
+    };
+    let runs = dir.join("runs");
+    let Ok(entries) = fs::read_dir(&runs) else {
+        return blocked("the target left no run records".to_owned());
+    };
+    let mut begins = BTreeSet::new();
+    let mut ends = BTreeMap::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = file.strip_suffix(".begin.json") {
+            begins.insert(stem.to_owned());
+        } else if let Some(stem) = file.strip_suffix(".end.json") {
+            ends.insert(stem.to_owned(), entry.path());
+        } else {
+            return blocked(format!("{file} isn't a run record"));
+        }
+    }
+    if let Some(stem) = begins.iter().find(|stem| !ends.contains_key(*stem)) {
+        return blocked(format!("run {stem} began but never ended"));
+    }
+    let mut ran = BTreeSet::new();
+    for (stem, path) in &ends {
+        if !begins.contains(stem) {
+            return blocked(format!("run {stem} ended without beginning"));
+        }
+        let Some(record) = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            return blocked(format!("run {stem}'s end record doesn't read"));
+        };
+        let input = record.get("input_sha256").and_then(Value::as_str);
+        if record.get("harness").and_then(Value::as_str) != Some(harness)
+            || !input.is_some_and(|input| seeds.iter().any(|seed| seed == input))
+        {
+            return blocked(format!(
+                "run {stem} isn't a run of one of {harness}'s seeds"
+            ));
+        }
+        let Some(end) = record
+            .get("end")
+            .and_then(|end| serde_json::from_value::<crate::record::EndRecord>(end.clone()).ok())
+        else {
+            return blocked(format!("run {stem} left no end record"));
+        };
+        if let Err(why) = owned_run_passes(&end, &registered, &RunExpect::Passes) {
+            return blocked(format!("run {stem}: {why}"));
+        }
+        ran.extend(input.map(str::to_owned));
+    }
+    match seeds.iter().find(|seed| !ran.contains(*seed)) {
+        Some(seed) => blocked(format!("the target never ran seed {seed}")),
+        None if seeds.is_empty() => blocked(format!("{harness} has no admitted seed")),
+        None => Verdict::Verified,
+    }
 }
 
 /// The discovery agreement pair's verdict, from the planted task's runs in
@@ -1598,6 +1746,12 @@ fn judge_task(
             input_sha256,
             ..
         } => judge_planted(dir, binding, bound, harness, input_sha256, applicable),
+        Task::Target {
+            name,
+            harness,
+            seeds,
+            ..
+        } => judge_target(dir, binding, bound, name, harness, seeds),
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)
                 if command.get("args") != Some(&serde_json::json!(args))

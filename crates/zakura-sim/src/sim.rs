@@ -148,7 +148,7 @@ pub struct RunReport {
 impl RunReport {
     /// The `end` record the run wrote, or would have written to a sink that
     /// keeps records.
-    pub(crate) fn end_record(&self) -> EndRecord {
+    pub fn end_record(&self) -> EndRecord {
         end_record(&self.end, &self.properties, self.cleanup, &self.picks)
     }
 }

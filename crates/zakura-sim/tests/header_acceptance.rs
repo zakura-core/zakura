@@ -4723,6 +4723,41 @@ fn the_evaluator_accepts_genuine_results() {
         state(&manifest, &pending, &Key::catch("t/a")),
         ObligationState::Verified
     );
+
+    // A set judged on the Draft run: the patched run stops at the case's
+    // own ID alone, and the Draft run, with the whole set as its override,
+    // violates every member by its end. The patched run with the broader ID
+    // violated too, or stopped by it, and a Draft run that doesn't violate
+    // it, each block the case.
+    let late = Key::Case {
+        property: "t/a".into(),
+        name: "late-bug".into(),
+    };
+    let mut later = manifest.clone();
+    let at = covering(&later, &late);
+    if let Expected::Caught { set, found, .. } = &mut later.expected[at].expected {
+        *set = &["t/a", "t/b"];
+        *found = Found::AtStepSetOnDraft;
+    }
+    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+        let mut file = results();
+        let (_, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        patched.end = End::Violation {
+            property: stopped_by.into(),
+        };
+        patched.actions = Actions::Prefix;
+        patched.reports.insert("t/b".into(), patched_b);
+        draft.reports.insert("t/b".into(), draft_b);
+        draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
+        state(&later, &file, &late)
+    };
+    assert_eq!(
+        judged("t/a", held(), Report::Violated),
+        ObligationState::Verified
+    );
+    assert!(blocked(&judged("t/a", Report::Violated, Report::Violated)));
+    assert!(blocked(&judged("t/b", held(), Report::Violated)));
+    assert!(blocked(&judged("t/a", held(), held())));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on

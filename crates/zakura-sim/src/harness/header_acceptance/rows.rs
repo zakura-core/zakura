@@ -94,6 +94,11 @@ const HONEST: &str = "session/honest-never-punished";
 /// [`NESTS`] lists over [`HONEST`].
 const CONFORMANT: &str = "header-sync/s5v9/conformant-never-closes";
 
+/// The v9 subscriber's rule that an outcome nothing it sent asked for
+/// closes the subscription, which [`NESTS`] lists over the bad-content
+/// close.
+const UNSOLICITED: &str = "header-sync/s5v9/headers-outcome/unsolicited-closes";
+
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
@@ -172,6 +177,11 @@ struct Generated {
 enum GeneratedCatch {
     /// The case's name. Its set is the ID alone, and it's found at a step.
     Case(&'static str),
+    /// The case's name and the broader IDs its patch breaks only after the
+    /// case's own break, which [`NESTS`] lists over the ID: the patched run
+    /// stops at the ID alone, and the case's `Draft` run shows the ID and
+    /// every broader one ([`Found::AtStepSetOnDraft`]).
+    CaseSetOnDraft(&'static str, &'static [&'static str]),
     /// The `Open`'s reason and its approval.
     Open(&'static str, Approval),
 }
@@ -208,7 +218,7 @@ const NONE: &[Gate] = &[];
 
 /// Header sync's 32 generated IDs on `main`.
 const GENERATED: [Generated; 32] = {
-    use GeneratedCatch::{Case, Open};
+    use GeneratedCatch::{Case, CaseSetOnDraft, Open};
     [
         gen(
             "conformant-never-closes",
@@ -226,13 +236,13 @@ const GENERATED: [Generated; 32] = {
             "subscribe-headers/sender-within-live",
             EVERY,
             G3,
-            Case("open-repeated"),
+            CaseSetOnDraft("open-repeated", &[CONFORMANT, HONEST]),
         ),
         gen(
             "subscribe-headers/sender-within-credit",
             EVERY,
             G3,
-            Case("page-past-credit"),
+            CaseSetOnDraft("page-past-credit", &["sim/no-livelock"]),
         ),
         gen(
             "headers/sender-answers-open",
@@ -394,7 +404,7 @@ const GENERATED: [Generated; 32] = {
             "headers-outcome/bad-content-closes",
             OUTCOME,
             G2,
-            Case("outcome-window-unchecked"),
+            CaseSetOnDraft("outcome-window-unchecked", &[UNSOLICITED]),
         ),
         gen(
             "headers-outcome/over-owed-closes",
@@ -1496,6 +1506,23 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
                 case(property, name),
                 set,
                 Found::AtStep,
+                generated.gates,
+                true,
+            ));
+        }
+        GeneratedCatch::CaseSetOnDraft(name, broader) => {
+            // As for `Case`, the leak is bounded by the fixed table.
+            let set: &'static [&'static str] = Box::leak(
+                std::iter::once(property)
+                    .chain(broader.iter().copied())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            expected.extend(caught(
+                WIRE,
+                case(property, name),
+                set,
+                Found::AtStepSetOnDraft,
                 generated.gates,
                 true,
             ));
@@ -2680,12 +2707,22 @@ fn hand_written_rows() -> Vec<Row> {
         (WATCH_LIFECYCLE, &[WATCH_LIFECYCLE], FLOOD_LIFECYCLE),
     ] {
         let mut watch = holds(id, G1, history);
-        for (name, found) in [
+        let both: &'static [&'static str] = if id == WATCH_WIRE {
+            &[WATCH_WIRE, WATCH_LIFECYCLE]
+        } else {
+            &[WATCH_LIFECYCLE, WATCH_WIRE]
+        };
+        for (name, set, found) in [
             // The revert's starved watch stops the run at a step. The wedged
             // loop leaves a publication unread when the run settles, which
-            // its end check finds.
-            ("watch-check-revert", Found::AtStep),
-            ("wedged-run-loop", Found::AtEnd),
+            // both queues' end checks find, so its set is both rules (C6's
+            // per-subject end join ties them by that publication).
+            (
+                "watch-check-revert",
+                set as &'static [&'static str],
+                Found::AtStep,
+            ),
+            ("wedged-run-loop", both, Found::AtEnd),
         ] {
             watch.extend(caught(
                 FLOOD,
@@ -2926,7 +2963,57 @@ pub static NESTS: &[Nest] = &[
         ],
         when: "the punished peer is marked honest",
     },
+    // The four below break only after the case's own break, so their cases
+    // judge the set on the Draft run (`Found::AtStepSetOnDraft`).
+    Nest {
+        broader: "sim/no-livelock",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-credit"],
+        when: SENDER_CREDIT_LIVELOCK,
+    },
+    Nest {
+        broader: UNSOLICITED,
+        over: &["header-sync/s5v9/headers-outcome/bad-content-closes"],
+        when: OUTCOME_UNSOLICITED,
+    },
+    Nest {
+        broader: "header-sync/s5v9/conformant-never-closes",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-live"],
+        when: OPEN_REPEATED_PUNISHED,
+    },
+    Nest {
+        broader: "session/honest-never-punished",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-live"],
+        when: OPEN_REPEATED_PUNISHED,
+    },
+    // A wedged run loop leaves its publication unread under both queues'
+    // rules at once, so each watch rule nests over the other.
+    Nest {
+        broader: WATCH_LIFECYCLE,
+        over: &[WATCH_WIRE],
+        when: WEDGED_LOOP,
+    },
+    Nest {
+        broader: WATCH_WIRE,
+        over: &[WATCH_LIFECYCLE],
+        when: WEDGED_LOOP,
+    },
 ];
+
+/// When `sim/no-livelock` breaks beside an over-credit page.
+const SENDER_CREDIT_LIVELOCK: &str = "the publisher goes on sending the held subscriber pages \
+                                      past its credit at zero time, so the run spins without \
+                                      time advancing";
+/// When `unsolicited-closes` breaks beside an unchecked outcome window.
+const OUTCOME_UNSOLICITED: &str = "the subscription ended on the early outcome, so the outcomes \
+                                   that follow for it are unsolicited and the subscriber never \
+                                   closes over them";
+/// When a repeated `Open` is punished.
+const OPEN_REPEATED_PUNISHED: &str = "the node goes on to close the honest peer's connection \
+                                      with a protocol reject over the subscription its repeated \
+                                      Open doubled";
+/// When a wedged loop breaks both watch rules.
+const WEDGED_LOOP: &str = "the run loop stops reading its committed watch, so the run settles \
+                           with the same publication unread under both queues' rules";
 
 /// A gate obligation no single ID owns (item 0's `GATE_REQUIREMENTS`),
 /// written from the spec's gate table.

@@ -5,13 +5,13 @@
 # the adversary subscribes from 50 with one page of credit, holds every
 # grant and takes no act, while the node holds 120 headers, so
 # `header-sync/s5v9/subscribe-headers/sender-within-credit` is the only ID
-# it breaks.
+# it breaks by its stopping step.
 # Besides the files the patch changes, the rest of these decide which
 # frames the input's peers send and when the node judges them. A change
 # there can move the input off its frame.
-# The held subscriber then never spends the over-credit page, which breaks
-# `sim/no-livelock` only later, past the stop, so the case's set is judged
-# on its Draft run (`draft_set`).
+# Past the stop, the publisher goes on sending pages over credit at zero
+# time, so `sim/no-livelock` breaks too, but only later, and the case's set
+# is judged on its Draft run (`draft_set`).
 draft_set = ["sim/no-livelock"]
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]
 

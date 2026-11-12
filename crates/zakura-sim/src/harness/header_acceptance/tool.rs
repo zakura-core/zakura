@@ -410,7 +410,9 @@ pub struct PatchedWitness {
 /// What a planted case's `.toml` says its patched witness expects
 /// ([`PatchedWitness`]). A case naming both `set` and `also_violates`, or
 /// either as anything but a list of IDs, is refused, as the planted runner
-/// refuses it.
+/// refuses it. A `draft_set` case's patched runs break its property alone,
+/// so they expect `violated` beside nothing: its set is judged on its
+/// `Draft` run ([`super::Found::AtStepSetOnDraft`]).
 fn patched_witness(repo: &Path, case: CaseRef) -> Result<PatchedWitness, String> {
     let file = repo
         .join("qa/planted")
@@ -4124,9 +4126,10 @@ mod tests {
     }
 
     /// A planted case's patched witness is the one the planted runner
-    /// records: the nested `target-page-refused` case names a `set`, so
-    /// its task expects `violated-set` with exactly that set, and a case
-    /// naming `also_violates` expects `violated` beside it. A patched run
+    /// records: the nested `target-page-refused` and `wedged-run-loop` cases
+    /// name a `set`, so their tasks expect `violated-set` with exactly that
+    /// set, a case naming `also_violates` expects `violated` beside it, and
+    /// a `draft_set` case expects `violated` beside nothing. A patched run
     /// of the nested case whose witness judges its set is read with its
     /// trigger. The same witness under `violated`, with a member missing or
     /// with another one added, isn't its witness, and fails the run.
@@ -4143,15 +4146,38 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{property}/{name} has a task"))
         };
-        let flood = task("header-sync/watch-observed-under-flood", "wedged-run-loop");
-        let Task::Case { patched, .. } = flood else {
-            unreachable!("found as a case");
+        let witness_of = |property: &str, name: &str| {
+            let Task::Case { patched, .. } = task(property, name) else {
+                unreachable!("found as a case");
+            };
+            patched.clone()
         };
+        let flood = "header-sync/watch-observed-under-flood";
+        let lifecycle = "header-sync/watch-observed-under-lifecycle-flood";
         assert_eq!(
-            patched,
-            &PatchedWitness {
+            witness_of(flood, "watch-check-revert"),
+            PatchedWitness {
                 expect: "violated".into(),
-                beside: vec!["header-sync/watch-observed-under-lifecycle-flood".into()],
+                beside: vec![lifecycle.into()],
+            }
+        );
+        assert_eq!(
+            witness_of(flood, "wedged-run-loop"),
+            PatchedWitness {
+                expect: "violated-set".into(),
+                beside: vec![lifecycle.into()],
+            }
+        );
+        // A set judged on the Draft run leaves its patched runs the
+        // property alone.
+        assert_eq!(
+            witness_of(
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "page-past-credit"
+            ),
+            PatchedWitness {
+                expect: "violated".into(),
+                beside: Vec::new(),
             }
         );
         let Task::Case {

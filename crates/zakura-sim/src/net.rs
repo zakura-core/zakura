@@ -39,8 +39,9 @@ struct State {
     admitted: BTreeSet<Link>,
     /// How many of the network's events have been logged.
     seen: usize,
-    /// Each datagram sent and not yet gone: its length and send time.
-    in_flight: BTreeMap<DatagramId, (u64, u64)>,
+    /// Each datagram sent and not yet gone: its length, send time and
+    /// payload digest.
+    in_flight: BTreeMap<DatagramId, (u64, u64, Option<String>)>,
 }
 
 impl Net {
@@ -211,9 +212,10 @@ impl ActionSource for Net {
         let now = nanos(hooks::now().expect("a run observes its sources inside the run"));
         for event in events {
             let (id, outcome) = match event {
-                NetEvent::Sent { id, len } => {
+                NetEvent::Sent { id, len, digest } => {
+                    let digest = digest.map(|digest| crate::trace::meta::hex(&digest));
                     // usize always fits in u64 on supported targets.
-                    state.in_flight.insert(id, (len as u64, now));
+                    state.in_flight.insert(id, (len as u64, now, digest));
                     (id, DatagramOutcome::Sent)
                 }
                 NetEvent::Delivered { id } => (id, DatagramOutcome::Delivered),
@@ -227,8 +229,8 @@ impl ActionSource for Net {
                 } => (id, DatagramOutcome::Unbound),
                 NetEvent::Bound { .. } | NetEvent::Unbound { .. } => continue,
             };
-            let (len, sent_at) = match outcome {
-                DatagramOutcome::Sent => state.in_flight[&id],
+            let (len, sent_at, digest) = match outcome {
+                DatagramOutcome::Sent => state.in_flight[&id].clone(),
                 _ => state.in_flight.remove(&id).ok_or_else(|| {
                     format!("datagram {id:?} left the network without a send the source saw")
                 })?,
@@ -239,6 +241,7 @@ impl ActionSource for Net {
                 len,
                 outcome,
                 sent_at,
+                digest,
             });
         }
         Ok(())
@@ -259,6 +262,11 @@ impl ActionSource for Net {
     }
 
     /// Nothing: the network has no holds.
+    /// Hashes each payload at its send while the run records its steps.
+    fn record_contents(&mut self, on: bool) {
+        self.0.borrow().sim.set_payload_digests(on);
+    }
+
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
     /// None: a datagram in flight is delivered once its window opens, and

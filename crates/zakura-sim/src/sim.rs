@@ -40,8 +40,8 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, Mark},
     observe::{Exit, Observation},
     record::{
-        digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
-        ViolationRecord,
+        digest, CleanupRecord, DrawRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink,
+        StepRecord, ViolationRecord,
     },
     Identity, ObservationLog, Plan, PlanInput, RecoveryOffer,
 };
@@ -390,9 +390,10 @@ impl Sim {
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
-    /// each step, then `end`. A sink that doesn't want steps
-    /// ([`RecordSink::wants_steps`]) gets only `init` and `end`, and the run
-    /// skips each step's `obs` digest.
+    /// after setup's step 0 observations, each step, then `end`. A sink that
+    /// doesn't want steps ([`RecordSink::wants_steps`]) gets only `init` and
+    /// `end`, and the run skips every `obs` digest, step 0's included, and
+    /// tells its sources so ([`ActionSource::record_contents`]).
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
         state.log.set_run(self.run_id);
@@ -402,12 +403,14 @@ impl Sim {
             choices.set_owner(Owner::Harness);
             choices.take_draws()
         };
-        sink.record(Record::Init(InitRecord { draws }));
         // A checker's failure from setup, such as a missing source, ends the
         // run before its first step.
         let end = match self.failure.take().or_else(|| checker.harness_failure()) {
-            Some(failure) => state.end_harness(failure),
-            None => self.drive(checker, &mut state, sink),
+            Some(failure) => {
+                sink.record(Record::Init(InitRecord { draws, obs: None }));
+                state.end_harness(failure)
+            }
+            None => self.drive(checker, &mut state, sink, draws),
         };
         // A trace replay that ended before its record did diverged.
         let unreached = match end.outcome {
@@ -521,18 +524,26 @@ impl Sim {
         cleanup
     }
 
-    /// Steps until the run ends.
+    /// Steps until the run ends, after observing setup and emitting `init`
+    /// with setup's `draws`.
     fn drive(
         &mut self,
         checker: &mut dyn Checker,
         st: &mut State,
         sink: &mut dyn RecordSink,
+        draws: Vec<DrawRecord>,
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
         // Read once, so a run never emits only some of its steps.
         let record_steps = sink.wants_steps();
-        if let Err(failure) = self.observe_sources(st) {
+        for source in &mut self.sources {
+            source.record_contents(record_steps);
+        }
+        let observed = self.observe_sources(st);
+        let obs = record_steps.then(|| digest(st.log.of_step(st.step)));
+        sink.record(Record::Init(InitRecord { draws, obs }));
+        if let Err(failure) = observed {
             return st.end_harness(failure);
         }
         let mut ready = match self.ready(st) {

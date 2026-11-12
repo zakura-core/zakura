@@ -16,6 +16,7 @@ use std::{
 };
 
 use quinn_proto::Transmit;
+use sha2::Digest as _;
 
 use super::*;
 use crate::socket::{SocketFactory, UdpIo};
@@ -128,10 +129,47 @@ async fn a_datagram_is_unreadable_until_delivered_and_resolves_once() {
         [
             NetEvent::Bound { addr: addr(1) },
             NetEvent::Bound { addr: addr(2) },
-            NetEvent::Sent { id, len: 5 },
+            NetEvent::Sent {
+                id,
+                len: 5,
+                digest: None
+            },
             NetEvent::Delivered { id },
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn payload_digests_tell_equal_lengths_apart_only_while_on() {
+    let net = SimNet::new(fifo(0, 10));
+    let a = net.bind(addr(1)).unwrap();
+    net.bind(addr(2)).unwrap();
+    send(&a, addr(2), b"hello");
+    net.set_payload_digests(true);
+    send(&a, addr(2), b"hello");
+    send(&a, addr(2), b"hellp");
+    net.set_payload_digests(false);
+    send(&a, addr(2), b"hellp");
+    let digests: Vec<Option<[u8; 32]>> = net
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Sent { len, digest, .. } => {
+                assert_eq!(len, 5);
+                Some(digest)
+            }
+            _ => None,
+        })
+        .collect();
+    let [None, Some(hello), Some(hellp), None] = digests[..] else {
+        panic!("only the sends while digests are on carry one: {digests:?}")
+    };
+    assert_eq!(
+        hello[..],
+        *sha2::Sha256::digest(b"hello"),
+        "the digest is the payload's SHA-256"
+    );
+    assert_ne!(hello, hellp, "one changed byte changes the digest");
 }
 
 #[tokio::test(start_paused = true)]

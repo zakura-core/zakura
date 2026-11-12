@@ -801,6 +801,166 @@ fn planted_host_clock_is_nondeterministic() {
     }
 }
 
+/// One task that sends a payload holding the host clock, eight bytes at a
+/// fixed length: a planted nondeterminism only the payload digest shows.
+struct PlantedPayload {
+    // Kept for the run, so the receiving socket stays bound.
+    _receiver: zakura_quic::sim::SimSocket,
+}
+
+no_view!(PlantedPayload);
+
+impl Subsystem for PlantedPayload {
+    const NAME: &'static str = "test/planted-payload";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// Room for the send and its delivery.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
+    /// Adds the network and spawns the sender.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        let net = zakura_sim::harness::NetScenario::default().net();
+        sim.add_source(Box::new(net.clone()));
+        let addr = |n| std::net::SocketAddr::from(([10, 0, 0, n], 4000));
+        let (a, b) = (
+            net.sim().bind(addr(1)).unwrap(),
+            net.sim().bind(addr(2)).unwrap(),
+        );
+        sim.scheduler().spawn_root("sender", async move {
+            // u128 to u64 keeps the clock's low bits, which change between runs.
+            let payload = (host_nanos() as u64).to_le_bytes();
+            let transmit = zakura_quic::Transmit {
+                destination: addr(2),
+                ecn: None,
+                size: payload.len(),
+                segment_size: None,
+                src_ip: None,
+            };
+            zakura_quic::UdpIo::try_send(&a, &transmit, &payload)
+                .expect("a simulated send never fails");
+        });
+        PlantedPayload { _receiver: b }
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// A host-random payload byte at an unchanged length replays as
+/// nondeterministic, at the step that sent it.
+#[test]
+fn planted_payload_byte_is_nondeterministic() {
+    let payload = entry::<PlantedPayload>();
+    let dir = record(&payload, &[]);
+    let trace = open(dir.path());
+    let sent = first_step(&trace, |step| step.pick.starts_with("task:sender"));
+    std::thread::sleep(Duration::from_micros(10));
+    match replay_with(&trace, &payload, ReplayOptions::default()) {
+        Err(ReplayError::Nondeterministic { step, field }) => {
+            assert_eq!((step, field), (sent, "obs"));
+        }
+        other => panic!("expected Nondeterministic, got {other:?}"),
+    }
+}
+
+/// A source whose setup observation reads the host clock, and which
+/// observes nothing after it.
+struct SetupClock(Cell<bool>);
+
+impl ActionSource for SetupClock {
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {}
+
+    /// Reads the host clock the first time, at setup's step 0.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if !self.0.replace(true) {
+            log.push(Observation::Fake {
+                source: "setup-clock".into(),
+                event: format!("read {}", host_nanos()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The [`SetupClock`] source and one task, so the run takes a step.
+struct PlantedSetup;
+
+no_view!(PlantedSetup);
+
+impl Subsystem for PlantedSetup {
+    const NAME: &'static str = "test/planted-setup";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// Room for the task.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
+    /// Adds the clock and a task that yields once.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        sim.add_source(Box::new(SetupClock(Cell::new(false))));
+        sim.scheduler().spawn_root("task", async {
+            zakura_rt::task::yield_now().await;
+        });
+        PlantedSetup
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// A changed step 0 observation replays as nondeterministic, through the
+/// digest `init` carries.
+#[test]
+fn changed_setup_observation_is_nondeterministic() {
+    let setup = entry::<PlantedSetup>();
+    let dir = record(&setup, &[]);
+    assert!(
+        open(dir.path()).init.unwrap().obs.is_some(),
+        "a recording digests step 0"
+    );
+    std::thread::sleep(Duration::from_micros(10));
+    match replay_with(&open(dir.path()), &setup, ReplayOptions::default()) {
+        Err(ReplayError::Nondeterministic { step, field }) => {
+            assert_eq!((step, field), (0, "init"));
+        }
+        other => panic!("expected Nondeterministic, got {other:?}"),
+    }
+}
+
 /// How [`Effects`] changes its observations on a later run, so a replay can
 /// show that each change is caught.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

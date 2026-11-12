@@ -343,6 +343,11 @@ pub enum Observation {
         outcome: DatagramOutcome,
         /// When it was sent, in nanoseconds since the run's start.
         sent_at: u64,
+        /// The SHA-256 of its payload, in hex, taken at the send. Only a run
+        /// that records its steps takes it ([`crate::ActionSource::record_contents`]),
+        /// so its step digests catch a change in content, not just length.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
     },
     /// One event a node's transport reported through its tap, in the order
     /// the transport reported it.

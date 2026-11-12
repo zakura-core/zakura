@@ -1784,7 +1784,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
 fn record() -> impl Strategy<Value = Record> {
     prop_oneof![
         meta_record().prop_map(|meta| Record::Meta(Box::new(meta))),
-        draws().prop_map(|draws| Record::Init(InitRecord { draws })),
+        draws().prop_map(|draws| Record::Init(InitRecord { draws, obs: None })),
         step().prop_map(Record::Step),
         end().prop_map(Record::End),
     ]

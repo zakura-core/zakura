@@ -369,7 +369,7 @@ impl Build {
 
     /// `cargo <subcommand> <args>` in this build: the `planted` profile
     /// goes after the subcommand.
-    fn command(self, subcommand: &str, args: &str) -> String {
+    pub fn command(self, subcommand: &str, args: &str) -> String {
         let profile = match self {
             Build::SimPlanted => " --profile planted",
             _ => "",

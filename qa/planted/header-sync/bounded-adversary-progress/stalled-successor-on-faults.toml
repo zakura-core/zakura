@@ -1,0 +1,20 @@
+# hdr-13's stalled successor on the fault class (#2355): a round never
+# dispatches its prepare once its last page is staged. In the fault
+# fixture every prepare fails `local-resource` until the `Recover`, which
+# waits for the first prepare to complete, so the stalled node never meets
+# that trigger. The prefix ends at the fixture's horizon instead, and the
+# `Recover` comes there whatever its trigger. The node stays at A3, its
+# baseline at the pick, so the `recovered` pick owes A4 to A6, and the
+# obligation runs to its 30-second deadline. The harness offers a time
+# boundary just past it, so the violation comes there, and the fixture's
+# finish ends the run idle after it. Before #2355 the run ended at the
+# horizon with no `Recover`, and the property never applied.
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides whether the source is offered the target and stages its pages.
+# A change there can move the input off its staged page.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-faults.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-faults.plan"

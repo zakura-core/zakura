@@ -1265,16 +1265,6 @@ const PATCHED: &[PatchedNa] = &[
         never: &["header-sync/s5v9/headers/sender-answers-open"],
         other: &[],
     },
-    // Its recorded Draft run, past the repeated `Open`, closes the honest
-    // peer and never applies the stale-completion rule its baseline
-    // applies.
-    PatchedNa {
-        property: "header-sync/s5v9/subscribe-headers/sender-within-live",
-        name: "open-repeated",
-        applies: &[],
-        never: &["header-sync/stale-completion-inert"],
-        other: &[],
-    },
     // Past the refused page, the node closes the peer, so it retires it and
     // never reaches a stale completion or chain effect.
     PatchedNa {

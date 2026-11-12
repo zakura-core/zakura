@@ -105,6 +105,42 @@ impl MempoolTipWork {
     }
 }
 
+/// What the mempool holds now, kept current as it admits and removes transactions.
+///
+/// A reader that wakes on a new block before the mempool has reported on it uses this to
+/// estimate the block's work at once (see [`MempoolHeld::estimated_tip_work`]).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct MempoolHeld {
+    /// The number of verified transactions.
+    pub transactions: usize,
+
+    /// The transparent outputs they spend and the nullifiers they reveal (see
+    /// [`MempoolTipWork::mempool_parts`]).
+    pub parts: usize,
+}
+
+impl MempoolHeld {
+    /// Estimates the work the mempool will report for a block of `block_transactions`
+    /// transactions, before it has seen the block.
+    ///
+    /// What the mempool holds is known exactly. The block's parts are not: a block's
+    /// transactions mostly come from the mempool, so each is counted at the average parts of
+    /// a held transaction, plus one for the output it creates.
+    pub fn estimated_tip_work(&self, block_transactions: usize) -> MempoolTipWork {
+        let parts_per_transaction = self
+            .parts
+            .checked_div(self.transactions)
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        MempoolTipWork {
+            mempool_transactions: self.transactions,
+            block_parts: block_transactions.saturating_mul(parts_per_transaction),
+            mempool_parts: self.parts,
+        }
+    }
+}
+
 /// The mempool's end of the snapshot channel.
 #[derive(Debug)]
 pub struct MempoolSnapshotSender {
@@ -113,6 +149,9 @@ pub struct MempoolSnapshotSender {
 
     /// The mempool's progress on the newest block, or `None` before its first block.
     tip_progress: watch::Sender<Option<MempoolTipProgress>>,
+
+    /// What the mempool holds now, or `None` before it first says.
+    held: watch::Sender<Option<MempoolHeld>>,
 }
 
 impl MempoolSnapshotSender {
@@ -121,7 +160,18 @@ impl MempoolSnapshotSender {
         Self {
             snapshots: watch::Sender::new(None),
             tip_progress: watch::Sender::new(None),
+            held: watch::Sender::new(None),
         }
+    }
+
+    /// Publishes what the mempool holds now. Readers only read it when they need it, so this
+    /// wakes no one.
+    pub fn publish_held(&self, held: MempoolHeld) {
+        self.held.send_if_modified(|published| {
+            let is_changed = *published != Some(held);
+            *published = Some(held);
+            is_changed
+        });
     }
 
     /// Publishes that the mempool has started on the block `tip_hash`, before it does any of
@@ -179,6 +229,7 @@ impl MempoolSnapshotSender {
         MempoolSnapshotReceiver {
             snapshots: self.snapshots.subscribe(),
             tip_progress: self.tip_progress.subscribe(),
+            held: self.held.subscribe(),
         }
     }
 }
@@ -197,12 +248,25 @@ pub struct MempoolSnapshotReceiver {
 
     /// The mempool's progress on the newest block.
     tip_progress: watch::Receiver<Option<MempoolTipProgress>>,
+
+    /// What the mempool holds now, or `None` before it first says.
+    held: watch::Receiver<Option<MempoolHeld>>,
 }
 
 impl MempoolSnapshotReceiver {
     /// Returns the latest snapshot, or `None` when no current list has been published.
     pub fn latest(&self) -> Option<MempoolSnapshot> {
         self.snapshots.borrow().clone()
+    }
+
+    /// Returns what the mempool holds now, or `None` if it has not said yet.
+    pub fn held(&self) -> Option<MempoolHeld> {
+        *self.held.borrow()
+    }
+
+    /// Returns the mempool's progress on the newest block it has started on, without waiting.
+    pub fn progress(&self) -> Option<MempoolTipProgress> {
+        *self.tip_progress.borrow()
     }
 
     /// Returns the mempool's progress on the block `tip_hash`, waiting until the mempool has
@@ -396,6 +460,33 @@ mod tests {
                 tip_hash: newer_tip,
                 stage: MempoolTipStage::Reconciling(work(2, 7)),
             })
+        );
+    }
+
+    /// The estimate counts what the mempool holds exactly, and each block transaction at the
+    /// average parts of a held one plus its output.
+    #[test]
+    fn estimated_tip_work_uses_the_held_average_for_the_block() {
+        let held = MempoolHeld {
+            transactions: 4,
+            parts: 10,
+        };
+        assert_eq!(
+            held.estimated_tip_work(3),
+            MempoolTipWork {
+                mempool_transactions: 4,
+                block_parts: 3 * (10 / 4 + 1),
+                mempool_parts: 10,
+            }
+        );
+        assert_eq!(
+            MempoolHeld::default().estimated_tip_work(2),
+            MempoolTipWork {
+                mempool_transactions: 0,
+                block_parts: 2,
+                mempool_parts: 0,
+            },
+            "an empty mempool counts one part for each block transaction"
         );
     }
 

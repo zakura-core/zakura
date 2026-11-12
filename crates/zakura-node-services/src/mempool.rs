@@ -24,8 +24,8 @@ pub use self::{
     mempool_change::{MempoolChange, MempoolChangeKind, MempoolTxSubscriber},
     service_trait::MempoolService,
     snapshot::{
-        MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTipProgress,
-        MempoolTipStage, MempoolTipWork,
+        MempoolHeld, MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender,
+        MempoolTipProgress, MempoolTipStage, MempoolTipWork,
     },
     transaction_dependencies::TransactionDependencies,
 };

@@ -49,7 +49,7 @@ use zakura_consensus::{error::TransactionError, transaction};
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolSnapshot,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolHeld, MempoolSnapshot,
     MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTipWork, MempoolTxSubscriber,
     QueueSource, Request, Response,
 };
@@ -746,10 +746,11 @@ impl Mempool {
     ///
     /// Rebuild only after processing a new tip. Otherwise keep a current cached list or
     /// withdraw an invalidated one without copying transactions during admission. A rebuild
-    /// also publishes that the mempool has finished that tip's block.
+    /// also publishes that the mempool has finished that tip's block. Always publishes what
+    /// the mempool holds now.
     fn publish_snapshot(&mut self, rebuild: bool) {
-        let (snapshot, finished_tip) = match &mut self.active_state {
-            ActiveState::Disabled => (None, None),
+        let (snapshot, finished_tip, held) = match &mut self.active_state {
+            ActiveState::Disabled => (None, None, MempoolHeld::default()),
             ActiveState::Enabled {
                 storage,
                 last_seen_tip_hash,
@@ -766,10 +767,15 @@ impl Mempool {
                         transactions,
                         transaction_dependencies,
                     });
-                (snapshot, rebuild.then_some(*last_seen_tip_hash))
+                (
+                    snapshot,
+                    rebuild.then_some(*last_seen_tip_hash),
+                    storage.held(),
+                )
             }
         };
 
+        self.snapshot_sender.publish_held(held);
         self.snapshot_sender.publish(snapshot);
         // Published after the lists, so a reader told that the block is finished finds them.
         if let Some(finished_tip) = finished_tip {

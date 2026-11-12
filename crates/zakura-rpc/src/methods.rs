@@ -2067,6 +2067,14 @@ where
         tip_hash: block::Hash,
     ) -> std::result::Result<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>), EmptyReason>
     {
+        if let Some(reason) = self.estimated_not_worth_waiting_for(tip_hash) {
+            tracing::debug!(
+                ?reason,
+                "not waiting for the mempool on a new tip by its estimated work; answering with the coinbase-only template"
+            );
+            return Err(reason);
+        }
+
         let deadline = tokio::time::Instant::now() + NEW_TIP_MEMPOOL_WAIT;
         let mut mempool_snapshots = self.mempool_snapshots.clone();
 
@@ -2147,19 +2155,45 @@ where
             .map(|progress| progress.stage);
 
         match stage {
-            Some(MempoolTipStage::Reconciling(work)) if work.mempool_transactions == 0 => {
-                EmptyReason::MempoolEmpty
-            }
-            Some(MempoolTipStage::Reconciling(work))
-                if work.work() > NEW_TIP_MEMPOOL_LIGHT_WORK =>
-            {
-                EmptyReason::MempoolWorkHeavy
-            }
-            // Light work, a finished block, or a mempool that has shut down.
-            Some(MempoolTipStage::Reconciling(_) | MempoolTipStage::Reconciled) | None => {
-                std::future::pending().await
-            }
+            Some(MempoolTipStage::Reconciling(work)) => match not_worth_waiting_for(&work) {
+                Some(reason) => reason,
+                None => std::future::pending().await,
+            },
+            // A finished block, or a mempool that has shut down.
+            Some(MempoolTipStage::Reconciled) | None => std::future::pending().await,
         }
+    }
+
+    /// Returns why waiting for the mempool on the new tip `tip_hash` will not pay off, judged
+    /// when the long poll wakes, before the mempool has reported on that block.
+    ///
+    /// The work is estimated from what the mempool holds now and the number of transactions
+    /// in the new block (see [`mempool::MempoolHeld::estimated_tip_work`]), so the long poll does not
+    /// wait for the mempool's report to answer coinbase-only. Returns `None`, leaving the
+    /// decision to the wait, when the mempool has already published its transactions for the
+    /// tip or reported on it, which is exact, when it has not said what it holds, or when the
+    /// best tip is no longer `tip_hash`.
+    fn estimated_not_worth_waiting_for(&self, tip_hash: block::Hash) -> Option<EmptyReason> {
+        let has_reported = self
+            .mempool_snapshots
+            .progress()
+            .is_some_and(|progress| progress.tip_hash == tip_hash);
+        let has_published = self
+            .mempool_snapshots
+            .latest()
+            .is_some_and(|snapshot| snapshot.last_seen_tip_hash == tip_hash);
+        if has_reported || has_published {
+            return None;
+        }
+
+        let held = self.mempool_snapshots.held()?;
+        let block_transactions = self.latest_chain_tip.best_tip_mined_transaction_ids().len();
+        // The mined transactions are only the new block's while it is still the best tip.
+        if self.latest_chain_tip.best_tip_hash() != Some(tip_hash) {
+            return None;
+        }
+
+        not_worth_waiting_for(&held.estimated_tip_work(block_transactions))
     }
 
     /// Builds the coinbase-only template a long poll returns on a new tip when a full template
@@ -6981,3 +7015,19 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+
+/// Returns why waiting for the mempool's transactions on a new tip will not pay off for a
+/// block that is `work` for the mempool, or `None` when the wait is expected to be short.
+///
+/// Waiting does not pay off when the mempool holds no transactions, since a block only removes
+/// transactions, or when the work is more than [`NEW_TIP_MEMPOOL_LIGHT_WORK`], since it is then
+/// not expected to finish within [`NEW_TIP_MEMPOOL_WAIT`].
+fn not_worth_waiting_for(work: &mempool::MempoolTipWork) -> Option<EmptyReason> {
+    if work.mempool_transactions == 0 {
+        Some(EmptyReason::MempoolEmpty)
+    } else if work.work() > NEW_TIP_MEMPOOL_LIGHT_WORK {
+        Some(EmptyReason::MempoolWorkHeavy)
+    } else {
+        None
+    }
+}

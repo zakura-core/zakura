@@ -4010,13 +4010,14 @@ async fn long_poll_from_old_tip_asks_the_mempool_when_its_snapshot_is_behind() {
 fn rpc_reading_mempool_snapshots(
     mempool_snapshots: &mempool::MempoolSnapshotSender,
 ) -> TestRpcImpl {
-    rpc_counting_mempool_requests(mempool_snapshots).0
+    rpc_counting_mempool_requests(mempool_snapshots, NoChainTip).0
 }
 
-/// Returns an RPC handler like [`rpc_reading_mempool_snapshots`], and the number of requests
-/// sent to its mempool so far.
+/// Returns an RPC handler like [`rpc_reading_mempool_snapshots`] that reads `latest_chain_tip`,
+/// and the number of requests sent to its mempool so far.
 fn rpc_counting_mempool_requests(
     mempool_snapshots: &mempool::MempoolSnapshotSender,
+    latest_chain_tip: impl Into<TestChainTip>,
 ) -> (TestRpcImpl, Arc<std::sync::atomic::AtomicUsize>) {
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mempool = tower::service_fn({
@@ -4042,7 +4043,7 @@ fn rpc_counting_mempool_requests(
         read_state,
         verifier,
         MockSyncStatus::default(),
-        NoChainTip,
+        latest_chain_tip,
         MockAddressBookPeers::default(),
         rx,
         None,
@@ -4114,7 +4115,7 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
         LONG_POLL_OLD_TIP,
         vec![fake_verified_mempool_tx()],
     )));
-    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots);
+    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots, NoChainTip);
 
     // The mempool has not started on the new tip: the long poll waits for it.
     let started = tokio::time::Instant::now();
@@ -4165,7 +4166,7 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
 async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_that_held_nothing() {
     let _init_guard = zakura_test::init();
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
-    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots);
+    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots, NoChainTip);
     mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, reported_work(0, 1));
 
     let started = tokio::time::Instant::now();
@@ -4287,6 +4288,97 @@ async fn first_answer_on_new_tip_waits_out_heavy_work_on_another_block_and_a_fin
         EmptyReason::MempoolWaitElapsed
     );
     assert_eq!(started.elapsed(), NEW_TIP_MEMPOOL_WAIT);
+}
+
+/// Returns a chain tip whose best block is `tip_hash` and has no mined transactions.
+fn chain_tip_at(tip_hash: Hash) -> MockChainTip {
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_hash(tip_hash);
+    // The sender is dropped: the tip keeps the last value sent.
+    chain_tip
+}
+
+/// A long poll that wakes on a new tip before the mempool has reported on that block decides
+/// from what the mempool holds: heavy work or nothing held answers coinbase-only at once,
+/// without asking the mempool.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_decides_from_what_the_mempool_holds_before_its_report() {
+    let _init_guard = zakura_test::init();
+
+    for (held, reason) in [
+        (
+            mempool::MempoolHeld {
+                transactions: 1,
+                parts: NEW_TIP_MEMPOOL_LIGHT_WORK,
+            },
+            EmptyReason::MempoolWorkHeavy,
+        ),
+        (mempool::MempoolHeld::default(), EmptyReason::MempoolEmpty),
+    ] {
+        let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+        mempool_snapshots.publish_held(held);
+        let (rpc, requests) =
+            rpc_counting_mempool_requests(&mempool_snapshots, chain_tip_at(LONG_POLL_NEW_TIP));
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
+                .await
+                .unwrap_err(),
+            reason,
+            "{held:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the mempool is not asked: {held:?}"
+        );
+    }
+}
+
+/// A long poll that wakes on a new tip and estimates light work waits for the mempool, and
+/// one whose block is no longer the best tip leaves the decision to the mempool's report.
+#[tokio::test(start_paused = true)]
+async fn first_answer_on_new_tip_waits_for_light_held_work_or_a_moved_tip() {
+    let _init_guard = zakura_test::init();
+    let mempool_tx = fake_verified_mempool_tx();
+
+    // Light work: the long poll waits and takes the transactions once published.
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    mempool_snapshots.publish_held(mempool::MempoolHeld {
+        transactions: 1,
+        parts: 1,
+    });
+    let (rpc, _requests) =
+        rpc_counting_mempool_requests(&mempool_snapshots, chain_tip_at(LONG_POLL_NEW_TIP));
+    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    tokio::pin!(populated_mempool);
+    assert!(
+        tokio::time::timeout(PART_OF_NEW_TIP_WAIT, &mut populated_mempool)
+            .await
+            .is_err(),
+        "light held work is waited for"
+    );
+    mempool_snapshots.publish(Some(mempool_snapshot(
+        LONG_POLL_NEW_TIP,
+        vec![mempool_tx.clone()],
+    )));
+    assert!(populated_mempool.await.is_ok());
+
+    // The best tip moved on: the mined transactions are not the block's, so no estimate.
+    let mempool_snapshots = mempool::MempoolSnapshotSender::new();
+    mempool_snapshots.publish_held(mempool::MempoolHeld::default());
+    let (rpc, _requests) =
+        rpc_counting_mempool_requests(&mempool_snapshots, chain_tip_at(LONG_POLL_OLD_TIP));
+    let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
+    tokio::pin!(populated_mempool);
+    assert!(
+        tokio::time::timeout(PART_OF_NEW_TIP_WAIT, &mut populated_mempool)
+            .await
+            .is_err(),
+        "without an estimate, the long poll waits for the report"
+    );
 }
 
 /// A long poll that only runs after its wait has ended answers coinbase-only, even when the

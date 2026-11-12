@@ -20,9 +20,9 @@ use zakura_chain::{
     transaction::{self, zip317, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
-use zakura_node_services::mempool::MempoolTipWork;
 #[cfg(test)]
 use zakura_node_services::mempool::TransactionDependencies;
+use zakura_node_services::mempool::{MempoolHeld, MempoolTipWork};
 use zcash_script::solver;
 
 use self::{
@@ -847,6 +847,14 @@ impl Storage {
     /// Returns the number of transactions in the mempool.
     pub fn transaction_count(&self) -> usize {
         self.verified.transaction_count()
+    }
+
+    /// Returns what the mempool holds now, for readers estimating a new block's work.
+    pub fn held(&self) -> MempoolHeld {
+        MempoolHeld {
+            transactions: self.transaction_count(),
+            parts: self.verified.scanned_parts(),
+        }
     }
 
     /// Returns what the mempool holds and how much work it is to remove the mined,

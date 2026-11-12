@@ -30,7 +30,7 @@ use zakura_chain::{
 use zakura_consensus::transaction as tx;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_node_services::mempool::{
-    MempoolTipProgress, MempoolTipStage, MempoolTipWork, QueueSource,
+    MempoolHeld, MempoolTipProgress, MempoolTipStage, MempoolTipWork, QueueSource,
 };
 use zakura_state::{Config as StateConfig, TipAction, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
@@ -2127,6 +2127,15 @@ async fn mempool_publishes_the_work_of_a_new_block_before_doing_it() -> Result<(
             tip_hash: block2.hash(),
             stage: MempoolTipStage::Reconciled,
         })
+    );
+
+    assert_eq!(
+        snapshots.held(),
+        Some(MempoolHeld {
+            transactions: 3,
+            parts: 3,
+        }),
+        "the mempool publishes what it holds after the block, which removed none of the fixtures"
     );
 
     let mut row = None;

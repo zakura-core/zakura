@@ -1742,8 +1742,8 @@ where
 }
 
 /// Checks the watch rule for `queue` over the view's adoption evidence
-/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
-/// published. A publication still waiting for its read or its third event
+/// ([`AdoptionEvidence::watch_read`]), each publication it broke its own
+/// violation. It applies once a state is published. A publication still waiting for its read or its third event
 /// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
 /// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
@@ -1758,11 +1758,18 @@ where
             cx.pending(Pending::WatchOpen);
             Verdict::Holds
         }
-        WatchRead::Broken(why) => cx.violated(
-            "each published state is read from the committed watch before a third event \
-             from the flooded queue",
-            why,
-        ),
+        WatchRead::Broken(breaks) => {
+            let expected = "each published state is read from the committed watch before a \
+                            third event from the flooded queue";
+            let mut breaks = breaks.into_iter();
+            let first = breaks
+                .next()
+                .expect("watch_read returns Broken only with a break");
+            for other in breaks {
+                cx.record_violation(expected, other);
+            }
+            cx.violated(expected, first)
+        }
     }
 }
 

@@ -1180,7 +1180,7 @@ fn caught(
             set,
             found,
             companions: &[],
-            not_applicable: &[],
+            not_applicable: super::not_applicable::expected(case),
         },
     )]
 }
@@ -2198,7 +2198,7 @@ fn hand_written_rows() -> Vec<Row> {
             set: &[COMMIT],
             found: Found::AtStep,
             companions: super::companions::COMPANIONS,
-            not_applicable: &[],
+            not_applicable: super::not_applicable::expected(despite),
         },
     ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));

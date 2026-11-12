@@ -35,6 +35,7 @@ pub mod companions;
 pub mod contracts;
 pub mod evaluate;
 pub mod inventory;
+pub mod not_applicable;
 pub mod reasons;
 pub mod required;
 pub mod rows;

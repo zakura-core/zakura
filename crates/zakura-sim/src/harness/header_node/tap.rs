@@ -1033,6 +1033,11 @@ impl TapState {
             ) {
                 state.adoption.record(now.since_start(), fact);
             }
+            // A session's refusal of a frame, kept in order with the
+            // queue's staging.
+            if in_run && matches!(event, ReactorEvent::FrameRefused { .. }) {
+                state.reservations.record(&event);
+            }
             return;
         }
         let at = zakura_scheduler::hooks::now()

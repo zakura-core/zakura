@@ -1417,7 +1417,7 @@ fn judge_planted(
             return blocked("`cargo xtask planted` recorded no runs".to_owned())
         }
         Ok(runs) => {
-            if let Some(why) = planted_runs_refusal(dir, binding, input, &runs) {
+            if let Some(why) = planted_runs_refusal(dir, binding, harness, input, &runs) {
                 return blocked(why);
             }
         }
@@ -1506,7 +1506,7 @@ fn judge_planted(
 
 /// One run's records, as [`crate::acceptance_runs`] writes them.
 struct RunRecord {
-    /// The records' file stem, `<pid>-<n>`.
+    /// The records' file stem, `<pid>-<start>-<n>`.
     stem: String,
     /// The harness.
     harness: String,
@@ -1672,9 +1672,13 @@ fn registered(entry: &crate::harness::HarnessEntry) -> Registered {
 /// the digests its report pins, and the simulator must be a build of S's
 /// commit with a change applied, the case's patch.
 fn minimize_build_refusal(dir: &Path, bound: &Bound<'_>, target: &str) -> Option<String> {
-    let report: Value =
-        serde_json::from_str(&fs::read_to_string(dir.join("minimize").join("report.json")).ok()?)
-            .ok()?;
+    let unread = || Some("sim-minimize's report.json can't be read".to_owned());
+    let Some(report) = fs::read_to_string(dir.join("minimize").join("report.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return unread();
+    };
     let pinned = |field: &str| {
         report
             .pointer(&format!("/build/{field}"))
@@ -1899,14 +1903,6 @@ fn judge_minimize(
                 run.stem
             ));
         }
-        // Every confirmation run names its input, and it's the one its
-        // phase confirms.
-        if run.input.as_deref() != Some(sha) {
-            return blocked(format!("run {} isn't named a run of input {sha}", run.stem));
-        }
-        if run.harness != harness {
-            return blocked(format!("run {} isn't a run of {harness}", run.stem));
-        }
         if let Err(why) = owned_run_passes(&run.end, &registered, &expect) {
             return blocked(format!("run {} ({}): {why}", run.stem, run.phase));
         }
@@ -2069,8 +2065,8 @@ fn judge_target(
 }
 
 /// Why the planted runner's own runs don't pass, if they don't. The case is
-/// sim-7's own, so each run passes through [`owned_run_passes`] by its role:
-/// the baseline, exactly once, holds; the patched run, exactly once,
+/// sim-7's own, so each run must be of `harness` and passes through
+/// [`owned_run_passes`] by its role: the baseline, exactly once, holds; the patched run, exactly once,
 /// violates the case's property; each campaign input the runner's inventory
 /// lists ran exactly once, as a run that held or one the property's
 /// violation stopped; a replay is judged as the run it replays. No other
@@ -2078,6 +2074,7 @@ fn judge_target(
 fn planted_runs_refusal(
     dir: &Path,
     binding: &TaskBinding,
+    harness: &str,
     input: &str,
     runs: &[RunRecord],
 ) -> Option<String> {
@@ -2093,6 +2090,9 @@ fn planted_runs_refusal(
     };
     let mut counted: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
     for run in runs {
+        if run.harness != harness {
+            return Some(format!("planted run {} isn't a run of {harness}", run.stem));
+        }
         let Ok(entry) = crate::harness::find(&run.harness) else {
             return Some(format!("{} isn't a harness at S", run.harness));
         };

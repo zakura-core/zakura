@@ -1348,15 +1348,6 @@ impl Expect<'_> {
     }
 }
 
-/// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
-/// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
-/// `property` that expects `expect`, writing the trace to `out`, and reads
-/// its `end` record and the test's result.
-///
-/// With a `deadline` and its interrupt flag, the command's output goes to
-/// `<out>.log`. A run past the deadline, or one that a signal killed, is
-/// [`Run::Killed`], whatever files it already wrote. A set flag kills the
-/// run and stops the pilot.
 /// `command` with its runs' acceptance phase set to `phase`, so sim-7's
 /// acceptance tool can tell the baseline, patched, campaign and replay runs
 /// apart. It changes nothing unless the tool also names a records
@@ -1366,6 +1357,15 @@ fn in_phase(mut command: Command, phase: &str) -> Command {
     command
 }
 
+/// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
+/// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
+/// `property` that expects `expect`, writing the trace to `out`, and reads
+/// its `end` record and the test's result.
+///
+/// With a `deadline` and its interrupt flag, the command's output goes to
+/// `<out>.log`. A run past the deadline, or one that a signal killed, is
+/// [`Run::Killed`], whatever files it already wrote. A set flag kills the
+/// run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,

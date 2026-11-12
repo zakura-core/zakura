@@ -264,12 +264,12 @@ impl ActionSource for Net {
         }
     }
 
-    /// Nothing: the network has no holds.
     /// Hashes each payload at its send while the run records its steps.
     fn record_contents(&mut self, on: bool) {
         self.0.borrow().sim.set_payload_digests(on);
     }
 
+    /// Nothing: the network has no holds.
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
     /// None: a datagram in flight is delivered once its window opens, and

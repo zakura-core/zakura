@@ -78,12 +78,20 @@ pub fn current() -> Context {
     CONTEXT.with(|slot| slot.borrow().clone())
 }
 
-/// Runs `f` with `context` as the thread's, restoring the old one after.
+/// Runs `f` with `context` as the thread's, restoring the old one after,
+/// even when `f` panics, since a caught panic's thread may make more runs.
 pub fn within<T>(context: Context, f: impl FnOnce() -> T) -> T {
-    let previous = CONTEXT.with(|slot| slot.replace(context));
-    let out = f();
-    CONTEXT.with(|slot| *slot.borrow_mut() = previous);
-    out
+    /// Puts the old context back when dropped.
+    struct Restore(Option<Context>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CONTEXT.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let _restore = Restore(Some(CONTEXT.with(|slot| slot.replace(context))));
+    f()
 }
 
 /// Runs `f` with `input`, a full fuzz input, as the input of the runs it

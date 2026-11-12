@@ -157,6 +157,7 @@ pub struct Derived {
     pub self_tests: Vec<String>,
 }
 
+/// The `zakura-sim` test `name` in `file`, as one expected result.
 const fn sim(file: &'static str, name: &'static str) -> Expected {
     Expected::Test(TestRef {
         package: "zakura-sim",
@@ -170,20 +171,25 @@ fn sims(file: &'static str, names: &[&'static str]) -> Vec<Expected> {
     names.iter().map(|name| sim(file, name)).collect()
 }
 
+/// hdr-14's [`Key::Passing`] for `property`, as one expected result.
 fn passing(property: &str) -> Expected {
     Expected::HeaderKey(Key::passing(property))
 }
 
+/// hdr-14's [`Key::Catch`] for `property`, as one expected result.
 fn catch(property: &str) -> Expected {
     Expected::HeaderKey(Key::catch(property))
 }
 
+/// hdr-14's [`Key::Requirement`] `name`, as one expected result.
 fn requirement(name: &str) -> Expected {
     Expected::HeaderKey(Key::Requirement {
         name: name.to_owned(),
     })
 }
 
+/// Requirement `id`, which holds when every `expected` result does. See
+/// [`Row`] for `never_excluded`.
 fn row(id: &str, never_excluded: bool, expected: Vec<Expected>) -> Row {
     Row {
         id: id.to_owned(),

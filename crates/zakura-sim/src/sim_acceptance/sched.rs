@@ -29,6 +29,7 @@ pub const SCHED_IDS: &[&str] = &[
     "S2.5", "S2.6", "S2.7", "S3.1", "S3.2", "S3.3", "S3.4", "S3.5", "S3.6", "S3.7",
 ];
 
+/// The `zakura-scheduler` test `name` in `file`, as a proof.
 const fn scheduler(file: &'static str, name: &'static str) -> Proof {
     Proof::Test(TestRef {
         package: "zakura-scheduler",
@@ -37,6 +38,7 @@ const fn scheduler(file: &'static str, name: &'static str) -> Proof {
     })
 }
 
+/// The `zakura-rt` test `name` in `file`, as a proof.
 const fn rt(file: &'static str, name: &'static str) -> Proof {
     Proof::Test(TestRef {
         package: "zakura-rt",

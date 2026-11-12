@@ -13,6 +13,7 @@ use std::{collections::BTreeSet, rc::Rc};
 
 use support::{
     inputs,
+    patched::{run_ok, Worktree},
     script::{run_scripted, run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::v9::RegtestMessage;
@@ -1061,7 +1062,9 @@ const DEFAULT_PLAN: &str = "header-wire-default.plan";
 /// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
 /// focused scenario ([`act_scenario`]) for each act no saved Plan takes, an
 /// adversary serving the node its chain and the held subscription, both
-/// with no act, and the node serving an honest subscriber. The saved Plans' inputs serve the other cases.
+/// with no act, the node serving an honest subscriber, and two reserved
+/// flags `Status` frames over fixed 0 ms links, the two-finding case's.
+/// The saved Plans' inputs serve the other cases.
 fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     let act = |name, act| (name, act_scenario(act));
     let mut held = act_scenario(Act::MinPayload {
@@ -1070,6 +1073,20 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     held.peers[0].script.clear();
     let mut serving = act_scenario(Act::ExtraEnding);
     serving.peers[0].script.clear();
+    let reserved = Act::ReservedFlags {
+        row: Row::Status,
+        bit: 0,
+    };
+    let mut twice = act_scenario(reserved);
+    twice.peers[0].script = vec![PeerAction::Act { act: reserved }; 2];
+    // Fixed and in order, so the script alone decides when each frame
+    // arrives.
+    twice.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        ..twice.net.default_link
+    };
     vec![
         act(
             "status-bad-content",
@@ -1148,6 +1165,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
         ("serving-adversary", serving),
         ("held-subscription", held),
         ("served-subscription", served_subscription()),
+        ("status-reserved-flags-twice", twice),
     ]
 }
 
@@ -1219,4 +1237,78 @@ fn regenerate_planted_scenarios() {
         std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
     }
     std::fs::write(fixture_file(DEFAULT_PLAN), "").expect("the fixture directory exists");
+}
+
+/// C21 for the generated receiver checks: reserved flags' two-frame planted
+/// case's patched `Draft` run keeps two distinct findings of the ID at one
+/// boundary, through the real reader and registry. The case's patch is
+/// applied in a scratch worktree of `HEAD` and built as the planted runner
+/// builds it ([`Worktree::build_patched`]), and that build records the
+/// case's scripted input as a `Draft` run of the ID, so the run goes on
+/// past the first finding.
+///
+/// The reader skips both reserved-flags `Status` frames, each at its own
+/// step, so the ID is the only one violated, and the run's full report
+/// beside its trace holds two of its findings at one step, the quiescence
+/// that concludes both open closes, each naming its own frame's step. A
+/// fresh replay by the same build matches exactly.
+#[test]
+fn two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary() {
+    use serde_json::Value;
+    const ID: &str = "header-sync/s5v9/status/reserved-flags-closes";
+    let case =
+        "qa/planted/header-sync/s5v9/status/reserved-flags-closes/two-reserved-flags-skipped";
+    let work = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("reserved-flags-twice");
+    let worktree = Worktree::of_head(&work);
+    let patched = worktree.build_patched(&format!("{case}.patch"));
+    let file: toml::Table = toml::from_str(
+        &std::fs::read_to_string(worktree.path.join(format!("{case}.toml")))
+            .expect("the case file reads"),
+    )
+    .expect("a case file");
+    let typed = file["typed"].as_table().expect("a typed case");
+    let input = |key: &str| worktree.path.join(typed[key].as_str().expect("a path"));
+    let out = work.join("draft");
+    if out.exists() {
+        std::fs::remove_dir_all(&out).expect("the old recording is removable");
+    }
+    run_ok(
+        std::process::Command::new(&patched)
+            .args(["record", "--sim", HeaderWire::NAME, "--scenario"])
+            .arg(std::fs::read_to_string(input("scenario")).expect("the scenario reads"))
+            .arg("--script")
+            .arg(input("script"))
+            .args(["--draft", ID, "--out"])
+            .arg(&out),
+    );
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join(zakura_sim::record::FULL_REPORT_FILE))
+            .expect("the run wrote its full report"),
+    )
+    .expect("the full report is JSON");
+    let properties = report["properties"]
+        .as_array()
+        .expect("the report lists each property");
+    let violated: Vec<&str> = properties
+        .iter()
+        .filter(|property| property["outcome"].get("violated").is_some())
+        .filter_map(|property| property["property"].as_str())
+        .collect();
+    assert_eq!(violated, [ID], "only the skipped frames' ID is violated");
+    let findings = properties
+        .iter()
+        .find(|property| property["property"] == ID)
+        .and_then(|property| property["violations"].as_array())
+        .expect("the ID lists its findings");
+    let [first, second] = &findings[..] else {
+        panic!("two findings: {findings:?}");
+    };
+    assert_eq!(first["step"], second["step"], "both at one boundary");
+    let opened = |finding: &Value| finding["witness"][0].as_u64().expect("an opening step");
+    assert!(
+        opened(first) < opened(second) && opened(second) < first["step"].as_u64().unwrap(),
+        "each opened at its own frame's step, before the boundary: {findings:?}"
+    );
+    assert_ne!(first["actual"], second["actual"], "two distinct findings");
+    run_ok(std::process::Command::new(&patched).arg("replay").arg(&out));
 }

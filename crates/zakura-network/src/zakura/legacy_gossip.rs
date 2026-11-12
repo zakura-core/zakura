@@ -3592,7 +3592,7 @@ impl fmt::Display for LegacyRequestFrame {
 #[cfg(test)]
 pub(super) mod bounded_decoding;
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use super::*;
     use crate::zakura::ResponseFrames;

@@ -7949,7 +7949,7 @@ impl ZakuraHandlerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod bounded_decoding;
     pub(super) mod connection;

@@ -371,12 +371,13 @@ impl Credit {
             }
             ReactorEvent::PageStaged {
                 request,
-                subscription,
                 ancestor,
                 hashes,
                 ..
             } => {
-                let key = (request.peer.clone(), request.session_id, *subscription);
+                // The page stages on its round's subscription, whatever ID a
+                // foreign page carries.
+                let key = (request.peer.clone(), request.session_id, request.request_id);
                 if let (Some(live), Some(last)) = (self.live.get_mut(&key), hashes.last()) {
                     // A page holds at most a few thousand headers.
                     let count = u32::try_from(hashes.len()).expect("a page's count fits u32");

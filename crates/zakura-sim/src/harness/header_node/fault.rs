@@ -24,10 +24,12 @@
 //!
 //! The reactor's teardown drops each call still pending (`CallEnded`
 //! `dropped`), with any reply it holds. That clears the reply's fault only
-//! if the harness stopped the node: [`EndEvidence`] shows its `Shutdown` and
-//! no exit of the reactor's own. A reactor that returned by itself and
-//! dropped a failed reply lost it, which breaks the rule as an untaken
-//! reply does.
+//! if the harness had begun stopping the node when the call dropped:
+//! [`EndEvidence`] stamps its `Shutdown` before the tap's `CallDropped` for
+//! the call, and shows no exit of the reactor's own. A reactor that
+//! dropped a failed reply while it ran on, or that returned by itself,
+//! lost it, which breaks the rule as an untaken reply does, whatever the
+//! harness did later.
 
 use std::{
     cell::RefCell,
@@ -502,32 +504,35 @@ impl Judge {
 
     /// Why the rule can't judge everything it read yet, if it can't. The
     /// first of [`Judge::open_at_end`]'s findings.
-    fn open(&self, stopped: bool) -> Option<String> {
-        self.open_at_end(stopped).into_iter().next()
+    fn open(&self, cleared: &dyn Fn(u64) -> bool) -> Option<String> {
+        self.open_at_end(cleared).into_iter().next()
     }
 
     /// Every finding still open when the run ends, each once: each penalty
     /// whose call's handling never ended, in the order its reply was taken,
     /// then each failure whose reply reached the reactor and was never
-    /// taken, by operation, then, unless the harness `stopped` the node,
-    /// each failure whose reply the reactor's teardown dropped with its
-    /// call, by operation.
-    fn open_at_end(&self, stopped: bool) -> Vec<String> {
+    /// taken, by operation, then each failure whose reply the reactor
+    /// dropped with its call, by operation, unless that call's drop is
+    /// `cleared`.
+    fn open_at_end(&self, cleared: &dyn Fn(u64) -> bool) -> Vec<String> {
         let mut findings: Vec<String> = self
             .pending
             .iter()
             .map(|&index| unhandled(&self.owed[index]))
             .collect();
         findings.extend(self.untaken_findings());
-        if !stopped {
-            findings.extend(self.dropped_failed.iter().map(|(op, call)| {
-                format!(
-                    "DroppedFault: operation {op} failed with a header-peer fault whose reply \
+        findings.extend(
+            self.dropped_failed
+                .iter()
+                .filter(|(_, call)| !cleared(**call))
+                .map(|(op, call)| {
+                    format!(
+                        "DroppedFault: operation {op} failed with a header-peer fault whose reply \
                      reached the reactor, and the reactor's teardown dropped call {call}, \
                      which held it, without the harness stopping the node"
-                )
-            }));
-        }
+                    )
+                }),
+        );
         findings
     }
 
@@ -768,20 +773,32 @@ impl FaultEvidence {
         }
     }
 
-    /// Whether the harness stopped the node: its `Shutdown` began, and the
-    /// reactor didn't return by itself. Only then does a dropped call
-    /// clear the failed reply it held (see the module docs).
-    fn stopped(&self) -> bool {
+    /// Whether the harness had begun stopping the node when the reactor
+    /// dropped `call`: a `Shutdown` stamped before the call's
+    /// `CallDropped`, and no return of the reactor's own. Only then does
+    /// the drop clear the failed reply the call held (see the module docs).
+    fn dropped_in_stop(&self, call: u64) -> bool {
+        let facts = self.ends.facts();
+        let stamp = |wanted: &dyn Fn(&EndFact) -> bool| {
+            facts
+                .iter()
+                .find(|(_, fact)| wanted(fact))
+                .map(|(stamp, _)| *stamp)
+        };
+        let shutdown = stamp(&|fact| {
+            matches!(
+                fact,
+                EndFact::Environment {
+                    action: EnvironmentAction::Shutdown,
+                    ..
+                }
+            )
+        });
+        let dropped = stamp(&|fact| *fact == EndFact::CallDropped { call });
         self.ends.reactor_exited().is_none()
-            && self.ends.facts().iter().any(|(_, fact)| {
-                matches!(
-                    fact,
-                    EndFact::Environment {
-                        action: EnvironmentAction::Shutdown,
-                        ..
-                    }
-                )
-            })
+            && shutdown
+                .zip(dropped)
+                .is_some_and(|(shutdown, dropped)| shutdown < dropped)
     }
 
     /// The failed operations in `entries` whose header-peer fault the rule
@@ -846,7 +863,7 @@ impl FaultEvidence {
         });
         judge.cooldowns(&self.cooldowns.facts_after(judge.facts_read));
         judge.read(entries, &self.attributions);
-        let open = judge.open(self.stopped());
+        let open = judge.open(&|call| self.dropped_in_stop(call));
         let breaks = judge.unreported();
         if !breaks.is_empty() {
             return FaultCheck::Broken { breaks, open };
@@ -900,7 +917,7 @@ impl FaultEvidence {
                 open_findings: Vec::new(),
             };
         }
-        let open = judge.open_at_end(self.stopped());
+        let open = judge.open_at_end(&|call| self.dropped_in_stop(call));
         match self.settled.get() {
             Some(true) => {
                 violated.extend(open);
@@ -1275,7 +1292,11 @@ pub(crate) mod tests {
     /// harness stopped, after.
     #[test]
     fn a_fault_that_never_reached_the_reactor_owes_nothing() {
-        let attributed = evidence(&[(1, blame("aa"))]);
+        // The harness stopped the node, and its stop dropped call 1.
+        let attributed = evidence_ending(
+            &[(1, blame("aa"))],
+            &[shutdown(), EndFact::CallDropped { call: 1 }],
+        );
         let dropped = reactor(ReactorFact::CallEnded {
             call: 1,
             end: "dropped".to_owned(),
@@ -1324,7 +1345,8 @@ pub(crate) mod tests {
         }));
         log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
         let blamed = [(1, blame("aa"))];
-        let stopped = evidence_ending(&blamed, &[shutdown()]);
+        let drop = EndFact::CallDropped { call: 1 };
+        let stopped = evidence_ending(&blamed, &[shutdown(), drop.clone()]);
         assert_eq!(stopped.penalized(&log), FaultEnd::default());
         assert_eq!(stopped.check(&log), FaultCheck::Nothing);
 
@@ -1332,7 +1354,11 @@ pub(crate) mod tests {
                        reached the reactor, and the reactor's teardown dropped call 1, which \
                        held it, without the harness stopping the node";
         let exited = EndFact::ReactorExited { step: 9 };
-        for ends in [vec![exited.clone()], vec![exited, shutdown()], Vec::new()] {
+        for ends in [
+            vec![drop.clone(), exited.clone()],
+            vec![drop, exited, shutdown()],
+            Vec::new(),
+        ] {
             let lost = evidence_ending(&blamed, &ends);
             assert_eq!(
                 violated(lost.penalized(&log)).as_deref(),
@@ -1355,6 +1381,47 @@ pub(crate) mod tests {
             Vec::<u64>::new(),
             "a dropped reply isn't an untaken one"
         );
+    }
+
+    /// A reactor that stays alive after dropping call 1 lost its failed
+    /// reply, even if the harness's `Shutdown` comes later: only a drop the
+    /// tap saw after the stop began clears it. A reactor that exited by
+    /// itself lost it in either order.
+    #[test]
+    fn a_drop_clears_its_fault_only_after_the_stop_began() {
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        log.push(reactor(ReactorFact::CallEnded {
+            call: 1,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        }));
+        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        let blamed = [(1, blame("aa"))];
+        let drop = EndFact::CallDropped { call: 1 };
+        let finding = "DroppedFault: operation 1 failed with a header-peer fault whose reply \
+                       reached the reactor, and the reactor's teardown dropped call 1, which \
+                       held it, without the harness stopping the node";
+        let stopped = evidence_ending(&blamed, &[shutdown(), drop.clone()]);
+        assert_eq!(stopped.penalized(&log), FaultEnd::default());
+        assert_eq!(stopped.check(&log), FaultCheck::Nothing);
+        let exited = EndFact::ReactorExited { step: 9 };
+        for ends in [
+            vec![drop.clone(), shutdown()],
+            vec![shutdown(), drop.clone(), exited],
+        ] {
+            let lost = evidence_ending(&blamed, &ends);
+            assert_eq!(
+                violated(lost.penalized(&log)).as_deref(),
+                Some(finding),
+                "{ends:?}"
+            );
+            assert_eq!(
+                lost.check(&log),
+                FaultCheck::Open(finding.to_owned()),
+                "{ends:?}"
+            );
+        }
     }
 
     /// A settled run's end reports every open finding, not just the

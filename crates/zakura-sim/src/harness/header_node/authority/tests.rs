@@ -2819,3 +2819,63 @@ fn a_path_finding_names_its_pages_arrival() {
         );
     }
 }
+
+/// `event`, a credit fact of the mirror's session 7, for its subscription
+/// `subscription` instead.
+fn on_subscription(mut event: ReactorEvent, subscription: u64) -> ReactorEvent {
+    match &mut event {
+        ReactorEvent::CursorClaimed {
+            subscription: id, ..
+        }
+        | ReactorEvent::CursorsAccepted {
+            subscription: id, ..
+        } => *id = subscription,
+        _ => unreachable!("only claims and acceptances are moved"),
+    }
+    event
+}
+
+/// A foreign page carrying another subscription's ID, staged on a round,
+/// is judged against the round's own `Open` and staged path, so the
+/// unrelated `Open` its ID names, on the same peer and session with
+/// another target, gets no false path finding and no staged cursor: its
+/// later acceptance of the page's last header still stages nothing.
+#[test]
+fn a_foreign_pages_subscription_id_leaves_other_opens_alone() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request_on(&mirror(), 7, 1, 1, chain[3].hash, genesis.hash);
+    let hashes = [chain[0].hash, chain[1].hash, chain[2].hash];
+    let mut page = page_on(&round, Some(4), genesis, &hashes);
+    if let ReactorEvent::PageStaged {
+        from_peer,
+        from_session,
+        subscription,
+        ..
+    } = &mut page
+    {
+        *from_peer = other_mirror();
+        *from_session = 8;
+        *subscription = 2;
+    }
+    let found = findings(&[
+        adopted(),
+        reserved(1, 10),
+        open_on(&mirror(), 7, 1, chain[3], &[genesis.hash]),
+        reserved(2, 10),
+        open_on(&mirror(), 7, 2, chain[1], &[genesis.hash]),
+        started(round, &[genesis.hash]),
+        page,
+        on_subscription(claimed(chain[2], 3), 2),
+        on_subscription(accepted(chain[2]), 2),
+    ]);
+    let rules: Vec<AuthorityRule> = found.iter().map(|found| found.attribution.rule).collect();
+    assert!(!rules.contains(&AuthorityRule::Path), "{found:?}");
+    assert!(
+        found.iter().any(|found| found
+            .to_string()
+            .contains("session 7 subscription 2 accepted through")
+            && found.detail.contains("which no staged page ends at")),
+        "{found:?}"
+    );
+}

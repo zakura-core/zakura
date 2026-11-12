@@ -19,16 +19,21 @@
 //! arrives, whichever that is.
 //!
 //! Its work stays linear in the run's frames, and it keeps nothing for
-//! ordinary traffic. A node frame enters only if its message type is the
-//! ending's. A peer frame enters only once its `PeerFrame` shows it's an
-//! update, and its write and judgment always come after that: a peer
+//! ordinary traffic. A node frame enters only if it's on a header-sync
+//! stream, which the node's `Session` row names before anything is written
+//! on it, and has the ending's message type, which other streams reuse. A
+//! peer frame enters only once its `PeerFrame` shows it's a header update.
+//! On a header stream its write and judgment always come after that: a peer
 //! records a frame's `PeerFrame` before its write and `peer-written` after
 //! ([`crate::peer`]'s `PeerTask::write`), and the wire evidence fails a run
-//! whose node reads a frame with no `PeerFrame` (`UnlabelledFrame`). A
-//! completed fact then looks only at the candidates of its own subscription
-//! on its stream.
+//! whose node reads a frame with no `PeerFrame` (`UnlabelledFrame`). Only
+//! discovery frames have their `PeerFrame` withheld until they settle, and
+//! none of them is a header update. A completed fact then looks only at the
+//! candidates of its own subscription on its stream.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
 
 use crate::{model::Label, observe::TransportFact, Observation};
 
@@ -37,7 +42,8 @@ const ENDING_ROW: &str = "headers-outcome";
 
 /// The message type of a node frame that ends a subscription, which
 /// `frame-written` and `peer-received` carry before the `NodeFrame` names
-/// its row.
+/// its row. Other streams' messages use it too, so it counts only on a
+/// header-sync stream.
 const ENDING_TYPE: u16 = 4;
 
 /// The row of a peer's subscription update.
@@ -100,10 +106,13 @@ struct Candidates {
 
 /// The incremental crossing join. Feed it every observation of a run, in
 /// log order, through [`CrossingJoin::observe`]. It holds one entry per
-/// ending-typed node frame and per peer update, and starts empty for each
-/// run.
+/// header-sync stream, per ending-typed node frame on one, and per peer
+/// update, and starts empty for each run.
 #[derive(Debug, Default)]
 pub struct CrossingJoin {
+    /// The header-sync streams the node admitted, by connection and QUIC
+    /// stream.
+    header_streams: BTreeSet<(u64, u64)>,
     /// The node's ending-typed frames.
     endings: BTreeMap<FrameKey, Ending>,
     /// The peers' updates.
@@ -118,6 +127,15 @@ impl CrossingJoin {
     /// Takes in `observation` and returns each crossing it completes.
     pub fn observe(&mut self, observation: &Observation) -> Vec<Crossed> {
         match *observation {
+            Observation::Session {
+                connection,
+                quic_stream,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                ..
+            } => {
+                self.header_streams.insert((connection, quic_stream));
+                Vec::new()
+            }
             Observation::Transport {
                 connection: Some(connection),
                 event:
@@ -128,7 +146,7 @@ impl CrossingJoin {
                         order,
                     },
                 ..
-            } => {
+            } if self.header_streams.contains(&(connection, quic_stream)) => {
                 let key = (connection, quic_stream, seq);
                 self.endings.entry(key).or_default().written = Some(order);
                 self.complete_ending(key)
@@ -140,7 +158,7 @@ impl CrossingJoin {
                 message_type: ENDING_TYPE,
                 order,
                 ..
-            } => {
+            } if self.header_streams.contains(&(connection, quic_stream)) => {
                 let key = (connection, quic_stream, seq);
                 self.endings.entry(key).or_default().read = Some(order);
                 self.complete_ending(key)
@@ -314,6 +332,18 @@ mod tests {
         version: 9,
     };
 
+    /// The node admitted the header-sync session on `C`'s stream `Q`.
+    fn session() -> Observation {
+        Observation::Session {
+            connection: C,
+            peer: "peer-0".to_owned(),
+            quic_stream: Q,
+            kind: ZAKURA_STREAM_HEADER_SYNC,
+            version: 9,
+            session_id: 1,
+        }
+    }
+
     /// The node finished writing its frame `seq`, stamped `order`.
     fn node_wrote(seq: u64, order: u64) -> Observation {
         Observation::Transport {
@@ -424,6 +454,7 @@ mod tests {
     fn an_update_written_between_the_ending_and_its_read_crosses() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
@@ -440,6 +471,7 @@ mod tests {
     fn an_ending_written_after_the_update_is_no_crossing() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             update(1, Label::Conformant),
             peer_wrote(1, 10),
             node_wrote(0, 11),
@@ -458,6 +490,7 @@ mod tests {
         let [own_received, own_frame] = peer_read(0, 11, SUB);
         let [other_received, other_frame] = peer_read(1, 14, SUB + 1);
         let log = [
+            session(),
             node_wrote(0, 10),
             own_received,
             own_frame,
@@ -477,6 +510,7 @@ mod tests {
     fn an_unjudged_update_is_no_crossing() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
@@ -494,6 +528,7 @@ mod tests {
     fn a_read_logged_late_is_ordered_by_its_stamp() {
         let [received, node_frame] = peer_read(0, 11, SUB);
         let log = [
+            session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 12),
@@ -511,6 +546,7 @@ mod tests {
     fn an_update_frame_logged_before_the_ending_still_crosses() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             update(1, Label::Conformant),
             node_wrote(0, 10),
             peer_wrote(1, 11),
@@ -528,6 +564,7 @@ mod tests {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let mut join = CrossingJoin::default();
         for obs in [
+            session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
@@ -545,6 +582,7 @@ mod tests {
     fn a_teardown_before_the_late_read_keeps_the_crossing() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
@@ -562,6 +600,7 @@ mod tests {
     fn a_crossing_keeps_its_label_and_reports_once() {
         let [received, node_frame] = peer_read(0, 12, SUB);
         let log = [
+            session(),
             node_wrote(0, 10),
             update(1, Label::BadCursor),
             peer_wrote(1, 11),
@@ -583,7 +622,47 @@ mod tests {
     #[test]
     fn ordinary_traffic_leaves_no_candidates() {
         let mut join = CrossingJoin::default();
+        // Another service's stream on the same connection, whose messages
+        // reuse the ending's type, as discovery's `GetServices` and block
+        // sync's `BlocksDone` do.
+        let other = Q + 4;
+        let discovery = Observation::Session {
+            connection: C,
+            peer: "peer-0".to_owned(),
+            quic_stream: other,
+            kind: ZAKURA_STREAM_HEADER_SYNC + 1,
+            version: 1,
+            session_id: 2,
+        };
+        for obs in [session(), discovery] {
+            join.observe(&obs);
+        }
         for seq in 0..10_000 {
+            let reused = Observation::Transport {
+                instance: 0,
+                seq,
+                node: "node".to_owned(),
+                connection: Some(C),
+                remote: "10.0.0.2:4000".to_owned(),
+                event: TransportFact::FrameWritten {
+                    quic_stream: other,
+                    seq,
+                    message_type: ENDING_TYPE,
+                    order: 3 * seq + 3,
+                },
+            };
+            let read = Observation::PeerReceived {
+                connection: C,
+                quic_stream: other,
+                seq,
+                message_type: ENDING_TYPE,
+                payload: 9,
+                credit: None,
+                order: 3 * seq + 4,
+            };
+            for obs in [reused, read] {
+                assert_eq!(join.observe(&obs), Vec::new());
+            }
             let page = Observation::Transport {
                 instance: 0,
                 seq,

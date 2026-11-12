@@ -23,6 +23,7 @@ use support::{
     byte_inputs, inputs,
     storage_witnesses::{hold, mirror, step, NODE, SOURCE},
 };
+use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync::{
@@ -34,14 +35,16 @@ use zakura_sim::{
             claim::SettlementEvidence,
             ends::{EndEvidence, EndFact, EnvironmentAction},
             policy::{Allow, OpKind, ReplyHold, Select, Trigger},
+            reservation::ReservationEvidence,
             session::{SessionEvidence, SessionFact},
-            stale::StaleEvidence,
+            stale::{StaleEvidence, StaleWindow},
             Chain, ControlAction, Policy, Reset,
         },
         header_sync::{Dialer, Storage, StorageScenario, Weights},
         run_prepared, Subsystem,
     },
-    MemorySink, NaReason, Plan, PlanInput, RunReport,
+    observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, WorkOwner},
+    MemorySink, NaReason, Observation, Plan, PlanInput, RunReport,
 };
 
 /// The mirror below the node, which the node dials and serves.
@@ -166,17 +169,19 @@ struct Run {
     stale: StaleEvidence,
     sessions: SessionEvidence,
     ends: EndEvidence,
+    reservations: ReservationEvidence,
 }
 
 /// Runs `scenario` under `input`, which must end with no violation and no
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
     let ports = Storage::prepare(scenario);
-    let (rounds, stale, sessions, ends) = (
+    let (rounds, stale, sessions, ends, reservations) = (
         ports.rounds.clone(),
         ports.stale_calls.clone(),
         ports.sessions.clone(),
         ports.ends.clone(),
+        ports.reservations.clone(),
     );
     let picks = Rc::new(RefCell::new(Vec::new()));
     let into = picks.clone();
@@ -209,13 +214,189 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
         stale,
         sessions,
         ends,
+        reservations,
+    }
+}
+
+/// What the run left of the scenario's selected operations: the log's
+/// observations, the stale calls and the work queue's accounting facts.
+#[derive(Clone)]
+struct Selected {
+    obs: Vec<Observation>,
+    stale: Vec<StaleWindow>,
+    accounting: Vec<ReactorEvent>,
+}
+
+impl Selected {
+    /// `run`'s.
+    fn of(run: &Run) -> Selected {
+        Selected {
+            obs: run
+                .report
+                .log
+                .entries()
+                .iter()
+                .map(|entry| entry.obs.clone())
+                .collect(),
+            stale: run.stale.windows(),
+            accounting: run.reservations.facts(),
+        }
+    }
+
+    /// The first storage operation `is` matches, as its submission gives
+    /// it: its ID, the reactor call that submitted it and its owner.
+    fn first_submitted(
+        &self,
+        is: impl Fn(&StorageRequest) -> Option<&WorkOwner>,
+    ) -> Option<(u64, Option<u64>, WorkOwner)> {
+        self.obs.iter().find_map(|obs| match obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Submitted {
+                        id, request, call, ..
+                    },
+                ..
+            } => is(request).map(|owner| (*id, *call, owner.clone())),
+            _ => None,
+        })
+    }
+
+    /// The index of the first observation `is` matches.
+    fn position(&self, is: impl Fn(&Observation) -> bool) -> Option<usize> {
+        self.obs.iter().position(is)
+    }
+
+    /// Checks the scenario's held first prepare is the one that ended stale
+    /// and whose round was released, joined through its identities: its
+    /// storage operation, submitted by a reactor call that dispatched a
+    /// prepare for the same owner and ended paired with that operation, a
+    /// stale window of that prepare call, the owner's round retired before
+    /// the call ended, and the queue's release of that round, by its peer
+    /// and incarnation.
+    fn held_prepare_joined(&self) -> Result<(), String> {
+        let (op, call, owner) = self
+            .first_submitted(|request| match request {
+                StorageRequest::PrepareHeaderTarget { owner, .. } => Some(owner),
+                _ => None,
+            })
+            .ok_or("no prepare was submitted")?;
+        let call = call.ok_or(format!("prepare {op} names no reactor call"))?;
+        self.position(|obs| {
+            matches!(obs, Observation::Reactor {
+                event: ReactorFact::Dispatched {
+                    call: c,
+                    port: ReactorCall::Prepare { owner: o, .. },
+                },
+                ..
+            } if *c == call && *o == owner)
+        })
+        .ok_or(format!("call {call} dispatched no prepare for {owner:?}"))?;
+        let ended = self
+            .position(|obs| {
+                matches!(obs, Observation::Reactor {
+                    event: ReactorFact::CallEnded { call: c, op: o, .. },
+                    ..
+                } if *c == call && *o == Some(op))
+            })
+            .ok_or(format!(
+                "call {call} never ended paired with operation {op}"
+            ))?;
+        if !self
+            .stale
+            .iter()
+            .any(|window| window.call == call && !window.apply && window.step.is_some())
+        {
+            return Err(format!(
+                "prepare call {call} didn't end stale: {:?}",
+                self.stale
+            ));
+        }
+        let same_round =
+            |session: u64, request: u64| (session, request) == (owner.session_id, owner.request_id);
+        self.obs[..ended]
+            .iter()
+            .find(|obs| {
+                matches!(obs, Observation::Reactor {
+                    event: ReactorFact::Retired { request, .. },
+                    ..
+                } if same_round(request.owner.session_id, request.owner.request_id))
+            })
+            .ok_or(format!(
+                "{owner:?}'s round didn't retire before call {call} ended"
+            ))?;
+        let round = self
+            .accounting
+            .iter()
+            .find_map(|event| match event {
+                ReactorEvent::ReservationBound { request, .. }
+                    if same_round(request.session_id, request.request_id) =>
+                {
+                    Some((request.peer.clone(), request.incarnation))
+                }
+                _ => None,
+            })
+            .ok_or(format!("no reservation backs {owner:?}'s round"))?;
+        let released = self.accounting.iter().any(|event| {
+            matches!(event, ReactorEvent::RoundReleased { peer, incarnation, .. }
+                if (peer, *incarnation) == (&round.0, round.1))
+        });
+        if !released {
+            return Err(format!("round {} was never released", round.1));
+        }
+        Ok(())
+    }
+
+    /// Checks the scenario's selected apply, the first, kept its reply
+    /// across the reset: storage committed it, the node then invalidated
+    /// its tip, and only then delivered the apply's reply.
+    fn apply_reply_crosses_reset(&self) -> Result<(), String> {
+        let (op, ..) = self
+            .first_submitted(|request| match request {
+                StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
+                _ => None,
+            })
+            .ok_or("no apply was submitted")?;
+        let committed = self
+            .position(|obs| {
+                matches!(obs, Observation::Storage {
+                    fact: StorageFact::Committed { id, .. },
+                    ..
+                } if *id == op)
+            })
+            .ok_or(format!("apply {op} never committed"))?;
+        let reset = self.obs[committed..]
+            .iter()
+            .position(|obs| {
+                matches!(obs, Observation::Storage {
+                    fact: StorageFact::Reset { kind, .. },
+                    ..
+                } if kind == "invalidate")
+            })
+            .ok_or(format!("no invalidation followed apply {op}'s commit"))?
+            + committed;
+        let delivered = |obs: &Observation| {
+            matches!(obs, Observation::Storage {
+                fact: StorageFact::Completed { id, delivered: true, .. },
+                ..
+            } if *id == op)
+        };
+        match self.position(delivered) {
+            Some(at) if at > reset => Ok(()),
+            Some(at) => Err(format!(
+                "apply {op}'s reply was delivered at {at}, before the reset at {reset}"
+            )),
+            None => Err(format!("apply {op}'s reply was never delivered")),
+        }
     }
 }
 
 /// Checks `run` is the mixed witness: every control step picked in order,
 /// each resource rule held and applied, every other property held or not
-/// applicable as [`NOT_APPLICABLE`] lists, a prepare ended stale and a
-/// round released, both mirrors back on fresh identities, and the node
+/// applicable as [`NOT_APPLICABLE`] lists, the held first prepare ended
+/// stale with its round released ([`Selected::held_prepare_joined`]), the
+/// selected apply's reply held across the reset
+/// ([`Selected::apply_reply_crosses_reset`]), both mirrors back on fresh
+/// identities, and the node
 /// stopped by the harness and settled at its reactor's exit.
 fn witnessed(label: &str, run: &Run) {
     assert_eq!(run.picks, PICKS, "{label}");
@@ -238,14 +419,13 @@ fn witnessed(label: &str, run: &Run) {
             "{label}: {id} reports"
         );
     }
-    assert!(
-        run.stale
-            .windows()
-            .iter()
-            .any(|window| !window.apply && window.step.is_some()),
-        "{label}: a prepare ends stale: {:?}",
-        run.stale.windows()
-    );
+    let selected = Selected::of(run);
+    if let Err(why) = selected.held_prepare_joined() {
+        panic!("{label}: the held prepare ends stale and its round is released: {why}");
+    }
+    if let Err(why) = selected.apply_reply_crosses_reset() {
+        panic!("{label}: the held apply reply crosses the reset: {why}");
+    }
     assert!(run.rounds.any_released(), "{label}: a round is released");
     assert!(
         run.rounds.settled(),
@@ -343,6 +523,152 @@ fn the_mixed_scenario_holds_under_generated_plans() {
     for (index, input) in inputs(8, 256).into_iter().enumerate() {
         witnessed(&format!("plan {index}"), &run(&scenario, input));
     }
+}
+
+/// The held prepare's join and the apply reply's crossing each fail when
+/// one identity changes on its own: the storage operation the call ended
+/// paired with, the reactor call the operation names, the owner the call
+/// dispatched for, the stale window's call, the retired round's owner and
+/// the released round's incarnation, and for the apply, a reply delivered
+/// before the reset.
+#[test]
+fn the_mixed_joins_fail_one_identity_off() {
+    let committed: StorageScenario = serde_json::from_str(
+        &fs::read_to_string(fixture_file("json")).expect("the fixture is committed"),
+    )
+    .expect("the fixture is a storage scenario");
+    let plan = fs::read(fixture_file("plan")).expect("the Plan is committed");
+    let selected = Selected::of(&run(&committed, Plan::from_fuzz(&plan)));
+    selected
+        .held_prepare_joined()
+        .expect("the committed run joins");
+    selected
+        .apply_reply_crosses_reset()
+        .expect("the committed reply crosses");
+    let (op, call, _) = selected
+        .first_submitted(|request| match request {
+            StorageRequest::PrepareHeaderTarget { owner, .. } => Some(owner),
+            _ => None,
+        })
+        .expect("a prepare was submitted");
+    let call = call.expect("a reactor call submitted it");
+
+    /// `selected` with `change` applied to each observation.
+    fn each_obs(selected: &Selected, change: impl Fn(&mut Observation)) -> Selected {
+        let mut changed = selected.clone();
+        changed.obs.iter_mut().for_each(change);
+        changed
+    }
+    let off: Vec<(&str, Selected)> = vec![
+        (
+            "operation",
+            each_obs(&selected, |obs| {
+                if let Observation::Reactor {
+                    event: ReactorFact::CallEnded { call: c, op: o, .. },
+                    ..
+                } = obs
+                {
+                    if *c == call && *o == Some(op) {
+                        *o = Some(op + 1000);
+                    }
+                }
+            }),
+        ),
+        (
+            "call",
+            each_obs(&selected, |obs| {
+                if let Observation::Storage {
+                    fact: StorageFact::Submitted { id, call: c, .. },
+                    ..
+                } = obs
+                {
+                    if *id == op {
+                        *c = c.map(|c| c + 1000);
+                    }
+                }
+            }),
+        ),
+        (
+            "owner",
+            each_obs(&selected, |obs| {
+                if let Observation::Reactor {
+                    event:
+                        ReactorFact::Dispatched {
+                            call: c,
+                            port: ReactorCall::Prepare { owner, .. },
+                        },
+                    ..
+                } = obs
+                {
+                    if *c == call {
+                        owner.request_id += 1000;
+                    }
+                }
+            }),
+        ),
+        ("stale call", {
+            let mut changed = selected.clone();
+            for window in &mut changed.stale {
+                if window.call == call {
+                    window.call += 1000;
+                }
+            }
+            changed
+        }),
+        (
+            "retired owner",
+            each_obs(&selected, |obs| {
+                if let Observation::Reactor {
+                    event: ReactorFact::Retired { request, .. },
+                    ..
+                } = obs
+                {
+                    request.owner.request_id += 1000;
+                }
+            }),
+        ),
+        ("released round", {
+            let mut changed = selected.clone();
+            for event in &mut changed.accounting {
+                if let ReactorEvent::RoundReleased { incarnation, .. } = event {
+                    *incarnation += 1000;
+                }
+            }
+            changed
+        }),
+    ];
+    for (identity, changed) in off {
+        assert!(changed.held_prepare_joined().is_err(), "{identity}");
+        assert!(changed.apply_reply_crosses_reset().is_ok(), "{identity}");
+    }
+
+    let (apply, ..) = selected
+        .first_submitted(|request| match request {
+            StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
+            _ => None,
+        })
+        .expect("an apply was submitted");
+    let reset = selected
+        .position(|obs| {
+            matches!(obs, Observation::Storage {
+                fact: StorageFact::Reset { kind, .. },
+                ..
+            } if kind == "invalidate")
+        })
+        .expect("the node invalidated");
+    let mut early = selected.clone();
+    let reply = early
+        .position(|obs| {
+            matches!(obs, Observation::Storage {
+                fact: StorageFact::Completed { id, delivered: true, .. },
+                ..
+            } if *id == apply)
+        })
+        .expect("the reply was delivered");
+    let moved = early.obs.remove(reply);
+    early.obs.insert(reset, moved);
+    assert!(early.apply_reply_crosses_reset().is_err());
+    assert!(early.held_prepare_joined().is_ok());
 }
 
 /// Rewrites the committed fixture from [`mixed_resources`].

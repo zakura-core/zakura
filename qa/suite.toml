@@ -168,6 +168,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
+test = "regenerate_late_fault_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"
 test = "regenerate_chain_witnesses"
 run = false

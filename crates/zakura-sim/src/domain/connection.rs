@@ -118,7 +118,8 @@ where
             // The taps' rows, and the view's bounds and fold.
             needs: &[Source::View, Source::Datagrams],
             // A draft: no planted bypass fails it, because production can't
-            // queue a second body ahead of another service's frame (#2268).
+            // queue a second body over 64 KiB ahead of another service's
+            // frame (#2268).
             // The saturated scenario has bodies to queue: the node asks
             // mirror-0 for six at once and mirror-1 for four, and each
             // mirror serves them back to back. QUIC's write path keeps them

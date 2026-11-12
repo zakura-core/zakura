@@ -28,6 +28,13 @@ use zakura_sim::{
 /// The Plan bytes after each seed's prefix.
 const PLAN_BYTES: usize = 1_024;
 
+/// The witness a seed carries, by stem: a property its run holds, which a
+/// planted case's patch on the same input violates.
+const WITNESSES: [(&str, &str); 1] = [(
+    "header-storage-w-stop-storage",
+    "header-sync/teardown-returns-baseline",
+)];
+
 /// The overlap a witness seed's run shows.
 #[derive(Clone, Copy, Debug)]
 enum Shows {
@@ -495,7 +502,7 @@ fn regenerate_witness_seeds() {
         let input = input(slice, &scenario);
         let base = fixtures().join(&stem);
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
+        let mut sidecar = format!(
             "# The committed fuzz input `{stem}.bin`, a fuzz-12 item 7 witness whose run\n\
              # shows {shows:?}. Its 344-byte prefix is the scenario's canonical\n\
              # encoding, then 1,024 Plan bytes.\n\
@@ -511,6 +518,11 @@ fn regenerate_witness_seeds() {
                 &serde_json::to_value(&scenario).expect("scenarios serialize")
             ),
         );
+        for (_, property) in WITNESSES.iter().filter(|(seed, _)| *seed == stem) {
+            sidecar.push_str(&format!(
+                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
+            ));
+        }
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

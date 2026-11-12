@@ -920,8 +920,8 @@ fn regenerate_saved_plans() {
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        // The progress fixture and the three refused-page acts are planted
-        // cases' inputs, which `cargo xtask planted` records as witnesses
+        // The progress fixture, honest sync and the three refused-page acts
+        // are planted cases' inputs, which `cargo xtask planted` records as witnesses
         // expecting a hold.
         let holds = |property: &str| {
             format!("\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n")
@@ -934,7 +934,8 @@ fn regenerate_saved_plans() {
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
-            SavedPlan::HonestSync | SavedPlan::Act(_) => String::new(),
+            SavedPlan::HonestSync => holds(HONEST_NEVER_PUNISHED),
+            SavedPlan::Act(_) => String::new(),
         };
         let sidecar = format!(
             "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\

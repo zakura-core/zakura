@@ -229,6 +229,18 @@ fn applies(report: &RunReport, id: &str, what: impl std::fmt::Debug) {
     }
 }
 
+/// Requires `session/honest-never-punished` to apply and hold in `report`.
+/// Its trigger history reads the harness's view, which a finished report
+/// doesn't carry, so this reads the property's outcome. The trigger itself
+/// is judged where the view is, as its planted case records it.
+fn honest_holds(report: &RunReport, what: impl std::fmt::Debug) {
+    let outcome = outcome(report, HONEST_NEVER_PUNISHED);
+    assert!(
+        matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+        "{what:?}: {HONEST_NEVER_PUNISHED}: {outcome:?}"
+    );
+}
+
 /// Every generated ID `header-sync/wire` registers, in order.
 fn generated() -> Vec<String> {
     HeaderWire::properties()
@@ -287,7 +299,7 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
         applies(report, covered, &witness);
     }
     applies(report, &id("conformant-never-closes"), &witness);
-    applies(report, HONEST_NEVER_PUNISHED, &witness);
+    honest_holds(report, &witness);
     for suffix in UNREACHED {
         assert_eq!(
             *outcome(report, &id(suffix)),
@@ -534,7 +546,7 @@ fn honest_peer_never_punished() {
             let report = run_plan(&scenario, plan);
             assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
             assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
-            applies(&report, HONEST_NEVER_PUNISHED, name);
+            honest_holds(&report, name);
             let honest = honest_connections(&report, &scenario);
             assert!(!honest.is_empty(), "{name}: no honest peer connected");
             for entry in report.log.entries() {

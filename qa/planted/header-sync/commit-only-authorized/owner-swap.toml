@@ -1,0 +1,13 @@
+# `begin_prepare` rebinds an ordinary round's owner to the next request
+# ID after its pages were staged, so the prepare names a request other
+# than the one its pages were staged for. The required failure is
+# `WrongOwner`. `wrong-request` binds the wrong request when the round
+# starts instead. The reactor, the subscriber and the queue decide how
+# the witness's rounds stage and prepare, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

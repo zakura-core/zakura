@@ -341,6 +341,12 @@ impl Effects {
     pub fn stores(&self) -> &EvidenceStores {
         self.ended.stores()
     }
+
+    /// When each link's session ended, by connection ID, as
+    /// [`Effects::ended`] holds it now.
+    pub fn session_ends(&self) -> BTreeMap<u64, Duration> {
+        self.ended.read(|ended| ended.0.clone())
+    }
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -1504,7 +1510,7 @@ impl Topology {
     /// admitted.
     pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let ended = self.effects.ended.read(|ended| ended.0.clone());
+        let ended = self.effects.session_ends();
         links
             .iter()
             .enumerate()

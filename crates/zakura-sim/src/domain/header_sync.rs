@@ -1804,7 +1804,7 @@ pub fn watch_end_violations(
     // Under a wedged loop the same publication is unread under both
     // queues' rules, so each finding names it.
     let subject = adoption.unread_publication(queue).map(|state_version| {
-        crate::check::EndSubject::Publication {
+        crate::check::FindingSubject::Publication {
             state_version: format!("{state_version:?}"),
         }
     });

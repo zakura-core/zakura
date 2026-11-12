@@ -7,7 +7,10 @@ use super::{
     Pending, Property, PropertyId, Source, Subject, Verdict,
 };
 use crate::{
-    check::Violation, end::RunEnd, model::LabelledFrame, Observation, ObservationLog, StepCtx,
+    check::{FindingSubject, Violation},
+    end::RunEnd,
+    model::LabelledFrame,
+    Observation, ObservationLog, StepCtx,
 };
 
 /// A harness's read-only view of the code under test. Checks read it through
@@ -95,8 +98,8 @@ pub struct EndViolation {
     pub expected: String,
     /// What the run did.
     pub actual: String,
-    /// What it's about, if the rule names it ([`EndSubject`]).
-    pub subject: Option<crate::check::EndSubject>,
+    /// What it's about, if the rule names it ([`FindingSubject`]).
+    pub subject: Option<FindingSubject>,
 }
 
 /// When a view's state was captured.
@@ -351,6 +354,31 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// recorded violation as the check's even if the verdict is `Holds`.
     pub fn record_violation(&mut self, expected: impl Into<String>, actual: impl Into<String>) {
         let violation = self.violation(expected.into(), actual.into());
+        self.recorded.push(violation);
+    }
+
+    /// [`CheckCtx::violated`] for a finding about `subject`, which a nested
+    /// case's witness joins it by (C6).
+    pub fn violated_about(
+        &self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        subject: FindingSubject,
+    ) -> Verdict {
+        let mut violation = self.violation(expected.into(), actual.into());
+        violation.subject = Some(subject);
+        Verdict::Violated(violation)
+    }
+
+    /// [`CheckCtx::record_violation`] for a finding about `subject`.
+    pub fn record_violation_about(
+        &mut self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        subject: FindingSubject,
+    ) {
+        let mut violation = self.violation(expected.into(), actual.into());
+        violation.subject = Some(subject);
         self.recorded.push(violation);
     }
 

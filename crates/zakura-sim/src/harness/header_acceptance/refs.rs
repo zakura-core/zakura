@@ -7,8 +7,9 @@
 //! frame, its connection, stream, direction and sequence ([`FrameRef`],
 //! and [`ReadRef`] as its session's reader names it); for a subscription event, its peer, session and
 //! subscription ([`SubscriptionRef`], and [`PageRef`] for a page staged on
-//! one); for work, its full owner ([`WorkRef`]); and for an end rule's
-//! finding, its subject ([`EndSubject`](crate::check::EndSubject)). A
+//! one); for work, its full owner ([`WorkRef`]); and for a finding, its
+//! subject ([`FindingSubject`](crate::check::FindingSubject)), such as the
+//! punished connection, event and frame. A
 //! finding is named by
 //! its step ([`FindingRef`]), within a run every artifact names by its
 //! trace's digest ([`super::binding`]). A join is [`joined`]:
@@ -38,22 +39,8 @@ pub fn joined<'a, T: 'a, R: Ref>(
         .collect()
 }
 
-/// One transport frame.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameRef {
-    /// Its connection.
-    pub connection: u64,
-    /// Its stream's kind.
-    pub kind: u16,
-    /// Its stream's version.
-    pub version: u16,
-    /// Its QUIC stream.
-    pub quic_stream: u64,
-    /// Whether the peer sent it to the node, rather than the node to it.
-    pub inbound: bool,
-    /// Its position among its direction's frames on the stream.
-    pub seq: u64,
-}
+/// One transport frame, defined beside the findings that name it.
+pub use crate::check::FrameRef;
 impl Ref for FrameRef {}
 
 /// One frame as its session's reader names it: the session, and the
@@ -149,10 +136,9 @@ pub struct LinkRef {
 }
 impl Ref for LinkRef {}
 
-/// What an end rule's finding is about ([`crate::check::EndSubject`]),
-/// which the witness judge joins a nested case's end finding to its own
-/// break by (C6).
-impl Ref for crate::check::EndSubject {}
+/// What a finding is about ([`crate::check::FindingSubject`]), which the
+/// witness judge joins a nested case's finding to its own break by (C6).
+impl Ref for crate::check::FindingSubject {}
 
 /// What a witness judged: its property, what it expected and the other
 /// IDs it allowed to break beside it, in order.

@@ -23,6 +23,7 @@ use support::{
     byte_inputs, inputs,
     storage_witnesses::{hold, mirror, step, NODE, SOURCE},
 };
+use zakura_header_chain::{HeaderGeneration, HeaderSyncWorkOwner};
 use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
@@ -45,6 +46,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, WorkOwner},
+    storage::work_owner,
     MemorySink, NaReason, Observation, Plan, PlanInput, RunReport,
 };
 
@@ -274,9 +276,10 @@ impl Selected {
     /// and whose round was released, joined through its identities: its
     /// storage operation, submitted by a reactor call that dispatched a
     /// prepare for the same owner and ended paired with that operation, a
-    /// stale window of that prepare call, the owner's round retired before
-    /// the call ended, and the queue's release of that round, by its peer
-    /// and incarnation.
+    /// stale window of that prepare call, the round of that same owner, in
+    /// full (its kind, header generation, branch, session and request),
+    /// retired before the call ended and backed by a reservation, and the
+    /// queue's release of that round, by its peer and incarnation.
     fn held_prepare_joined(&self) -> Result<(), String> {
         let (op, call, owner) = self
             .first_submitted(|request| match request {
@@ -315,15 +318,15 @@ impl Selected {
                 self.stale
             ));
         }
-        let same_round =
-            |session: u64, request: u64| (session, request) == (owner.session_id, owner.request_id);
         self.obs[..ended]
             .iter()
             .find(|obs| {
                 matches!(obs, Observation::Reactor {
                     event: ReactorFact::Retired { request, .. },
                     ..
-                } if same_round(request.owner.session_id, request.owner.request_id))
+                } if request.owner == owner
+                    && (request.session_id, request.request_id)
+                        == (owner.session_id, owner.request_id))
             })
             .ok_or(format!(
                 "{owner:?}'s round didn't retire before call {call} ended"
@@ -333,7 +336,9 @@ impl Selected {
             .iter()
             .find_map(|event| match event {
                 ReactorEvent::ReservationBound { request, .. }
-                    if same_round(request.session_id, request.request_id) =>
+                    if work_owner(request.owner) == owner
+                        && (request.session_id, request.request_id)
+                            == (owner.session_id, owner.request_id) =>
                 {
                     Some((request.peer.clone(), request.incarnation))
                 }
@@ -541,9 +546,10 @@ fn the_mixed_scenario_holds_under_generated_plans() {
 /// The held prepare's join and the apply reply's crossing each fail when
 /// one identity changes on its own: the storage operation the call ended
 /// paired with, the reactor call the operation names, the owner the call
-/// dispatched for, the stale window's call, the retired round's owner and
-/// the released round's incarnation, and for the apply, a reply delivered
-/// before the reset.
+/// dispatched for, the stale window's call, the retired round's owner, by
+/// its request, header generation or branch, the reserved round's owner,
+/// by its header generation or branch, and the released round's
+/// incarnation, and for the apply, a reply delivered before the reset.
 #[test]
 fn the_mixed_joins_fail_one_identity_off() {
     let committed: StorageScenario = serde_json::from_str(
@@ -640,6 +646,54 @@ fn the_mixed_joins_fail_one_identity_off() {
                 }
             }),
         ),
+        (
+            "retired generation",
+            each_obs(&selected, |obs| {
+                if let Observation::Reactor {
+                    event: ReactorFact::Retired { request, .. },
+                    ..
+                } = obs
+                {
+                    request.owner.scope.header_generation += 1000;
+                }
+            }),
+        ),
+        (
+            "retired branch",
+            each_obs(&selected, |obs| {
+                if let Observation::Reactor {
+                    event: ReactorFact::Retired { request, .. },
+                    ..
+                } = obs
+                {
+                    request.owner.scope.branch.target = "another target".into();
+                }
+            }),
+        ),
+        ("reserved generation", {
+            let mut changed = selected.clone();
+            for event in &mut changed.accounting {
+                if let ReactorEvent::ReservationBound { request, .. } = event {
+                    if let HeaderSyncWorkOwner::Header(owner) = &mut request.owner {
+                        let generation = owner.authority.header_generation.get();
+                        owner.authority.header_generation =
+                            HeaderGeneration::new(generation + 1000);
+                    }
+                }
+            }
+            changed
+        }),
+        ("reserved branch", {
+            let mut changed = selected.clone();
+            for event in &mut changed.accounting {
+                if let ReactorEvent::ReservationBound { request, .. } = event {
+                    if let HeaderSyncWorkOwner::Header(owner) = &mut request.owner {
+                        owner.authority.branch.target_tip_hash = owner.authority.branch.anchor_hash;
+                    }
+                }
+            }
+            changed
+        }),
         ("released round", {
             let mut changed = selected.clone();
             for event in &mut changed.accounting {

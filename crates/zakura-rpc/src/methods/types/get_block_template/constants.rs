@@ -32,10 +32,11 @@ pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_
 /// coinbase-only template at once.
 ///
 /// The mempool reports the work when it starts on a block (see `MempoolTipWork::work`): the
-/// transparent outputs spent and created and the nullifiers revealed by the block's
-/// transactions, the outputs spent and nullifiers revealed by its own, which it checks against
-/// the block's, and one for each transaction it holds. It handles these one by one, so their
-/// number predicts how long it takes to have its transactions for the block ready.
+/// transparent outputs spent and the nullifiers revealed by the block's transactions, the
+/// outputs created by those of them it held, the outputs spent and nullifiers revealed by its
+/// own, which it checks against the block's, and one for each transaction it holds. It
+/// handles these one by one, so their number predicts how long it takes to have its
+/// transactions for the block ready.
 ///
 /// The limit is set so that the wait is only started when the mempool is expected to finish
 /// within [`NEW_TIP_MEMPOOL_WAIT`]. On an isolated regtest node, the time from reporting the

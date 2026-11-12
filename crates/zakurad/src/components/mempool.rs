@@ -792,7 +792,9 @@ impl Mempool {
         };
         let (tip_hash, _height) = tip_action.best_tip_hash_and_height();
         let work = match tip_action {
-            TipAction::Grow { block } => storage.tip_work(&block.transactions),
+            TipAction::Grow { block } => {
+                storage.tip_work(&block.transaction_hashes, &block.transactions)
+            }
             TipAction::Reset { .. } => MempoolTipWork::default(),
         };
         self.snapshot_sender.start_tip(tip_hash, work);
@@ -1084,6 +1086,8 @@ impl Service<Request> for Mempool {
                     tip: tip_action.best_tip_hash_and_height(),
                     tx_count_after: storage.transaction_count(),
                     requeued,
+                    // A reset returns before the mempool stores finished downloads.
+                    drained: 0,
                     process: reset_started.elapsed(),
                 });
             }
@@ -1116,7 +1120,9 @@ impl Service<Request> for Mempool {
             let grace_period_upgrade = upgrade_grace_period(network, next_height);
 
             // Clean up completed download tasks and add to mempool if successful.
+            let mut drained = 0;
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
+                drained += 1;
                 match result {
                     Ok(Ok((tx, spent_mempool_outpoints, expected_tip_height, rsp_tx))) => {
                         // # Correctness:
@@ -1298,6 +1304,7 @@ impl Service<Request> for Mempool {
                     tip,
                     tx_count_after: storage.transaction_count(),
                     requeued: 0,
+                    drained,
                     process: grow_started.elapsed(),
                 });
             }

@@ -850,16 +850,23 @@ impl Storage {
     }
 
     /// Returns what the mempool holds and how much work it is to remove the mined,
-    /// conflicting and expired transactions of a block with `block_transactions`.
+    /// conflicting and expired transactions of a block with `block_transactions`, whose
+    /// mined IDs are `block_transaction_hashes`.
     ///
     /// See [`MempoolTipWork`] for what each part counts.
-    pub fn tip_work(&self, block_transactions: &[impl AsRef<Transaction>]) -> MempoolTipWork {
+    pub fn tip_work(
+        &self,
+        block_transaction_hashes: &[transaction::Hash],
+        block_transactions: &[impl AsRef<Transaction>],
+    ) -> MempoolTipWork {
+        let checked_parts: usize = block_transactions
+            .iter()
+            .map(|transaction| verified_set::checked_parts(transaction.as_ref()))
+            .sum();
+
         MempoolTipWork {
             mempool_transactions: self.transaction_count(),
-            block_parts: block_transactions
-                .iter()
-                .map(|transaction| verified_set::tracked_parts(transaction.as_ref()))
-                .sum(),
+            block_parts: checked_parts + self.verified.held_output_parts(block_transaction_hashes),
             mempool_parts: self.verified.scanned_parts(),
         }
     }

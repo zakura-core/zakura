@@ -2059,12 +2059,12 @@ async fn mempool_publishes_the_work_of_a_new_block_before_doing_it() -> Result<(
 
     let block2: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    // The mempool never held block 2's coinbase, so its outputs are not counted.
     let block_parts: usize = block2
         .transactions
         .iter()
         .map(|tx| {
             tx.inputs().len()
-                + tx.outputs().len()
                 + tx.sprout_nullifiers().count()
                 + tx.sapling_nullifiers().count()
                 + tx.orchard_nullifiers().count()
@@ -3212,13 +3212,13 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     }
     // The mempool holds no verified transactions here, so the work it reports for the block
     // that grows the tip is that block's own parts: the transparent outputs its transactions
-    // spend and create, and the nullifiers they reveal. A reset is reported as no work.
+    // spend and the nullifiers they reveal. The outputs they create are not counted, since
+    // the mempool held none of them. A reset is reported as no work.
     let grow_work: usize = grow_block
         .transactions
         .iter()
         .map(|tx| {
             tx.inputs().len()
-                + tx.outputs().len()
                 + tx.sprout_nullifiers().count()
                 + tx.sapling_nullifiers().count()
                 + tx.orchard_nullifiers().count()
@@ -3243,6 +3243,15 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         assert_eq!(row["tx_count_before"], 0);
         assert_eq!(row["tx_count_after"], 0);
         assert_eq!(row["requeued"], requeued);
+        let drained = row["drained"]
+            .as_u64()
+            .expect("the row records the finished downloads handled before the removal");
+        if action == "reset" {
+            assert_eq!(
+                drained, 0,
+                "a reset returns before handling finished downloads"
+            );
+        }
         assert_eq!(row["block_parts"], work);
         assert_eq!(row["mempool_parts"], 0);
         assert_eq!(row["work"], work);

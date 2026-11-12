@@ -7,7 +7,7 @@
 //! separate parts, and two times: `process_us`, the time it spent removing transactions, and
 //! `ready_us`, the time from publishing that it started to publishing that it finished. The
 //! second is what a long poll waiting for the tip's transactions sees: it also covers storing
-//! transactions verified meanwhile and rebuilding the published list.
+//! transactions verified meanwhile, counted in `drained`, and rebuilding the published list.
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,10 @@ pub(super) struct TipApplied {
     pub(super) tx_count_after: usize,
     /// The number of transactions queued for re-verification.
     pub(super) requeued: usize,
+    /// The number of finished downloads the mempool handled in the same pass, before it
+    /// removed the block's transactions. Storing them is part of `ready_us` but not of the
+    /// reported work.
+    pub(super) drained: usize,
     /// The time the mempool spent removing transactions.
     pub(super) process: Duration,
 }
@@ -66,6 +70,7 @@ struct MempoolTipProcessed<'a> {
     tx_count_before: u64,
     tx_count_after: u64,
     requeued: u64,
+    drained: u64,
     block_parts: u64,
     mempool_parts: u64,
     work: u64,
@@ -92,6 +97,7 @@ impl MempoolTrace {
             tx_count_before: saturating_count(started.transactions_before),
             tx_count_after: saturating_count(applied.tx_count_after),
             requeued: saturating_count(applied.requeued),
+            drained: saturating_count(applied.drained),
             block_parts: saturating_count(started.work.block_parts),
             mempool_parts: saturating_count(started.work.mempool_parts),
             work: saturating_count(started.work.work()),

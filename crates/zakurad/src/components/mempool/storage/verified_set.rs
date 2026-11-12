@@ -47,12 +47,14 @@ pub(super) mod benchmarks;
 #[allow(unused_imports)]
 use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
-/// Returns the number of parts of `transaction` that the mempool looks up or removes one by
-/// one when a block arrives: the transparent outputs it creates and spends, and the
+/// Returns the number of parts of a block's `transaction` that the mempool collects one by
+/// one to check its own transactions against: the transparent outputs it spends and the
 /// nullifiers it reveals.
-pub(super) fn tracked_parts(transaction: &Transaction) -> usize {
-    transaction.outputs().len()
-        + transaction.inputs().len()
+///
+/// The outputs it creates are not counted here: the mempool only touches them when it held
+/// the transaction, see [`VerifiedSet::held_output_parts`].
+pub(super) fn checked_parts(transaction: &Transaction) -> usize {
+    transaction.inputs().len()
         + transaction.sprout_nullifiers().count()
         + transaction.sapling_nullifiers().count()
         + transaction.orchard_nullifiers().count()
@@ -175,13 +177,29 @@ impl VerifiedSet {
     /// block: the transparent outputs they spend and the nullifiers they reveal.
     ///
     /// The outputs they create are not counted: a block only touches the outputs of the
-    /// transactions it mines, which [`tracked_parts`] counts for the block.
+    /// transactions it mines, which [`Self::held_output_parts`] counts.
     pub fn scanned_parts(&self) -> usize {
         self.spent_outpoints.len()
             + self.sprout_nullifiers.len()
             + self.sapling_nullifiers.len()
             + self.orchard_nullifiers.len()
             + self.ironwood_nullifiers.len()
+    }
+
+    /// Returns the number of transparent outputs created by the transactions in `mined_ids`
+    /// that the set holds: the outputs it removes one by one when a block mines them.
+    ///
+    /// A mined transaction the set does not hold costs nothing here, however many outputs it
+    /// creates.
+    pub fn held_output_parts<'a>(
+        &self,
+        mined_ids: impl IntoIterator<Item = &'a transaction::Hash>,
+    ) -> usize {
+        mined_ids
+            .into_iter()
+            .filter_map(|id| self.transactions.get(id))
+            .map(|tx| tx.transaction.transaction().outputs().len())
+            .sum()
     }
 
     /// Returns the total cost of the verified transactions in the set.

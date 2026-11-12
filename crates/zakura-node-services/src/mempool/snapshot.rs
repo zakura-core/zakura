@@ -82,9 +82,12 @@ pub struct MempoolTipWork {
     /// and to copy it into the published list.
     pub mempool_transactions: usize,
 
-    /// The transparent outputs the block's transactions spend and create, and the nullifiers
-    /// they reveal. The mempool collects the spends and nullifiers to check its transactions
-    /// against, and removes the outputs and spends of the transactions the block mined.
+    /// The transparent outputs the block's transactions spend and the nullifiers they reveal,
+    /// which the mempool collects to check its transactions against, and the outputs created
+    /// by the block's transactions that the mempool held, which it removes with them.
+    ///
+    /// Outputs created by transactions the mempool never held are not counted: it never
+    /// touches them, so a block with many such outputs is not reported as heavy work.
     pub block_parts: usize,
 
     /// The transparent outputs the mempool's transactions spend, and the nullifiers they

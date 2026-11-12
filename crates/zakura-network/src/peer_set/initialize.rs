@@ -5,8 +5,7 @@
 //! [tower-balance]: https://github.com/tower-rs/tower/tree/master/tower/src/balance
 
 use std::{
-    collections::{HashMap, HashSet},
-    convert::Infallible,
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
@@ -17,12 +16,11 @@ use std::{
 };
 
 use futures::{
-    future::{self, FutureExt},
+    future::{self, BoxFuture, Fuse, FusedFuture, FutureExt},
     sink::SinkExt,
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
@@ -41,11 +39,13 @@ use tracing::Instrument;
 use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
+    serialization::DateTime32,
 };
 use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
+    config::InitialPeerOrder,
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
@@ -372,7 +372,7 @@ where
         futures::channel::mpsc::channel::<DiscoveredPeer>(config.peerset_total_connection_limit());
 
     let discovered_peers = peerset_rx.map(|(address, client)| {
-        Result::<_, Infallible>::Ok(Change::Insert(address, client.into()))
+        Result::<_, std::convert::Infallible>::Ok(Change::Insert(address, client.into()))
     });
 
     // Create an mpsc channel for peerset demand signaling,
@@ -443,7 +443,13 @@ where
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
-        let mut active_outbound_connections = initial_peers_join
+        let InitialPeerConnections {
+            active_connections: mut active_outbound_connections,
+            pending_seed_peers,
+            resolved_seed_peers,
+            attempted_peers,
+            seed_peer_attempted,
+        } = initial_peers_join
             .await
             .panic_if_task_has_panicked()
             .expect("initial peer task is not cancelled")
@@ -475,7 +481,14 @@ where
             let _ = demand_tx.try_send(MorePeers);
         }
 
-        // Start the peer crawler
+        // Start the peer crawler. Seeds that resolve later still reach discovery.
+        let seed_bootstrap = SeedBootstrap::new(
+            &config,
+            pending_seed_peers,
+            resolved_seed_peers,
+            attempted_peers,
+            seed_peer_attempted,
+        );
         let crawl_fut = crawl_and_dial(
             config.clone(),
             demand_tx,
@@ -485,6 +498,7 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
+            seed_bootstrap,
             Arc::new(AtomicBool::new(false)),
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
@@ -576,6 +590,112 @@ where
     ))
 }
 
+/// Seed peers whose DNS resolution is still pending.
+type PendingSeedPeers = Fuse<BoxFuture<'static, Vec<PeerSocketAddr>>>;
+
+/// The result of startup dials.
+struct InitialPeerConnections {
+    /// The connections to initial peers.
+    active_connections: ActiveConnectionCounter,
+    /// Seed peers that had not resolved when startup dials finished.
+    pending_seed_peers: Option<PendingSeedPeers>,
+    /// Resolved seed addresses retained independently of address-book pruning.
+    resolved_seed_peers: Vec<PeerSocketAddr>,
+    /// Every startup admission, to avoid repeating cached or seed attempts.
+    attempted_peers: HashSet<PeerSocketAddr>,
+    /// Whether startup already admitted a seed-derived address.
+    seed_peer_attempted: bool,
+}
+
+/// One finite, serial opportunity to connect beyond the cached startup target.
+/// Ordinary demand and this work share the crawler's outbound counter. A reserved
+/// slot uses existing headroom only; unresolved DNS releases it after one lookup
+/// window. Very late seeds wait for turnover if ordinary work has filled the cap.
+struct SeedBootstrap {
+    pending_peers: PendingSeedPeers,
+    candidates: VecDeque<PeerSocketAddr>,
+    excluded_ips: HashSet<IpAddr>,
+    attempts_remaining: usize,
+    candidate_limit: usize,
+    in_flight: bool,
+    reserve_until: Instant,
+}
+
+impl SeedBootstrap {
+    fn new(
+        config: &Config,
+        pending: Option<PendingSeedPeers>,
+        resolved: Vec<PeerSocketAddr>,
+        attempted: HashSet<PeerSocketAddr>,
+        seed_attempted: bool,
+    ) -> Self {
+        let has_headroom =
+            config.peerset_outbound_connection_limit() > config.peerset_initial_target_size;
+        let attempts_remaining = if has_headroom && !seed_attempted {
+            (config.peerset_initial_target_size / 2).max(1)
+        } else {
+            0
+        };
+        let pending_peers = match pending {
+            Some(pending) => pending.boxed().fuse(),
+            None => future::ready(resolved).boxed().fuse(),
+        };
+        Self {
+            pending_peers,
+            candidates: VecDeque::new(),
+            excluded_ips: attempted.into_iter().map(|addr| addr.ip()).collect(),
+            attempts_remaining,
+            candidate_limit: config.peerset_initial_target_size,
+            in_flight: false,
+            reserve_until: Instant::now() + constants::DNS_LOOKUP_TIMEOUT,
+        }
+    }
+
+    /// A disabled opportunity for callers without startup seed work.
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            pending_peers: future::ready(Vec::new()).boxed().fuse(),
+            candidates: VecDeque::new(),
+            excluded_ips: HashSet::new(),
+            attempts_remaining: 0,
+            candidate_limit: 0,
+            in_flight: false,
+            reserve_until: Instant::now(),
+        }
+    }
+
+    fn accept_resolved(&mut self, peers: Vec<PeerSocketAddr>) {
+        if self.attempts_remaining == 0 {
+            return;
+        }
+        self.candidates = peers
+            .into_iter()
+            .filter(|addr| self.excluded_ips.insert(addr.ip()))
+            .take(self.candidate_limit)
+            .collect();
+    }
+
+    fn reserved_slots(&self) -> usize {
+        usize::from(
+            self.attempts_remaining > 0
+                && (self.in_flight
+                    || !self.candidates.is_empty()
+                    || (!self.pending_peers.is_terminated()
+                        && Instant::now() < self.reserve_until)),
+        )
+    }
+}
+
+impl std::fmt::Debug for InitialPeerConnections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialPeerConnections")
+            .field("active_connections", &self.active_connections)
+            .field("seed_peers_pending", &self.pending_seed_peers.is_some())
+            .finish()
+    }
+}
+
 /// Use the provided `outbound_connector` to connect to the configured DNS seeder and
 /// disk cache initial peers, then send the resulting peer connections over `peerset_tx`.
 ///
@@ -584,9 +704,9 @@ where
 async fn add_initial_peers<S>(
     config: Config,
     outbound_connector: S,
-    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> Result<ActiveConnectionCounter, BoxError>
+) -> Result<InitialPeerConnections, BoxError>
 where
     S: Service<
             OutboundConnectorRequest,
@@ -597,7 +717,74 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+    let seed_config = config.clone();
+    let seed_peers = async move { seed_config.initial_seed_peers().await }.boxed();
+    dial_initial_peers(
+        config,
+        seed_peers,
+        outbound_connector,
+        peerset_tx,
+        address_book_updater,
+    )
+    .await
+}
+
+/// Dial cached peers without waiting for `seed_peers`, then add seeds to the same
+/// startup dials when they resolve.
+///
+/// Candidates follow [`InitialPeerOrder`]. At most
+/// [`INITIAL_PEER_DIAL_CONCURRENCY`](constants::INITIAL_PEER_DIAL_CONCURRENCY)
+/// attempts run at once, and each completed attempt admits the next candidate.
+/// Startup admits at most `peerset_initial_target_size` attempts, and at most
+/// `max_connections_per_ip` per IP. Every candidate reaches the address book.
+///
+/// Startup waits for seeds only when cached peers cannot fill the startup target
+/// and no connection remains live. A working cached connection must not depend on
+/// DNS before initialization can finish. Seeds still resolving when every admitted
+/// attempt has finished are returned unresolved, and reach discovery after they resolve.
+/// With a startup target of one, a cached peer therefore takes the slot when seeds
+/// resolve later than the cache loads. More generally, a full cache can spend the
+/// entire startup attempt budget before DNS resolves. The crawler receives the
+/// unresolved or unused seed candidates for a finite opportunity within existing
+/// outbound headroom; startup itself never exceeds its original attempt budget.
+async fn dial_initial_peers<S>(
+    config: Config,
+    seed_peers: BoxFuture<'static, Vec<PeerSocketAddr>>,
+    outbound_connector: S,
+    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+) -> Result<InitialPeerConnections, BoxError>
+where
+    S: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let mut seed_peers = seed_peers.fuse();
+    let (cached_peers, cached_peers_responded_after) = config.initial_cached_peers().await;
+    send_cached_peers(
+        cached_peers.iter().copied(),
+        cached_peers_responded_after,
+        &address_book_updater,
+    )
+    .await;
+    let cached_peer_count = cached_peers.len();
+    let mut order = InitialPeerOrder::new(cached_peers, config.peerset_initial_target_size);
+    let mut resolved_seed_peers = Vec::new();
+    let mut seed_addresses = HashSet::new();
+    let mut attempted_peers = HashSet::new();
+    let mut seed_peer_attempted = false;
+    // Seeds that are already resolved alternate with cached peers from the first dial.
+    if let Some(seed_peers) = (&mut seed_peers).now_or_never() {
+        send_initial_peers(seed_peers.iter().copied(), &address_book_updater).await;
+        seed_addresses.extend(seed_peers.iter().copied());
+        resolved_seed_peers = seed_peers.clone();
+        order.add_seed_peers(seed_peers);
+    }
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -607,26 +794,32 @@ where
         "Outbound Connections",
     );
 
-    // TODO: update when we add Tor peers or other kinds of addresses.
-    let ipv4_peer_count = initial_peers.iter().filter(|ip| ip.is_ipv4()).count();
-    let ipv6_peer_count = initial_peers.iter().filter(|ip| ip.is_ipv6()).count();
     info!(
-        ?ipv4_peer_count,
-        ?ipv6_peer_count,
+        ?cached_peer_count,
+        seed_peers_resolved = seed_peers.is_terminated(),
         "connecting to initial peer set"
     );
 
-    // Admit only a bounded window of attempts. The selected prefix still obeys
-    // the total target, per-IP limit, and cached/seed preference order.
-    // Completed attempts refill the window without delaying unrelated peers.
-    let mut remaining_peers = initial_peers.into_iter();
+    let mut admitted_total: usize = 0;
+    let mut admitted_per_ip = HashMap::new();
     let mut handshakes = FuturesUnordered::new();
 
     loop {
-        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY {
-            let Some(addr) = remaining_peers.next() else {
+        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY
+            && admitted_total < config.peerset_initial_target_size
+        {
+            let Some(addr) = order.next_available() else {
                 break;
             };
+            let admitted_for_ip = admitted_per_ip.entry(addr.ip()).or_insert(0);
+            if *admitted_for_ip >= config.max_connections_per_ip {
+                continue;
+            }
+            *admitted_for_ip += 1;
+            admitted_total += 1;
+            attempted_peers.insert(addr);
+            seed_peer_attempted |= seed_addresses.contains(&addr);
+
             let req = OutboundConnectorRequest {
                 addr,
                 connection_tracker: active_outbound_connections.track_connection(),
@@ -651,8 +844,26 @@ where
             });
         }
 
-        let Some(handshake_result) = handshakes.next().await else {
+        // Keep the seed fallback when an undersized cache has no live connection.
+        // A working cached connection must let initialization finish without DNS.
+        // Reservations held by aborting failed handshakes are not successful peers.
+        let must_wait_for_seeds = admitted_total < config.peerset_initial_target_size
+            && !seed_peers.is_terminated()
+            && (handshake_success_total == 0
+                || active_outbound_connections.update_open_count() == 0);
+        if handshakes.is_empty() && !must_wait_for_seeds {
             break;
+        }
+
+        let handshake_result = tokio::select! {
+            seed_peers = &mut seed_peers, if !seed_peers.is_terminated() => {
+                send_initial_peers(seed_peers.iter().copied(), &address_book_updater).await;
+                seed_addresses.extend(seed_peers.iter().copied());
+                resolved_seed_peers = seed_peers.clone();
+                order.add_seed_peers(seed_peers);
+                continue;
+            }
+            Some(handshake_result) = handshakes.next() => handshake_result,
         };
         match handshake_result {
             Ok(change) => {
@@ -671,6 +882,12 @@ where
             Err((addr, ref e)) => {
                 handshake_error_total += 1;
                 let addr_label = addr.addr_label(config.expose_peer_addresses);
+
+                // Like crawler dials, a failed startup dial must not look never-attempted,
+                // or the crawler retries it ahead of untried candidates.
+                let _ = address_book_updater
+                    .send(MetaAddr::new_errored(addr, None))
+                    .await;
 
                 // this is verbose, but it's better than just hanging with no output when there are errors
                 let mut expected_error = false;
@@ -710,47 +927,53 @@ where
 
     let outbound_connections = active_outbound_connections.update_count();
     info!(
+        ?admitted_total,
         ?handshake_success_total,
         ?handshake_error_total,
         ?outbound_connections,
+        seed_peers_resolved = seed_peers.is_terminated(),
         "finished connecting to initial seed and disk cache peers"
     );
 
-    Ok(active_outbound_connections)
+    Ok(InitialPeerConnections {
+        active_connections: active_outbound_connections,
+        pending_seed_peers: (!seed_peers.is_terminated()).then_some(seed_peers),
+        resolved_seed_peers,
+        attempted_peers,
+        seed_peer_attempted,
+    })
 }
 
-/// Limit the number of `initial_peers` addresses entries to the configured
-/// `peerset_initial_target_size`.
+/// Send `peers` from the disk cache to the address book, so discovery can use them.
 ///
-/// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
-/// do not consume a startup slot; later candidates can fill it.
-///
-/// Also sends every initial peer to the `address_book_updater`.
-async fn limit_initial_peers(
-    config: &Config,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-) -> IndexSet<PeerSocketAddr> {
-    let all_peers = config.initial_peers().await;
-    let mut initial_peers = IndexSet::new();
-    let mut selected_per_ip = HashMap::new();
+/// Each peer responded to this node after `responded_after`, if known. With that
+/// time, a peer that fails its startup dial stays eligible for later retries.
+async fn send_cached_peers(
+    peers: impl IntoIterator<Item = PeerSocketAddr>,
+    responded_after: Option<DateTime32>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) {
+    for peer in peers {
+        let change = match responded_after {
+            Some(responded_after) => MetaAddr::new_cached_peer(peer, responded_after),
+            None => MetaAddr::new_initial_peer(peer),
+        };
+        // `send` only waits when the channel is full, and the updater runs on its own thread.
+        let _ = address_book_updater.send(change).await;
+    }
+}
 
-    // Config has validated and interleaved cached peers with shuffled seeds.
-    // Feed every candidate to discovery, even beyond the startup dial limit.
-    for peer in all_peers {
+/// Send initial `peers` to the address book, so discovery can use them.
+async fn send_initial_peers(
+    peers: impl IntoIterator<Item = PeerSocketAddr>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) {
+    for peer in peers {
+        // `send` only waits when the channel is full, and the updater runs on its own thread.
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
-        if initial_peers.len() < config.peerset_initial_target_size {
-            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
-            if *count < config.max_connections_per_ip {
-                initial_peers.insert(peer);
-                *count += 1;
-            }
-        }
     }
-
-    initial_peers
 }
 
 /// Open a peer connection listener on `config.listen_addr`,
@@ -1056,6 +1279,14 @@ where
 
 /// An action that the peer crawler can take.
 enum CrawlerAction {
+    /// DNS has resolved independently of normal peer demand.
+    SeedPeersResolved(Vec<PeerSocketAddr>),
+    /// Release unresolved-DNS headroom after a bounded grace interval.
+    SeedReservationExpired,
+    /// Start one independently bounded seed-derived attempt.
+    SeedHandshake,
+    /// A seed candidate was skipped or its one attempt finished.
+    SeedHandshakeFinished { attempted: bool, connected: bool },
     /// Drop the demand signal because there are too many pending handshakes.
     DemandDrop,
     /// Initiate a handshake to the next candidate peer in response to demand.
@@ -1150,6 +1381,7 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        seed_bootstrap,
         force_failed_dial_demand_restore_full,
     ),
     fields(
@@ -1165,6 +1397,7 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    mut seed_bootstrap: SeedBootstrap,
     // When true, failed dials report a full demand channel so tests can cover
     // unrestored-demand credit gating without racing the crawler select loop.
     force_failed_dial_demand_restore_full: Arc<AtomicBool>,
@@ -1215,12 +1448,19 @@ where
     // decrements this counter, even if it crawls instead of dialing. The next
     // periodic crawl refreshes any remaining deficit.
     let remaining_replenishment_demand = AtomicUsize::new(0);
+    let seed_reservation_timer = tokio::time::sleep_until(seed_bootstrap.reserve_until).fuse();
+    tokio::pin!(seed_reservation_timer);
 
     // # Concurrency
     //
     // To avoid hangs and starvation, the crawler must spawn a separate task for each crawl
     // and handshake, so they can make progress independently (and avoid deadlocking each other).
     loop {
+        let can_probe_seed = seed_bootstrap.attempts_remaining > 0
+            && !seed_bootstrap.in_flight
+            && !seed_bootstrap.candidates.is_empty()
+            && active_outbound_connections.update_count()
+                < config.peerset_outbound_connection_limit();
         metrics::gauge!("crawler.in_flight_handshakes").set(
             handshakes
                 .len()
@@ -1235,6 +1475,18 @@ where
             next_handshake_res = handshakes.next() => next_handshake_res.expect(
                 "handshakes never terminates, because it contains a future that never resolves"
             ),
+            seed_peers = &mut seed_bootstrap.pending_peers,
+                if !seed_bootstrap.pending_peers.is_terminated() =>
+            {
+                Ok(SeedPeersResolved(seed_peers))
+            },
+            _ = &mut seed_reservation_timer,
+                if !seed_reservation_timer.is_terminated() && seed_bootstrap.attempts_remaining > 0 =>
+            {
+                Ok(SeedReservationExpired)
+            },
+            // A seed opportunity uses shared capacity before ordinary demand can fill it.
+            _ = future::ready(()), if can_probe_seed => Ok(SeedHandshake),
             // The timer is rate-limited
             next_timer = crawl_timer.next() => Ok(next_timer.expect("timers never terminate")),
             // External demand is potentially unlimited, so it goes after the
@@ -1269,9 +1521,10 @@ where
                     |demand| Some(demand.saturating_sub(1)),
                 );
 
-                if active_outbound_connections.update_count()
-                    >= config.peerset_outbound_connection_limit()
-                {
+                let ordinary_limit = config
+                    .peerset_outbound_connection_limit()
+                    .saturating_sub(seed_bootstrap.reserved_slots());
+                if active_outbound_connections.update_count() >= ordinary_limit {
                     remaining_replenishment_demand.store(0, Ordering::Relaxed);
                     Ok(DemandDrop)
                 } else {
@@ -1284,6 +1537,76 @@ where
         };
 
         match crawler_action {
+            Ok(SeedPeersResolved(peers)) => {
+                send_initial_peers(peers.iter().copied(), &address_book_updater).await;
+                seed_bootstrap.accept_resolved(peers);
+            }
+            Ok(SeedReservationExpired) => {}
+            Ok(SeedHandshake) => {
+                let addr = seed_bootstrap
+                    .candidates
+                    .pop_front()
+                    .expect("seed admission requires a queued candidate");
+                seed_bootstrap.in_flight = true;
+                // No await separates the capacity check above from this reservation.
+                let tracker = active_outbound_connections.track_connection();
+                let candidates = candidates.clone();
+                let connector = outbound_connector.clone();
+                let peerset_tx = peerset_tx.clone();
+                let updater = address_book_updater.clone();
+                let max_connections_per_ip = config.max_connections_per_ip;
+                let expose_peer_addresses = config.expose_peer_addresses;
+                let task = AbortOnDropHandle::new(tokio::spawn(erased(async move {
+                    let candidate = candidates
+                        .lock()
+                        .await
+                        .next_seed(addr, max_connections_per_ip)
+                        .await;
+                    if let Some((candidate, _claim)) = candidate {
+                        dial_seed(
+                            candidate,
+                            connector,
+                            tracker,
+                            peerset_tx,
+                            updater,
+                            expose_peer_addresses,
+                        )
+                        .await
+                        .map(|connected| SeedHandshakeFinished {
+                            attempted: true,
+                            connected,
+                        })
+                    } else {
+                        drop(tracker);
+                        Ok(SeedHandshakeFinished {
+                            attempted: false,
+                            connected: false,
+                        })
+                    }
+                })));
+                handshakes.push(
+                    async move {
+                        task.await
+                            .panic_if_task_has_panicked()
+                            .expect("seed probe tasks are owned by the crawler")
+                    }
+                    .boxed(),
+                );
+            }
+            Ok(SeedHandshakeFinished {
+                attempted,
+                connected,
+            }) => {
+                seed_bootstrap.in_flight = false;
+                if attempted {
+                    seed_bootstrap.attempts_remaining =
+                        seed_bootstrap.attempts_remaining.saturating_sub(1);
+                }
+                if connected {
+                    seed_bootstrap.attempts_remaining = 0;
+                    seed_bootstrap.candidates.clear();
+                }
+            }
             // Dummy actions
             Ok(DemandDrop) => {
                 // This is set to trace level because when the peer set is
@@ -1325,9 +1648,9 @@ where
                         // book lock, so it shouldn't hang.
                         //
                         // Hold the lock for as short a time as possible.
-                        let candidate = { candidates.lock().await.next().await };
+                        let candidate = { candidates.lock().await.next_tracked().await };
 
-                        if let Some(candidate) = candidate {
+                        if let Some((candidate, _claim)) = candidate {
                             // we don't need to spawn here, because there's nothing running concurrently
                             match dial(
                                 candidate,
@@ -1632,6 +1955,46 @@ where
             )?;
 
             Ok(DialOutcome::Failed { demand_restored })
+        }
+    }
+}
+
+/// Dial one seed-derived candidate without restoring ordinary demand: this
+/// finite opportunity did not consume a MorePeers signal.
+async fn dial_seed<C>(
+    candidate: MetaAddr,
+    outbound_connector: C,
+    connection_tracker: ConnectionTracker,
+    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    expose_peer_addresses: bool,
+) -> Result<bool, BoxError>
+where
+    C: Service<OutboundConnectorRequest, Response = DiscoveredPeer, Error = BoxError>
+        + Clone
+        + Send
+        + 'static,
+    C::Future: Send + 'static,
+{
+    let result = outbound_connector
+        .oneshot(OutboundConnectorRequest {
+            addr: candidate.addr,
+            connection_tracker,
+        })
+        .await;
+    match result {
+        Ok(peer) => {
+            peerset_tx.send(peer).await?;
+            Ok(true)
+        }
+        Err(error) => {
+            let neutral_disconnect = error
+                .downcast_ref::<peer::HandshakeError>()
+                .is_some_and(peer::HandshakeError::is_neutral_disconnect);
+            if !neutral_disconnect {
+                report_failed(address_book_updater, candidate, expose_peer_addresses).await;
+            }
+            Ok(false)
         }
     }
 }

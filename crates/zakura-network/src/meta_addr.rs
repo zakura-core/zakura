@@ -239,6 +239,8 @@ pub enum MetaAddrChange {
             proptest(strategy = "canonical_peer_addr_strategy()")
         )]
         addr: PeerSocketAddr,
+        /// A time before the peer's last response, if this node knows one.
+        untrusted_last_seen: Option<DateTime32>,
     },
 
     /// Creates a new gossiped `MetaAddr`.
@@ -334,6 +336,19 @@ impl MetaAddr {
     pub fn new_initial_peer(addr: PeerSocketAddr) -> MetaAddrChange {
         NewInitial {
             addr: canonical_peer_addr(addr),
+            untrusted_last_seen: None,
+        }
+    }
+
+    /// Returns a [`MetaAddrChange::NewInitial`] for a peer loaded from the disk cache,
+    /// which last responded to this node after `responded_after`.
+    ///
+    /// The last seen time keeps the peer [probably reachable](MetaAddr::is_probably_reachable)
+    /// after a failed connection attempt, so it is retried like any other recent peer.
+    pub fn new_cached_peer(addr: PeerSocketAddr, responded_after: DateTime32) -> MetaAddrChange {
+        NewInitial {
+            addr: canonical_peer_addr(addr),
+            untrusted_last_seen: Some(responded_after),
         }
     }
 
@@ -786,7 +801,7 @@ impl MetaAddrChange {
     /// Return the address for this change.
     pub fn addr(&self) -> PeerSocketAddr {
         match self {
-            NewInitial { addr }
+            NewInitial { addr, .. }
             | NewGossiped { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -804,7 +819,7 @@ impl MetaAddrChange {
     /// This method should only be used in tests.
     pub fn set_addr(&mut self, new_addr: PeerSocketAddr) {
         match self {
-            NewInitial { addr }
+            NewInitial { addr, .. }
             | NewGossiped { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -837,7 +852,10 @@ impl MetaAddrChange {
     /// Return the untrusted last seen time for this change, if available.
     pub fn untrusted_last_seen(&self, now: DateTime32) -> Option<DateTime32> {
         match self {
-            NewInitial { .. } => None,
+            NewInitial {
+                untrusted_last_seen,
+                ..
+            } => *untrusted_last_seen,
             NewGossiped {
                 untrusted_last_seen,
                 ..

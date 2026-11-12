@@ -67,9 +67,46 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
     );
 }
 
-/// Gossip-only peers have no measured preference and do not keep a fixed cache prefix.
+/// A gossiped last seen time does not make a peer cacheable: only this node's own
+/// responses show that an address is a reachable listener.
 #[test]
-fn peer_cache_shuffles_unmeasured_gossip() {
+fn peer_cache_excludes_gossip_only_peers() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let responded = "127.0.0.1:8233".parse().unwrap();
+    let gossiped = "127.0.0.2:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(responded, None));
+    book.update(
+        MetaAddr::new_gossiped_meta_addr(gossiped, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .unwrap(),
+    );
+
+    let cached: Vec<_> = book
+        .cacheable(Utc::now())
+        .iter()
+        .map(|peer| peer.addr)
+        .collect();
+    assert_eq!(cached, vec![responded]);
+
+    let later = Utc::now()
+        + chrono::Duration::from(crate::constants::MAX_PEER_ACTIVE_FOR_GOSSIP)
+        + chrono::Duration::seconds(1);
+    assert!(
+        book.cacheable(later).is_empty(),
+        "a response older than the cache window is not cached"
+    );
+}
+
+/// Peers without a measured RTT have no trusted preference and do not keep a fixed
+/// cache prefix.
+#[test]
+fn peer_cache_shuffles_unmeasured_peers() {
     let _init_guard = zakura_test::init();
     let mut book = AddressBook::new(
         "0.0.0.0:0".parse().unwrap(),
@@ -86,11 +123,7 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     for ip in 1..=8 {
         let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
         expected.insert(addr);
-        book.update(
-            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
-                .new_gossiped_change()
-                .unwrap(),
-        );
+        book.update(MetaAddr::new_responded(addr, None));
     }
     let mut orders = std::collections::HashSet::new();
     for _ in 0..16 {
@@ -109,7 +142,7 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     // Sixteen identical independent shuffles of eight peers have probability (8!)^-15.
     assert!(
         orders.len() > 1,
-        "unmeasured gossip must not retain deterministic priority"
+        "unmeasured peers must not retain deterministic priority"
     );
 }
 

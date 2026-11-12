@@ -1,6 +1,12 @@
 //! Candidate peer selection for outbound connections using the [`CandidateSet`].
 
-use std::{any::type_name, cmp::min, sync::Arc};
+use std::{
+    any::type_name,
+    cmp::min,
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -12,11 +18,62 @@ use zakura_chain::{diagnostic::task::WaitForPanics, serialization::DateTime32};
 
 use crate::{
     constants, meta_addr::MetaAddrChange, peer_set::set::MorePeers, types::MetaAddr, AddressBook,
-    BoxError, Request, Response,
+    BoxError, PeerSocketAddr, Request, Response,
 };
 
 #[cfg(test)]
 mod tests;
+
+/// Shared, short-lived selection claims; successful connections use the address
+/// book's normal liveness checks after their dial finishes.
+#[derive(Debug, Default)]
+struct DialingIps {
+    counts: HashMap<IpAddr, usize>,
+    seed_ip: Option<IpAddr>,
+}
+
+/// Releases an in-flight selection claim on completion or cancellation.
+#[derive(Debug)]
+pub(crate) struct PeerDialClaim {
+    state: Arc<Mutex<DialingIps>>,
+    ip: IpAddr,
+    seed: bool,
+}
+
+impl PeerDialClaim {
+    fn new(state: Arc<Mutex<DialingIps>>, ip: IpAddr, seed: bool) -> Self {
+        {
+            let mut claims = state.lock().unwrap();
+            *claims.counts.entry(ip).or_default() += 1;
+            if seed {
+                assert!(
+                    claims.seed_ip.replace(ip).is_none(),
+                    "seed probes are serial"
+                );
+            }
+        }
+        Self { state, ip, seed }
+    }
+}
+
+impl Drop for PeerDialClaim {
+    fn drop(&mut self) {
+        let mut claims = self.state.lock().unwrap();
+        let count = claims
+            .counts
+            .get_mut(&self.ip)
+            .expect("live guard owns an IP claim");
+        *count = count
+            .checked_sub(1)
+            .expect("live guard has a nonzero claim count");
+        if *count == 0 {
+            claims.counts.remove(&self.ip);
+        }
+        if self.seed {
+            claims.seed_ip = None;
+        }
+    }
+}
 
 /// The [`CandidateSet`] manages outbound peer connection attempts. Successful
 /// connections become peers in the [`PeerSet`](super::set::PeerSet).
@@ -142,6 +199,9 @@ where
 
     /// A timer that enforces a rate-limit on peer set requests for more peers.
     min_next_crawl: Instant,
+
+    /// In-flight IP claims survive gossip eviction and are released by task ownership.
+    dialing_ips: Arc<Mutex<DialingIps>>,
 }
 
 impl<S> std::fmt::Debug for CandidateSet<S>
@@ -174,6 +234,7 @@ where
             peer_service,
             min_next_handshake: Instant::now(),
             min_next_crawl: Instant::now(),
+            dialing_ips: Arc::new(Mutex::new(DialingIps::default())),
         }
     }
 
@@ -400,6 +461,7 @@ where
     pub async fn next(&mut self) -> Option<MetaAddr> {
         // Correctness: To avoid hangs, computation in the critical section should be kept to a minimum.
         let address_book = self.address_book.clone();
+        let seed_probe_ip = self.dialing_ips.lock().unwrap().seed_ip;
         let next_peer = move || -> Option<MetaAddr> {
             let mut guard = address_book.lock().unwrap();
 
@@ -409,7 +471,9 @@ where
 
             // It's okay to return without sleeping here, because we're returning
             // `None`. We only need to sleep before yielding an address.
-            let next_peer = guard.reconnection_peers(instant_now, chrono_now).next()?;
+            let next_peer = guard
+                .reconnection_peers(instant_now, chrono_now)
+                .find(|peer| Some(peer.addr.ip()) != seed_probe_ip)?;
 
             // TODO: only mark the peer as AttemptPending when it is actually used (#1976)
             //
@@ -433,6 +497,46 @@ where
         self.min_next_handshake = Instant::now() + constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
 
         Some(next_peer)
+    }
+
+    /// Select ordinary work and retain its IP claim through the caller's dial.
+    pub(crate) async fn next_tracked(&mut self) -> Option<(MetaAddr, PeerDialClaim)> {
+        let candidate = self.next().await?;
+        let claim = PeerDialClaim::new(self.dialing_ips.clone(), candidate.addr.ip(), false);
+        Some((candidate, claim))
+    }
+
+    /// Claim a retained DNS candidate under the same selection lock and rate
+    /// limiter as ordinary discovery, without giving gossip priority over it.
+    pub(crate) async fn next_seed(
+        &mut self,
+        addr: PeerSocketAddr,
+        max_connections_per_ip: usize,
+    ) -> Option<(MetaAddr, PeerDialClaim)> {
+        if self
+            .dialing_ips
+            .lock()
+            .unwrap()
+            .counts
+            .contains_key(&addr.ip())
+        {
+            return None;
+        }
+        let address_book = self.address_book.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            address_book
+                .lock()
+                .unwrap()
+                .claim_seed_candidate(addr, max_connections_per_ip)
+        })
+        .wait_for_panics()
+        .await?;
+        sleep_until(self.min_next_handshake).await;
+        self.min_next_handshake = Instant::now() + constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
+        // The caller holds the selector lock through this entire method, so no
+        // ordinary selection can interleave before the guard is returned.
+        let claim = PeerDialClaim::new(self.dialing_ips.clone(), candidate.addr.ip(), true);
+        Some((candidate, claim))
     }
 
     /// Returns the address book for this `CandidateSet`.

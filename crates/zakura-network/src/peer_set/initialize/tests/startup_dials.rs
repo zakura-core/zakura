@@ -13,16 +13,22 @@ use tokio::{
 };
 use tower::{service_fn, util::BoxCloneService};
 
+use chrono::Utc;
+use tracing::Span;
+use zakura_chain::parameters::Network::Mainnet;
+
 use crate::{
     config::CacheDir,
-    constants::INITIAL_PEER_DIAL_CONCURRENCY,
-    meta_addr::MetaAddrChange,
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, INITIAL_PEER_DIAL_CONCURRENCY, MIN_PEER_RECONNECTION_DELAY,
+    },
+    meta_addr::{MetaAddrChange, PeerAddrState},
     peer::{ClientTestHarness, OutboundConnectorRequest},
-    peer_set::{ActiveConnectionCounter, ConnectionTracker},
-    BoxError, Config, PeerSocketAddr,
+    peer_set::ConnectionTracker,
+    AddressBook, BoxError, Config, PeerSocketAddr,
 };
 
-use super::super::{add_initial_peers, DiscoveredPeer};
+use super::super::{add_initial_peers, DiscoveredPeer, InitialPeerConnections};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -109,7 +115,7 @@ fn spawn_initial(
     config: Config,
     connector: TestConnector,
 ) -> (
-    JoinHandle<Result<ActiveConnectionCounter, BoxError>>,
+    JoinHandle<Result<InitialPeerConnections, BoxError>>,
     mpsc::Receiver<DiscoveredPeer>,
     tokio_mpsc::Receiver<MetaAddrChange>,
 ) {
@@ -183,7 +189,12 @@ async fn startup_window_refills_on_success_and_failure() {
         attempt.finish.send(false).unwrap();
     }
     assert_eq!(tail, expected[52..].iter().copied().collect());
-    let mut counter = timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
+    let mut counter = timeout(TEST_TIMEOUT, task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .active_connections;
     assert_eq!(
         counter.update_count(),
         1,
@@ -193,6 +204,50 @@ async fn startup_window_refills_on_success_and_failure() {
     assert_eq!(counter.update_count(), 0);
     assert!(attempts.recv().await.is_none());
     assert_eq!(Instant::now(), started_at, "startup adds no pacing timer");
+}
+
+/// A cached peer that fails its startup dial stays a reconnection candidate, so one
+/// timeout or duplicate close does not drop a recently live peer until the next restart.
+#[tokio::test]
+async fn failed_cached_peer_stays_retryable() {
+    let _init_guard = zakura_test::init();
+    let cached = peers(1);
+    let (config, _cache) = cached_config(&cached, 1);
+    let (connector, mut attempts, _live) = controlled_connector();
+    let (task, _discovered, mut changes) = spawn_initial(config, connector);
+    next_attempt(&mut attempts)
+        .await
+        .finish
+        .send(false)
+        .unwrap();
+    timeout(TEST_TIMEOUT, task).await.unwrap().unwrap().unwrap();
+
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    while let Some(change) = changes.recv().await {
+        book.update(change);
+    }
+    assert_eq!(
+        book.get(cached[0]).unwrap().last_connection_state,
+        PeerAddrState::Failed
+    );
+
+    let later = MIN_PEER_RECONNECTION_DELAY + Duration::from_secs(1);
+    let instant_later = std::time::Instant::now() + later;
+    let chrono_later = Utc::now() + chrono::Duration::from_std(later).unwrap();
+    assert!(
+        book.reconnection_peers(instant_later, chrono_later)
+            .any(|peer| peer.addr == cached[0]),
+        "the cache file time keeps the failed peer probably reachable"
+    );
+    assert!(
+        book.cacheable(Utc::now()).is_empty(),
+        "an unreached cached peer is not written back to the cache"
+    );
 }
 
 /// The window changes concurrency, not the selected total or per-IP budget.
@@ -215,10 +270,19 @@ async fn startup_window_preserves_target_and_ip_limits() {
     assert_eq!(dialed, expected[..3].iter().copied().collect());
     assert!(attempts.recv().await.is_none());
     let mut addresses = Vec::new();
+    let mut failed = std::collections::HashSet::new();
     while let Some(change) = book.recv().await {
-        addresses.push(change.addr());
+        if matches!(change, MetaAddrChange::UpdateFailed { .. }) {
+            failed.insert(change.addr());
+        } else {
+            addresses.push(change.addr());
+        }
     }
     assert_eq!(addresses, cached, "even skipped candidates reach discovery");
+    assert_eq!(
+        failed, dialed,
+        "failed startup dials are marked failed, so the crawler does not retry them first"
+    );
 }
 
 /// Dropping startup aborts every admitted connector and never starts the queued suffix.

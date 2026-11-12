@@ -86,6 +86,15 @@ impl ActiveConnectionCounter {
         ConnectionTracker::new(self)
     }
 
+    /// Process connection notifications and count only opened connections.
+    ///
+    /// Unlike [`Self::update_count`], this excludes reservations for attempts that
+    /// have not established a connection yet, including pending abort cleanup.
+    pub(super) fn update_open_count(&mut self) -> usize {
+        self.update_count();
+        self.count
+    }
+
     /// Check for closed connection notifications, and return the current connection count.
     pub fn update_count(&mut self) -> usize {
         let previous_connections = self.count;

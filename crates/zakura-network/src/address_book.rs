@@ -591,25 +591,29 @@ impl AddressBook {
         peers
     }
 
-    /// Get active outbound listener addresses in measured RTT order, followed by
-    /// shuffled addresses without a measurement, excluding our local listener.
+    /// Get outbound listener addresses that responded to this node within
+    /// [`MAX_PEER_ACTIVE_FOR_GOSSIP`](constants::MAX_PEER_ACTIVE_FOR_GOSSIP), in
+    /// measured RTT order, followed by shuffled addresses without a measurement,
+    /// excluding our local listener.
     pub fn cacheable(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
         let peers = self.peers.clone();
 
-        // Get peers in preferred order, then keep the recently active ones
+        // Get peers in preferred order, then keep the ones that recently responded
         let mut eligible: Vec<_> = peers
             .ordered_values()
             // # Security
             //
-            // Remove peers that:
-            //   - last responded more than three hours ago, or
-            //   - haven't responded yet but were reported last seen more than three hours ago
-            //
-            // This prevents Zebra from caching nodes that are likely unreachable,
-            // which improves startup time and reliability.
-            .filter(|addr| addr.is_active_for_gossip(now))
+            // Only this node's own responses count. A gossiped last seen time does not
+            // show that an address is a reachable listener, and peers gossip their
+            // inbound peers' source ports. Startup dials cached peers first, and
+            // `Config::initial_cached_peers` relies on this window.
+            .filter(|addr| {
+                addr.last_response().is_some_and(|last_response| {
+                    last_response.saturating_elapsed(now) <= constants::MAX_PEER_ACTIVE_FOR_GOSSIP
+                })
+            })
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
             // Address-only persistence must not forget a known rejection.
@@ -633,6 +637,43 @@ impl AddressBook {
     pub fn get(&mut self, addr: PeerSocketAddr) -> Option<MetaAddr> {
         let addr = canonical_peer_addr(*addr);
         self.peers.get(&addr)
+    }
+
+    /// Claim a DNS-derived candidate without depending on its retention in the
+    /// ordinary gossip-priority index. The returned metadata remains valid even
+    /// if the bounded address book immediately prunes this low-priority entry.
+    pub(crate) fn claim_seed_candidate(
+        &mut self,
+        addr: PeerSocketAddr,
+        max_connections_per_ip: usize,
+    ) -> Option<MetaAddr> {
+        if self.bans_by_ip.contains(addr.ip()) {
+            return None;
+        }
+        let instant_now = Instant::now();
+        let chrono_now = Utc::now();
+        let peer = self
+            .get(addr)
+            .or_else(|| self.update(MetaAddr::new_initial_peer(addr)))?;
+        if peer.is_inbound()
+            || !peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
+        {
+            return None;
+        }
+        // Include recent attempts as well as live connections on the same IP.
+        let busy_on_ip = self
+            .peers
+            .by_ip
+            .get(&addr.ip())
+            .into_iter()
+            .flatten()
+            .filter_map(|addr| self.peers.get(addr))
+            .filter(|peer| peer.was_recently_updated(instant_now, chrono_now))
+            .count();
+        if busy_on_ip >= max_connections_per_ip {
+            return None;
+        }
+        self.update(MetaAddr::new_reconnect(addr))
     }
 
     /// Returns true if `updated` needs to be applied to the recent outbound peer connection IP cache.

@@ -84,6 +84,48 @@ async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     assert!(config.load_peer_cache().await.unwrap().is_empty());
 }
 
+/// Late seeds take the next turn without disturbing the remaining cached order.
+#[test]
+fn late_seeds_take_next_turn_with_cached_peers_remaining() {
+    use crate::config::InitialPeerOrder;
+
+    let cached: indexmap::IndexSet<crate::PeerSocketAddr> = [
+        "127.0.0.1:8233",
+        "127.0.0.2:8233",
+        "127.0.0.3:8233",
+        "127.0.0.4:8233",
+    ]
+    .into_iter()
+    .map(|addr| addr.parse().unwrap())
+    .collect();
+    let seeds: Vec<crate::PeerSocketAddr> = ["127.0.0.10:8233", "127.0.0.11:8233"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    let mut order = InitialPeerOrder::new(cached.clone(), 6);
+    assert_eq!(order.next_available(), Some(cached[0]));
+    assert_eq!(order.next_available(), Some(cached[1]));
+    // Returned and undialed cached duplicates both keep their cache positions.
+    order.add_seed_peers(vec![cached[0], cached[2], seeds[0], seeds[1]]);
+    let remaining: Vec<_> = std::iter::from_fn(|| order.next_available()).collect();
+    assert_eq!(remaining, vec![seeds[0], cached[2], seeds[1], cached[3]]);
+}
+
+/// A late seed duplicate cannot repeat the one cached startup dial.
+#[test]
+fn single_slot_late_seeds_do_not_repeat_the_cached_dial() {
+    use crate::config::InitialPeerOrder;
+
+    let cached: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let seed: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let mut order = InitialPeerOrder::new(indexmap::IndexSet::from([cached]), 1);
+    assert_eq!(order.next_available(), Some(cached));
+    assert_eq!(order.next_available(), None);
+    order.add_seed_peers(vec![cached, seed]);
+    assert_eq!(order.next_available(), Some(seed));
+    assert_eq!(order.next_available(), None);
+}
+
 /// A one-slot startup uses a fresh seed when available and cached peers as fallback.
 #[tokio::test]
 async fn single_startup_slot_prefers_seed_over_cached_peer() {

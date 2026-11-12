@@ -1,0 +1,21 @@
+# Drops the header-generation comparison from
+# `AdvertisedHeaderTarget::is_current`, so an adoption that changes the
+# generation no longer retires a target still awaiting its locator read,
+# and the read, once it settles, starts a round under the generation it
+# was taken in. The witness's first locator read is held across the
+# invalidation, so the peer's awaiting slot still names the old generation
+# when the adopting unit ends.
+# `awaiting-kept` keeps every obsolete awaiting target, whatever made it
+# obsolete, so it keeps a superset of the targets this patch keeps, and no
+# input catches this one where that one isn't: both first fail here at
+# the same step with the same finding. This case still pins the
+# generation comparison itself, which `awaiting-kept` leaves in place.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.plan"

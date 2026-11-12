@@ -526,6 +526,7 @@ fn honest_peer_never_punished() {
             honest(PeerSpec::listening(), 120, None),
         ],
         policy: Policy::converging(),
+        budget: None,
     };
     let redial = WireScenario {
         peers: vec![PeerSpec {

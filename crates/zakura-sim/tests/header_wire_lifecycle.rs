@@ -948,13 +948,23 @@ fn regenerate_saved_plans() {
         };
         let witness = match plan {
             SavedPlan::HonestProgress => holds(HONEST_PROGRESS),
+            // `headers/bad-content-closes`' planted case drops this page.
+            SavedPlan::Act(Act::BadContent {
+                rule: ContentRule::Linkage,
+            }) => {
+                holds(COMMIT_ONLY_AUTHORIZED)
+                    + &holds("header-sync/s5v9/headers/bad-content-closes")
+            }
             SavedPlan::Act(
                 Act::BadContent {
-                    rule: ContentRule::Linkage | ContentRule::LowerLocator,
+                    rule: ContentRule::LowerLocator,
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
-            SavedPlan::HonestSync => holds(HONEST_NEVER_PUNISHED),
+            SavedPlan::HonestSync => {
+                holds(HONEST_NEVER_PUNISHED)
+                    + &holds("header-sync/s5v9/subscribe-headers/sender-within-live")
+            }
             SavedPlan::Act(act) if CLOSES_CAUGHT.contains(&act) => {
                 let row = if act.label() == Label::OverCredit {
                     "subscribe-headers"

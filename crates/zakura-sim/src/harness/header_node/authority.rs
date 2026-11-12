@@ -238,10 +238,12 @@ impl Authority {
                 ..
             } => {
                 self.applies();
-                // The round's identity finds the path it asked for. The
-                // finding names the page where it arrived, as the ledger's
-                // `ForeignPage` does, which differs only for a foreign page.
-                let requested = (request.peer.clone(), request.session_id, *subscription);
+                // The round's whole identity, its request's, finds the path
+                // it asked for, so a foreign page's own subscription ID never
+                // reads or moves another `Open`'s path. The finding names the
+                // page where it arrived, as the ledger's `ForeignPage` does,
+                // which differs only for a foreign page.
+                let requested = (request.peer.clone(), request.session_id, request.request_id);
                 let page = AuthoritySubject::page(
                     &(from_peer.clone(), *from_session, *subscription),
                     hashes,

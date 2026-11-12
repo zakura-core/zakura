@@ -1352,6 +1352,53 @@ pub struct OpenExport {
     pub approval: String,
 }
 
+/// A header ID still `Draft`, as the record lists it: what promotes it,
+/// and who.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftExport {
+    /// The property.
+    pub property: String,
+    /// What must hold before it goes `Active`.
+    pub condition: String,
+    /// Who promotes it.
+    pub owner: String,
+}
+
+/// Every header ID a harness in `registered` registers as `Draft`, once,
+/// with its row's promotion, and an error for each such ID whose row in
+/// `rows` is missing, isn't `Draft`, or names no promotion (item 9).
+pub fn draft_list(
+    registered: &[super::Registered],
+    rows: &[super::Row],
+) -> (Vec<DraftExport>, Vec<String>) {
+    let drafts: BTreeSet<&str> = registered
+        .iter()
+        .filter(|registration| registration.status == crate::property::Status::Draft)
+        .map(|registration| registration.property.as_str())
+        .collect();
+    let mut listed = Vec::new();
+    let mut errors = Vec::new();
+    for property in drafts {
+        let row = rows.iter().find(|row| row.property == property);
+        match row.and_then(|row| {
+            (row.status == crate::property::Status::Draft)
+                .then_some(row.promotion)
+                .flatten()
+        }) {
+            Some(promotion) => listed.push(DraftExport {
+                property: property.to_owned(),
+                condition: promotion.condition.to_owned(),
+                owner: promotion.owner.to_owned(),
+            }),
+            None => errors.push(format!(
+                "{property} is registered Draft with no Draft row saying what promotes it"
+            )),
+        }
+    }
+    (listed, errors)
+}
+
 /// One obligation in the record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1388,6 +1435,9 @@ pub struct Record {
     pub excluded: Vec<RecordEntry>,
     /// Blocked obligations, each with what blocks it.
     pub blocked: Vec<RecordEntry>,
+    /// Every header ID still `Draft`, with what promotes it and who. A
+    /// `Draft` with no row saying so is a stray.
+    pub drafts: Vec<DraftExport>,
     /// Each gate's verdict.
     pub gates: BTreeMap<Gate, bool>,
     /// What fails acceptance outside any key.
@@ -1622,6 +1672,8 @@ pub fn record(
     };
     let mut stray = evaluation.stray.clone();
     stray.extend(refusal);
+    let (drafts, draft_errors) = draft_list(&super::registered(), &super::rows());
+    stray.extend(draft_errors);
     if run.containment != Containment::Subreaper {
         stray.push(
             "the run's containment was best-effort; only a Linux run under a subreaper is an \
@@ -1645,6 +1697,7 @@ pub fn record(
         verified: Vec::new(),
         excluded: Vec::new(),
         blocked: Vec::new(),
+        drafts,
         gates: evaluation.gates.clone(),
         accepted: evaluation.accepted() && stray.is_empty(),
         fully_accepted: evaluation.fully_accepted() && stray.is_empty(),
@@ -1719,6 +1772,39 @@ fn evaluate_against(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The committed rows list `honest-progress` as the one `Draft`, owned
+    /// by Evan. A `Draft` registration whose row is gone, isn't `Draft`, or
+    /// names no promotion is an error instead.
+    #[test]
+    fn the_draft_list_names_each_draft_and_its_owner() {
+        let registered = super::super::registered();
+        let rows = super::super::rows();
+        let (drafts, errors) = draft_list(&registered, &rows);
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            drafts
+                .iter()
+                .map(|draft| (draft.property.as_str(), draft.owner.as_str()))
+                .collect::<Vec<_>>(),
+            [("header-sync/honest-progress", "Evan")]
+        );
+        let at = rows
+            .iter()
+            .position(|row| row.property == "header-sync/honest-progress")
+            .expect("honest-progress has a row");
+        let mut unpromoted = rows.clone();
+        unpromoted[at].promotion = None;
+        let mut activated = rows.clone();
+        activated[at].status = crate::property::Status::Active;
+        let mut missing = rows.clone();
+        missing.remove(at);
+        for changed in [unpromoted, activated, missing] {
+            let (drafts, errors) = draft_list(&registered, &changed);
+            assert!(drafts.is_empty(), "{drafts:?}");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+        }
+    }
 
     /// A history identity for the fixtures.
     fn history_run() -> RunId {

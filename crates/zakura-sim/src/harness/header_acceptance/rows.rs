@@ -2732,6 +2732,8 @@ fn hand_written_rows() -> Vec<Row> {
         NONE,
         false,
     ));
+    // Still Draft at hdr-14.8: its promotion needs Evan's agreement, so the
+    // frozen-head run's record lists it under `drafts` until he gives it.
     rows.push(Row {
         property: progress,
         tier: Tier::Sim,
@@ -3056,6 +3058,10 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             ),
         },
     },
+    // C12 (E9) and C13 (hf-1 to hf-3) have landed, but both contracts are
+    // still Blocked in the contracts table, so this stays open until their
+    // states move with their proving tests. The frozen-head run then
+    // records it.
     GateRequirement {
         name: "gate-2/end-boundary-preservation",
         gates: G2,

@@ -714,6 +714,54 @@ const C18_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C13's proving tests: the fault store's four histories through a
+/// recorded run's full report and its sidecar, each replayed fresh (two
+/// untaken replies at the end, two breaks at one step, a break beside an
+/// open fault, and a self-exit after a reply beside a harness shutdown at
+/// the same point), and the store and check tests hf-1 to hf-3 added.
+const C13_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_break_beside_an_open_fault_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_self_exit_after_a_reply_is_violated_and_a_shutdown_clears_it",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::the_fault_check_reports_every_break_at_a_step",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::the_end_reports_every_open_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::every_break_is_reported_once",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_break_beside_an_open_fault_reports_both",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::only_the_harness_stop_clears_a_dropped_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_drop_clears_its_fault_only_after_the_stop_began",
+    ),
+];
+
 /// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
 const fn planted_test(test: &'static str) -> TestRef {
     TestRef {
@@ -936,9 +984,9 @@ const fn satisfied(
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
-/// to E10, C18 by E10 with hdr-14.7b's binding, and C14 and C17 by hf-6's
-/// stores. Every other row's deliveries landed, and its state names the
-/// proving test still missing.
+/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
+/// stores, and C13 by hf-1 to hf-3. Every other row's deliveries landed,
+/// and its state names the proving test still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1050,14 +1098,13 @@ pub fn contract_table() -> Vec<Contract> {
             C12_PROVING,
             "E9",
         ),
-        waiting(
+        satisfied(
             C13,
             "Adam's harness",
             "The fault store keeps every distinct fault and every break, and a dropped call \
              clears an untaken fault only after the harness's Shutdown.",
+            C13_PROVING,
             "hf-1, hf-2, hf-3",
-            "the four fault-store histories through the final report and its sidecar, which \
-             hf-1 to hf-3 test at the store and check level only",
         ),
         satisfied(
             C14,

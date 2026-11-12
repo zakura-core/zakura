@@ -405,7 +405,6 @@ const CASES: &[CaseNa] = &[
             "header-sync/storage-operation-ids",
             "header-sync/teardown-returns-baseline",
             "header-sync/reset-invalidates-work",
-            "header-sync/stale-completion-inert",
             "header-sync/stale-chain-effect-inert",
             "header-sync/s5v9/subscribe-headers/sender-within-credit",
             "session/honest-never-punished",

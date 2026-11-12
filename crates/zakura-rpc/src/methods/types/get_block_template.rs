@@ -531,8 +531,9 @@ impl BlockTemplateResponse {
         let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) =
             mempool_txs.into_iter().map(|tx| ((&tx).into(), tx)).unzip();
 
-        // Transaction selection returns transactions in an arbitrary order,
-        // but Zebra's snapshot tests expect the same order every time.
+        // Production keeps the selection order, which is deterministic and puts
+        // parents before children. Tests re-sort by dependency depth, then hash,
+        // so snapshot tests do not change when the selection order does.
         //
         // # Correctness
         //

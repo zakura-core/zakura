@@ -886,10 +886,10 @@ fn benchmark_full_mempool_gbt_selection() {
                 Misfit::Skip,
             );
             assert_eq!(ids(&production), ids(&mirrored), "{era} {kind}");
+            let misfits = mirrored.misfits;
             println!(
-            "gbt-check era={era} fixture={kind} production_matches_skip_variant=true misfits={}",
-            mirrored.misfits
-        );
+                "gbt-check era={era} fixture={kind} production_matches_skip_variant=true misfits={misfits}"
+            );
             for phase in ["selection", "template_json"] {
                 let modes = Mode::ALL;
                 let mut results: [Vec<(Duration, Stats)>; Mode::ALL.len()] = Default::default();

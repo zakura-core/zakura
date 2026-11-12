@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index c847aa6cfc..2f9eb859bd 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -1233,7 +1233,8 @@ fn page_output<const HEADER_BYTES: usize>(
+         tap: None,
+     };
+     let frame = encode_frame(&Message::<HEADER_BYTES>::Headers(Headers {
+-        subscription_id: job.id,
++        // Mutation: the page names the next subscription ID, not its own.
++        subscription_id: job.id.wrapping_add(1),
+         initial_target_tip_hash: job.initial_target,
+         common_ancestor_height: page.common_ancestor.height,
+         common_ancestor_hash: page.common_ancestor.hash,

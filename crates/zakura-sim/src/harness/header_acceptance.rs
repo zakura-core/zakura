@@ -197,9 +197,9 @@ pub enum Found {
     AtEnd,
     /// At a step, by the case's own ID alone: the run stops at the case's
     /// own break, before the rest of its set breaks. The set is judged on
-    /// the case's `Draft` run instead, which goes on past the break, and
-    /// must have every member violated by its end and nothing else (Adam,
-    /// 2026-11-12).
+    /// the case's `Draft` run instead, which goes on past the break, as a
+    /// counterfactual of its baseline (Adam, 2026-11-12): see
+    /// `evaluate::caught_draft` for the rule.
     AtStepSetOnDraft,
 }
 

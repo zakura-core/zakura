@@ -7,7 +7,8 @@
 //! Plan's one-page `Grant`, a `Close`, and a `Grant` whose credit, on top of
 //! the `Open`'s page, is above the row's window. fuzz-13's
 //! [`crossings`] finds the crossing, joined on the connection, QUIC stream,
-//! frame sequence and subscription, and ordered by the run's wire stamps. It
+//! frame sequence and subscription, and ordered by the run's wire stamps,
+//! and names the update by its full [`FrameRef`]. It
 //! reports only an update the node judged, after an ending of the same
 //! subscription that the node wrote before the update's write returned and
 //! the peer read after it. Its unit tests carry the order controls: an
@@ -15,24 +16,26 @@
 //! unjudged update and a read logged late.
 //!
 //! Each history then binds the update's label and consequence to the
-//! crossing it returns. The first two are conformant and draw no
-//! punishment on their connection. The third is `bad-cursor`, and the first
-//! close of its connection comes after its judgment, with a fault cause.
-//! The controls move each key of the update off by one, drop its judgment,
-//! and put the close on an unrelated fault: a close of another connection,
-//! or one decided before the judgment. Each must fail.
+//! crossing it returns, joining its judgment on that whole ref (Rule 25).
+//! The first two are conformant and draw no punishment on their
+//! connection. The third is `bad-cursor`, and the first close of its
+//! connection comes after its judgment, with a fault cause. The controls
+//! move each key of the update off by one, move its judgment to another
+//! stream kind or version, drop its judgment, and put the close on an
+//! unrelated fault: a close of another connection, or one decided before
+//! the judgment. Each must fail.
 #![cfg(zakura_sim)]
 
 mod support;
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use support::one_key_off::assert_one_key_off;
 use zakura_network::zakura::{v9::RegtestMessage, Credit, MessageRole};
 use zakura_sim::{
     explore::state::crossing::{crossings, Crossed},
     harness::{
+        header_acceptance::{companions::judged_frame, refs::FrameRef},
         header_sync::{HeaderWire, WireScenario},
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},
@@ -104,27 +107,6 @@ fn over_window() -> Act {
     }
 }
 
-/// A crossed update's identity, as its `PeerFrame` numbers it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct UpdateRef {
-    /// The connection.
-    connection: u64,
-    /// The QUIC stream.
-    quic_stream: u64,
-    /// The update's position among the peer's frames on the stream.
-    seq: u64,
-}
-
-impl From<Crossed> for UpdateRef {
-    fn from(crossed: Crossed) -> Self {
-        UpdateRef {
-            connection: crossed.connection,
-            quic_stream: crossed.quic_stream,
-            seq: crossed.seq,
-        }
-    }
-}
-
 /// `report`'s observations, in log order.
 fn observations(report: &RunReport) -> Vec<Observation> {
     report
@@ -137,8 +119,8 @@ fn observations(report: &RunReport) -> Vec<Observation> {
 
 /// The frame `act` wrote: the peer's last frame on the stream its
 /// `ActRan` names, before that `ActRan`, which the peer logs once it has
-/// written the act's frames.
-fn act_frame(observations: &[Observation], act: Act) -> Option<UpdateRef> {
+/// written the act's frames, as its `PeerFrame` names it.
+fn act_frame(observations: &[Observation], act: Act) -> Option<FrameRef> {
     let (ran, connection, quic_stream) =
         observations
             .iter()
@@ -157,12 +139,16 @@ fn act_frame(observations: &[Observation], act: Act) -> Option<UpdateRef> {
         .find_map(|observation| match *observation {
             Observation::PeerFrame {
                 connection: c,
+                stream,
                 quic_stream: Some(q),
                 seq,
                 ..
-            } if (c, q) == (connection, quic_stream) => Some(UpdateRef {
+            } if (c, q) == (connection, quic_stream) => Some(FrameRef {
                 connection,
+                kind: stream.kind,
+                version: stream.version,
                 quic_stream,
+                inbound: true,
                 seq,
             }),
             _ => None,
@@ -171,7 +157,7 @@ fn act_frame(observations: &[Observation], act: Act) -> Option<UpdateRef> {
 
 /// The one crossed update in `observations`, which must carry `label`.
 fn crossed(observations: &[Observation], label: Label) -> Result<Crossed, String> {
-    let [crossed] = crossings(observations)[..] else {
+    let [crossed] = &crossings(observations)[..] else {
         return Err(format!(
             "one crossed update, not {:?}",
             crossings(observations)
@@ -180,22 +166,15 @@ fn crossed(observations: &[Observation], label: Label) -> Result<Crossed, String
     if crossed.label != label {
         return Err(format!("the crossed update is {:?}", crossed.label));
     }
-    Ok(crossed)
+    Ok(crossed.clone())
 }
 
 /// Where `update`'s `FrameJudged` sits in `observations`, joined on its
-/// connection, QUIC stream and frame sequence.
-fn judged_at(observations: &[Observation], update: UpdateRef) -> Result<usize, String> {
+/// whole [`FrameRef`].
+fn judged_at(observations: &[Observation], update: &FrameRef) -> Result<usize, String> {
     observations
         .iter()
-        .position(|observation| {
-            matches!(*observation, Observation::FrameJudged {
-                connection,
-                quic_stream: Some(quic_stream),
-                seq,
-                ..
-            } if UpdateRef { connection, quic_stream, seq } == update)
-        })
+        .position(|observation| judged_frame(observation).as_ref() == Some(update))
         .ok_or_else(|| format!("{update:?} was never judged"))
 }
 
@@ -203,7 +182,7 @@ fn judged_at(observations: &[Observation], update: UpdateRef) -> Result<usize, S
 /// the connection's first close comes after the update's `FrameJudged`,
 /// with a fault cause. A close of another connection, or one the node
 /// decided before it judged the update, is an unrelated fault's.
-fn closed_on_its_judgment(observations: &[Observation], update: UpdateRef) -> Result<(), String> {
+fn closed_on_its_judgment(observations: &[Observation], update: &FrameRef) -> Result<(), String> {
     let judged = judged_at(observations, update)?;
     let (at, cause) = observations
         .iter()
@@ -235,7 +214,7 @@ fn closed_on_its_judgment(observations: &[Observation], update: UpdateRef) -> Re
 /// Requires that the node judged `update` and drew no punishment for it:
 /// no fault close and no `Misbehavior` on its connection after its
 /// judgment.
-fn unpunished(observations: &[Observation], update: UpdateRef) -> Result<(), String> {
+fn unpunished(observations: &[Observation], update: &FrameRef) -> Result<(), String> {
     let judged = judged_at(observations, update)?;
     for observation in &observations[judged..] {
         match observation {
@@ -269,10 +248,14 @@ fn held_applied(report: &RunReport, id: &str) {
 
 /// The one update that crossed the node's ending in `observations`,
 /// labelled `label`, which must be the frame `act` wrote.
-fn crossed_act(observations: &[Observation], act: Act, label: Label) -> UpdateRef {
-    let update =
-        UpdateRef::from(crossed(observations, label).unwrap_or_else(|error| panic!("{error}")));
-    assert_eq!(act_frame(observations, act), Some(update), "{act:?}");
+fn crossed_act(observations: &[Observation], act: Act, label: Label) -> FrameRef {
+    let Crossed { update, .. } =
+        crossed(observations, label).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        act_frame(observations, act).as_ref(),
+        Some(&update),
+        "{act:?}"
+    );
     update
 }
 
@@ -281,23 +264,46 @@ fn crossed_act(observations: &[Observation], act: Act, label: Label) -> UpdateRe
 /// node's ending, labelled conformant, and the node judged it and didn't
 /// punish its connection, with `conformant-never-closes` held, applied.
 /// Returns the run's observations and the crossed update.
-fn conformant_crossing(report: &RunReport, act: Act) -> (Vec<Observation>, UpdateRef) {
+fn conformant_crossing(report: &RunReport, act: Act) -> (Vec<Observation>, FrameRef) {
     assert_eq!(act.label(), Label::Conformant, "{act:?}");
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let observations = observations(report);
     let update = crossed_act(&observations, act, Label::Conformant);
-    assert_eq!(unpunished(&observations, update), Ok(()));
+    assert_eq!(unpunished(&observations, &update), Ok(()));
     held_applied(report, NEVER_CLOSES);
     (observations, update)
 }
 
+/// `observations` with `update`'s judgment moved, in turn, to another
+/// stream kind and another stream version: each is another frame's
+/// judgment, which the update's identity must not join.
+fn restreamed(observations: &[Observation], update: &FrameRef) -> Vec<Vec<Observation>> {
+    let judged = judged_at(observations, update).expect("the update was judged");
+    let mut moved = Vec::new();
+    for key in 0..2 {
+        let mut changed = observations.to_vec();
+        if let Observation::FrameJudged { stream, .. } = &mut changed[judged] {
+            match key {
+                0 => stream.kind += 1,
+                _ => stream.version += 1,
+            }
+        }
+        moved.push(changed);
+    }
+    moved
+}
+
 /// The controls of a conformant history: the same update with any one key
-/// moved names no judged frame, and a fault close or a `Misbehavior` added
-/// on its connection after its judgment is punishment. The same close on
-/// another connection isn't.
-fn conformant_controls(observations: &[Observation], update: UpdateRef) {
-    assert_one_key_off(&update, |update| unpunished(observations, *update).is_ok());
+/// moved names no judged frame, and nor does its judgment moved to another
+/// stream kind or version. A fault close or a `Misbehavior` added on its
+/// connection after its judgment is punishment. The same close on another
+/// connection isn't.
+fn conformant_controls(observations: &[Observation], update: &FrameRef) {
+    assert_one_key_off(update, |update| unpunished(observations, update).is_ok());
+    for moved in restreamed(observations, update) {
+        assert!(unpunished(&moved, update).is_err());
+    }
     let judged = judged_at(observations, update).expect("the update was judged");
     let with = |extra: Observation| {
         let mut changed = observations.to_vec();
@@ -327,7 +333,7 @@ fn conformant_controls(observations: &[Observation], update: UpdateRef) {
 fn an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished() {
     let report = saved_outcome_crossing();
     let (observations, update) = conformant_crossing(&report, Act::OutcomeCrossing);
-    conformant_controls(&observations, update);
+    conformant_controls(&observations, &update);
 }
 
 /// A subscription `Close` for the unretained `Open` crosses the node's
@@ -336,7 +342,7 @@ fn an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished() {
 fn a_crossing_close_is_conformant_and_unpunished() {
     let report = crossing_history(Act::CrossingClose);
     let (observations, update) = conformant_crossing(&report, Act::CrossingClose);
-    conformant_controls(&observations, update);
+    conformant_controls(&observations, &update);
 }
 
 /// A `Grant` above the window crosses the node's ending, labelled
@@ -353,18 +359,22 @@ fn an_over_window_crossing_grant_is_bad_cursor_and_closed() {
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let observations = observations(&report);
     let update = crossed_act(&observations, over_window(), Label::BadCursor);
-    assert_eq!(closed_on_its_judgment(&observations, update), Ok(()));
+    assert_eq!(closed_on_its_judgment(&observations, &update), Ok(()));
     held_applied(&report, BAD_CURSOR_CLOSES);
 
     assert_one_key_off(&update, |update| {
-        closed_on_its_judgment(&observations, *update).is_ok()
+        closed_on_its_judgment(&observations, update).is_ok()
     });
 
-    let judged = judged_at(&observations, update).expect("the update was judged");
+    for moved in restreamed(&observations, &update) {
+        assert!(closed_on_its_judgment(&moved, &update).is_err());
+    }
+
+    let judged = judged_at(&observations, &update).expect("the update was judged");
     let mut unjudged = observations.clone();
     unjudged.remove(judged);
     assert!(crossed(&unjudged, Label::BadCursor).is_err());
-    assert!(closed_on_its_judgment(&unjudged, update).is_err());
+    assert!(closed_on_its_judgment(&unjudged, &update).is_err());
 
     let close = observations
         .iter()
@@ -377,9 +387,9 @@ fn an_over_window_crossing_grant_is_bad_cursor_and_closed() {
     if let Observation::ConnectionClosed { connection, .. } = &mut elsewhere[close] {
         *connection += 1;
     }
-    assert!(closed_on_its_judgment(&elsewhere, update).is_err());
+    assert!(closed_on_its_judgment(&elsewhere, &update).is_err());
     let mut early = observations.clone();
     let moved = early.remove(close);
     early.insert(judged, moved);
-    assert!(closed_on_its_judgment(&early, update).is_err());
+    assert!(closed_on_its_judgment(&early, &update).is_err());
 }

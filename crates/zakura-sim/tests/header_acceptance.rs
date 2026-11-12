@@ -4778,9 +4778,12 @@ fn the_evaluator_accepts_genuine_results() {
 
     // A set judged on the Draft run: the patched run stops at the case's
     // own ID alone, and the Draft run, with the whole set as its override,
-    // violates every member by its end. The patched run with the broader ID
-    // violated too, or stopped by it, and a Draft run that doesn't violate
-    // it, each block the case.
+    // violates every member by its end, which the baseline doesn't (the
+    // Draft-set rule, `evaluate::caught_draft`). The patched run with the
+    // broader ID violated too, or stopped by it, a Draft run that doesn't
+    // violate it, and a baseline that violates a member each block the
+    // case. That last one is the reviewers' unrelated bug: a member broken
+    // in both runs isn't the patch's doing.
     let late = Key::Case {
         property: "t/a".into(),
         name: "late-bug".into(),
@@ -4791,9 +4794,10 @@ fn the_evaluator_accepts_genuine_results() {
         *set = &["t/a", "t/b"];
         *found = Found::AtStepSetOnDraft;
     }
-    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+    let judged_with = |stopped_by: &str, baseline_b: Report, patched_b: Report, draft_b: Report| {
         let mut file = results();
-        let (_, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        let (baseline, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        baseline.reports.insert("t/b".into(), baseline_b);
         patched.end = End::Violation {
             property: stopped_by.into(),
         };
@@ -4803,6 +4807,9 @@ fn the_evaluator_accepts_genuine_results() {
         draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
         state(&later, &file, &late)
     };
+    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+        judged_with(stopped_by, held(), patched_b, draft_b)
+    };
     assert_eq!(
         judged("t/a", held(), Report::Violated),
         ObligationState::Verified
@@ -4810,6 +4817,12 @@ fn the_evaluator_accepts_genuine_results() {
     assert!(blocked(&judged("t/a", Report::Violated, Report::Violated)));
     assert!(blocked(&judged("t/b", held(), Report::Violated)));
     assert!(blocked(&judged("t/a", held(), held())));
+    assert!(blocked(&judged_with(
+        "t/a",
+        Report::Violated,
+        held(),
+        Report::Violated
+    )));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on
@@ -6549,4 +6562,606 @@ fn the_evaluator_binds_runners_and_traces() {
     assert!(!evaluation.stray.is_empty());
     assert!(!evaluation.accepted());
     assert!(evaluation.gates.values().all(|passes| !passes));
+}
+
+/// The identity definitions outside `refs.rs` that Rule 25's scan
+/// ([`defined_refs`]) allows, as `(file, name, why)`, with the file
+/// relative to the crate. None is an identity an acceptance assertion
+/// joins on: each predates Rule 25 (adopted 2026-11-12) and keys a
+/// model's, harness's or explorer's own state as its facts name it, or
+/// names something that isn't a history's identity at all.
+const OUTSIDE_REFS: &[(&str, &str, &str)] = &[
+    (
+        "src/check.rs",
+        "FrameRef",
+        "defined beside the findings whose subject carries it; refs.rs re-exports it as Rule 25's \
+         frame ref",
+    ),
+    (
+        "src/trace/meta.rs",
+        "BlobRef",
+        "a trace meta's pointer to a stored file, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "PropertyRef",
+        "a trace meta's pointer to a registered property, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "InputRef",
+        "a trace meta's pointer to its input file, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "PlanRef",
+        "a trace meta's pointer to its Plan file, not a history identity",
+    ),
+    (
+        "src/record/machine.rs",
+        "CallRef",
+        "a machine record's storage call, compared whole by its derive",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "TestRef",
+        "the manifest's name for a test, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "HistoryRef",
+        "the manifest's name for a history, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "CaseRef",
+        "the manifest's name for a planted case, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_node/authority/finding.rs",
+        "EngineRunRef",
+        "the controlled port's record of an engine run, compared whole by its derive",
+    ),
+    (
+        "src/peer/adapter.rs",
+        "StreamKey",
+        "the sender adapter's per-stream state, keyed as the transport names a stream",
+    ),
+    (
+        "src/peer/discovery/sender.rs",
+        "StreamKey",
+        "discovery's sender model's per-stream state, keyed as the transport names a stream",
+    ),
+    (
+        "src/peer/evidence.rs",
+        "FrameKey",
+        "the wire evidence's reader state, keyed as transport facts name a frame, with no stream \
+         kind or version; the pages it hands acceptance are keyed by FrameRef",
+    ),
+    (
+        "src/explore/state/crossing.rs",
+        "FrameKey",
+        "fuzz-13's crossing join over transport facts, which name no stream kind or version; it \
+         hands each crossed update out as its whole FrameRef",
+    ),
+    (
+        "src/explore/state/crossing.rs",
+        "SubscriptionKey",
+        "fuzz-13's crossing join's candidates, per subscription on a stream",
+    ),
+    (
+        "src/explore/state/collector.rs",
+        "SentFrame",
+        "the explorer's state collector's peer frames, a coverage feature's key",
+    ),
+    (
+        "src/domain/connection.rs",
+        "PeerConn",
+        "xsync's connection model, keyed as its observations name a peer's connection",
+    ),
+    (
+        "src/domain/session.rs",
+        "SessionRow",
+        "the punishment model's session rows, as its observations name them",
+    ),
+    (
+        "src/harness/header_node/authority.rs",
+        "Subscription",
+        "hdr-9's authority evidence's index of subscriptions as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/retirement.rs",
+        "Session",
+        "hdr-10's retirement evidence's index of sessions as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/stale.rs",
+        "Round",
+        "the stale-completion evidence's index of rounds as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/round_life.rs",
+        "Authority",
+        "hdr-9's round-life index of authority as the reactor names it",
+    ),
+    (
+        "src/harness/header_node/round_life.rs",
+        "Subscription",
+        "hdr-9's round-life index of rounds by the reactor's subscription",
+    ),
+    (
+        "src/harness/header_node/retirement.rs",
+        "SlotKey",
+        "hdr-10's retirement report index of slots",
+    ),
+    (
+        "src/domain/block_sync.rs",
+        "RequestKey",
+        "block sync's model of its requests, outside header sync",
+    ),
+    (
+        "tests/header_node_reservations.rs",
+        "StreamKey",
+        "a reservation witness's grouping of frames by stream, not an acceptance join",
+    ),
+    (
+        "tests/header_wire.rs",
+        "SessionKey",
+        "the wire harness's admission test, which compares a Session row to its admission",
+    ),
+];
+
+/// Whether `ty` is a part of an identity, and if so whether it's a number:
+/// an unsigned integer is, and a string, peer ID, stream, hash or byte
+/// vector is a part that isn't, through a reference or an `Option`.
+/// Anything else isn't a part of an identity.
+fn identity_part(ty: &syn::Type) -> Option<bool> {
+    match ty {
+        syn::Type::Reference(reference) => identity_part(&reference.elem),
+        syn::Type::Path(path) => {
+            let last = path.path.segments.last()?;
+            let argument = || match &last.arguments {
+                syn::PathArguments::AngleBracketed(args) => match args.args.first()? {
+                    syn::GenericArgument::Type(ty) => Some(ty),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match last.ident.to_string().as_str() {
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => Some(true),
+                "Option" => identity_part(argument()?),
+                "Vec" => matches!(identity_part(argument()?), Some(true)).then_some(false),
+                "String" | "str" | "ZakuraPeerId" | "StreamId" | "Hash" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Each identity definition the Rust source `text`, the file `file`,
+/// makes, in order: a struct, enum, union, trait or type alias named
+/// `*Ref`, and a type alias for an identity tuple a join could key on,
+/// two or more [`identity_part`]s, at least one a number. It finds them at
+/// any depth, in test code and function bodies too. An associated type in
+/// an `impl` or trait isn't a definition of its own.
+fn defined_refs(text: &str, file: &str) -> Vec<String> {
+    use syn::visit::Visit;
+    /// Collects the definitions' names.
+    #[derive(Default)]
+    struct Defined(Vec<String>);
+    impl Defined {
+        /// Notes `ident` if it's named `*Ref`.
+        fn named(&mut self, ident: &syn::Ident) {
+            let name = ident.to_string();
+            if name.len() > 3 && name.ends_with("Ref") {
+                self.0.push(name);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Defined {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            self.named(&item.ident);
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            self.named(&item.ident);
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            self.named(&item.ident);
+            syn::visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            self.named(&item.ident);
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            let parts: Option<Vec<bool>> = match &*item.ty {
+                syn::Type::Tuple(tuple) if tuple.elems.len() >= 2 => {
+                    tuple.elems.iter().map(identity_part).collect()
+                }
+                _ => None,
+            };
+            match parts {
+                Some(parts) if parts.contains(&true) => self.0.push(item.ident.to_string()),
+                _ => self.named(&item.ident),
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut defined = Defined::default();
+    defined.visit_file(&parsed);
+    defined.0
+}
+
+/// Every identity definition ([`defined_refs`]) in the crate's `src` and
+/// `tests` outside `refs.rs`, as `(file, name)` with the file relative to
+/// the crate.
+fn refs_outside_refs() -> BTreeSet<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the directory reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&krate.join("src"), &mut files);
+    walk(&krate.join("tests"), &mut files);
+    let mut found = BTreeSet::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(krate)
+            .expect("under the crate")
+            .display()
+            .to_string();
+        if relative == "src/harness/header_acceptance/refs.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("a source file reads");
+        for name in defined_refs(&text, &relative) {
+            found.insert((relative.clone(), name));
+        }
+    }
+    found
+}
+
+/// Rule 25's source scan: no identity a join could key on is defined
+/// outside `refs.rs`, in the crate's `src` or `tests`, apart from the
+/// reasoned [`OUTSIDE_REFS`], which must each still be there. The control
+/// shows the scan finds a planted local `*Ref`, at the top level, in a
+/// test module and in a function body, and a tuple alias, and leaves an
+/// associated type and a one-type alias alone.
+#[test]
+fn identity_refs_are_defined_only_in_refs() {
+    let allowed: BTreeSet<(String, String)> = OUTSIDE_REFS
+        .iter()
+        .map(|(file, name, why)| {
+            assert!(!why.is_empty(), "{file} {name} has no reason");
+            ((*file).to_owned(), (*name).to_owned())
+        })
+        .collect();
+    assert_eq!(
+        allowed.len(),
+        OUTSIDE_REFS.len(),
+        "an entry is listed twice"
+    );
+    assert_eq!(refs_outside_refs(), allowed);
+
+    let planted = "struct UpdateRef { connection: u64, quic_stream: u64, seq: u64 }\n\
+                   type FrameKey = (u64, u64, u64);\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       enum SessionRef { One }\n\
+                       fn t() { struct LocalRef(u64); type Pair<'a> = (&'a str, u64); }\n\
+                   }\n\
+                   type Slot = (Vec<u8>, Option<u64>, block::Hash, ZakuraPeerId);\n\
+                   impl Subsystem for X { type View = (u64, u32); }\n\
+                   type Version = (u64);\n\
+                   type Unit = ();\n\
+                   type Names = (&'static str, String);\n\
+                   type Seed = (&'static str, Scenario, usize);\n\
+                   struct Ref;\n";
+    assert_eq!(
+        defined_refs(planted, "t.rs"),
+        [
+            "UpdateRef",
+            "FrameKey",
+            "SessionRef",
+            "LocalRef",
+            "Pair",
+            "Slot"
+        ]
+    );
+}
+
+/// The acceptance tool's source directory, relative to the crate.
+const ACCEPTANCE_SRC: &str = "src/harness/header_acceptance";
+
+/// The reads under [`ACCEPTANCE_SRC`] outside `binding.rs` that read no
+/// run artifact, as `(file, function, why)`. Every other read there must
+/// go through `binding.rs`, the one place an artifact is bound to what its
+/// reader expects (Rule 25).
+const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
+    (
+        "tool.rs",
+        "patched_witness",
+        "a planted case's committed `.toml` at S",
+    ),
+    (
+        "tool.rs",
+        "case_input",
+        "a planted case's committed `.toml` at S",
+    ),
+    (
+        "tool.rs",
+        "native_patch",
+        "the committed native mutation's directory at S",
+    ),
+    (
+        "tool.rs",
+        "fuzz_targets",
+        "the committed fuzz-target mapping at S",
+    ),
+    ("tool.rs", "committed_input", "a committed fuzz input at S"),
+    (
+        "tool.rs",
+        "walk",
+        "the committed planted-case tree at S, which `planted_cases_in` walks",
+    ),
+    (
+        "tool.rs",
+        "native_dirs",
+        "the committed native-mutation tree at S",
+    ),
+    (
+        "tool.rs",
+        "record_args",
+        "the runner's recorder arguments for a declaration, which judge nothing: the \
+         recording they make is bound to the same declaration's files by \
+         `binding::scenario_expect` and `binding::RAN`",
+    ),
+    (
+        "history.rs",
+        "declared",
+        "which declaration a witness test made is which, by its own history file; the one \
+         counted is then bound to its recording by its scenario, Plan and steps",
+    ),
+    (
+        "companions.rs",
+        "judge_trace",
+        "the companions judge, run by the case's own build on the Draft run it's handed: it \
+         writes `companions.json`, which the reader binds (`binding::COMPANIONS`)",
+    ),
+];
+
+/// Every read in the Rust source `text` outside test code, as the name of
+/// the function it's in, in order: a call of `fs::read`,
+/// `fs::read_to_string`, `fs::read_dir`, `File::open`, `read_bounded`,
+/// `TraceReader::open` or `open_prefix`, `serde_json::from_reader` or a
+/// `read_json` helper, however its path is spelled, other than the binding
+/// module's own (`binding::read_bounded`), and a method call of
+/// `read_dir`, `read_to_string` or `read_to_end`. A `use` that imports one
+/// of those names, or renames one, would hide a call, so it fails the scan.
+fn artifact_reads(text: &str, file: &str) -> Vec<String> {
+    use syn::visit::Visit;
+    /// The last segment of each read path, with the segment before it if
+    /// that names its owner.
+    const READS: &[(&str, &str)] = &[
+        ("fs", "read"),
+        ("fs", "read_to_string"),
+        ("fs", "read_dir"),
+        ("File", "open"),
+        ("", "read_bounded"),
+        ("TraceReader", "open"),
+        ("TraceReader", "open_prefix"),
+        ("serde_json", "from_reader"),
+        ("", "read_json"),
+    ];
+    /// Whether `names`, a path's segments, call one of [`READS`] other than
+    /// through `binding`.
+    fn reads(names: &[String]) -> bool {
+        if matches!(names, [.., module, _] if module == "binding") {
+            return false;
+        }
+        READS.iter().any(|(owner, last)| match names {
+            [.., before, at] => at == last && (owner.is_empty() || before == owner),
+            [at] => at == last && owner.is_empty(),
+            [] => false,
+        })
+    }
+    /// Collects the reads, by enclosing function.
+    struct Reads<'a> {
+        file: &'a str,
+        within: Vec<String>,
+        found: Vec<String>,
+    }
+    /// Whether `attrs` mark test-only code: `#[test]`, or `#[cfg(test)]`.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
+        })
+    }
+    /// Fails on a `use` tree importing a read by name.
+    fn check_use(tree: &syn::UseTree, path: &mut Vec<String>, file: &str) {
+        match tree {
+            syn::UseTree::Path(at) => {
+                path.push(at.ident.to_string());
+                check_use(&at.tree, path, file);
+                path.pop();
+            }
+            syn::UseTree::Name(syn::UseName { ident: name })
+            | syn::UseTree::Rename(syn::UseRename { ident: name, .. })
+                if {
+                    let mut names = path.clone();
+                    names.push(name.to_string());
+                    reads(&names)
+                } =>
+            {
+                panic!("{file}: a `use` imports a read by name, which the scan can't see")
+            }
+            syn::UseTree::Rename(rename)
+                if READS
+                    .iter()
+                    .any(|(owner, _)| !owner.is_empty() && rename.ident == owner) =>
+            {
+                panic!("{file}: a `use` renames a read's owner, which the scan can't see")
+            }
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .for_each(|tree| check_use(tree, path, file)),
+            _ => {}
+        }
+    }
+    impl Reads<'_> {
+        /// Notes a read at `path` inside the current function.
+        fn path(&mut self, path: &syn::Path) {
+            let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if reads(&names) {
+                self.note();
+            }
+        }
+
+        /// Notes a read inside the current function.
+        fn note(&mut self) {
+            let within = self.within.last().cloned().unwrap_or_default();
+            self.found.push(within);
+        }
+    }
+    impl<'ast> Visit<'ast> for Reads<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            check_use(&item.tree, &mut Vec::new(), self.file);
+        }
+
+        fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+            self.path(&expr.path);
+            syn::visit::visit_expr_path(self, expr);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if ["read_dir", "read_to_string", "read_to_end"]
+                .iter()
+                .any(|name| call.method == name)
+            {
+                self.note();
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut reads = Reads {
+        file,
+        within: Vec::new(),
+        found: Vec::new(),
+    };
+    reads.visit_file(&parsed);
+    reads.found
+}
+
+/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read of a run
+/// artifact goes through `binding.rs`, so no reader binds an artifact
+/// itself or reads one unbound. Each read anywhere else in the directory
+/// is one [`NON_ARTIFACT_READS`] lists, with why it reads no artifact, and
+/// each listed read is still there. A planted bypass, however its read is
+/// spelled, fails the scan.
+#[test]
+fn every_artifact_read_goes_through_binding() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ACCEPTANCE_SRC);
+    let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut texts = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("the acceptance source reads") {
+        let path = entry.expect("an entry reads").path();
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a UTF-8 file name")
+            .to_owned();
+        if path.extension().is_none_or(|ext| ext != "rs") || file == "binding.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a source file reads");
+        for within in artifact_reads(&text, &file) {
+            found.insert((file.clone(), within));
+        }
+        texts.insert(file, text);
+    }
+    let allowed: BTreeSet<(String, String)> = NON_ARTIFACT_READS
+        .iter()
+        .map(|(file, within, _)| ((*file).to_owned(), (*within).to_owned()))
+        .collect();
+    let unbound: Vec<&(String, String)> = found.difference(&allowed).collect();
+    assert!(
+        unbound.is_empty(),
+        "reads outside binding.rs that NON_ARTIFACT_READS doesn't list: {unbound:?}"
+    );
+    let stale: Vec<&(String, String)> = allowed.difference(&found).collect();
+    assert!(stale.is_empty(), "listed reads that are gone: {stale:?}");
+
+    let tool = &texts["tool.rs"];
+    for bypass in [
+        "fn planted(dir: &Path) { let _ = std::fs::read_to_string(dir.join(\"replay.json\")); }",
+        "fn planted(dir: &Path) { let _ = fs::read(dir); }",
+        "fn planted(dir: &Path) { let _ = read_json::<Value>(dir); }",
+        "fn planted(dir: &Path) { let _ = crate::trace::TraceReader::open(dir); }",
+        "struct P; impl P { fn planted(dir: &Path) { let _ = std::fs::File::open(dir); } }",
+        "fn planted(dir: &Path) { let _ = dir.read_dir(); }",
+    ] {
+        let planted = format!("{tool}\n{bypass}\n");
+        assert!(
+            artifact_reads(&planted, "tool.rs").contains(&"planted".to_owned()),
+            "{bypass}"
+        );
+    }
+    let in_test =
+        format!("{tool}\n#[cfg(test)]\nfn planted() {{ let _ = std::fs::read(\"x\"); }}\n");
+    assert!(!artifact_reads(&in_test, "tool.rs").contains(&"planted".to_owned()));
+    for hidden in [
+        "use std::fs::read_to_string;",
+        "use std::fs::{read as slurp};",
+        "use std::fs as files;",
+    ] {
+        let planted = format!("{tool}\n{hidden}\n");
+        assert!(
+            std::panic::catch_unwind(|| artifact_reads(&planted, "tool.rs")).is_err(),
+            "{hidden}"
+        );
+    }
 }

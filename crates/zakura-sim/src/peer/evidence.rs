@@ -82,6 +82,7 @@ use super::{
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
+    check::FrameRef,
     evidence::LiveEvidence,
     model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
@@ -248,8 +249,8 @@ pub(crate) enum RecordBody {
     },
 }
 
-/// The header hashes of each page the peers sent, by connection, QUIC stream
-/// and frame, as the identity map places them: what the peer put on the
+/// The header hashes of each page the peers sent, by its frame's whole
+/// [`FrameRef`], as the identity map places it: what the peer put on the
 /// wire, apart from what the node did with it. They stay out of the log.
 /// It's evidence, kept in the run's stores, so it freezes with the log.
 /// Cloning shares the store.
@@ -259,7 +260,7 @@ pub struct SentPages(Registered<SentPageMap>);
 /// What [`SentPages`] holds: each sent page's header hashes, in hex, by
 /// frame.
 #[derive(Debug, Default)]
-pub struct SentPageMap(BTreeMap<FrameKey, Vec<String>>);
+pub struct SentPageMap(BTreeMap<FrameRef, Vec<String>>);
 
 impl Snapshot for SentPageMap {
     /// Every page, by frame.
@@ -274,16 +275,15 @@ impl SentPages {
         SentPages(stores.register("sent_pages", SentPageMap::default()))
     }
 
-    /// Keeps `hashes` as the page of frame `key`, unless the store froze.
-    pub(crate) fn record(&self, key: FrameKey, hashes: Vec<String>) {
-        self.0.write(|pages| pages.0.insert(key, hashes));
+    /// Keeps `hashes` as the page of `frame`, unless the store froze.
+    pub(crate) fn record(&self, frame: FrameRef, hashes: Vec<String>) {
+        self.0.write(|pages| pages.0.insert(frame, hashes));
     }
 
-    /// The header hashes, in hex, of the page the peer sent as frame `seq`
-    /// on `connection` and `quic_stream`, if it sent one there.
-    pub fn page(&self, connection: u64, quic_stream: u64, seq: u64) -> Option<Vec<String>> {
-        self.0
-            .read(|pages| pages.0.get(&(connection, quic_stream, seq)).cloned())
+    /// The header hashes, in hex, of the page the peer sent as `frame`,
+    /// joined on its whole ref, if it sent one there.
+    pub fn page(&self, frame: &FrameRef) -> Option<Vec<String>> {
+        self.0.read(|pages| pages.0.get(frame).cloned())
     }
 
     /// How many pages it holds.
@@ -585,7 +585,15 @@ impl WireEvidence {
                 let key = (connection, quic_stream, seq);
                 if !hashes.is_empty() {
                     if let Some(sent) = &self.sent {
-                        sent.record(key, hashes);
+                        let frame = FrameRef {
+                            connection,
+                            kind: stream.kind,
+                            version: stream.version,
+                            quic_stream,
+                            inbound: true,
+                            seq,
+                        };
+                        sent.record(frame, hashes);
                     }
                 }
                 self.labels.insert(key, label);
@@ -1200,10 +1208,18 @@ mod tests {
     /// A sent page recorded after the run's stores froze is dropped.
     #[test]
     fn a_frozen_sent_page_store_drops_a_page() {
+        let frame = FrameRef {
+            connection: 1,
+            kind: 5,
+            version: 9,
+            quic_stream: 0,
+            inbound: true,
+            seq: 3,
+        };
         crate::stores::assert_freeze_drops_writes(
             super::SentPages::new,
-            |pages| pages.record((1, 0, 3), vec!["ab".to_owned()]),
-            |pages| pages.page(1, 0, 3),
+            |pages| pages.record(frame.clone(), vec!["ab".to_owned()]),
+            |pages| pages.page(&frame),
         );
     }
 

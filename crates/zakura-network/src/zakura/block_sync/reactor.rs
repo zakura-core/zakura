@@ -1532,7 +1532,7 @@ impl ReactorIO {
         let started = Instant::now();
         let error = match session.offer_status(status) {
             Ok(StatusSend::Queued) => {
-                delivery.queued(status);
+                delivery.queued(status, now);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
                 return true;

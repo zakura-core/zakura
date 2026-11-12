@@ -53,7 +53,7 @@ fn a_ready_peer_with_the_latest_status_needs_no_send() {
     schedule
         .delivery_mut(&peer(0))
         .expect("the admitted peer has a delivery record")
-        .queued(status(5));
+        .queued(status(5), now);
     assert!(schedule
         .due(
             status(5),
@@ -84,7 +84,7 @@ fn a_replacement_session_starts_a_fresh_delivery() {
     schedule
         .delivery_mut(&peer(0))
         .expect("the admitted peer has a delivery record")
-        .queued(status(5));
+        .queued(status(5), now);
     schedule.admit(&peer(0), now);
     assert_eq!(
         schedule.due(status(5), [(&peer(0), true)], now),
@@ -166,10 +166,11 @@ proptest! {
                     model[usize::from(id)] = None;
                 }
                 Input::Queued(id) => {
-                    let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queued(status(latest)));
+                    let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queued(status(latest), now));
                     prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
                     if let Some(delivery) = model[usize::from(id)].as_mut() {
                         delivery.last_queued = Some(latest);
+                        delivery.retry_ms = now_ms;
                         delivery.deferred = None;
                     }
                 }

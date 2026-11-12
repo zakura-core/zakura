@@ -44,8 +44,15 @@ impl StatusDelivery {
         }
     }
 
-    pub(super) fn queued(&mut self, status: BlockSyncStatus) {
+    /// `status` entered the connection's queue at `now`.
+    ///
+    /// Any earlier deadline belonged to a Status this one supersedes, so the
+    /// next change is due at once and the connection's cadence decides when it
+    /// may go out. A held-over deadline would hold a later tip until a
+    /// correction's 30 s interval.
+    pub(super) fn queued(&mut self, status: BlockSyncStatus, now: Instant) {
         self.last_queued = Some(status);
+        self.retry_at = now;
         self.deferred = None;
     }
 
@@ -88,7 +95,7 @@ mod tests {
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(initial, true), Some(now));
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         assert_eq!(delivery.next_deadline(initial, true), None);
         let correction = status(1_000, 6_001);
         assert_eq!(delivery.next_deadline(correction, true), Some(now));
@@ -104,7 +111,7 @@ mod tests {
         // it may go out early.
         let new_tip = status(1_000, 6_002);
         assert_eq!(delivery.next_deadline(new_tip, true), Some(now));
-        delivery.queued(correction);
+        delivery.queued(correction, now);
         assert_eq!(delivery.next_deadline(correction, true), None);
     }
 
@@ -113,7 +120,7 @@ mod tests {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         let full_at = now + Duration::from_secs(30);
         delivery.queue_full(full_at);
         let latest = status(1_002, 6_002);
@@ -126,7 +133,7 @@ mod tests {
             delivery.next_deadline(latest, true),
             Some(deadline + QUEUE_RETRY_INTERVAL)
         );
-        delivery.queued(latest);
+        delivery.queued(latest, now);
         assert_eq!(delivery.next_deadline(latest, true), None);
     }
 
@@ -136,7 +143,7 @@ mod tests {
     fn queue_pressure_after_a_deferral_backs_off_a_new_tip() {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
-        delivery.queued(status(1_000, 6_000));
+        delivery.queued(status(1_000, 6_000), now);
         let deferred = status(1_000, 6_001);
         delivery.deferred_until(deferred, now, now + Duration::from_secs(1));
         let new_tip = status(1_000, 6_002);
@@ -150,13 +157,33 @@ mod tests {
         );
     }
 
+    /// A tip that goes out early past a deferred correction leaves no deadline
+    /// behind: the next tip is due at once, not at the correction's interval.
+    #[test]
+    fn an_early_tip_clears_a_superseded_correction_deadline() {
+        let now = Instant::now();
+        let mut delivery = StatusDelivery::new(now);
+        delivery.queued(status(1_000, 6_000), now);
+        let correction = status(1_001, 6_000);
+        let cadence = now + Duration::from_secs(30);
+        delivery.deferred_until(correction, now, cadence);
+
+        let tip_at = now + Duration::from_secs(2);
+        let tip = status(1_001, 6_001);
+        assert_eq!(delivery.next_deadline(tip, true), Some(now));
+        delivery.queued(tip, tip_at);
+
+        let next_tip = status(1_001, 6_002);
+        assert_eq!(delivery.next_deadline(next_tip, true), Some(tip_at));
+    }
+
     #[test]
     fn unchanged_status_retries_only_until_the_peer_supplies_its_status() {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
         let latest = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
-        delivery.queued(latest);
+        delivery.queued(latest, now);
         // The handshake keeps an unchanged Status due. The connection's cadence
         // paces the resend; see the reactor test for that deferral.
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
@@ -168,7 +195,7 @@ mod tests {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         delivery.queue_full(now);
         assert!(delivery.next_deadline(status(1_001, 6_001), true).is_some());
         assert_eq!(delivery.next_deadline(initial, true), None);

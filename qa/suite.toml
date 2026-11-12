@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_planted_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_authority.rs"
 test = "regenerate_authority_witnesses"
 run = false

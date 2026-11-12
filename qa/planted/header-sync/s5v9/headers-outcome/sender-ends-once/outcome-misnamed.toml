@@ -1,0 +1,17 @@
+# The publisher writes each terminal outcome with the next subscription ID
+# instead of its own, so the peer receives an outcome for no subscription
+# it opened, which its models label `Unsolicited`. Its input is the served
+# subscription: an honest peer at 50 subscribes to the node at 120 from
+# genesis, and the node never subscribes, so its publisher ends the
+# subscription when the peer closes it, so
+# `header-sync/s5v9/headers-outcome/sender-ends-once` is the only ID it
+# breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-served-subscription.json"
+plan = "crates/zakura-sim/tests/fixtures/header-wire-default.plan"

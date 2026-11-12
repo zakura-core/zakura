@@ -167,41 +167,6 @@ pub const GATE_1_REPLAY_STORE_CONTROL: &str =
     "a changed stored fact with every report the same must fail the replay \
                      comparison";
 
-/// Why `gate-2/despite-close/caught` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CAUGHT: &str =
-    "the planted case under commit-only-authorized that keeps the fault close \
-                     but stages the rejected page";
-
-/// Why `gate-2/despite-close/close-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CLOSE_COMPANION: &str =
-    "its patched Draft trace closes the rejected page's connection with a fault \
-                     cause";
-
-/// Why `gate-2/despite-close/staging-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_STAGING_COMPANION: &str =
-    "its patched Draft trace stages the rejected page for that subscription and \
-                     those hashes";
-
-/// Why `gate-2/bad-content-fault-close/status` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS: &str =
-    "the status bad-content history carries the fault-close assertion where the \
-                     close is owed";
-
-/// Why `gate-2/bad-content-fault-close/subscribe-headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS: &str =
-    "the subscribe-headers bad-content history carries the fault-close assertion \
-                     where the close is owed";
-
-/// Why `gate-2/bad-content-fault-close/headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS: &str =
-    "the headers bad-content history carries the fault-close assertion where the \
-                     close is owed";
-
-/// Why `gate-2/bad-content-fault-close/headers-outcome` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME: &str =
-    "the headers-outcome bad-content history carries the fault-close assertion \
-                     where the close is owed";
-
 /// Why `gate-2/end-boundary-preservation` is open until hdr-14.8.
 pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
     "every distinct end finding at one boundary survives, which C12 and C13 \
@@ -281,65 +246,58 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-2/despite-close/caught",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CAUGHT,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_path_break_needs_a_retained_violation",
+        )),
     },
     GateObligation {
         name: "gate-2/despite-close/close-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_fault_close_holds_on_the_unpatched_rejection",
+        )),
     },
     GateObligation {
         name: "gate-2/despite-close/staging-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_staging_companion_needs_the_rejected_page_staged",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/status",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-close-claim",

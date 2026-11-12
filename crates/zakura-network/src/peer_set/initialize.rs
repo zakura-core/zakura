@@ -296,7 +296,7 @@ where
             listen_addr,
             advertised_services,
             peer_registry.clone(),
-            unconditional_peers,
+            unconditional_peers.clone(),
         );
 
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
@@ -434,6 +434,7 @@ where
             peerset_tx.clone(),
             bans.clone(),
             block_gossip_peer_ips,
+            unconditional_peers,
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             listen_fut.in_current_span(),
@@ -855,7 +856,8 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
-#[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(config, listener, handshaker, peerset_tx, unconditional_peers), fields(listener_addr = ?listener.local_addr()))]
 async fn accept_inbound_connections<S>(
     config: Config,
     listener: TcpListener,
@@ -864,6 +866,7 @@ async fn accept_inbound_connections<S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     bans: BannedIps,
     zcashd_compat_peer_ips: Vec<IpAddr>,
+    unconditional_peers: UnconditionalPeerSet,
 ) -> Result<(), BoxError>
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
@@ -957,7 +960,9 @@ where
                 active_zcashd_compat_connections.track_connection()
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                || recent_inbound_connections.is_past_limit_or_add(addr.ip())
+                // An unconditional peer that lost its connection may reconnect at once.
+                || (!unconditional_peers.contains(addr.ip())
+                    && recent_inbound_connections.is_past_limit_or_add(addr.ip()))
             {
                 // Too many open inbound connections or pending handshakes already.
                 // Close the connection.

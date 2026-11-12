@@ -113,7 +113,9 @@ impl AddressBookUpdater {
         .with_unconditional_peers(unconditional_peers);
         if !config.unconditional_peers.is_empty() {
             if config.expose_peer_addresses {
-                let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                // Two entries with different ports name the same address.
+                let unconditional_peers: std::collections::BTreeSet<_> =
+                    config.unconditional_peers.iter().collect();
                 let unconditional_peer_names = config.unconditional_peers.dial_hosts();
                 info!(
                     ?unconditional_peers,

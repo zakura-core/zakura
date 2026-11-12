@@ -1,6 +1,6 @@
 //! Keeps connections open to the configured unconditional peers.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand_10::RngExt;
@@ -63,15 +63,39 @@ struct RedialState {
     /// The number of attempts since this peer last had a healthy connection.
     attempts: u32,
 
-    /// Whether a lookup or a dial for this peer is in flight.
+    /// Whether an attempt to connect to this peer is in flight.
     is_attempting: bool,
+
+    /// Whether this peer has been attempted before. Every attempt but the first waits
+    /// a random delay, see [`redial_jitter`].
+    has_attempted: bool,
+
+    /// Whether the last lookup of this peer's name failed.
+    is_lookup_failing: bool,
 
     /// When this peer was first seen connected, if it still is.
     connected_since: Option<Instant>,
 }
 
+impl RedialState {
+    /// Returns whether a dial to this peer would add nothing to `connections`, because
+    /// one of its addresses is connected, see [`is_connected`].
+    fn is_connected(
+        &self,
+        connections: &[(PeerSocketAddr, bool)],
+        max_connections_per_ip: usize,
+    ) -> bool {
+        self.addrs
+            .iter()
+            .any(|addr| is_connected(*addr, connections, max_connections_per_ip))
+    }
+}
+
 /// A finished step of an attempt to connect to the peer at `index`.
 enum AttemptEvent {
+    /// The random delay before the attempt is over.
+    Delayed { index: usize },
+
     /// The lookup of the peer's name finished.
     Resolved {
         index: usize,
@@ -223,17 +247,51 @@ fn redial_delay(attempts: u32) -> Duration {
         .min(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY)
 }
 
-/// Returns `delay` plus a random extra of up to a quarter of it.
+/// Returns a random delay of up to [`constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER`].
 ///
-/// Two nodes that list each other dial at the same moment after their connection drops.
-/// With one connection per IP, each node can keep the dial that the other one drops.
-/// The random extra lets one dial land first on a later round.
-fn with_jitter(delay: Duration) -> Duration {
-    let max_jitter_millis = u64::try_from(delay.as_millis() / 4).unwrap_or(u64::MAX);
+/// Two nodes that list each other both redial when their connection drops. When the
+/// two dials start within about half a round trip of each other, each node keeps its
+/// own dial and drops the other's, and both connections close. Independent random
+/// delays make that rare, and separate the two nodes on the next round when it happens.
+fn redial_jitter() -> Duration {
+    let max_jitter_millis =
+        u64::try_from(constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER.as_millis())
+            .unwrap_or(u64::MAX);
 
-    delay.saturating_add(Duration::from_millis(
-        rand_10::rng().random_range(0..=max_jitter_millis),
-    ))
+    Duration::from_millis(rand_10::rng().random_range(0..=max_jitter_millis))
+}
+
+/// Warns about each IP that more fixed addresses in `dial_targets` name than
+/// `max_connections_per_ip` allows connections to.
+///
+/// [`is_connected`] counts such an address as connected once the IP is at its limit,
+/// so Zakura never dials it. Without this line, nothing would tell the operator.
+fn warn_about_addrs_over_the_ip_limit(dial_targets: &[DialTarget], config: &Config) {
+    let addrs = || {
+        dial_targets.iter().filter_map(|target| match target {
+            DialTarget::Addr(addr) => Some(*addr),
+            DialTarget::Host(..) => None,
+        })
+    };
+
+    let mut addrs_by_ip: HashMap<_, usize> = HashMap::new();
+    for addr in addrs() {
+        *addrs_by_ip.entry(canonical_ip(addr.ip())).or_default() += 1;
+    }
+
+    for addr in addrs() {
+        if let Some(addrs) = addrs_by_ip.remove(&canonical_ip(addr.ip())) {
+            if addrs > config.max_connections_per_ip {
+                warn!(
+                    peer = %addr.addr_label(config.expose_peer_addresses),
+                    addrs,
+                    max_connections_per_ip = config.max_connections_per_ip,
+                    "unconditional peer addresses share an IP beyond max_connections_per_ip, \
+                     so only that many of them are kept connected"
+                );
+            }
+        }
+    }
 }
 
 /// Logs a failed attempt to connect to `peer`.
@@ -267,15 +325,18 @@ fn log_failed_attempt(peer: &RedialState, error: &BoxError, expose_peer_addresse
 /// A peer with a DNS name is looked up with `resolver` at the start of every attempt, so
 /// Zakura follows the peer when its name moves to a new address. The addresses it
 /// resolves to are published to `resolved_peers`, which exempts them from scoring and
-/// bans, and any ban on them is lifted from `bans`. They replace the addresses of the
-/// last lookup. When a lookup fails, Zakura dials the addresses of the last one that
+/// bans, and then any ban on them is lifted from `bans`. They replace the addresses of
+/// the last lookup. When a lookup fails, Zakura dials the addresses of the last one that
 /// worked. Successive dials go through a name's addresses in turn.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
 /// [`constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`]. A connection that lasts
-/// [`constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION`] resets it, so the peer is dialed
-/// as soon as that connection drops.
+/// [`constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION`] resets it, so the peer is
+/// attempted at the next check after that connection drops.
+///
+/// Every attempt but a peer's first waits [`redial_jitter`], then goes ahead only if
+/// the peer is still not connected.
 ///
 /// These dials use their own connection counter, so the outbound connection limit never
 /// blocks them. [`Config::unconditional_peer_connection_limit`] adds their slots to the
@@ -311,6 +372,7 @@ where
     C::Future: Send + 'static,
 {
     let expose_peer_addresses = config.expose_peer_addresses;
+    let max_connections_per_ip = config.max_connections_per_ip;
 
     if expose_peer_addresses {
         let dial_targets: Vec<_> = dial_targets
@@ -327,6 +389,7 @@ where
             "keeping connections open to unconditional peers"
         );
     }
+    warn_about_addrs_over_the_ip_limit(&dial_targets, &config);
 
     let mut active_connections = ActiveConnectionCounter::new_counter_with(
         dial_targets.len(),
@@ -346,6 +409,8 @@ where
             next_attempt: start,
             attempts: 0,
             is_attempting: false,
+            has_attempted: false,
+            is_lookup_failing: false,
             connected_since: None,
         })
         .collect();
@@ -356,14 +421,13 @@ where
 
     // Starts a dial to `addr` for the peer at `index`.
     let mut start_dial = |index: usize, addr: PeerSocketAddr| {
+        // Drain the close notifications, so the counter's channel stays small.
+        active_connections.update_count();
         let request = OutboundConnectorRequest {
             addr,
             connection_tracker: active_connections.track_connection(),
         };
         let outbound_connector = outbound_connector.clone();
-
-        // Drain the close notifications, so the counter's channel stays small.
-        active_connections.update_count();
 
         tokio::spawn(erased(
             async move {
@@ -388,6 +452,47 @@ where
             // An empty pool yields `None`, which disables this branch until the next
             // attempt.
             Some(event) = events.next() => match event {
+                AttemptEvent::Delayed { index } => {
+                    let peer: &mut RedialState = peers
+                        .get_mut(index)
+                        .expect("event indexes come from the peer list, which never shrinks");
+
+                    // The peer may have dialed in while this attempt waited.
+                    if peer.is_connected(&peer_registry.connection_addrs(), max_connections_per_ip) {
+                        peer.is_attempting = false;
+                        continue;
+                    }
+
+                    metrics::counter!("peer.unconditional.dial.total").increment(1);
+
+                    match &peer.target {
+                        DialTarget::Addr(addr) => {
+                            events.push(start_dial(index, *addr));
+
+                            // Security: start outbound connections at least this far
+                            // apart, like the crawler does.
+                            sleep(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+                        }
+                        DialTarget::Host(name, port) => {
+                            let lookup = resolver.clone().oneshot((name.clone(), *port));
+
+                            events.push(
+                                tokio::spawn(erased(
+                                    async move {
+                                        AttemptEvent::Resolved {
+                                            index,
+                                            result: lookup.await,
+                                        }
+                                    }
+                                    .in_current_span(),
+                                ))
+                                .wait_for_panics()
+                                .boxed(),
+                            );
+                        }
+                    }
+                }
+
                 AttemptEvent::Resolved { index, result } => {
                     let peer: &mut RedialState = peers
                         .get_mut(index)
@@ -403,28 +508,26 @@ where
                     });
 
                     let lookup_error = match lookup {
-                        Ok(addrs) if addrs != peer.addrs => {
-                            debug!(
-                                peer = %peer.target.label(expose_peer_addresses),
-                                addrs = addrs.len(),
-                                "an unconditional peer's name resolved to new addresses"
-                            );
-                            peer.addrs = addrs;
+                        Ok(addrs) => {
+                            if addrs != peer.addrs {
+                                debug!(
+                                    peer = %peer.target.label(expose_peer_addresses),
+                                    addrs = addrs.len(),
+                                    "an unconditional peer's name resolved to new addresses"
+                                );
+                                peer.addrs = addrs;
 
-                            // Exempt the new addresses before any connection to them
-                            // can be scored.
-                            for addr in &peer.addrs {
-                                bans.remove(addr.ip());
+                                // Exempt the new addresses before any connection to
+                                // them can be scored.
+                                resolved_peers.publish(
+                                    peers
+                                        .iter()
+                                        .filter(|peer| matches!(peer.target, DialTarget::Host(..)))
+                                        .flat_map(|peer| peer.addrs.iter().map(|addr| addr.ip())),
+                                );
                             }
-                            resolved_peers.publish(
-                                peers
-                                    .iter()
-                                    .filter(|peer| matches!(peer.target, DialTarget::Host(..)))
-                                    .flat_map(|peer| peer.addrs.iter().map(|addr| addr.ip())),
-                            );
                             None
                         }
-                        Ok(_unchanged_addrs) => None,
                         Err(error) => Some(error),
                     };
 
@@ -432,22 +535,49 @@ where
                         .get_mut(index)
                         .expect("event indexes come from the peer list, which never shrinks");
 
-                    // A failed lookup falls back to the addresses of the last one that
-                    // worked.
-                    if peer.addrs.is_empty() {
-                        let error = lookup_error
-                            .expect("a successful lookup leaves the peer with an address");
-                        peer.is_attempting = false;
-                        log_failed_attempt(peer, &error, expose_peer_addresses);
-                        continue;
+                    match lookup_error {
+                        None => {
+                            peer.is_lookup_failing = false;
+
+                            // Lift bans only after the addresses are exempt, so the
+                            // address book cannot ban them again in between. Doing it
+                            // on every lookup that works also clears a ban from a
+                            // report that the address book accepted just before the
+                            // address became exempt.
+                            for addr in &peer.addrs {
+                                bans.remove(addr.ip());
+                            }
+                        }
+                        // A name that has never resolved has no address to dial.
+                        Some(error) if peer.addrs.is_empty() => {
+                            peer.is_attempting = false;
+                            log_failed_attempt(peer, &error, expose_peer_addresses);
+                            continue;
+                        }
+                        // A failed lookup falls back to the addresses of the last one
+                        // that worked. Only the first failure in a row is worth an
+                        // operator's attention.
+                        Some(error) => {
+                            let peer_label = peer.target.label(expose_peer_addresses);
+                            if peer.is_lookup_failing {
+                                debug!(
+                                    peer = %peer_label,
+                                    ?error,
+                                    "failed to look up an unconditional peer's name"
+                                );
+                            } else {
+                                info!(
+                                    peer = %peer_label,
+                                    ?error,
+                                    "failed to look up an unconditional peer's name, \
+                                     dialing its last known addresses"
+                                );
+                            }
+                            peer.is_lookup_failing = true;
+                        }
                     }
 
-                    let connections = peer_registry.connection_addrs();
-                    if peer
-                        .addrs
-                        .iter()
-                        .any(|addr| is_connected(*addr, &connections, config.max_connections_per_ip))
-                    {
+                    if peer.is_connected(&peer_registry.connection_addrs(), max_connections_per_ip) {
                         peer.is_attempting = false;
                         continue;
                     }
@@ -497,11 +627,7 @@ where
 
                     let now = Instant::now();
 
-                    if peer
-                        .addrs
-                        .iter()
-                        .any(|addr| is_connected(*addr, &connections, config.max_connections_per_ip))
-                    {
+                    if peer.is_connected(&connections, max_connections_per_ip) {
                         let connected_since = *peer.connected_since.get_or_insert(now);
                         if now.saturating_duration_since(connected_since)
                             >= constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION
@@ -516,37 +642,24 @@ where
                         continue;
                     }
 
+                    let delay = if peer.has_attempted {
+                        redial_jitter()
+                    } else {
+                        Duration::ZERO
+                    };
+
                     peer.is_attempting = true;
-                    peer.next_attempt = now + with_jitter(redial_delay(peer.attempts));
+                    peer.has_attempted = true;
+                    peer.next_attempt = now + redial_delay(peer.attempts);
                     peer.attempts = peer.attempts.saturating_add(1);
-                    metrics::counter!("peer.unconditional.dial.total").increment(1);
 
-                    match &peer.target {
-                        DialTarget::Addr(addr) => {
-                            events.push(start_dial(index, *addr));
-
-                            // Security: start outbound connections at least this far
-                            // apart, like the crawler does.
-                            sleep(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+                    events.push(
+                        async move {
+                            sleep(delay).await;
+                            AttemptEvent::Delayed { index }
                         }
-                        DialTarget::Host(name, port) => {
-                            let lookup = resolver.clone().oneshot((name.clone(), *port));
-
-                            events.push(
-                                tokio::spawn(erased(
-                                    async move {
-                                        AttemptEvent::Resolved {
-                                            index,
-                                            result: lookup.await,
-                                        }
-                                    }
-                                    .in_current_span(),
-                                ))
-                                .wait_for_panics()
-                                .boxed(),
-                            );
-                        }
-                    }
+                        .boxed(),
+                    );
                 }
             }
         }

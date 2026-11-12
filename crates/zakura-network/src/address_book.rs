@@ -777,11 +777,12 @@ impl AddressBook {
         if let Some(updated) = updated {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
+                //
+                // The report that raised the score passed the exemption check above.
+                // A name lookup can exempt this address between that check and this
+                // ban. The dialer lifts bans after every lookup that works, so such
+                // a ban lasts until the next one.
                 let banned_ip = updated.addr.ip();
-                debug_assert!(
-                    !self.unconditional_peers.contains(banned_ip),
-                    "unconditional peers must never be banned"
-                );
                 self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when

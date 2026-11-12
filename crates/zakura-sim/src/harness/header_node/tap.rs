@@ -1896,7 +1896,7 @@ impl ReactorTap {
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
-pub(super) fn peer(peer: &ZakuraPeerId) -> String {
+pub(crate) fn peer(peer: &ZakuraPeerId) -> String {
     hex(&peer.digest())
 }
 

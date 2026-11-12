@@ -146,6 +146,13 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
 /// The file of `header-sync/wire`'s generated witnesses.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
+/// The file of the despite-close case's companion tests.
+const DESPITE_CLOSE_TESTS: &str = "tests/header_despite_close.rs";
+
+/// The file of `header-sync/wire`'s receiver-direction table checks, whose
+/// per-row content tests carry the fault close a content rejection owes.
+const TABLE_TESTS: &str = "tests/header_wire_table.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
 /// names its passing history, the gates it serves, and its catch.
 struct Generated {
@@ -2112,6 +2119,24 @@ fn hand_written_rows() -> Vec<Row> {
             index == 0,
         ));
     }
+    // Gap 6: a page staged despite its connection's fault close, judged on
+    // the case's Draft run by its three companions (`companions`).
+    let despite = super::companions::DESPITE_CLOSE;
+    commit.push(result(
+        vec![Key::Case {
+            property: despite.property.to_owned(),
+            name: despite.name.to_owned(),
+        }],
+        G23,
+        Expected::Caught {
+            case: despite,
+            harness: WIRE,
+            set: &[COMMIT],
+            found: Found::AtStep,
+            companions: super::companions::COMPANIONS,
+            not_applicable: &[],
+        },
+    ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
@@ -2870,71 +2895,65 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-2/despite-close/caught",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CAUGHT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_path_break_needs_a_retained_violation",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/close-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_fault_close_holds_on_the_unpatched_rejection",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/staging-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_staging_companion_needs_the_rejected_page_staged",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/status",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "status_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "subscribe_headers_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "headers_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "headers_outcome_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {

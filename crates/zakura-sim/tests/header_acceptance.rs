@@ -2917,6 +2917,37 @@ fn the_gate_requirements_match_their_obligations() {
         name: "gate-3/crossing/crossing-close".into(),
     };
     assert!(!crossing.covers(&standing.expected, NARROWING));
+    // Each row's bad-content requirement is that row's fault-close test,
+    // since a content rejection owes the close. Another row's test doesn't
+    // satisfy it, nor does its old transitional Open, nor the
+    // disconnect-mid-prepare witness: a fault found after an environment
+    // disconnect owes the penalty, not a close.
+    for (row, own) in BAD_CONTENT_CLOSES {
+        let key = Key::Requirement {
+            name: format!("gate-2/bad-content-fault-close/{row}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{row}"
+        );
+        for (other, test) in BAD_CONTENT_CLOSES {
+            if other != row {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{row}");
+            }
+        }
+        assert!(
+            !key.covers(&Expected::Passes { test: MID_PREPARE }, NARROWING),
+            "{row}"
+        );
+        let transitional = Expected::Open {
+            reason: "the bad-content history carries the fault-close assertion where the close \
+                     is owed",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{row}");
+    }
     // A requirement's own Open with only its owner changed.
     for name in ["gate-2/bad-content-close-claim", "gate-1/a-a-and-a-b-a"] {
         let requirement = GATE_REQUIREMENTS.iter().find(|r| r.name == name).unwrap();
@@ -2931,6 +2962,45 @@ fn the_gate_requirements_match_their_obligations() {
 
 /// The wire witness file.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
+
+/// Each row's bad-content fault-close test, by row.
+const BAD_CONTENT_CLOSES: [(&str, TestRef); 4] = [
+    (
+        "status",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "subscribe-headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers-outcome",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        ),
+    ),
+];
+
+/// The disconnect-mid-prepare witness, whose fault came after its session
+/// ended, so it owes the penalty and no close.
+const MID_PREPARE: TestRef = sim_test(
+    "tests/header_wire_prepare_fault.rs",
+    "a_disconnect_mid_prepare_is_still_penalized",
+);
 
 /// Each history a row judges for an ID other than the one it's run for, as
 /// `(history, ID)`: `both-ways`, run for `conformant-never-closes`,
@@ -4263,6 +4333,40 @@ fn the_evaluator_accepts_genuine_results() {
         "the standing exclusion is excluded"
     );
     assert!(evaluation.gates.values().all(|passes| *passes));
+
+    // A bad-content close requirement verifies on its row's fault-close
+    // test, beside the disconnect-mid-prepare witness, which owes the
+    // penalty and no close and verifies on its own key. Swapping the
+    // requirement onto that witness's pass blocks it.
+    let (row, close) = BAD_CONTENT_CLOSES[2];
+    let requirement = Key::Requirement {
+        name: format!("gate-2/bad-content-fault-close/{row}"),
+    };
+    let mut owed = manifest.clone();
+    owed.expected.push(er(
+        vec![requirement.clone()],
+        &[Gate::G2],
+        Expected::Passes { test: close },
+    ));
+    owed.expected.push(er(
+        vec![witness_key(MID_PREPARE)],
+        &[Gate::G2],
+        Expected::Passes { test: MID_PREPARE },
+    ));
+    let mut passed = results();
+    passed.results.push(test_record(close));
+    passed.results.push(test_record(MID_PREPARE));
+    for key in [&requirement, &witness_key(MID_PREPARE)] {
+        assert_eq!(
+            state(&owed, &passed, key),
+            ObligationState::Verified,
+            "{key:?}"
+        );
+    }
+    let mut swapped = owed.clone();
+    let at = covering(&swapped, &requirement);
+    swapped.expected[at].expected = Expected::Passes { test: MID_PREPARE };
+    assert!(blocked(&state(&swapped, &passed, &requirement)));
 
     // A catch stopped at a step is a prefix: another property may still be
     // open there.

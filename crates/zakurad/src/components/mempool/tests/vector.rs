@@ -29,10 +29,8 @@ use zakura_chain::{
 };
 use zakura_consensus::transaction as tx;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
-use zakura_node_services::mempool::{
-    MempoolHeld, MempoolTipProgress, MempoolTipStage, MempoolTipWork, QueueSource,
-};
-use zakura_state::{Config as StateConfig, TipAction, CHAIN_TIP_UPDATE_WAIT_LIMIT};
+use zakura_node_services::mempool::QueueSource;
+use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::components::{
@@ -2016,160 +2014,6 @@ async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
     Ok(())
 }
 
-/// When a block grows the tip, the mempool publishes, before removing anything, how many
-/// transactions it held, the parts of the block's transactions and the parts of its own that
-/// it checks against them. A reset is published as holding nothing, whatever the mempool held.
-/// The trace row for the block carries the published numbers, and a time until the block's
-/// transactions were published that covers the removal.
-#[tokio::test]
-async fn mempool_publishes_the_work_of_a_new_block_before_doing_it() -> Result<(), Report> {
-    let network = Network::Mainnet;
-    let (
-        mempool,
-        _peer_set,
-        mut state_service,
-        mut chain_tip_change,
-        _tx_verifier,
-        mut recent_syncs,
-        _changes,
-    ) = setup(&network, u64::MAX, true).await;
-    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
-    let mut mempool =
-        mempool.with_trace(JsonlEventEmitter::new(JsonlTracer::new(trace_tx), "test"));
-    mempool.enable(&mut recent_syncs).await;
-    let mut snapshots = mempool.snapshots();
-
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    timeout(
-        CHAIN_TIP_UPDATE_WAIT_LIMIT,
-        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
-    )
-    .await?;
-    mempool.dummy_call().await;
-
-    // Each fixture spends one output and creates one, which is not counted.
-    for index in 1..=3 {
-        mempool.storage().insert(
-            expiry_fixture_transaction(index, Height(0), None),
-            Vec::new(),
-            Some(Height(1)),
-        )?;
-    }
-
-    let block2: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    // The block's spends and nullifiers are counted exactly. Its held outputs are estimated
-    // without looking its transactions up: at most one of its one transaction is held, at the
-    // held average of one output each.
-    let estimated_held_outputs = block2.transactions.len().min(3);
-    let block_parts: usize = block2
-        .transactions
-        .iter()
-        .map(|tx| {
-            tx.inputs().len()
-                + tx.sprout_nullifiers().count()
-                + tx.sapling_nullifiers().count()
-                + tx.orchard_nullifiers().count()
-                + tx.ironwood_nullifiers().count()
-        })
-        .sum::<usize>()
-        + estimated_held_outputs;
-    let expected = MempoolTipWork {
-        mempool_transactions: 3,
-        block_parts,
-        mempool_parts: 3,
-    };
-
-    let reset = TipAction::Reset {
-        height: Height(2),
-        hash: block2.hash(),
-    };
-    let reset_started = mempool
-        .publish_tip_started(&reset)
-        .expect("the mempool is enabled");
-    assert_eq!(reset_started.transactions_before, 3);
-    assert_eq!(
-        snapshots.progress_on_tip(block2.hash()).await,
-        Some(MempoolTipProgress {
-            tip_hash: block2.hash(),
-            stage: MempoolTipStage::Reconciling(MempoolTipWork::default()),
-        }),
-        "a reset empties the mempool, so it holds nothing for the block"
-    );
-
-    let grow = TipAction::Grow {
-        block: zs::ChainTipBlock::from(zs::SemanticallyVerifiedBlock::from(block2.clone())),
-    };
-    let grow_started = mempool
-        .publish_tip_started(&grow)
-        .expect("the mempool is enabled");
-    assert_eq!(grow_started.work, expected);
-    assert_eq!(
-        snapshots.progress_on_tip(block2.hash()).await,
-        Some(MempoolTipProgress {
-            tip_hash: block2.hash(),
-            stage: MempoolTipStage::Reconciling(expected),
-        }),
-        "the mempool publishes the block's work before removing anything"
-    );
-    assert_eq!(mempool.storage().transaction_count(), 3);
-
-    timeout(
-        CHAIN_TIP_UPDATE_WAIT_LIMIT,
-        commit_block_and_wait_for_tip_change(
-            &mut state_service,
-            &mut chain_tip_change,
-            block2.clone(),
-        ),
-    )
-    .await?;
-    mempool.dummy_call().await;
-    assert_eq!(
-        snapshots.progress_on_tip(block2.hash()).await,
-        Some(MempoolTipProgress {
-            tip_hash: block2.hash(),
-            stage: MempoolTipStage::Reconciled,
-        })
-    );
-
-    assert_eq!(
-        snapshots.held(),
-        Some(MempoolHeld {
-            transactions: 3,
-            parts: 3,
-        }),
-        "the mempool publishes what it holds after the block, which removed none of the fixtures"
-    );
-
-    let mut row = None;
-    while let Ok(written) = trace_rx.try_recv() {
-        let written: serde_json::Value =
-            serde_json::from_slice(&written.line).expect("each trace row is JSON");
-        if written["tip_hash"] == block2.hash().to_string() {
-            row = Some(written);
-        }
-    }
-    let row = row.expect("the mempool traced block 2");
-    assert_eq!(row["action"], "grow");
-    assert_eq!(row["tx_count_before"], 3);
-    assert_eq!(row["block_parts"], block_parts);
-    assert_eq!(row["mempool_parts"], 3);
-    assert_eq!(row["work"], expected.work());
-    let process_us = row["process_us"]
-        .as_u64()
-        .expect("the row records the removal time");
-    let ready_us = row["ready_us"]
-        .as_u64()
-        .expect("the row records the time until publishing");
-    assert!(
-        ready_us >= process_us,
-        "the time until the transactions are published covers the removal: {row}"
-    );
-
-    Ok(())
-}
-
 /// Tip changes and explicit list requests publish current snapshots. Admission only
 /// withdraws the previous list, and unchanged polls keep shared allocations.
 #[tokio::test]
@@ -2390,26 +2234,6 @@ async fn queue_checker_has_the_mempool_publish_a_new_block_to_snapshot_readers(
             .collect::<HashSet<_>>(),
         HashSet::from([staying_id]),
         "the snapshot for block 2 holds only the transaction that block did not expire"
-    );
-
-    // The snapshot is published before the block is reported finished, so wait for the report.
-    let progress = timeout(Duration::from_secs(2), async {
-        loop {
-            let progress = snapshots
-                .progress_on_tip(block2.hash())
-                .await
-                .expect("the mempool is still running");
-            if progress.stage == MempoolTipStage::Reconciled {
-                break progress;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    assert_eq!(
-        progress.tip_hash,
-        block2.hash(),
-        "the mempool reports block 2 as finished once its snapshot is published"
     );
 
     Ok(())
@@ -3223,26 +3047,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
             serde_json::from_slice(&written.line).expect("each trace row is JSON");
         rows.push(row);
     }
-    // The mempool holds no verified transactions here, so the work it reports for the block
-    // that grows the tip is that block's own parts: the transparent outputs its transactions
-    // spend and the nullifiers they reveal. The outputs they create are not counted, since
-    // the mempool held none of them. A reset is reported as no work.
-    let grow_work: usize = grow_block
-        .transactions
-        .iter()
-        .map(|tx| {
-            tx.inputs().len()
-                + tx.sprout_nullifiers().count()
-                + tx.sapling_nullifiers().count()
-                + tx.orchard_nullifiers().count()
-                + tx.ironwood_nullifiers().count()
-        })
-        .sum();
-    assert!(grow_work > 0, "the block has a coinbase transaction");
-    for (block, action, requeued, work) in [
-        (&reset_block, "reset", 1, 0),
-        (&grow_block, "grow", 0, grow_work),
-    ] {
+    for (block, action, requeued) in [(&reset_block, "reset", 1), (&grow_block, "grow", 0)] {
         let row = rows
             .iter()
             .find(|row| row["tip_hash"] == block.hash().to_string())
@@ -3253,112 +3058,10 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
             row["tip_height"],
             block.coinbase_height().expect("the block has a height").0
         );
-        assert_eq!(row["tx_count_before"], 0);
         assert_eq!(row["tx_count_after"], 0);
         assert_eq!(row["requeued"], requeued);
-        let drained = row["drained"]
-            .as_u64()
-            .expect("the row records the finished downloads handled before the removal");
-        if action == "reset" {
-            assert_eq!(
-                drained, 0,
-                "a reset returns before handling finished downloads"
-            );
-        }
-        assert_eq!(row["block_parts"], work);
-        assert_eq!(row["mempool_parts"], 0);
-        assert_eq!(row["work"], work);
-        let process_us = row["process_us"]
-            .as_u64()
-            .expect("the row records the removal time");
-        let ready_us = row["ready_us"]
-            .as_u64()
-            .expect("the row records the time until publishing");
-        assert!(ready_us >= process_us, "{row}");
+        assert!(row["process_us"].is_u64(), "{row}");
     }
-
-    Ok(())
-}
-
-/// The mempool announces a new block and returns before removing that block's transactions,
-/// so tasks the announcement woke can run first. It removes them on its next poll.
-#[tokio::test]
-async fn mempool_yields_after_announcing_a_new_block() -> Result<(), Report> {
-    let network = Network::Mainnet;
-    let (
-        mut mempool,
-        _peer_set,
-        mut state_service,
-        mut chain_tip_change,
-        _tx_verifier,
-        mut recent_syncs,
-        _changes,
-    ) = setup(&network, u64::MAX, true).await;
-    mempool.enable(&mut recent_syncs).await;
-    let mut snapshots = mempool.snapshots();
-
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    timeout(
-        CHAIN_TIP_UPDATE_WAIT_LIMIT,
-        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
-    )
-    .await?;
-    mempool.dummy_call().await;
-
-    // Both transactions expire at block 2, so applying block 2 removes them.
-    for index in 1..=2 {
-        mempool.storage().insert(
-            expiry_fixture_transaction(index, Height(2), None),
-            Vec::new(),
-            Some(Height(1)),
-        )?;
-    }
-
-    let block2: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    timeout(
-        CHAIN_TIP_UPDATE_WAIT_LIMIT,
-        commit_block_and_wait_for_tip_change(
-            &mut state_service,
-            &mut chain_tip_change,
-            block2.clone(),
-        ),
-    )
-    .await?;
-
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    assert!(
-        mempool.poll_ready(&mut cx).is_pending(),
-        "the mempool returns after announcing the block"
-    );
-    let progress = snapshots
-        .progress_on_tip(block2.hash())
-        .await
-        .expect("the mempool is still running");
-    assert!(
-        matches!(
-            progress.stage,
-            MempoolTipStage::Reconciling(work) if work.mempool_transactions == 2
-        ),
-        "the announcement reports what the mempool held: {progress:?}"
-    );
-    assert_eq!(
-        mempool.storage().transaction_count(),
-        2,
-        "the block's work has not started"
-    );
-
-    assert!(mempool.poll_ready(&mut cx).is_ready());
-    assert_eq!(mempool.storage().transaction_count(), 0);
-    assert_eq!(
-        snapshots.progress_on_tip(block2.hash()).await,
-        Some(MempoolTipProgress {
-            tip_hash: block2.hash(),
-            stage: MempoolTipStage::Reconciled,
-        })
-    );
 
     Ok(())
 }

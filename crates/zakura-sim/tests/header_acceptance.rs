@@ -624,14 +624,18 @@ fn every_required_key_is_covered_once_with_its_gates() {
         );
         m.expected[at].expected = rows::MACHINE_CLEANUP;
     });
-    // A native mutation's or a narrowing entry's transitional Open with
-    // only another owner, or only another reason.
-    for key in [
-        Key::Native {
-            patch: "own9-join".into(),
-        },
-        Key::NarrowingTest { entry: "N1".into() },
-    ] {
+    // A narrowing entry's key covered by another test than its entry's.
+    refused(&|m| {
+        let at = covering(m, &Key::NarrowingTest { entry: "N1".into() });
+        if let Expected::Passes { test } = &mut m.expected[at].expected {
+            test.test = "another_test";
+        }
+    });
+    // A native mutation's transitional Open with only another owner, or
+    // only another reason.
+    for key in [Key::Native {
+        patch: "own9-join".into(),
+    }] {
         refused(&|m| {
             let at = covering(m, &key);
             if let Expected::Open { owner, .. } = &mut m.expected[at].expected {

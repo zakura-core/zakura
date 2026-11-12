@@ -634,8 +634,8 @@ pub struct Mempool {
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
 
-    /// Configured peers exempt from mempool bans, cooldowns, and disconnects.
-    unconditional_peers: zn::UnconditionalPeers,
+    /// The peers exempt from mempool bans, cooldowns, and disconnects.
+    unconditional_peers: zn::UnconditionalPeerSet,
     /// Signalled after each transaction download and verify task finishes.
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
@@ -658,7 +658,7 @@ impl Mempool {
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
-        unconditional_peers: zn::UnconditionalPeers,
+        unconditional_peers: zn::UnconditionalPeerSet,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);

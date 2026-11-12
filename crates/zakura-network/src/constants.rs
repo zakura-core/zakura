@@ -273,6 +273,13 @@ pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1)
 /// The longest delay between two dials to the same unconditional peer, before jitter.
 pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(60);
 
+/// The most addresses that Zakura takes from one lookup of an unconditional peer's DNS
+/// name.
+///
+/// These addresses are exempt from scoring and bans, and dialed in turn. A node has a
+/// few addresses at most, so a longer answer is not one node.
+pub const MAX_UNCONDITIONAL_PEER_RESOLVED_ADDRS: usize = 16;
+
 /// How long a connection to an unconditional peer must last to reset its redial delay.
 ///
 /// A peer that keeps dropping new connections is dialed at the maximum delay, instead of

@@ -15,12 +15,12 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
-    config::UnconditionalPeers,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
     protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
     types::{MetaAddr, PeerServices},
+    unconditional_peer_set::UnconditionalPeerSet,
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
 };
 
@@ -90,6 +90,27 @@ impl BannedIps {
                 .expect("ban list lock should not be poisoned");
             let changed = !list.ips.contains(&canonical_ip(ip));
             list.insert(ip);
+            changed
+        };
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
+    /// Lifts the ban on `ip`, if it has one, and notifies readers after releasing the
+    /// list lock.
+    pub(crate) fn remove(&self, ip: IpAddr) {
+        let ip = canonical_ip(ip);
+
+        let changed = {
+            let mut list = self
+                .inner
+                .write()
+                .expect("ban list lock should not be poisoned");
+            let changed = list.ips.remove(&ip);
+            if changed {
+                list.insertion_order.retain(|banned_ip| *banned_ip != ip);
+            }
             changed
         };
         if changed {
@@ -293,10 +314,10 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
-    /// Peer IP addresses and ranges that are never scored or banned.
+    /// The peers that are never scored or banned.
     ///
     /// The address book drops misbehavior changes for these peers.
-    unconditional_peers: UnconditionalPeers,
+    unconditional_peers: UnconditionalPeerSet,
 
     /// The local listener address.
     local_listener: SocketAddr,
@@ -409,7 +430,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
-            unconditional_peers: UnconditionalPeers::default(),
+            unconditional_peers: UnconditionalPeerSet::default(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -432,14 +453,20 @@ impl AddressBook {
         self
     }
 
-    /// Sets the peer IP addresses and ranges that are never scored or banned.
+    /// Sets the peers that are never scored or banned.
     #[must_use]
     pub(crate) fn with_unconditional_peers(
         mut self,
-        unconditional_peers: UnconditionalPeers,
+        unconditional_peers: impl Into<UnconditionalPeerSet>,
     ) -> Self {
-        self.unconditional_peers = unconditional_peers;
+        self.unconditional_peers = unconditional_peers.into();
         self
+    }
+
+    /// Returns the peers that are never scored or banned. The returned set follows the
+    /// addresses that unconditional peer names resolve to.
+    pub fn unconditional_peers(&self) -> UnconditionalPeerSet {
+        self.unconditional_peers.clone()
     }
 
     /// Attach the active peer registry used by local RPC diagnostics.

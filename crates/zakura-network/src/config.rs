@@ -369,8 +369,9 @@ pub struct Config {
     /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
-    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, or a CIDR range, such as
-    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
+    /// `"peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`. CIDR ranges
+    /// with host bits set are rejected, and a DNS name needs a port.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.
     ///
@@ -379,13 +380,19 @@ pub struct Config {
     /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
     /// mempool cooldowns and their disconnects.
     ///
-    /// Zakura also dials every entry that names one address, and dials it again whenever
-    /// no connection to that peer is open, in either direction. An entry without a port
-    /// is dialed on the network's default port. A CIDR range has no single address, so
-    /// it is never dialed. A dial to a peer that accepts no connections fails quietly and
-    /// is retried about once a minute.
+    /// Zakura also dials every entry that names one address or one DNS name, and dials
+    /// it again whenever no connection to that peer is open, in either direction. An IP
+    /// address without a port is dialed on the network's default port. A CIDR range has
+    /// no single address, so it is never dialed. A dial to a peer that accepts no
+    /// connections fails quietly and is retried about once a minute.
     ///
-    /// Each dialed address gets its own connection slot, outside the outbound connection
+    /// Zakura looks a DNS name up again at the start of every dial, so it follows a peer
+    /// whose name moves to a new address. The exemption covers the addresses the name
+    /// resolved to in the last lookup that worked, and Zakura lifts any ban on them. It
+    /// does not look a name up while that peer is connected. When a lookup fails, Zakura
+    /// dials the addresses of the last lookup that worked.
+    ///
+    /// Each dialed entry gets its own connection slot, outside the outbound connection
     /// limit. Zakura still applies the inbound and per-IP connection limits to these
     /// peers, and still disconnects them on protocol errors or inbound overload.
     ///
@@ -396,7 +403,8 @@ pub struct Config {
     /// # Security
     ///
     /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
-    /// Only list peers you trust.
+    /// Only list peers you trust. Whoever controls a listed DNS name, or the answers
+    /// this node gets for it, chooses addresses that Zakura trusts in the same way.
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///

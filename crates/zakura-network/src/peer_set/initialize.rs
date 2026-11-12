@@ -56,6 +56,7 @@ use crate::{
     peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
+    unconditional_peer_set::UnconditionalPeerSet,
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
@@ -66,7 +67,9 @@ mod tests;
 mod recent_by_ip;
 mod unconditional_peers;
 
-use unconditional_peers::{keep_unconditional_peers_connected, unconditional_peer_dial_addrs};
+use unconditional_peers::{
+    keep_unconditional_peers_connected, resolve_host, unconditional_peer_dial_targets,
+};
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
 ///
@@ -284,12 +287,16 @@ where
         .as_ref()
         .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
+    let (unconditional_peers, resolved_unconditional_peers) =
+        UnconditionalPeerSet::new(config.unconditional_peers.clone());
+
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
         AddressBookUpdater::spawn_with_peer_registry(
             &config,
             listen_addr,
             advertised_services,
             peer_registry.clone(),
+            unconditional_peers,
         );
 
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
@@ -425,7 +432,7 @@ where
             constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
             listen_handshaker,
             peerset_tx.clone(),
-            bans,
+            bans.clone(),
             block_gossip_peer_ips,
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
@@ -433,12 +440,16 @@ where
         ))));
 
         // 2. Unconditional peers, which are dialed again whenever they are not connected.
-        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
-        if !unconditional_dial_addrs.is_empty() {
+        let unconditional_dial_targets = unconditional_peer_dial_targets(&config, listen_addr);
+        if !unconditional_dial_targets.is_empty() {
             let unconditional_peers_fut = keep_unconditional_peers_connected(
                 config.clone(),
-                unconditional_dial_addrs,
+                listen_addr,
+                unconditional_dial_targets,
                 peer_registry,
+                resolved_unconditional_peers,
+                bans,
+                tower::service_fn(resolve_host),
                 outbound_connector.clone(),
                 peerset_tx.clone(),
             );

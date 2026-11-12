@@ -15,7 +15,8 @@ use crate::{
     constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
-    AddressBook,
+    unconditional_peer_set::UnconditionalPeerSet,
+    AddressBook, BannedIps,
 };
 
 /// Cache ranking uses measured RTT, retaining book order for measured ties.
@@ -506,6 +507,83 @@ fn unconditional_peer_misbehavior_is_ignored() {
     );
     assert!(address_book.get(other_addr).is_none());
     assert!(address_book.get(unconditional_addr).is_some());
+}
+
+/// The address book ignores misbehavior reports for the addresses that an unconditional
+/// peer's name resolves to, and stops when the name moves away from an address.
+#[test]
+fn unconditional_peer_misbehavior_is_ignored_at_resolved_addresses() {
+    let addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let (unconditional_peers, resolved_peers) =
+        UnconditionalPeerSet::new(UnconditionalPeers::default());
+    let mut address_book =
+        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
+            .with_unconditional_peers(unconditional_peers);
+    let bans = address_book.bans();
+
+    // The name resolves to the address.
+    resolved_peers.publish([addr.ip()]);
+    assert!(address_book.unconditional_peers().contains(addr.ip()));
+
+    let updated = address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
+    assert_eq!(updated, None, "the misbehavior report should be dropped");
+    assert!(!bans.contains(addr.ip()));
+
+    // The name moves to another address.
+    resolved_peers.publish(["127.0.0.2".parse().unwrap()]);
+    assert!(!address_book.unconditional_peers().contains(addr.ip()));
+
+    address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
+    assert!(
+        bans.contains(addr.ip()),
+        "an address that the name left is banned like any other"
+    );
+}
+
+/// Lifting a ban removes the IP from the ban list, and leaves the list able to ban it
+/// again.
+#[test]
+fn lifted_ban_can_be_applied_again() {
+    let ip = "127.0.0.1".parse().unwrap();
+    let other_ip = "127.0.0.2".parse().unwrap();
+
+    let bans = BannedIps::with_banned_ip(ip);
+    bans.insert(other_ip);
+
+    bans.remove(ip);
+    assert!(!bans.contains(ip));
+    assert!(bans.contains(other_ip), "other bans stay in place");
+
+    // Lifting a ban that is not there changes nothing.
+    bans.remove(ip);
+    assert!(bans.contains(other_ip));
+
+    bans.insert(ip);
+    assert!(bans.contains(ip));
+}
+
+/// A ban that was lifted and applied again is as new as its second application, so a
+/// full ban list evicts older bans first.
+#[test]
+fn lifted_ban_keeps_no_place_in_the_eviction_order() {
+    let ip = |host: u32| std::net::IpAddr::from(std::net::Ipv4Addr::from(host));
+
+    // Ban 1 is the oldest, until it is lifted and applied again.
+    let bans = BannedIps::default();
+    bans.insert(ip(1));
+    bans.insert(ip(2));
+    bans.remove(ip(1));
+    bans.insert(ip(1));
+
+    // Fill the list, then add one more ban, which evicts the oldest.
+    let max_banned_ips = u32::try_from(crate::constants::MAX_BANNED_IPS).unwrap();
+    for host in 3..=max_banned_ips + 1 {
+        bans.insert(ip(host));
+    }
+
+    assert!(!bans.contains(ip(2)), "the oldest ban is evicted");
+    assert!(bans.contains(ip(1)), "the ban that was applied again stays");
 }
 
 /// Repeated sub-threshold misbehavior reports for an unconditional peer never

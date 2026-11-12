@@ -11,7 +11,8 @@ use tracing::{Level, Span};
 
 use crate::{
     address_book::AddressMetrics, meta_addr::MetaAddrChange, peer_registry::PeerRegistry,
-    types::PeerServices, AddressBook, BannedIps, BoxError, Config,
+    types::PeerServices, unconditional_peer_set::UnconditionalPeerSet, AddressBook, BannedIps,
+    BoxError, Config,
 };
 
 type SpawnedAddressBook = (
@@ -60,21 +61,30 @@ impl AddressBookUpdater {
         watch::Receiver<AddressMetrics>,
         JoinHandle<Result<(), BoxError>>,
     ) {
-        Self::spawn_inner(config, local_listener, advertised_services, None)
+        Self::spawn_inner(
+            config,
+            local_listener,
+            advertised_services,
+            None,
+            config.unconditional_peers.clone().into(),
+        )
     }
 
-    /// Spawn an address book and attach a separate active peer registry.
+    /// Spawn an address book that never scores or bans `unconditional_peers`, and
+    /// attach a separate active peer registry.
     pub(crate) fn spawn_with_peer_registry(
         config: &Config,
         local_listener: SocketAddr,
         advertised_services: PeerServices,
         peer_registry: PeerRegistry,
+        unconditional_peers: UnconditionalPeerSet,
     ) -> SpawnedAddressBook {
         Self::spawn_inner(
             config,
             local_listener,
             advertised_services,
             Some(peer_registry),
+            unconditional_peers,
         )
     }
 
@@ -83,6 +93,7 @@ impl AddressBookUpdater {
         local_listener: SocketAddr,
         advertised_services: PeerServices,
         peer_registry: Option<PeerRegistry>,
+        unconditional_peers: UnconditionalPeerSet,
     ) -> SpawnedAddressBook {
         // Create an mpsc channel for peerset address book updates,
         // based on the maximum number of inbound and outbound peers.
@@ -99,12 +110,14 @@ impl AddressBookUpdater {
         )
         .with_local_listener_services(advertised_services)
         .with_expose_peer_addresses(config.expose_peer_addresses)
-        .with_unconditional_peers(config.unconditional_peers.clone());
+        .with_unconditional_peers(unconditional_peers);
         if !config.unconditional_peers.is_empty() {
             if config.expose_peer_addresses {
                 let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                let unconditional_peer_names = config.unconditional_peers.dial_hosts();
                 info!(
                     ?unconditional_peers,
+                    ?unconditional_peer_names,
                     "ignoring misbehavior reports from unconditional peers"
                 );
             } else {

@@ -1028,7 +1028,7 @@ async fn peer_penalties_with_unconditional(
             Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
         );
     }
-    mempool.unconditional_peers = unconditional_peers;
+    mempool.unconditional_peers = unconditional_peers.into();
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(network);
@@ -4049,7 +4049,7 @@ async fn setup_with_mempool_config(
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
-        zn::UnconditionalPeers::default(),
+        zn::UnconditionalPeerSet::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

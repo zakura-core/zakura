@@ -806,6 +806,53 @@ const C22_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C21's proving tests: for each `header-sync` check the header node
+/// harnesses register that can find two failures at one boundary, two
+/// distinct ones there surviving into the run's report and the full report
+/// recorded beside its trace, which a fresh replay sends again. The
+/// claim-reading checks share one test, and `commit-only-authorized` and
+/// `header-fault-penalized` are C22's and C13's. `honest-progress` and
+/// `bounded-adversary-progress` find at most one failure in a run, as their
+/// checks say, so they have none.
+const C21_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::every_operation_id_finding_at_a_step_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_check_keeps_two_findings_at_a_boundary_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/fork_choice/tests.rs",
+        "harness::header_node::fork_choice::tests::a_selection_break_beside_a_settled_break_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/wake.rs",
+        "harness::header_node::wake::tests::every_unanswered_wake_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/hold_wake/tests.rs",
+        "harness::header_node::hold_wake::tests::every_unhandled_held_reply_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::every_unread_publication_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+];
+
 /// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
 const fn planted_test(test: &'static str) -> TestRef {
     TestRef {
@@ -1029,9 +1076,9 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every
-/// other row's deliveries landed, and its state names the proving test
-/// still missing.
+/// stores, C13 by hf-1 to hf-3, and C21 and C22 by hf-8 and hf-9 with E4's
+/// sidecar. Every other row's deliveries landed, and its state names the
+/// proving test still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1212,13 +1259,12 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        waiting(
+        satisfied(
             C21,
             "Adam's harness",
             "Every header check keeps every finding at a boundary, not just its first.",
+            C21_PROVING,
             "hf-8",
-            "a two-finding report and sidecar test for every header check, those hdr-9, \
-             hdr-10 and hdr-12 added after hf-8 included",
         ),
         satisfied(
             C22,

@@ -817,9 +817,10 @@ const fn planted_test(test: &'static str) -> TestRef {
 
 /// C4's proving tests: the planted runner's classification of baseline and
 /// patched runs, its fresh replay of every catch, typed and fuzz-input, a
-/// deadline killing a hung baseline, patched or campaign run, and its
-/// set-aware judgment of a nested case. The fresh-replay and hang tests are
-/// `cfg(unix)`, which the acceptance host, Linux, builds.
+/// deadline killing a hung baseline, patched or campaign run, a recording
+/// that exits nonzero after a passing witness never counting, and its
+/// set-aware judgment of a nested case. The fresh-replay, hang and exit
+/// tests are `cfg(unix)`, which the acceptance host, Linux, builds.
 const C4_PROVING: &[TestRef] = &[
     planted_test("planted::tests::planted_passes_only_on_its_own_id"),
     planted_test("planted::tests::witness_flags_carry_the_co_violations"),
@@ -834,6 +835,7 @@ const C4_PROVING: &[TestRef] = &[
     planted_test("planted::tests::a_replay_miss_reads_the_exit_status"),
     planted_test("planted::tests::a_hung_patched_run_is_killed_and_never_caught"),
     planted_test("planted::tests::a_hung_baseline_or_campaign_run_is_killed_and_never_passes"),
+    planted_test("planted::tests::a_recording_that_exits_nonzero_never_counts"),
     planted_test("planted::tests::a_nested_case_needs_exactly_its_set"),
     planted_test("planted::tests::a_typed_case_watches_and_runs_its_files"),
 ];

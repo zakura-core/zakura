@@ -138,6 +138,11 @@ impl<S: Subsystem> HasView for Without<S> {
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
     }
+
+    /// `S`'s store snapshot.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        self.0.snapshot()
+    }
 }
 
 impl<S: Own> Subsystem for Without<S> {

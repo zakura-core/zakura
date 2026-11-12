@@ -828,6 +828,8 @@ pub struct Storage {
     topology: Rc<Topology>,
     /// The run's recovery, once a `Recover` step is picked.
     recovery: RecoveryEvidence,
+    /// The node's evidence stores, which hold every store above.
+    stores: EvidenceStores,
 }
 
 /// What [`Storage`]'s checks read between steps.
@@ -1118,6 +1120,12 @@ impl HasView for Storage {
     /// view-side store its tap and harness keep.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         Some(self.stamps.after(after))
+    }
+
+    /// Every store in the node's stores, as they froze with the log
+    /// ([`EvidenceStores::report_snapshot`]).
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.stores.report_snapshot())
     }
 }
 
@@ -1465,6 +1473,7 @@ impl Subsystem for Storage {
             faults,
             topology,
             recovery,
+            stores: ports.stores,
         }
     }
 
@@ -1692,6 +1701,8 @@ pub struct HeaderWire {
     /// view shows empty: outstanding work, recovery, fork choice and
     /// publication.
     inert: Inert,
+    /// The node's evidence stores, which hold every store above.
+    stores: EvidenceStores,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -1766,6 +1777,12 @@ impl HasView for HeaderWire {
     /// `header-sync/honest-progress`'s obligation.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         Some(self.stamps.after(after))
+    }
+
+    /// Every store in the node's stores, as they froze with the log
+    /// ([`EvidenceStores::report_snapshot`]).
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.stores.report_snapshot())
     }
 }
 
@@ -2017,6 +2034,7 @@ impl Subsystem for HeaderWire {
                 fork_choice: ForkChoiceEvidence::new(&ports.stores),
                 publication: PublicationEvidence::new(&ports.stores),
             },
+            stores: ports.stores,
             _keep: Box::new(node),
         }
     }

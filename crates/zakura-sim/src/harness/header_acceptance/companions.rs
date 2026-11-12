@@ -798,7 +798,7 @@ mod tests {
     fn the_sent_page_comes_from_the_frames_evidence() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let peers = vec![("peer-0".to_owned(), "ab".to_owned())];
-        let pages = SentPages::default();
+        let pages = SentPages::new(&crate::stores::EvidenceStores::default());
         assert!(sent_page(&page, &peers, &pages).is_err());
         pages.record((1, 4, 3), sent().hashes);
         assert_eq!(sent_page(&page, &peers, &pages), Ok(sent()));

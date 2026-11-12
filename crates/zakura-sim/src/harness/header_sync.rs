@@ -1903,7 +1903,7 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             closed: PeerCloses::default(),
             reservations: ReservationEvidence::new(&stores),
-            sent_pages: crate::peer::SentPages::default(),
+            sent_pages: crate::peer::SentPages::new(&stores),
             capacity: CapacityEvidence::new(&stores),
             rounds: SettlementEvidence::new(&stores),
             stale_calls: StaleEvidence::new(&stores),

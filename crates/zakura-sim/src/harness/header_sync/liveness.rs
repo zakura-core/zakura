@@ -1323,7 +1323,8 @@ impl RecoveryProgressInputs {
 struct Deadlines {
     retirement: RetirementEvidence,
     ends: EndEvidence,
-    /// The finish, whose unpaid `Status` debts' deadlines it also offers.
+    /// The publication evidence the finish reads, whose unpaid `Status`
+    /// debts' deadlines it also offers.
     publication: PublicationEvidence,
 }
 

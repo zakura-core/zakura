@@ -1,0 +1,19 @@
+# Makes `start_readmission_cooldown` install half the configured cooldown:
+# the reactor still starts one after each header-peer fault, but the peer
+# gets back in after 30 s instead of 60 s, and `CooldownStarted` says 30 s.
+# The required failure is `UncooledFault`, at the step after the reactor
+# handled the failed preparation. The input is the late-fault fixture,
+# scripted because no Plan bytes reach it: steering picks the peer's
+# disconnect while the node's storage holds the preparation of its invalid
+# tip, so the preparation fails `InvalidHeader` and the reactor cools the
+# peer down. No reconnect after the 30 s mark is needed, since the penalty
+# rule reads the cooldown the reactor installed.
+# Besides state.rs, which the patch changes, the rest of header sync
+# decides when the node submits that preparation and whether the reactor
+# starts the cooldown. A change there can move the script off its fault.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-late-fault.json"
+script = "crates/zakura-sim/tests/fixtures/header-wire-late-fault.script.json"

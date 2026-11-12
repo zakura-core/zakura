@@ -1103,10 +1103,6 @@ const SCRIPTED_CATCH: &str = "only a scripted bypass today: a production patch g
 /// Why `header-fault-penalized`'s counted history is still owed.
 const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
                                  COVERAGE test runs test/header-wire-watched";
-/// Why `header-fault-penalized`'s catch is still owed.
-const PENALIZED_CATCH: &str = "late-fault-unpenalized, cooldown-session-gate and short-cooldown \
-                               move from native mutations to typed planted cases, after the ID \
-                               gets a trigger";
 /// Why `honest-never-punished`'s catch is still owed.
 const HONEST_CATCH: &str = "only a scripted bypass today, and any production punishment of an \
                             honest peer also breaks conformant-never-closes, so its catch is \
@@ -1138,7 +1134,6 @@ pub fn owed_open(key: &Key) -> Option<Expected> {
         {
             (SCRIPTED_CATCH, "hdr-14.4")
         }
-        Key::Catch { property } if property == PENALIZED => (PENALIZED_CATCH, "hdr-14.4"),
         Key::Catch { property } if property == HONEST => (HONEST_CATCH, "hdr-14.4"),
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
@@ -2085,6 +2080,30 @@ fn hand_written_rows() -> Vec<Row> {
     let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
     for (index, (name, harness, set, found)) in [
         (
+            "every-session-refused",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "later-sessions-refused",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "missing-cooldown-refuses",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "service-rejects-valid-streams",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
             "offer-by-height",
             STORAGE,
             &[SELECTED] as &'static [&'static str],
@@ -2306,7 +2325,22 @@ fn hand_written_rows() -> Vec<Row> {
     // harness (`TEST_ONLY_WITNESSES`), so its counted history waits for a
     // registered one.
     let mut fault = vec![owed(Key::passing(penalized), G2)];
-    fault.push(owed(Key::catch(penalized), G2));
+    // hdr-14.4 moved its three native mutations here, each a typed case on
+    // the scripted late-fault fixture, and each is found at a step.
+    for name in [
+        "late-fault-unpenalized",
+        "cooldown-session-gate",
+        "short-cooldown",
+    ] {
+        fault.extend(caught(
+            WIRE,
+            case(penalized, name),
+            &[PENALIZED],
+            Found::AtStep,
+            G2,
+            name == "late-fault-unpenalized",
+        ));
+    }
     rows.push(sim_row(penalized, &[WIRE], fault));
 
     let honest = HONEST;
@@ -2850,19 +2884,23 @@ const fn to_move(
 /// classification gives them.
 pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     to_move("consumed-locator-permit", TEARDOWN, "hdr-14.4"),
-    to_move(
-        "cooldown-session-gate",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
+    NativeMutation {
+        patch: "cooldown-session-gate",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "cooldown-session-gate",
+        },
+    },
     to_move("dropped-owner-check", STALE, "hdr-14.4"),
     to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
     to_move("forgotten-locator-permit", TEARDOWN, "hdr-14.4"),
-    to_move(
-        "late-fault-unpenalized",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
+    NativeMutation {
+        patch: "late-fault-unpenalized",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "late-fault-unpenalized",
+        },
+    },
     to_move("misstored-page", COMMIT, "hdr-9c.1a"),
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
     to_move("owner-swap", COMMIT, "hdr-9c.2a"),
@@ -2898,11 +2936,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "session-view",
         },
     },
-    to_move(
-        "short-cooldown",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
+    NativeMutation {
+        patch: "short-cooldown",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "short-cooldown",
+        },
+    },
     to_move("short-payload", COMMIT, "hdr-9c.2a"),
     to_move("shutdown-kept-queue", TEARDOWN, "hdr-14.4"),
     to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),

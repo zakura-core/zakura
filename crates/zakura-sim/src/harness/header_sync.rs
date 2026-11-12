@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    spawn_header_sync_reactor, v9::RegtestMessage, FullStateFrontiers, HeaderSyncStartup,
-    ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
+    observe::{HeaderSyncObserver, ReactorEvent},
+    spawn_header_sync_reactor,
+    v9::RegtestMessage,
+    FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_rt::sync::watch;
@@ -668,6 +670,29 @@ fn step(peer: &str, action: ControlAction, when: Option<Trigger>) -> ControlStep
 /// `mirror-<index>`, a [`StorageScenario`] mirror's name.
 fn mirror(index: usize) -> String {
     format!("mirror-{index}")
+}
+
+/// A [`StorageScenario`] mirror's observer: the settled points' record of
+/// its own reactor deciding on its session with the node, from its events,
+/// and the publication check's record of it refusing the node's frames,
+/// from its capacity handle, which the mirror's service reports refusals
+/// to. Neither takes the session token or the resource probe.
+#[derive(Debug)]
+struct MirrorObserver {
+    decisions: Arc<dyn HeaderSyncObserver>,
+    refusals: Arc<dyn HeaderSyncObserver>,
+}
+
+impl HeaderSyncObserver for MirrorObserver {
+    /// Hands `event` to the decisions record.
+    fn observe(&self, event: ReactorEvent) {
+        self.decisions.observe(event);
+    }
+
+    /// The refusals record's handle.
+    fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+        self.refusals.capacity_observer()
+    }
 }
 
 /// The scenario's storage, with each actor's chain committed before the
@@ -1364,8 +1389,10 @@ impl Subsystem for Storage {
             .enumerate()
         {
             let name = format!("mirror-{index}");
-            // The served-page rule reads each mirror's `Open`s.
-            let observer = ports.publication.subscriber(&name);
+            let observer: Arc<dyn HeaderSyncObserver> = Arc::new(MirrorObserver {
+                decisions: ports.fork_choice.mirror(&name, nodes[0].id.clone()),
+                refusals: ports.publication.mirror(&name, nodes[0].id.clone()),
+            });
             let mut config = ZakuraHeaderSyncConfig::default();
             if let Some(limit) = spec.max_headers_per_response {
                 config.max_headers_per_response = limit;
@@ -1395,17 +1422,22 @@ impl Subsystem for Storage {
             .collect();
         ports.publication.name_peers(names.clone());
         let topology = Rc::new(
-            Topology::new(nodes, effects)
+            Topology::new(nodes, effects.clone())
                 .with_tap(shutdown)
                 .with_sessions(ports.sessions.clone())
                 .with_delayed_page(ports.delayed_page.clone()),
         );
+        let mut mirror_links = Vec::new();
         for (index, spec) in (1..).zip(&scenario.mirrors) {
-            match spec.dialer {
+            let link = match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
                 Dialer::Node => topology.link(0, index),
             };
+            mirror_links.push((link.conn_id, link.peer));
         }
+        ports
+            .fork_choice
+            .watch_link_ends(effects.ended.clone(), mirror_links);
         let control = Control::new(
             sim,
             topology.clone(),

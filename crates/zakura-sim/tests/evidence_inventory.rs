@@ -288,6 +288,16 @@ const REGISTERED: &[Store] = &[
              cancellations, and hf-7's freshness test reads them through the storage view",
         ),
     },
+    Store {
+        file: "src/harness/header_node/fork_choice.rs",
+        owner: "LinkEnds",
+        field: "ended",
+        checkpoints: &[HeaderTap],
+        producer: Producer::OwedToHf7(
+            "a second handle on `Effects::ended`, the topology's session lifetimes, which \
+             the fork-choice check reads for the mirrors' link ends: owed with that store",
+        ),
+    },
 ];
 
 /// The shared-state fields that aren't evidence, by file, struct and
@@ -917,5 +927,5 @@ fn owed_to_hf7() {
         .filter(|store| matches!(store.producer, Producer::OwedToHf7(_)))
         .map(|store| format!("{}.{}", store.owner, store.field))
         .collect();
-    assert_eq!(owed, ["Effects.ended"]);
+    assert_eq!(owed, ["Effects.ended", "LinkEnds.ended"]);
 }

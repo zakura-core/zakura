@@ -32,6 +32,7 @@
 //! the result to stop counting.
 
 pub mod actions;
+pub mod binding;
 pub mod companions;
 pub mod contracts;
 pub mod evaluate;

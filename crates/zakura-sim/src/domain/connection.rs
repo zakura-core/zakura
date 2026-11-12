@@ -210,6 +210,9 @@ struct ConnectionFold {
     holding: BTreeMap<u64, u16>,
     /// Each node connection's raw bytes held per kind at its last load.
     held: BTreeMap<(u64, u16), u64>,
+    /// Each node connection's raw and output gates' free bytes per kind at
+    /// its last load.
+    free: BTreeMap<(u64, u16), (u64, u64)>,
     /// Each peer connection's saturation at its last load.
     saturated: BTreeMap<PeerConn, bool>,
     /// Each peer connection's pending writes, by stream and sequence.
@@ -220,6 +223,9 @@ struct ConnectionFold {
     /// Whether a service held more received frame bytes than another
     /// service's receive share on its connection.
     held_past_another_share: bool,
+    /// Whether a gate's free bytes rose between two loads of its
+    /// connection: a grant returned bytes.
+    grant_returned: bool,
     /// Whether a write that started under saturation reached the node
     /// after other services' frames.
     written_under_saturation: bool,
@@ -386,6 +392,17 @@ impl ConnectionFold {
         for load in kinds {
             let share = shares.share(load.kind);
             self.held.insert((connection, load.kind), load.raw_held);
+            let free = (
+                load.raw_capacity
+                    .saturating_sub(load.raw_held)
+                    .saturating_add(load.raw_excess),
+                load.output_capacity
+                    .saturating_sub(load.output_held)
+                    .saturating_add(load.output_excess),
+            );
+            if let Some(last) = self.free.insert((connection, load.kind), free) {
+                self.grant_returned |= free.0 > last.0 || free.1 > last.1;
+            }
             self.held_past_another_share |= kinds.iter().any(|other| {
                 other.kind != load.kind && load.raw_held > shares.share(other.kind).receive
             });
@@ -635,7 +652,8 @@ where
 /// [`CONNECTION_SHARES_BOUND`]'s trigger history: a service on a
 /// connection held more received frame bytes than another service's
 /// receive share there, so a gate the two shared would have let one take
-/// the other's share.
+/// the other's share; or a gate's free bytes rose between two loads, so a
+/// grant returned bytes and a second return would free them twice.
 fn held_past_another_share<S>(view: &S::View, log: &ObservationLog) -> bool
 where
     S: HasView,
@@ -644,7 +662,7 @@ where
     view.wire().is_some_and(|wire| {
         let mut fold = wire.fold.borrow_mut();
         fold.advance(&wire.bounds, log);
-        fold.held_past_another_share
+        fold.held_past_another_share || fold.grant_returned
     })
 }
 

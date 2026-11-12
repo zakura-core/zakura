@@ -1,0 +1,143 @@
+{
+  "node": {
+    "main": 2,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 8,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 1,
+        "fork": null
+      },
+      "dialer": "node"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "prepare",
+          "nth": 1,
+          "session": null,
+          "held": false
+        },
+        "until": {
+          "count": [
+            2,
+            {
+              "session-admitted": "mirror-0"
+            }
+          ]
+        },
+        "then": [
+          "engine"
+        ],
+        "deadline_ms": null
+      }
+    ],
+    "reply_holds": [
+      {
+        "select": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        },
+        "until": {
+          "reset": "node"
+        }
+      }
+    ]
+  },
+  "controls": [
+    {
+      "peer": "mirror-0",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "prepare",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-0"
+      }
+    },
+    {
+      "peer": "node",
+      "action": {
+        "reset": {
+          "invalidate": {
+            "depth": 0
+          }
+        }
+      },
+      "when": {
+        "committed": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    },
+    {
+      "peer": "node",
+      "action": {
+        "reset": "reconsider"
+      },
+      "when": {
+        "completed": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        }
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "close",
+      "when": null
+    },
+    {
+      "peer": "mirror-1",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-1"
+      }
+    },
+    {
+      "peer": "node",
+      "action": "shutdown",
+      "when": {
+        "count": [
+          2,
+          {
+            "session-admitted": "mirror-1"
+          }
+        ]
+      }
+    },
+    {
+      "peer": "node",
+      "action": "stop-storage",
+      "when": null
+    }
+  ]
+}

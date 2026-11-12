@@ -1097,12 +1097,16 @@ pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: 
     })
 }
 
+/// Why `storage-operation-ids` has no catch: its facts are written only by
+/// simulator code, which no production patch reaches.
+const OPERATION_IDS_UNREACHED: &str =
+    "only the controlled storage port, zakura-storage's ControlledPort, numbers the node's \
+     storage operations and logs their submissions and completions, so only storage-fake code \
+     can break the rule and no production patch can";
+
 /// Why a reachable generated ID's catch is still owed.
 const GENERATED_CATCH: &str =
     "one planted case per reachable generated ID, from about six production patches (decision 1)";
-/// Why a catch with only a scripted bypass is still owed.
-const SCRIPTED_CATCH: &str = "only a scripted bypass today: a production patch gets a Caught, \
-                              or harness-only breakage gets an approved Open";
 /// Why `header-fault-penalized`'s counted history is still owed.
 const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
                                  COVERAGE test runs test/header-wire-watched";
@@ -1117,8 +1121,8 @@ const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harnes
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
 /// plan's PR table. Every reachable generated ID's catch is hdr-14.5's, and
-/// the scripted-only and sim-wide IDs' catches and the two test-only
-/// witnesses' passing histories are hdr-14.4's. [`Key::covers`] takes a
+/// the sim-wide IDs' catches and the two test-only witnesses' passing
+/// histories are hdr-14.4's. [`Key::covers`] takes a
 /// transitional `Open` on such a key only if it's exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
@@ -1127,11 +1131,6 @@ pub fn owed_open(key: &Key) -> Option<Expected> {
                 && !property.ends_with("over-owed-closes") =>
         {
             (GENERATED_CATCH, "hdr-14.5")
-        }
-        Key::Catch { property }
-            if [OPERATION_IDS, DIRECT_DISPATCH].contains(&property.as_str()) =>
-        {
-            (SCRIPTED_CATCH, "hdr-14.4")
         }
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
@@ -1258,11 +1257,27 @@ fn hand_written_rows() -> Vec<Row> {
     let mut rows = Vec::new();
 
     let mut operation_ids = holds(OPERATION_IDS, G1, NODE_SYNC);
-    operation_ids.push(owed(Key::catch(OPERATION_IDS), G1));
+    operation_ids.push(result(
+        vec![Key::catch(OPERATION_IDS)],
+        G1,
+        Expected::Open {
+            reason: OPERATION_IDS_UNREACHED,
+            owner: "hdr-14",
+            approval: Approval::Pending,
+            until: None,
+        },
+    ));
     rows.push(sim_row(OPERATION_IDS, storage_harnesses, operation_ids));
 
     let mut direct = holds(DIRECT_DISPATCH, G1, NODE_SYNC);
-    direct.push(owed(Key::catch(DIRECT_DISPATCH), G1));
+    direct.extend(caught(
+        STORAGE,
+        case(DIRECT_DISPATCH, "locator-to-action-channel"),
+        &[DIRECT_DISPATCH],
+        Found::AtStep,
+        G1,
+        true,
+    ));
     rows.push(sim_row(DIRECT_DISPATCH, storage_harnesses, direct));
 
     let mut chunk = holds(CHUNK, G5, CLOSE_RELINK_CAPACITY);

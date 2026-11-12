@@ -648,19 +648,19 @@ fn every_required_key_is_covered_once_with_its_gates() {
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
             *until = Some("hdr-14.5");
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
             *owner = "Evan's side";
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
             *reason = "some other reason hdr-14.4 owns";
         }

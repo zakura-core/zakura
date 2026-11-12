@@ -2545,7 +2545,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::View],
             status: Status::Active,
             check: check_direct_dispatch::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::View(storage_call_dispatched)),
         },
         chunk_budget_bound(),
         teardown_returns_baseline(),
@@ -2658,6 +2658,20 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
     } else {
         Verdict::Holds
     }
+}
+
+/// [`DIRECT_DISPATCH`]'s trigger: a reactor dispatched a storage call,
+/// either to the node's port, whose header storage logs its submission, or
+/// to its action channel, which sets the dispatch guard's flag. So the rule
+/// had a call to judge.
+fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
+    view.direct_dispatch_broken
+        || log.entries().iter().any(|entry| {
+            matches!(
+                operation_fact(HEADER_SERVICE, &entry.obs),
+                Some(StorageFact::Submitted { .. })
+            )
+        })
 }
 
 /// [`HEADER_FAULT_PENALIZED`], active.

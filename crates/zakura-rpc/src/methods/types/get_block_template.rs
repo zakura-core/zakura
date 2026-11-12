@@ -1208,8 +1208,6 @@ where
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?;
 
-    // TODO: Order transactions in block templates based on their dependencies
-
     let mempool::Response::FullTransactions {
         transactions,
         transaction_dependencies,

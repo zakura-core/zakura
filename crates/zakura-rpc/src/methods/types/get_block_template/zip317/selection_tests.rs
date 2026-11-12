@@ -1,10 +1,9 @@
-//! Test-only indexed selector prototype and GBT CPU benchmarks.
+//! Indexed selection tests and the GBT CPU benchmark.
 //!
-//! Production selection stays unchanged. Fixtures have canonical encoded shapes
-//! and unique nullifiers, but placeholder proofs/signatures are not verified.
+//! Fixtures have canonical encoded shapes and unique nullifiers, but
+//! placeholder proofs/signatures are not verified.
 
 use std::{
-    cmp::Ordering,
     collections::BTreeSet,
     hint::black_box,
     sync::Arc,
@@ -27,102 +26,18 @@ use zakura_chain::{
 };
 use zakura_state::GetBlockTemplateChainInfo;
 
-use super::*;
+use super::{
+    indexed::{
+        parents, priority, IndexedSelector, Pool, Priority, MAX_PACKING_SCAN_ENTRIES,
+        PACKING_THRESHOLD_BYTES, SELECTION_STOP_BYTES,
+    },
+    *,
+};
 use crate::methods::types::get_block_template::{
     proposal::proposal_block_from_template, BlockTemplateResponse, MinerAddress,
 };
 
-const PACKING_THRESHOLD_BYTES: usize = 50_000;
-const MAX_PACKING_SCAN_ENTRIES: usize = 100;
-const SELECTION_STOP_BYTES: usize = 3_000;
 const SAMPLES: usize = 12;
-
-#[derive(Clone, Copy, Debug)]
-struct Priority {
-    fee: u64,
-    cost: u64,
-    time: Option<chrono::DateTime<chrono::Utc>>,
-    id: transaction::Hash,
-}
-
-impl Ord for Priority {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (u128::from(other.fee) * u128::from(self.cost))
-            .cmp(&(u128::from(self.fee) * u128::from(other.cost)))
-            .then_with(|| self.time.cmp(&other.time))
-            .then_with(|| self.id.cmp(&other.id))
-    }
-}
-impl PartialOrd for Priority {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl PartialEq for Priority {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl Eq for Priority {}
-
-type Pool = HashMap<transaction::Hash, VerifiedUnminedTx>;
-
-fn parents<'a>(
-    deps: &'a TransactionDependencies,
-    id: &transaction::Hash,
-) -> impl Iterator<Item = transaction::Hash> + 'a {
-    deps.dependencies().get(id).into_iter().flatten().copied()
-}
-
-/// Returns the still-required package in parent-first order, rejecting missing
-/// ancestors or cycles. Only the fixture's bounded dependency groups are used.
-fn package(
-    id: transaction::Hash,
-    pool: &Pool,
-    selected: &HashMap<transaction::Hash, usize>,
-    deps: &TransactionDependencies,
-) -> Option<Vec<transaction::Hash>> {
-    let mut pending = vec![id];
-    let mut required = HashSet::new();
-    while let Some(id) = pending.pop() {
-        if selected.contains_key(&id) || !required.insert(id) {
-            continue;
-        }
-        pool.get(&id)?;
-        pending.extend(parents(deps, &id));
-    }
-    let mut ordered = Vec::new();
-    while !required.is_empty() {
-        let next = required.iter().copied().find(|id| {
-            parents(deps, id)
-                .all(|parent| selected.contains_key(&parent) || ordered.contains(&parent))
-        })?;
-        required.remove(&next);
-        ordered.push(next);
-    }
-    Some(ordered)
-}
-
-fn priority(
-    id: transaction::Hash,
-    pool: &Pool,
-    selected: &HashMap<transaction::Hash, usize>,
-    deps: &TransactionDependencies,
-) -> Option<Priority> {
-    let mut fee = 0_u64;
-    let mut cost = 0_u64;
-    for member in package(id, pool, selected, deps)? {
-        let member_fee: u64 = pool[&member].miner_fee.into();
-        fee = fee.checked_add(member_fee)?;
-        cost = cost.checked_add(pool[&member].cost())?;
-    }
-    Some(Priority {
-        fee,
-        cost,
-        time: pool[&id].time,
-        id,
-    })
-}
 
 fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTemplateLimits {
     let coinbase =
@@ -130,183 +45,43 @@ fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTempla
     BlockTemplateLimits::initial(network, height, coinbase)
 }
 
-fn copy_limits(value: &BlockTemplateLimits) -> BlockTemplateLimits {
-    BlockTemplateLimits {
-        remaining_bytes: value.remaining_bytes,
-        remaining_sigops: value.remaining_sigops,
-        remaining_unpaid_actions: value.remaining_unpaid_actions,
-        remaining_orchard_actions: value.remaining_orchard_actions,
-        remaining_ironwood_actions: value.remaining_ironwood_actions,
-        remaining_sapling_ios: value.remaining_sapling_ios,
-        remaining_sprout_joinsplits: value.remaining_sprout_joinsplits,
-        remaining_shielded_cost: value.remaining_shielded_cost,
-    }
+/// Selected transactions, the number of entries packing visited, and the
+/// time packing took.
+struct Selection {
+    txs: Vec<SelectedMempoolTx>,
+    packing_scanned: usize,
+    packing_elapsed: Duration,
 }
 
-struct IndexedSelector {
-    pool: Pool,
-    order: Vec<transaction::Hash>,
+/// Runs the primary passes, then packing if `pack` is set.
+fn run(
+    txs: Vec<VerifiedUnminedTx>,
     deps: TransactionDependencies,
-    selected_depths: HashMap<transaction::Hash, usize>,
-    selected: Vec<SelectedMempoolTx>,
-    changed: HashSet<transaction::Hash>,
-    updates: BTreeSet<Priority>,
-    update_keys: HashMap<transaction::Hash, Priority>,
-    cursor: usize,
-    minimum_size: usize,
     limits: BlockTemplateLimits,
+    pack: bool,
+) -> Selection {
+    let mut selector = IndexedSelector::new(txs, deps, limits);
+    selector.select_primary();
+    let (packing_scanned, packing_elapsed) = if pack {
+        let start = Instant::now();
+        let scanned = selector.pack();
+        (scanned, start.elapsed())
+    } else {
+        (0, Duration::ZERO)
+    };
+    Selection {
+        txs: selector.selected().to_vec(),
+        packing_scanned,
+        packing_elapsed,
+    }
 }
 
-impl IndexedSelector {
-    fn new(
-        txs: Vec<VerifiedUnminedTx>,
-        deps: TransactionDependencies,
-        limits: BlockTemplateLimits,
-    ) -> Self {
-        let mut pool = HashMap::with_capacity(txs.len());
-        let mut order = Vec::with_capacity(txs.len());
-        let mut minimum_size = usize::MAX;
-        for tx in txs {
-            let id = tx.transaction.id().mined_id();
-            minimum_size = minimum_size.min(tx.transaction.size());
-            order.push(id);
-            pool.insert(id, tx);
-        }
-        Self {
-            pool,
-            order,
-            deps,
-            selected_depths: HashMap::new(),
-            selected: Vec::new(),
-            changed: HashSet::new(),
-            updates: BTreeSet::new(),
-            update_keys: HashMap::new(),
-            cursor: 0,
-            minimum_size,
-            limits,
-        }
-    }
-
-    fn best(&mut self) -> Option<transaction::Hash> {
-        while self.cursor < self.order.len()
-            && (self.changed.contains(&self.order[self.cursor])
-                || !self.pool.contains_key(&self.order[self.cursor]))
-        {
-            self.cursor += 1;
-        }
-        let baseline = self
-            .order
-            .get(self.cursor)
-            .and_then(|id| priority(*id, &self.pool, &self.selected_depths, &self.deps));
-        let updated = self.updates.first().copied();
-        match (baseline, updated) {
-            (Some(base), Some(local)) if base <= local => {
-                self.cursor += 1;
-                Some(base.id)
-            }
-            (_, Some(_)) => {
-                let next = self.updates.pop_first()?;
-                self.update_keys.remove(&next.id);
-                Some(next.id)
-            }
-            (Some(base), None) => {
-                self.cursor += 1;
-                Some(base.id)
-            }
-            (None, None) => None,
-        }
-    }
-
-    fn emit(&mut self, id: transaction::Hash) {
-        let depth = parents(&self.deps, &id)
-            .map(|parent| self.selected_depths[&parent] + 1)
-            .max()
-            .unwrap_or(0);
-        self.selected_depths.insert(id, depth);
-        self.selected.push((depth, self.pool.remove(&id).unwrap()));
-    }
-
-    fn add_package(&mut self, id: transaction::Hash) -> bool {
-        let Some(package) = package(id, &self.pool, &self.selected_depths, &self.deps) else {
-            return false;
-        };
-        let mut next_limits = copy_limits(&self.limits);
-        if !package.iter().all(|id| next_limits.try_add(&self.pool[id])) {
-            return false;
-        }
-        self.limits = next_limits;
-        for &id in &package {
-            self.emit(id);
-        }
-        let mut pending = package;
-        let mut affected = HashSet::new();
-        while let Some(id) = pending.pop() {
-            for &child in self.deps.dependents().get(&id).into_iter().flatten() {
-                if affected.insert(child) {
-                    pending.push(child);
-                }
-            }
-        }
-        for id in affected {
-            if let Some(old) = self.update_keys.remove(&id) {
-                self.updates.remove(&old);
-            }
-            self.changed.insert(id);
-            if self.pool.contains_key(&id) {
-                let next = priority(id, &self.pool, &self.selected_depths, &self.deps).unwrap();
-                self.updates.insert(next);
-                self.update_keys.insert(id, next);
-            }
-        }
-        true
-    }
-
-    fn finish(mut self, pack: bool) -> Selection {
-        while self.limits.remaining_bytes > SELECTION_STOP_BYTES {
-            let Some(id) = self.best() else {
-                break;
-            };
-            if !self.add_package(id) {
-                break;
-            }
-        }
-        let mut scanned = 0;
-        let mut packing_elapsed = Duration::ZERO;
-        if pack && self.limits.remaining_bytes > PACKING_THRESHOLD_BYTES {
-            let start = Instant::now();
-            let scan_end = self
-                .cursor
-                .saturating_add(MAX_PACKING_SCAN_ENTRIES)
-                .min(self.order.len());
-            // Continue from the main pass without revisiting its prefix. Every
-            // visited entry counts, including selected or ineligible entries.
-            for offset in self.cursor..scan_end {
-                if self.limits.remaining_bytes <= SELECTION_STOP_BYTES
-                    || self.limits.remaining_bytes < self.minimum_size
-                {
-                    break;
-                }
-                scanned += 1;
-                let id = self.order[offset];
-                let Some(tx) = self.pool.get(&id) else {
-                    continue;
-                };
-                if tx.transaction.size() <= self.limits.remaining_bytes
-                    && parents(&self.deps, &id)
-                        .all(|parent| self.selected_depths.contains_key(&parent))
-                    && self.limits.try_add(tx)
-                {
-                    self.emit(id);
-                }
-            }
-            packing_elapsed = start.elapsed();
-        }
-        Selection {
-            txs: self.selected,
-            scanned,
-            packing_elapsed,
-        }
-    }
+fn ids(selection: &Selection) -> Vec<transaction::Hash> {
+    selection
+        .txs
+        .iter()
+        .map(|(_, tx)| tx.transaction.id().mined_id())
+        .collect()
 }
 
 struct Factory {
@@ -409,7 +184,7 @@ struct Fixture {
 impl Fixture {
     fn from_transactions(txs: Vec<VerifiedUnminedTx>) -> Self {
         let mut deps = TransactionDependencies::default();
-        let mut pool = HashMap::new();
+        let mut pool = Pool::new();
         let mut cost = 0;
         for tx in txs {
             let id = tx.transaction.id().mined_id();
@@ -417,7 +192,7 @@ impl Fixture {
             cost += tx.cost();
             pool.insert(id, tx);
         }
-        let selected = HashMap::new();
+        let selected = std::collections::HashMap::new();
         let index = pool
             .keys()
             .map(|id| priority(*id, &pool, &selected, &deps).unwrap())
@@ -482,45 +257,17 @@ impl Fixture {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Random,
-    Indexed,
-    Packed,
-}
-impl Mode {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Random => "random",
-            Self::Indexed => "indexed",
-            Self::Packed => "indexed_pack",
-        }
-    }
-}
-struct Selection {
-    txs: Vec<SelectedMempoolTx>,
-    scanned: usize,
-    packing_elapsed: Duration,
-}
+/// Selects with the production entry point's limits, with or without packing.
 fn select(
-    mode: Mode,
+    pack: bool,
     txs: Vec<VerifiedUnminedTx>,
     deps: TransactionDependencies,
     network: &Network,
     height: Height,
     miner: &MinerParams,
 ) -> Selection {
-    match mode {
-        Mode::Random => Selection {
-            txs: select_mempool_transactions(network, height, miner, None, txs, deps).unwrap(),
-            scanned: 0,
-            packing_elapsed: Duration::ZERO,
-        },
-        Mode::Indexed | Mode::Packed => {
-            IndexedSelector::new(txs, deps, limits(network, height, miner))
-                .finish(matches!(mode, Mode::Packed))
-        }
-    }
+    let limits = limits(network, height, miner);
+    run(txs, deps, limits, pack)
 }
 
 #[derive(Clone, Copy)]
@@ -539,9 +286,9 @@ fn validate(
     height: Height,
     miner: &MinerParams,
 ) -> Stats {
-    assert!(selection.scanned <= MAX_PACKING_SCAN_ENTRIES);
+    assert!(selection.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
     let mut limits = limits(network, height, miner);
-    let mut selected = HashSet::new();
+    let mut selected = std::collections::HashSet::new();
     let mut bytes = 0;
     let mut fees = 0;
     for (_, tx) in &selection.txs {
@@ -559,7 +306,7 @@ fn validate(
         bytes,
         fees,
         remaining: limits.remaining_bytes,
-        scanned: selection.scanned,
+        scanned: selection.packing_scanned,
         packing_ns: selection.packing_elapsed.as_nanos().try_into().unwrap(),
     }
 }
@@ -584,7 +331,7 @@ fn context() -> (Network, Height, MinerParams, GetBlockTemplateChainInfo) {
 }
 
 #[test]
-fn indexed_prototype_rescores_surviving_children_after_parent_selection() {
+fn indexed_rescores_surviving_children_after_parent_selection() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let parent = factory.tx(1, 10, Vec::new(), 2);
@@ -595,7 +342,7 @@ fn indexed_prototype_rescores_surviving_children_after_parent_selection() {
     let independent_id = independent.transaction.id().mined_id();
     let fixture = Fixture::from_transactions(vec![parent, child_a, child_b, independent]);
     let (txs, deps) = fixture.snapshot();
-    let selection = select(Mode::Indexed, txs, deps, &network, height, &miner);
+    let selection = select(false, txs, deps, &network, height, &miner);
     validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(selection.txs[0].1.transaction.id().mined_id(), parent_id);
     assert_eq!(
@@ -605,26 +352,26 @@ fn indexed_prototype_rescores_surviving_children_after_parent_selection() {
 }
 
 #[test]
-fn indexed_prototype_packing_preserves_priority_prefix_and_fills_the_gap() {
+fn indexed_packing_preserves_priority_prefix_and_fills_the_gap() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let mut txs: Vec<_> = (0..12).map(|_| factory.tx(64, 10, Vec::new(), 1)).collect();
     txs.extend((0..40).map(|_| factory.tx(1, 1, Vec::new(), 1)));
     let fixture = Fixture::from_transactions(txs);
     let (txs, deps) = fixture.snapshot();
-    let plain = select(Mode::Indexed, txs, deps, &network, height, &miner);
+    let plain = select(false, txs, deps, &network, height, &miner);
     let plain_stats = validate(&plain, &fixture, &network, height, &miner);
     assert!(plain_stats.remaining > PACKING_THRESHOLD_BYTES);
     let (txs, deps) = fixture.snapshot();
-    let packed = select(Mode::Packed, txs, deps, &network, height, &miner);
+    let packed = select(true, txs, deps, &network, height, &miner);
     let packed_stats = validate(&packed, &fixture, &network, height, &miner);
     assert!(packed.txs.starts_with(&plain.txs));
     assert!(packed_stats.remaining < plain_stats.remaining);
-    assert!(packed.scanned <= MAX_PACKING_SCAN_ENTRIES);
+    assert!(packed.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
 }
 
 #[test]
-fn indexed_prototype_packing_stops_after_one_hundred_entries() {
+fn indexed_packing_stops_after_one_hundred_entries() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let mut txs: Vec<_> = (0..=MAX_PACKING_SCAN_ENTRIES)
@@ -640,14 +387,14 @@ fn indexed_prototype_packing_stops_after_one_hundred_entries() {
         }
         let mut limits = limits(&network, height, &miner);
         limits.remaining_bytes = PACKING_THRESHOLD_BYTES + 1;
-        IndexedSelector::new(txs, deps, limits).finish(true)
+        run(txs, deps, limits, true)
     };
 
     // The small transaction follows 100 oversized entries after the blocked
     // priority candidate. It must not be visited as entry 101.
     let (txs, deps) = fixture.snapshot();
     let bounded = run(txs, deps, false);
-    assert_eq!(bounded.scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert_eq!(bounded.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
     assert!(bounded.txs.is_empty());
 
     // Removing one oversized transaction puts the fitting candidate exactly at
@@ -655,13 +402,13 @@ fn indexed_prototype_packing_stops_after_one_hundred_entries() {
     let (txs, deps) = fixture.snapshot();
     let boundary = run(txs, deps, true);
     validate(&boundary, &fixture, &network, height, &miner);
-    assert_eq!(boundary.scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert_eq!(boundary.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
     assert_eq!(boundary.txs.len(), 1);
     assert_eq!(boundary.txs[0].1.transaction.id().mined_id(), small_id);
 }
 
 #[test]
-fn indexed_prototype_primary_stops_at_three_kilobytes() {
+fn indexed_primary_stops_at_three_kilobytes() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let first = factory.tx(0, 10, Vec::new(), 1);
@@ -675,14 +422,14 @@ fn indexed_prototype_primary_stops_at_three_kilobytes() {
             let (txs, deps) = fixture.snapshot();
             let mut limits = limits(&network, height, &miner);
             limits.remaining_bytes = remaining;
-            let selection = IndexedSelector::new(txs, deps, limits).finish(pack);
+            let selection = run(txs, deps, limits, pack);
             assert!(selection.txs.is_empty());
-            assert_eq!(selection.scanned, 0);
+            assert_eq!(selection.packing_scanned, 0);
         }
         let (txs, deps) = fixture.snapshot();
         let mut limits = limits(&network, height, &miner);
         limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
-        let selection = IndexedSelector::new(txs, deps, limits).finish(pack);
+        let selection = run(txs, deps, limits, pack);
         validate(&selection, &fixture, &network, height, &miner);
         assert_eq!(selection.txs.len(), 1);
         assert_eq!(selection.txs[0].1.transaction.id().mined_id(), first_id);
@@ -690,7 +437,7 @@ fn indexed_prototype_primary_stops_at_three_kilobytes() {
 }
 
 #[test]
-fn indexed_prototype_packing_stops_at_three_kilobytes() {
+fn indexed_packing_stops_at_three_kilobytes() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let mut txs = vec![factory.tx(64, 10, Vec::new(), 1)];
@@ -709,15 +456,89 @@ fn indexed_prototype_packing_stops_at_three_kilobytes() {
     let (txs, deps) = fixture.snapshot();
     let mut limits = limits(&network, height, &miner);
     limits.remaining_bytes = remaining;
-    let selection = IndexedSelector::new(txs, deps, limits).finish(true);
+    let selection = run(txs, deps, limits, true);
     let stats = validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(remaining - stats.bytes, SELECTION_STOP_BYTES);
-    assert_eq!(selection.scanned, 8);
+    assert_eq!(selection.packing_scanned, 8);
     assert_eq!(selection.txs.len(), 8);
     assert!(selection
         .txs
         .iter()
         .all(|(_, tx)| tx.transaction.id().mined_id() != tail_id));
+}
+
+#[test]
+fn indexed_selection_is_repeatable_and_orders_package_parents_by_txid() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let parent_a = factory.tx(1, 1, Vec::new(), 1);
+    let parent_b = factory.tx(1, 1, Vec::new(), 1);
+    let parent_ids = [
+        parent_a.transaction.id().mined_id(),
+        parent_b.transaction.id().mined_id(),
+    ];
+    let child = factory.tx(
+        1,
+        100,
+        parent_ids
+            .iter()
+            .map(|id| OutPoint::from_usize(*id, 0))
+            .collect(),
+        1,
+    );
+    let child_id = child.transaction.id().mined_id();
+    let independent = factory.tx(1, 2, Vec::new(), 1);
+    let fixture = Fixture::from_transactions(vec![parent_a, parent_b, child, independent]);
+
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let (txs, deps) = fixture.snapshot();
+            let selection = select(true, txs, deps, &network, height, &miner);
+            validate(&selection, &fixture, &network, height, &miner);
+            ids(&selection)
+        })
+        .collect();
+    assert!(runs.windows(2).all(|pair| pair[0] == pair[1]));
+
+    // The child's package ranks first, so both parents precede it in TXID order.
+    let (low, high) = (
+        parent_ids[0].min(parent_ids[1]),
+        parent_ids[0].max(parent_ids[1]),
+    );
+    assert_eq!(runs[0][..3], [low, high, child_id]);
+}
+
+#[test]
+fn indexed_skips_candidates_with_unavailable_ancestors() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let orphan = factory.tx(
+        1,
+        100,
+        vec![OutPoint::from_usize(transaction::Hash([0xab; 32]), 0)],
+        1,
+    );
+    let orphan_id = orphan.transaction.id().mined_id();
+    let available = factory.tx(1, 1, Vec::new(), 1);
+    let available_id = available.transaction.id().mined_id();
+
+    let mut deps = TransactionDependencies::default();
+    deps.add(
+        orphan_id,
+        orphan.transaction.transaction().spent_outpoints().collect(),
+    );
+    deps.add(available_id, Vec::new());
+
+    // The orphan comes first, as its baseline score would rank it.
+    let selection = select(
+        true,
+        vec![orphan, available],
+        deps,
+        &network,
+        height,
+        &miner,
+    );
+    assert_eq!(ids(&selection), [available_id]);
 }
 
 /// The env gate keeps all-ignored CI runs from executing this performance job.
@@ -733,32 +554,28 @@ fn benchmark_full_mempool_gbt_selection() {
     for kind in ["uniform", "mixed", "packages", "mixed_packages"] {
         let fixture = Fixture::full(kind, cost_limit);
         for phase in ["selection", "template_json"] {
-            let modes = [Mode::Random, Mode::Indexed, Mode::Packed];
-            // Balance both position and predecessor, including warm-cache
-            // effects when one indexed variant immediately follows the other.
-            let orders = [
-                [0, 1, 2],
-                [2, 1, 0],
-                [1, 2, 0],
-                [0, 2, 1],
-                [2, 0, 1],
-                [1, 0, 2],
-            ];
-            let mut results: [Vec<(Duration, Stats)>; 3] = Default::default();
+            // (name, pack): the main pass alone, then with packing, so the
+            // difference shows what packing costs.
+            let modes = [("indexed", false), ("indexed_pack", true)];
+            // Alternate which mode runs first, balancing warm-cache effects
+            // when one mode immediately follows the other.
+            let orders = [[0, 1], [1, 0]];
+            let mut results: [Vec<(Duration, Stats)>; 2] = Default::default();
+            // Sample 0 warms caches and is discarded.
             for sample in 0..=SAMPLES {
                 for index in orders[sample % orders.len()] {
-                    let mode = modes[index];
+                    let (_, pack) = modes[index];
                     let mut elapsed = Duration::ZERO;
                     let selection = if phase == "selection" {
                         let (txs, deps) = fixture.snapshot();
                         let start = Instant::now();
-                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
+                        let result = black_box(select(pack, txs, deps, &network, height, &miner));
                         elapsed += start.elapsed();
                         result
                     } else {
                         let start = Instant::now();
                         let (txs, deps) = fixture.snapshot();
-                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
+                        let result = black_box(select(pack, txs, deps, &network, height, &miner));
                         elapsed += start.elapsed();
                         result
                     };
@@ -789,7 +606,8 @@ fn benchmark_full_mempool_gbt_selection() {
                     }
                 }
             }
-            for (mode, mut result) in modes.into_iter().zip(results) {
+
+            for ((mode, _), mut result) in modes.into_iter().zip(results) {
                 result.sort_by_key(|(elapsed, _)| *elapsed);
                 let median =
                     (result[SAMPLES / 2 - 1].0.as_nanos() + result[SAMPLES / 2].0.as_nanos()) / 2;
@@ -809,8 +627,8 @@ fn benchmark_full_mempool_gbt_selection() {
                 let (remaining_min, remaining_max) =
                     values(|s| u64::try_from(s.remaining).unwrap());
                 let (scanned_min, scanned_max) = values(|s| u64::try_from(s.scanned).unwrap());
-                println!("gbt fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} scanned_min={scanned_min} scanned_max={scanned_max} packing_ns={packing_ns}",
-                    fixture.cost, fixture.pool.len(), mode.name(), result[0].0.as_nanos(), result[SAMPLES-1].0.as_nanos());
+                println!("gbt fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={mode} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} scanned_min={scanned_min} scanned_max={scanned_max} packing_ns={packing_ns}",
+                    fixture.cost, fixture.pool.len(), result[0].0.as_nanos(), result[SAMPLES-1].0.as_nanos());
             }
         }
     }

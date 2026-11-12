@@ -404,8 +404,8 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 Expected::Test(t) => Some(Task::Test {
                     expected: id.clone(),
                     package: t.package.to_owned(),
-                    file: format!("tests/{}.rs", t.file),
-                    test: t.name.to_owned(),
+                    file: t.file.to_owned(),
+                    test: t.test.to_owned(),
                 }),
                 Expected::UnitTest { package, path } => Some(Task::Test {
                     expected: id.clone(),

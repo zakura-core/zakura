@@ -96,7 +96,7 @@ impl fmt::Display for Expected {
     /// The result's ID, unique in the manifest.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expected::Test(t) => write!(f, "test/{}/{}/{}", t.package, t.file, t.name),
+            Expected::Test(t) => write!(f, "test/{}/{}/{}", t.package, test_target(t), t.test),
             Expected::UnitTest { package, path } => write!(f, "unit/{package}/{path}"),
             Expected::Lane(id) => write!(f, "lane/{id}"),
             Expected::FuzzTest(name) => write!(f, "fuzz-test/{name}"),
@@ -157,13 +157,20 @@ pub struct Derived {
     pub self_tests: Vec<String>,
 }
 
-/// The `zakura-sim` test `name` in `file`, as one expected result.
+/// The `zakura-sim` test `name` in `file`, its path in the package, as one
+/// expected result.
 const fn sim(file: &'static str, name: &'static str) -> Expected {
-    Expected::Test(TestRef {
-        package: "zakura-sim",
-        file,
-        name,
-    })
+    Expected::Test(crate::harness::header_acceptance::sim_test(file, name))
+}
+
+/// The stem of `test`'s file under its package's `tests/`, such as
+/// `fixtures`: the name of its integration test target, and how a result's
+/// ID names it.
+pub fn test_target(test: &TestRef) -> &'static str {
+    test.file
+        .strip_prefix("tests/")
+        .and_then(|file| file.strip_suffix(".rs"))
+        .unwrap_or(test.file)
 }
 
 /// `sim`'s tests in `file`, one result each.
@@ -246,8 +253,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.1",
             false,
             [
-                sims(
-                    "trace_format",
+                sims("tests/trace_format.rs",
                     &[
                         "every_record_round_trips",
                         "real_run_round_trips",
@@ -263,7 +269,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                         "strict_reader",
                     ],
                 ),
-                vec![sim("replay_exact", "prefix_replays_and_is_never_complete")],
+                vec![sim("tests/replay_exact.rs", "prefix_replays_and_is_never_complete")],
             ]
             .concat(),
         ),
@@ -271,9 +277,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.2",
             false,
             [
-                vec![sim("cli", "every_harness_replays_byte_for_byte_in_a_fresh_process")],
-                sims(
-                    "replay_exact",
+                vec![sim("tests/cli.rs", "every_harness_replays_byte_for_byte_in_a_fresh_process")],
+                sims("tests/replay_exact.rs",
                     &[
                         "recorded_traces_replay_exact",
                         "matching_violation_is_a_success",
@@ -290,9 +295,9 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                     .map(Expected::HeaderKey)
                     .collect(),
                 vec![
-                    sim("net", "recorded_steps_tell_equal_length_payloads_apart"),
-                    sim("full_report", "record_keeps_the_full_report_and_replay_matches_it"),
-                    sim("race_schedules", "fresh_processes_reproduce_each_saved_violation"),
+                    sim("tests/net.rs", "recorded_steps_tell_equal_length_payloads_apart"),
+                    sim("tests/full_report.rs", "record_keeps_the_full_report_and_replay_matches_it"),
+                    sim("tests/race_schedules.rs", "fresh_processes_reproduce_each_saved_violation"),
                 ],
             ]
             .concat(),
@@ -301,8 +306,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.3",
             false,
             [
-                sims(
-                    "replay_exact",
+                sims("tests/replay_exact.rs",
                     &[
                         "non_equivalent_build_refused",
                         "allow_build_mismatch_never_succeeds",
@@ -310,8 +314,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                     ],
                 ),
                 vec![
-                    sim("cli", "replay_exit_codes"),
-                    sim("trace_format", "build_equivalence"),
+                    sim("tests/cli.rs", "replay_exit_codes"),
+                    sim("tests/trace_format.rs", "build_equivalence"),
                 ],
             ]
             .concat(),
@@ -320,8 +324,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.4",
             false,
             [
-                sims(
-                    "minimize",
+                sims("tests/minimize.rs",
                     &[
                         "tmin_keeps_the_property",
                         "a_missing_witness_is_rejected",
@@ -329,8 +332,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                         "the_binary_confirms_in_a_fresh_process",
                     ],
                 ),
-                sims(
-                    "triage_minimize",
+                sims("tests/triage_minimize.rs",
                     &[
                         "minimizer_output_that_doesnt_hold_is_not_kept",
                         "verify_holds_a_minimized_bundle_to_its_failure",
@@ -344,8 +346,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.5",
             false,
             [
-                sims(
-                    "explore",
+                sims("tests/explore.rs",
                     &[
                         "empty_malformed_and_exhausted_inputs_end",
                         "aba_in_one_process",
@@ -355,10 +356,10 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                     ],
                 ),
                 vec![
-                    sim("harness", "task_panic_violates_no_task_panic"),
-                    sim("record_failure", "record_failure_writes_the_same_violation"),
-                    sim("record_failure", "record_failure_survives_a_run_that_leaks_tasks"),
-                    sim("triage", "buckets_for_harness_crash_and_nondeterminism"),
+                    sim("tests/harness.rs", "task_panic_violates_no_task_panic"),
+                    sim("tests/record_failure.rs", "record_failure_writes_the_same_violation"),
+                    sim("tests/record_failure.rs", "record_failure_survives_a_run_that_leaks_tasks"),
+                    sim("tests/triage.rs", "buckets_for_harness_crash_and_nondeterminism"),
                 ],
                 [
                     "fuzz::adapter::a_property_failure_saves_its_input_and_trace_and_panics_with_its_id",
@@ -378,9 +379,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "M7.6",
             false,
             [
-                vec![sim("suite", "the_committed_suite_covers_the_registry")],
-                sims(
-                    "race_fixtures",
+                vec![sim("tests/suite.rs", "the_committed_suite_covers_the_registry")],
+                sims("tests/race_fixtures.rs",
                     &[
                         "lost_update",
                         "snapshot_reserve",
@@ -392,9 +392,9 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                     ],
                 ),
                 vec![
-                    sim("targets", "every_declared_target_runs_seeds_that_apply_its_properties"),
-                    sim("explore", "classify_table"),
-                    sim("witness", "harness_end_fails"),
+                    sim("tests/targets.rs", "every_declared_target_runs_seeds_that_apply_its_properties"),
+                    sim("tests/explore.rs", "classify_table"),
+                    sim("tests/witness.rs", "harness_end_fails"),
                     Expected::Lane("sim-release/zakura-sim"),
                 ],
             ]
@@ -444,8 +444,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "corpus/discovery-lost-wakeup",
             true,
             [
-                sims(
-                    "witness",
+                sims("tests/witness.rs",
                     &[
                         "discovery_wait_complete_lost_wakeup",
                         "discovery_wait_complete_check_inside_final_mark",
@@ -463,8 +462,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "corpus/timer-only-waiting",
             false,
-            sims(
-                "time",
+            sims("tests/time.rs",
                 &[
                     "advances_to_earliest_boundary",
                     "deadline_blocks_time",
@@ -475,8 +473,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "corpus/storage-released-deadlock",
             false,
-            sims(
-                "idle",
+            sims("tests/idle.rs",
                 &["storage_completion_releases_apparent_deadlock", "idle_outcomes_distinct"],
             ),
         ),
@@ -530,8 +527,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "S4.1",
             true,
-            sims(
-                "draws",
+            sims("tests/draws.rs",
                 &[
                     "each_draw_reaches_plan_once",
                     "replayed_draws_reproduce_values",
@@ -543,7 +539,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "S4.2",
             true,
             vec![
-                sim("draws", "draw_inside_run_no_borrow_failure"),
+                sim("tests/draws.rs", "draw_inside_run_no_borrow_failure"),
                 Expected::UnitTest {
                     package: "zakura-sim",
                     path: "sim::tests::held_borrow_is_harness_not_panic",
@@ -572,8 +568,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                 ["clamped_timer_cancels", "second_joiner_gets_stand_in"].map(|name| {
                     Expected::Test(TestRef {
                         package: "zakura-scheduler",
-                        file: "rt",
-                        name,
+                        file: "tests/rt.rs",
+                        test: name,
                     })
                 }),
             )
@@ -583,8 +579,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "S4.4",
             true,
             [
-                sims(
-                    "race_fixtures",
+                sims("tests/race_fixtures.rs",
                     &[
                         "lost_update",
                         "snapshot_reserve",
@@ -594,7 +589,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                         "abort_without_join",
                     ],
                 ),
-                vec![sim("race_schedules", "each_race_has_a_saved_schedule")],
+                vec![sim("tests/race_schedules.rs", "each_race_has_a_saved_schedule")],
                 race_agreements(),
             ]
             .concat(),
@@ -603,13 +598,11 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             "S4.5",
             true,
             vec![
-                sim(
-                    "race_schedules",
+                sim("tests/race_schedules.rs",
                     "fresh_processes_reproduce_each_saved_violation",
                 ),
-                sim("race_schedules", "changed_code_replay_reports_divergence"),
-                sim(
-                    "cli",
+                sim("tests/race_schedules.rs", "changed_code_replay_reports_divergence"),
+                sim("tests/cli.rs",
                     "every_harness_replays_byte_for_byte_in_a_fresh_process",
                 ),
             ],
@@ -634,8 +627,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             vec![
                 Expected::Planted("discovery/wait-complete-wakes"),
                 Expected::Agreement("discovery/wait-complete-wakes".to_owned()),
-                sim("discovery", "holding_the_source_back_finds_no_violation"),
-                sim("discovery", "seed_sweep_wakes"),
+                sim("tests/discovery.rs", "holding_the_source_back_finds_no_violation"),
+                sim("tests/discovery.rs", "seed_sweep_wakes"),
             ],
         ),
         row(
@@ -652,8 +645,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                 .cloned()
                 .map(Expected::SelfTest)
                 .chain([
-                    sim("suite", "the_zakura_sim_lanes_run_every_sched4_target"),
-                    sim("suite", "a_lane_without_a_sched4_target_fails"),
+                    sim("tests/suite.rs", "the_zakura_sim_lanes_run_every_sched4_target"),
+                    sim("tests/suite.rs", "a_lane_without_a_sched4_target_fails"),
                 ])
                 .chain(
                     [
@@ -1032,7 +1025,9 @@ pub fn sched4_sim_targets(rows: &[Row]) -> BTreeSet<String> {
         .filter(|row| row.id.starts_with("S4."))
         .flat_map(|row| &row.expected)
         .filter_map(|expected| match expected {
-            Expected::Test(test) if test.package == "zakura-sim" => Some(test.file.to_owned()),
+            Expected::Test(test) if test.package == "zakura-sim" => {
+                Some(test_target(test).to_owned())
+            }
             _ => None,
         })
         .collect()

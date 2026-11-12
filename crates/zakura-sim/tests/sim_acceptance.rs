@@ -543,9 +543,8 @@ mod sched_mapping {
         let file = seed::repo_root()
             .join("crates")
             .join(test.package)
-            .join("tests")
-            .join(format!("{}.rs", test.file));
-        std::fs::read_to_string(file).is_ok_and(|text| text.contains(&format!("fn {}(", test.name)))
+            .join(test.file);
+        std::fs::read_to_string(file).is_ok_and(|text| text.contains(&format!("fn {}(", test.test)))
     }
 
     /// The mapping covers exactly the specs' IDs, once each, in order.
@@ -580,8 +579,8 @@ mod sched_mapping {
     fn a_misspelled_test_doesnt_exist() {
         assert!(!exists(&TestRef {
             package: "zakura-scheduler",
-            file: "fixtures",
-            name: "no_such_test",
+            file: "tests/fixtures.rs",
+            test: "no_such_test",
         }));
     }
 }
@@ -871,8 +870,8 @@ mod manifest {
         for row in rows(derived()) {
             for expected in &row.expected {
                 let ok = match expected {
-                    Expected::Test(t) => read(&format!("crates/{}/tests/{}.rs", t.package, t.file))
-                        .contains(&format!("fn {}(", t.name)),
+                    Expected::Test(t) => read(&format!("crates/{}/{}", t.package, t.file))
+                        .contains(&format!("fn {}(", t.test)),
                     Expected::UnitTest { package, path } => {
                         // `a::b::tests::name` is in `src/a/b.rs`.
                         let segments: Vec<&str> = path.split("::").collect();

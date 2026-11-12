@@ -1125,7 +1125,19 @@ fn judge_patched(
                 &scratch.join("draft"),
                 Some((deadline, &NEVER_INTERRUPTED)),
             )?;
-            match classify_draft_set(&case.property, &case.draft_set, &draft) {
+            let baseline = scratch.join("baseline");
+            let judged = match counterfactual_misses(&baseline, &scratch.join("draft"))? {
+                Some(why) => Verdict::NotCaught(format!(
+                    "its Draft run isn't its baseline's counterfactual: {why}"
+                )),
+                None => classify_draft_set(
+                    &case.property,
+                    &case.draft_set,
+                    &recorded_end(&baseline, &case.property)?,
+                    &draft,
+                ),
+            };
+            match judged {
                 Verdict::Caught(None) => campaign(
                     zakura_sim,
                     harness,
@@ -1813,11 +1825,34 @@ fn classify_set(
 }
 
 /// What `draft`, a `draft_set` case's `Draft` run of its committed input,
-/// shows about the case's nested set: a catch only if it went on past the
-/// case's break and violated `property` and every member of `set` by its
-/// end, nothing else, with its witness passing. A member it didn't violate
-/// misses the set, and any other violation is [`Verdict::Unrelated`].
-fn classify_draft_set(property: &str, set: &[String], draft: &Run) -> Verdict {
+/// shows about the case's nested set beside `baseline`, the unpatched run
+/// of the same input, as the acceptance tool's Draft-set judge
+/// (`zakura-sim`'s `evaluate::caught_draft`) rules: a catch only if it went
+/// on past the case's break and violated `property` and every member of
+/// `set` by its end, nothing else, with its witness passing, and the
+/// baseline violated no member. A member it didn't violate misses the set,
+/// one the baseline violated too isn't the patch's doing, and any other
+/// violation is [`Verdict::Unrelated`]. [`counterfactual_misses`] checks
+/// the two ran the same input.
+fn classify_draft_set(property: &str, set: &[String], baseline: &Run, draft: &Run) -> Verdict {
+    if let Run::Ended {
+        violation,
+        others_violated,
+        outcome,
+        ..
+    } = baseline
+    {
+        let violated = |member: &String| {
+            violation.as_ref() == Some(member)
+                || others_violated.contains(member)
+                || (member == property && matches!(outcome, Some(EndOutcome::Violated {})))
+        };
+        if let Some(member) = set.iter().find(|member| violated(member)) {
+            return Verdict::NotCaught(format!(
+                "its baseline violates {member} of its draft set too, so the patch didn't cause it"
+            ));
+        }
+    }
     let (violation, others_violated, outcome, witness) = match draft {
         Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
         Run::Ended {
@@ -1857,6 +1892,43 @@ fn classify_draft_set(property: &str, set: &[String], draft: &Run) -> Verdict {
         Some(why) => Verdict::WitnessFails(why.clone()),
         None => Verdict::Caught(None),
     }
+}
+
+/// Why the `Draft` run recorded in `draft` isn't the counterfactual of the
+/// baseline recorded in `baseline`, as their traces' meta lines show: it
+/// ran on the baseline's build, or another harness, input, scenario or
+/// Plan. `None` if it is.
+fn counterfactual_misses(baseline: &Path, draft: &Path) -> Result<Option<String>, BoxError> {
+    let meta = |dir: &Path| -> Result<Value, BoxError> {
+        let path = dir.join("trace.jsonl");
+        let text =
+            fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let first = text.lines().next().ok_or("the trace is empty")?;
+        let line: Value = serde_json::from_str(first)?;
+        Ok(line
+            .get("meta")
+            .cloned()
+            .ok_or("the trace has no meta line")?)
+    };
+    let (baseline, draft) = (meta(baseline)?, meta(draft)?);
+    if baseline.pointer("/build/source") == draft.pointer("/build/source") {
+        return Ok(Some("it ran on the baseline's build".to_owned()));
+    }
+    Ok(["sim", "input", "scenario", "plan"]
+        .into_iter()
+        .find(|key| baseline.get(key) != draft.get(key))
+        .map(|key| format!("it ran another {key} than its baseline")))
+}
+
+/// The run recorded in `dir`, as its trace's end record shows it for
+/// `property`, without its witness result.
+fn recorded_end(dir: &Path, property: &str) -> Result<Run, BoxError> {
+    let path = dir.join("trace.jsonl");
+    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    end_of(
+        property,
+        text.lines().next_back().ok_or("the trace is empty")?,
+    )
 }
 
 /// What `patched` shows about a harness-caught case of `property` whose
@@ -3337,10 +3409,11 @@ mod tests {
     fn a_draft_set_is_judged_on_the_draft_run() {
         const LATER: &str = "sim/no-livelock";
         let set = [LATER.to_owned()];
+        let baseline = run(None, &[(ID, HELD), (LATER, HELD)]);
         let judged = |others: &[&str]| {
             let mut reports = vec![(ID, VIOLATED)];
             reports.extend(others.iter().map(|id| (*id, VIOLATED)));
-            classify_draft_set(ID, &set, &run(None, &reports))
+            classify_draft_set(ID, &set, &baseline, &run(None, &reports))
         };
         assert_eq!(judged(&[LATER]), Verdict::Caught(None));
         assert!(
@@ -3352,9 +3425,25 @@ mod tests {
             Verdict::Unrelated("test/other".to_owned())
         );
         assert!(matches!(
-            classify_draft_set(ID, &set, &run(None, &[(ID, HELD), (LATER, VIOLATED)])),
+            classify_draft_set(
+                ID,
+                &set,
+                &baseline,
+                &run(None, &[(ID, HELD), (LATER, VIOLATED)])
+            ),
             Verdict::NotCaught(_)
         ));
+        // The reviewers' unrelated bug: a member the baseline breaks too.
+        let both = run(None, &[(ID, VIOLATED), (LATER, VIOLATED)]);
+        for broken in [
+            run(None, &[(ID, HELD), (LATER, VIOLATED)]),
+            run(Some(LATER), &[(ID, HELD), (LATER, VIOLATED)]),
+        ] {
+            assert!(
+                matches!(classify_draft_set(ID, &set, &broken, &both), Verdict::NotCaught(why) if why.contains("baseline")),
+                "{broken:?}"
+            );
+        }
         assert_eq!(
             Expect::ViolatedOnDraft {
                 property: ID,
@@ -3379,6 +3468,55 @@ mod tests {
             .expect_err("a draft set stands alone")
             .to_string();
         assert!(error.contains("draft_set"), "{error}");
+    }
+
+    /// A `draft_set` case's `Draft` run is its baseline's counterfactual
+    /// only if both traces' metas name one harness, input, scenario and
+    /// Plan, from two builds: each of those moved, or the baseline's build,
+    /// misses.
+    #[test]
+    fn a_draft_run_is_its_baseline_s_counterfactual() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let meta = serde_json::json!({
+            "build": { "source": "s" },
+            "sim": "header-sync/wire",
+            "input": { "sha256": "ab", "len": 3 },
+            "scenario": { "peers": 1 },
+            "plan": null,
+        });
+        let write = |name: &str, meta: &Value| {
+            let run = dir.path().join(name);
+            fs::create_dir_all(&run).unwrap();
+            fs::write(
+                run.join("trace.jsonl"),
+                format!(
+                    "{}\n{{\"end\":{{}}}}\n",
+                    serde_json::json!({ "meta": meta })
+                ),
+            )
+            .unwrap();
+        };
+        write("baseline", &meta);
+        let misses = |draft: Value| {
+            write("draft", &draft);
+            counterfactual_misses(&dir.path().join("baseline"), &dir.path().join("draft"))
+                .expect("both traces read")
+        };
+        let mut patched = meta.clone();
+        patched["build"]["source"] = "patched".into();
+        assert_eq!(misses(patched.clone()), None);
+        assert!(misses(meta.clone()).is_some(), "the baseline's own build");
+        for (pointer, moved) in [
+            ("/sim", Value::from("header-sync/storage")),
+            ("/input/sha256", Value::from("ac")),
+            ("/input/len", Value::from(4)),
+            ("/scenario/peers", Value::from(2)),
+            ("/plan", serde_json::json!({ "bytes": "00" })),
+        ] {
+            let mut draft = patched.clone();
+            *draft.pointer_mut(pointer).expect("the meta names it") = moved;
+            assert!(misses(draft).is_some(), "{pointer}");
+        }
     }
 
     /// A typed case watches its scenario and Plan file, and runs with

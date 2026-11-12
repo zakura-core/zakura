@@ -634,6 +634,28 @@ struct Tools {
 /// writing artifacts under `artifacts`: each property's planted cases
 /// first, through [`run_planted`], then every task in order. With `only`,
 /// a partial run's indices ([`split_only`]), it runs and binds only those.
+/// The run and task whose directory an artifact goes in, which every
+/// artifact the runner writes there names beside its role, as the
+/// reader's `TaskAt` reads it.
+#[derive(Clone, Copy, Debug)]
+struct TaskId<'a> {
+    /// The run's ID.
+    run_id: &'a str,
+    /// The task's index in its plan.
+    index: usize,
+}
+
+impl TaskId<'_> {
+    /// `fields` with this task's run at `role` named, as the reader's
+    /// `binding::TEST`, `UNIT_BUILD` and `REPLAY` carry them.
+    fn name(&self, role: &str, mut fields: Value) -> Value {
+        fields["run_id"] = json!(self.run_id);
+        fields["index"] = json!(self.index);
+        fields["role"] = json!(role);
+        fields
+    }
+}
+
 fn run_tasks(
     repo_root: &Path,
     options: &Options,
@@ -675,24 +697,31 @@ fn run_tasks(
     let mut confirmations = BTreeMap::new();
     for (property, cases) in &by_property {
         stop_if_interrupted()?;
-        confirmations.extend(run_planted(repo_root, options, property, cases, artifacts)?);
+        confirmations.extend(run_planted(
+            repo_root,
+            options,
+            property,
+            cases,
+            (artifacts, run_id),
+        )?);
     }
     let mut broken: Option<String> = None;
     for &(index, task) in &tasks {
         stop_if_interrupted()?;
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
+        let id = TaskId { run_id, index };
         if let Some(test) = task.get("test") {
             run_test(
                 repo_root,
                 options,
                 Some(&subject.source),
                 test,
-                &dir,
+                (&dir, id, ""),
                 (&options.out.join("tests"), None, true),
             )?;
         } else if let Some(history) = task.get("history") {
-            run_history(repo_root, options, subject, tools, history, &dir)?;
+            run_history(repo_root, options, subject, tools, history, (&dir, id))?;
         } else if task.get("case").is_some()
             || task.get("integrity").is_some()
             || task.get("unit").is_some()
@@ -711,12 +740,12 @@ fn run_tasks(
             let ran = match (task.get("case"), task.get("integrity"), task.get("unit")) {
                 (Some(case), _, _) => {
                     let confirmation = confirmations.remove(&index);
-                    case_task(options, subject, at, case, &dir, confirmation)?
+                    case_task(options, subject, at, case, (&dir, id), confirmation)?
                 }
                 (_, Some(integrity), _) => {
-                    run_integrity(options, subject, tools, integrity, &dir, worktree)
+                    run_integrity(options, subject, tools, integrity, (&dir, id), worktree)
                 }
-                (_, _, Some(unit)) => run_unit(options, subject, unit, &dir, worktree),
+                (_, _, Some(unit)) => run_unit(options, subject, unit, (&dir, id), worktree),
                 _ => unreachable!("the task is a case, an integrity mutation or a unit witness"),
             };
             stop_if_interrupted()?;
@@ -747,13 +776,15 @@ fn run_tasks(
 /// [`CONFIRMATION_DIR`], and returns each case's target check by task
 /// index ([`confirmation_check`]). A check whose case runs on no target
 /// names no source yet: its [`case_task`] gives it the source its rebuild
-/// measured, which the reader requires of every check.
+/// measured, which the reader requires of every check. Each copied replay
+/// is named as this run's (`run_id`) task's at its run's role
+/// ([`name_replay`]).
 fn run_planted(
     repo_root: &Path,
     options: &Options,
     property: &str,
     cases: &[(usize, String)],
-    artifacts: &Path,
+    (artifacts, run_id): (&Path, &str),
 ) -> Result<BTreeMap<usize, Value>, BoxError> {
     let stem = property.replace('/', "-");
     let ended = planted_child(repo_root, options, property, false, &stem)?;
@@ -774,6 +805,13 @@ fn run_planted(
                     fs::remove_dir_all(replay)?;
                 }
             }
+        }
+        for run in ["baseline", "patched"] {
+            let id = TaskId {
+                run_id,
+                index: *index,
+            };
+            name_replay(&dir.join(run), id, run)?;
         }
         let refused = case_verdict(&log, property, name, ended.killed()).err();
         write_verdict(&dir, property, name, refused)?;
@@ -1029,13 +1067,15 @@ fn verdict_line<'a>(log: &'a str, property: &str, name: &str) -> Option<&'a str>
 /// `source`. With `histories`, the test runs with the reader's
 /// `HISTORIES_VAR` set to it, so it declares every history it runs there.
 /// With `sim`, it builds and runs under the simulator's flags, and without,
-/// as a plain build. Returns the executable it ran, if it found one.
+/// as a plain build. `test.json` names task `id`'s run at `role` and the
+/// SHA-256 of the executable it ran. Returns the executable it ran, if it
+/// found one.
 pub(crate) fn run_test(
     dir_root: &Path,
     options: &Options,
     source: Option<&str>,
     test: &Value,
-    out: &Path,
+    (out, id, role): (&Path, TaskId<'_>, &str),
     (targets, histories, sim): (&Path, Option<&Path>, bool),
 ) -> Result<Option<PathBuf>, BoxError> {
     let package = text(test, "package")?;
@@ -1049,16 +1089,20 @@ pub(crate) fn run_test(
         fs::write(&log, why)?;
         fs::write(
             out.join("test.json"),
-            serde_json::to_string_pretty(&json!({
-                "package": package,
-                "file": file,
-                "tests": [],
-                "killed": killed,
-                "exited_ok": false,
-                "log": why,
-                "binary_source": null,
-                "checkout_source": source,
-            }))?,
+            serde_json::to_string_pretty(&id.name(
+                role,
+                json!({
+                    "executable_sha256": null,
+                    "package": package,
+                    "file": file,
+                    "tests": [],
+                    "killed": killed,
+                    "exited_ok": false,
+                    "log": why,
+                    "binary_source": null,
+                    "checkout_source": source,
+                }),
+            ))?,
         )?;
         Ok(None)
     };
@@ -1136,16 +1180,20 @@ pub(crate) fn run_test(
     };
     fs::write(
         out.join("test.json"),
-        serde_json::to_string_pretty(&json!({
-            "package": package,
-            "file": file,
-            "tests": tests,
-            "killed": ended.killed(),
-            "exited_ok": ended.exited(),
-            "log": text_log,
-            "binary_source": binary_source,
-            "checkout_source": source,
-        }))?,
+        serde_json::to_string_pretty(&id.name(
+            role,
+            json!({
+                "executable_sha256": sha256_file(&executable),
+                "package": package,
+                "file": file,
+                "tests": tests,
+                "killed": ended.killed(),
+                "exited_ok": ended.exited(),
+                "log": text_log,
+                "binary_source": binary_source,
+                "checkout_source": source,
+            }),
+        ))?,
     )?;
     Ok(Some(executable))
 }
@@ -1458,9 +1506,14 @@ fn record_run(
 /// The recorded run in `run`'s fresh replay, by `sim`, the binary that
 /// recorded it: a separate `zakura-sim replay <run> --report
 /// <run>/replay/full-report.json` under the deadline, and how it ended as
-/// `<run>/replay/replay.json`, the reader's `ReplayRun`. A run with no
-/// trace, or one killed at its deadline, gets none.
-fn fresh_replay(options: &Options, sim: &Path, run: &Path) -> Result<(), BoxError> {
+/// `<run>/replay/replay.json`, the reader's `ReplayRun`, named as task
+/// `id`'s run at `role` ([`name_replay`]). A run with no trace, or one
+/// killed at its deadline, gets none.
+fn fresh_replay(
+    options: &Options,
+    sim: &Path,
+    (run, id, role): (&Path, TaskId<'_>, &str),
+) -> Result<(), BoxError> {
     if !run.join("trace.jsonl").is_file() || run.join(KILLED).exists() {
         return Ok(());
     }
@@ -1483,6 +1536,30 @@ fn fresh_replay(options: &Options, sim: &Path, run: &Path) -> Result<(), BoxErro
             "log": fs::read_to_string(&log).unwrap_or_default(),
         }))?,
     )?;
+    name_replay(run, id, role)
+}
+
+/// Names the fresh replay of the recorded run in `run`, if it has one, as
+/// task `id`'s run at `role`: its `replay.json` gets the run's ID, the
+/// task's index, the role, the SHA-256 of `run`'s trace and the source the
+/// replay's own full report names, the build that replayed it, as the
+/// reader's `binding::REPLAY` carries them. A trace or report that can't be
+/// read is named by none, which the reader refuses.
+fn name_replay(run: &Path, id: TaskId<'_>, role: &str) -> Result<(), BoxError> {
+    let dir = run.join(planted::REPLAY_DIR);
+    let file = dir.join(REPLAY_FILE);
+    if !file.is_file() {
+        return Ok(());
+    }
+    let mut replay: Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
+    let source = fs::read_to_string(dir.join(FULL_REPORT_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|report| report.get("source").cloned())
+        .unwrap_or(Value::Null);
+    replay["trace"] = json!(sha256_file(&run.join("trace.jsonl")));
+    replay["source"] = source;
+    fs::write(&file, serde_json::to_string_pretty(&id.name(role, replay))?)?;
     Ok(())
 }
 
@@ -1541,7 +1618,7 @@ fn run_history(
     subject: &Subject,
     tools: &Tools,
     history: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
 ) -> Result<(), BoxError> {
     let test = text(history, "test")?;
     let declared = dir.join("declared");
@@ -1550,7 +1627,7 @@ fn run_history(
         options,
         Some(&subject.source),
         history,
-        dir,
+        (dir, id, ""),
         (&options.out.join("tests"), Some(&declared), true),
     )?;
     let property = text(history, "property")?;
@@ -1570,7 +1647,7 @@ fn run_history(
         &run,
         expect.map(|expect| (property.as_str(), expect)),
     )? {
-        fresh_replay(options, &tools.sim, &run)?;
+        fresh_replay(options, &tools.sim, (&run, id, "run"))?;
     }
     Ok(())
 }
@@ -1625,14 +1702,14 @@ fn case_task(
     subject: &Subject,
     at: Checkouts<'_>,
     case: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     confirmation: Option<Value>,
 ) -> Result<Result<(), BoxError>, BoxError> {
     let target = options
         .out
         .join("cases")
         .join(dir.file_name().unwrap_or_default());
-    let rebuilt = rebuild_case(options, subject, at, case, dir, &target).and_then(|source| {
+    let rebuilt = rebuild_case(options, subject, at, case, (dir, id), &target).and_then(|source| {
         let Some(mut check) = confirmation else {
             return Ok(());
         };
@@ -1661,7 +1738,8 @@ fn case_task(
 /// `dir`'s [`PROVENANCE_FILE`] with the commit the checkout was made from
 /// and the SHA-256 of the patch it applied. For a node case, whose task
 /// names `draft`, the rebuilt `zakura-sim` then records `dir/draft` from
-/// S's committed input with `--draft <set>` (C9), replays it fresh, and,
+/// S's committed input with `--draft <set>` (C9) and the task's
+/// `draft_witness` ([`draft_witness_args`]), replays it fresh, and,
 /// if the task names companions, the rebuilt `header-acceptance` judges
 /// them on that trace into `dir/draft/companions.json`. A patch that
 /// doesn't apply or build is a refused check with no `Draft` run, not an
@@ -1671,7 +1749,7 @@ fn rebuild_case(
     subject: &Subject,
     at: Checkouts<'_>,
     case: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     target: &Path,
 ) -> Result<String, BoxError> {
     let worktree = at.worktree;
@@ -1722,9 +1800,10 @@ fn rebuild_case(
         let mut args: Vec<OsString> = vec!["--sim".into(), text(case, "harness")?.into()];
         args.extend(case_input_args(at.subject, &case["input"])?);
         args.extend(["--draft".into(), set.join(",").into()]);
+        args.extend(draft_witness_args(case)?);
         let draft = dir.join("draft");
         record_run(options, sim, &args, &draft)?;
-        fresh_replay(options, sim, &draft)?;
+        fresh_replay(options, sim, (&draft, id, "draft"))?;
         let named = case
             .get("companions")
             .and_then(Value::as_array)
@@ -1754,6 +1833,35 @@ fn rebuild_case(
     Ok(source)
 }
 
+/// `zakura-sim record`'s witness arguments for case task `case`'s `Draft`
+/// run, from its `draft_witness`, the reader's `PatchedWitness`: `--witness
+/// <property> --expect <expect>`, then `--also-violates <beside,
+/// comma-separated>` if `beside` isn't empty.
+fn draft_witness_args(case: &Value) -> Result<Vec<OsString>, BoxError> {
+    let witness = case
+        .get("draft_witness")
+        .filter(|witness| !witness.is_null())
+        .ok_or_else(|| format!("a case with a Draft run names no draft_witness: {case}"))?;
+    let mut args: Vec<OsString> = vec![
+        "--witness".into(),
+        text(case, "property")?.into(),
+        "--expect".into(),
+        text(witness, "expect")?.into(),
+    ];
+    let beside = witness
+        .get("beside")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("a draft_witness with no beside: {witness}"))?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| format!("a draft_witness whose beside isn't IDs: {witness}"))?;
+    if !beside.is_empty() {
+        args.extend(["--also-violates".into(), beside.join(",").into()]);
+    }
+    Ok(args)
+}
+
 /// Runs integrity mutation `integrity`'s history test unpatched, patched
 /// and restored in `worktree`, each run in `dir/<run>`: the test by its
 /// exact name, declaring under `dir/<run>/declared` and writing its
@@ -1771,7 +1879,7 @@ fn run_integrity(
     subject: &Subject,
     tools: &Tools,
     integrity: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     worktree: &Path,
 ) -> Result<(), BoxError> {
     reset(options, worktree, &subject.commit)?;
@@ -1824,7 +1932,7 @@ fn run_integrity(
             options,
             source.as_deref(),
             &witness,
-            &out,
+            (&out, id, run),
             (&targets, Some(&declared), true),
         )?;
         let mut build = planted::cargo_sim(worktree, &targets);
@@ -1856,13 +1964,14 @@ fn run_integrity(
 /// provenance: the commit the checkout was made from, the SHA-256 of the
 /// patch (applied or not), the checkout's source digest, and the SHA-256
 /// of the test executable it ran, since a plain build embeds no source
-/// digest. A patch that doesn't apply or revert is this task's failure, as
-/// for [`run_integrity`].
+/// digest. Both name task `id`'s run at its role, `unpatched`, `patched`
+/// or `restored`. A patch that doesn't apply or revert is this task's
+/// failure, as for [`run_integrity`].
 fn run_unit(
     options: &Options,
     subject: &Subject,
     unit: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     worktree: &Path,
 ) -> Result<(), BoxError> {
     reset(options, worktree, &subject.commit)?;
@@ -1900,7 +2009,7 @@ fn run_unit(
             options,
             source.as_deref(),
             &witness,
-            &out,
+            (&out, id, run),
             (&targets, None, false),
         )?;
         // The source is read again after the run, so a build or test that
@@ -1911,12 +2020,15 @@ fn run_unit(
             .filter(|after| Some(after) == source.as_ref());
         fs::write(
             out.join(PATCHED_BUILD_FILE),
-            serde_json::to_string_pretty(&json!({
-                "base": head_of(options, worktree),
-                "patch_sha256": patch_sha256,
-                "source": after.as_deref().unwrap_or(provenance::UNKNOWN),
-                "executable_sha256": executable.as_deref().and_then(sha256_file),
-            }))?,
+            serde_json::to_string_pretty(&id.name(
+                run,
+                json!({
+                    "base": head_of(options, worktree),
+                    "patch_sha256": patch_sha256,
+                    "source": after.as_deref().unwrap_or(provenance::UNKNOWN),
+                    "executable_sha256": executable.as_deref().and_then(sha256_file),
+                }),
+            ))?,
         )?;
     }
     reset(options, worktree, &subject.commit)
@@ -2432,7 +2544,11 @@ mod tests {
             fs::read_to_string(run.join("args")).unwrap(),
             format!("record\n--sim\nh\n--out\n{}\n", run.display())
         );
-        fresh_replay(&options, &sim, &run).unwrap();
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        fresh_replay(&options, &sim, (&run, id, "run")).unwrap();
         let replay = run.join("replay");
         assert_eq!(
             fs::read_to_string(replay.join(FULL_REPORT_FILE)).unwrap(),
@@ -2443,6 +2559,13 @@ mod tests {
         assert_eq!(ran["exited_ok"], true);
         assert_eq!(ran["killed"], false);
         assert!(ran["log"].as_str().unwrap().contains("every pick, draw"));
+        // It names this run's task and role, the trace it replayed, and the
+        // build its own report names, here none.
+        assert_eq!(ran["run_id"], "r");
+        assert_eq!(ran["index"], 3);
+        assert_eq!(ran["role"], "run");
+        assert_eq!(ran["trace"], json!(sha256_file(&run.join("trace.jsonl"))));
+        assert_eq!(ran["source"], Value::Null);
 
         let short = Options {
             out: dir.path().to_owned(),
@@ -2452,8 +2575,60 @@ mod tests {
         let slow = fake(dir.path(), "slow", "sleep 30");
         assert!(!record_run(&short, &slow, &[], &killed).unwrap());
         assert!(killed.join(KILLED).exists());
-        fresh_replay(&short, &sim, &killed).unwrap();
+        fresh_replay(&short, &sim, (&killed, id, "run")).unwrap();
         assert!(!killed.join("replay").exists());
+    }
+
+    /// A copied planted replay is named as this run's task's at its run's
+    /// role, with its trace's SHA-256 and the source its own report names,
+    /// which an earlier attempt's identical copy doesn't carry. A run with
+    /// no replay gets none.
+    #[test]
+    fn a_copied_replay_is_named_as_this_run_s() {
+        let run = tempfile::tempdir().unwrap();
+        name_replay(
+            run.path(),
+            TaskId {
+                run_id: "r",
+                index: 2,
+            },
+            "patched",
+        )
+        .unwrap();
+        assert!(!run.path().join("replay").exists());
+        let replay = run.path().join("replay");
+        fs::create_dir_all(&replay).unwrap();
+        fs::write(run.path().join("trace.jsonl"), "t\n").unwrap();
+        fs::write(replay.join(FULL_REPORT_FILE), r#"{"source":"s"}"#).unwrap();
+        fs::write(
+            replay.join(REPLAY_FILE),
+            r#"{"exited_ok":true,"killed":false,"log":"l"}"#,
+        )
+        .unwrap();
+        name_replay(
+            run.path(),
+            TaskId {
+                run_id: "r",
+                index: 2,
+            },
+            "patched",
+        )
+        .unwrap();
+        let named: Value =
+            serde_json::from_str(&fs::read_to_string(replay.join(REPLAY_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            named,
+            json!({
+                "run_id": "r",
+                "index": 2,
+                "role": "patched",
+                "trace": sha256_file(&run.path().join("trace.jsonl")),
+                "source": "s",
+                "exited_ok": true,
+                "killed": false,
+                "log": "l",
+            })
+        );
     }
 
     /// A declared history is recorded with the arguments S's tool gives
@@ -2528,6 +2703,41 @@ mod tests {
             ]
         );
         assert!(case_input_args(repo.path(), &json!({ "other": {} })).is_err());
+    }
+
+    /// A case's `Draft` run records its task's `draft_witness` on the
+    /// case's property, with `--also-violates` only for a set beside it. A
+    /// case naming none records no `Draft` run.
+    #[test]
+    fn a_draft_run_records_its_task_s_witness() {
+        let case = |beside: Value| {
+            json!({
+                "property": "p",
+                "draft_witness": { "expect": "violated", "beside": beside },
+            })
+        };
+        let strings = |args: Vec<OsString>| -> Vec<String> {
+            args.into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            strings(draft_witness_args(&case(json!([]))).unwrap()),
+            ["--witness", "p", "--expect", "violated"]
+        );
+        assert_eq!(
+            strings(draft_witness_args(&case(json!(["q", "r"]))).unwrap()),
+            [
+                "--witness",
+                "p",
+                "--expect",
+                "violated",
+                "--also-violates",
+                "q,r"
+            ]
+        );
+        assert!(draft_witness_args(&json!({ "property": "p" })).is_err());
+        assert!(draft_witness_args(&json!({ "property": "p", "draft_witness": null })).is_err());
     }
 
     /// Each task directory names the run that wrote it, its index and its
@@ -2719,7 +2929,13 @@ mod tests {
                 subject,
                 checkouts,
                 &case,
-                &dir,
+                (
+                    &dir,
+                    TaskId {
+                        run_id: "r",
+                        index: 0,
+                    },
+                ),
                 Some(unconfirmed.clone()),
             )
         };

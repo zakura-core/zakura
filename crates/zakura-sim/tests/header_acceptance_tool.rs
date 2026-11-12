@@ -7,12 +7,15 @@
 //! contract gives them.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
 };
 
 use serde_json::Value;
+use support::patched::Worktree;
 use zakura_sim::{
     harness::{
         self,
@@ -20,7 +23,7 @@ use zakura_sim::{
             contracts::RunBy,
             evaluate::{Actual, End},
             sim_test,
-            tool::{self, ReplayRun, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
+            tool::{self, ReplayRun, TaskAt, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
             HistoryRef, RunId,
         },
         RecordInput,
@@ -47,9 +50,23 @@ fn sim(args: &[&str]) -> (bool, String) {
     (output.status.success(), log)
 }
 
-/// Writes `dir`'s fresh replay as the runner does: a separate `zakura-sim
-/// replay --report` child, and its end as [`REPLAY_FILE`].
+/// The task the fixtures' replays are named for.
+const AT: TaskAt<'static> = TaskAt {
+    run_id: "t",
+    index: 0,
+};
+
+/// Writes `dir`'s fresh replay as the runner does, for [`AT`]'s own run
+/// ([`replay_as`]).
 fn replay(dir: &Path) {
+    replay_as(dir, &AT, "");
+}
+
+/// Writes `dir`'s fresh replay as the runner does: a separate `zakura-sim
+/// replay --report` child, and its end as [`REPLAY_FILE`], named as task
+/// `at`'s run at `role`, with `dir`'s trace and the source the replay's own
+/// report names.
+fn replay_as(dir: &Path, at: &TaskAt<'_>, role: &str) {
     let replay = dir.join(REPLAY_DIR);
     std::fs::create_dir_all(&replay).expect("the temp dir is writable");
     let report = replay.join(FULL_REPORT_FILE);
@@ -59,7 +76,16 @@ fn replay(dir: &Path) {
         "--report",
         report.to_str().expect("the path is UTF-8"),
     ]);
+    let source = std::fs::read_to_string(&report)
+        .ok()
+        .and_then(|text| serde_json::from_str::<FullReport>(&text).ok())
+        .and_then(|report| report.source);
     let ran = ReplayRun {
+        run_id: at.run_id.to_owned(),
+        index: at.index,
+        role: role.to_owned(),
+        trace: digest(&dir.join("trace.jsonl")),
+        source,
         exited_ok,
         killed: false,
         log,
@@ -148,7 +174,7 @@ fn a_changed_stored_fact_fails_the_replay_comparison() {
     let dir = tempfile::tempdir().expect("a temp dir can be created");
     recorded(dir.path());
     replay(dir.path());
-    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let read = |dir: &Path| flags(tool::read_replay(dir, (&AT, ""), history(), RunBy::Tool));
     assert_eq!(read(dir.path()), (true, true, true, true));
 
     edit_report(
@@ -219,7 +245,7 @@ fn another_run_s_full_reports_beside_a_trace_are_refused() {
     };
     let execution =
         |dir: &Path| tool::read_execution(dir, history(), "header-sync/storage", RunBy::Tool).end;
-    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let read = |dir: &Path| flags(tool::read_replay(dir, (&AT, ""), history(), RunBy::Tool));
     let a = recorded(1);
     let b = recorded(2);
     let (a_full, b_full) = (full(a.path()), full(b.path()));
@@ -435,6 +461,31 @@ fn input_args(repo: &Path, input: &tool::CaseInput) -> Vec<String> {
     }
 }
 
+/// The arguments, after its input, that record a node case's `Draft` run
+/// as the runner's contract gives them: its set as the override and its
+/// task's `draft_witness` on `property`.
+fn draft_args(
+    property: &str,
+    set: &[String],
+    witness: &Option<tool::PatchedWitness>,
+) -> Vec<String> {
+    let witness = witness
+        .as_ref()
+        .expect("a case with a Draft run has its witness");
+    let mut args = vec![
+        "--draft".to_owned(),
+        set.join(","),
+        "--witness".to_owned(),
+        property.to_owned(),
+        "--expect".to_owned(),
+        witness.expect.clone(),
+    ];
+    if !witness.beside.is_empty() {
+        args.extend(["--also-violates".to_owned(), witness.beside.join(",")]);
+    }
+    args
+}
+
 /// The two planted cases the whole-path test runs: the despite-close case
 /// on `header-sync/wire`, with its three companions, and a stale-completion
 /// case on `header-sync/storage`, with none. Their patches differ.
@@ -508,6 +559,7 @@ fn two_planted_cases_run_through_the_tool() {
             patched: witness,
             patch,
             draft: Some(set),
+            draft_witness,
             companions,
             ..
         } = task
@@ -523,7 +575,11 @@ fn two_planted_cases_run_through_the_tool() {
             args.extend(extra.iter().map(|arg| (*arg).to_owned()));
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             sim(&args);
-            replay(&dir.join(out));
+            let at = TaskAt {
+                run_id: &run.run_id,
+                index,
+            };
+            replay_as(&dir.join(out), &at, out);
         };
         record("baseline", &["--witness", property, "--expect", "holds"]);
         // The patched run expects what the case's task names, as the
@@ -534,7 +590,11 @@ fn two_planted_cases_run_through_the_tool() {
             patched.extend(["--also-violates", &beside]);
         }
         record("patched", &patched);
-        record("draft", &["--draft", &set.join(",")]);
+        let draft = draft_args(property, set, draft_witness);
+        record(
+            "draft",
+            &draft.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         let checks = [
             (
                 "provenance.json",
@@ -699,4 +759,128 @@ fn two_planted_cases_run_through_the_tool() {
             .all(|artifact| artifact.starts_with(&format!("{index}/"))));
     }
     assert!(!record.accepted);
+}
+
+/// The case whose `Draft` run scripts adversary acts that
+/// [`a_draft_run_s_acts_are_shown_by_its_witness`] records: reserved flags'
+/// two-frame case, whose script sends two `Status` frames.
+const TWO_FRAMES: (&str, &str) = (
+    "header-sync/s5v9/status/reserved-flags-closes",
+    "two-reserved-flags-skipped",
+);
+
+/// A node case's `Draft` run whose scenario scripts adversary acts shows
+/// them only through a passing witness of that very run, so the runner
+/// records it with one, its task's `draft_witness`. The two-frame case's
+/// patch is applied in a scratch worktree of `HEAD` and built as the
+/// planted runner builds it, and that build records the case's scripted
+/// input as the runner's contract gives its `Draft` run. Read through the
+/// tool, the run completed with every declared act shown and its trigger.
+/// Without its witness file, or with one bound to another trace, the same
+/// run's acts aren't shown.
+#[test]
+fn a_draft_run_s_acts_are_shown_by_its_witness() {
+    use zakura_sim::harness::header_acceptance::{
+        evaluate::Actions, tool::Task, CaseRun, Manifest,
+    };
+    let (property, name) = TWO_FRAMES;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let plan = tool::plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| {
+            matches!(task, Task::Case { property: p, name: n, .. } if p == property && n == name)
+        })
+        .expect("the case has a task");
+    let Task::Case {
+        harness,
+        input,
+        draft: Some(set),
+        draft_witness,
+        ..
+    } = task
+    else {
+        panic!("{name} is a node case with a Draft run");
+    };
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("draft-witness");
+    let worktree = Worktree::of_head(&work);
+    let patched = worktree.build_patched(&format!("qa/planted/{property}/{name}.patch"));
+    let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+    let draft = artifacts.path().join("draft");
+    let mut args: Vec<String> = vec!["record".into(), "--sim".into(), harness.clone()];
+    args.extend(input_args(&repo, input));
+    args.extend(draft_args(property, set, draft_witness));
+    args.extend(["--out".into(), draft.display().to_string()]);
+    let output = Command::new(&patched)
+        .args(&args)
+        .output()
+        .expect("the patched binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let run = RunId::Case {
+        property: property.to_owned(),
+        name: name.to_owned(),
+        run: CaseRun::Draft,
+    };
+    let read = || tool::read_execution(&draft, run.clone(), harness, RunBy::Tool);
+    let execution = read();
+    assert_eq!(execution.end, End::Completed);
+    assert_eq!(execution.actions, Actions::Complete, "{execution:?}");
+    assert!(execution.trigger);
+
+    let witness = draft.join("witness.json");
+    let text = std::fs::read_to_string(&witness).expect("the run wrote its witness");
+    let mut moved: Value = serde_json::from_str(&text).expect("the witness is JSON");
+    moved["trace"] = Value::from("0".repeat(64));
+    std::fs::write(&witness, moved.to_string()).expect("the temp dir is writable");
+    assert_eq!(read().actions, Actions::Incomplete);
+    std::fs::remove_file(&witness).expect("the witness is removable");
+    assert_eq!(read().actions, Actions::Incomplete);
+}
+
+/// A late-fault case's `Draft` run, whose scenario's one peer script is a
+/// `disconnect`, carries it out as the node's own session facts show it:
+/// `late-fault-unpenalized`'s scripted input recorded as the runner's
+/// contract gives its `Draft` run, here by this build (the action is the
+/// scenario's, whichever build records it), reads through the tool as
+/// completed with every declared action shown.
+#[test]
+fn a_late_fault_draft_run_s_disconnect_is_shown() {
+    use zakura_sim::harness::header_acceptance::{
+        evaluate::Actions, tool::Task, CaseRun, Manifest,
+    };
+    let (property, name) = (
+        "header-sync/header-fault-penalized",
+        "late-fault-unpenalized",
+    );
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let plan = tool::plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+    let Some(Task::Case {
+        harness,
+        input,
+        draft: Some(set),
+        draft_witness,
+        ..
+    }) = plan.tasks.iter().find(|task| {
+        matches!(task, Task::Case { property: p, name: n, .. } if p == property && n == name)
+    })
+    else {
+        panic!("{name} is a node case with a Draft run");
+    };
+    let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+    let draft = artifacts.path().join("draft");
+    let mut args: Vec<String> = vec!["record".into(), "--sim".into(), harness.clone()];
+    args.extend(input_args(&repo, input));
+    args.extend(draft_args(property, set, draft_witness));
+    args.extend(["--out".into(), draft.display().to_string()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    sim(&args);
+    let run = RunId::Case {
+        property: property.to_owned(),
+        name: name.to_owned(),
+        run: CaseRun::Draft,
+    };
+    let execution = tool::read_execution(&draft, run, harness, RunBy::Tool);
+    assert_eq!(execution.end, End::Completed);
+    assert_eq!(execution.actions, Actions::Complete, "{execution:?}");
 }

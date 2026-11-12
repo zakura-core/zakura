@@ -390,11 +390,11 @@ impl AdoptionEvidence {
     }
 
     /// Whether the run [`settled`] with a publication still waiting for its
-    /// watch read under `queue` ([`WatchRead::Open`]). False before the run
-    /// has ended ([`AdoptionEvidence::end`]).
+    /// watch read under `queue` ([`AdoptionEvidence::unread_publications`]),
+    /// even beside one the loop broke the rule for at a step. False before
+    /// the run has ended ([`AdoptionEvidence::end`]).
     pub fn unread_at_settled_end(&self, queue: EventQueue) -> bool {
-        let open = self.watch_read(queue) == WatchRead::Open;
-        open && self.store().settled == Some(true)
+        self.store().settled == Some(true) && !self.unread_publications(queue).is_empty()
     }
 
     /// Every fact so far, in the order the reactor reported them.
@@ -464,15 +464,16 @@ impl AdoptionEvidence {
         }
     }
 
-    /// The first published state still waiting for its watch read under
-    /// `queue` ([`WatchRead::Open`]), which an unread end names as its
-    /// subject.
-    pub fn unread_publication(&self, queue: EventQueue) -> Option<StateVersion> {
+    /// Every published state still waiting for its watch read under
+    /// `queue`, neither read nor broken yet, in publication order. A settled
+    /// end breaks the rule once for each, naming it as its subject.
+    pub fn unread_publications(&self, queue: EventQueue) -> Vec<StateVersion> {
         self.publication_reads(queue)
             .into_iter()
-            .find_map(|(state_version, read)| {
+            .filter_map(|(state_version, read)| {
                 (read == PublicationRead::Open).then_some(state_version)
             })
+            .collect()
     }
 
     /// Each `Published` state in order, with what answered it under
@@ -702,6 +703,57 @@ mod tests {
         read.end(&settled);
         assert!(!read.unread_at_settled_end(EventQueue::Wire));
         assert!(watch_end_violations(&read, EventQueue::Wire, false).is_empty());
+    }
+
+    /// A settled end breaks the rule once for each publication still
+    /// unread, naming it: two unread publications are two findings, and a
+    /// publication the loop broke the rule for at a step, which its step
+    /// finding already names, leaves a later unread one its own end finding.
+    #[test]
+    fn a_settled_end_names_every_unread_publication() {
+        use crate::check::FindingSubject;
+        let settled = RunEnd {
+            outcome: Outcome::Budget,
+            steps: 100,
+            violation: None,
+            drain: Some(Drain {
+                steps: 10,
+                exhausted: false,
+            }),
+            harness: None,
+            rest: Some(SchedulerStatus::Quiescent),
+        };
+        let named = |facts: Vec<AdoptionFact>| {
+            let evidence = evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0);
+            evidence.end(&settled);
+            watch_end_violations(&evidence, EventQueue::Wire, false)
+                .into_iter()
+                .map(|found| found.subject)
+                .collect::<Vec<_>>()
+        };
+        let publication = |version: u64| {
+            Some(FindingSubject::Publication {
+                state_version: format!("{:?}", StateVersion::new(version)),
+            })
+        };
+        assert_eq!(
+            named(vec![commit(4), commit(5)]),
+            vec![publication(4), publication(5)]
+        );
+        assert_eq!(
+            named(vec![
+                commit(4),
+                wire(TakePoint::TurnStart, 4),
+                wire(TakePoint::Select, 3),
+                wire(TakePoint::TurnStart, 2),
+                commit(5),
+            ]),
+            vec![publication(5)]
+        );
+        assert_eq!(
+            named(vec![commit(4), commit(5), read(4)]),
+            vec![publication(5)]
+        );
     }
 
     /// The watch rule over `facts`, all at time 0.

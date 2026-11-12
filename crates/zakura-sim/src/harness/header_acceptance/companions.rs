@@ -38,7 +38,9 @@ use zakura_network::zakura::observe::ReactorEvent;
 
 use super::{
     binding::{self, Expect, Field},
-    refs::{joined, FindingRef, FrameRef, PageRef, ReadRef, SessionRef, SubscriptionRef},
+    refs::{
+        joined, FindingRef, FrameRef, PageRef, ReadRef, SessionRef, StreamRef, SubscriptionRef,
+    },
     CaseRef,
 };
 use crate::{
@@ -221,7 +223,7 @@ impl StagedPage {
 
 /// The frame `obs` says the node judged, if it's a `FrameJudged` on a QUIC
 /// stream: a frame the peer sent.
-fn judged_frame(obs: &Observation) -> Option<FrameRef> {
+pub fn judged_frame(obs: &Observation) -> Option<FrameRef> {
     match obs {
         Observation::FrameJudged {
             connection,
@@ -282,41 +284,39 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
     let subscription =
         exchange.ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
     // The session row names the stream its session reads.
-    let sessions: Vec<(u64, &str)> = observations
-        .iter()
-        .filter_map(|obs| match obs {
-            Observation::Session {
-                connection,
-                quic_stream,
-                kind,
-                version,
-                session_id,
-                peer,
-            } if (*connection, *quic_stream, *kind, *version)
-                == (
-                    frame.connection,
-                    frame.quic_stream,
-                    frame.kind,
-                    frame.version,
-                ) =>
-            {
-                Some((*session_id, peer.as_str()))
-            }
-            _ => None,
-        })
-        .collect();
-    let [(session, peer)] = sessions[..] else {
-        return Err(format!(
-            "connection {} stream {} carries sessions {sessions:?}, not one",
-            frame.connection, frame.quic_stream
-        ));
+    let stream = StreamRef::from(frame);
+    let sessions = joined(observations, session_stream, &stream);
+    let [Observation::Session {
+        session_id, peer, ..
+    }] = sessions[..]
+    else {
+        return Err(format!("{stream:?} carries sessions {sessions:?}, not one"));
     };
     Ok(RejectedPage {
         frame: frame.clone(),
-        session,
+        session: *session_id,
         subscription,
-        peer: peer.to_owned(),
+        peer: peer.clone(),
     })
+}
+
+/// The stream `obs` says its session reads, if it's a `Session` row.
+fn session_stream(obs: &Observation) -> Option<StreamRef> {
+    match obs {
+        Observation::Session {
+            connection,
+            quic_stream,
+            kind,
+            version,
+            ..
+        } => Some(StreamRef {
+            connection: *connection,
+            kind: *kind,
+            version: *version,
+            quic_stream: *quic_stream,
+        }),
+        _ => None,
+    }
 }
 
 /// The peer `page` came from, as `peers` names it for its harness name, by
@@ -338,11 +338,7 @@ pub fn sent_page(
 ) -> Result<SentPage, String> {
     let peer = page_peer(page, peers)?;
     let hashes = sent
-        .page(
-            page.frame.connection,
-            page.frame.quic_stream,
-            page.frame.seq,
-        )
+        .page(&page.frame)
         .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
     Ok(SentPage { peer, hashes })
 }
@@ -937,17 +933,49 @@ mod tests {
         }
     }
 
+    /// The rejected page's session is the one whose `Session` row names its
+    /// frame's stream, joined on that whole [`StreamRef`]: a row with any
+    /// one key of the stream moved names another stream, so the page has
+    /// no session (Rule 25's template).
+    #[test]
+    fn the_rejected_page_s_session_joins_its_stream() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let stream = StreamRef::from(&page.frame);
+        let keys = assert_one_key_off(&stream, |stream| {
+            let mut moved = log(1, 1, "service_protocol_reject");
+            moved[0] = Observation::Session {
+                connection: stream.connection,
+                peer: "peer-0".into(),
+                quic_stream: stream.quic_stream,
+                kind: stream.kind,
+                version: stream.version,
+                session_id: 11,
+            };
+            rejected_page(&moved).as_ref() == Ok(&page)
+        });
+        assert_eq!(keys, 4);
+    }
+
     /// The rejected page's peer and hashes come from its frame's evidence:
-    /// the peer its `Session` row names, and the page the peer sent there.
+    /// the peer its `Session` row names, and the page the peer sent there,
+    /// joined on its frame's whole [`FrameRef`], so the same position on
+    /// another stream kind, version or direction holds no page.
     #[test]
     fn the_sent_page_comes_from_the_frames_evidence() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let peers = vec![("peer-0".to_owned(), "ab".to_owned())];
         let pages = SentPages::new(&crate::stores::EvidenceStores::default());
         assert!(sent_page(&page, &peers, &pages).is_err());
-        pages.record((1, 4, 3), sent().hashes);
+        pages.record(page.frame.clone(), sent().hashes);
         assert_eq!(sent_page(&page, &peers, &pages), Ok(sent()));
         assert!(sent_page(&page, &[], &pages).is_err());
+        assert_one_key_off(&page.frame, |frame| {
+            let page = RejectedPage {
+                frame: frame.clone(),
+                ..page.clone()
+            };
+            sent_page(&page, &peers, &pages).is_ok()
+        });
     }
 
     /// The staging companion joins the page staged from the rejected frame:

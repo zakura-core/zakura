@@ -1455,8 +1455,12 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     }
                     (false, Some(_)) => {
                         let mut draft = checks.draft(case(CaseRun::Draft));
-                        if let Some(why) = rebuild_refusal(repo, patch, subject, &dir) {
-                            fail(&mut draft, why);
+                        // The Draft run is the patched build's, of S plus
+                        // the case's patch, unless it already failed.
+                        if !matches!(draft.end, End::Failed { .. }) {
+                            if let Some(why) = rebuild_refusal(repo, patch, subject, &dir) {
+                                fail(&mut draft, why);
+                            }
                         }
                         let companions = companions_of(&dir, &draft, companions);
                         Actual::Caught {
@@ -1633,8 +1637,7 @@ impl CaseChecks<'_> {
                 &mut execution,
                 format!("its trace's build source isn't the measured patched checkout's: {why}"),
             );
-        }
-        if let Some(why) = counterfactual_refusal(self.dir, self.subject_source) {
+        } else if let Some(why) = counterfactual_refusal(self.dir, self.subject_source) {
             fail(&mut execution, why);
         }
         execution

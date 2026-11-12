@@ -6,7 +6,9 @@
 //! time per `--out`, a fresh run directory, a clean checkout of S inside it,
 //! a deadline on every child, containment, and a record that exists only if
 //! the run fully succeeded. Every binary it runs is its own build from that
-//! checkout, in a target directory of its own (Rule 5).
+//! checkout, in a target directory of its own (Rule 5), the runner itself
+//! included: the caller's xtask builds xtask in S's checkout and hands the
+//! run to it, as header-acceptance's runner does.
 //!
 //! The simulator side decides everything: `sim-acceptance plan` lists the
 //! tasks, this runner runs them and keeps their raw output under
@@ -27,8 +29,8 @@ use serde_json::{json, Value};
 use crate::{
     acceptance::{
         add_worktree, child, clear_stale_runs, contain, lock_out, mark_descendants, publish_record,
-        remove_worktrees_under, run_id, source_digest, stop_if_interrupted, track_sessions,
-        Options, Tool, ESCAPED, RECORD, RUNS, SOURCE_DIGEST, SUBJECT_DIR,
+        remove_worktrees_under, resolved, run_id, source_digest, stop_if_interrupted,
+        track_sessions, Options, Tool, ESCAPED, RECORD, RUNS, SOURCE_DIGEST, SUBJECT_DIR,
     },
     header_acceptance::{cargo, clean_build_env, libtest, run_test},
     planted::provenance,
@@ -46,7 +48,8 @@ const TOOL: Tool = Tool {
 const DEFAULT_DEADLINE_SECS: u64 = 7200;
 
 /// A run directory's build directories, dropped once the run succeeds.
-const RUN_TARGETS: [&str; 6] = [
+const RUN_TARGETS: [&str; 7] = [
+    "xtask-target",
     "build",
     "build-release",
     "tests",
@@ -136,6 +139,10 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     // A signal ends every child the way its deadline would.
     sim_minimize::install_interrupt_handler();
     clean_build_env();
+    if args_in.peek().map(String::as_str) == Some(IN_SUBJECT) {
+        args_in.next();
+        return run_in_subject(repo_root, args(args_in)?);
+    }
     let args = args(args_in)?;
     let options = Options {
         out: args.out.clone(),
@@ -145,8 +152,10 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     let (_lock, kept) = lock_out(&TOOL, &args.out)?;
     mark_descendants(&TOOL, &args.out);
     let mut sessions = track_sessions(&args.out);
-    let contained = contain();
-    let source = subject_source(repo_root, &options, &args.subject)?;
+    contain();
+    // The caller's checkout must already be clean and at S, so a mistaken
+    // subject fails before anything is built.
+    subject_source(repo_root, &options, &args.subject)?;
     clear_stale_runs(&TOOL, repo_root, &options, kept.as_deref())?;
     sessions.cleared();
     let run_dir = args.out.join(RUNS).join(run_id());
@@ -158,7 +167,8 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     };
     let root = run_dir.join(SUBJECT_DIR);
     add_worktree(repo_root, &run, &root, &args.subject)?;
-    let result = run_at(&root, &run, &args, &source, contained);
+    // Everything after runs as the xtask built from S ([`hand_off`]).
+    let result = hand_off(&root, &run, &args);
     let removed = remove_worktrees_under(repo_root, &run, &run_dir);
     let summary = result?;
     removed?;
@@ -179,6 +189,83 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     publish_record(&args.out, &run_dir)?;
     println!("{summary}");
     println!("record: {}", args.out.join(RECORD).display());
+    Ok(())
+}
+
+/// The hidden first argument that has this command run the experiments as
+/// the xtask built from S's own checkout ([`hand_off`]).
+const IN_SUBJECT: &str = "--in-subject";
+
+/// How long the xtask built from S gets for the whole run: each of its own
+/// children has the run's per-child deadline too.
+const IN_SUBJECT_DEADLINE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Builds xtask in `root`, S's own checkout, and runs the experiments with
+/// it ([`run_in_subject`]), so the code that runs every task and writes its
+/// artifacts' bindings is S's, not the caller's, as header-acceptance's
+/// runner does. Returns the run's summary.
+fn hand_off(root: &Path, run: &Options, args: &Args) -> Result<String, BoxError> {
+    let logs = run.out.join("logs");
+    fs::create_dir_all(&logs)?;
+    let target = run.out.join("xtask-target");
+    let cargo_path = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = Command::new(&cargo_path);
+    build
+        .args(["build", "--locked", "-p", "xtask", "--target-dir"])
+        .arg(&target)
+        .env("CARGO_TERM_COLOR", "never")
+        .env_remove("RUSTFLAGS")
+        .current_dir(root);
+    child(&mut build, &logs.join("xtask-build.log"), run.deadline)
+        .exited_ok()
+        .map_err(|end| format!("building xtask at S {end}"))?;
+    let mut inner = Command::new(target.join("debug").join("xtask"));
+    inner
+        .args(["sim-acceptance", IN_SUBJECT, "--subject", &args.subject])
+        .arg("--header-out")
+        .arg(&args.header_out)
+        .arg("--out")
+        .arg(&run.out)
+        .arg("--deadline-secs")
+        .arg(args.deadline.as_secs().to_string())
+        .env("CARGO", &cargo_path)
+        .current_dir(root);
+    for only in &args.only {
+        inner.args(["--only", only]);
+    }
+    let log = logs.join("in-subject.log");
+    child(&mut inner, &log, IN_SUBJECT_DEADLINE)
+        .exited_ok()
+        .map_err(|end| {
+            format!(
+                "the run at S {end}:\n{}",
+                fs::read_to_string(&log).unwrap_or_default()
+            )
+        })?;
+    Ok(fs::read_to_string(logs.join("evaluate.log"))?)
+}
+
+/// The experiments, as the xtask built from S runs them ([`hand_off`]).
+/// Its `--out` is the run's own directory, and `repo_root`, where it was
+/// built, must be the checkout of S inside it, clean and at `--subject`.
+/// The caller set that checkout up, removes it, and publishes the record
+/// only if this exits 0.
+fn run_in_subject(repo_root: &Path, args: Args) -> Result<(), BoxError> {
+    let root = args.out.join(SUBJECT_DIR);
+    if resolved(repo_root) != resolved(&root) {
+        return Err(format!(
+            "{IN_SUBJECT} runs only as the xtask built in {}",
+            root.display()
+        )
+        .into());
+    }
+    let run = Options {
+        out: args.out.clone(),
+        deadline: args.deadline,
+    };
+    let contained = contain();
+    let source = subject_source(repo_root, &run, &args.subject)?;
+    run_at(repo_root, &run, &args, &source, contained)?;
     Ok(())
 }
 

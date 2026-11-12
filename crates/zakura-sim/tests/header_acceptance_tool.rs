@@ -165,6 +165,51 @@ fn a_changed_stored_fact_fails_the_replay_comparison() {
     assert!(!exact && !stores_equal);
 }
 
+/// The runner contract's `record` arguments for a declared history record
+/// it through the `zakura-sim` binary: `--scenario` takes the declaration's
+/// JSON text, and the recorded trace runs the declared scenario and Plan.
+/// The scenario file's path in its place, as the contract once read, is
+/// refused as not JSON.
+#[test]
+fn a_declared_history_records_through_the_contracts_arguments() {
+    use zakura_sim::{
+        harness::{header_acceptance::history, header_sync::StorageScenario},
+        PlanInput,
+    };
+    let root = tempfile::tempdir().expect("a temp dir can be created");
+    let scenario = StorageScenario::default();
+    let storage = "header-sync/storage";
+    history::declare_into(
+        root.path(),
+        storage,
+        "only",
+        &scenario,
+        &PlanInput::Bytes(vec![7, 1]),
+    )
+    .expect("the temp dir is writable");
+    let declaration = root.path().join("0");
+    let out = root.path().join("run");
+    let mut args = vec!["record".to_owned()];
+    args.extend(tool::record_args(storage, &declaration).expect("it names one Plan"));
+    args.extend(["--out".to_owned(), out.display().to_string()]);
+    let (ok, log) = sim(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok, "{log}");
+    let trace = zakura_sim::trace::TraceReader::open(&out).expect("the trace reads back");
+    let described = (harness::find(storage).expect("it's registered").meta)(
+        &serde_json::to_value(&scenario).expect("it serializes"),
+    )
+    .expect("the scenario fits");
+    assert_eq!(trace.meta.scenario, described.scenario);
+
+    let path = declaration.join(history::SCENARIO_FILE);
+    let mut by_path = args.clone();
+    by_path[4] = path.display().to_string();
+    by_path.pop();
+    by_path.push(root.path().join("by-path").display().to_string());
+    let (ok, log) = sim(&by_path.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!ok && log.contains("--scenario isn't JSON"), "{log}");
+}
+
 /// Every committed fixture of `harness`, sorted.
 fn fixtures_of(harness: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(fixture(""))

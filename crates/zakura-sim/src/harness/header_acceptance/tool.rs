@@ -37,10 +37,13 @@
 //!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`,
 //!   so `<i>/declared` holds what it declared ([`super::history`]). Then
 //!   `<i>/run`, the declaration whose case is the task's `case`, recorded by
-//!   S's `zakura-sim record --sim <harness> --scenario <its scenario.json>
-//!   (--plan <its plan.bin> | --script <its script.json>)`, with
-//!   `--witness <property> --expect <expect>` when the task names `expect`,
-//!   and its fresh replay.
+//!   S's `zakura-sim record` with [`record_args`]: `--sim <harness>
+//!   --scenario <scenario>`, where `<scenario>` is the JSON text its
+//!   `scenario.json` holds, passed as one argument (the CLI parses
+//!   `--scenario`'s value as JSON, not as a path), then `--plan <path of its
+//!   plan.bin>` or `--script <path of its script.json>`, with `--witness
+//!   <property> --expect <expect>` when the task names `expect`, and its
+//!   fresh replay.
 //! * `case`: the planted runner's `baseline` and `patched` recorded runs,
 //!   copied whole, with the fresh replays it made of them (C4), and
 //!   [`VERDICT_FILE`], [`TARGET_FILE`] and [`PROVENANCE_FILE`] as before.
@@ -49,7 +52,8 @@
 //!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
 //!   where its input is `--input <input>`, `--scenario <scenario> --plan
 //!   <plan>` or `--scenario <scenario> --script <script>` as [`CaseInput`]
-//!   names it, with its fresh replay by the same binary. A case whose task
+//!   names it, `--scenario` again taking the scenario file's JSON text and
+//!   the others paths, with its fresh replay by the same binary. A case whose task
 //!   names `companions` gets [`COMPANIONS_FILE`] in `<i>/draft` from the
 //!   same rebuilt checkout's `header-acceptance companions --trace <i>/draft
 //!   --out <i>/draft/companions.json`, a [`CompanionsRun`].
@@ -1707,15 +1711,44 @@ fn libtest_names(thread: &str, test: &str) -> bool {
     thread == test || thread.ends_with(&format!("::{test}"))
 }
 
+/// The declaration in `declaration`'s one Plan file and whether it's a
+/// script, or why it names neither or both forms.
+fn declared_plan(declaration: &Path) -> Result<(std::path::PathBuf, bool), String> {
+    let (plan, script) = (declaration.join(PLAN_FILE), declaration.join(SCRIPT_FILE));
+    match (plan.exists(), script.exists()) {
+        (true, false) => Ok((plan, false)),
+        (false, true) => Ok((script, true)),
+        _ => Err("its declaration names neither or both Plan forms".to_owned()),
+    }
+}
+
+/// The `zakura-sim record` arguments, before `--out` and any witness, that
+/// record the declaration in `declaration` on `harness`, as the runner's
+/// contract gives them: `--sim`, then `--scenario` with the JSON text its
+/// [`SCENARIO_FILE`] holds as one argument, since the CLI parses that value
+/// as JSON, and `--plan` or `--script` with its Plan file's path.
+pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, String> {
+    let (file, script) = declared_plan(declaration)?;
+    let scenario_file = declaration.join(SCENARIO_FILE);
+    let scenario = fs::read_to_string(&scenario_file)
+        .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+    Ok(vec![
+        "--sim".to_owned(),
+        harness.to_owned(),
+        "--scenario".to_owned(),
+        scenario,
+        if script { "--script" } else { "--plan" }.to_owned(),
+        file.display().to_string(),
+    ])
+}
+
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
 /// on `harness`: its scenario and its Plan bytes or script, by digest
 /// (C18).
 fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
-    let (plan, script) = (declaration.join(PLAN_FILE), declaration.join(SCRIPT_FILE));
-    let (file, script) = match (plan.exists(), script.exists()) {
-        (true, false) => (plan, false),
-        (false, true) => (script, true),
-        _ => return Some("its declaration names neither or both Plan forms".to_owned()),
+    let (file, script) = match declared_plan(declaration) {
+        Ok(found) => found,
+        Err(why) => return Some(why),
     };
     typed_refusal(
         harness,

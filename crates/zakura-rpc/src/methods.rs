@@ -2054,7 +2054,8 @@ where
     /// - transactions already published for `tip_hash` are returned without waiting;
     /// - the wait ends at once when the mempool reports that it held no transactions when the
     ///   block arrived, or that removing the block's transactions is more work than
-    ///   [`NEW_TIP_MEMPOOL_LIGHT_WORK`] (see [`Self::mempool_not_worth_waiting_for`]);
+    ///   [`NEW_TIP_MEMPOOL_LIGHT_WORK`] (see [`Self::mempool_not_worth_waiting_for`]). The
+    ///   mempool is then sent no request;
     /// - otherwise it ends after [`NEW_TIP_MEMPOOL_WAIT`].
     ///
     /// Returns the reason when there are none to offer: the mempool is empty, has too much
@@ -2066,19 +2067,27 @@ where
         tip_hash: block::Hash,
     ) -> std::result::Result<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>), EmptyReason>
     {
-        let mempool = tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, self.mempool_on_tip(tip_hash));
+        let mut mempool_snapshots = self.mempool_snapshots.clone();
 
         let mempool = tokio::select! {
-            // Transactions the mempool already has for the tip are taken whatever it reports.
+            // Checked in this order: transactions the mempool already published for the tip
+            // are taken whatever it reports, and its report is read before it is sent a
+            // request, so a mempool busy with heavy work is not asked for anything.
             biased;
 
-            mempool = mempool => mempool,
+            // A mempool that has shut down publishes nothing more; the request decides.
+            Some(snapshot) = mempool_snapshots.on_tip(tip_hash) => {
+                Ok(Ok(Some((snapshot.transactions, snapshot.transaction_dependencies))))
+            }
             reason = self.mempool_not_worth_waiting_for(tip_hash) => {
                 tracing::debug!(
                     ?reason,
                     "not waiting for the mempool on a new tip; answering with the coinbase-only template"
                 );
                 return Err(reason);
+            }
+            mempool = tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, self.mempool_on_tip(tip_hash)) => {
+                mempool
             }
         };
 
@@ -2126,17 +2135,16 @@ where
             .map(|progress| progress.stage);
 
         match stage {
-            Some(MempoolTipStage::Reconciling {
-                mempool_transactions: 0,
-                ..
-            }) => EmptyReason::MempoolEmpty,
-            Some(MempoolTipStage::Reconciling { work, .. })
-                if work > NEW_TIP_MEMPOOL_LIGHT_WORK =>
+            Some(MempoolTipStage::Reconciling(work)) if work.mempool_transactions == 0 => {
+                EmptyReason::MempoolEmpty
+            }
+            Some(MempoolTipStage::Reconciling(work))
+                if work.work() > NEW_TIP_MEMPOOL_LIGHT_WORK =>
             {
                 EmptyReason::MempoolWorkHeavy
             }
             // Light work, a finished block, or a mempool that has shut down.
-            Some(MempoolTipStage::Reconciling { .. } | MempoolTipStage::Reconciled) | None => {
+            Some(MempoolTipStage::Reconciling(_) | MempoolTipStage::Reconciled) | None => {
                 std::future::pending().await
             }
         }

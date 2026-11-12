@@ -61,21 +61,45 @@ pub struct MempoolTipProgress {
 pub enum MempoolTipStage {
     /// The mempool is removing the block's mined, conflicting and expired transactions.
     /// Its transactions for this block are not available until it finishes.
-    Reconciling {
-        /// The number of verified transactions the mempool held when the block arrived.
-        /// The block can only remove some of them, so zero means it has none for this block.
-        mempool_transactions: usize,
-
-        /// How much there is to do, counted in the parts of a transaction the mempool looks
-        /// up or removes one by one: the transparent outputs it spends and creates, and the
-        /// nullifiers it reveals. This is the number of those parts in the block's
-        /// transactions plus the number in the mempool's.
-        work: usize,
-    },
+    Reconciling(MempoolTipWork),
 
     /// The mempool has finished the block. Its transactions for the block are published, or
     /// it answers a request for them without further work on the block.
     Reconciled,
+}
+
+/// What the mempool held when a block arrived, and how much work removing the block's
+/// transactions is.
+///
+/// Work is counted in the items the mempool handles one by one when a block arrives, called
+/// parts here. Each kind is counted separately, so that measurements can weigh them.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct MempoolTipWork {
+    /// The number of verified transactions the mempool held when the block arrived.
+    ///
+    /// The block can only remove some of them, so zero means the mempool has none for this
+    /// block. Each one is visited once to check it against the block, to check its expiry,
+    /// and to copy it into the published list.
+    pub mempool_transactions: usize,
+
+    /// The transparent outputs the block's transactions spend and create, and the nullifiers
+    /// they reveal. The mempool collects the spends and nullifiers to check its transactions
+    /// against, and removes the outputs and spends of the transactions the block mined.
+    pub block_parts: usize,
+
+    /// The transparent outputs the mempool's transactions spend, and the nullifiers they
+    /// reveal: the parts the mempool checks against the block's.
+    pub mempool_parts: usize,
+}
+
+impl MempoolTipWork {
+    /// Returns the work as one number: each part counts one, and each transaction held counts
+    /// one for its visits.
+    pub fn work(&self) -> usize {
+        self.mempool_transactions
+            .saturating_add(self.block_parts)
+            .saturating_add(self.mempool_parts)
+    }
 }
 
 /// The mempool's end of the snapshot channel.
@@ -98,14 +122,11 @@ impl MempoolSnapshotSender {
     }
 
     /// Publishes that the mempool has started on the block `tip_hash`, before it does any of
-    /// the work. See [`MempoolTipStage::Reconciling`] for `mempool_transactions` and `work`.
-    pub fn start_tip(&self, tip_hash: block::Hash, mempool_transactions: usize, work: usize) {
+    /// the `work`.
+    pub fn start_tip(&self, tip_hash: block::Hash, work: MempoolTipWork) {
         self.publish_tip_progress(MempoolTipProgress {
             tip_hash,
-            stage: MempoolTipStage::Reconciling {
-                mempool_transactions,
-                work,
-            },
+            stage: MempoolTipStage::Reconciling(work),
         });
     }
 
@@ -323,6 +344,15 @@ mod tests {
         assert!(has_news(&seen), "same lists on a new block");
     }
 
+    /// Work with `mempool_transactions` held and `block_parts` in the block.
+    fn work(mempool_transactions: usize, block_parts: usize) -> MempoolTipWork {
+        MempoolTipWork {
+            mempool_transactions,
+            block_parts,
+            mempool_parts: 0,
+        }
+    }
+
     /// A reader gets the mempool's progress on the block it asks about, whether the mempool
     /// started on that block before or after it asked, and not its progress on another block.
     #[tokio::test]
@@ -332,15 +362,12 @@ mod tests {
         let sender = MempoolSnapshotSender::new();
         let mut receiver = sender.subscribe();
 
-        sender.start_tip(older_tip, 3, 40);
+        sender.start_tip(older_tip, work(3, 40));
         assert_eq!(
             receiver.progress_on_tip(older_tip).await,
             Some(MempoolTipProgress {
                 tip_hash: older_tip,
-                stage: MempoolTipStage::Reconciling {
-                    mempool_transactions: 3,
-                    work: 40,
-                },
+                stage: MempoolTipStage::Reconciling(work(3, 40)),
             }),
             "the mempool had already started on the block"
         );
@@ -355,7 +382,7 @@ mod tests {
             "progress on an older block is not progress on the block asked about"
         );
 
-        sender.start_tip(newer_tip, 2, 7);
+        sender.start_tip(newer_tip, work(2, 7));
         let started_after = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the mempool starting on the block wakes the reader")
@@ -364,10 +391,7 @@ mod tests {
             started_after,
             Some(MempoolTipProgress {
                 tip_hash: newer_tip,
-                stage: MempoolTipStage::Reconciling {
-                    mempool_transactions: 2,
-                    work: 7,
-                },
+                stage: MempoolTipStage::Reconciling(work(2, 7)),
             })
         );
     }
@@ -380,7 +404,7 @@ mod tests {
         let sender = MempoolSnapshotSender::new();
         let mut receiver = sender.subscribe();
 
-        sender.start_tip(tip, 3, 40);
+        sender.start_tip(tip, work(3, 40));
         sender.finish_tip(tip);
         assert_eq!(
             receiver.progress_on_tip(tip).await,

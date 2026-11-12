@@ -4010,8 +4010,21 @@ async fn long_poll_from_old_tip_asks_the_mempool_when_its_snapshot_is_behind() {
 fn rpc_reading_mempool_snapshots(
     mempool_snapshots: &mempool::MempoolSnapshotSender,
 ) -> TestRpcImpl {
-    let mempool = tower::service_fn(|_: mempool::Request| {
-        std::future::pending::<std::result::Result<mempool::Response, BoxError>>()
+    rpc_counting_mempool_requests(mempool_snapshots).0
+}
+
+/// Returns an RPC handler like [`rpc_reading_mempool_snapshots`], and the number of requests
+/// sent to its mempool so far.
+fn rpc_counting_mempool_requests(
+    mempool_snapshots: &mempool::MempoolSnapshotSender,
+) -> (TestRpcImpl, Arc<std::sync::atomic::AtomicUsize>) {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mempool = tower::service_fn({
+        let requests = requests.clone();
+        move |_: mempool::Request| {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<std::result::Result<mempool::Response, BoxError>>()
+        }
     });
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -4035,7 +4048,18 @@ fn rpc_reading_mempool_snapshots(
         None,
     );
 
-    rpc
+    (rpc, requests)
+}
+
+/// The work a mempool holding `mempool_transactions` reports for a block, `work` in all.
+fn reported_work(mempool_transactions: usize, work: usize) -> mempool::MempoolTipWork {
+    let reported = mempool::MempoolTipWork {
+        mempool_transactions,
+        block_parts: work - mempool_transactions,
+        mempool_parts: 0,
+    };
+    assert_eq!(reported.work(), work);
+    reported
 }
 
 /// A long poll that reaches a new tip before the mempool has processed that block gets the
@@ -4086,7 +4110,7 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
         LONG_POLL_OLD_TIP,
         vec![fake_verified_mempool_tx()],
     )));
-    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
+    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots);
 
     // The mempool has not started on the new tip: the long poll waits for it.
     let started = tokio::time::Instant::now();
@@ -4099,7 +4123,10 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
         "a mempool that has reported nothing on the new tip is waited for"
     );
 
-    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.start_tip(
+        LONG_POLL_NEW_TIP,
+        reported_work(1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1),
+    );
     assert_eq!(
         populated_mempool.await.unwrap_err(),
         EmptyReason::MempoolWorkHeavy
@@ -4110,7 +4137,9 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
         "the wait ends when the mempool reports the work"
     );
 
-    // The mempool already reported the work when the next long poll asks.
+    // The mempool already reported the work when the next long poll asks: it answers at
+    // once and does not add a request to the busy mempool's queue.
+    let requests_before = requests.load(std::sync::atomic::Ordering::SeqCst);
     let started = tokio::time::Instant::now();
     assert_eq!(
         rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
@@ -4119,6 +4148,11 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
         EmptyReason::MempoolWorkHeavy
     );
     assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        requests_before,
+        "a mempool that reported heavy work is not sent a request"
+    );
 }
 
 /// A long poll that reaches a new tip does not wait for a mempool that held no transactions
@@ -4127,8 +4161,8 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_with_heavy_work() {
 async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_that_held_nothing() {
     let _init_guard = zakura_test::init();
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
-    let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
-    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 0, 1);
+    let (rpc, requests) = rpc_counting_mempool_requests(&mempool_snapshots);
+    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, reported_work(0, 1));
 
     let started = tokio::time::Instant::now();
     assert_eq!(
@@ -4138,6 +4172,11 @@ async fn first_answer_on_new_tip_does_not_wait_for_a_mempool_that_held_nothing()
         EmptyReason::MempoolEmpty
     );
     assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a mempool that held nothing is not sent a request"
+    );
 }
 
 /// A long poll that reaches a new tip waits for a mempool that reports light work on that
@@ -4153,7 +4192,10 @@ async fn first_answer_on_new_tip_waits_for_a_mempool_with_light_work() {
         vec![mempool_tx.clone()],
     )));
     let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
-    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK);
+    mempool_snapshots.start_tip(
+        LONG_POLL_NEW_TIP,
+        reported_work(1, NEW_TIP_MEMPOOL_LIGHT_WORK),
+    );
 
     let populated_mempool = rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP);
     tokio::pin!(populated_mempool);
@@ -4186,7 +4228,10 @@ async fn first_answer_on_new_tip_uses_published_transactions_despite_heavy_work(
     let mempool_tx = fake_verified_mempool_tx();
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
     let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
-    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.start_tip(
+        LONG_POLL_NEW_TIP,
+        reported_work(1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1),
+    );
     mempool_snapshots.publish(Some(mempool_snapshot(
         LONG_POLL_NEW_TIP,
         vec![mempool_tx.clone()],
@@ -4210,7 +4255,10 @@ async fn first_answer_on_new_tip_waits_out_heavy_work_on_another_block_and_a_fin
     let mempool_snapshots = mempool::MempoolSnapshotSender::new();
     let rpc = rpc_reading_mempool_snapshots(&mempool_snapshots);
 
-    mempool_snapshots.start_tip(LONG_POLL_OLD_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.start_tip(
+        LONG_POLL_OLD_TIP,
+        reported_work(1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1),
+    );
     let started = tokio::time::Instant::now();
     assert_eq!(
         rpc.populated_mempool_on_new_tip(LONG_POLL_NEW_TIP)
@@ -4222,7 +4270,10 @@ async fn first_answer_on_new_tip_waits_out_heavy_work_on_another_block_and_a_fin
 
     // The mempool finished the new tip and then withdrew its transactions: it no longer has
     // that work to do, so its request, which this mempool never answers, is waited for.
-    mempool_snapshots.start_tip(LONG_POLL_NEW_TIP, 1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1);
+    mempool_snapshots.start_tip(
+        LONG_POLL_NEW_TIP,
+        reported_work(1, NEW_TIP_MEMPOOL_LIGHT_WORK + 1),
+    );
     mempool_snapshots.finish_tip(LONG_POLL_NEW_TIP);
     let started = tokio::time::Instant::now();
     assert_eq!(

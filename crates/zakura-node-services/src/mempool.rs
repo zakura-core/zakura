@@ -25,7 +25,7 @@ pub use self::{
     service_trait::MempoolService,
     snapshot::{
         MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTipProgress,
-        MempoolTipStage,
+        MempoolTipStage, MempoolTipWork,
     },
     transaction_dependencies::TransactionDependencies,
 };

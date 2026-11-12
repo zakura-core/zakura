@@ -50,15 +50,15 @@ use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolSnapshot,
-    MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTxSubscriber, QueueSource, Request,
-    Response,
+    MempoolSnapshotReceiver, MempoolSnapshotSender, MempoolTipWork, MempoolTxSubscriber,
+    QueueSource, Request, Response,
 };
 use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
 
 use crate::components::sync::SyncStatus;
-use trace::{MempoolTrace, TipProcessing, TipWork};
+use trace::{MempoolTrace, TipApplied, TipProcessing, TipStarted};
 
 pub mod config;
 mod crawler;
@@ -765,34 +765,35 @@ impl Mempool {
     /// that block is, before doing any of the work.
     ///
     /// A reader that cannot wait long for the block's transactions uses this to decide
-    /// whether to wait at all. A reset is published as holding nothing: it empties the
-    /// mempool whatever the block holds.
+    /// whether to wait at all. A reset is published as holding nothing and no work: it
+    /// empties the mempool whatever the block holds.
     ///
-    /// Returns what was held and that work, for the trace. A disabled mempool holds nothing
-    /// and publishes nothing.
-    fn publish_tip_started(&self, tip_action: &TipAction) -> TipWork {
+    /// Returns what was held and published, for the trace, or `None` for a disabled mempool,
+    /// which publishes nothing.
+    fn publish_tip_started(&self, tip_action: &TipAction) -> Option<TipStarted> {
         let ActiveState::Enabled { storage, .. } = &self.active_state else {
-            return TipWork::default();
+            return None;
         };
-        let transactions_before = storage.transaction_count();
         let (tip_hash, _height) = tip_action.best_tip_hash_and_height();
-
         let work = match tip_action {
-            TipAction::Grow { block } => {
-                let work = storage.tip_work(&block.transactions);
-                self.snapshot_sender
-                    .start_tip(tip_hash, transactions_before, work);
-                work
-            }
-            TipAction::Reset { .. } => {
-                self.snapshot_sender.start_tip(tip_hash, 0, 0);
-                0
-            }
+            TipAction::Grow { block } => storage.tip_work(&block.transactions),
+            TipAction::Reset { .. } => MempoolTipWork::default(),
         };
+        self.snapshot_sender.start_tip(tip_hash, work);
 
-        TipWork {
-            transactions_before,
+        Some(TipStarted {
+            transactions_before: storage.transaction_count(),
             work,
+            published_at: Instant::now(),
+        })
+    }
+
+    /// Traces a tip change the mempool `started` on and `applied`, once it has published the
+    /// result. Call it after [`Self::publish_snapshot`], so the trace covers the whole time a
+    /// reader waiting for the tip's transactions sees.
+    fn trace_tip_processed(&self, started: Option<TipStarted>, applied: Option<TipApplied>) {
+        if let (Some(started), Some(applied)) = (started, applied) {
+            self.trace.tip_processed(started, applied);
         }
     }
 
@@ -979,10 +980,12 @@ impl Service<Request> for Mempool {
 
         // Say how much work the new block is before doing any of it: a mining long poll
         // answers without the mempool's transactions rather than wait out a long removal.
-        let tip_work = tip_action
+        let tip_started = tip_action
             .as_ref()
-            .map(|tip_action| self.publish_tip_started(tip_action))
-            .unwrap_or_default();
+            .and_then(|tip_action| self.publish_tip_started(tip_action));
+
+        // How the tip change was applied, traced once its result is published.
+        let mut applied = None;
 
         // Clear the mempool and cancel downloads if there has been a chain tip reset.
         //
@@ -1034,17 +1037,17 @@ impl Service<Request> for Mempool {
                     let _result = tx_downloads.retry_after_tip_reset(tx, source);
                 }
 
-                self.trace.tip_processed(
-                    TipProcessing::Reset,
-                    tip_action.best_tip_hash_and_height(),
-                    tip_work,
-                    storage.transaction_count(),
+                applied = Some(TipApplied {
+                    action: TipProcessing::Reset,
+                    tip: tip_action.best_tip_hash_and_height(),
+                    tx_count_after: storage.transaction_count(),
                     requeued,
-                    reset_started.elapsed(),
-                );
+                    process: reset_started.elapsed(),
+                });
             }
 
             self.publish_snapshot(true);
+            self.trace_tip_processed(tip_started, applied);
             return Poll::Ready(Ok(()));
         }
 
@@ -1248,14 +1251,13 @@ impl Service<Request> for Mempool {
                     invalidated_ids.extend(expired_transactions);
                 }
 
-                self.trace.tip_processed(
-                    TipProcessing::Grow,
+                applied = Some(TipApplied {
+                    action: TipProcessing::Grow,
                     tip,
-                    tip_work,
-                    storage.transaction_count(),
-                    0,
-                    grow_started.elapsed(),
-                );
+                    tx_count_after: storage.transaction_count(),
+                    requeued: 0,
+                    process: grow_started.elapsed(),
+                });
             }
 
             // Withdraw invalidated lists before notifying listeners, including when sending
@@ -1312,6 +1314,7 @@ impl Service<Request> for Mempool {
         }
 
         self.publish_snapshot(publish_for_tip);
+        self.trace_tip_processed(tip_started, applied);
         Poll::Ready(Ok(()))
     }
 

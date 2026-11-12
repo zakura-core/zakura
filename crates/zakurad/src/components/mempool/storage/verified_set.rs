@@ -171,13 +171,13 @@ impl VerifiedSet {
         self.transactions.len()
     }
 
-    /// Returns the number of parts of its transactions that the set tracks one by one: the
-    /// transparent outputs they create and spend, and the nullifiers they reveal.
+    /// Returns the number of parts of its transactions that the mempool checks against a new
+    /// block: the transparent outputs they spend and the nullifiers they reveal.
     ///
-    /// Counts the same parts as [`tracked_parts`] does for one transaction.
-    pub fn tracked_parts(&self) -> usize {
-        self.created_outputs.len()
-            + self.spent_outpoints.len()
+    /// The outputs they create are not counted: a block only touches the outputs of the
+    /// transactions it mines, which [`tracked_parts`] counts for the block.
+    pub fn scanned_parts(&self) -> usize {
+        self.spent_outpoints.len()
             + self.sprout_nullifiers.len()
             + self.sapling_nullifiers.len()
             + self.orchard_nullifiers.len()
@@ -957,33 +957,45 @@ mod tests {
         assert!(Arc::ptr_eq(&populated.1, &after_rejection.1));
     }
 
-    /// The set's count of tracked parts is the sum of its transactions' parts, as
-    /// transactions are added and removed.
+    /// The set's count of scanned parts is the sum of its transactions' spent outputs and
+    /// revealed nullifiers, as transactions are added and removed. The outputs they create are
+    /// not counted.
     #[test]
-    fn tracked_parts_count_the_parts_of_the_transactions_held() {
+    fn scanned_parts_count_the_spends_and_nullifiers_of_the_transactions_held() {
         use super::super::fixtures::TxFactory;
 
+        let scanned_parts = |transaction: &Transaction| {
+            transaction.spent_outpoints().count()
+                + transaction.sprout_nullifiers().count()
+                + transaction.sapling_nullifiers().count()
+                + transaction.orchard_nullifiers().count()
+                + transaction.ironwood_nullifiers().count()
+        };
         let mut factory = TxFactory::new();
         let mut verified = VerifiedSet::default();
         let mut pending = PendingOutputs::default();
-        assert_eq!(verified.tracked_parts(), 0);
+        assert_eq!(verified.scanned_parts(), 0);
 
-        let first = factory.tx(10_000);
+        let first = factory.tx_with(10_000, 3, 0);
         let second = factory.tx(10_000);
         let first_id = first.transaction.id().mined_id();
-        let first_parts = tracked_parts(first.transaction.transaction());
-        let second_parts = tracked_parts(second.transaction.transaction());
+        let first_parts = scanned_parts(first.transaction.transaction());
+        let second_parts = scanned_parts(second.transaction.transaction());
         assert!(
             first_parts > 0 && second_parts > 0,
             "every transaction spends or reveals something"
         );
+        assert!(
+            !first.transaction.transaction().outputs().is_empty(),
+            "the transaction creates outputs, which are not counted"
+        );
 
         verified.insert(first, vec![], &mut pending, None).unwrap();
         verified.insert(second, vec![], &mut pending, None).unwrap();
-        assert_eq!(verified.tracked_parts(), first_parts + second_parts);
+        assert_eq!(verified.scanned_parts(), first_parts + second_parts);
 
         assert_eq!(verified.remove_all([first_id]).len(), 1);
-        assert_eq!(verified.tracked_parts(), second_parts);
+        assert_eq!(verified.scanned_parts(), second_parts);
     }
 
     #[test]

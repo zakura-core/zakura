@@ -2211,7 +2211,8 @@ fn hand_written_rows() -> Vec<Row> {
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
     outstanding.push(mixed(OUTSTANDING));
     // The two cancellation cases' publishers linger at rest, which the end
-    // check finds.
+    // check finds after the drain. The run records that as its stopping
+    // `Violation`, so both are found at a step.
     for (index, (name, harness, set, found)) in [
         (
             "accepted-cursors-kept",
@@ -2229,13 +2230,13 @@ fn hand_written_rows() -> Vec<Row> {
             "cancellation-ignored",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "cancellation-ignored-at-capacity",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "close-kept-on-replace",

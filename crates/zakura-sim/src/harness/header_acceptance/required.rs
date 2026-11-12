@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
+    contracts::{
+        contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
+    },
     reasons::NaEntry,
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
     Tier, PLAN, TIERS,
@@ -519,7 +521,8 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
 /// Each planted case owes its own case key, each native mutation a key,
 /// each needed source a missing-source key, each `COVERAGE` test a witness
 /// key, each `Satisfied` contract's proving test and each narrowing entry
-/// a test key, each requirement and composition check its key, and each
+/// a test key, each such contract's proving catch a catch key, each
+/// requirement and composition check its key, and each
 /// counted execution a replay and, for a history, a cleanup comparison.
 /// Each `NotApplicable` reason owes its test, and each ID an entry for every
 /// tier other than its own.
@@ -581,6 +584,9 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
             if contract.state == ContractState::Satisfied {
                 for &test in contract.proving {
                     keys.insert(contract_test_key(id, test), BTreeSet::new());
+                }
+                for &case in contract.proving_catches {
+                    keys.insert(contract_catch_key(id, case), BTreeSet::new());
                 }
             }
         }

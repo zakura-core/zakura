@@ -7,7 +7,7 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{sim_test, Approval, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use super::{sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -129,6 +129,11 @@ pub struct Contract {
     /// The tests that prove it. A `Satisfied` contract needs at least one,
     /// each passing at the subject commit.
     pub proving: &'static [TestRef],
+    /// The planted cases whose `Caught` proves it beside its tests (Adam's
+    /// ruling on question 6, 2026-11-12). Each names a case a row catches,
+    /// and a `Satisfied` contract counts only once each one's catch
+    /// verified at the subject commit too.
+    pub proving_catches: &'static [CaseRef],
     /// Its state.
     pub state: ContractState,
     /// The PR or ask that delivers it.
@@ -841,6 +846,15 @@ const C22_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C2's proving catches: `idle-exit-drops-fault`, whose reactor walks
+/// away from owed work and whose owed penalty concludes `Violated` at the
+/// drain's end, as the end replay's `DroppedFault`, alone. Those are C2's
+/// two bug-only halves.
+const C2_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/header-fault-penalized",
+    name: "idle-exit-drops-fault",
+}];
+
 /// C15's proving tests: the release-wake fixtures' runs equal the runs
 /// without the release up to their measured boundary and then settle, on
 /// the committed inputs and on every plan, and two planted wake bypasses'
@@ -1086,6 +1100,7 @@ const fn waiting(
         owner,
         statement,
         proving: &[],
+        proving_catches: &[],
         state: ContractState::Blocked {
             waiting_for: missing,
         },
@@ -1109,6 +1124,7 @@ const fn proved_short(
         owner,
         statement,
         proving,
+        proving_catches: &[],
         state: ContractState::Blocked {
             waiting_for: missing,
         },
@@ -1129,6 +1145,7 @@ const fn satisfied(
         owner,
         statement,
         proving,
+        proving_catches: &[],
         state: ContractState::Satisfied,
         delivery,
     }
@@ -1153,22 +1170,25 @@ pub fn contract_table() -> Vec<Contract> {
             C1_PROVING,
             "E1",
         ),
-        waiting(
-            C2,
-            "Adam's harness",
-            "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
-             conclude under C1's drain.",
-            "hf-4, after E1",
-            "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty and \
-             node-abandonment cases at the drain's end are both planted case \
-             header-fault-penalized/idle-exit-drops-fault",
-        ),
+        Contract {
+            proving_catches: C2_CATCHES,
+            ..waiting(
+                C2,
+                "Adam's harness",
+                "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
+                 conclude under C1's drain.",
+                "hf-4, after E1",
+                "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty \
+                 and node-abandonment halves at the drain's end are C2_CATCHES",
+            )
+        },
         Contract {
             id: C3,
             owner: "Evan (trace-3)",
             statement: "Replay refuses a non-equivalent build, then compares the \
                         scenario-relevant meta fields, every step and the end record.",
             proving: C3_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1234,6 +1254,7 @@ pub fn contract_table() -> Vec<Contract> {
                         observes, is dropped, skips a boundary, records outside its run, \
                         publishes past what it delivered, or delivers a different log.",
             proving: C10_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1283,6 +1304,7 @@ pub fn contract_table() -> Vec<Contract> {
             statement: "The registry evaluates every property at a step before it returns \
                         the first Active violation, and keeps every violation found there.",
             proving: C16_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1316,6 +1338,7 @@ pub fn contract_table() -> Vec<Contract> {
             statement: "NA_REASONS and NOT_HEADER together list every NaReason, each once, and \
                         NA_REASONS each reason a header ID's report can carry.",
             proving: C20_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
@@ -1515,20 +1538,44 @@ pub const NARROWING: &[Narrowing] = &[
 /// releases. Callees outside this file are their owners' contracts.
 pub const NARROWING_FINGERPRINT: &str = "cbe285413fc88ad5";
 
-/// The [`Key::ContractTest`] results: one `Passes` per proving test of each
-/// `Satisfied` contract.
-pub fn contract_test_results(table: &[Contract]) -> Vec<ExpectedResult> {
-    table
+/// The [`Key::ContractTest`] and [`Key::ContractCatch`] results of each
+/// `Satisfied` contract: one `Passes` per proving test, and per proving
+/// catch the `Caught` a result of `rows` names for that case. A catch no
+/// row names gets no result, so its key stays uncovered and blocks.
+pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec<ExpectedResult> {
+    let satisfied = table
         .iter()
-        .filter(|contract| contract.state == ContractState::Satisfied)
-        .flat_map(|contract| {
-            contract.proving.iter().map(|&test| ExpectedResult {
-                keys: vec![contract_test_key(contract.id, test)],
+        .filter(|contract| contract.state == ContractState::Satisfied);
+    let tests = satisfied.clone().flat_map(|contract| {
+        contract.proving.iter().map(|&test| ExpectedResult {
+            keys: vec![contract_test_key(contract.id, test)],
+            gates: Vec::new(),
+            expected: Expected::Passes { test },
+        })
+    });
+    let catches = satisfied.flat_map(|contract| {
+        contract.proving_catches.iter().filter_map(|&case| {
+            let caught = rows.iter().find_map(|result| match result.expected {
+                Expected::Caught { case: c, .. } if c == case => Some(result.expected.clone()),
+                _ => None,
+            })?;
+            Some(ExpectedResult {
+                keys: vec![contract_catch_key(contract.id, case)],
                 gates: Vec::new(),
-                expected: Expected::Passes { test },
+                expected: caught,
             })
         })
-        .collect()
+    });
+    tests.chain(catches).collect()
+}
+
+/// The [`Key::ContractCatch`] for `contract`'s proving catch `case`.
+pub fn contract_catch_key(contract: ContractId, case: CaseRef) -> Key {
+    Key::ContractCatch {
+        contract: contract.name(),
+        property: case.property.to_owned(),
+        name: case.name.to_owned(),
+    }
 }
 
 /// The [`Key::ContractTest`] for `contract`'s proving test `test`.

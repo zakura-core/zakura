@@ -481,6 +481,15 @@ pub enum Key {
         /// The test's name.
         test: String,
     },
+    /// A `Satisfied` contract's proving catch: a planted case's `Caught`.
+    ContractCatch {
+        /// The contract, such as `C2`.
+        contract: String,
+        /// The case's property directory.
+        property: String,
+        /// The case's name.
+        name: String,
+    },
     /// A [`NARROWING`] entry's test.
     NarrowingTest {
         /// The entry, such as `N1`.
@@ -661,6 +670,11 @@ impl Key {
                 Key::Case { property, name },
                 Expected::Caught { case, .. } | Expected::MachineCaught { case, .. },
             ) => case.property == property && case.name == name,
+            // A contract's proving catch takes the `Caught` of exactly that
+            // case, and nothing else.
+            (Key::ContractCatch { property, name, .. }, Expected::Caught { case, .. }) => {
+                case.property == property && case.name == name
+            }
             (Key::Replay { run }, Expected::Replays { run: replayed }) => run == replayed,
             (
                 Key::History { run, target },
@@ -802,7 +816,9 @@ impl Key {
                 Key::Case { .. } | Key::Replay { .. } | Key::Witness { .. } | Key::History { .. },
                 _,
             )
-            | (Key::ContractTest { .. } | Key::Composition { .. }, _) => false,
+            | (Key::ContractTest { .. } | Key::ContractCatch { .. } | Key::Composition { .. }, _) => {
+                false
+            }
             (Key::Requirement { name }, expected) => required::GATE_OBLIGATIONS
                 .iter()
                 .any(|obligation| obligation.name == name && obligation.permit.allows(expected)),
@@ -934,7 +950,8 @@ impl Manifest {
         let native = rows::native_results(&expected);
         expected.extend(native);
         let contracts = contract_table();
-        expected.extend(contracts::contract_test_results(&contracts));
+        let catches = contracts::contract_test_results(&contracts, &expected);
+        expected.extend(catches);
         expected.extend(contracts::narrowing_test_results(NARROWING));
         expected.extend(rows::composition_results());
         expected.extend(rows::missing_source_results(&needs()));

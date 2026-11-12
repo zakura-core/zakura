@@ -2496,9 +2496,73 @@ fn test_exists(test: TestRef) -> Result<(), String> {
     }
 }
 
+/// Every proving catch of `manifest`'s contracts that doesn't name a
+/// committed planted case with a row's `Caught`.
+fn catch_errors(manifest: &Manifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    for contract in &manifest.contracts {
+        for case in contract.proving_catches {
+            let patch = repo()
+                .join("qa/planted")
+                .join(case.property)
+                .join(format!("{}.patch", case.name));
+            if !patch.is_file() {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no planted case",
+                    contract.id, case.property, case.name
+                ));
+            }
+            let caught = manifest.expected.iter().any(|result| {
+                result
+                    .keys
+                    .iter()
+                    .any(|key| matches!(key, Key::Case { .. }))
+                    && matches!(result.expected, Expected::Caught { case: c, .. } if c == *case)
+            });
+            if !caught {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no row's Caught",
+                    contract.id, case.property, case.name
+                ));
+            }
+        }
+    }
+    errors
+}
+
 #[test]
 fn every_referenced_test_exists() {
     let manifest = Manifest::committed();
+    // Every proving catch names a committed case and a row's catch of it.
+    assert_eq!(catch_errors(&manifest), Vec::<String>::new());
+    assert!(manifest
+        .contracts
+        .iter()
+        .any(|contract| !contract.proving_catches.is_empty()));
+    for (case, error) in [
+        (
+            CaseRef {
+                property: "header-sync/header-fault-penalized",
+                name: "no-such-case",
+            },
+            "has no planted case",
+        ),
+        (
+            CaseRef {
+                property: "session/honest-never-punished",
+                name: "no-such-case",
+            },
+            "has no row's Caught",
+        ),
+    ] {
+        let mut named = manifest.clone();
+        named.contracts[0].proving_catches = Box::leak(Box::new([case]));
+        assert!(
+            catch_errors(&named).iter().any(|e| e.contains(error)),
+            "{case:?}: {:?}",
+            catch_errors(&named)
+        );
+    }
     let mut tests = BTreeSet::new();
     for result in &manifest.expected {
         match result.expected {
@@ -3958,6 +4022,7 @@ fn satisfied(id: ContractId, test: &'static [TestRef]) -> Contract {
         owner: "test",
         statement: "test",
         proving: test,
+        proving_catches: &[],
         state: ContractState::Satisfied,
         delivery: "test",
     }
@@ -5228,6 +5293,44 @@ fn the_evaluator_applies_contracts_and_narrowing() {
     let mut m = manifest();
     m.contracts[0].state = ContractState::Blocked { waiting_for: "E1" };
     assert!(blocked(&state(&m, &results(), &holds)));
+
+    // A proving catch decides its contract as a proving test does: C3,
+    // proved by `CASE`'s catch too, counts only while that catch's own
+    // judgment passes, and only the `Caught` of exactly that case covers
+    // its key.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, CASE);
+    let caught_of = |m: &Manifest, case: CaseRef| {
+        m.expected
+            .iter()
+            .find(|r| matches!(r.expected, Expected::Caught { case: c, .. } if c == case))
+            .unwrap()
+            .expected
+            .clone()
+    };
+    let mut proved = manifest();
+    proved.contracts[0].proving_catches = &[CASE];
+    let caught = caught_of(&proved, CASE);
+    proved
+        .expected
+        .push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&proved, &results(), &catch_key),
+        ObligationState::Verified
+    );
+    assert_eq!(
+        state(&proved, &results(), &holds),
+        ObligationState::Verified
+    );
+    let mut lost = results();
+    caught_runs(&mut lost, CASE).1.trigger = false;
+    assert!(blocked(&state(&proved, &lost, &catch_key)));
+    assert!(blocked(&state(&proved, &lost, &holds)));
+    let mut other = manifest();
+    other.contracts[0].proving_catches = &[CASE];
+    let late = caught_of(&other, END_CASE);
+    other.expected.push(er(vec![catch_key.clone()], &[], late));
+    assert!(blocked(&state(&other, &results(), &catch_key)));
+    assert!(blocked(&state(&other, &results(), &holds)));
 
     // A satisfied contract whose proving test failed, is missing, ran at
     // another commit, or ran another test blocks.

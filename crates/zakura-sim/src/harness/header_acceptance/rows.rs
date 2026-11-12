@@ -90,6 +90,9 @@ const SIM_WIDE: [&str; 2] = ["sim/no-task-panic", "sim/no-livelock"];
 const PENALIZED: &str = "header-sync/header-fault-penalized";
 /// `session/honest-never-punished`.
 const HONEST: &str = "session/honest-never-punished";
+/// `header-sync/s5v9/conformant-never-closes`, the broader claim
+/// [`NESTS`] lists over [`HONEST`].
+const CONFORMANT: &str = "header-sync/s5v9/conformant-never-closes";
 
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
@@ -1094,19 +1097,19 @@ pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: 
     })
 }
 
+/// Why `storage-operation-ids` has no catch: its facts are written only by
+/// simulator code, which no production patch reaches.
+const OPERATION_IDS_UNREACHED: &str =
+    "only the controlled storage port, zakura-storage's ControlledPort, numbers the node's \
+     storage operations and logs their submissions and completions, so only storage-fake code \
+     can break the rule and no production patch can";
+
 /// Why a reachable generated ID's catch is still owed.
 const GENERATED_CATCH: &str =
     "one planted case per reachable generated ID, from about six production patches (decision 1)";
-/// Why a catch with only a scripted bypass is still owed.
-const SCRIPTED_CATCH: &str = "only a scripted bypass today: a production patch gets a Caught, \
-                              or harness-only breakage gets an approved Open";
 /// Why `header-fault-penalized`'s counted history is still owed.
 const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
                                  COVERAGE test runs test/header-wire-watched";
-/// Why `honest-never-punished`'s catch is still owed.
-const HONEST_CATCH: &str = "only a scripted bypass today, and any production punishment of an \
-                            honest peer also breaks conformant-never-closes, so its catch is \
-                            nested (decision 2)";
 /// Why a sim-wide ID's catch is still owed.
 const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
                               header-harness catch or an approved Open is still owed";
@@ -1118,8 +1121,8 @@ const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harnes
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
 /// plan's PR table. Every reachable generated ID's catch is hdr-14.5's, and
-/// the scripted-only and sim-wide IDs' catches and the two test-only
-/// witnesses' passing histories are hdr-14.4's. [`Key::covers`] takes a
+/// the sim-wide IDs' catches and the two test-only witnesses' passing
+/// histories are hdr-14.4's. [`Key::covers`] takes a
 /// transitional `Open` on such a key only if it's exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
@@ -1129,12 +1132,6 @@ pub fn owed_open(key: &Key) -> Option<Expected> {
         {
             (GENERATED_CATCH, "hdr-14.5")
         }
-        Key::Catch { property }
-            if [OPERATION_IDS, DIRECT_DISPATCH].contains(&property.as_str()) =>
-        {
-            (SCRIPTED_CATCH, "hdr-14.4")
-        }
-        Key::Catch { property } if property == HONEST => (HONEST_CATCH, "hdr-14.4"),
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
         }
@@ -1260,11 +1257,27 @@ fn hand_written_rows() -> Vec<Row> {
     let mut rows = Vec::new();
 
     let mut operation_ids = holds(OPERATION_IDS, G1, NODE_SYNC);
-    operation_ids.push(owed(Key::catch(OPERATION_IDS), G1));
+    operation_ids.push(result(
+        vec![Key::catch(OPERATION_IDS)],
+        G1,
+        Expected::Open {
+            reason: OPERATION_IDS_UNREACHED,
+            owner: "hdr-14",
+            approval: Approval::Pending,
+            until: None,
+        },
+    ));
     rows.push(sim_row(OPERATION_IDS, storage_harnesses, operation_ids));
 
     let mut direct = holds(DIRECT_DISPATCH, G1, NODE_SYNC);
-    direct.push(owed(Key::catch(DIRECT_DISPATCH), G1));
+    direct.extend(caught(
+        STORAGE,
+        case(DIRECT_DISPATCH, "locator-to-action-channel"),
+        &[DIRECT_DISPATCH],
+        Found::AtStep,
+        G1,
+        true,
+    ));
     rows.push(sim_row(DIRECT_DISPATCH, storage_harnesses, direct));
 
     let mut chunk = holds(CHUNK, G5, CLOSE_RELINK_CAPACITY);
@@ -1287,6 +1300,11 @@ fn hand_written_rows() -> Vec<Row> {
         ("leaked-lease-clone", Found::AtStep),
         ("leaked-reservation-entry", Found::AtStep),
         ("skipped-round-release", Found::AtStep),
+        // hdr-14.4 moved the node-settlement native mutations here, each on
+        // the committed stop-storage seed, which shuts the node down.
+        ("shutdown-kept-queue", Found::AtStep),
+        ("consumed-locator-permit", Found::AtStep),
+        ("forgotten-locator-permit", Found::AtStep),
     ]
     .into_iter()
     .enumerate()
@@ -1310,6 +1328,8 @@ fn hand_written_rows() -> Vec<Row> {
         "stale-retirement",
         "stale-acceptance",
         "stale-close",
+        // hdr-14.4 moved this native mutation here, on the churn witness.
+        "dropped-owner-check",
     ]
     .into_iter()
     .enumerate()
@@ -2345,7 +2365,16 @@ fn hand_written_rows() -> Vec<Row> {
 
     let honest = HONEST;
     let mut never = holds(honest, G2, HONEST_PEER);
-    never.push(owed(Key::catch(honest), G2));
+    // Any production punishment of an honest peer also breaks
+    // conformant-never-closes, so the catch is nested (decision 2).
+    never.extend(caught(
+        WIRE,
+        case(honest, "target-page-refused"),
+        &[HONEST, CONFORMANT],
+        Found::AtStep,
+        G2,
+        true,
+    ));
     rows.push(sim_row(honest, &[WIRE], never));
 
     let progress = PROGRESS_ID;
@@ -2883,7 +2912,13 @@ const fn to_move(
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
 pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
-    to_move("consumed-locator-permit", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "consumed-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "consumed-locator-permit",
+        },
+    },
     NativeMutation {
         patch: "cooldown-session-gate",
         class: NativeClass::Moved {
@@ -2891,9 +2926,21 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "cooldown-session-gate",
         },
     },
-    to_move("dropped-owner-check", STALE, "hdr-14.4"),
+    NativeMutation {
+        patch: "dropped-owner-check",
+        class: NativeClass::Moved {
+            property: STALE,
+            case: "dropped-owner-check",
+        },
+    },
     to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
-    to_move("forgotten-locator-permit", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "forgotten-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "forgotten-locator-permit",
+        },
+    },
     NativeMutation {
         patch: "late-fault-unpenalized",
         class: NativeClass::Moved {
@@ -2944,7 +2991,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         },
     },
     to_move("short-payload", COMMIT, "hdr-9c.2a"),
-    to_move("shutdown-kept-queue", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "shutdown-kept-queue",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "shutdown-kept-queue",
+        },
+    },
     to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
     to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
     to_move("skipped-staging", COMMIT, "hdr-9c.1a"),

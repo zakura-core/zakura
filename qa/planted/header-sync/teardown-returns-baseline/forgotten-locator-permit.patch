@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
-index cafdee5a52..ae8f065687 100644
+index 67fb071acb..4f51533d1e 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
-@@ -429,7 +429,11 @@ impl HeaderSyncReactor {
+@@ -523,7 +523,11 @@ impl HeaderSyncReactor {
                  self.peer_work_queue.remove_unstarted(peer);
                  return StorageDispatch::Deferred(key.call);
              };

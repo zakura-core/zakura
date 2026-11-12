@@ -220,9 +220,9 @@ where
 /// found, so a mark still pending there leaves the property
 /// `HarnessFailed`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
-/// settle. Today no committed input can stop the node, so every planted
-/// round-level case relies on that. A step with a released round a claim
-/// tainted isn't judged, so it never counts as holding.
+/// settle, which every planted round-level case's input relies on. A step
+/// with a released round a claim tainted isn't judged, so it never counts
+/// as holding.
 pub(crate) fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,

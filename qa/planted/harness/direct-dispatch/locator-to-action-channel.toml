@@ -1,0 +1,10 @@
+# The reactor also sends each locator query to its action channel, an
+# external driver's queue, beside the port's own call. The dispatch
+# guard's flag is set once the guard reads it, and the required failure
+# is `harness/direct-dispatch`'s violation that a reactor sent a call to
+# its action channel. The input's node reads a locator first thing.
+input = "crates/zakura-sim/tests/fixtures/header-storage-default.bin"
+# Besides dispatch.rs, which the patch changes, the rest of header sync
+# decides when the node reads its first locator. A change there can move
+# the input off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -34,7 +34,7 @@ use super::{
 /// The fingerprint of the committed inventories' canonical text
 /// ([`canonical`]): the first 16 hex digits of its SHA-256. Moving it
 /// needs a reread of every changed line and Adam's approval.
-pub const INVENTORY_FINGERPRINT: &str = "c04fee43cee4e3eb";
+pub const INVENTORY_FINGERPRINT: &str = "e299488aebd92cfe";
 
 /// What the inventories hold that the manifest doesn't carry.
 pub struct Lists<'a> {

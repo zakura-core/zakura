@@ -67,7 +67,7 @@ type Seed = (&'static str, fn() -> StorageScenario, usize);
 
 /// The witness each seed carries, by stem: a property its run holds, which a
 /// planted case's patch on the same input violates.
-const WITNESSES: [(&str, &str); 3] = [
+const WITNESSES: [(&str, &str); 4] = [
     (
         "header-storage-close-relink",
         "header-sync/chunk-budget-bound",
@@ -80,6 +80,7 @@ const WITNESSES: [(&str, &str); 3] = [
         "header-storage-stale-prepare",
         "header-sync/stale-completion-inert",
     ),
+    ("header-storage-default", "harness/direct-dispatch"),
 ];
 
 /// The witness scenarios `tests/explore_state.rs` draws from their seeds,

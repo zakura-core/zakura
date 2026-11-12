@@ -54,8 +54,25 @@ where
         needs: &[Source::View, Source::Closes, Source::Storage],
         status: Status::Active,
         check: check_honest_never_punished::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::View(honest_frame_judged::<S::View>)),
     }
+}
+
+/// [`HONEST_NEVER_PUNISHED`]'s trigger: the node judged a frame on the
+/// connection of a peer the scenario marks `HonestPeer`, so it had a frame
+/// it could have punished that peer for. The connection's peer is found
+/// as the check finds a punished one's, from its latest transport row
+/// before the judgement.
+fn honest_frame_judged<V: HonestPeers>(view: &V, log: &ObservationLog) -> bool {
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged { connection, .. } = entry.obs else {
+            return false;
+        };
+        remote_of(&entries[..at], connection)
+            .and_then(peer_at)
+            .is_some_and(|peer| view.is_honest(peer))
+    })
 }
 
 /// Checks [`HONEST_NEVER_PUNISHED`] on the step's observations. It applies

@@ -12,8 +12,8 @@
 //! Each registered store is on [`REGISTERED`], which names the checkpoint
 //! that delivers its facts and the producer test that checks them against
 //! the owner state or message they come from. The scan fails if that test
-//! doesn't exist. A store with no producer test yet says why, as owed to
-//! hf-7, and [`owed_to_hf7`] lists them.
+//! doesn't exist. A store with no producer test would say why, as owed to
+//! hf-7, and [`owed_to_hf7`] checks that none is.
 #![cfg(zakura_sim)]
 
 use std::{
@@ -278,26 +278,28 @@ const REGISTERED: &[Store] = &[
             "an_attributed_prepare_failure_owes_its_source_a_penalty",
         ),
     ),
-    Store {
-        file: "src/harness/header_node.rs",
-        owner: "Effects",
-        field: "ended",
-        checkpoints: &[HeaderTap],
-        producer: Producer::OwedToHf7(
-            "the topology's session lifetimes: no test checks them against the links' \
-             cancellations, and hf-7's freshness test reads them through the storage view",
+    store(
+        "src/harness/header_node.rs",
+        "Effects",
+        "ended",
+        &[HeaderTap],
+        (
+            "header_node_session_ends",
+            "each_recorded_end_is_its_links_cancellation",
         ),
-    },
-    Store {
-        file: "src/harness/header_node/fork_choice.rs",
-        owner: "LinkEnds",
-        field: "ended",
-        checkpoints: &[HeaderTap],
-        producer: Producer::OwedToHf7(
-            "a second handle on `Effects::ended`, the topology's session lifetimes, which \
-             the fork-choice check reads for the mirrors' link ends: owed with that store",
+    ),
+    // A second handle on `Effects::ended`, which the fork-choice check
+    // reads for the mirrors' link ends, so the same producer test.
+    store(
+        "src/harness/header_node/fork_choice.rs",
+        "LinkEnds",
+        "ended",
+        &[HeaderTap],
+        (
+            "header_node_session_ends",
+            "each_recorded_end_is_its_links_cancellation",
         ),
-    },
+    ),
 ];
 
 /// The shared-state fields that aren't evidence, by file, struct and
@@ -918,14 +920,29 @@ fn every_registered_store_names_its_checkpoint_and_producer() {
     assert!(missing.is_empty(), "{missing:#?}");
 }
 
-/// The stores with no producer test yet, which hf-7 owes, are exactly
-/// these.
-#[test]
-fn owed_to_hf7() {
-    let owed: Vec<String> = REGISTERED
+/// The stores of `stores` marked [`Producer::OwedToHf7`], as
+/// `owner.field`.
+fn owed(stores: &[Store]) -> Vec<String> {
+    stores
         .iter()
         .filter(|store| matches!(store.producer, Producer::OwedToHf7(_)))
         .map(|store| format!("{}.{}", store.owner, store.field))
-        .collect();
-    assert_eq!(owed, ["Effects.ended", "LinkEnds.ended"]);
+        .collect()
+}
+
+/// No store is owed a producer test: hf-7 gave the last two theirs, so a
+/// new store marked [`Producer::OwedToHf7`] fails here instead of skipping
+/// its producer silently, as the control shows.
+#[test]
+fn owed_to_hf7() {
+    let control = Store {
+        file: "new.rs",
+        owner: "New",
+        field: "kept",
+        checkpoints: &[HeaderTap],
+        producer: Producer::OwedToHf7("the control"),
+    };
+    assert_eq!(owed(&[control]), ["New.kept"]);
+    let owed = owed(REGISTERED);
+    assert!(owed.is_empty(), "{owed:?}");
 }

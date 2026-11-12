@@ -29,19 +29,24 @@ fn keys(value: &Value, at: String, out: &mut Vec<String>) {
     }
 }
 
-/// `leaf` moved to a value no real event shares with it: a number far
-/// off, a boolean flipped, and a string with its last character changed
-/// within its class, so a hex digest stays a hex digest of its length.
-fn moved(leaf: &mut Value) {
-    *leaf = match leaf.take() {
-        Value::Bool(flag) => Value::Bool(!flag),
-        Value::Number(number) => match (number.as_u64(), number.as_i64()) {
-            (Some(n), _) if n < u64::MAX / 2 => Value::from(n + 1_000_003),
-            (Some(n), _) => Value::from(n - 1_000_003),
-            (None, Some(n)) => Value::from(n.wrapping_add(1_000_003)),
-            (None, None) => Value::from(number.as_f64().unwrap_or(0.0) + 1_000_003.0),
+/// The values `leaf` can move to that no real event shares with it, most
+/// distant first: a number far off, then nearer for a narrow type, a
+/// boolean flipped, and a string with its last character changed within
+/// its class, so a hex digest stays a hex digest of its length.
+fn moves(leaf: &Value) -> Vec<Value> {
+    match leaf {
+        Value::Bool(flag) => vec![Value::Bool(!flag)],
+        Value::Number(number) => match number.as_u64() {
+            Some(n) => [1_000_003, 20_011, 101, 1]
+                .into_iter()
+                .filter_map(|by| n.checked_add(by).or_else(|| n.checked_sub(by)))
+                .chain(n.checked_sub(101))
+                .map(Value::from)
+                .collect(),
+            None => vec![Value::from(number.as_f64().unwrap_or(0.0) + 1_000_003.0)],
         },
-        Value::String(mut text) => {
+        Value::String(text) => {
+            let mut text = text.clone();
             let last = text.pop();
             let replaced = match last {
                 Some('0') => "1".to_owned(),
@@ -54,15 +59,15 @@ fn moved(leaf: &mut Value) {
                 None => "x".to_owned(),
             };
             text.push_str(&replaced);
-            Value::String(text)
+            vec![Value::String(text)]
         }
-        other => other,
-    };
+        _ => Vec::new(),
+    }
 }
 
-/// Each copy of `positive` with exactly one key moved, with that key's
-/// pointer. A copy that doesn't read back as `R` panics, so no key is left
-/// without its control.
+/// Each copy of `positive` with exactly one key moved, the first of its
+/// [`moves`] that reads back as `R`, with that key's pointer. A key with no
+/// such move panics, so no key is left without its control.
 pub fn one_key_off<R: Serialize + DeserializeOwned>(positive: &R) -> Vec<(String, R)> {
     let value = serde_json::to_value(positive).expect("a ref serializes");
     let mut found = Vec::new();
@@ -70,10 +75,15 @@ pub fn one_key_off<R: Serialize + DeserializeOwned>(positive: &R) -> Vec<(String
     found
         .into_iter()
         .map(|pointer| {
-            let mut off = value.clone();
-            moved(off.pointer_mut(&pointer).expect("the key is there"));
-            let off = serde_json::from_value(off)
-                .unwrap_or_else(|error| panic!("{pointer} moved doesn't read back: {error}"));
+            let leaf = value.pointer(&pointer).expect("the key is there");
+            let off = moves(leaf)
+                .into_iter()
+                .find_map(|moved| {
+                    let mut off = value.clone();
+                    *off.pointer_mut(&pointer).expect("the key is there") = moved;
+                    serde_json::from_value(off).ok()
+                })
+                .unwrap_or_else(|| panic!("no move of {pointer} reads back"));
             (pointer, off)
         })
         .collect()

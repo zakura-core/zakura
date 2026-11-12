@@ -1115,8 +1115,11 @@ fn reports_diagnostic(log: &str, diagnostic: &str) -> bool {
 /// harness failure reporting `diagnostic` for a failing test, completed for
 /// a passing one. A test reports no property outcomes, so without that
 /// recording the run claims no history and its whole-report check fails.
-/// Its trigger history is the test's own assertions, which passed only if
-/// it did.
+/// Its `Draft` override and declared actions are that recording's too, so
+/// a history recorded with an override, or whose actions didn't all run,
+/// is judged as it ran, and without the recording its actions are
+/// incomplete. Its trigger history is the test's own assertions, which
+/// passed only if it did.
 fn integrity_execution(
     dir: &Path,
     run: RunId,
@@ -1189,6 +1192,8 @@ fn integrity_execution(
     let mut claimed = None;
     let mut reports = BTreeMap::new();
     let mut leaked = 0;
+    let mut draft_override = Vec::new();
+    let mut actions = Actions::Incomplete;
     if matches!(end, End::Completed | End::HarnessFailure { .. }) {
         let history = dir.join("history");
         let bound = declaration(&dir.join("declared"), harness, name, case).and_then(|at| {
@@ -1221,6 +1226,8 @@ fn integrity_execution(
                 claimed = Some(input.clone());
                 reports = recorded.reports;
                 leaked = recorded.leaked;
+                draft_override = recorded.meta.draft_override;
+                actions = recorded.actions;
             }
             Err(why) if patched => end = End::Failed { why },
             Err(_) => {}
@@ -1231,7 +1238,7 @@ fn integrity_execution(
         run,
         meta: ExecMeta {
             harness: harness.to_owned(),
-            draft_override: Vec::new(),
+            draft_override,
             run_by: RunBy::Tool,
             input: claimed,
         },
@@ -1239,7 +1246,7 @@ fn integrity_execution(
         reports,
         trigger,
         leaked,
-        actions: Actions::Complete,
+        actions,
     }
 }
 
@@ -4382,6 +4389,71 @@ mod tests {
                 end["harness"] = Value::String(failure.to_owned());
             }
         });
+    }
+
+    /// An integrity run's `Draft` override and declared actions are its
+    /// recorded history's. A clean recording carries none and all of its
+    /// actions. One recorded with an override carries it, so the
+    /// evaluator's override check sees it, and one whose `ends` store
+    /// doesn't show a control step's effect is incomplete, as is a run
+    /// with no recording.
+    #[test]
+    fn an_integrity_run_carries_its_recording_s_override_and_actions() {
+        let input = history_run();
+        let read = |edit: &dyn Fn(&Path)| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            declare_and_record(dir.path(), "a_test", "plan 0", "subject", None);
+            edit(&dir.path().join("history"));
+            let artifact = TestRun {
+                package: "zakura-sim".into(),
+                file: "tests/header_node.rs".into(),
+                tests: vec![("a_test".into(), "ok".into())],
+                killed: false,
+                exited_ok: true,
+                log: String::new(),
+                binary_source: Some("subject".into()),
+                checkout_source: Some("subject".into()),
+            };
+            fs::write(
+                dir.path().join(TEST_FILE),
+                serde_json::to_string(&artifact).expect("a test run serializes"),
+            )
+            .expect("the temp dir is writable");
+            integrity_execution(
+                dir.path(),
+                RunId::native("raw-budget-lease", CaseRun::Unpatched),
+                &input,
+                NODE,
+                "OwnedMismatch",
+                "subject",
+            )
+        };
+        let clean = read(&|_| {});
+        assert_eq!(clean.meta.input.as_ref(), Some(&input), "{clean:?}");
+        assert!(clean.meta.draft_override.is_empty());
+        assert_eq!(clean.actions, Actions::Complete);
+        let drafted = read(&|history| {
+            rewrite(history, |lines| {
+                lines[0]["meta"]["draft"] = serde_json::json!(["p/a"]);
+            });
+        });
+        assert_eq!(drafted.meta.input.as_ref(), Some(&input), "{drafted:?}");
+        assert_eq!(drafted.meta.draft_override, ["p/a"]);
+        let unshown = read(&|history| {
+            let path = history.join(FULL_REPORT_FILE);
+            let text = fs::read_to_string(&path).expect("the report is readable");
+            let relinked =
+                "(21, Environment { peer: \\\"mirror-1\\\", connection: Some(4), action: Relink })";
+            assert!(text.contains(relinked), "{text}");
+            fs::write(&path, text.replace(relinked, "(21, Dropped)"))
+                .expect("the temp dir is writable");
+        });
+        assert_eq!(unshown.meta.input.as_ref(), Some(&input), "{unshown:?}");
+        assert_eq!(unshown.actions, Actions::Incomplete);
+        let unrecorded = read(&|history| {
+            fs::remove_dir_all(history).expect("the recording exists");
+        });
+        assert_eq!(unrecorded.actions, Actions::Incomplete);
     }
 
     /// A declaration binds to the run its test made through

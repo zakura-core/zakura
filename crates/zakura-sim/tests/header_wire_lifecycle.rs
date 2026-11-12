@@ -1060,10 +1060,16 @@ fn fuzz_13_saved_plans_replay_exact_in_a_fresh_process() {
         .env(FUZZ_13_CHILD, dir.path())
         .output()
         .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&child.stdout);
     assert!(
         child.status.success(),
         "{}",
         String::from_utf8_lossy(&child.stderr)
+    );
+    // A renamed test would match nothing and still exit cleanly.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran the replay: {stdout}"
     );
 }
 

@@ -59,7 +59,8 @@ pub enum ConfirmStatus {
     /// The property has no trigger-history check, so no run can show the
     /// causal witness.
     WitnessUnsupported,
-    /// The run violates the property without reaching its trigger history.
+    /// The run violates the property without reaching its trigger history,
+    /// or the witness's act never ran.
     WitnessLost,
     /// The run ended at a harness failure, so its evidence is incomplete.
     IncompleteEvidence,
@@ -78,6 +79,17 @@ pub enum ConfirmStatus {
 }
 
 impl ConfirmStatus {
+    /// Whether the run violates the property and replays, but can't serve as
+    /// a witness: [`ConfirmStatus::WitnessUnsupported`] or
+    /// [`ConfirmStatus::WitnessLost`]. Such a confirmation still records the
+    /// trace, which shows the violation.
+    pub fn missing_witness(self) -> bool {
+        matches!(
+            self,
+            ConfirmStatus::WitnessUnsupported | ConfirmStatus::WitnessLost
+        )
+    }
+
     /// The status's name, as the JSON writes it.
     pub fn name(self) -> &'static str {
         match self {
@@ -150,8 +162,9 @@ pub struct Confirmation {
     /// Tasks the run's shutdown leaked.
     pub leaked: usize,
     /// The recorded trace's directory, relative to the confirmation's
-    /// directory. Set only for [`ConfirmStatus::Confirmed`] and the
-    /// statuses [`Confirmation::against`] adds.
+    /// directory. Set only for [`ConfirmStatus::Confirmed`], the statuses
+    /// [`Confirmation::against`] adds, and a
+    /// [`ConfirmStatus::missing_witness`] status.
     pub trace: Option<PathBuf>,
     /// The recorded trace's ID, beside [`Confirmation::trace`].
     pub trace_id: Option<String>,
@@ -255,7 +268,9 @@ fn json(value: &impl Serialize) -> String {
 ///    it violates `property` at the same step, and replays it Exact.
 ///
 /// The first check that fails sets the status. A run that passes all three
-/// is [`ConfirmStatus::Confirmed`], with its trace.
+/// is [`ConfirmStatus::Confirmed`], with its trace. A run that fails only
+/// check 2 for want of a witness ([`ConfirmStatus::missing_witness`]) keeps
+/// that status, and check 3 still records its trace.
 ///
 /// # Errors
 ///
@@ -420,7 +435,11 @@ fn judge(
         };
         confirmation.status = status;
         confirmation.detail = Some(format!("the witness test of {want}: {error}"));
-        return Ok(confirmation);
+        // A run that only can't serve as a witness still violates the
+        // property, so its trace is still recorded.
+        if !status.missing_witness() {
+            return Ok(confirmation);
+        }
     }
 
     let report = run

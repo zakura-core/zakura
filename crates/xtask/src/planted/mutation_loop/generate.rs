@@ -76,7 +76,7 @@ use sha2::{Digest, Sha256};
 use super::{
     super::lane::{
         self, campaign_failure, confirm_and_replay, left_failures, run_lane_child, BuildFailure,
-        CampaignBounds, CampaignFacts, LaneError, LaneSpec, EXPECT_VAR,
+        CampaignBounds, CampaignFacts, Confirm, LaneError, LaneSpec, EXPECT_VAR,
     },
     classify::{self, kill_violations, Class, Classified, GenerateFacts, GenerateStop, Reason},
     host_memory, key, scoped,
@@ -147,9 +147,21 @@ fn per_run(millis: u64, runs: Option<u64>) -> Duration {
         .map_or(Duration::ZERO, |runs| Duration::from_millis(millis / runs))
 }
 
-/// The longest one confirm or replay child runs: the pilot catalogue's
-/// `child_seconds`.
+/// The shortest deadline a kill's confirm or replay child gets: the pilot
+/// catalogue's `child_seconds`.
 const CONFIRM_CHILD: Duration = Duration::from_secs(300);
+
+/// The runs a kill's confirm or replay child can afford at least, at the
+/// search's time per run. A confirmation runs the input about four times.
+const CONFIRM_RUNS: u32 = 10;
+
+/// The deadline of one confirm or replay child of a kill when a search's
+/// run takes `per_run`: [`CONFIRM_RUNS`] runs, and at least
+/// [`CONFIRM_CHILD`]. A harness whose run takes minutes would otherwise
+/// never confirm.
+pub(super) fn confirm_child(per_run: Duration) -> Duration {
+    (per_run * CONFIRM_RUNS).max(CONFIRM_CHILD)
+}
 
 /// How a lane searches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,7 +296,7 @@ pub(in crate::planted) struct FollowUp {
     /// The confirmed or shrunk trace, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) trace: Option<PathBuf>,
-    /// Why the step failed.
+    /// Why the step failed, or why a confirmed kill's trace is no witness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) detail: Option<String>,
 }
@@ -1231,10 +1243,12 @@ impl Runner {
         })
     }
 
-    /// Confirms `kill` on `harness` in fresh processes with `built`'s
-    /// simulator, allowing the `also` IDs, and shrinks the confirmed trace
-    /// within `wall`. Writes under `dir`. Returns the confirmation, and the
-    /// shrink if the kill confirmed.
+    /// Confirms `kill` on `harness` as a kill ([`Confirm::Kill`]) in fresh
+    /// processes with `built`'s simulator, allowing the `also` IDs, and
+    /// shrinks the confirmed trace. A search's run took `per_run`, which
+    /// sets each child's deadline ([`confirm_child`]) and the shrink's wall
+    /// ([`shrink_wall`]). Writes under `dir`. Returns the confirmation, and
+    /// the shrink if the kill confirmed.
     #[allow(clippy::too_many_arguments)]
     fn follow_up(
         &self,
@@ -1244,8 +1258,9 @@ impl Runner {
         also: &[String],
         dir: &Path,
         cap: Option<u64>,
-        wall: Duration,
+        per_run: Duration,
     ) -> Result<(FollowUp, Option<FollowUp>), BoxError> {
+        let wall = shrink_wall(per_run);
         let Some(input) = &kill.input else {
             return Ok((
                 FollowUp::failed("the search saved no input".to_owned()),
@@ -1263,17 +1278,18 @@ impl Runner {
             input,
             &kill.id,
             also,
+            Confirm::Kill,
             &dir.join("confirmation"),
-            CONFIRM_CHILD,
+            confirm_child(per_run),
         )?;
-        let trace = match confirmed {
-            Ok(trace) => trace,
+        let (trace, missing_witness) = match confirmed {
+            Ok(confirmed) => (confirmed.dir, confirmed.missing_witness),
             Err(why) => return Ok((FollowUp::failed(why), None)),
         };
         let confirmation = FollowUp {
             ok: true,
             trace: Some(self.relative(&trace)),
-            detail: None,
+            detail: missing_witness,
         };
         let out = dir.join("shrink");
         let log = dir.join("shrink.log");
@@ -1306,8 +1322,8 @@ impl Runner {
     }
 
     /// Replays the kill's `which` trace, at `trace`, on the unpatched
-    /// build, under the memory `cap`, and judges whether it violates `id`
-    /// there. Writes under `dir`.
+    /// build, under the memory `cap` and within `child`, and judges whether
+    /// it violates `id` there. Writes under `dir`.
     #[allow(clippy::too_many_arguments)]
     fn replay_unpatched(
         &self,
@@ -1317,6 +1333,7 @@ impl Runner {
         id: &str,
         dir: &Path,
         cap: Option<u64>,
+        child: Duration,
     ) -> Result<UnpatchedCheck, BoxError> {
         let report = dir.join(format!("unpatched-{}-report.json", which.name()));
         let log = dir.join(format!("unpatched-{}-replay.log", which.name()));
@@ -1331,7 +1348,7 @@ impl Runner {
             .arg("--report")
             .arg(&report);
         // `--allow-build-mismatch` always exits 1, so only the report counts.
-        let ended = run_lane_child(&mut replay, &log, Some(CONFIRM_CHILD))?;
+        let ended = run_lane_child(&mut replay, &log, Some(child))?;
         let written = fs::read_to_string(&report).ok();
         let (outcome, detail) = judge_unpatched(id, which, written.as_deref(), &ended.to_string());
         Ok(UnpatchedCheck {
@@ -1448,7 +1465,7 @@ impl Runner {
                         &also,
                         &search.dir.join(key(id)),
                         self.alone_cap(),
-                        shrink_wall(per_run(search.millis, search.runs())),
+                        per_run(search.millis, search.runs()),
                     )?;
                     Some((kill, done))
                 }
@@ -1558,10 +1575,7 @@ impl Runner {
                     deadline,
                     cap,
                 )?;
-                let wall = shrink_wall(per_run(
-                    baseline.millis,
-                    Some(lanes.flags.runs_for(harness)),
-                ));
+                let run_time = per_run(baseline.millis, Some(lanes.flags.runs_for(harness)));
                 let mut follow_ups: BTreeMap<
                     String,
                     (FollowUp, Option<FollowUp>, Vec<UnpatchedCheck>),
@@ -1578,8 +1592,9 @@ impl Runner {
                         if !follow_ups.contains_key(&kill.id) {
                             let also = co_violations(&search.searched, &kill.id);
                             let kill_dir = search_dir.join(key(&kill.id));
-                            let (confirmation, shrunk) =
-                                self.follow_up(built, harness, &kill, &also, &kill_dir, cap, wall)?;
+                            let (confirmation, shrunk) = self.follow_up(
+                                built, harness, &kill, &also, &kill_dir, cap, run_time,
+                            )?;
                             let traces = [
                                 (KillTrace::Confirmed, Some(&confirmation)),
                                 (KillTrace::Shrunk, shrunk.as_ref()),
@@ -1599,6 +1614,7 @@ impl Runner {
                                         &kill.id,
                                         &kill_dir,
                                         cap,
+                                        confirm_child(run_time),
                                     )?);
                                 }
                             }

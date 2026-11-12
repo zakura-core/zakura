@@ -810,3 +810,50 @@ fn a_draft_run_s_acts_are_shown_by_its_witness() {
     std::fs::remove_file(&witness).expect("the witness is removable");
     assert_eq!(read().actions, Actions::Incomplete);
 }
+
+/// A late-fault case's `Draft` run, whose scenario's one peer script is a
+/// `disconnect`, carries it out as the node's own session facts show it:
+/// `late-fault-unpenalized`'s scripted input recorded as the runner's
+/// contract gives its `Draft` run, here by this build (the action is the
+/// scenario's, whichever build records it), reads through the tool as
+/// completed with every declared action shown.
+#[test]
+fn a_late_fault_draft_run_s_disconnect_is_shown() {
+    use zakura_sim::harness::header_acceptance::{
+        evaluate::Actions, tool::Task, CaseRun, Manifest,
+    };
+    let (property, name) = (
+        "header-sync/header-fault-penalized",
+        "late-fault-unpenalized",
+    );
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let plan = tool::plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+    let Some(Task::Case {
+        harness,
+        input,
+        draft: Some(set),
+        draft_witness,
+        ..
+    }) = plan.tasks.iter().find(|task| {
+        matches!(task, Task::Case { property: p, name: n, .. } if p == property && n == name)
+    })
+    else {
+        panic!("{name} is a node case with a Draft run");
+    };
+    let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+    let draft = artifacts.path().join("draft");
+    let mut args: Vec<String> = vec!["record".into(), "--sim".into(), harness.clone()];
+    args.extend(input_args(&repo, input));
+    args.extend(draft_args(property, set, draft_witness));
+    args.extend(["--out".into(), draft.display().to_string()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    sim(&args);
+    let run = RunId::Case {
+        property: property.to_owned(),
+        name: name.to_owned(),
+        run: CaseRun::Draft,
+    };
+    let execution = tool::read_execution(&draft, run, harness, RunBy::Tool);
+    assert_eq!(execution.end, End::Completed);
+    assert_eq!(execution.actions, Actions::Complete, "{execution:?}");
+}

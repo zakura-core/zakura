@@ -93,10 +93,48 @@ pub enum Effect {
     /// shows wrote its frames: the judge fails a run where a scripted act
     /// was skipped or never ran.
     ActRan,
+    /// A wire peer's act on its own link, which the node's `sessions`
+    /// store shows on that link ([`LinkRef`]): `peer`'s `link`th
+    /// connection, counted from 0 in the order the node first admitted a
+    /// session on each. A peer's script acts on its first link until a
+    /// `redial`, which opens the next one.
+    Link {
+        /// The peer, by harness name.
+        peer: String,
+        /// Which of its links it acts on.
+        link: usize,
+        /// What shows it on that link.
+        shows: LinkShows,
+    },
     /// A peer task carries it out and no checkpointed store records it,
     /// since the peers' records aren't one (C11). It's never shown.
     Unshown,
 }
+
+/// What the node's session facts show of a wire peer's act on one link
+/// ([`Effect::Link`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkShows {
+    /// A `close` or `disconnect`: the node ended a session on the link
+    /// because the connection stopped under it (`accept_failed`). Every
+    /// teardown of the node's own records its reason first, and the first
+    /// reason wins, so this one shows a close the node didn't make.
+    Ended,
+    /// A `redial`: the node admitted a session on the link, the peer's
+    /// next one.
+    Opened,
+    /// A `finish-header`: the node ended a session on the link because the
+    /// peer finished its header stream (`stream_closed`), once for each
+    /// finish on that link.
+    Finished,
+}
+
+/// The reason the node's reactor gives a session that ended because its
+/// connection stopped under it, as a peer's own close makes it do.
+const PEER_CLOSED: &str = "accept_failed";
+/// The reason the node's reactor gives a session that ended because the
+/// peer finished its header stream.
+const STREAM_FINISHED: &str = "stream_closed";
 
 /// One action a history's bound scenario declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,20 +220,38 @@ fn controls(scenario: &StorageScenario) -> Vec<Declared> {
         .collect()
 }
 
-/// A wire scenario's peer scripts, each peer named `peer-<i>`.
+/// A wire scenario's peer scripts, each peer named `peer-<i>`. A link
+/// act's link is the peer's first until a `redial`, which acts on the next
+/// one and moves the rest of the script there.
 fn peers(scenario: &WireScenario) -> Vec<Declared> {
     let mut declared = Vec::new();
     for (index, peer) in scenario.peers.iter().enumerate() {
         let name = format!("peer-{index}");
+        let mut link = 0;
         for action in &peer.script {
+            let on_link = |link, shows| Effect::Link {
+                peer: name.clone(),
+                link,
+                shows,
+            };
+            let effect = match action {
+                PeerAction::Act { .. } => Effect::ActRan,
+                PeerAction::Close | PeerAction::Disconnect => on_link(link, LinkShows::Ended),
+                PeerAction::Redial => {
+                    link += 1;
+                    on_link(link, LinkShows::Opened)
+                }
+                PeerAction::FinishHeader => on_link(link, LinkShows::Finished),
+                PeerAction::Open { .. }
+                | PeerAction::Grant
+                | PeerAction::Ask { .. }
+                | PeerAction::Discover { .. } => Effect::Unshown,
+            };
             declared.push(Declared {
                 pick: format!("peer:{name}:{}", action.name()),
                 script: name.clone(),
                 control: None,
-                effect: match action {
-                    PeerAction::Act { .. } => Effect::ActRan,
-                    _ => Effect::Unshown,
-                },
+                effect,
             });
         }
     }
@@ -345,6 +401,106 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
         .collect()
 }
 
+/// The node's sessions as the full report's `sessions` store shows them:
+/// each peer's links in the order the node first admitted a session on
+/// each, and each ended session's link with the reason the node gave.
+/// Read from the store's `Debug` facts: `SessionAdmitted { peer:
+/// "<peer>", session_id: <id>, ..., origin: Some(SessionOrigin {
+/// connection: <link>, ... }) }` and `SessionEnded { peer: "<peer>",
+/// session_id: <id>, reason: "<reason>" }`. A session admitted with no
+/// origin names no link, so its end shows nothing.
+#[derive(Debug, Default)]
+struct Sessions {
+    /// Each peer's links, in first-admission order.
+    links: std::collections::BTreeMap<String, Vec<u64>>,
+    /// Each ended session's link and reason, in the store's order.
+    ended: Vec<(LinkRef, String)>,
+}
+
+impl Sessions {
+    /// `report`'s sessions, empty if its `sessions` store isn't there.
+    fn of(report: &FullReport) -> Sessions {
+        let mut sessions = Sessions::default();
+        let Some(facts) = snapshot(report, "sessions")
+            .and_then(|sessions| sessions.get("facts"))
+            .and_then(Value::as_str)
+        else {
+            return sessions;
+        };
+        let mut admitted: Vec<(String, u64, u64)> = Vec::new();
+        let field = |fact: &str, name: &str| -> Option<u64> {
+            let (_, rest) = fact.split_once(&format!("{name}: "))?;
+            leading_number(rest)
+        };
+        let quoted = |fact: &str, name: &str| -> Option<String> {
+            let (_, rest) = fact.split_once(&format!("{name}: \""))?;
+            Some(rest.split_once('"')?.0.to_owned())
+        };
+        // Each fact's name starts with `Session`, and so does its origin's
+        // type, which isn't a fact.
+        let facts = facts.replace("SessionOrigin {", "Origin {");
+        for fact in facts.split("Session").skip(1) {
+            let (Some(peer), Some(session)) = (quoted(fact, "peer"), field(fact, "session_id"))
+            else {
+                continue;
+            };
+            if fact.starts_with("Admitted {") {
+                let Some(link) = fact
+                    .split_once("origin: Some(Origin {")
+                    .and_then(|(_, origin)| field(origin, "connection"))
+                else {
+                    continue;
+                };
+                let links = sessions.links.entry(peer.clone()).or_default();
+                if !links.contains(&link) {
+                    links.push(link);
+                }
+                admitted.push((peer, session, link));
+            } else if fact.starts_with("Ended {") {
+                let (Some(reason), Some(&(_, _, connection))) = (
+                    quoted(fact, "reason"),
+                    admitted
+                        .iter()
+                        .find(|(at, id, _)| *at == peer && *id == session),
+                ) else {
+                    continue;
+                };
+                sessions.ended.push((LinkRef { peer, connection }, reason));
+            }
+        }
+        sessions
+    }
+
+    /// `peer`'s `link`th link, if the node admitted that many.
+    fn link(&self, peer: &str, link: usize) -> Option<LinkRef> {
+        Some(LinkRef {
+            peer: peer.to_owned(),
+            connection: *self.links.get(peer)?.get(link)?,
+        })
+    }
+
+    /// How many sessions on `link` the node ended for `reason`.
+    fn ends(&self, link: &LinkRef, reason: &str) -> usize {
+        let ended = self.ended.iter().filter(|(_, why)| why == reason);
+        joined(ended, |(at, _)| Some(at.clone()), link).len()
+    }
+
+    /// Whether the node shows `shows` on `link` the `nth` time, from 0, a
+    /// script acted that way there: a link it admitted for a redial, and
+    /// more ends for the reason a close or finish leaves than acts before
+    /// this one.
+    fn show(&self, link: &LinkRef, shows: LinkShows, nth: usize) -> bool {
+        match shows {
+            LinkShows::Opened => self
+                .links
+                .get(&link.peer)
+                .is_some_and(|links| links.contains(&link.connection)),
+            LinkShows::Ended => self.ends(link, PEER_CLOSED) > nth,
+            LinkShows::Finished => self.ends(link, STREAM_FINISHED) > nth,
+        }
+    }
+}
+
 /// Whether each of `facts`, in stamp order, names the link it acted on,
 /// as `report`'s `sessions` store shows it. A relink names a link opened to
 /// its peer, which becomes the peer's current one. A close names its peer's
@@ -450,6 +606,10 @@ pub fn judge(
     {
         return Actions::Incomplete;
     }
+    let sessions = Sessions::of(report);
+    // How many earlier acts of each kind each peer's link has seen.
+    let mut acted: std::collections::BTreeMap<(String, usize, LinkShows), usize> =
+        std::collections::BTreeMap::new();
     // Each in-turn step's effect, its first fact, follows the one before.
     let mut turn = 0;
     let mut shown: Vec<bool> = declared
@@ -482,6 +642,14 @@ pub fn judge(
                 }
             }
             Effect::ActRan => witnessed,
+            Effect::Link { peer, link, shows } => {
+                let nth = acted.entry((peer.clone(), *link, *shows)).or_default();
+                let shown = sessions
+                    .link(peer, *link)
+                    .is_some_and(|at| sessions.show(&at, *shows, *nth));
+                *nth += 1;
+                shown
+            }
             Effect::Queued | Effect::Unshown => false,
         })
         .collect();
@@ -621,5 +789,109 @@ mod tests {
             joined += 1;
         }
         assert_eq!(joined, 3);
+    }
+
+    /// A committed fixture's path, from the repository root.
+    fn fixture(file: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(file)
+    }
+
+    /// `input` recorded on `header-sync/wire`: its trace, its full report
+    /// and its declared actions.
+    fn wire(input: crate::harness::RecordInput<'_>) -> (Trace, FullReport, Vec<Declared>) {
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let entry = crate::harness::find("header-sync/wire").expect("it's registered");
+        let trace = crate::harness::record(entry, input, dir.path()).expect("the run records");
+        let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
+            .expect("record writes the full report");
+        let report = serde_json::from_str(&text).expect("the full report reads back");
+        let declared = declared("header-sync/wire", &trace.meta.scenario).expect("it declares");
+        (trace, report, declared)
+    }
+
+    /// The late-fault fixture, whose one peer's script is a `disconnect`,
+    /// recorded with its committed script.
+    fn late_fault() -> (Trace, FullReport, Vec<Declared>) {
+        let read = |file: &str| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(fixture(file)).expect("it reads"))
+                .expect("it's JSON")
+        };
+        let scenario = read("header-wire-late-fault.json");
+        let plan: crate::Plan = serde_json::from_value(read("header-wire-late-fault.script.json"))
+            .expect("the script is a Plan");
+        wire(crate::harness::RecordInput::Script {
+            scenario: &scenario,
+            plan: &plan,
+            derived_from: None,
+        })
+    }
+
+    /// The late-fault fixture's scenario with its peer's script `close`,
+    /// then `redial`, with no invalid tip or holds, recorded with no Plan
+    /// bytes.
+    fn close_redial() -> (Trace, FullReport, Vec<Declared>) {
+        let mut scenario: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture("header-wire-late-fault.json")).expect("it reads"),
+        )
+        .expect("it's JSON");
+        scenario["peers"][0]["script"] = json!([{"action": "close"}, {"action": "redial"}]);
+        scenario["peers"][0]["invalid_tip"] = json!(false);
+        scenario["policy"]["holds"] = json!([]);
+        wire(crate::harness::RecordInput::Plan {
+            scenario: &scenario,
+            plan: &[],
+        })
+    }
+
+    /// A wire peer's scripted `disconnect`, `close`, `redial` and
+    /// `finish-header` are each shown by the node's own session facts for
+    /// the link it acted on: the late-fault fixture's disconnect, a close
+    /// and its redial, and the reopen fixture's header-stream finish
+    /// (`own9-join`'s committed input). Each completed run carried out
+    /// every declared action.
+    #[test]
+    fn a_wire_peer_s_link_actions_are_shown_by_its_sessions() {
+        let reopen = std::fs::read(fixture("header-wire-reopen.bin")).expect("it reads");
+        for (name, (trace, report, declared)) in [
+            ("late fault", late_fault()),
+            ("close and redial", close_redial()),
+            ("reopen", wire(crate::harness::RecordInput::Input(&reopen))),
+        ] {
+            assert!(!declared.is_empty(), "{name}");
+            assert_eq!(
+                judge(&declared, &trace, &report, &End::Completed, false),
+                Actions::Complete,
+                "{name}: {declared:?}"
+            );
+        }
+    }
+
+    /// Each wire link act joins the node's session facts on its whole link
+    /// (Rule 25's template): the late fault's disconnect on `peer-0`'s
+    /// first connection is shown, and the same act with only its peer or
+    /// connection moved shows nothing. With the session's end removed, or
+    /// its reason the node's own, the run's disconnect isn't shown.
+    #[test]
+    fn a_link_act_joins_its_whole_link() {
+        let (trace, report, declared) = late_fault();
+        let sessions = Sessions::of(&report);
+        let link = sessions
+            .link("peer-0", 0)
+            .expect("the node admitted peer-0");
+        assert_one_key_off(&link, |link| sessions.show(link, LinkShows::Ended, 0));
+        assert!(!sessions.show(&link, LinkShows::Ended, 1));
+        let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
+        assert_eq!(judged(&report), Actions::Complete);
+        let ended = "SessionEnded { peer: \"peer-0\", session_id: 16294208416658607535, reason: \"accept_failed\" }";
+        for to in [
+            "",
+            "SessionEnded { peer: \"peer-0\", session_id: 16294208416658607535, reason: \"idle_timeout\" }",
+            "SessionEnded { peer: \"peer-1\", session_id: 16294208416658607535, reason: \"accept_failed\" }",
+        ] {
+            let edited = edited(&report, "sessions", Some("facts"), ended, to);
+            assert_eq!(judged(&edited), Actions::Incomplete, "{to}");
+        }
     }
 }

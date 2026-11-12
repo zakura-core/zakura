@@ -1377,11 +1377,10 @@ fn simultaneous_long_polls_build_a_bounded_number_of_full_first_answers() {
     answer_simultaneous_long_polls_on_a_new_tip(MempoolSnapshotOnNewTip::Published);
 }
 
-/// While the mempool's snapshot is still behind the new block, only the long polls building a
-/// full first answer ask the mempool. The ones over the limit answer coinbase-only without
-/// sending it a request.
+/// While the mempool's snapshot is still behind the new block, every long poll answers
+/// coinbase-only at once, and none sends the mempool a request.
 #[test]
-fn simultaneous_long_polls_over_the_limit_do_not_ask_the_mempool() {
+fn simultaneous_long_polls_do_not_ask_a_mempool_that_is_behind() {
     answer_simultaneous_long_polls_on_a_new_tip(MempoolSnapshotOnNewTip::Behind);
 }
 
@@ -1391,13 +1390,14 @@ fn simultaneous_long_polls_over_the_limit_do_not_ask_the_mempool() {
 enum MempoolSnapshotOnNewTip {
     /// The snapshot is for the new block.
     Published,
-    /// No snapshot is for the new block, so a long poll has to ask the mempool.
+    /// No snapshot is for the new block, so every first answer is coinbase-only.
     Behind,
 }
 
 /// Answers more long polls together on a new tip than may build a full first answer, and
-/// checks that [`MAX_FULL_FIRST_ANSWERS`] of them answer with the full template, that the
-/// rest answer coinbase-only, and how many requests they send the mempool between them.
+/// checks how many answer with the full template ([`MAX_FULL_FIRST_ANSWERS`] when the
+/// mempool's snapshot is for the new block, none otherwise), that the rest answer
+/// coinbase-only, and that they send the mempool no request.
 fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip) {
     const LONG_POLLS: usize = 8;
 
@@ -1416,8 +1416,8 @@ fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip
             })))
         };
 
-        // A block lands. The mempool answers a request with its transactions for that block
-        // either way, and has published them only in the `Published` case.
+        // A block lands. The mempool has published its transactions for it only in the
+        // `Published` case.
         let next = chain_info(3, 2, 400_000_000);
         if snapshot == MempoolSnapshotOnNewTip::Published {
             mempool_snapshots.publish(Some(mempool::MempoolSnapshot {
@@ -1438,17 +1438,11 @@ fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip
         for request in &mut requests {
             assert!(futures::poll!(request).is_pending());
         }
-        let requests_sent = mempool_requests.load(Ordering::SeqCst) - requests_before;
-        match snapshot {
-            MempoolSnapshotOnNewTip::Published => assert_eq!(
-                requests_sent, 0,
-                "a snapshot for the new block answers without asking the mempool"
-            ),
-            MempoolSnapshotOnNewTip::Behind => assert_eq!(
-                requests_sent, MAX_FULL_FIRST_ANSWERS,
-                "only the long polls building a full first answer ask the mempool"
-            ),
-        }
+        assert_eq!(
+            mempool_requests.load(Ordering::SeqCst) - requests_before,
+            0,
+            "a first answer on a new tip never asks the mempool"
+        );
 
         gate.release().await;
         let templates: Vec<_> = bounded(futures::future::join_all(requests))
@@ -1463,6 +1457,10 @@ fn answer_simultaneous_long_polls_on_a_new_tip(snapshot: MempoolSnapshotOnNewTip
             .iter()
             .filter(|template| !template.transactions.is_empty())
             .count();
+        if snapshot == MempoolSnapshotOnNewTip::Behind {
+            assert_eq!(full_answers, 0, "no list for the new block is published");
+            return;
+        }
         assert_eq!(
             full_answers, MAX_FULL_FIRST_ANSWERS,
             "the long polls over the limit answer coinbase-only"

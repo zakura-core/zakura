@@ -51,18 +51,11 @@ pub(crate) enum EmptyReason {
     CoinbaseBuiltAhead,
     /// As many long polls as may build a full first answer at once were already doing so.
     NoBuildSlot,
-    /// The mempool holds no transactions for the new tip.
+    /// The mempool published its transactions for the new tip, and there are none.
     MempoolEmpty,
-    /// The mempool reported more work to remove the new block's transactions than it is
-    /// expected to finish within the wait for it.
-    MempoolWorkHeavy,
-    /// The mempool answered a request while it was still on an older tip.
-    MempoolOnOlderTip,
-    /// The mempool neither published its transactions for the new tip nor answered a request
-    /// within the wait for it.
-    MempoolWaitElapsed,
-    /// The request to the mempool failed.
-    MempoolError,
+    /// The mempool has not published its transactions for the new tip: it has not finished
+    /// the block yet, or it admitted a transaction since and withdrew its list.
+    MempoolNotReady,
 }
 
 /// How long one template build waited to start, and how long it ran.

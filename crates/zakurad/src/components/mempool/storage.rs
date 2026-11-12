@@ -22,7 +22,6 @@ use zakura_chain::{
 };
 #[cfg(test)]
 use zakura_node_services::mempool::TransactionDependencies;
-use zakura_node_services::mempool::{MempoolHeld, MempoolTipWork};
 use zcash_script::solver;
 
 use self::{
@@ -847,44 +846,6 @@ impl Storage {
     /// Returns the number of transactions in the mempool.
     pub fn transaction_count(&self) -> usize {
         self.verified.transaction_count()
-    }
-
-    /// Returns what the mempool holds now, for readers estimating a new block's work.
-    pub fn held(&self) -> MempoolHeld {
-        MempoolHeld {
-            transactions: self.transaction_count(),
-            parts: self.verified.scanned_parts(),
-        }
-    }
-
-    /// Returns what the mempool holds and how much work it is to remove the mined,
-    /// conflicting and expired transactions of a block with `block_transactions`.
-    ///
-    /// See [`MempoolTipWork`] for what each part counts. The outputs of the mined
-    /// transactions the mempool held are estimated rather than looked up: the mempool counts
-    /// this before it starts on the block, and a lookup for each mined transaction delays
-    /// that start by milliseconds on large blocks.
-    pub fn tip_work(&self, block_transactions: &[impl AsRef<Transaction>]) -> MempoolTipWork {
-        let checked_parts: usize = block_transactions
-            .iter()
-            .map(|transaction| verified_set::checked_parts(transaction.as_ref()))
-            .sum();
-
-        // At most this many of the block's transactions can be held ones, each creating the
-        // average number of outputs of a held transaction.
-        let held_transactions = self.transaction_count();
-        let held_output_parts = block_transactions
-            .len()
-            .min(held_transactions)
-            .saturating_mul(self.verified.created_output_count())
-            .checked_div(held_transactions)
-            .unwrap_or(0);
-
-        MempoolTipWork {
-            mempool_transactions: held_transactions,
-            block_parts: checked_parts.saturating_add(held_output_parts),
-            mempool_parts: self.verified.scanned_parts(),
-        }
     }
 
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.

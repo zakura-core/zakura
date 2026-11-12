@@ -1647,6 +1647,9 @@ pub struct WirePorts {
     /// The node's header capacity accounting, which its tap fills during the
     /// run.
     pub reservations: ReservationEvidence,
+    /// The header hashes of each page the peers sent, which the identity
+    /// map keeps as it places their frames.
+    pub sent_pages: crate::peer::SentPages,
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
@@ -1900,6 +1903,7 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             closed: PeerCloses::default(),
             reservations: ReservationEvidence::new(&stores),
+            sent_pages: crate::peer::SentPages::default(),
             capacity: CapacityEvidence::new(&stores),
             rounds: SettlementEvidence::new(&stores),
             stale_calls: StaleEvidence::new(&stores),
@@ -2017,7 +2021,8 @@ impl Subsystem for HeaderWire {
             failure.clone(),
             ports.records.clone(),
             shared_ids,
-        );
+        )
+        .with_sent_pages(ports.sent_pages.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =
                 control.add(&name, spec.script.clone(), spec.adversary.is_some());
@@ -3168,8 +3173,13 @@ mod tests {
     ) -> bool {
         use crate::harness::header_node::fault::tests::{evidence_ending, shutdown};
 
+        // A drop the harness's stop explains is stamped after its
+        // `Shutdown` (see `FaultEvidence::dropped_in_stop`).
         let ends = if stopped {
-            vec![shutdown()]
+            vec![
+                shutdown(),
+                crate::harness::header_node::ends::EndFact::CallDropped { call: 1 },
+            ]
         } else {
             Vec::new()
         };

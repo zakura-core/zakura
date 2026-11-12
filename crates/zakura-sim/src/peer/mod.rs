@@ -76,6 +76,7 @@ use zakura_rt::{
 use zakura_scheduler::SimInstant;
 
 use self::evidence::PeerFeed;
+pub use self::evidence::SentPages;
 pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote, SharedIds};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
@@ -460,6 +461,13 @@ impl PeerControl {
             checkpoint,
             id,
         }
+    }
+
+    /// Also keeps the header hashes of each page the peers send in `sent`.
+    pub(crate) fn with_sent_pages(mut self, sent: SentPages) -> Self {
+        let evidence = std::mem::take(&mut self.evidence);
+        self.evidence = evidence.with_sent(sent);
+        self
     }
 
     /// Also logs the peers' frames on `stream`, discovery's, which the
@@ -931,6 +939,14 @@ impl StreamModels {
                 payload: header.payload_len as u64,
                 prepares,
                 asks: None,
+                hashes: match &frame.message {
+                    RegtestMessage::Headers(page) => page
+                        .entries
+                        .iter()
+                        .map(|entry| crate::storage::hash(entry.header.hash()))
+                        .collect(),
+                    _ => Vec::new(),
+                },
             }],
         }
     }

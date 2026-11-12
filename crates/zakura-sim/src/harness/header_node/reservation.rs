@@ -4,8 +4,10 @@
 //! page it stages, each lease that returns, and each round it releases. The reactor tap checks them
 //! as they arrive, in its [`HeaderWorkLedger`], which fails the run at the
 //! next drain when a rule breaks. It also keeps them here, in the order the
-//! queue reported them, for a test or a later property to read. They stay
-//! out of the observation log, so pinned Plans and traces keep their format.
+//! queue reported them, for a test or a later property to read, with each
+//! frame a session's reader refused (`FrameRefused`) in the order it
+//! reported it. They stay out of the observation log, so pinned Plans and
+//! traces keep their format.
 //!
 //! [`HeaderWorkLedger`]: zakura_network::zakura::observe::HeaderWorkLedger
 

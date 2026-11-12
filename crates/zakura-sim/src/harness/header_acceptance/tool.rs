@@ -1,23 +1,67 @@
-//! The acceptance tool's simulator side (hdr-14.7a, item 9).
+//! The acceptance tool's simulator side (hdr-14.7a and hdr-14.7b, item 9).
 //!
 //! `cargo xtask header-acceptance` can't link this crate, which builds only
 //! under `--cfg zakura_sim`, so it drives the `header-acceptance` binary in
 //! three steps around the children it runs itself:
 //!
 //! 1. [`plan`] turns the manifest into [`Task`]s: the tests to execute by
-//!    name, the planted cases to rebuild and record, and the integrity
-//!    mutations to run. Every other expected result is listed with why the
-//!    tool can't produce it yet, and stays blocked.
+//!    name, the histories to declare and record, the planted cases to
+//!    rebuild and record, and the integrity mutations to run. Every other
+//!    expected result is listed with why the tool can't produce it, and
+//!    stays blocked.
 //! 2. xtask runs each task with a deadline and writes its artifacts under
-//!    `<artifacts>/<task index>/`, as [`TEST_FILE`], recorded traces and
-//!    [`PROVENANCE_FILE`].
+//!    `<artifacts>/<task index>/`, as the contract below gives them.
 //! 3. [`assemble`] reads those artifacts into the evaluator's
 //!    [`ResultFile`], and [`record`] runs the evaluator and writes the
 //!    record's three exports.
 //!
-//! The adapters here, from a trace's end record to an [`Execution`], stand
-//! in for the full-report sidecars C8 adds. They read only what the trace
-//! keeps.
+//! # The runner's artifacts
+//!
+//! Every path below is under the task's directory `<i>`, which holds its
+//! [`TASK_FILE`] first. A file a child didn't write is missing, and a child
+//! killed at its deadline leaves [`KILLED_FILE`] in its directory. A
+//! missing or killed artifact gives its execution no result, so it blocks.
+//!
+//! A *recorded run* is a directory `zakura-sim record --out` wrote:
+//! `trace.jsonl`, `full-report.json` ([`FULL_REPORT_FILE`], C8), and
+//! `witness.json` when it was recorded with `--witness`. Its *fresh
+//! replay*, where the contract asks for one, is the directory
+//! [`REPLAY_DIR`] inside it, written by a separate
+//! `zakura-sim replay <run> --report <run>/replay/full-report.json` with the
+//! same binary that recorded the run: the replay's own `full-report.json`,
+//! and [`REPLAY_FILE`], a [`ReplayRun`] holding how that child ended and
+//! its output.
+//!
+//! * `test`: [`TEST_FILE`], a [`TestRun`] of the exact-name filter.
+//! * `history`: the witness test run as for `test`, with
+//!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`,
+//!   so `<i>/declared` holds what it declared ([`super::history`]). Then
+//!   `<i>/run`, the declaration whose case is the task's `case`, recorded by
+//!   S's `zakura-sim record --sim <harness> --scenario <its scenario.json>
+//!   (--plan <its plan.bin> | --script <its script.json>)`, with
+//!   `--witness <property> --expect <expect>` when the task names `expect`,
+//!   and its fresh replay.
+//! * `case`: the planted runner's `baseline` and `patched` recorded runs,
+//!   copied whole, with the fresh replays it made of them (C4), and
+//!   [`VERDICT_FILE`], [`TARGET_FILE`] and [`PROVENANCE_FILE`] as before.
+//!   A node case's task names `draft`, its set: then `<i>/draft` is
+//!   recorded by the case's own rebuilt binary with `zakura-sim record
+//!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
+//!   where its input is `--input <input>`, `--scenario <scenario> --plan
+//!   <plan>` or `--scenario <scenario> --script <script>` as [`CaseInput`]
+//!   names it, with its fresh replay by the same binary. A case whose task
+//!   names `companions` gets [`COMPANIONS_FILE`] in `<i>/draft` from the
+//!   same rebuilt checkout's `header-acceptance companions --trace <i>/draft
+//!   --out <i>/draft/companions.json`, a [`CompanionsRun`].
+//! * `integrity`: for each of `unpatched`, `patched` and `restored`, the
+//!   history's witness test as for `history` in `<i>/<run>`, with
+//!   [`TEST_FILE`] and `declared`, and `<i>/<run>/history`, the declaration
+//!   named by the task's `case`, recorded by that checkout's own
+//!   `zakura-sim` with no witness.
+//!
+//! Every recorded run's report and store snapshot come from its
+//! `full-report.json`, never from the trace's `end` record, which keeps no
+//! violation and no store, and the two must agree on every outcome.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,15 +75,21 @@ use serde_json::Value;
 use super::{
     contracts::RunBy,
     evaluate::{
-        evaluate, Actions, Actual, End, Evaluation, ExecMeta, Execution, ObligationState, Report,
-        ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
+        evaluate, Actions, Actual, Companion, End, Evaluation, ExecMeta, Execution,
+        ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
+    history::{declared, DeclaredHistory, PLAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
     NARROWING, REQUIRED_CONTRACTS,
 };
-use crate::harness::coverage::{Bypass, COVERAGE};
+use crate::{
+    harness::coverage::{Bypass, COVERAGE},
+    record::{FullReport, OutcomeKind},
+    trace::{meta::PlanRef, Trace},
+    PropertyOutcome,
+};
 
 /// A test task's artifact: how the exact-name filter ran.
 pub const TEST_FILE: &str = "test.json";
@@ -103,6 +153,55 @@ impl std::str::FromStr for Containment {
         }
     }
 }
+/// A recorded run's fresh replay, the directory inside it.
+pub const REPLAY_DIR: &str = "replay";
+/// A fresh replay's own artifact: how its child ended ([`ReplayRun`]).
+pub const REPLAY_FILE: &str = "replay.json";
+/// A node case's `Draft` run's companions, judged by the case's own build
+/// ([`CompanionsRun`]).
+pub const COMPANIONS_FILE: &str = "companions.json";
+pub use crate::record::FULL_REPORT_FILE;
+
+/// What a fresh replay's [`REPLAY_FILE`] holds, as the runner writes it
+/// from its child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayRun {
+    /// Whether the child exited 0, which `zakura-sim replay` does only for a
+    /// verified replay.
+    pub exited_ok: bool,
+    /// Whether it ended at its deadline.
+    pub killed: bool,
+    /// Its combined output, which names the trace it replayed.
+    pub log: String,
+}
+
+/// What a `Draft` run's [`COMPANIONS_FILE`] holds: each companion's verdict
+/// on that trace, from `header-acceptance companions` built from the case's
+/// own patched checkout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionsRun {
+    /// The digest of the trace it judged.
+    pub trace: String,
+    /// The source digest the judging binary embeds.
+    pub source: String,
+    /// Each companion, in its declared order.
+    pub companions: Vec<CompanionVerdict>,
+}
+
+/// One companion's verdict in a [`CompanionsRun`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionVerdict {
+    /// Its declared name.
+    pub name: String,
+    /// Whether it held.
+    pub held: bool,
+    /// Why not, if it didn't.
+    pub why: Option<String>,
+}
+
 /// A planted case's artifact: its fuzz-target confirmation, from the
 /// planted runner's `--targets` run.
 pub const TARGET_FILE: &str = "target.json";
@@ -125,11 +224,30 @@ pub enum Task {
         /// Its name.
         test: String,
     },
+    /// A history, declared by its witness test and recorded from that
+    /// declaration (C18).
+    History {
+        /// The expected result it produces.
+        expected: ExpectedId,
+        /// The harness it runs on.
+        harness: String,
+        /// The property whose witness the recording runs.
+        property: String,
+        /// `--expect`'s value for that witness, or `None` to record with no
+        /// witness.
+        expect: Option<String>,
+        /// Its witness test's package.
+        package: String,
+        /// Its witness test's file.
+        file: String,
+        /// Its witness test's name.
+        test: String,
+        /// Its case within that test.
+        case: String,
+    },
     /// A planted case, rebuilt with its patch in its own target directory.
     Case {
-        /// The expected result it's for. A node case's `Draft` run needs C9
-        /// (hdr-14.7b), so its result can't be whole yet: the plan lists it
-        /// unsupported, and its runs are only linked as evidence.
+        /// The expected result it's for.
         expected: ExpectedId,
         /// The case's property directory.
         property: String,
@@ -143,6 +261,11 @@ pub enum Task {
         input: CaseInput,
         /// The patch, relative to the repository root.
         patch: String,
+        /// A node case's set, its `Draft` run's override (C9). `None` for a
+        /// machine case, which has no `Draft` run.
+        draft: Option<Vec<String>>,
+        /// The companions judged on its `Draft` run, by name.
+        companions: Vec<String>,
     },
     /// A native integrity mutation: its history's test unpatched, patched
     /// and restored.
@@ -275,15 +398,16 @@ fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
     }
 }
 
-/// Turns `manifest`'s expected results into tasks. `Holds`,
-/// `StaysNotApplicable` and `Replays` need a history recorded from its
-/// bound scenario and input (C18) with its full report (C8), so they wait
-/// for hdr-14.7b. A node `Caught`'s baseline and patched runs are tasks, but
-/// its `Draft` run needs C9's override, so its expected result has none.
+/// Turns `manifest`'s expected results into tasks: a `Holds` or
+/// `StaysNotApplicable` becomes a history task, a planted case a case task
+/// with its `Draft` run if it's a node one, and a `Replays` is read from
+/// the task that records its run. A replay of a run no task records is
+/// listed unsupported.
 pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
     let mut tasks = Vec::new();
     let mut unsupported = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut replays = Vec::new();
     for result in &manifest.expected {
         let Some(id) = result.expected.id() else {
             continue;
@@ -298,33 +422,35 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
                 file: test.file.to_owned(),
                 test: test.test.to_owned(),
             }),
-            Expected::Caught { case, harness, .. } => {
-                tasks.push(case_task(repo, case, harness, false, id.clone())?);
-                unsupported.push((
-                    id,
-                    "its Draft run needs C9's override in record and replay (E5, hdr-14.7b)"
-                        .to_owned(),
-                ));
-            }
-            Expected::MachineCaught { case, harness } => {
-                let task = case_task(repo, case, harness, true, id.clone())?;
-                // Binding a typed case's trace to its scenario and Plan is
-                // C18's (E10), so its runs are linked but give no result.
-                if matches!(
-                    task,
-                    Task::Case {
-                        input: CaseInput::Typed { .. } | CaseInput::Scripted { .. },
-                        ..
-                    }
-                ) {
-                    unsupported.push((
-                        id,
-                        "binding a typed case's trace to its scenario and Plan needs C18 \
-                         (E10, hdr-14.7b)"
-                            .to_owned(),
-                    ));
+            Expected::Holds {
+                property, history, ..
+            } => tasks.push(history_task(id, property, history, Some("holds"))),
+            // A target that stays NotApplicable has no witness expectation
+            // to record it under, so its trigger history isn't shown.
+            Expected::StaysNotApplicable {
+                property, history, ..
+            } => tasks.push(history_task(id, property, history, None)),
+            Expected::Caught {
+                case,
+                harness,
+                set,
+                companions,
+                ..
+            } => {
+                let mut task = case_task(repo, case, harness, false, id)?;
+                if let Task::Case {
+                    draft,
+                    companions: named,
+                    ..
+                } = &mut task
+                {
+                    *draft = Some(set.iter().map(|id| (*id).to_owned()).collect());
+                    *named = companions.iter().map(|name| (*name).to_owned()).collect();
                 }
                 tasks.push(task);
+            }
+            Expected::MachineCaught { case, harness } => {
+                tasks.push(case_task(repo, case, harness, true, id)?);
             }
             Expected::IntegrityCaught {
                 patch,
@@ -342,21 +468,79 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
                 test: history.witness.test.to_owned(),
                 diagnostic: diagnostic.to_owned(),
             }),
-            Expected::Holds { .. } | Expected::StaysNotApplicable { .. } => unsupported.push((
-                id,
-                "recording a history from its bound scenario and input needs C18 and its full \
-                 report needs C8 (hdr-14.7b)"
-                    .to_owned(),
-            )),
-            Expected::Replays { .. } => unsupported.push((
-                id,
-                "a replay compares full reports and store snapshots, which need C8 (hdr-14.7b)"
-                    .to_owned(),
-            )),
+            Expected::Replays { ref run } => replays.push((id, run.clone())),
             Expected::Open { .. } => {}
         }
     }
+    for (id, run) in replays {
+        if recorded_at(&tasks, &run).is_none() {
+            unsupported.push((id, format!("no task records {run:?}")));
+        }
+    }
     Ok(RunPlan { tasks, unsupported })
+}
+
+/// A history's task, recording its witness of `property` with `expect`.
+fn history_task(
+    expected: ExpectedId,
+    property: &str,
+    history: super::HistoryRef,
+    expect: Option<&str>,
+) -> Task {
+    Task::History {
+        expected,
+        harness: history.harness.to_owned(),
+        property: property.to_owned(),
+        expect: expect.map(str::to_owned),
+        package: history.witness.package.to_owned(),
+        file: history.witness.file.to_owned(),
+        test: history.witness.test.to_owned(),
+        case: history.case.to_owned(),
+    }
+}
+
+/// Where in `tasks` execution `run` is recorded: its task's index and the
+/// recorded run's directory within it, `run` for a history and the role's
+/// name for a planted case's run. `None` if no task records it, as for a
+/// native mutation's run, whose witness test isn't a recorded run.
+pub fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)> {
+    tasks.iter().enumerate().find_map(|(index, task)| {
+        let dir = match (task, run) {
+            (Task::History { expected, .. }, RunId::History { .. })
+                if history_of(expected) == Some(run) =>
+            {
+                "run"
+            }
+            (
+                Task::Case {
+                    property,
+                    name,
+                    draft,
+                    ..
+                },
+                RunId::Case {
+                    property: p,
+                    name: n,
+                    run: role,
+                },
+            ) if property == p && name == n => match role {
+                CaseRun::Baseline => "baseline",
+                CaseRun::Patched => "patched",
+                CaseRun::Draft if draft.is_some() => "draft",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((index, dir))
+    })
+}
+
+/// The history a `Holds` or `StaysNotApplicable` identity names.
+fn history_of(expected: &ExpectedId) -> Option<&RunId> {
+    match expected {
+        ExpectedId::Holds { run, .. } | ExpectedId::StaysNotApplicable { run, .. } => Some(run),
+        _ => None,
+    }
 }
 
 /// A planted case's task.
@@ -375,6 +559,8 @@ fn case_task(
         machine,
         input: case_input(repo, case)?,
         patch: format!("qa/planted/{}/{}.patch", case.property, case.name),
+        draft: None,
+        companions: Vec::new(),
     })
 }
 
@@ -522,10 +708,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 /// driver runs its whole input and stops only at its first model mismatch
 /// (Rule 17's machine histories end as their driver does), so a completed
 /// machine run carried out its input, a stopped one a prefix of it, and any
-/// other end none it can show. A node
-/// history's actions must each be shown to reach its documented effect,
-/// not just picked, and that evidence comes with the history runs in
-/// hdr-14.7b, so a node run is `Incomplete` until then.
+/// other end none it can show. A node history's actions, its scripted acts
+/// and control steps, must each be derived from its bound scenario and shown
+/// from the trace to reach their documented effect, not just picked
+/// (item 0, "each history's declared actions must run"). No node harness
+/// derives them yet, so a node run is `Incomplete`, and its result blocks.
 fn actions(harness: &str, end: &End) -> Actions {
     let machine = crate::harness::find(harness).is_ok_and(|entry| entry.machine);
     match (machine, end) {
@@ -544,39 +731,70 @@ fn trace_source(dir: &Path) -> Option<String> {
     (!source.is_empty() && source != "unknown").then(|| source.to_owned())
 }
 
-/// The outcome name of a report in a trace's end record: a string, or an
-/// object keyed by its name.
-fn outcome_name(outcome: &Value) -> Option<&str> {
-    outcome
-        .as_str()
-        .or_else(|| outcome.as_object()?.keys().next().map(String::as_str))
+/// The full report (C8) in `dir`'s [`FULL_REPORT_FILE`], read as the
+/// trace reader reads its files: a regular file within
+/// [`MAX_REPORT_BYTES`](crate::trace::MAX_REPORT_BYTES).
+fn full_report(dir: &Path) -> Result<FullReport, String> {
+    let path = dir.join(FULL_REPORT_FILE);
+    match crate::trace::read::read_bounded(&path, crate::trace::MAX_REPORT_BYTES) {
+        Ok(Some(bytes)) => {
+            serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
+        }
+        Ok(None) => Err(format!("{}: missing", path.display())),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
 }
 
-/// One property report from a trace's end record.
-fn report(outcome: &Value) -> Option<Report> {
-    Some(match outcome_name(outcome)? {
-        "held" => Report::Held {
-            applicable: outcome.get("held")?.get("applicable")?.as_u64()?,
-        },
-        // The trace's typed reason, so an unknown one is a malformed record.
-        "not-applicable" => Report::NotApplicable {
-            reason: serde_json::from_value::<crate::NaReason>(
-                outcome.get("not-applicable")?.get("reason")?.clone(),
-            )
-            .ok()?
-            .name()
-            .into_owned(),
-        },
-        "violated" => Report::Violated,
-        _ => return None,
-    })
+/// The recorded run in `dir`: its trace, which the simulator's own reader
+/// checks whole (its versions, every line's shape and order, its step
+/// numbers and that its last line is a written `end`), and its full
+/// report, whose outcomes must be the `end` record's, property by property.
+fn recorded(dir: &Path) -> Result<(Trace, FullReport), String> {
+    let trace = crate::trace::TraceReader::open(dir)
+        .map_err(|error| format!("{}: {error}", dir.display()))?;
+    let end = trace
+        .end
+        .as_ref()
+        .ok_or_else(|| format!("{}: no end record", dir.display()))?;
+    let report = full_report(dir)?;
+    let ended: Vec<(&str, &PropertyOutcome)> = end
+        .properties
+        .iter()
+        .map(|found| (found.property.as_str(), &found.outcome))
+        .collect();
+    let reported: Vec<(&str, &PropertyOutcome)> = report
+        .properties
+        .iter()
+        .map(|found| (found.property.as_str(), &found.outcome))
+        .collect();
+    if ended != reported {
+        return Err(format!(
+            "{}: its full report's outcomes aren't its end record's",
+            dir.display()
+        ));
+    }
+    Ok((trace, report))
 }
 
-/// The execution `run` recorded in `dir`: its trace's end record and
-/// picks, and its witness result. A missing trace, a killed child or a
-/// malformed end record is a run that didn't happen. A completed end comes
-/// from the trace's `idle`, `drain` or `budget` outcome until C1's
-/// completion replaces them, and every result still depends on C1.
+/// One property's report, from its outcome in a full report.
+fn report(outcome: &PropertyOutcome) -> Report {
+    match outcome {
+        PropertyOutcome::Held { applicable } => Report::Held {
+            applicable: u64::from(*applicable),
+        },
+        PropertyOutcome::NotApplicable { reason } => Report::NotApplicable {
+            reason: reason.name().into_owned(),
+        },
+        PropertyOutcome::Violated { .. } => Report::Violated,
+    }
+}
+
+/// The execution `run` recorded in `dir`: its trace's end and meta, its
+/// full report's outcomes (C8), its `Draft` override from `meta.draft`
+/// (C9), and its witness result. A missing or refused trace or report, or
+/// a killed child, is a run that didn't happen. A completed end is the
+/// trace's `idle` or `budget` outcome, which C1's completion decides, and
+/// every result still depends on C1.
 fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution {
     let trace = digest(&dir.join("trace.jsonl"));
     let failed = |why: String| Execution {
@@ -599,82 +817,112 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
         killed.end = End::Killed;
         return killed;
     }
-    // The simulator's own reader checks the whole trace: its versions,
-    // every line's shape and order, its step numbers and that its last
-    // line is a written `end`. A trace it refuses is no execution.
-    if let Err(error) = crate::trace::TraceReader::open(dir) {
-        return failed(format!("{}: {error}", dir.display()));
-    }
-    let Ok(text) = fs::read_to_string(dir.join("trace.jsonl")) else {
-        return failed(format!("{}: no trace", dir.display()));
+    let (recorded, full) = match recorded(dir) {
+        Ok(read) => read,
+        Err(why) => return failed(why),
     };
-    let lines: Vec<Value> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    let (Some(meta), Some(end)) = (
-        lines.first().and_then(|line| line.get("meta")),
-        lines.last().and_then(|line| line.get("end")),
-    ) else {
-        return failed(format!("{}: no meta or end record", dir.display()));
-    };
-    let recorded = meta.get("sim").and_then(Value::as_str).unwrap_or_default();
-    let mut reports = BTreeMap::new();
-    for property in end
-        .get("properties")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let (Some(id), Some(report)) = (
-            property.get("property").and_then(Value::as_str),
-            property.get("outcome").and_then(report),
-        ) else {
-            return failed(format!("{}: an unreadable property report", dir.display()));
-        };
-        reports.insert(id.to_owned(), report);
-    }
-    let end_kind = match end.get("outcome").and_then(Value::as_str) {
-        Some("violation") => End::Violation {
+    let end = recorded
+        .end
+        .as_ref()
+        .expect("`recorded` refuses a trace with no end");
+    let end_kind = match end.outcome {
+        OutcomeKind::Violation => End::Violation {
             property: end
-                .get("violation")
-                .and_then(|v| v.get("property"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+                .violation
+                .as_ref()
+                .map(|violation| violation.property.clone())
+                .unwrap_or_default(),
         },
-        Some("harness") => End::HarnessFailure {
-            diagnostic: end.get("harness").map(Value::to_string).unwrap_or_default(),
+        OutcomeKind::Harness => End::HarnessFailure {
+            diagnostic: end.harness.clone().unwrap_or_default(),
         },
-        Some("idle" | "drain" | "budget") => End::Completed,
-        other => End::Failed {
-            why: format!("the trace ended {other:?}"),
-        },
+        OutcomeKind::Idle | OutcomeKind::Budget => End::Completed,
     };
-    let actions = actions(recorded, &end_kind);
+    let actions = actions(&recorded.meta.sim, &end_kind);
     let witness: Option<Value> = read_json(&dir.join("witness.json"));
     Execution {
         trace,
         run,
         meta: ExecMeta {
-            harness: recorded.to_owned(),
-            draft_override: Vec::new(),
+            harness: recorded.meta.sim.clone(),
+            draft_override: recorded.meta.draft.clone(),
             run_by,
             input: None,
         },
         end: end_kind,
-        reports,
+        reports: full
+            .properties
+            .iter()
+            .map(|found| (found.property.clone(), report(&found.outcome)))
+            .collect(),
         trigger: witness
             .as_ref()
             .and_then(|w| w.get("passed"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        leaked: end
-            .get("cleanup")
-            .and_then(|c| c.get("leaked"))
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
+        // A usize count always fits in a u64 on supported targets.
+        leaked: end.cleanup.leaked as u64,
         actions,
+    }
+}
+
+/// The execution `run` recorded in `dir`, by `run_by` on `harness`, as
+/// [`assemble`] reads every recorded run before its role's own checks.
+pub fn read_execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution {
+    execution(dir, run, harness, run_by)
+}
+
+/// The fresh replay (C3, C8) of the recorded run `run` in `dir`, from its
+/// [`REPLAY_DIR`]: it's exact only if its child exited 0, wasn't killed
+/// and said it replayed this trace with every pick, draw and observation
+/// matched. Its full report is compared with the recording's, outcomes and
+/// violations apart from the store snapshot, so a changed stored fact fails
+/// it even when every report is the same. Its meta is the recording's: the
+/// replay reruns the meta's harness with its `Draft` override.
+fn replay_actual(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
+    let of = digest(&dir.join("trace.jsonl"));
+    let replay = dir.join(REPLAY_DIR);
+    let ran = read_json::<ReplayRun>(&replay.join(REPLAY_FILE));
+    let recorded = recorded(dir).ok();
+    let meta = ExecMeta {
+        harness: recorded
+            .as_ref()
+            .map(|(trace, _)| trace.meta.sim.clone())
+            .unwrap_or_default(),
+        draft_override: recorded
+            .as_ref()
+            .map(|(trace, _)| trace.meta.draft.clone())
+            .unwrap_or_default(),
+        run_by,
+        input: None,
+    };
+    let matched = format!("replayed trace {of}: ");
+    let exact = ran.as_ref().is_some_and(|ran| {
+        ran.exited_ok
+            && !ran.killed
+            && ran.log.lines().any(|line| {
+                line.starts_with(&matched)
+                    && line.ends_with("every pick, draw and observation matched")
+            })
+    });
+    let (reports_equal, stores_equal) = match (
+        recorded.as_ref().map(|(_, report)| report),
+        full_report(&replay),
+    ) {
+        (Some(original), Ok(replayed)) => (
+            original.properties == replayed.properties,
+            original.snapshot == replayed.snapshot,
+        ),
+        _ => (false, false),
+    };
+    Actual::Replay {
+        run,
+        of,
+        meta,
+        exact,
+        reports_equal,
+        stores_equal,
+        fresh: ran.is_some(),
     }
 }
 
@@ -685,31 +933,45 @@ fn known(source: Option<&str>) -> bool {
     source.is_some_and(|source| !source.is_empty() && source != "unknown" && source != NOT_EMBEDDED)
 }
 
+/// Whether `failure`, a harness failure's `Display` form, is the source
+/// evidence failure `diagnostic`: `<source>'s evidence failed:
+/// <diagnostic>: <detail>`
+/// ([`HarnessFailure::SourceEvidence`](crate::end::HarnessFailure::SourceEvidence)),
+/// whose detail leads with the failure's name. A text that only mentions
+/// the name isn't one.
+fn fails_with(failure: &str, diagnostic: &str) -> bool {
+    let detail = format!("'s evidence failed: {diagnostic}: ");
+    failure.find(&detail).is_some_and(|at| at > 0)
+}
+
 /// Whether `log` holds the harness's own report of `diagnostic`. A harness
 /// failure ends `run_prepared` with [`HarnessError::Run`], and the witness
 /// panics with its `Display` form, `the run hit a harness failure:
-/// <source>'s evidence failed: <diagnostic>: <detail>`
-/// ([`HarnessFailure::SourceEvidence`](crate::end::HarnessFailure::SourceEvidence)),
-/// whose detail leads with the failure's name. A panic that only mentions
-/// the name isn't one. C8's structured end record replaces this in
-/// hdr-14.7b.
+/// <failure>`, where the failure is [`fails_with`]'s.
 ///
 /// [`HarnessError::Run`]: crate::harness::HarnessError::Run
 fn reports_diagnostic(log: &str, diagnostic: &str) -> bool {
-    let detail = format!("'s evidence failed: {diagnostic}: ");
     log.lines().any(|line| {
         line.split_once("the run hit a harness failure: ")
-            .is_some_and(|(_, rest)| rest.find(&detail).is_some_and(|at| at > 0))
+            .is_some_and(|(_, rest)| fails_with(rest, diagnostic))
     })
 }
 
-/// An integrity mutation's history run from its test artifact: a passing
-/// test is a completed run, a failing one whose output reports
-/// `diagnostic` ([`reports_diagnostic`]) is that harness failure, and
-/// anything else didn't happen. The artifact must be the history's own
-/// test. A test reports
-/// no property outcomes, so a clean run's whole-report check fails until
-/// the tool records the history itself with C8's report (hdr-14.7b).
+/// An integrity mutation's history run in `dir`. Its end comes from its
+/// test artifact: a passing test is a completed run, a failing one whose
+/// output reports `diagnostic` ([`reports_diagnostic`]) is that harness
+/// failure, and anything else didn't happen. The artifact must be the
+/// history's own test, from a binary embedding the checkout it ran in.
+///
+/// The run claims `input` as its history only if the test declared it
+/// exactly once ([`declaration`]), and its reports come from that
+/// declaration recorded in `dir/history` by the same checkout (C18, C8),
+/// whose trace must bind to the declaration and end as the test did: a
+/// harness failure reporting `diagnostic` for a failing test, completed for
+/// a passing one. A test reports no property outcomes, so without that
+/// recording the run claims no history and its whole-report check fails.
+/// Its trigger history is the test's own assertions, which passed only if
+/// it did.
 fn integrity_execution(
     dir: &Path,
     run: RunId,
@@ -729,12 +991,14 @@ fn integrity_execution(
         package,
         file,
         test: name,
+        case,
         ..
     } = input
     else {
         unreachable!("an integrity run's input is a history");
     };
-    let end = match read_json::<TestRun>(&dir.join(TEST_FILE)) {
+    let artifact = read_json::<TestRun>(&dir.join(TEST_FILE));
+    let mut end = match &artifact {
         Some(test) if test.killed => End::Killed,
         // The artifact must be the history's own witness test, by package,
         // file and name, or it's not that history's run.
@@ -776,6 +1040,47 @@ fn integrity_execution(
             why: format!("{}: no test artifact", dir.display()),
         },
     };
+    let trigger = end == End::Completed;
+    let mut claimed = None;
+    let mut reports = BTreeMap::new();
+    let mut leaked = 0;
+    if matches!(end, End::Completed | End::HarnessFailure { .. }) {
+        let history = dir.join("history");
+        let bound = declaration(&dir.join("declared"), harness, name, case).and_then(|at| {
+            match declared_refusal(harness, &at, &history) {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
+        });
+        let checkout = artifact
+            .as_ref()
+            .and_then(|test| test.checkout_source.clone());
+        let recorded = execution(&history, run.clone(), harness, RunBy::Tool);
+        let agrees = match (&end, &recorded.end) {
+            (End::Completed, End::Completed) => Ok(()),
+            (
+                End::HarnessFailure { .. },
+                End::HarnessFailure {
+                    diagnostic: failure,
+                },
+            ) if fails_with(failure, diagnostic) => Ok(()),
+            (_, other) => Err(format!("its recorded history ended {other:?}")),
+        };
+        let from_checkout = if trace_source(&history) == checkout && checkout.is_some() {
+            Ok(())
+        } else {
+            Err("its recorded history isn't from the checkout its test ran in".to_owned())
+        };
+        match bound.and(agrees).and(from_checkout) {
+            Ok(()) => {
+                claimed = Some(input.clone());
+                reports = recorded.reports;
+                leaked = recorded.leaked;
+            }
+            Err(why) if patched => end = End::Failed { why },
+            Err(_) => {}
+        }
+    }
     Execution {
         trace: digest(&dir.join(TEST_FILE)),
         run,
@@ -783,16 +1088,12 @@ fn integrity_execution(
             harness: harness.to_owned(),
             draft_override: Vec::new(),
             run_by: RunBy::Tool,
-            // The witness test runs every input of its loop, so which of
-            // its histories `input` is isn't shown yet: that's C18's
-            // witness-test history reconciliation (hdr-14.7b). Until then
-            // the run claims no history, and the result blocks.
-            input: None,
+            input: claimed,
         },
         end,
-        reports: BTreeMap::new(),
-        trigger: false,
-        leaked: 0,
+        reports,
+        trigger,
+        leaked,
         actions: Actions::Complete,
     }
 }
@@ -823,8 +1124,8 @@ fn binding_refusal(
 /// The result file for `run_plan`'s tasks from their artifacts under
 /// `artifacts`, for the run `run` names at its subject, with the committed
 /// inputs and fuzz-target mapping read from `repo`. The directory's
-/// [`RUN_FILE`] must be `run`'s and the plan the one S's manifest gives. A node case's runs are read, and its provenance applied,
-/// but give no result until its `Draft` run exists.
+/// [`RUN_FILE`] must be `run`'s and the plan the one S's manifest gives.
+/// Each `Replays` is read from the task directory that records its run.
 pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBinding) -> ResultFile {
     let (subject, subject_source) = (run.subject.as_str(), run.subject_source.as_str());
     let plan = run_plan;
@@ -837,27 +1138,45 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             results,
         };
     }
+    let bound = |index: usize, task: &Task| {
+        read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
+            == Some(task_binding(index, task))
+    };
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
         // A directory the runner didn't write for this task gives it no
         // result, so it blocks.
-        if read_json::<serde_json::Value>(&dir.join(TASK_FILE)) != Some(task_binding(index, task)) {
+        if !bound(index, task) {
             continue;
         }
-        match task {
-            Task::Test { expected, .. } => results.push(ResultRecord {
-                expected: expected.clone(),
-                commit: subject.to_owned(),
-                actual: test_actual(&dir),
-            }),
-            Task::Case {
+        let actual = match task {
+            Task::Test { .. } => test_actual(&dir),
+            Task::History {
                 expected,
+                harness,
+                package,
+                file,
+                test,
+                case,
+                ..
+            } => Actual::Run(history_execution(
+                &dir,
+                history_of(expected)
+                    .expect("a history task's result names its history")
+                    .clone(),
+                harness,
+                (package, file, test, case),
+                subject_source,
+            )),
+            Task::Case {
                 property,
                 name,
                 harness,
-                input: CaseInput::Fuzz { input },
-                machine: true,
+                machine,
+                input,
                 patch,
+                draft,
+                companions,
                 ..
             } => {
                 let case = |run| RunId::Case {
@@ -865,41 +1184,21 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     name: name.clone(),
                     run,
                 };
+                let checks = CaseChecks {
+                    repo,
+                    dir: &dir,
+                    property,
+                    harness,
+                    input,
+                    subject_source,
+                };
                 // The planted runner runs a case's baseline and patched
                 // runs (C4), and xtask copies its traces here.
-                let mut baseline = execution(
-                    &dir.join("baseline"),
-                    case(CaseRun::Baseline),
-                    harness,
-                    RunBy::Planted,
-                );
-                let mut patched = execution(
-                    &dir.join("patched"),
-                    case(CaseRun::Patched),
-                    harness,
-                    RunBy::Planted,
-                );
+                let mut baseline = checks.planted(case(CaseRun::Baseline), "baseline", "holds");
+                let mut patched = checks.planted(case(CaseRun::Patched), "patched", "violated");
                 credit_sources(&dir, subject_source, &mut baseline, &mut patched);
                 if let Some(why) = patch_refusal(repo, patch, &dir) {
                     fail(&mut patched, why);
-                }
-                // Each trace must have run the case's committed input, and
-                // each witness file must judge the case's property with its
-                // run's expectation.
-                for (run, execution, expect) in [
-                    ("baseline", &mut baseline, "holds"),
-                    ("patched", &mut patched, "violated"),
-                ] {
-                    if let Some(why) = input_refusal(repo, input, &dir.join(run)) {
-                        fail(execution, why);
-                    }
-                    if !witness_judges(&dir.join(run), property, expect) {
-                        execution.trigger = false;
-                        fail(
-                            execution,
-                            format!("its witness file doesn't judge {property} expecting {expect}"),
-                        );
-                    }
                 }
                 // The runner's own verdict covers what the traces don't, its
                 // campaign, and item 9 runs `--targets` for a case with a
@@ -909,17 +1208,22 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 if let Some(why) = case_refusal(&dir, property, name, target.as_deref()) {
                     fail(&mut patched, why);
                 }
-                results.push(ResultRecord {
-                    expected: expected.clone(),
-                    commit: subject.to_owned(),
-                    actual: Actual::MachineCaught { baseline, patched },
-                });
+                match (machine, draft) {
+                    (true, _) => Actual::MachineCaught { baseline, patched },
+                    (false, Some(_)) => {
+                        let draft = checks.draft(case(CaseRun::Draft));
+                        let companions = companions_of(&dir, &draft, companions);
+                        Actual::Caught {
+                            baseline,
+                            patched,
+                            draft,
+                            companions,
+                        }
+                    }
+                    (false, None) => continue,
+                }
             }
-            // A node case's result needs its Draft run, and a typed
-            // machine case's needs C18's binding, so neither gives one yet.
-            Task::Case { .. } => {}
             Task::Integrity {
-                expected,
                 patch,
                 harness,
                 case,
@@ -939,44 +1243,216 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     test: test.clone(),
                     case: case.clone(),
                 };
-                results.push(ResultRecord {
-                    expected: expected.clone(),
-                    commit: subject.to_owned(),
-                    actual: Actual::IntegrityCaught {
-                        unpatched: integrity_execution(
-                            &dir.join("unpatched"),
-                            run(CaseRun::Unpatched),
-                            &input,
-                            harness,
-                            diagnostic,
-                            subject_source,
-                        ),
-                        patched: integrity_execution(
-                            &dir.join("patched"),
-                            run(CaseRun::Patched),
-                            &input,
-                            harness,
-                            diagnostic,
-                            subject_source,
-                        ),
-                        restored: integrity_execution(
-                            &dir.join("restored"),
-                            run(CaseRun::Restored),
-                            &input,
-                            harness,
-                            diagnostic,
-                            subject_source,
-                        ),
-                    },
-                });
+                let read = |name: &str, which| {
+                    integrity_execution(
+                        &dir.join(name),
+                        run(which),
+                        &input,
+                        harness,
+                        diagnostic,
+                        subject_source,
+                    )
+                };
+                Actual::IntegrityCaught {
+                    unpatched: read("unpatched", CaseRun::Unpatched),
+                    patched: read("patched", CaseRun::Patched),
+                    restored: read("restored", CaseRun::Restored),
+                }
             }
+        };
+        results.push(ResultRecord {
+            expected: task_expected(task).clone(),
+            commit: subject.to_owned(),
+            actual,
+        });
+    }
+    // Each replay comes from the recorded run's own directory, by whoever
+    // ran that run: the planted runner replays its own (C4).
+    let mut seen = BTreeSet::new();
+    for result in &Manifest::committed().expected {
+        let (Expected::Replays { run: replayed }, Some(id)) =
+            (&result.expected, result.expected.id())
+        else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
         }
+        let Some((index, role)) = recorded_at(&plan.tasks, replayed) else {
+            continue;
+        };
+        if !bound(index, &plan.tasks[index]) {
+            continue;
+        }
+        let run_by = match role {
+            "baseline" | "patched" => RunBy::Planted,
+            _ => RunBy::Tool,
+        };
+        results.push(ResultRecord {
+            expected: id,
+            commit: subject.to_owned(),
+            actual: replay_actual(
+                &artifacts.join(index.to_string()).join(role),
+                replayed.clone(),
+                run_by,
+            ),
+        });
     }
     ResultFile {
         subject: subject.to_owned(),
         subject_source: subject_source.to_owned(),
         results,
     }
+}
+
+/// The expected result `task` produces.
+fn task_expected(task: &Task) -> &ExpectedId {
+    match task {
+        Task::Test { expected, .. }
+        | Task::History { expected, .. }
+        | Task::Case { expected, .. }
+        | Task::Integrity { expected, .. } => expected,
+    }
+}
+
+/// What a planted case's runs are checked against.
+struct CaseChecks<'a> {
+    /// The repository at S.
+    repo: &'a Path,
+    /// The case task's directory.
+    dir: &'a Path,
+    /// The case's property directory.
+    property: &'a str,
+    /// The harness its input runs on.
+    harness: &'a str,
+    /// Its committed input.
+    input: &'a CaseInput,
+    /// S's source digest.
+    subject_source: &'a str,
+}
+
+impl CaseChecks<'_> {
+    /// The planted runner's run `name` of the case, as `run`: it must have
+    /// run the case's committed input (C18), and its witness file must judge
+    /// the case's property expecting `expect`.
+    fn planted(&self, run: RunId, name: &str, expect: &str) -> Execution {
+        let dir = self.dir.join(name);
+        let mut execution = execution(&dir, run, self.harness, RunBy::Planted);
+        if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
+            fail(&mut execution, why);
+        }
+        if !witness_judges(&dir, self.property, expect) {
+            execution.trigger = false;
+            fail(
+                &mut execution,
+                format!(
+                    "its witness file doesn't judge {} expecting {expect}",
+                    self.property
+                ),
+            );
+        }
+        execution
+    }
+
+    /// The case's `Draft` run, as `run`, which the tool records itself with
+    /// the case's rebuilt binary (C9): it must have run the committed input,
+    /// from the binary the provenance check measured, which must have
+    /// passed. Its override is read from its meta, and the evaluator checks
+    /// it's the case's set.
+    fn draft(&self, run: RunId) -> Execution {
+        let dir = self.dir.join("draft");
+        let mut execution = execution(&dir, run, self.harness, RunBy::Tool);
+        if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
+            fail(&mut execution, why);
+        }
+        let measured = read_json::<ProvenanceCheck>(&self.dir.join(PROVENANCE_FILE));
+        if let Some(why) = provenance_refusal(self.dir) {
+            fail(&mut execution, why);
+        } else if trace_source(&dir).is_none()
+            || measured.map(|check| check.source) != trace_source(&dir)
+            || trace_source(&dir).as_deref() == Some(self.subject_source)
+        {
+            fail(
+                &mut execution,
+                "its trace's build source isn't the measured patched checkout's".to_owned(),
+            );
+        }
+        execution
+    }
+}
+
+/// The companions judged on `draft`, the case's `Draft` run in `dir`, from
+/// its [`COMPANIONS_FILE`]. They count only from the case's own build, the
+/// source its provenance check measured, so a file from any other build
+/// shows none, and each names the trace it judged, which the evaluator
+/// requires to be `draft`'s. A case with no declared companions reads
+/// none.
+fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Companion> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let measured = read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE));
+    let Some(run) = read_json::<CompanionsRun>(&dir.join("draft").join(COMPANIONS_FILE)) else {
+        return Vec::new();
+    };
+    if !known(Some(&run.source)) || measured.map(|check| check.source) != Some(run.source.clone()) {
+        return Vec::new();
+    }
+    run.companions
+        .into_iter()
+        .map(|verdict| Companion {
+            name: verdict.name,
+            trace: run.trace.clone(),
+            run: draft.run.clone(),
+            held: verdict.held,
+        })
+        .collect()
+}
+
+/// A history task's run, `run`, in `dir`: its witness test (`test`, as
+/// package, file, name and case) must have passed at S from a binary
+/// embedding S, and declared the history once ([`declaration`]); then
+/// `dir/run`, S's recording of that declaration, must bind to it (C18) and
+/// come from S's build.
+fn history_execution(
+    dir: &Path,
+    run: RunId,
+    harness: &str,
+    test: (&str, &str, &str, &str),
+    subject_source: &str,
+) -> Execution {
+    let (package, file, name, case) = test;
+    let recording = dir.join("run");
+    let mut execution = execution(&recording, run, harness, RunBy::Tool);
+    let passed = read_json::<TestRun>(&dir.join(TEST_FILE)).is_some_and(|ran| {
+        ran.package == package
+            && ran.file == file
+            && !ran.killed
+            && ran.exited_ok
+            && ran.binary_source.as_deref() == Some(subject_source)
+            && ran.tests == [(name.to_owned(), "ok".to_owned())]
+    });
+    if !passed {
+        fail(
+            &mut execution,
+            format!("its witness test {package}/{file}::{name} didn't pass at S"),
+        );
+    }
+    match declaration(&dir.join("declared"), harness, name, case) {
+        Ok(at) => {
+            if let Some(why) = declared_refusal(harness, &at, &recording) {
+                fail(&mut execution, why);
+            }
+        }
+        Err(why) => fail(&mut execution, why),
+    }
+    if trace_source(&recording).as_deref() != Some(subject_source) {
+        fail(
+            &mut execution,
+            "its trace's build source isn't the subject's".to_owned(),
+        );
+    }
+    execution
 }
 
 /// Fails each of a case's runs whose trace doesn't come from the binary
@@ -1093,7 +1569,7 @@ fn patch_refusal(repo: &Path, patch: &str, dir: &Path) -> Option<String> {
     }
 }
 
-/// Why the trace in `dir` didn't run the committed input at `input` (a
+/// Why the trace in `dir` didn't run the committed fuzz input at `input` (a
 /// path under `repo`): its meta's `input` names another SHA-256 or length,
 /// or either can't be read.
 fn input_refusal(repo: &Path, input: &str, dir: &Path) -> Option<String> {
@@ -1114,6 +1590,140 @@ fn input_refusal(repo: &Path, input: &str, dir: &Path) -> Option<String> {
             && input.get("len").and_then(Value::as_u64) == u64::try_from(bytes.len()).ok()
     });
     (!matches).then(|| format!("its trace ran {recorded:?}, not the committed input {input}"))
+}
+
+/// A typed Plan file's reference as `meta.plan` names it: Plan bytes by
+/// their own digest, a script by the Plan it parses to ([`PlanRef::script`]),
+/// so a committed script binds however it's formatted.
+fn plan_ref(path: &Path, script: bool) -> Result<PlanRef, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if script {
+        let plan: crate::Plan = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{} isn't a Plan: {error}", path.display()))?;
+        Ok(PlanRef::script(&plan))
+    } else {
+        Ok(PlanRef::bytes(&bytes))
+    }
+}
+
+/// Why the trace in `dir` isn't a run of `scenario_file`'s scenario under
+/// the Plan in `plan_file` (C18): its harness isn't `harness`, its meta's
+/// scenario isn't the one `harness` describes the file's scenario with, it
+/// names a fuzz input, or its `meta.plan` isn't the file's Plan, bytes or
+/// script as `script` says. Any file that can't be read refuses it too.
+fn typed_refusal(
+    harness: &str,
+    scenario_file: &Path,
+    plan_file: &Path,
+    script: bool,
+    dir: &Path,
+) -> Option<String> {
+    let check = || -> Result<(), String> {
+        let trace = crate::trace::TraceReader::open(dir)
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
+        if trace.meta.sim != harness {
+            return Err(format!("its trace ran {}, not {harness}", trace.meta.sim));
+        }
+        let text = fs::read_to_string(scenario_file)
+            .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+        let scenario: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+        let entry = crate::harness::find(harness).map_err(|error| error.to_string())?;
+        let described = (entry.meta)(&scenario).map_err(|error| error.to_string())?;
+        if described.scenario != trace.meta.scenario {
+            return Err(format!(
+                "its trace's scenario isn't {}'s",
+                scenario_file.display()
+            ));
+        }
+        if trace.meta.input.is_some() {
+            return Err("its trace names a fuzz input, not a typed Plan".to_owned());
+        }
+        let committed = plan_ref(plan_file, script)?;
+        if trace.meta.plan.as_ref() != Some(&committed) {
+            return Err(format!(
+                "its trace ran the Plan {:?}, not {}'s {committed:?}",
+                trace.meta.plan,
+                plan_file.display()
+            ));
+        }
+        Ok(())
+    };
+    check().err()
+}
+
+/// Why the trace in `dir` didn't run `input`, the case's committed input
+/// under `repo` on `harness`: its fuzz input by digest, or its typed
+/// scenario and Plan bytes or script (C18).
+fn case_input_refusal(repo: &Path, harness: &str, input: &CaseInput, dir: &Path) -> Option<String> {
+    match input {
+        CaseInput::Fuzz { input } => input_refusal(repo, input, dir),
+        CaseInput::Typed { scenario, plan } => {
+            typed_refusal(harness, &repo.join(scenario), &repo.join(plan), false, dir)
+        }
+        CaseInput::Scripted { scenario, script } => {
+            typed_refusal(harness, &repo.join(scenario), &repo.join(script), true, dir)
+        }
+    }
+}
+
+/// The one declaration under `declared_dir` of `harness`'s history `case`
+/// by `test` ([`super::history`]), or why there isn't exactly one. A
+/// declaration by another test, or of the case on another harness, isn't
+/// it.
+fn declaration(
+    declared_dir: &Path,
+    harness: &str,
+    test: &str,
+    case: &str,
+) -> Result<std::path::PathBuf, String> {
+    let all = declared(declared_dir);
+    let named: Vec<&(std::path::PathBuf, DeclaredHistory)> = all
+        .iter()
+        .filter(|(_, history)| history.case == case)
+        .collect();
+    match named.as_slice() {
+        [(dir, history)] if history.harness == harness && libtest_names(&history.test, test) => {
+            Ok(dir.clone())
+        }
+        [(_, history)] => Err(format!(
+            "its witness test declared {case} as {}'s on {}, not {test}'s on {harness}",
+            history.test, history.harness
+        )),
+        [] => Err(format!(
+            "its witness test declared no history named {case} among {} declarations",
+            all.len()
+        )),
+        _ => Err(format!(
+            "its witness test declared {case} {} times",
+            named.len()
+        )),
+    }
+}
+
+/// Whether libtest's thread name `thread` names the test `test`: the test
+/// itself, or a path ending in it within its file's crate.
+fn libtest_names(thread: &str, test: &str) -> bool {
+    thread == test || thread.ends_with(&format!("::{test}"))
+}
+
+/// Why the trace in `dir` isn't the declaration in `declaration` recorded
+/// on `harness`: its scenario and its Plan bytes or script, by digest
+/// (C18).
+fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
+    let (plan, script) = (declaration.join(PLAN_FILE), declaration.join(SCRIPT_FILE));
+    let (file, script) = match (plan.exists(), script.exists()) {
+        (true, false) => (plan, false),
+        (false, true) => (script, true),
+        _ => return Some("its declaration names neither or both Plan forms".to_owned()),
+    };
+    typed_refusal(
+        harness,
+        &declaration.join(SCENARIO_FILE),
+        &file,
+        script,
+        dir,
+    )
 }
 
 /// Whether `dir`'s `witness.json` judges `property` expecting `expect`
@@ -1284,6 +1894,65 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
         histories: &super::rows::history_targets(),
         machine: super::rows::is_machine,
     })
+}
+
+/// Which history a run of [`a_a_and_a_b_a`] records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Which {
+    /// The history under comparison.
+    A,
+    /// A different history, run between two of A's.
+    B,
+}
+
+/// Gate 1's A/A and A/B/A comparison, in this one process: `record` writes
+/// history A's run into a fresh directory, then A again, then a distinct
+/// history B, then A once more, each a recorded run under `root`. A's
+/// three runs must have the same trace and the same full report, every
+/// outcome and violation and the stores' snapshot (C8), so neither a rerun
+/// nor anything B leaves behind changes it. B must be another execution,
+/// with a trace of its own. A run that can't be
+/// read, such as one with no full report, is a missing comparison.
+pub fn a_a_and_a_b_a(
+    root: &Path,
+    record: &mut dyn FnMut(Which, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut read = |which: Which, name: &str| -> Result<(Trace, FullReport), String> {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        record(which, &dir).map_err(|why| format!("{name}: {why}"))?;
+        recorded(&dir).map_err(|why| format!("{name} is a missing comparison: {why}"))
+    };
+    let first = read(Which::A, "a")?;
+    let again = read(Which::A, "a-again")?;
+    let other = read(Which::B, "b")?;
+    let after = read(Which::A, "a-after-b")?;
+    let same = |(trace, report): &(Trace, FullReport)| (trace.id == first.0.id, *report == first.1);
+    match same(&again) {
+        (true, true) => {}
+        (trace, report) => {
+            return Err(format!(
+                "A's second run differs: same trace {trace}, same full report {report}"
+            ))
+        }
+    }
+    // A trace holds every pick, draw and observation digest, so another
+    // execution has another trace.
+    if other.0.id == first.0.id {
+        return Err("B resolves to A's execution".to_owned());
+    }
+    match same(&after) {
+        (true, true) => Ok(()),
+        (trace, report) => Err(format!(
+            "A's run after B differs: same trace {trace}, same full report {report}"
+        )),
+    }
+}
+
+/// The fresh replay of the recorded run `run` in `dir`, by `run_by`, as
+/// [`assemble`] reads a `Replays` result from the runner's artifacts.
+pub fn read_replay(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
+    replay_actual(dir, run, run_by)
 }
 
 /// Where one obligation's evidence is.
@@ -1470,12 +2139,34 @@ fn links(
                     ..Links::default()
                 },
             ),
+            Task::History {
+                expected,
+                harness,
+                property,
+                ..
+            } => (
+                expected.clone(),
+                Links {
+                    harness: Some(harness.clone()),
+                    history: history_of(expected).cloned(),
+                    trigger: Some(property.clone()),
+                    result: Some(expected.clone()),
+                    artifacts: vec![
+                        format!("{index}/{TEST_FILE}"),
+                        format!("{index}/declared"),
+                        format!("{index}/run/trace.jsonl"),
+                        format!("{index}/run/{FULL_REPORT_FILE}"),
+                        format!("{index}/run/witness.json"),
+                    ],
+                    ..Links::default()
+                },
+            ),
             Task::Case {
                 expected,
                 property,
                 harness,
                 input,
-                machine,
+                draft,
                 ..
             } => (
                 expected.clone(),
@@ -1484,20 +2175,29 @@ fn links(
                     input: Some(input.input().to_owned()),
                     plan: input.plan().map(str::to_owned),
                     trigger: Some(property.clone()),
-                    // A node case's result needs its Draft run, and a typed
-                    // case's C18's binding, so the tool writes none, but
-                    // its runs stay linked.
-                    result: (*machine && matches!(input, CaseInput::Fuzz { .. }))
-                        .then(|| expected.clone()),
-                    artifacts: vec![
-                        format!("{index}/baseline/trace.jsonl"),
-                        format!("{index}/baseline/witness.json"),
-                        format!("{index}/patched/trace.jsonl"),
-                        format!("{index}/patched/witness.json"),
-                        format!("{index}/{PROVENANCE_FILE}"),
-                        format!("{index}/{VERDICT_FILE}"),
-                        format!("{index}/{TARGET_FILE}"),
-                    ],
+                    result: Some(expected.clone()),
+                    artifacts: {
+                        let mut artifacts = Vec::new();
+                        for run in ["baseline", "patched"]
+                            .into_iter()
+                            .chain(draft.as_ref().map(|_| "draft"))
+                        {
+                            artifacts.push(format!("{index}/{run}/trace.jsonl"));
+                            artifacts.push(format!("{index}/{run}/{FULL_REPORT_FILE}"));
+                            if run != "draft" {
+                                artifacts.push(format!("{index}/{run}/witness.json"));
+                            }
+                        }
+                        if draft.is_some() {
+                            artifacts.push(format!("{index}/draft/{COMPANIONS_FILE}"));
+                        }
+                        artifacts.extend([
+                            format!("{index}/{PROVENANCE_FILE}"),
+                            format!("{index}/{VERDICT_FILE}"),
+                            format!("{index}/{TARGET_FILE}"),
+                        ]);
+                        artifacts
+                    },
                     ..Links::default()
                 },
             ),
@@ -1523,7 +2223,14 @@ fn links(
                     result: Some(expected.clone()),
                     artifacts: ["unpatched", "patched", "restored"]
                         .iter()
-                        .map(|run| format!("{index}/{run}/{TEST_FILE}"))
+                        .flat_map(|run| {
+                            [
+                                format!("{index}/{run}/{TEST_FILE}"),
+                                format!("{index}/{run}/declared"),
+                                format!("{index}/{run}/history/trace.jsonl"),
+                                format!("{index}/{run}/history/{FULL_REPORT_FILE}"),
+                            ]
+                        })
                         .collect(),
                     ..Links::default()
                 },
@@ -1531,36 +2238,15 @@ fn links(
         };
         by_id.insert(id, links);
     }
-    // A history or replay the tool can't produce yet still links what it's
-    // of: a history's harness and identity, and a planted run's replay the
-    // trace its case task copied.
-    let cases: BTreeMap<(&str, &str), (usize, &Task)> = plan
-        .tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, task)| match task {
-            Task::Case { property, name, .. } if bound(index, task) => {
-                Some(((property.as_str(), name.as_str()), (index, task)))
-            }
-            _ => None,
-        })
-        .collect();
+    // A replay links the recorded run it replayed and its fresh replay, in
+    // the task that records that run, and a replay of a run no task records
+    // links what it's of.
     for result in &manifest.expected {
-        let Some(id) = result.expected.id() else {
+        let (Expected::Replays { run }, Some(id)) = (&result.expected, result.expected.id()) else {
             continue;
         };
-        let fallback = match &result.expected {
-            Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. } => {
-                Links {
-                    harness: Some(history.harness.to_owned()),
-                    history: Some(RunId::from(*history)),
-                    ..Links::default()
-                }
-            }
-            Expected::Replays { run } => replay_links(run, &cases),
-            _ => continue,
-        };
-        by_id.entry(id).or_insert(fallback);
+        let links = replay_links(run, &plan.tasks, &bound);
+        by_id.entry(id).or_insert(links);
     }
     let mut links = BTreeMap::new();
     for result in &manifest.expected {
@@ -1576,53 +2262,49 @@ fn links(
     links
 }
 
-/// What a replay of `run` links before the tool replays anything: a
-/// history's harness and identity, or a planted run's harness, input and
-/// trace, as its case's task (`cases`, by property and name) planned and
-/// copied it. A `Draft` run has no trace yet.
-fn replay_links(run: &RunId, cases: &BTreeMap<(&str, &str), (usize, &Task)>) -> Links {
-    match run {
-        RunId::History { harness, .. } => Links {
-            harness: Some(harness.clone()),
+/// What a replay of `run` links: the recorded run in the task of `tasks`
+/// that records it, if that task's directory is `bound` to it, with the
+/// replay's own artifacts, and its case's or history's harness, input and
+/// trigger. A run no bound task records links only its identity.
+fn replay_links(run: &RunId, tasks: &[Task], bound: &impl Fn(usize, &Task) -> bool) -> Links {
+    let Some((index, dir)) =
+        recorded_at(tasks, run).filter(|(index, _)| bound(*index, &tasks[*index]))
+    else {
+        return Links {
             history: Some(run.clone()),
             ..Links::default()
-        },
-        RunId::Case {
+        };
+    };
+    let (harness, input, plan, trigger) = match &tasks[index] {
+        Task::Case {
+            harness,
+            input,
             property,
-            name,
-            run: role,
-        } => {
-            let Some((index, Task::Case { harness, input, .. })) =
-                cases.get(&(property.as_str(), name.as_str()))
-            else {
-                return Links {
-                    history: Some(run.clone()),
-                    trigger: Some(property.clone()),
-                    ..Links::default()
-                };
-            };
-            let dir = match role {
-                CaseRun::Baseline => Some("baseline"),
-                CaseRun::Patched => Some("patched"),
-                _ => None,
-            };
-            Links {
-                harness: Some(harness.clone()),
-                input: Some(input.input().to_owned()),
-                plan: input.plan().map(str::to_owned),
-                history: Some(run.clone()),
-                trigger: Some(property.clone()),
-                artifacts: dir
-                    .map(|dir| {
-                        vec![
-                            format!("{index}/{dir}/trace.jsonl"),
-                            format!("{index}/{dir}/witness.json"),
-                        ]
-                    })
-                    .unwrap_or_default(),
-                ..Links::default()
-            }
-        }
+            ..
+        } => (
+            harness.clone(),
+            Some(input.input().to_owned()),
+            input.plan().map(str::to_owned),
+            property.clone(),
+        ),
+        Task::History {
+            harness, property, ..
+        } => (harness.clone(), None, None, property.clone()),
+        _ => unreachable!("only a case or history task records a run"),
+    };
+    Links {
+        harness: Some(harness),
+        input,
+        plan,
+        history: Some(run.clone()),
+        trigger: Some(trigger),
+        result: Some(ExpectedId::Replays(run.clone())),
+        artifacts: vec![
+            format!("{index}/{dir}/trace.jsonl"),
+            format!("{index}/{dir}/{FULL_REPORT_FILE}"),
+            format!("{index}/{dir}/{REPLAY_DIR}/{REPLAY_FILE}"),
+            format!("{index}/{dir}/{REPLAY_DIR}/{FULL_REPORT_FILE}"),
+        ],
     }
 }
 
@@ -1929,6 +2611,212 @@ mod tests {
         assert_eq!(run.trace, "missing");
     }
 
+    /// An execution's reports come from its full report (C8), which must
+    /// agree with the trace's `end` record on every outcome: a missing
+    /// report, or one whose outcome differs, is a run that didn't happen.
+    /// Its `Draft` override is the trace's `meta.draft` (C9).
+    #[test]
+    fn an_execution_s_reports_come_from_its_full_report() {
+        let dir = recorded();
+        let path = dir.path().join(FULL_REPORT_FILE);
+        let mut report = full_report(dir.path()).expect("record wrote it");
+        let run = execution(dir.path(), history_run(), MACHINE, RunBy::Tool);
+        assert_eq!(run.end, End::Completed, "{run:?}");
+        assert_eq!(run.meta.draft_override, Vec::<String>::new());
+        report.properties[0].outcome = PropertyOutcome::Violated { witness: vec![1] };
+        fs::write(&path, report.to_line()).expect("the temp dir is writable");
+        let run = execution(dir.path(), history_run(), MACHINE, RunBy::Tool);
+        assert!(matches!(run.end, End::Failed { .. }), "{:?}", run.end);
+        fs::remove_file(&path).expect("it exists");
+        let run = execution(dir.path(), history_run(), MACHINE, RunBy::Tool);
+        assert!(matches!(run.end, End::Failed { .. }), "{:?}", run.end);
+        let dir = recorded();
+        rewrite(dir.path(), |lines| {
+            lines[0]["meta"]["draft"] = serde_json::json!(["header/reactor-policy"]);
+        });
+        let run = execution(dir.path(), history_run(), MACHINE, RunBy::Tool);
+        assert_eq!(run.meta.draft_override, ["header/reactor-policy"]);
+    }
+
+    /// Writes `dir`'s fresh replay as the runner does: the replay's own full
+    /// report from an in-process replay of the trace, and its child's end
+    /// with `log`.
+    fn replay_into(dir: &Path, exited_ok: bool, log: &str) {
+        let trace = crate::trace::TraceReader::open(dir).expect("the trace reads");
+        let replayed = crate::trace::replay(&trace, crate::trace::ReplayOptions::default())
+            .expect("the trace replays");
+        let replay = dir.join(REPLAY_DIR);
+        fs::create_dir_all(&replay).expect("the temp dir is writable");
+        fs::write(
+            replay.join(FULL_REPORT_FILE),
+            replayed
+                .report
+                .expect("a replay sends its report")
+                .to_line(),
+        )
+        .expect("the temp dir is writable");
+        let ran = ReplayRun {
+            exited_ok,
+            killed: false,
+            log: log.to_owned(),
+        };
+        fs::write(
+            replay.join(REPLAY_FILE),
+            serde_json::to_string(&ran).expect("it serializes"),
+        )
+        .expect("the temp dir is writable");
+    }
+
+    /// A replay is exact only when its child exited 0 naming this trace with
+    /// every record matched, and its reports and store snapshot are equal
+    /// only when its full report's outcomes and violations, and its
+    /// snapshot, are the recording's. A changed stored fact with every
+    /// report the same is unequal stores. No replay file is no fresh
+    /// replay.
+    #[test]
+    fn a_replay_is_read_from_its_own_artifacts() {
+        let dir = recorded();
+        let of = digest(&dir.path().join("trace.jsonl"));
+        let matched = format!(
+            "replayed trace {of}: idle after 3 steps; every pick, draw and observation matched"
+        );
+        replay_into(dir.path(), true, &matched);
+        let read = |dir: &Path| match replay_actual(dir, history_run(), RunBy::Tool) {
+            Actual::Replay {
+                exact,
+                reports_equal,
+                stores_equal,
+                fresh,
+                of: replayed,
+                meta,
+                ..
+            } => {
+                assert_eq!(replayed, of);
+                assert_eq!(meta.harness, MACHINE);
+                (exact, reports_equal, stores_equal, fresh)
+            }
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(read(dir.path()), (true, true, true, true));
+        // A child that failed, or named another trace.
+        for (ok, log) in [
+            (false, matched.clone()),
+            (true, matched.replace(&of, &"0".repeat(64))),
+            (true, String::new()),
+        ] {
+            let dir = recorded();
+            replay_into(dir.path(), ok, &log);
+            assert!(!read(dir.path()).0, "{log}");
+        }
+        // One stored fact changed in the replay's report, every outcome and
+        // violation the same: only the stores differ.
+        let replayed = dir.path().join(REPLAY_DIR).join(FULL_REPORT_FILE);
+        let mut report: FullReport =
+            serde_json::from_str(&fs::read_to_string(&replayed).expect("it exists"))
+                .expect("it reads");
+        report.snapshot = Some(serde_json::json!([{"store": "a", "snapshot": [1]}]));
+        fs::write(&replayed, report.to_line()).expect("the temp dir is writable");
+        assert_eq!(read(dir.path()), (true, true, false, true));
+        let dir = recorded();
+        assert_eq!(read(dir.path()), (false, false, false, false));
+    }
+
+    /// A typed case's trace binds to its committed scenario and Plan (C18):
+    /// Plan bytes by their digest, a script by the Plan it parses to however
+    /// it's formatted. Another scenario, other Plan bytes, another script,
+    /// the other Plan form or another harness each refuse it.
+    #[test]
+    fn a_typed_trace_binds_to_its_scenario_and_plan() {
+        let input = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/header-reactor-policy.bin"),
+        )
+        .expect("the committed input is readable");
+        let entry = crate::harness::find(MACHINE).expect("the machine harness is registered");
+        let split = entry.scenario_bytes.min(input.len());
+        let (scenario, plan) = (entry.scenario(&input), input[split..].to_vec());
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        let put = |name: &str, bytes: &[u8]| {
+            fs::write(repo.path().join(name), bytes).expect("the temp dir is writable")
+        };
+        put("scenario.json", scenario.to_string().as_bytes());
+        put("plan.bin", &plan);
+        let script = crate::Plan::default();
+        put(
+            "script.json",
+            serde_json::to_string_pretty(&script)
+                .expect("it serializes")
+                .as_bytes(),
+        );
+        let typed = CaseInput::Typed {
+            scenario: "scenario.json".into(),
+            plan: "plan.bin".into(),
+        };
+        let scripted = CaseInput::Scripted {
+            scenario: "scenario.json".into(),
+            script: "script.json".into(),
+        };
+        let bytes_run = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::record(
+            entry,
+            crate::harness::RecordInput::Plan {
+                scenario: &scenario,
+                plan: &plan,
+            },
+            bytes_run.path(),
+        )
+        .expect("the Plan bytes record");
+        let script_run = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::record(
+            entry,
+            crate::harness::RecordInput::Script {
+                scenario: &scenario,
+                plan: &script,
+                derived_from: None,
+            },
+            script_run.path(),
+        )
+        .expect("the script records");
+        let refused =
+            |input: &CaseInput, dir: &Path| case_input_refusal(repo.path(), MACHINE, input, dir);
+        assert_eq!(refused(&typed, bytes_run.path()), None);
+        assert_eq!(refused(&scripted, script_run.path()), None);
+        assert!(refused(&typed, script_run.path()).is_some());
+        assert!(refused(&scripted, bytes_run.path()).is_some());
+        assert!(case_input_refusal(
+            repo.path(),
+            "header/publisher-policy",
+            &typed,
+            bytes_run.path()
+        )
+        .is_some());
+        let mut other = plan.clone();
+        other.push(0);
+        put("plan.bin", &other);
+        assert!(refused(&typed, bytes_run.path()).is_some());
+        put("plan.bin", &plan);
+        // Another valid scenario of the harness, from another prefix.
+        let changed = (0..=u8::MAX)
+            .map(|byte| {
+                let mut other = input.clone();
+                other.iter_mut().take(split).for_each(|b| *b ^= byte);
+                entry.scenario(&other)
+            })
+            .find(|other| *other != scenario)
+            .expect("another prefix decodes another scenario");
+        put("scenario.json", changed.to_string().as_bytes());
+        assert!(refused(&typed, bytes_run.path()).is_some());
+        put("scenario.json", scenario.to_string().as_bytes());
+        put(
+            "script.json",
+            serde_json::to_string(&crate::Plan {
+                choices: vec![crate::PlanChoice::Pick("x".into())],
+            })
+            .expect("it serializes")
+            .as_bytes(),
+        );
+        assert!(refused(&scripted, script_run.path()).is_some());
+    }
+
     /// A case's baseline must be built from the subject's source, and its
     /// patched run from the source its provenance check measured, which
     /// must have passed. Each one-field change fails only its own run, and
@@ -2153,9 +3041,8 @@ mod tests {
         assert!(!witness_judges(dir.path(), MACHINE, "violated"));
     }
 
-    /// A typed planted case plans beside a fuzz-input one: both get tasks,
-    /// the typed one's result is listed unsupported until C18 binds its
-    /// scenario and Plan, and its links name both. A typed case's Plan is
+    /// A typed planted case plans beside a fuzz-input one: each gets a task
+    /// and a result, and its links name its scenario and Plan. A typed case's Plan is
     /// its bytes or its script. A case naming both forms, or neither, is
     /// refused, and so is a typed case naming both Plans.
     #[test]
@@ -2221,21 +3108,18 @@ mod tests {
                 },
             ]
         );
-        for typed in ["typed", "scripted"] {
-            let typed_id = caught(typed).expected.id();
+        // C18 binds a typed case's trace to its scenario and Plan, so
+        // every case gives a result.
+        for name in ["fuzz", "typed", "scripted"] {
+            let id = caught(name).expected.id();
             assert!(
-                planned
+                !planned
                     .unsupported
                     .iter()
-                    .any(|(id, _)| Some(id) == typed_id.as_ref()),
-                "{typed}"
+                    .any(|(unsupported, _)| Some(unsupported) == id.as_ref()),
+                "{name}"
             );
         }
-        let fuzz_id = caught("fuzz").expected.id();
-        assert!(!planned
-            .unsupported
-            .iter()
-            .any(|(id, _)| Some(id) == fuzz_id.as_ref()));
         for refused in ["both", "both-plans"] {
             let both = Manifest {
                 expected: vec![caught(refused)],
@@ -2602,23 +3486,18 @@ mod tests {
         assert_eq!(planted_cases(repo.path()), kept);
     }
 
-    /// Every task's keys link its evidence: a node case, whose result the
-    /// tool can't produce yet, keeps its runs' links with no result, and an
-    /// integrity mutation links the history it ran.
+    /// Every task's keys link its evidence and its result: a node case its
+    /// `Draft` run and companions, a history its declarations and
+    /// recording, and an integrity mutation the history it ran.
     #[test]
     fn every_task_links_its_evidence() {
         let manifest = Manifest::committed();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let plan = plan(&manifest, &repo).expect("the committed manifest plans");
         let links = links(&manifest, &plan, |_, _| true);
-        let mut node = false;
-        let mut integrity = false;
+        let (mut node, mut history, mut integrity) = (false, false, false);
         for (index, task) in plan.tasks.iter().enumerate() {
-            let expected = match task {
-                Task::Test { expected, .. }
-                | Task::Case { expected, .. }
-                | Task::Integrity { expected, .. } => expected,
-            };
+            let expected = task_expected(task);
             let key = manifest
                 .expected
                 .iter()
@@ -2633,28 +3512,40 @@ mod tests {
                     .all(|artifact| artifact.starts_with(&format!("{index}/"))),
                 "{found:?}"
             );
+            assert_eq!(found.result.as_ref(), Some(expected));
             match task {
                 Task::Case { machine: false, .. } => {
                     node = true;
-                    assert_eq!(found.result, None);
+                    for artifact in [
+                        "patched/trace.jsonl",
+                        "patched/witness.json",
+                        "draft/trace.jsonl",
+                        "draft/full-report.json",
+                        "draft/companions.json",
+                    ] {
+                        assert!(
+                            found.artifacts.contains(&format!("{index}/{artifact}")),
+                            "{artifact}: {found:?}"
+                        );
+                    }
+                }
+                Task::History { .. } => {
+                    history = true;
+                    assert!(matches!(found.history, Some(RunId::History { .. })));
                     assert!(found
                         .artifacts
-                        .contains(&format!("{index}/patched/trace.jsonl")));
-                    assert!(found
-                        .artifacts
-                        .contains(&format!("{index}/patched/witness.json")));
+                        .contains(&format!("{index}/run/trace.jsonl")));
                 }
                 Task::Integrity { .. } => {
                     integrity = true;
                     assert!(matches!(found.history, Some(RunId::History { .. })));
-                    assert_eq!(found.result.as_ref(), Some(expected));
                 }
-                _ => assert_eq!(found.result.as_ref(), Some(expected)),
+                _ => {}
             }
         }
         assert!(
-            node && integrity,
-            "the plan has a node case and an integrity mutation"
+            node && history && integrity,
+            "the plan has a node case, a history and an integrity mutation"
         );
     }
 
@@ -2709,19 +3600,100 @@ mod tests {
         assert!(outcomes(test_actual(empty.path())).is_empty());
     }
 
+    /// A storage history the integrity fixtures declare and record: the
+    /// committed close-and-relink seed's scenario and Plan bytes.
+    fn storage_history() -> (Value, Vec<u8>) {
+        let input = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/header-storage-close-relink.bin"),
+        )
+        .expect("the committed seed is readable");
+        let entry = crate::harness::find(NODE).expect("the storage harness is registered");
+        let split = entry.scenario_bytes.min(input.len());
+        (entry.scenario(&input), input[split..].to_vec())
+    }
+
+    /// [`storage_history`] recorded once, by this build.
+    fn storage_recording() -> &'static Path {
+        static RECORDED: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        RECORDED
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().expect("a temp dir can be created");
+                let (scenario, plan) = storage_history();
+                crate::harness::record(
+                    crate::harness::find(NODE).expect("the storage harness is registered"),
+                    crate::harness::RecordInput::Plan {
+                        scenario: &scenario,
+                        plan: &plan,
+                    },
+                    dir.path(),
+                )
+                .expect("the storage history records");
+                dir
+            })
+            .path()
+    }
+
+    /// Writes into `dir` what the runner leaves for an integrity run whose
+    /// test `test` declared [`storage_history`] as `case`: the declaration,
+    /// and that history recorded by the build with source `source`, ending
+    /// in the harness failure `failure` when one is given.
+    fn declare_and_record(dir: &Path, test: &str, case: &str, source: &str, failure: Option<&str>) {
+        let (scenario, plan) = storage_history();
+        let declared = dir.join("declared");
+        super::super::history::declare_into(
+            &declared,
+            NODE,
+            case,
+            &scenario,
+            &crate::PlanInput::Bytes(plan),
+        )
+        .expect("the declaration writes");
+        let identity = declared.join("0").join(super::super::history::HISTORY_FILE);
+        let mut history: DeclaredHistory =
+            serde_json::from_str(&fs::read_to_string(&identity).expect("it was written"))
+                .expect("it reads back");
+        history.test = format!("a::path::{test}");
+        fs::write(
+            &identity,
+            serde_json::to_string(&history).expect("it serializes"),
+        )
+        .expect("the temp dir is writable");
+        let recording = dir.join("history");
+        fs::create_dir_all(&recording).expect("the temp dir is writable");
+        for file in ["trace.jsonl", FULL_REPORT_FILE] {
+            fs::copy(storage_recording().join(file), recording.join(file))
+                .expect("the recording is copied");
+        }
+        rewrite(&recording, |lines| {
+            lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
+            if let Some(failure) = failure {
+                let end = &mut lines.last_mut().expect("the trace has an end")["end"];
+                end["outcome"] = Value::String("harness".to_owned());
+                end["harness"] = Value::String(failure.to_owned());
+            }
+        });
+    }
+
     /// Each integrity run's end is read from its test artifact: passing
     /// with a clean exit is completed, failing with the witness's own report
     /// of the diagnostic is that harness failure, and anything else didn't
     /// happen. An artifact one field off the history's test, in its package,
     /// file or name, isn't that run, and its binary must embed the checkout
     /// it ran in, S for the unpatched and restored runs and not S for the
-    /// patched one. No run claims its history yet (C18, hdr-14.7b).
+    /// patched one. Each run claims its history, and takes its reports, only
+    /// from the test's own declaration of it recorded by the same checkout,
+    /// ending as the test did (C18, C8).
     #[test]
     fn an_integrity_run_is_read_from_its_artifact() {
         let input = history_run();
         let read =
             |run: CaseRun, test: (&str, &str, &str), result: &str, log: &str, source: &str| {
                 let dir = tempfile::tempdir().expect("a temp dir can be created");
+                let failure = (result == "FAILED").then_some(
+                    "storage:header's evidence failed: OwnedMismatch: at a quiet boundary",
+                );
+                declare_and_record(dir.path(), "a_test", "plan 0", source, failure);
                 let (package, file, name) = test;
                 let artifact = TestRun {
                     package: package.into(),
@@ -2769,7 +3741,7 @@ mod tests {
             &reported("OwnedMismatch"),
             "patched",
         );
-        assert_eq!(patched.meta.input, None);
+        assert_eq!(patched.meta.input.as_ref(), Some(&input));
         assert_eq!(
             patched.end,
             End::HarnessFailure {
@@ -2777,7 +3749,121 @@ mod tests {
             }
         );
         for run in [CaseRun::Unpatched, CaseRun::Restored] {
-            assert_eq!(read(run, own, "ok", "", "subject").end, End::Completed);
+            let clean = read(run, own, "ok", "", "subject");
+            assert_eq!(clean.end, End::Completed);
+            assert_eq!(clean.meta.input.as_ref(), Some(&input));
+            assert!(clean.trigger && !clean.reports.is_empty(), "{clean:?}");
+        }
+        // Without its declaration and recording, or with a declaration of
+        // another case, by another test, or a recording from another
+        // checkout or of another Plan, a run claims no history, and the
+        // patched one didn't happen.
+        let reread = |dir: &Path, run: CaseRun| {
+            integrity_execution(
+                dir,
+                RunId::native("raw-budget-lease", run),
+                &input,
+                NODE,
+                "OwnedMismatch",
+                "subject",
+            )
+        };
+        type Defect<'a> = (&'a str, &'a dyn Fn(&Path));
+        let defects: [Defect; 5] = [
+            ("nothing", &|dir| {
+                fs::remove_dir_all(dir.join("declared")).expect("it exists");
+                fs::remove_dir_all(dir.join("history")).expect("it exists");
+            }),
+            ("another case", &|dir| {
+                let path = dir
+                    .join("declared/0")
+                    .join(super::super::history::HISTORY_FILE);
+                let text = fs::read_to_string(&path).expect("it exists");
+                fs::write(&path, text.replace("\"plan 0\"", "\"plan 1\""))
+                    .expect("the temp dir is writable");
+            }),
+            ("another test", &|dir| {
+                let path = dir
+                    .join("declared/0")
+                    .join(super::super::history::HISTORY_FILE);
+                let text = fs::read_to_string(&path).expect("it exists");
+                fs::write(&path, text.replace("::a_test", "::another_test"))
+                    .expect("the temp dir is writable");
+            }),
+            ("another checkout", &|dir| {
+                rewrite(&dir.join("history"), |lines| {
+                    lines[0]["meta"]["build"]["source"] = Value::String("elsewhere".to_owned());
+                });
+            }),
+            ("another Plan", &|dir| {
+                fs::write(dir.join("declared/0").join(PLAN_FILE), [7u8; 3])
+                    .expect("the temp dir is writable");
+            }),
+        ];
+        for (defect, apply) in defects {
+            for (run, result, log, source) in [
+                (CaseRun::Unpatched, "ok", String::new(), "subject"),
+                (
+                    CaseRun::Patched,
+                    "FAILED",
+                    reported("OwnedMismatch"),
+                    "patched",
+                ),
+            ] {
+                let dir = tempfile::tempdir().expect("a temp dir can be created");
+                let failure = (result == "FAILED").then_some(
+                    "storage:header's evidence failed: OwnedMismatch: at a quiet boundary",
+                );
+                declare_and_record(dir.path(), "a_test", "plan 0", source, failure);
+                let artifact = TestRun {
+                    package: own.0.into(),
+                    file: own.1.into(),
+                    tests: vec![(own.2.into(), result.into())],
+                    killed: false,
+                    exited_ok: result == "ok",
+                    log: log.clone(),
+                    binary_source: Some(source.into()),
+                    checkout_source: Some(source.into()),
+                };
+                fs::write(
+                    dir.path().join(TEST_FILE),
+                    serde_json::to_string(&artifact).expect("a test run serializes"),
+                )
+                .expect("the temp dir is writable");
+                assert_eq!(reread(dir.path(), run).meta.input.as_ref(), Some(&input));
+                apply(dir.path());
+                let read = reread(dir.path(), run);
+                assert_eq!(read.meta.input, None, "{defect}");
+                if run == CaseRun::Patched {
+                    assert!(matches!(read.end, End::Failed { .. }), "{defect}");
+                }
+            }
+        }
+        // A patched recording that ended clean, or failed with another
+        // diagnostic, isn't the test's harness failure.
+        for failure in [
+            None,
+            Some("storage:header's evidence failed: ReservedMismatch: x"),
+        ] {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            declare_and_record(dir.path(), "a_test", "plan 0", "patched", failure);
+            let artifact = TestRun {
+                package: own.0.into(),
+                file: own.1.into(),
+                tests: vec![(own.2.into(), "FAILED".into())],
+                killed: false,
+                exited_ok: false,
+                log: reported("OwnedMismatch"),
+                binary_source: Some("patched".into()),
+                checkout_source: Some("patched".into()),
+            };
+            fs::write(
+                dir.path().join(TEST_FILE),
+                serde_json::to_string(&artifact).expect("a test run serializes"),
+            )
+            .expect("the temp dir is writable");
+            let read = reread(dir.path(), CaseRun::Patched);
+            assert!(matches!(read.end, End::Failed { .. }), "{failure:?}");
         }
         let failed = |end: End| matches!(end, End::Failed { .. });
         // `ok` with a nonzero exit isn't completed.
@@ -2879,12 +3965,13 @@ mod tests {
         }
     }
 
-    /// A planted run's replay links its case task's copy of that run's
-    /// trace, by its property, name and role: another case's task or another
-    /// role isn't it, and a `Draft` run has none yet.
+    /// A replay links the recorded run it replays and its fresh replay, in
+    /// the task that records that run, by its property, name and role:
+    /// another case's task, a role the task doesn't record, or a task whose
+    /// directory isn't bound to it links only the run's identity.
     #[test]
     fn a_replay_links_its_run_s_trace() {
-        let task = |name: &str, input: CaseInput| Task::Case {
+        let task = |name: &str, input: CaseInput, draft: bool| Task::Case {
             expected: ExpectedId::Passes {
                 package: "p".into(),
                 file: name.into(),
@@ -2893,16 +3980,19 @@ mod tests {
             property: "p".into(),
             name: name.into(),
             harness: MACHINE.into(),
-            machine: true,
+            machine: !draft,
             input,
             patch: format!("qa/planted/p/{name}.patch"),
+            draft: draft.then(|| vec!["p".to_owned()]),
+            companions: Vec::new(),
         };
-        let (a, b) = (
+        let tasks = [
             task(
                 "a",
                 CaseInput::Fuzz {
                     input: "a.bin".into(),
                 },
+                false,
             ),
             task(
                 "a-b",
@@ -2910,55 +4000,55 @@ mod tests {
                     scenario: "s.json".into(),
                     plan: "p.bin".into(),
                 },
+                true,
             ),
-        );
-        let scripted = task(
-            "s",
-            CaseInput::Scripted {
-                scenario: "s.json".into(),
-                script: "p.json".into(),
-            },
-        );
-        let cases = BTreeMap::from([
-            (("p", "a"), (3, &a)),
-            (("p", "a-b"), (4, &b)),
-            (("p", "s"), (5, &scripted)),
-        ]);
+            task(
+                "s",
+                CaseInput::Scripted {
+                    scenario: "s.json".into(),
+                    script: "p.json".into(),
+                },
+                false,
+            ),
+        ];
+        let all = |_: usize, _: &Task| true;
         let run = |name: &str, role| RunId::Case {
             property: "p".into(),
             name: name.into(),
             run: role,
         };
-        let links = replay_links(&run("a", CaseRun::Patched), &cases);
+        let links = replay_links(&run("a", CaseRun::Patched), &tasks, &all);
         assert_eq!(
             links.artifacts,
-            ["3/patched/trace.jsonl", "3/patched/witness.json"]
+            [
+                "0/patched/trace.jsonl",
+                "0/patched/full-report.json",
+                "0/patched/replay/replay.json",
+                "0/patched/replay/full-report.json"
+            ]
         );
         assert_eq!(links.history, Some(run("a", CaseRun::Patched)));
         assert_eq!(links.harness.as_deref(), Some(MACHINE));
         assert_eq!(links.input.as_deref(), Some("a.bin"));
         assert_eq!(links.plan, None);
-        let typed = replay_links(&run("a-b", CaseRun::Patched), &cases);
+        let typed = replay_links(&run("a-b", CaseRun::Patched), &tasks, &all);
         assert_eq!(typed.input.as_deref(), Some("s.json"));
         assert_eq!(typed.plan.as_deref(), Some("p.bin"));
-        let scripted = replay_links(&run("s", CaseRun::Patched), &cases);
-        assert_eq!(scripted.input.as_deref(), Some("s.json"));
+        let scripted = replay_links(&run("s", CaseRun::Patched), &tasks, &all);
         assert_eq!(scripted.plan.as_deref(), Some("p.json"));
         assert_eq!(
-            replay_links(&run("a-b", CaseRun::Baseline), &cases).artifacts,
-            ["4/baseline/trace.jsonl", "4/baseline/witness.json"]
+            replay_links(&run("a-b", CaseRun::Draft), &tasks, &all).artifacts[0],
+            "1/draft/trace.jsonl"
         );
-        assert!(replay_links(&run("a", CaseRun::Draft), &cases)
-            .artifacts
-            .is_empty());
-        assert!(replay_links(&run("c", CaseRun::Patched), &cases)
-            .artifacts
-            .is_empty());
-        let history = history_run();
-        assert_eq!(
-            replay_links(&history, &cases).harness.as_deref(),
-            Some("header-sync/storage")
-        );
+        // A machine case records no Draft run, another case isn't it, and
+        // an unbound directory links nothing.
+        for unlinked in [
+            replay_links(&run("a", CaseRun::Draft), &tasks, &all),
+            replay_links(&run("c", CaseRun::Patched), &tasks, &all),
+            replay_links(&run("a", CaseRun::Patched), &tasks, &|_, _| false),
+        ] {
+            assert!(unlinked.artifacts.is_empty() && unlinked.result.is_none());
+        }
     }
 
     /// The record exports what an exclusion rests on: a standing `Open`'s

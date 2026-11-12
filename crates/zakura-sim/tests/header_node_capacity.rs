@@ -20,6 +20,7 @@ use zakura_sim::{
     domain::header_sync::CHUNK_BUDGET_BOUND,
     harness::{
         self,
+        header_acceptance::history::declare,
         header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::SettlementEvidence,
@@ -157,7 +158,15 @@ fn prepare_end(report: &RunReport) -> Option<String> {
 #[test]
 fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
     let scenario = witness();
-    for input in inputs(16, 256) {
+    for (index, input) in inputs(16, 256).into_iter().enumerate() {
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        declare(
+            Storage::NAME,
+            &format!("plan {index} of inputs(16, 256)"),
+            &scenario,
+            &input,
+        );
         let (report, readings) = run(&scenario, input);
         assert!(
             readings

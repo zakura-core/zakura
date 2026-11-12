@@ -624,27 +624,30 @@ fn every_required_key_is_covered_once_with_its_gates() {
         );
         m.expected[at].expected = rows::MACHINE_CLEANUP;
     });
-    // A native mutation's or a narrowing entry's transitional Open with
-    // only another owner, or only another reason.
-    for key in [
-        Key::Native {
-            patch: "own9-join".into(),
-        },
-        Key::NarrowingTest { entry: "N1".into() },
-    ] {
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
-                *owner = "Evan's side";
-            }
-        });
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-                *reason = "another reason for the same PR";
-            }
-        });
-    }
+    // A narrowing entry's key covered by another test than its entry's.
+    refused(&|m| {
+        let at = covering(m, &Key::NarrowingTest { entry: "N1".into() });
+        if let Expected::Passes { test } = &mut m.expected[at].expected {
+            test.test = "another_test";
+        }
+    });
+    // A native mutation's transitional Open with only another owner, or
+    // only another reason.
+    let native = Key::Native {
+        patch: "own9-join".into(),
+    };
+    refused(&|m| {
+        let at = covering(m, &native);
+        if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
+            *owner = "Evan's side";
+        }
+    });
+    refused(&|m| {
+        let at = covering(m, &native);
+        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
+            *reason = "another reason for the same PR";
+        }
+    });
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
     refused(&|m| {
@@ -3074,14 +3077,23 @@ fn the_gate_requirements_match_their_obligations() {
         };
         assert!(!key.covers(&transitional, NARROWING), "{row}");
     }
-    // A requirement's own Open with only its owner changed.
-    for name in ["gate-2/bad-content-close-claim", "gate-1/a-a-and-a-b-a"] {
+    // A requirement's own Open with only its owner changed, or its own
+    // test with only its name changed.
+    for name in [
+        "gate-2/bad-content-close-claim",
+        "gate-1/topology-freshness",
+        "gate-1/a-a-and-a-b-a",
+        "gate-1/replay-store-control",
+    ] {
         let requirement = GATE_REQUIREMENTS.iter().find(|r| r.name == name).unwrap();
         let mut changed = requirement.expected.clone();
-        if let Expected::Open { owner, .. } = &mut changed {
-            *owner = "someone else";
+        match &mut changed {
+            Expected::Open { owner, .. } => *owner = "someone else",
+            Expected::Passes { test } => test.test = "another_test",
+            other => panic!("{name}: {other:?}"),
         }
         let key = Key::Requirement { name: name.into() };
+        assert!(key.covers(&requirement.expected, NARROWING), "{name}");
         assert!(!key.covers(&changed, NARROWING), "{name}");
     }
 }

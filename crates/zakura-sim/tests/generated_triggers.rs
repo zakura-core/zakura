@@ -285,6 +285,93 @@ fn receiver_triggers_need_a_judged_frame() {
     ));
 }
 
+/// A fault close of connection `connection`.
+fn fault_closed(connection: u64) -> Observation {
+    Observation::ConnectionClosed {
+        connection,
+        cause: "service_protocol_reject".to_owned(),
+    }
+}
+
+/// `frame` moved to connection 2.
+fn on_two(frame: Observation) -> Observation {
+    match frame {
+        Observation::PeerFrame {
+            stream,
+            quic_stream,
+            seq,
+            row,
+            rule_stream,
+            label,
+            exhausted,
+            exchange,
+            payload,
+            ..
+        } => Observation::PeerFrame {
+            connection: 2,
+            stream,
+            quic_stream,
+            seq,
+            row,
+            rule_stream,
+            label,
+            exhausted,
+            exchange,
+            payload,
+        },
+        Observation::FrameJudged {
+            stream,
+            quic_stream,
+            seq,
+            ..
+        } => Observation::FrameJudged {
+            connection: 2,
+            stream,
+            quic_stream,
+            seq,
+        },
+        other => other,
+    }
+}
+
+/// `conformant-never-closes`'s trigger joins the punishment it counts to
+/// the connection it's on: connection 1's judged conformant frame doesn't
+/// reach it for a fault close or `Misbehavior` of connection 2 before the
+/// node judged anything there, and connection 2's own judged conformant
+/// frame does. A punishment the property doesn't count, after a
+/// non-conformant frame, leaves the trigger as connection 1's frame made it.
+#[test]
+fn conformant_never_closes_joins_the_punished_connection() {
+    let conformant = id(None, Template::ConformantNeverCloses);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &conformant,
+        [first.clone(), vec![fault_closed(1)]].concat()
+    ));
+    for punished in [fault_closed(2), Observation::Misbehavior { connection: 2 }] {
+        assert!(
+            !reaches(
+                &conformant,
+                [first.clone(), vec![punished.clone()]].concat()
+            ),
+            "{punished:?}"
+        );
+        let own: Vec<Observation> = first.iter().cloned().map(on_two).collect();
+        assert!(reaches(
+            &conformant,
+            [first.clone(), own, vec![punished.clone()]].concat()
+        ));
+    }
+    let bad = vec![
+        on_two(peer(0, "item", Label::LongPayload)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(
+        &conformant,
+        [first, bad, vec![fault_closed(2)]].concat()
+    ));
+}
+
 /// The node applying the peer's grant of subscription `key` on connection
 /// 1's QUIC stream `quic`, as its regulation logs it.
 fn applied(quic: u64, key: u64) -> Observation {

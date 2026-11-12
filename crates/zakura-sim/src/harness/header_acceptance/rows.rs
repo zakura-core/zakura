@@ -1793,6 +1793,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "swapped-payload",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "swapped-side-header",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -3035,7 +3041,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "stale-status-cache",
         },
     },
-    to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "swapped-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "swapped-payload",
+        },
+    },
     NativeMutation {
         patch: "unreleased-retirement",
         class: NativeClass::Moved {

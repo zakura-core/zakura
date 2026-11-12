@@ -1,0 +1,24 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/service.rs b/crates/zakura-network/src/zakura/header_sync/service.rs
+index 6994496496..8e0cf0e520 100644
+--- a/crates/zakura-network/src/zakura/header_sync/service.rs
++++ b/crates/zakura-network/src/zakura/header_sync/service.rs
+@@ -393,6 +393,8 @@ impl PeerSession {
+                     error => OrderedSendError::Encode(error.into()),
+                 })?;
+         let id = update.subscription_id;
++        // Mutation: the `Open` is queued a second time behind itself.
++        let repeated = update.clone();
+         if slot
+             .send_fenced(update_frame(subscriber.header_bytes(), update), &writer)
+             .is_err()
+@@ -401,6 +403,10 @@ impl PeerSession {
+             subscriber.retract(id);
+             return Err(OrderedSendError::Closed);
+         }
++        if let Ok(again) = self.reserve() {
++            let _ =
++                again.send_following(update_frame(subscriber.header_bytes(), repeated), &writer);
++        }
+         *self.open_writer() = Some(writer);
+         Ok(HeaderSyncRequestId::new(id).expect("subscription IDs are nonzero"))
+     }

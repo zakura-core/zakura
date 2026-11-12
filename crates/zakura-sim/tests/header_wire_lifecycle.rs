@@ -961,7 +961,10 @@ fn regenerate_saved_plans() {
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
-            SavedPlan::HonestSync => holds(HONEST_NEVER_PUNISHED),
+            SavedPlan::HonestSync => {
+                holds(HONEST_NEVER_PUNISHED)
+                    + &holds("header-sync/s5v9/subscribe-headers/sender-within-live")
+            }
             SavedPlan::Act(act) if CLOSES_CAUGHT.contains(&act) => {
                 let row = if act.label() == Label::OverCredit {
                     "subscribe-headers"

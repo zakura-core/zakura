@@ -223,7 +223,7 @@ const GENERATED: [Generated; 32] = {
             "subscribe-headers/sender-within-live",
             EVERY,
             G3,
-            Open(SENDER_LIVE_UNREACHED),
+            Case("open-repeated"),
         ),
         gen(
             "subscribe-headers/sender-within-credit",
@@ -426,12 +426,6 @@ const SENDER_CADENCE_UNREACHED: &str =
      takes over 600 Status frames from the node; with both its pacing floors cut to a millisecond, \
      the reactor's publication interval and the cadence sender's send interval, a wire run sends \
      about 213 before its 30,000-step budget ends";
-/// Why `subscribe-headers/sender-within-live` has no catch: the node's
-/// subscriber can't hold the subscriptions the rule's label needs.
-const SENDER_LIVE_UNREACHED: &str =
-    "the peer's models label a node Open over-live only beside two subscriptions the node holds \
-     on that peer, and the node's v9 subscriber state holds at most one live subscription per \
-     session, so no patch to one path makes the node send it";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1423,7 +1417,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
     };
     match generated.catch {
         GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 27, so the leak is
+            // Built once per case for a fixed set of 28, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
             expected.extend(caught(

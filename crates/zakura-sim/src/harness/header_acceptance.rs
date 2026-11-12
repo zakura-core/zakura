@@ -31,10 +31,16 @@
 //! without its file and package, or a case's name without its property. The evaluator's controls change one field at a time and require
 //! the result to stop counting.
 
+pub mod actions;
+pub mod binding;
+pub mod companions;
 pub mod contracts;
 pub mod evaluate;
+pub mod history;
 pub mod inventory;
+pub mod not_applicable;
 pub mod reasons;
+pub mod refs;
 pub mod required;
 pub mod rows;
 pub mod tool;
@@ -140,8 +146,9 @@ pub const fn sim_test(file: &'static str, test: &'static str) -> TestRef {
 
 /// One acceptance history: a run of a registered harness on one committed
 /// scenario and input, named by the witness test that builds it and, where
-/// that test runs several, the case it names. hdr-14.7b binds each to the
-/// digest of its recorded scenario and input (C18).
+/// that test runs several, the case it names. The test declares each case's
+/// scenario and Plan ([`history::declare`]), and the acceptance tool records
+/// that declaration and binds the trace to it by digest (C18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HistoryRef {
     /// The registered harness it runs on.
@@ -188,6 +195,12 @@ pub enum Found {
     /// At the end: an obligation the drain concludes or an end finding, with
     /// no stopping violation.
     AtEnd,
+    /// At a step, by the case's own ID alone: the run stops at the case's
+    /// own break, before the rest of its set breaks. The set is judged on
+    /// the case's `Draft` run instead, which goes on past the break, and
+    /// must have every member violated by its end and nothing else (Adam,
+    /// 2026-11-12).
+    AtStepSetOnDraft,
 }
 
 /// A property that a history's row expects to stay `NotApplicable`, with
@@ -247,6 +260,24 @@ pub fn planted_harness(
     }
 }
 
+/// Whether planted case `name` of `property`, under the repository `repo`,
+/// is harness-caught: its `.toml` names `missing_evidence`, as the planted
+/// runner reads it. An error says what can't be read.
+pub fn planted_harness_caught(
+    repo: &std::path::Path,
+    property: &str,
+    name: &str,
+) -> Result<bool, String> {
+    let path = repo
+        .join("qa/planted")
+        .join(property)
+        .join(format!("{name}.toml"));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let case: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(case.contains_key("missing_evidence"))
+}
+
 /// One result a row expects (Rule 20).
 #[derive(Clone, Debug)]
 pub enum Expected {
@@ -288,6 +319,11 @@ pub enum Expected {
         companions: &'static [&'static str],
         /// Other properties of the harness expected `NotApplicable`.
         not_applicable: &'static [ExpectedNa],
+        /// The same for the patched build's completed runs, its `Draft` run
+        /// and a patched run found at the end, where they differ: those go
+        /// on past the break, so they can apply other IDs or never reach
+        /// some the baseline applies. `None` means `not_applicable`.
+        patched_not_applicable: Option<&'static [ExpectedNa]>,
     },
     /// A machine harness's planted case: the baseline holds and the patched
     /// run violates exactly the machine's ID.
@@ -296,6 +332,24 @@ pub enum Expected {
         case: CaseRef,
         /// The machine harness.
         harness: &'static str,
+    },
+    /// A planted case whose patched run fails the harness, which Adam
+    /// allowed only for a missing-evidence end (question 7, 2026-11-12):
+    /// the baseline holds, and the patched run ends at a
+    /// `HarnessFailure::MissingEvidence` of the case's own property whose
+    /// detail carries `detail`, violating nothing. It has no `Draft` run,
+    /// since its patched run can't complete.
+    HarnessCaught {
+        /// The case.
+        case: CaseRef,
+        /// The harness its input runs on.
+        harness: &'static str,
+        /// What the missing evidence's detail must say, such as the
+        /// unread-boundary detail's `with a boundary unread`.
+        detail: &'static str,
+        /// Other properties of the harness expected `NotApplicable` on the
+        /// baseline.
+        not_applicable: &'static [ExpectedNa],
     },
     /// A retained integrity mutation: the patched history fails the run as a
     /// harness failure carrying exactly `diagnostic`.
@@ -309,6 +363,15 @@ pub enum Expected {
         /// Properties of the history's harness expected `NotApplicable` on
         /// its clean runs.
         not_applicable: &'static [ExpectedNa],
+    },
+    /// A retired native mutation's witness outside the simulator: its test
+    /// passes unpatched and restored, and fails with the witness's required
+    /// failure patched.
+    UnitCaught {
+        /// The directory under `qa/native-mutations/header-sync/`.
+        patch: &'static str,
+        /// The witness test and the failure it must show.
+        witness: rows::UnitWitness,
     },
     /// A fresh-process Exact replay of one execution, with its reports and
     /// store snapshots equal.
@@ -471,6 +534,15 @@ pub enum Key {
         /// The test's name.
         test: String,
     },
+    /// A `Satisfied` contract's proving catch: a planted case's `Caught`.
+    ContractCatch {
+        /// The contract, such as `C2`.
+        contract: String,
+        /// The case's property directory.
+        property: String,
+        /// The case's name.
+        name: String,
+    },
     /// A [`NARROWING`] entry's test.
     NarrowingTest {
         /// The entry, such as `N1`.
@@ -549,8 +621,12 @@ pub enum ExpectedId {
     Caught(RunId),
     /// [`Expected::MachineCaught`] for this case's patched run.
     MachineCaught(RunId),
+    /// [`Expected::HarnessCaught`] for this case's patched run.
+    HarnessCaught(RunId),
     /// [`Expected::IntegrityCaught`] for this mutation's patched run.
     IntegrityCaught(RunId),
+    /// [`Expected::UnitCaught`] for this mutation's patched run.
+    UnitCaught(RunId),
     /// [`Expected::Replays`] of this execution.
     Replays(RunId),
     /// [`Expected::Passes`] of this test.
@@ -587,8 +663,14 @@ impl Expected {
             Expected::MachineCaught { case, .. } => {
                 ExpectedId::MachineCaught(RunId::case(case, CaseRun::Patched))
             }
+            Expected::HarnessCaught { case, .. } => {
+                ExpectedId::HarnessCaught(RunId::case(case, CaseRun::Patched))
+            }
             Expected::IntegrityCaught { patch, .. } => {
                 ExpectedId::IntegrityCaught(RunId::native(patch, CaseRun::Patched))
+            }
+            Expected::UnitCaught { patch, .. } => {
+                ExpectedId::UnitCaught(RunId::native(patch, CaseRun::Patched))
             }
             Expected::Replays { run } => ExpectedId::Replays(run),
             Expected::Passes { test } => ExpectedId::Passes {
@@ -607,7 +689,9 @@ impl Expected {
             Expected::StaysNotApplicable { .. } => ResultKind::StaysNotApplicable,
             Expected::Caught { .. } => ResultKind::Caught,
             Expected::MachineCaught { .. } => ResultKind::MachineCaught,
+            Expected::HarnessCaught { .. } => ResultKind::HarnessCaught,
             Expected::IntegrityCaught { .. } => ResultKind::IntegrityCaught,
+            Expected::UnitCaught { .. } => ResultKind::UnitCaught,
             Expected::Replays { .. } => ResultKind::Replays,
             Expected::Passes { .. } => ResultKind::Passes,
             Expected::Open { .. } => ResultKind::Open,
@@ -624,12 +708,14 @@ impl Key {
     /// A passing key takes a `Holds` or `StaysNotApplicable` of its own
     /// property, a catch key a `Caught` whose case is under its property and
     /// whose set contains it, or a `MachineCaught` of its property, a case
-    /// key the catch of exactly that case, a replay key the replay of exactly
-    /// that execution, a test key the `Passes` of exactly that test, and a
-    /// requirement key what its [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS)
-    /// entry permits. Any other key also takes an `Open`, which blocks until
-    /// approved. A narrowing test key is matched against `narrowing`,
-    /// the manifest's entries.
+    /// key the catch of exactly that case, a duplicate native mutation's key
+    /// the catch of the case its classification names, a replay key the
+    /// replay of exactly that execution, a test key the `Passes` of exactly
+    /// that test, and a requirement key what its
+    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits. Any
+    /// other key also takes an `Open`, which blocks until approved. A
+    /// narrowing test key is matched against `narrowing`, the manifest's
+    /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
         let test_is = |package: &str, file: &str, name: &str, test: &TestRef| {
             test.package == package && test.file == file && test.test == name
@@ -647,7 +733,15 @@ impl Key {
             }
             (
                 Key::Case { property, name },
-                Expected::Caught { case, .. } | Expected::MachineCaught { case, .. },
+                Expected::Caught { case, .. }
+                | Expected::MachineCaught { case, .. }
+                | Expected::HarnessCaught { case, .. },
+            ) => case.property == property && case.name == name,
+            // A contract's proving catch takes the `Caught` or
+            // `HarnessCaught` of exactly that case, and nothing else.
+            (
+                Key::ContractCatch { property, name, .. },
+                Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. },
             ) => case.property == property && case.name == name,
             (Key::Replay { run }, Expected::Replays { run: replayed }) => run == replayed,
             (
@@ -684,6 +778,28 @@ impl Key {
                                     not_applicable,
                                 }
                     })
+            }
+            // A retired native mutation's key takes the catch of exactly
+            // the witness its classification pins.
+            (Key::Native { patch }, Expected::UnitCaught { patch: p, witness }) => {
+                patch == p
+                    && NATIVE_MUTATIONS.iter().any(|mutation| {
+                        mutation.patch == patch
+                            && matches!(mutation.class, NativeClass::Retired { witness: w, .. }
+                                if w == *witness)
+                    })
+            }
+            // A duplicate native mutation's key takes the catch of exactly
+            // the planted case its classification names.
+            (Key::Native { patch }, Expected::Caught { case, .. }) => {
+                NATIVE_MUTATIONS.iter().any(|mutation| {
+                    mutation.patch == patch
+                        && mutation.class
+                            == NativeClass::Duplicate {
+                                property: case.property,
+                                case: case.name,
+                            }
+                })
             }
             (Key::Cleanup { run }, Expected::Open { .. }) => {
                 let machine =
@@ -757,9 +873,6 @@ impl Key {
                             NativeClass::ToMove { until, .. } => {
                                 same_open(expected, &rows::native_open(until))
                             }
-                            NativeClass::Retired { .. } => {
-                                same_open(expected, &rows::retired_open())
-                            }
                             _ => false,
                         }
                 })
@@ -778,7 +891,9 @@ impl Key {
                 Key::Case { .. } | Key::Replay { .. } | Key::Witness { .. } | Key::History { .. },
                 _,
             )
-            | (Key::ContractTest { .. } | Key::Composition { .. }, _) => false,
+            | (Key::ContractTest { .. } | Key::ContractCatch { .. } | Key::Composition { .. }, _) => {
+                false
+            }
             (Key::Requirement { name }, expected) => required::GATE_OBLIGATIONS
                 .iter()
                 .any(|obligation| obligation.name == name && obligation.permit.allows(expected)),
@@ -825,8 +940,12 @@ pub enum ResultKind {
     Caught,
     /// [`Expected::MachineCaught`].
     MachineCaught,
+    /// [`Expected::HarnessCaught`].
+    HarnessCaught,
     /// [`Expected::IntegrityCaught`].
     IntegrityCaught,
+    /// [`Expected::UnitCaught`].
+    UnitCaught,
     /// [`Expected::Replays`].
     Replays,
     /// [`Expected::Passes`].
@@ -907,9 +1026,11 @@ impl Manifest {
         expected.extend(rows::counted_results(&expected.clone()));
         expected.extend(rows::requirement_results());
         expected.extend(rows::witness_results(&rows));
-        expected.extend(rows::native_results());
+        let native = rows::native_results(&expected);
+        expected.extend(native);
         let contracts = contract_table();
-        expected.extend(contracts::contract_test_results(&contracts));
+        let catches = contracts::contract_test_results(&contracts, &expected);
+        expected.extend(catches);
         expected.extend(contracts::narrowing_test_results(NARROWING));
         expected.extend(rows::composition_results());
         expected.extend(rows::missing_source_results(&needs()));

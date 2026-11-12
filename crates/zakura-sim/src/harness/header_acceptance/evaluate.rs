@@ -22,8 +22,8 @@
 //! comes from the manifest's expected execution, never from what a result
 //! claims about itself.
 //!
-//! The tests that decide a contract's or an entry's state depend only on
-//! C5, the binary's provenance: letting them depend on the contracts they
+//! The tests and proving catches that decide a contract's or an entry's
+//! state depend only on C5, the binary's provenance: letting them depend on the contracts they
 //! decide would make the graph cyclic, so a contract could never be
 //! satisfied and an entry could never release. C5's own proving tests can't
 //! depend on C5, so each must have run from a binary that embeds the
@@ -36,7 +36,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    contracts::{contract_test_key, ContractId, ContractState, Narrowing, NarrowingTest, RunBy},
+    contracts::{
+        contract_catch_key, contract_test_key, ContractId, ContractState, Narrowing, NarrowingTest,
+        RunBy,
+    },
     Approval, CaseRun, Expected, ExpectedId, ExpectedNa, ExpectedResult, Found, Gate, Key,
     Manifest, ResultCtx, RunId, TestRef, GATES,
 };
@@ -91,6 +94,13 @@ pub enum Actual {
         /// The patched run.
         patched: Execution,
     },
+    /// A harness-caught planted case's two runs.
+    HarnessCaught {
+        /// The unpatched baseline.
+        baseline: Execution,
+        /// The patched run, which ends at its harness failure.
+        patched: Execution,
+    },
     /// A native integrity mutation's three runs, each naming the history
     /// it ran in [`ExecMeta::input`].
     IntegrityCaught {
@@ -100,6 +110,12 @@ pub enum Actual {
         patched: Execution,
         /// The history on the restored checkout.
         restored: Execution,
+    },
+    /// A retired native mutation's witness test, unpatched, patched and
+    /// restored, as the tool judged its three runs (`tool::unit_refusal`).
+    UnitCaught {
+        /// Why its runs aren't the mutation caught, or `None` if they are.
+        refused: Option<String>,
     },
     /// A fresh-process replay of one execution.
     Replay {
@@ -127,6 +143,10 @@ pub enum Actual {
         /// The source digest the test binary embeds, or `None` if the tool
         /// couldn't read one, which blocks the test's key.
         binary_source: Option<String>,
+        /// The source digest of the checkout the test ran in, which reads
+        /// its files, or `None` if the tool couldn't read one, which blocks
+        /// the test's key too.
+        checkout_source: Option<String>,
     },
 }
 
@@ -501,10 +521,15 @@ pub fn evaluate(
             .iter()
             .filter(|contract| contract.id == id)
             .flat_map(|contract| {
-                contract
+                let tests = contract
                     .proving
                     .iter()
-                    .map(move |&t| contract_test_key(id, t))
+                    .map(move |&t| contract_test_key(id, t));
+                let catches = contract
+                    .proving_catches
+                    .iter()
+                    .map(move |&case| contract_catch_key(id, case));
+                tests.chain(catches)
             })
             .collect()
     };
@@ -590,7 +615,9 @@ pub fn evaluate(
             let passes = stray.is_empty()
                 && required.iter().all(|(key, gates)| match key {
                     Key::Composition { .. } => keys[key] == ObligationState::Verified,
-                    Key::ContractTest { .. } | Key::NarrowingTest { .. } => {
+                    Key::ContractTest { .. }
+                    | Key::ContractCatch { .. }
+                    | Key::NarrowingTest { .. } => {
                         !matches!(keys[key], ObligationState::Blocked { .. })
                     }
                     _ if gates.contains(&gate) => {
@@ -623,7 +650,10 @@ fn recorded(reason: &str, approval: Approval) -> bool {
 
 /// Whether `key` decides a contract's or a narrowing entry's state.
 fn decides_a_contract(key: &Key) -> bool {
-    matches!(key, Key::ContractTest { .. } | Key::NarrowingTest { .. })
+    matches!(
+        key,
+        Key::ContractTest { .. } | Key::ContractCatch { .. } | Key::NarrowingTest { .. }
+    )
 }
 
 impl<'a> Evidence<'a> {
@@ -636,25 +666,38 @@ impl<'a> Evidence<'a> {
                 "its result is from {}, not the subject {}",
                 record.commit, self.subject
             )),
-            // A test whose binary embeds another source, or whose digest
-            // couldn't be read, isn't shown to have run S, whatever C5 says
-            // of provenance in general.
+            // A test whose binary embeds another source, or that ran in a
+            // checkout of another source, whose files it reads, or whose
+            // digest couldn't be read, isn't shown to have run S, whatever C5
+            // says of provenance in general.
             Some(
                 [ResultRecord {
-                    actual: Actual::Test { binary_source, .. },
+                    actual:
+                        Actual::Test {
+                            binary_source,
+                            checkout_source,
+                            ..
+                        },
                     ..
                 }],
-            ) if binary_source.as_deref() != Some(self.subject_source) => Err(format!(
-                "its binary embeds {binary_source:?}, not the subject's source {}",
-                self.subject_source
-            )),
+            ) if binary_source.as_deref() != Some(self.subject_source)
+                || checkout_source.as_deref() != Some(self.subject_source) =>
+            {
+                Err(format!(
+                    "its binary embeds {binary_source:?} and it ran in a checkout of \
+                     {checkout_source:?}, not the subject's source {}",
+                    self.subject_source
+                ))
+            }
             Some([record]) => Ok(record),
             Some(_) => Err("its result is duplicated".into()),
         }
     }
 
     /// Whether `test` passed at the subject commit, and, when `bootstrap`,
-    /// ran from a binary embedding the subject's source digest.
+    /// ran from a binary embedding the subject's source digest, which must
+    /// be known. [`Evidence::one_result`] already requires that digest of
+    /// its binary and its checkout alike.
     fn test_passed(&self, test: TestRef, bootstrap: bool) -> Result<(), String> {
         let id = Expected::Passes { test }
             .id()
@@ -712,22 +755,28 @@ impl<'a> Evidence<'a> {
                     return Standing::Blocked(format!("{id:?} is satisfied with no proving test"));
                 }
                 let mut excluded = None;
-                for &test in contract.proving {
-                    match keys.get(&contract_test_key(id, test)) {
+                let tests = contract
+                    .proving
+                    .iter()
+                    .map(|&test| (contract_test_key(id, test), format!("test {}", test.test)));
+                let catches = contract.proving_catches.iter().map(|&case| {
+                    (
+                        contract_catch_key(id, case),
+                        format!("catch {}/{}", case.property, case.name),
+                    )
+                });
+                for (key, what) in tests.chain(catches) {
+                    match keys.get(&key) {
                         Some(ObligationState::Verified) => {}
                         Some(ObligationState::Excluded { why }) => {
                             excluded = excluded.or(Some(why.clone()));
                         }
                         Some(ObligationState::Blocked { why }) => {
-                            return Standing::Blocked(format!(
-                                "{id:?}'s proving test {}: {why}",
-                                test.test
-                            ))
+                            return Standing::Blocked(format!("{id:?}'s proving {what}: {why}"))
                         }
                         None => {
                             return Standing::Blocked(format!(
-                                "{id:?}'s proving test {} has no state",
-                                test.test
+                                "{id:?}'s proving {what} has no state"
                             ))
                         }
                     }
@@ -742,9 +791,10 @@ impl<'a> Evidence<'a> {
     }
 
     /// The state of a key that decides a contract or a narrowing entry:
-    /// its test passed at the subject commit, with C5's standing applied
-    /// when `c5` is given, and for `bootstrap`, from a binary embedding the
-    /// subject's source digest.
+    /// its test passed at the subject commit, or its proving catch's result
+    /// at the subject commit passed its own judgment, with C5's standing
+    /// applied when `c5` is given, and for `bootstrap`, from a binary
+    /// embedding the subject's source digest. A catch never bootstraps C5.
     fn deciding_state(
         &self,
         result: &ExpectedResult,
@@ -753,11 +803,24 @@ impl<'a> Evidence<'a> {
     ) -> ObligationState {
         let own = match result.expected {
             Expected::Passes { test } => self.test_passed(test, bootstrap),
+            // A proving catch is its case's own judgment, which reads no
+            // contract.
+            Expected::Caught { .. } | Expected::HarnessCaught { .. } if !bootstrap => {
+                let id = result.expected.id().expect("a catch has an identity");
+                self.one_result(&id).and_then(|record| {
+                    judge(
+                        self.manifest,
+                        &self.traces,
+                        &result.expected,
+                        &record.actual,
+                    )
+                })
+            }
             Expected::Open { until, .. } => Err(match until {
                 Some(until) => format!("transitional until {until}"),
                 None => "an Open decides nothing".to_owned(),
             }),
-            _ => Err("a contract or entry is decided only by a test".to_owned()),
+            _ => Err("a contract or entry is decided only by a test or a catch".to_owned()),
         };
         // A blocked C5 blocks. A test that's missing or failed blocks too,
         // even under an excluded C5, so only a passing one is excluded by it.
@@ -858,15 +921,22 @@ impl<'a> Evidence<'a> {
     /// execution's role, whether its `Draft` override is empty and who runs
     /// it ([`roles`]).
     fn context(&self, result: &ExpectedResult) -> ResultCtx {
-        let harness = expected_harness(self.manifest, &result.expected);
-        ResultCtx {
-            kind: result.expected.kind(),
-            machine: harness
-                .as_deref()
-                .is_some_and(|harness| self.manifest.machines.contains(&harness)),
-            harness,
-            executions: roles(&result.expected),
-        }
+        result_context(self.manifest, &result.expected)
+    }
+}
+
+/// What the narrowing entries decide on for `expected` in `manifest`, as
+/// the evaluator gives it: its kind, its harness and machine flag, and each
+/// execution's role ([`roles`]), all from the manifest.
+pub fn result_context(manifest: &Manifest, expected: &Expected) -> ResultCtx {
+    let harness = expected_harness(manifest, expected);
+    ResultCtx {
+        kind: expected.kind(),
+        machine: harness
+            .as_deref()
+            .is_some_and(|harness| manifest.machines.contains(&harness)),
+        harness,
+        executions: roles(expected),
     }
 }
 
@@ -915,15 +985,20 @@ fn owned_runs(expected: &Expected) -> Vec<RunId> {
         Expected::Caught { case, .. } => [CaseRun::Baseline, CaseRun::Patched, CaseRun::Draft]
             .map(|run| RunId::case(case, run))
             .to_vec(),
-        Expected::MachineCaught { case, .. } => [CaseRun::Baseline, CaseRun::Patched]
-            .map(|run| RunId::case(case, run))
-            .to_vec(),
+        Expected::MachineCaught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            [CaseRun::Baseline, CaseRun::Patched]
+                .map(|run| RunId::case(case, run))
+                .to_vec()
+        }
         Expected::IntegrityCaught { patch, .. } => {
             [CaseRun::Unpatched, CaseRun::Patched, CaseRun::Restored]
                 .map(|run| RunId::native(patch, run))
                 .to_vec()
         }
-        Expected::Replays { .. } | Expected::Passes { .. } | Expected::Open { .. } => Vec::new(),
+        Expected::UnitCaught { .. }
+        | Expected::Replays { .. }
+        | Expected::Passes { .. }
+        | Expected::Open { .. } => Vec::new(),
     }
 }
 
@@ -937,14 +1012,15 @@ fn executions(actual: &Actual) -> Vec<&Execution> {
             draft,
             ..
         } => vec![baseline, patched, draft],
-        Actual::MachineCaught { baseline, patched } => vec![baseline, patched],
+        Actual::MachineCaught { baseline, patched }
+        | Actual::HarnessCaught { baseline, patched } => vec![baseline, patched],
         Actual::IntegrityCaught {
             unpatched,
             patched,
             restored,
             ..
         } => vec![unpatched, patched, restored],
-        Actual::Replay { .. } | Actual::Test { .. } => Vec::new(),
+        Actual::UnitCaught { .. } | Actual::Replay { .. } | Actual::Test { .. } => Vec::new(),
     }
 }
 
@@ -956,11 +1032,11 @@ fn expected_harness(manifest: &Manifest, expected: &Expected) -> Option<String> 
         Expected::Holds { history, .. }
         | Expected::StaysNotApplicable { history, .. }
         | Expected::IntegrityCaught { history, .. } => Some(history.harness.to_owned()),
-        Expected::Caught { harness, .. } | Expected::MachineCaught { harness, .. } => {
-            Some((*harness).to_owned())
-        }
+        Expected::Caught { harness, .. }
+        | Expected::MachineCaught { harness, .. }
+        | Expected::HarnessCaught { harness, .. } => Some((*harness).to_owned()),
         Expected::Replays { run } => replayed_harness(manifest, run),
-        Expected::Passes { .. } | Expected::Open { .. } => None,
+        Expected::UnitCaught { .. } | Expected::Passes { .. } | Expected::Open { .. } => None,
     }
 }
 
@@ -976,6 +1052,7 @@ fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
                 .find_map(|result| match result.expected {
                     Expected::Caught { case, harness, .. }
                     | Expected::MachineCaught { case, harness }
+                    | Expected::HarnessCaught { case, harness, .. }
                         if case.property == property && case.name == name =>
                     {
                         Some(harness.to_owned())
@@ -1091,6 +1168,7 @@ fn judge(
                 found,
                 companions,
                 not_applicable,
+                patched_not_applicable,
             },
             Actual::Caught {
                 baseline,
@@ -1113,8 +1191,10 @@ fn judge(
                 not_applicable,
             )?;
             target_held(baseline, case.property)?;
-            caught_patched(manifest, patched, case, harness, set, found, not_applicable)?;
-            caught_draft(manifest, draft, case, harness, set, not_applicable)?;
+            // The patched build's completed runs go on past the break.
+            let past_break = patched_not_applicable.unwrap_or(not_applicable);
+            caught_patched(manifest, patched, case, harness, set, found, past_break)?;
+            caught_draft(manifest, draft, case, harness, set, past_break)?;
             companions_shown(companions, shown, draft)
         }
         (
@@ -1164,6 +1244,43 @@ fn judge(
                 return Err("its patched run lost the trigger history".into());
             }
             exactly_violated(patched, &[case.property])
+        }
+        (
+            Expected::HarnessCaught {
+                case,
+                harness,
+                detail,
+                not_applicable,
+            },
+            Actual::HarnessCaught { baseline, patched },
+        ) => {
+            if manifest.machines.contains(&harness) {
+                return Err(format!("{harness} is a machine, which runs no drain"));
+            }
+            whole_report(
+                manifest,
+                baseline,
+                &RunId::case(case, CaseRun::Baseline),
+                harness,
+                case.property,
+                not_applicable,
+            )?;
+            target_held(baseline, case.property)?;
+            same_run(
+                manifest,
+                patched,
+                &RunId::case(case, CaseRun::Patched),
+                harness,
+            )?;
+            inventory(manifest, patched, harness)?;
+            if patched.leaked != 0 {
+                return Err(format!("its patched run leaked {} tasks", patched.leaked));
+            }
+            missing_evidence(&patched.end, case.property, detail)?;
+            match violated(patched).next() {
+                Some(property) => Err(format!("its patched run violated {property}")),
+                None => Ok(()),
+            }
         }
         (
             Expected::IntegrityCaught {
@@ -1262,6 +1379,10 @@ fn judge(
             }
         }
         (Expected::Passes { test }, actual) => judge_test(actual, test),
+        (Expected::UnitCaught { .. }, Actual::UnitCaught { refused }) => match refused {
+            None => Ok(()),
+            Some(why) => Err(why.clone()),
+        },
         (expected, actual) => Err(format!(
             "a {:?} result can't satisfy a {:?}",
             kind_of(actual),
@@ -1342,7 +1463,9 @@ fn kind_of(actual: &Actual) -> &'static str {
         Actual::Run(_) => "run",
         Actual::Caught { .. } => "caught",
         Actual::MachineCaught { .. } => "machine-caught",
+        Actual::HarnessCaught { .. } => "harness-caught",
         Actual::IntegrityCaught { .. } => "integrity-caught",
+        Actual::UnitCaught { .. } => "unit-caught",
         Actual::Replay { .. } => "replay",
         Actual::Test { .. } => "test",
     }
@@ -1438,8 +1561,8 @@ fn target_held(run: &Execution, target: &str) -> Result<(), String> {
 /// The whole-report rule for a completed counted run: the execution is the
 /// expected one, it completed with every declared action, leaked no task,
 /// reports exactly its harness's properties, and every one other than
-/// `target` held, or stayed `NotApplicable` with the reason the row lists
-/// for it. The caller judges `target`.
+/// `target` held, or stayed `NotApplicable` with the benign reason the row
+/// lists for it ([`others_pass`]). The caller judges `target`.
 fn whole_report(
     manifest: &Manifest,
     run: &Execution,
@@ -1454,10 +1577,13 @@ fn whole_report(
     others_pass(run, &[target], not_applicable)
 }
 
-/// Checks every property of `run` outside `skip` held, or stayed
-/// `NotApplicable` with the reason `not_applicable` lists for it. A listed
-/// property that held, an unlisted one that didn't apply, a wrong reason and
-/// a violation each fail.
+/// Checks every property of `run`, a completed counted run, outside `skip`
+/// held, or stayed `NotApplicable` with the reason `not_applicable` lists
+/// for it, which must be benign ([`benign`]). A listed property that held,
+/// an unlisted one that didn't apply, a wrong reason and a violation each
+/// fail. So does an incomplete reason, such as `unsettled:watch-open`,
+/// whatever a list says: it's evidence the run left open, not a property
+/// with nothing to check, so no list can accept it (C6).
 fn others_pass(
     run: &Execution,
     skip: &[&str],
@@ -1480,6 +1606,11 @@ fn others_pass(
             .find(|na| na.property == property.as_str());
         match (report, listed) {
             (Report::Held { .. }, None) => {}
+            (Report::NotApplicable { reason }, _) if !benign(reason) => {
+                return Err(format!(
+                    "{property} is NotApplicable({reason}), whose evidence is incomplete"
+                ))
+            }
             (Report::NotApplicable { reason: given }, Some(na)) if given == na.reason => {}
             (report, listed) => {
                 return Err(format!(
@@ -1493,6 +1624,18 @@ fn others_pass(
         }
     }
     Ok(())
+}
+
+/// Whether `reason`, a `NotApplicable` report's reason by name, says there
+/// was nothing to judge ([`NaReason::is_benign`](crate::NaReason::is_benign))
+/// rather than that the run's observations were incomplete. A name no
+/// reason a header ID can carry has isn't benign.
+fn benign(reason: &str) -> bool {
+    super::reasons::NA_REASONS
+        .iter()
+        .map(|entry| entry.reason)
+        .chain(super::reasons::NOT_HEADER.iter().map(|&(reason, _)| reason))
+        .any(|known| known.is_benign() && known.name() == reason)
 }
 
 /// Checks `run` completed: no stopping violation, no harness failure, every
@@ -1510,9 +1653,10 @@ fn completed(run: &Execution) -> Result<(), String> {
     Ok(())
 }
 
-/// A `Caught`'s patched run: exactly `set` violated where `found` says,
-/// with its trigger history, a complete inventory, no harness failure and
-/// no leaked task. A run stopped at a step is judged as a prefix, so other
+/// A `Caught`'s patched run: exactly `set` violated where `found` says, or
+/// the case's own ID alone for [`Found::AtStepSetOnDraft`], with its
+/// trigger history, a complete inventory, no harness failure and no leaked
+/// task. A run stopped at a step is judged as a prefix, so other
 /// properties may still have work pending there.
 fn caught_patched(
     manifest: &Manifest,
@@ -1537,6 +1681,14 @@ fn caught_patched(
                 return Err("its patched run's actions don't match its declared prefix".into());
             }
         }
+        // The set breaks only after the stop, so the patched run shows the
+        // case's own ID alone, and its Draft run shows the set.
+        (Found::AtStepSetOnDraft, End::Violation { property }) if *property == case.property => {
+            if run.actions == Actions::Incomplete {
+                return Err("its patched run's actions don't match its declared prefix".into());
+            }
+            return exactly_violated(run, &[case.property]);
+        }
         // A completed run gets the whole-report rule outside its set.
         (Found::AtEnd, End::Completed) => {
             if run.actions != Actions::Complete {
@@ -1547,6 +1699,30 @@ fn caught_patched(
         (found, end) => return Err(format!("found {found:?}, its patched run ended {end:?}")),
     }
     exactly_violated(run, set)
+}
+
+/// Checks `end` is a harness failure of `property`'s missing evidence,
+/// `<property> lacks evidence after step <n>: <its detail>` as
+/// `HarnessFailure::MissingEvidence` writes it, whose detail says `detail`.
+fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), String> {
+    let End::HarnessFailure { diagnostic } = end else {
+        return Err(format!(
+            "its patched run ended {end:?}, not at a harness failure"
+        ));
+    };
+    let shown = diagnostic
+        .strip_prefix(property)
+        .and_then(|rest| rest.strip_prefix(" lacks evidence after step "))
+        .and_then(|rest| rest.split_once(": "))
+        .filter(|(step, _)| !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, shown)| shown);
+    match shown {
+        Some(shown) if shown.contains(detail) => Ok(()),
+        _ => Err(format!(
+            "its patched run's harness failure {diagnostic:?} isn't {property}'s missing \
+             evidence saying {detail:?}"
+        )),
+    }
 }
 
 /// A `Caught`'s `Draft` run: a completed counted run with the set as its

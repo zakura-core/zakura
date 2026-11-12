@@ -373,11 +373,19 @@ fn committed_required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
             Some(((property.clone(), name.clone()), harness))
         })
         .collect();
+    let harness_caught: BTreeSet<(String, String)> = planted
+        .iter()
+        .filter(|(property, name)| {
+            header_acceptance::planted_harness_caught(&repo(), property, name).unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     required_keys(&Inventories {
         registered: &registered,
         needs: &needs,
         planted: &planted,
         planted_harnesses: &planted_harnesses,
+        harness_caught: &harness_caught,
         native: &native,
         coverage_tests: &coverage,
         contracts: &contracts,
@@ -624,43 +632,40 @@ fn every_required_key_is_covered_once_with_its_gates() {
         );
         m.expected[at].expected = rows::MACHINE_CLEANUP;
     });
-    // A native mutation's or a narrowing entry's transitional Open with
-    // only another owner, or only another reason.
-    for key in [
-        Key::Native {
-            patch: "dropped-owner-check".into(),
-        },
-        Key::NarrowingTest { entry: "N1".into() },
-    ] {
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
-                *owner = "Evan's side";
-            }
-        });
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-                *reason = "another reason for the same PR";
-            }
-        });
-    }
+    // A narrowing entry's key covered by another test than its entry's.
+    refused(&|m| {
+        let at = covering(m, &Key::NarrowingTest { entry: "N1".into() });
+        if let Expected::Passes { test } = &mut m.expected[at].expected {
+            test.test = "another_test";
+        }
+    });
+    // No native mutation is still to move, so none takes a transitional
+    // Open, even the one a move to a listed PR would write.
+    refused(&|m| {
+        let at = covering(
+            m,
+            &Key::Native {
+                patch: "raw-budget-lease".into(),
+            },
+        );
+        m.expected[at].expected = rows::native_open("hdr-14.7b");
+    });
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
             *until = Some("hdr-14.5");
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
             *owner = "Evan's side";
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("header-sync/storage-operation-ids"));
+        let at = covering(m, &Key::catch("sim/no-task-panic"));
         if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
             *reason = "some other reason hdr-14.4 owns";
         }
@@ -833,19 +838,8 @@ fn every_required_key_is_covered_once_with_its_gates() {
             ),
         };
     });
-    refused(&|m| {
-        let at = covering(
-            m,
-            &Key::Native {
-                patch: "short-cooldown".into(),
-            },
-        );
-        if let Expected::Open { until, .. } = &mut m.expected[at].expected {
-            *until = Some("hdr-14.6");
-        }
-    });
-    // The retired mutation's Open with another reason, or a ToMove's Open,
-    // isn't its own.
+    // The retired mutation's catch of another failure than its pinned
+    // witness's, or any Open, such as a ToMove's, isn't its own.
     refused(&|m| {
         let at = covering(
             m,
@@ -853,8 +847,8 @@ fn every_required_key_is_covered_once_with_its_gates() {
                 patch: "readmission-unchecked".into(),
             },
         );
-        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-            *reason = "covered by a zakura-network unit test";
+        if let Expected::UnitCaught { witness, .. } = &mut m.expected[at].expected {
+            witness.failure = "assertion `left == right` failed: cooldown 0ns";
         }
     });
     refused(&|m| {
@@ -1421,6 +1415,25 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             Some("header-sync/stale-completion-inert"),
             owned(&["committed stale-prepare input"]),
         ),
+    ];
+    // Gate 5's mixed resource witness, run for each of the four resource
+    // rules.
+    let mut groups = groups;
+    for target in [
+        "header-sync/chunk-budget-bound",
+        "header-sync/teardown-returns-baseline",
+        "header-sync/stale-completion-inert",
+        "header-sync/outstanding-work-bounded",
+    ] {
+        groups.push((
+            STORAGE,
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+            Some(target),
+            owned(&["header-resources-mixed"]),
+        ));
+    }
+    groups.extend([
         (
             "header-sync/release-wake",
             "tests/header_release_wake.rs",
@@ -1463,7 +1476,7 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             Some("header/publisher-policy"),
             owned(&["PUBLISHER_INPUT"]),
         ),
-    ];
+    ]);
     // Built once per call for a fixed test table, so the leaks are bounded.
     let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
     groups
@@ -1509,6 +1522,11 @@ fn every_history_names_its_case() {
     // the inventory must name every execution of every counted witness,
     // by its full identity.
     let targets: BTreeSet<(HistoryRef, &str)> = rows::history_targets().into_iter().collect();
+    assert_eq!(
+        targets.len(),
+        rows::history_targets().len(),
+        "each history once per target"
+    );
     assert_eq!(targets, pinned_histories());
     // A history differing from a pinned one only in its witness's file, in
     // its harness, or in the property it's run for, isn't that history.
@@ -1572,8 +1590,19 @@ fn case_harness(property: &str, name: &str) -> Result<String, String> {
 fn case_errors(expected: &[ExpectedResult], cases: &[(String, String)]) -> Vec<String> {
     let mut named: BTreeMap<(String, String), Vec<(bool, &str)>> = BTreeMap::new();
     for result in expected {
+        // A duplicate native mutation's key shares its covering case's
+        // catch, which the case's own row names, and so does a contract's
+        // proving catch.
+        if result
+            .keys
+            .iter()
+            .all(|key| matches!(key, Key::Native { .. } | Key::ContractCatch { .. }))
+        {
+            continue;
+        }
         let (case, machine, declared) = match result.expected {
-            Expected::Caught { case, harness, .. } => (case, false, harness),
+            Expected::Caught { case, harness, .. }
+            | Expected::HarnessCaught { case, harness, .. } => (case, false, harness),
             Expected::MachineCaught { case, harness } => (case, true, harness),
             _ => continue,
         };
@@ -1651,6 +1680,7 @@ fn every_planted_case_is_named_by_one_row_of_its_kind() {
                 found: Found::AtStep,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             };
         }
     });
@@ -1684,7 +1714,8 @@ fn every_planted_case_is_named_by_one_row_of_its_kind() {
 /// Every problem with `mutations` against the native directories `dirs`,
 /// the planted `cases` and `expected`: an unlisted directory, a moved
 /// mutation whose directory remains or whose planted case is missing or
-/// named by no catch, and a stale move.
+/// named by no catch, a duplicate whose covering case is, and a stale
+/// move.
 fn native_errors(
     mutations: &[rows::NativeMutation],
     dirs: &[String],
@@ -1747,9 +1778,24 @@ fn native_errors(
                     errors.push(format!("{}: no diagnostic", mutation.patch));
                 }
             }
-            NativeClass::Retired { reason } => {
+            NativeClass::Retired { reason, witness } => {
                 if reason.is_empty() {
                     errors.push(format!("{}: no reason", mutation.patch));
+                }
+                if witness.failure.is_empty() || witness.shows.is_empty() {
+                    errors.push(format!("{}: no required failure", mutation.patch));
+                }
+            }
+            NativeClass::Duplicate { property, case } => {
+                let named = expected.iter().any(|result| {
+                    matches!(result.expected, Expected::Caught { case: c, .. }
+                        if c.property == property && c.name == case)
+                });
+                if !cases.contains(&(property.to_owned(), case.to_owned())) || !named {
+                    errors.push(format!(
+                        "{}: its covering case {property}/{case} is missing or unnamed",
+                        mutation.patch
+                    ));
                 }
             }
         }
@@ -1765,8 +1811,12 @@ enum NativePin {
     /// It stays native as an integrity mutation on this history, caught
     /// with this diagnostic.
     Integrity(HistoryRef, &'static str),
-    /// It's retired.
-    Retired,
+    /// It's retired, caught by this test outside the simulator, by its
+    /// full libtest name.
+    Retired(&'static str),
+    /// It's retired as a duplicate of this planted case: its property,
+    /// then its name.
+    Duplicate(&'static str, &'static str),
 }
 
 /// The probe-accounting history the integrity mutations run, written from
@@ -1810,7 +1860,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "misstored-page",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
+        NativePin::Duplicate("header-sync/commit-only-authorized", "stored-order"),
     ),
     (
         "own9-join",
@@ -1828,7 +1878,13 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "raw-budget-reservation",
         NativePin::Integrity(PROBE_ACCOUNTING, "ReservedMismatch"),
     ),
-    ("readmission-unchecked", NativePin::Retired),
+    (
+        "readmission-unchecked",
+        NativePin::Retired(
+            "zakura::header_sync::reactor::tests::observer::\
+             a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
+        ),
+    ),
     (
         "reordered-payload",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
@@ -1847,7 +1903,10 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "short-payload",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
+        NativePin::Duplicate(
+            "header-sync/commit-only-authorized",
+            "dropped-payload-header",
+        ),
     ),
     (
         "shutdown-kept-queue",
@@ -1859,7 +1918,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "skipped-retention",
-        NativePin::Move("header-sync/outstanding-work-bounded", "hdr-9d.1"),
+        NativePin::Duplicate("header-sync/outstanding-work-bounded", "retention-skipped"),
     ),
     (
         "skipped-staging",
@@ -1867,7 +1926,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "stale-locator-round",
-        NativePin::Move("header-sync/reset-invalidates-work", "hdr-9a.2"),
+        NativePin::Move("header-sync/reset-invalidates-work", "hdr-14.5"),
     ),
     (
         "stale-status-cache",
@@ -1910,7 +1969,12 @@ fn native_pin_errors(mutations: &[rows::NativeMutation]) -> Vec<String> {
                 },
                 Some(NativePin::Integrity(pinned, pinned_diagnostic)),
             ) => history == pinned && diagnostic == pinned_diagnostic,
-            (NativeClass::Retired { .. }, Some(NativePin::Retired)) => true,
+            (NativeClass::Retired { witness, .. }, Some(NativePin::Retired(test))) => {
+                witness.test.test == test
+            }
+            (NativeClass::Duplicate { property, case }, Some(NativePin::Duplicate(p, c))) => {
+                property == p && case == c
+            }
             _ => false,
         };
         if !ok {
@@ -1934,14 +1998,11 @@ fn every_native_mutation_is_classified() {
     assert_eq!(native_pin_errors(NATIVE_MUTATIONS), Vec::<String>::new());
     // A move's PR or destination changed in the classification itself.
     for (until, property) in [
-        ("hdr-14.5", "header-sync/stale-completion-inert"),
-        ("hdr-14.4", "header-sync/teardown-returns-baseline"),
+        ("hdr-14.5", "header-sync/commit-only-authorized"),
+        ("hdr-9c.2a", "header-sync/teardown-returns-baseline"),
     ] {
         let mut changed = NATIVE_MUTATIONS.to_vec();
-        let at = changed
-            .iter()
-            .position(|m| m.patch == "dropped-owner-check")
-            .unwrap();
+        let at = changed.iter().position(|m| m.patch == "own9-join").unwrap();
         changed[at].class = NativeClass::ToMove { property, until };
         assert_eq!(native_pin_errors(&changed).len(), 1, "{property} {until}");
     }
@@ -1952,11 +2013,20 @@ fn every_native_mutation_is_classified() {
         .find(|m| m.patch == "raw-budget-lease")
         .unwrap()
         .class;
+    let retired = NATIVE_MUTATIONS
+        .iter()
+        .find(|m| m.patch == "readmission-unchecked")
+        .unwrap()
+        .class;
+    let NativeClass::Retired { witness, .. } = retired else {
+        panic!("readmission-unchecked is retired");
+    };
     for (patch, class) in [
         (
             "raw-budget-reservation",
             NativeClass::Retired {
                 reason: "no longer reachable",
+                witness,
             },
         ),
         ("readmission-unchecked", integrity),
@@ -1995,101 +2065,156 @@ fn every_native_mutation_is_classified() {
                 (NativeClass::Integrity { .. }, Expected::IntegrityCaught { .. })
                 | (NativeClass::ToMove { .. }, Expected::Open { until: Some(_), .. }) => {}
                 (
-                    NativeClass::Retired { .. },
-                    Expected::Open {
-                        until: Some("hdr-14.7b"),
-                        ..
+                    NativeClass::Retired { witness, .. },
+                    Expected::UnitCaught {
+                        patch: p,
+                        witness: w,
                     },
-                ) => {}
+                ) if p == patch && *w == witness => {}
+                (NativeClass::Duplicate { property, case }, Expected::Caught { case: c, .. })
+                    if c.property == property && c.name == case => {}
                 (class, expected) => panic!("{patch}: {class:?} as {:?}", expected.kind()),
             }
         }
     }
-    // A retired mutation stays a required key, blocked by its transitional
-    // Open until its witness runs.
+    // A retired mutation stays a required key, on gate 6, which only its
+    // witness's catch verifies.
     assert_eq!(
         committed_required(&manifest).get(&Key::Native {
             patch: "readmission-unchecked".into(),
         }),
         Some(&BTreeSet::from([Gate::G6]))
     );
+    // A duplicate keeps its directory, so it stays a required key on gate
+    // 6, which only its covering case's catch verifies. It's refused when
+    // that case is missing or no catch names it, and its pin refuses it
+    // reclassified as a plain retirement or onto another case.
+    assert_eq!(
+        committed_required(&manifest).get(&Key::Native {
+            patch: "short-payload".into(),
+        }),
+        Some(&BTreeSet::from([Gate::G6]))
+    );
+    let covering = (
+        "header-sync/commit-only-authorized".to_owned(),
+        "dropped-payload-header".to_owned(),
+    );
+    let uncovered: Vec<(String, String)> =
+        cases.iter().filter(|c| **c != covering).cloned().collect();
+    assert_eq!(
+        native_errors(
+            NATIVE_MUTATIONS,
+            &native_dirs(),
+            &uncovered,
+            &manifest.expected
+        )
+        .len(),
+        1
+    );
+    let unnamed: Vec<ExpectedResult> = manifest
+        .expected
+        .iter()
+        .filter(|r| {
+            !matches!(r.expected, Expected::Caught { case, .. }
+                if case.property == covering.0 && case.name == covering.1)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        native_errors(NATIVE_MUTATIONS, &native_dirs(), &cases, &unnamed).len(),
+        1
+    );
+    for class in [
+        NativeClass::Retired {
+            reason: "a duplicate",
+            witness,
+        },
+        NativeClass::Duplicate {
+            property: "header-sync/commit-only-authorized",
+            case: "stored-order",
+        },
+    ] {
+        let mut changed = NATIVE_MUTATIONS.to_vec();
+        let at = changed
+            .iter()
+            .position(|m| m.patch == "short-payload")
+            .unwrap();
+        changed[at].class = class;
+        assert_eq!(native_pin_errors(&changed).len(), 1, "{class:?}");
+    }
     // A mutation whose directory and classification are both removed is
-    // refused, since the inventory still names it.
+    // refused, since the inventory still names it: here the moved
+    // `own9-join`, whose directory is gone.
+    assert!(!native_dirs().iter().any(|dir| dir == "own9-join"));
     let dropped: Vec<rows::NativeMutation> = NATIVE_MUTATIONS
         .iter()
-        .filter(|m| m.patch != "dropped-owner-check")
+        .filter(|m| m.patch != "own9-join")
         .copied()
         .collect();
-    let fewer: Vec<String> = native_dirs()
-        .into_iter()
-        .filter(|dir| dir != "dropped-owner-check")
-        .collect();
-    assert!(!native_errors(&dropped, &fewer, &cases, &manifest.expected).is_empty());
+    assert!(!native_errors(&dropped, &native_dirs(), &cases, &manifest.expected).is_empty());
     // A move's record outlives its directory: once moved, its planted case
-    // must exist under its property and a catch must name it.
-    let mut moved = NATIVE_MUTATIONS.to_vec();
-    let at = moved
+    // must exist under its property and a catch must name it. The
+    // committed move holds. Without its planted case, without the Caught
+    // naming it, onto an existing, caught case of another name, or under
+    // another property, it's refused.
+    let own9 = (
+        "header-sync/commit-only-authorized".to_owned(),
+        "own9-join".to_owned(),
+    );
+    assert!(cases.contains(&own9));
+    let without_case: Vec<(String, String)> =
+        cases.iter().filter(|c| **c != own9).cloned().collect();
+    let unnamed: Vec<ExpectedResult> = manifest
+        .expected
         .iter()
-        .position(|m| m.patch == "dropped-owner-check")
-        .unwrap();
-    let dirs: Vec<String> = native_dirs()
-        .into_iter()
-        .filter(|dir| dir != "dropped-owner-check")
-        .collect();
-    // Moved, it needs a planted case of its own name under its property,
-    // named by a Caught. An existing, caught case of another name doesn't
-    // stand in for it.
-    let mut with_case = cases.clone();
-    with_case.push((
-        "header-sync/stale-completion-inert".into(),
-        "dropped-owner-check".into(),
-    ));
-    let mut named = manifest.expected.clone();
-    let caught = named
-        .iter()
-        .find(|r| {
-            matches!(r.expected, Expected::Caught { case, .. }
-            if case.property == "header-sync/stale-completion-inert")
+        .filter(|r| {
+            !matches!(r.expected, Expected::Caught { case, .. }
+                if case.property == own9.0 && case.name == own9.1)
         })
-        .unwrap()
-        .clone();
-    let mut own = caught;
-    if let Expected::Caught { case, .. } = &mut own.expected {
-        case.name = "dropped-owner-check";
-    }
-    named.push(own);
+        .cloned()
+        .collect();
+    assert_eq!(unnamed.len() + 1, manifest.expected.len());
+    let mut moved = NATIVE_MUTATIONS.to_vec();
+    let at = moved.iter().position(|m| m.patch == "own9-join").unwrap();
     for (property, case, cases, expected, ok) in [
         (
-            "header-sync/stale-completion-inert",
-            "dropped-owner-check",
-            &with_case,
-            &named,
+            "header-sync/commit-only-authorized",
+            "own9-join",
+            &cases,
+            &manifest.expected,
             true,
         ),
         (
-            "header-sync/stale-completion-inert",
-            "stale-charge",
-            &cases,
+            "header-sync/commit-only-authorized",
+            "own9-join",
+            &without_case,
             &manifest.expected,
             false,
         ),
         (
-            "header-sync/stale-completion-inert",
-            "dropped-owner-check",
+            "header-sync/commit-only-authorized",
+            "own9-join",
+            &cases,
+            &unnamed,
+            false,
+        ),
+        (
+            "header-sync/commit-only-authorized",
+            "wrong-peer",
             &cases,
             &manifest.expected,
             false,
         ),
         (
             "header-sync/teardown-returns-baseline",
-            "dropped-owner-check",
-            &with_case,
-            &named,
+            "own9-join",
+            &cases,
+            &manifest.expected,
             false,
         ),
     ] {
         moved[at].class = NativeClass::Moved { property, case };
-        let errors = native_errors(&moved, &dirs, cases, expected);
+        let errors = native_errors(&moved, &native_dirs(), cases, expected);
         assert_eq!(errors.is_empty(), ok, "{property}/{case}: {errors:?}");
     }
 }
@@ -2181,10 +2306,11 @@ fn scripted_bypasses_never_satisfy_a_catch() {
 /// Every `#[test]` or `#[tokio::test]` function in `source`, by its full
 /// libtest name inside the file (`module::name` for one in an inline
 /// module), and whether its own attributes or an enclosing module's keep it
-/// from running: an `#[ignore]`, or a `cfg` other than the two the
-/// acceptance run's test builds turn on, `test` and `zakura_sim`. Doc
-/// comments and other attributes may sit between the test attribute and
-/// the `fn`.
+/// from running: an `#[ignore]`, or a `cfg` the acceptance run's test
+/// builds leave off. They turn on `test` and `zakura_sim`, and run on
+/// Linux, the only host whose record counts (`Containment::Subreaper`), so
+/// `unix` and `target_os = "linux"` are on too. Doc comments and other
+/// attributes may sit between the test attribute and the `fn`.
 fn test_fns(source: &str) -> BTreeMap<String, bool> {
     use proc_macro2::{Delimiter, TokenStream, TokenTree};
     /// Whether `attribute` keeps the item it's on from running in the
@@ -2209,12 +2335,18 @@ fn test_fns(source: &str) -> BTreeMap<String, bool> {
         }
     }
     /// Whether a `cfg` predicate holds in the acceptance run's test builds,
-    /// where `test` and `zakura_sim` are on and nothing else is known on:
-    /// `all`, `any` and `not` evaluate, and any other option is off.
+    /// where `test`, `zakura_sim`, `unix` and `target_os = "linux"` are on
+    /// and nothing else is known on: `all`, `any` and `not` evaluate, and
+    /// any other option is off.
     fn enabled(predicate: TokenStream) -> bool {
         let tokens: Vec<TokenTree> = predicate.into_iter().collect();
         match tokens.as_slice() {
-            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim",
+            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim" || name == "unix",
+            [TokenTree::Ident(name), TokenTree::Punct(eq), TokenTree::Literal(value)]
+                if eq.as_char() == '=' =>
+            {
+                name == "target_os" && value.to_string() == "\"linux\""
+            }
             [TokenTree::Ident(name), TokenTree::Group(args)] => {
                 let mut parts = Vec::new();
                 let mut part = Vec::new();
@@ -2378,9 +2510,77 @@ fn test_exists(test: TestRef) -> Result<(), String> {
     }
 }
 
+/// Every proving catch of `manifest`'s contracts that doesn't name a
+/// committed planted case with a row's `Caught`.
+fn catch_errors(manifest: &Manifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    for contract in &manifest.contracts {
+        for case in contract.proving_catches {
+            let patch = repo()
+                .join("qa/planted")
+                .join(case.property)
+                .join(format!("{}.patch", case.name));
+            if !patch.is_file() {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no planted case",
+                    contract.id, case.property, case.name
+                ));
+            }
+            let caught = manifest.expected.iter().any(|result| {
+                result
+                    .keys
+                    .iter()
+                    .any(|key| matches!(key, Key::Case { .. }))
+                    && matches!(
+                        result.expected,
+                        Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
+                            if c == *case
+                    )
+            });
+            if !caught {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no row's Caught",
+                    contract.id, case.property, case.name
+                ));
+            }
+        }
+    }
+    errors
+}
+
 #[test]
 fn every_referenced_test_exists() {
     let manifest = Manifest::committed();
+    // Every proving catch names a committed case and a row's catch of it.
+    assert_eq!(catch_errors(&manifest), Vec::<String>::new());
+    assert!(manifest
+        .contracts
+        .iter()
+        .any(|contract| !contract.proving_catches.is_empty()));
+    for (case, error) in [
+        (
+            CaseRef {
+                property: "header-sync/header-fault-penalized",
+                name: "no-such-case",
+            },
+            "has no planted case",
+        ),
+        (
+            CaseRef {
+                property: "session/honest-never-punished",
+                name: "no-such-case",
+            },
+            "has no row's Caught",
+        ),
+    ] {
+        let mut named = manifest.clone();
+        named.contracts[0].proving_catches = Box::leak(Box::new([case]));
+        assert!(
+            catch_errors(&named).iter().any(|e| e.contains(error)),
+            "{case:?}: {:?}",
+            catch_errors(&named)
+        );
+    }
     let mut tests = BTreeSet::new();
     for result in &manifest.expected {
         match result.expected {
@@ -2592,6 +2792,9 @@ fn an_unnamed_replay_test() {{}}
          #[test]\n#[cfg(all(test, zakura_sim))]\nfn h() {}\n\
          #[test]\n#[cfg(all(test, windows))]\nfn i() {}\n\
          #[test]\n#[cfg(not(feature = \"slow\"))]\nfn j() {}\n\
+         #[test]\n#[cfg(target_os = \"linux\")]\nfn k() {}\n\
+         #[test]\n#[cfg(target_os = \"macos\")]\nfn l() {}\n\
+         #[test]\n#[cfg(not(unix))]\nfn n() {}\n\
          #[cfg(test)]\nmod on {\n    #[test]\n    #[cfg(zakura_sim)]\n    fn g() {}\n}\n\
          #[tokio::test(flavor = \"multi_thread\")]\nasync fn e() {}\n\
          fn not_a_test() {}\n",
@@ -2599,7 +2802,7 @@ fn an_unnamed_replay_test() {{}}
     let expected: BTreeMap<String, bool> = [
         ("a", false),
         ("m::a", false),
-        ("b", true),
+        ("b", false),
         ("c", true),
         ("d", false),
         ("e", false),
@@ -2608,6 +2811,9 @@ fn an_unnamed_replay_test() {{}}
         ("h", false),
         ("i", true),
         ("j", false),
+        ("k", false),
+        ("l", true),
+        ("n", true),
     ]
     .map(|(name, cfg)| (name.to_owned(), cfg))
     .into_iter()
@@ -2622,6 +2828,15 @@ fn an_unnamed_replay_test() {{}}
         ..xtask
     })
     .is_err());
+    // A real `#[cfg(unix)]` runner test resolves, since only a Linux run's
+    // record counts.
+    assert_eq!(
+        test_exists(TestRef {
+            test: "planted::tests::a_hung_patched_run_is_killed_and_never_caught",
+            ..xtask
+        }),
+        Ok(())
+    );
     // A real `#[tokio::test]` resolves, and an ignored test doesn't.
     assert_eq!(
         test_exists(TestRef {
@@ -2748,6 +2963,7 @@ fn the_contracts_table_has_one_row_per_required_contract() {
     assert!(!contract_errors(&doubled).is_empty());
     let mut unproved = table.clone();
     unproved[0].state = ContractState::Satisfied;
+    unproved[0].proving = &[];
     assert!(!contract_errors(&unproved).is_empty());
 }
 
@@ -2777,7 +2993,6 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 const OPEN_PRS: &[&str] = &[
     "hdr-14.4",
     "hdr-14.5",
-    "hdr-14.6",
     "hdr-14.7b",
     "hdr-14.8",
     "hf-1",
@@ -2813,7 +3028,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let penalized = "header-sync/header-fault-penalized";
+    let panic = "sim/no-task-panic";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -2826,6 +3041,7 @@ fn every_transitional_row_names_an_open_pr() {
         harness,
         found,
         not_applicable,
+        patched_not_applicable,
         companions,
         ..
     } = caught
@@ -2834,19 +3050,20 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: penalized.into(),
-            name: "late-fault".into(),
+            property: panic.into(),
+            name: "task-panic".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: penalized,
-                name: "late-fault",
+                property: panic,
+                name: "task-panic",
             },
             harness,
-            set: &["header-sync/header-fault-penalized"],
+            set: &["sim/no-task-panic"],
             found,
             not_applicable,
+            patched_not_applicable,
             companions,
         },
     });
@@ -2935,20 +3152,148 @@ fn the_gate_requirements_match_their_obligations() {
         name: "gate-3/crossing/crossing-close".into(),
     };
     assert!(!crossing.covers(&standing.expected, NARROWING));
-    // A requirement's own Open with only its owner changed.
-    for name in ["gate-2/bad-content-close-claim", "gate-1/a-a-and-a-b-a"] {
+    // Each crossing requirement is its own history's test. Another
+    // history's test doesn't satisfy it, nor does its old transitional
+    // Open: a conformant crossing isn't the over-window Grant's close.
+    for (name, own) in CROSSINGS {
+        let key = Key::Requirement {
+            name: format!("gate-3/crossing/{name}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{name}"
+        );
+        for (other, test) in CROSSINGS {
+            if other != name {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{name}");
+            }
+        }
+        let transitional = Expected::Open {
+            reason: "a crossed update, labelled and judged",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{name}");
+    }
+    // Each row's bad-content requirement is that row's fault-close test,
+    // since a content rejection owes the close. Another row's test doesn't
+    // satisfy it, nor does its old transitional Open, nor the
+    // disconnect-mid-prepare witness: a fault found after an environment
+    // disconnect owes the penalty, not a close.
+    for (row, own) in BAD_CONTENT_CLOSES {
+        let key = Key::Requirement {
+            name: format!("gate-2/bad-content-fault-close/{row}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{row}"
+        );
+        for (other, test) in BAD_CONTENT_CLOSES {
+            if other != row {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{row}");
+            }
+        }
+        assert!(
+            !key.covers(&Expected::Passes { test: MID_PREPARE }, NARROWING),
+            "{row}"
+        );
+        let transitional = Expected::Open {
+            reason: "the bad-content history carries the fault-close assertion where the close \
+                     is owed",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{row}");
+    }
+    // A requirement's own Open with only its owner changed, or its own
+    // test with only its name changed.
+    for name in [
+        "gate-2/bad-content-close-claim",
+        "gate-1/topology-freshness",
+        "gate-1/a-a-and-a-b-a",
+        "gate-1/replay-store-control",
+    ] {
         let requirement = GATE_REQUIREMENTS.iter().find(|r| r.name == name).unwrap();
         let mut changed = requirement.expected.clone();
-        if let Expected::Open { owner, .. } = &mut changed {
-            *owner = "someone else";
+        match &mut changed {
+            Expected::Open { owner, .. } => *owner = "someone else",
+            Expected::Passes { test } => test.test = "another_test",
+            other => panic!("{name}: {other:?}"),
         }
         let key = Key::Requirement { name: name.into() };
+        assert!(key.covers(&requirement.expected, NARROWING), "{name}");
         assert!(!key.covers(&changed, NARROWING), "{name}");
     }
 }
 
 /// The wire witness file.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
+
+/// Each row's bad-content fault-close test, by row.
+const BAD_CONTENT_CLOSES: [(&str, TestRef); 4] = [
+    (
+        "status",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "subscribe-headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        ),
+    ),
+    (
+        "headers-outcome",
+        sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        ),
+    ),
+];
+
+/// Each gate-3 crossing history's test, by requirement name.
+const CROSSINGS: [(&str, TestRef); 3] = [
+    (
+        "unretained-open-then-outcome",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "crossing-close",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "over-window-grant",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+        ),
+    ),
+];
+
+/// The disconnect-mid-prepare witness, whose fault came after its session
+/// ended, so it owes the penalty and no close.
+const MID_PREPARE: TestRef = sim_test(
+    "tests/header_wire_prepare_fault.rs",
+    "a_disconnect_mid_prepare_is_still_penalized",
+);
 
 /// Each history a row judges for an ID other than the one it's run for, as
 /// `(history, ID)`: `both-ways`, run for `conformant-never-closes`,
@@ -3696,8 +4041,9 @@ const NATIVE_HISTORY: HistoryRef = HistoryRef {
 };
 /// The harness the native mutation's history runs on.
 const NATIVE_HARNESS: &str = "header-sync/storage";
-/// Why `t/b` doesn't apply on [`HISTORY`].
-const UNREACHED: &str = "unreached here";
+/// Why `t/b` doesn't apply on [`HISTORY`]: a benign reason, since a
+/// completed counted run accepts no other for a non-target property.
+const UNREACHED: &str = "never-applied";
 /// Why `t/b` never applies.
 const NEVER: &str = "never applies";
 /// `t/b`'s expected `NotApplicable` on [`HISTORY`].
@@ -3742,6 +4088,7 @@ fn satisfied(id: ContractId, test: &'static [TestRef]) -> Contract {
         owner: "test",
         statement: "test",
         proving: test,
+        proving_catches: &[],
         state: ContractState::Satisfied,
         delivery: "test",
     }
@@ -3852,6 +4199,7 @@ fn manifest() -> Manifest {
                 found: Found::AtStep,
                 companions: &["close"],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -3867,6 +4215,7 @@ fn manifest() -> Manifest {
                 found: Found::AtEnd,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -4006,7 +4355,7 @@ fn na(reason: &str) -> Report {
 }
 
 /// A test result for `test`, which ran `ran` with `outcome`, from a binary
-/// embedding the subject's source.
+/// embedding the subject's source, in a checkout of it.
 fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
     Actual::Test {
         ran: vec![TestRan {
@@ -4016,6 +4365,7 @@ fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
             outcome,
         }],
         binary_source: Some(SOURCE.into()),
+        checkout_source: Some(SOURCE.into()),
     }
 }
 
@@ -4177,6 +4527,96 @@ fn results() -> ResultFile {
     }
 }
 
+/// A native mutation retired as a duplicate, a real one, since
+/// `Key::Native` binds to its classification.
+const DUPLICATE: &str = "short-payload";
+/// The planted case its classification names as covering it.
+const DUPLICATE_CASE: CaseRef = CaseRef {
+    property: "header-sync/commit-only-authorized",
+    name: "dropped-payload-header",
+};
+/// The node harness the covering case runs on here.
+const DUPLICATE_NODE: &str = "t/commit-node";
+
+/// The duplicate's native key.
+fn duplicate_key() -> Key {
+    Key::Native {
+        patch: DUPLICATE.into(),
+    }
+}
+
+/// The covering case's catch.
+fn duplicate_caught() -> Expected {
+    Expected::Caught {
+        case: DUPLICATE_CASE,
+        harness: DUPLICATE_NODE,
+        set: &[DUPLICATE_CASE.property],
+        found: Found::AtStep,
+        companions: &[],
+        not_applicable: &[],
+        patched_not_applicable: None,
+    }
+}
+
+/// The test manifest and its genuine results with the duplicate added: the
+/// covering case's catch on its case key, the duplicate's native key on
+/// gate 6 sharing that catch, and the catch's three runs.
+fn with_duplicate() -> (Manifest, ResultFile) {
+    let mut manifest = manifest();
+    manifest.expected.push(er(
+        vec![Key::Case {
+            property: DUPLICATE_CASE.property.into(),
+            name: DUPLICATE_CASE.name.into(),
+        }],
+        &[Gate::G2],
+        duplicate_caught(),
+    ));
+    manifest
+        .expected
+        .push(er(vec![duplicate_key()], &[Gate::G6], duplicate_caught()));
+    manifest
+        .matrix
+        .push((DUPLICATE_NODE, DUPLICATE_CASE.property, Status::Active));
+    let property = DUPLICATE_CASE.property;
+    let run = |which, report| {
+        execution(
+            RunId::case(DUPLICATE_CASE, which),
+            DUPLICATE_NODE,
+            &[(property, report)],
+        )
+    };
+    let mut patched = run(CaseRun::Patched, Report::Violated);
+    patched.end = End::Violation {
+        property: property.into(),
+    };
+    patched.actions = Actions::Prefix;
+    let mut draft = run(CaseRun::Draft, Report::Violated);
+    draft.meta.draft_override = vec![property.into()];
+    let mut results = results();
+    results.results.push(ResultRecord {
+        expected: duplicate_caught().id().unwrap(),
+        commit: S.into(),
+        actual: Actual::Caught {
+            baseline: run(CaseRun::Baseline, held()),
+            patched,
+            draft,
+            companions: Vec::new(),
+        },
+    });
+    (manifest, results)
+}
+
+/// The state [`with_duplicate`]'s evaluation gives the duplicate's key
+/// once `defect` changes its manifest or results, against the keys the
+/// unchanged manifest requires.
+fn duplicate_state(defect: impl FnOnce(&mut Manifest, &mut ResultFile)) -> ObligationState {
+    let (mut manifest, mut results) = with_duplicate();
+    let required = required(&manifest);
+    defect(&mut manifest, &mut results);
+    header_acceptance::evaluate(&manifest, &required, &results, SUBJECT).keys[&duplicate_key()]
+        .clone()
+}
+
 /// The state the test manifest's evaluation gives `key`.
 fn state(manifest: &Manifest, results: &ResultFile, key: &Key) -> ObligationState {
     header_acceptance::evaluate(manifest, &required(manifest), results, SUBJECT)
@@ -4282,6 +4722,48 @@ fn the_evaluator_accepts_genuine_results() {
     );
     assert!(evaluation.gates.values().all(|passes| *passes));
 
+    // A duplicate native mutation's key shares its covering case's catch,
+    // and that catch verifies it.
+    let (with, results_with) = with_duplicate();
+    let evaluation = header_acceptance::evaluate(&with, &required(&with), &results_with, SUBJECT);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    assert_eq!(evaluation.keys[&duplicate_key()], ObligationState::Verified);
+    assert!(evaluation.gates[&Gate::G6]);
+
+    // A bad-content close requirement verifies on its row's fault-close
+    // test, beside the disconnect-mid-prepare witness, which owes the
+    // penalty and no close and verifies on its own key. Swapping the
+    // requirement onto that witness's pass blocks it.
+    let (row, close) = BAD_CONTENT_CLOSES[2];
+    let requirement = Key::Requirement {
+        name: format!("gate-2/bad-content-fault-close/{row}"),
+    };
+    let mut owed = manifest.clone();
+    owed.expected.push(er(
+        vec![requirement.clone()],
+        &[Gate::G2],
+        Expected::Passes { test: close },
+    ));
+    owed.expected.push(er(
+        vec![witness_key(MID_PREPARE)],
+        &[Gate::G2],
+        Expected::Passes { test: MID_PREPARE },
+    ));
+    let mut passed = results();
+    passed.results.push(test_record(close));
+    passed.results.push(test_record(MID_PREPARE));
+    for key in [&requirement, &witness_key(MID_PREPARE)] {
+        assert_eq!(
+            state(&owed, &passed, key),
+            ObligationState::Verified,
+            "{key:?}"
+        );
+    }
+    let mut swapped = owed.clone();
+    let at = covering(&swapped, &requirement);
+    swapped.expected[at].expected = Expected::Passes { test: MID_PREPARE };
+    assert!(blocked(&state(&swapped, &passed, &requirement)));
+
     // A catch stopped at a step is a prefix: another property may still be
     // open there.
     let mut pending = results();
@@ -4293,6 +4775,41 @@ fn the_evaluator_accepts_genuine_results() {
         state(&manifest, &pending, &Key::catch("t/a")),
         ObligationState::Verified
     );
+
+    // A set judged on the Draft run: the patched run stops at the case's
+    // own ID alone, and the Draft run, with the whole set as its override,
+    // violates every member by its end. The patched run with the broader ID
+    // violated too, or stopped by it, and a Draft run that doesn't violate
+    // it, each block the case.
+    let late = Key::Case {
+        property: "t/a".into(),
+        name: "late-bug".into(),
+    };
+    let mut later = manifest.clone();
+    let at = covering(&later, &late);
+    if let Expected::Caught { set, found, .. } = &mut later.expected[at].expected {
+        *set = &["t/a", "t/b"];
+        *found = Found::AtStepSetOnDraft;
+    }
+    let judged = |stopped_by: &str, patched_b: Report, draft_b: Report| {
+        let mut file = results();
+        let (_, patched, draft, _) = caught_runs(&mut file, END_CASE);
+        patched.end = End::Violation {
+            property: stopped_by.into(),
+        };
+        patched.actions = Actions::Prefix;
+        patched.reports.insert("t/b".into(), patched_b);
+        draft.reports.insert("t/b".into(), draft_b);
+        draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
+        state(&later, &file, &late)
+    };
+    assert_eq!(
+        judged("t/a", held(), Report::Violated),
+        ObligationState::Verified
+    );
+    assert!(blocked(&judged("t/a", Report::Violated, Report::Violated)));
+    assert!(blocked(&judged("t/b", held(), Report::Violated)));
+    assert!(blocked(&judged("t/a", held(), held())));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on
@@ -4735,6 +5252,38 @@ fn the_evaluator_refuses_each_single_defect() {
     refused(&Key::passing("t/a"), |r| {
         run_of(r, &holds_id()).meta.input = Some(HISTORY.into())
     });
+    // A duplicate native mutation blocks unless its covering case is
+    // caught: the case never ran, its patched run held, the catch covering
+    // it is gone, or it shares another case's catch.
+    let covering = duplicate_caught().id().unwrap();
+    for state in [
+        duplicate_state(|_, r| r.results.retain(|record| record.expected != covering)),
+        duplicate_state(|_, r| {
+            let patched = caught_runs(r, DUPLICATE_CASE).1;
+            patched.end = End::Completed;
+            patched.actions = Actions::Complete;
+            patched
+                .reports
+                .insert(DUPLICATE_CASE.property.into(), held());
+        }),
+        duplicate_state(|m, _| m.expected.retain(|e| e.keys != [duplicate_key()])),
+        duplicate_state(|m, _| {
+            let other = m
+                .expected
+                .iter()
+                .find(|e| matches!(e.expected, Expected::Caught { case, .. } if case == CASE))
+                .unwrap()
+                .expected
+                .clone();
+            for result in &mut m.expected {
+                if result.keys == [duplicate_key()] {
+                    result.expected = other.clone();
+                }
+            }
+        }),
+    ] {
+        assert!(blocked(&state), "{state:?}");
+    }
 }
 
 /// Manifest-side defects: each must block the key it touches.
@@ -4824,6 +5373,114 @@ fn the_evaluator_refuses_manifest_defects() {
     assert!(!evaluation.accepted());
 }
 
+/// A harness-caught case (Adam's ruling on question 7) verifies only with
+/// its baseline holding and its patched run ending at its own property's
+/// missing evidence that says its detail, violating nothing. Every other
+/// end blocks it, and a contract's proving catch may name it.
+#[test]
+fn the_evaluator_judges_a_harness_caught_case() {
+    const STUCK: CaseRef = CaseRef {
+        property: "t/a",
+        name: "stuck",
+    };
+    const DETAIL: &str = "with a boundary unread";
+    let key = Key::Case {
+        property: "t/a".into(),
+        name: "stuck".into(),
+    };
+    let caught = Expected::HarnessCaught {
+        case: STUCK,
+        harness: NODE,
+        detail: DETAIL,
+        not_applicable: &[],
+    };
+    let mut m = manifest();
+    m.expected
+        .push(er(vec![key.clone()], &[Gate::G2], caught.clone()));
+    let id = caught.id().unwrap();
+    let ended = |diagnostic: &str| {
+        let mut patched = execution(
+            RunId::case(STUCK, CaseRun::Patched),
+            NODE,
+            &[("t/a", na("harness-failed")), ("t/b", na("harness-failed"))],
+        );
+        patched.end = End::HarnessFailure {
+            diagnostic: diagnostic.into(),
+        };
+        patched
+    };
+    let with = |patched: Execution| {
+        let mut results = results();
+        results.results.push(ResultRecord {
+            expected: id.clone(),
+            commit: S.into(),
+            actual: Actual::HarnessCaught {
+                baseline: execution(
+                    RunId::case(STUCK, CaseRun::Baseline),
+                    NODE,
+                    &[("t/a", held()), ("t/b", held())],
+                ),
+                patched,
+            },
+        });
+        results
+    };
+    let missing = format!("t/a lacks evidence after step 9: the run ran dry after step 9 {DETAIL}");
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &key),
+        ObligationState::Verified
+    );
+
+    // Another property's missing evidence, another detail, another harness
+    // failure, no step, a completed run or a stop at a violation blocks it.
+    for diagnostic in [
+        format!("t/b lacks evidence after step 9: {DETAIL}"),
+        "t/a lacks evidence after step 9: a gap".to_owned(),
+        format!("t/a lacks evidence after step : {DETAIL}"),
+        format!("source 3's evidence failed: {DETAIL}"),
+    ] {
+        assert!(
+            blocked(&state(&m, &with(ended(&diagnostic)), &key)),
+            "{diagnostic}"
+        );
+    }
+    let mut completed = ended(&missing);
+    completed.end = End::Completed;
+    assert!(blocked(&state(&m, &with(completed), &key)));
+    let mut stopped = ended(&missing);
+    stopped.end = End::Violation {
+        property: "t/a".into(),
+    };
+    assert!(blocked(&state(&m, &with(stopped), &key)));
+    // A violation beside the missing evidence, or a leaked task, blocks it.
+    let mut violating = ended(&missing);
+    violating.reports.insert("t/b".into(), Report::Violated);
+    assert!(blocked(&state(&m, &with(violating), &key)));
+    let mut leaking = ended(&missing);
+    leaking.leaked = 1;
+    assert!(blocked(&state(&m, &with(leaking), &key)));
+    // A Caught's record never stands in for it.
+    let mut wrong = with(ended(&missing));
+    wrong.results.last_mut().unwrap().actual = caught_actual(STUCK, Found::AtStep);
+    assert!(blocked(&state(&m, &wrong, &key)));
+
+    // As a contract's proving catch, it decides that contract.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, STUCK);
+    m.contracts[0].proving_catches = &[STUCK];
+    m.expected.push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &catch_key),
+        ObligationState::Verified
+    );
+    let other = format!("t/b lacks evidence after step 9: {DETAIL}");
+    assert!(blocked(&state(&m, &with(ended(&other)), &catch_key)));
+    assert!(blocked(&state(
+        &m,
+        &with(ended(&other)),
+        &Key::passing("t/a")
+    )));
+}
+
 #[test]
 fn the_evaluator_applies_contracts_and_narrowing() {
     let holds = Key::passing("t/a");
@@ -4846,6 +5503,44 @@ fn the_evaluator_applies_contracts_and_narrowing() {
     let mut m = manifest();
     m.contracts[0].state = ContractState::Blocked { waiting_for: "E1" };
     assert!(blocked(&state(&m, &results(), &holds)));
+
+    // A proving catch decides its contract as a proving test does: C3,
+    // proved by `CASE`'s catch too, counts only while that catch's own
+    // judgment passes, and only the `Caught` of exactly that case covers
+    // its key.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, CASE);
+    let caught_of = |m: &Manifest, case: CaseRef| {
+        m.expected
+            .iter()
+            .find(|r| matches!(r.expected, Expected::Caught { case: c, .. } if c == case))
+            .unwrap()
+            .expected
+            .clone()
+    };
+    let mut proved = manifest();
+    proved.contracts[0].proving_catches = &[CASE];
+    let caught = caught_of(&proved, CASE);
+    proved
+        .expected
+        .push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&proved, &results(), &catch_key),
+        ObligationState::Verified
+    );
+    assert_eq!(
+        state(&proved, &results(), &holds),
+        ObligationState::Verified
+    );
+    let mut lost = results();
+    caught_runs(&mut lost, CASE).1.trigger = false;
+    assert!(blocked(&state(&proved, &lost, &catch_key)));
+    assert!(blocked(&state(&proved, &lost, &holds)));
+    let mut other = manifest();
+    other.contracts[0].proving_catches = &[CASE];
+    let late = caught_of(&other, END_CASE);
+    other.expected.push(er(vec![catch_key.clone()], &[], late));
+    assert!(blocked(&state(&other, &results(), &catch_key)));
+    assert!(blocked(&state(&other, &results(), &holds)));
 
     // A satisfied contract whose proving test failed, is missing, ran at
     // another commit, or ran another test blocks.
@@ -5028,6 +5723,25 @@ fn the_evaluator_applies_contracts_and_narrowing() {
         assert!(blocked(&state(&manifest(), &stale, &quiet)));
         let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
         assert!(blocked(&state(&manifest(), &stale, &c5_key)));
+    }
+    // Nor does C5's own test from S's binary run in a checkout that has
+    // since moved, or one never measured: only its checkout differs, and
+    // C5's bootstrap still verifies with both of S's.
+    let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
+    assert_eq!(
+        state(&manifest(), &results(), &c5_key),
+        ObligationState::Verified
+    );
+    for checkout in [None, Some("another-source".to_owned())] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t5).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &quiet)));
+        assert!(blocked(&state(&manifest(), &moved, &c5_key)));
     }
     // An unknown digest anchors nothing, even when the caller's subject,
     // the result file and every test binary all agree on it: C5's own test
@@ -5593,6 +6307,18 @@ fn the_evaluator_binds_runners_and_traces() {
     }
     assert!(blocked(&state(&manifest(), &stale, &t3_key)));
     assert!(blocked(&state(&manifest(), &stale, &Key::passing("t/a"))));
+    // So does one from S's binary that ran in another checkout, whose files
+    // it read, or in one never measured.
+    for checkout in [Some("old-source".to_owned()), None] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t3).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &t3_key)));
+    }
     // So does one whose digest couldn't be read, for a proving test and for
     // a narrowing test, which then releases nothing.
     let mut unread = results();

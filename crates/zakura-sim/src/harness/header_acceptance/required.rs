@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
+    contracts::{
+        contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
+    },
     reasons::NaEntry,
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
     Tier, PLAN, TIERS,
@@ -44,6 +46,11 @@ pub struct Inventories<'a> {
     /// ([`planted_harness`](super::planted_harness)) apart from the rows.
     /// A case with no readable harness counts as a node case.
     pub planted_harnesses: &'a BTreeMap<(String, String), String>,
+    /// Every planted case whose `.toml` names `missing_evidence`, a
+    /// harness-caught case with no `Draft` run
+    /// ([`planted_harness_caught`](super::planted_harness_caught)), read
+    /// apart from the rows.
+    pub harness_caught: &'a BTreeSet<(String, String)>,
     /// Every directory under `qa/native-mutations/header-sync/`, retired
     /// ones included.
     pub native: &'a [String],
@@ -147,12 +154,6 @@ impl Permit {
     }
 }
 
-/// Why `gate-1/a-a-and-a-b-a` is open until hdr-14.7b, whose fresh-process
-/// recordings and replays it compares.
-pub const GATE_1_A_A_AND_A_B_A: &str =
-    "the acceptance tool runs each history A twice and between a distinct B in \
-                     one process, and compares traces, reports and store snapshots";
-
 /// Why `gate-1/topology-freshness` is open until hf-7.
 pub const GATE_1_TOPOLOGY_FRESHNESS: &str =
     "a topology change with no reactor event shows in the next view";
@@ -162,64 +163,10 @@ pub const GATE_1_STORE_INVENTORY: &str =
     "every store a header check reads is registered, behind a checkpoint and \
                      has a producer test";
 
-/// Why `gate-1/replay-store-control` is open until hdr-14.7b.
-pub const GATE_1_REPLAY_STORE_CONTROL: &str =
-    "a changed stored fact with every report the same must fail the replay \
-                     comparison";
-
-/// Why `gate-2/despite-close/caught` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CAUGHT: &str =
-    "the planted case under commit-only-authorized that keeps the fault close \
-                     but stages the rejected page";
-
-/// Why `gate-2/despite-close/close-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CLOSE_COMPANION: &str =
-    "its patched Draft trace closes the rejected page's connection with a fault \
-                     cause";
-
-/// Why `gate-2/despite-close/staging-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_STAGING_COMPANION: &str =
-    "its patched Draft trace stages the rejected page for that subscription and \
-                     those hashes";
-
-/// Why `gate-2/bad-content-fault-close/status` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS: &str =
-    "the status bad-content history carries the fault-close assertion where the \
-                     close is owed";
-
-/// Why `gate-2/bad-content-fault-close/subscribe-headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS: &str =
-    "the subscribe-headers bad-content history carries the fault-close assertion \
-                     where the close is owed";
-
-/// Why `gate-2/bad-content-fault-close/headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS: &str =
-    "the headers bad-content history carries the fault-close assertion where the \
-                     close is owed";
-
-/// Why `gate-2/bad-content-fault-close/headers-outcome` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME: &str =
-    "the headers-outcome bad-content history carries the fault-close assertion \
-                     where the close is owed";
-
 /// Why `gate-2/end-boundary-preservation` is open until hdr-14.8.
 pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
     "every distinct end finding at one boundary survives, which C12 and C13 \
                      deliver";
-
-/// Why `gate-3/crossing/unretained-open-then-outcome` is open until hdr-14.6.
-pub const GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME: &str =
-    "Act::UnretainedOpen then Act::OutcomeCrossing, labelled conformant with no \
-                     punishment";
-
-/// Why `gate-3/crossing/crossing-close` is open until hdr-14.6.
-pub const GATE_3_CROSSING_CROSSING_CLOSE: &str =
-    "a subscription Close that crosses the node's ending, labelled conformant \
-                     with no punishment";
-
-/// Why `gate-3/crossing/over-window-grant` is open until hdr-14.6.
-pub const GATE_3_CROSSING_OVER_WINDOW_GRANT: &str =
-    "a crossed Grant above the window, labelled bad-cursor and closed";
 
 /// Why `gate-5/bound-table` is open until hdr-9d.1.
 pub const GATE_5_BOUND_TABLE: &str =
@@ -227,21 +174,16 @@ pub const GATE_5_BOUND_TABLE: &str =
                      one-over-denied and release-then-reuse fixture, its cleanup or \
                      conservation witness, or its exclusion";
 
-/// Why `gate-5/mixed-witness` is open until hdr-14.8.
-pub const GATE_5_MIXED_WITNESS: &str =
-    "one storage scenario running all four Sim resource IDs together";
-
 /// Every gate obligation no row owns, with its gates and what may satisfy
 /// it, written from the spec's gate table.
 pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/a-a-and-a-b-a",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_A_A_AND_A_B_A,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "each_history_is_the_same_alone_and_after_another",
+        )),
     },
     GateObligation {
         name: "gate-1/topology-freshness",
@@ -264,11 +206,10 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/replay-store-control",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_REPLAY_STORE_CONTROL,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "a_changed_stored_fact_fails_the_replay_comparison",
+        )),
     },
     GateObligation {
         name: "gate-2/conformant-control-per-fault",
@@ -281,65 +222,58 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-2/despite-close/caught",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CAUGHT,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_path_break_needs_a_retained_violation",
+        )),
     },
     GateObligation {
         name: "gate-2/despite-close/close-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_fault_close_holds_on_the_unpatched_rejection",
+        )),
     },
     GateObligation {
         name: "gate-2/despite-close/staging-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_staging_companion_needs_the_rejected_page_staged",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/status",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-close-claim",
@@ -384,29 +318,26 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/crossing-close",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_CROSSING_CLOSE,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/over-window-grant",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_OVER_WINDOW_GRANT,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+        )),
     },
     GateObligation {
         name: "gate-3/no-request-row",
@@ -448,14 +379,16 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
             reason: GATE_5_BOUND_TABLE,
         },
     },
+    // The one storage history running all four Sim resource IDs together,
+    // with its Shutdown and StopStorage picked and the node settled at its
+    // reactor's exit. Its four whole-report passes are history keys.
     GateObligation {
         name: "gate-5/mixed-witness",
         gates: &[Gate::G5],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.8",
-            reason: GATE_5_MIXED_WITNESS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+        )),
     },
 ];
 
@@ -566,6 +499,15 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
             ],
             Vec::new(),
         ),
+        // Its patched run ends at a harness failure, so only the baseline
+        // owes a cleanup comparison.
+        Expected::HarnessCaught { case, .. } => (
+            vec![
+                RunId::case(case, CaseRun::Baseline),
+                RunId::case(case, CaseRun::Patched),
+            ],
+            vec![RunId::case(case, CaseRun::Baseline)],
+        ),
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -576,7 +518,8 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
 /// Each planted case owes its own case key, each native mutation a key,
 /// each needed source a missing-source key, each `COVERAGE` test a witness
 /// key, each `Satisfied` contract's proving test and each narrowing entry
-/// a test key, each requirement and composition check its key, and each
+/// a test key, each such contract's proving catch a catch key, each
+/// requirement and composition check its key, and each
 /// counted execution a replay and, for a history, a cleanup comparison.
 /// Each `NotApplicable` reason owes its test, and each ID an entry for every
 /// tier other than its own.
@@ -639,6 +582,9 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
                 for &test in contract.proving {
                     keys.insert(contract_test_key(id, test), BTreeSet::new());
                 }
+                for &case in contract.proving_catches {
+                    keys.insert(contract_catch_key(id, case), BTreeSet::new());
+                }
             }
         }
     }
@@ -686,9 +632,10 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
     }
     // Every planted case's baseline and patched runs owe a replay, and a
     // node case's `Draft` run does too, its baseline and Draft runs a
-    // cleanup comparison as well, from the planted inventory itself. Only
-    // whether a node case's patched run completes, so owes a cleanup too,
-    // comes from its row's `found`, below.
+    // cleanup comparison as well, from the planted inventory itself. A
+    // harness-caught case has no `Draft` run, so only its baseline owes a
+    // cleanup. Only whether a node case's patched run completes, so owes a
+    // cleanup too, comes from its row's `found`, below.
     for (property, name) in inv.planted {
         let case = |run| RunId::Case {
             property: property.clone(),
@@ -702,7 +649,17 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
         for run in [CaseRun::Baseline, CaseRun::Patched] {
             keys.insert(Key::Replay { run: case(run) }, BTreeSet::from([Gate::G1]));
         }
-        if !machine {
+        if inv
+            .harness_caught
+            .contains(&(property.clone(), name.clone()))
+        {
+            keys.insert(
+                Key::Cleanup {
+                    run: case(CaseRun::Baseline),
+                },
+                BTreeSet::from([Gate::G1]),
+            );
+        } else if !machine {
             keys.insert(
                 Key::Replay {
                     run: case(CaseRun::Draft),

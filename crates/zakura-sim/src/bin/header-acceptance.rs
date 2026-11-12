@@ -6,12 +6,20 @@
 //! header-acceptance evaluate --repo <dir> --plan <plan.json> --artifacts <dir>
 //!     --subject <commit> --subject-source <digest> --run-id <id>
 //!     --containment <subreaper|best-effort> --out <dir>
+//! header-acceptance companions --trace <dir> --out <companions.json>
+//! header-acceptance record-args --declared <dir> --harness <name> --test <name>
+//!     --case <case> --out <args.json>
 //! ```
 //!
 //! `plan` writes the tasks xtask runs. `evaluate` reads their artifacts,
 //! writes `results.json` and `record.json` under `--out`, and prints the
 //! record's counts. It exits 0 whether or not acceptance passes, since the
-//! record says which.
+//! record says which. `companions` judges a node case's recorded `Draft`
+//! run's companions and writes a `CompanionsRun` to a new file. xtask runs
+//! it from the case's own patched build, the one that recorded the trace.
+//! `record-args` writes, as a JSON list, the `zakura-sim record` arguments
+//! for the one history a witness test declared under `--declared` as
+//! `--case` on `--harness`, so the runner records it as the reader binds it.
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 
@@ -38,16 +46,23 @@ fn main() {
 mod cli {
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
-    use zakura_sim::harness::header_acceptance::{
-        tool::{self, RunPlan},
-        Manifest,
+    use zakura_sim::{
+        harness::header_acceptance::{
+            companions,
+            tool::{self, CompanionVerdict, CompanionsRun, RunPlan},
+            Manifest,
+        },
+        trace::{BuildInfo, TraceReader},
     };
 
     /// The usage text.
     const USAGE: &str = "usage: header-acceptance plan --repo <dir> --out <plan.json>\n       \
                          header-acceptance evaluate --repo <dir> --plan <plan.json> \
                          --artifacts <dir> --subject <commit> --subject-source <digest> \
-                         --run-id <id> --containment <subreaper|best-effort> --out <dir>";
+                         --run-id <id> --containment <subreaper|best-effort> --out <dir>\n       \
+                         header-acceptance companions --trace <dir> --out <companions.json>\n       \
+                         header-acceptance record-args --declared <dir> --harness <name> \
+                         --test <name> --case <case> --out <args.json>";
 
     /// Reads `--flag value` pairs, refusing an unknown or repeated flag.
     fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
@@ -140,6 +155,62 @@ mod cli {
                     record.stray.len(),
                     record.accepted
                 );
+                Ok(())
+            }
+            "companions" => {
+                let flags = flags(rest, &["--trace", "--out"])?;
+                let dir = PathBuf::from(&flags["--trace"]);
+                let trace = TraceReader::open(&dir)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?
+                    .id;
+                // A trace with no verdict fails every companion, with why.
+                let verdicts = match companions::judge_trace(&dir) {
+                    Ok(verdicts) => verdicts,
+                    Err(why) => companions::COMPANIONS
+                        .iter()
+                        .map(|&name| (name, Err(why.clone())))
+                        .collect(),
+                };
+                let run = CompanionsRun {
+                    trace,
+                    source: BuildInfo::current().source,
+                    companions: verdicts
+                        .into_iter()
+                        .map(|(name, verdict)| CompanionVerdict {
+                            name: name.to_owned(),
+                            held: verdict.is_ok(),
+                            why: verdict.err(),
+                        })
+                        .collect(),
+                };
+                let json = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
+                // Never over an existing file, such as another run's.
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&flags["--out"])
+                    .and_then(|mut out| std::io::Write::write_all(&mut out, json.as_bytes()))
+                    .map_err(|e| format!("{}: {e}", flags["--out"]))?;
+                println!(
+                    "{} of {} companions held",
+                    run.companions.iter().filter(|c| c.held).count(),
+                    run.companions.len()
+                );
+                Ok(())
+            }
+            "record-args" => {
+                let flags = flags(
+                    rest,
+                    &["--declared", "--harness", "--test", "--case", "--out"],
+                )?;
+                let args = tool::declared_record_args(
+                    &PathBuf::from(&flags["--declared"]),
+                    &flags["--harness"],
+                    &flags["--test"],
+                    &flags["--case"],
+                )?;
+                let json = serde_json::to_string(&args).map_err(|e| e.to_string())?;
+                fs::write(&flags["--out"], json).map_err(|e| format!("{}: {e}", flags["--out"]))?;
                 Ok(())
             }
             _ => Err(USAGE.to_owned()),

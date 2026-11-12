@@ -2920,7 +2920,8 @@ fn case_task(
 /// `dir`'s [`PROVENANCE_FILE`] with the commit the checkout was made from
 /// and the SHA-256 of the patch it applied. For a node case, whose task
 /// names `draft`, the rebuilt `zakura-sim` then records `dir/draft` from
-/// S's committed input with `--draft <set>` (C9), replays it fresh, and,
+/// S's committed input with `--draft <set>` (C9) and the task's
+/// `draft_witness` ([`draft_witness_args`]), replays it fresh, and,
 /// if the task names companions, the rebuilt `header-acceptance` judges
 /// them on that trace into `dir/draft/companions.json`. A patch that
 /// doesn't apply or build is a refused check with no `Draft` run, not an
@@ -2981,6 +2982,7 @@ fn rebuild_case(
         let mut args: Vec<OsString> = vec!["--sim".into(), text(case, "harness")?.into()];
         args.extend(case_input_args(at.subject, &case["input"])?);
         args.extend(["--draft".into(), set.join(",").into()]);
+        args.extend(draft_witness_args(case)?);
         let draft = dir.join("draft");
         record_run(options, sim, &args, &draft)?;
         fresh_replay(options, sim, &draft)?;
@@ -3011,6 +3013,35 @@ fn rebuild_case(
     }
     reset(options, worktree, &subject.commit)?;
     Ok(source)
+}
+
+/// `zakura-sim record`'s witness arguments for case task `case`'s `Draft`
+/// run, from its `draft_witness`, the reader's `PatchedWitness`: `--witness
+/// <property> --expect <expect>`, then `--also-violates <beside,
+/// comma-separated>` if `beside` isn't empty.
+fn draft_witness_args(case: &Value) -> Result<Vec<OsString>, BoxError> {
+    let witness = case
+        .get("draft_witness")
+        .filter(|witness| !witness.is_null())
+        .ok_or_else(|| format!("a case with a Draft run names no draft_witness: {case}"))?;
+    let mut args: Vec<OsString> = vec![
+        "--witness".into(),
+        text(case, "property")?.into(),
+        "--expect".into(),
+        text(witness, "expect")?.into(),
+    ];
+    let beside = witness
+        .get("beside")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("a draft_witness with no beside: {witness}"))?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| format!("a draft_witness whose beside isn't IDs: {witness}"))?;
+    if !beside.is_empty() {
+        args.extend(["--also-violates".into(), beside.join(",").into()]);
+    }
+    Ok(args)
 }
 
 /// Runs integrity mutation `integrity`'s history test unpatched, patched
@@ -4145,6 +4176,41 @@ mod tests {
             ]
         );
         assert!(case_input_args(repo.path(), &json!({ "other": {} })).is_err());
+    }
+
+    /// A case's `Draft` run records its task's `draft_witness` on the
+    /// case's property, with `--also-violates` only for a set beside it. A
+    /// case naming none records no `Draft` run.
+    #[test]
+    fn a_draft_run_records_its_task_s_witness() {
+        let case = |beside: Value| {
+            json!({
+                "property": "p",
+                "draft_witness": { "expect": "violated", "beside": beside },
+            })
+        };
+        let strings = |args: Vec<OsString>| -> Vec<String> {
+            args.into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            strings(draft_witness_args(&case(json!([]))).unwrap()),
+            ["--witness", "p", "--expect", "violated"]
+        );
+        assert_eq!(
+            strings(draft_witness_args(&case(json!(["q", "r"]))).unwrap()),
+            [
+                "--witness",
+                "p",
+                "--expect",
+                "violated",
+                "--also-violates",
+                "q,r"
+            ]
+        );
+        assert!(draft_witness_args(&json!({ "property": "p" })).is_err());
+        assert!(draft_witness_args(&json!({ "property": "p", "draft_witness": null })).is_err());
     }
 
     /// Each task directory names the run that wrote it, its index and its

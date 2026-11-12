@@ -77,8 +77,10 @@
 //!   the case's `harness`, the one the target maps to.
 //!   A node case's task names `draft`, its set: then `<i>/draft` is
 //!   recorded by the case's own rebuilt binary with `zakura-sim record
-//!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
-//!   where its input is `--input <input>`, `--scenario <scenario> --plan
+//!   --sim <harness> <its input> --draft <set, comma-separated>` (C9) and
+//!   the task's `draft_witness`, `--witness <property> --expect <expect>`
+//!   and, if its `beside` isn't empty, `--also-violates <beside,
+//!   comma-separated>` ([`draft_witness`]), where its input is `--input <input>`, `--scenario <scenario> --plan
 //!   <plan>` or `--scenario <scenario> --script <script>` as [`CaseInput`]
 //!   names it, `--scenario` again taking the scenario file's JSON text and
 //!   the others paths, with its fresh replay by the same binary. A case whose task
@@ -332,6 +334,10 @@ pub enum Task {
         /// A node case's set, its `Draft` run's override (C9). `None` for a
         /// machine case, which has no `Draft` run.
         draft: Option<Vec<String>>,
+        /// What its `Draft` run's witness expects ([`draft_witness`]), with
+        /// `draft`. A scripted act shows only through a passing witness of
+        /// its run ([`super::actions::Effect::ActRan`]).
+        draft_witness: Option<PatchedWitness>,
         /// The companions judged on its `Draft` run, by name.
         companions: Vec<String>,
     },
@@ -585,12 +591,15 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             } => {
                 let mut task = case_task(repo, case, harness, false, id)?;
                 if let Task::Case {
+                    property,
                     draft,
+                    draft_witness: witness,
                     companions: named,
                     ..
                 } = &mut task
                 {
                     *draft = Some(set.iter().map(|id| (*id).to_owned()).collect());
+                    *witness = Some(draft_witness(property, set));
                     *named = companions.iter().map(|name| (*name).to_owned()).collect();
                 }
                 tasks.push(task);
@@ -722,8 +731,25 @@ fn case_task(
         patched: patched_witness(repo, case)?,
         patch: format!("qa/planted/{}/{}.patch", case.property, case.name),
         draft: None,
+        draft_witness: None,
         companions: Vec::new(),
     })
+}
+
+/// What a node case's `Draft` run's witness expects, given the case's
+/// `property` and its set: the property `violated` beside the rest of the
+/// set, in the set's order, as the planted runner's own `Draft` run
+/// expects it. The run goes on past each break, so the evaluator, not the
+/// witness, holds it to exactly the set ([`super::evaluate`]).
+fn draft_witness(property: &str, set: &[&str]) -> PatchedWitness {
+    PatchedWitness {
+        expect: "violated".to_owned(),
+        beside: set
+            .iter()
+            .filter(|id| **id != property)
+            .map(|id| (*id).to_owned())
+            .collect(),
+    }
 }
 
 /// The one patch file in native mutation `patch`'s directory, relative to
@@ -1410,6 +1436,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 patched: witness,
                 patch,
                 draft,
+                draft_witness,
                 companions,
             } => {
                 let case = |run| RunId::Case {
@@ -1424,6 +1451,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     harness,
                     input,
                     subject_source,
+                    draft_witness: draft_witness.as_ref(),
                 };
                 // The planted runner runs a case's baseline and patched
                 // runs (C4), and xtask copies its traces here.
@@ -1587,6 +1615,8 @@ struct CaseChecks<'a> {
     input: &'a CaseInput,
     /// S's source digest.
     subject_source: &'a str,
+    /// What its `Draft` run's witness expects, if it has one.
+    draft_witness: Option<&'a PatchedWitness>,
 }
 
 impl CaseChecks<'_> {
@@ -1615,15 +1645,31 @@ impl CaseChecks<'_> {
 
     /// The case's `Draft` run, as `run`, which the tool records itself with
     /// the case's rebuilt binary (C9): it must have run the committed input,
-    /// from the binary the provenance check measured, which must have
-    /// passed, and be its baseline's counterfactual
-    /// ([`counterfactual_refusal`]). Its override is read from its meta,
-    /// and the evaluator judges its set (`evaluate::caught_draft`).
+    /// with a witness file judging the case's property as the task's
+    /// `draft_witness` expects ([`witness_judges`]), from the binary the
+    /// provenance check measured, which must have passed, and be its
+    /// baseline's counterfactual ([`counterfactual_refusal`]). Its override
+    /// is read from its meta, and the evaluator judges its set
+    /// (`evaluate::caught_draft`).
     fn draft(&self, run: RunId) -> Execution {
         let dir = self.dir.join("draft");
         let mut execution = execution(&dir, run, self.harness, RunBy::Tool);
         if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
             fail(&mut execution, why);
+        }
+        let judged = self.draft_witness.is_some_and(|witness| {
+            witness_judges(&dir, self.property, &witness.expect, &witness.beside)
+        });
+        if !judged {
+            execution.trigger = false;
+            execution.actions = Actions::Incomplete;
+            fail(
+                &mut execution,
+                format!(
+                    "its witness file doesn't judge {} as {:?} expects",
+                    self.property, self.draft_witness
+                ),
+            );
         }
         let measured = measured_source(self.dir);
         if let Some(why) = provenance_refusal(self.dir) {
@@ -4390,7 +4436,10 @@ mod tests {
     /// a `draft_set` case expects `violated` beside nothing. A patched run
     /// of the nested case whose witness judges its set is read with its
     /// trigger. The same witness under `violated`, with a member missing or
-    /// with another one added, isn't its witness, and fails the run.
+    /// with another one added, isn't its witness, and fails the run. Each
+    /// node case's `Draft` run expects its property `violated` beside the
+    /// rest of its set, and a `Draft` run whose witness judges anything
+    /// else, or that has none, loses its trigger and its acts.
     #[test]
     fn a_nested_case_s_patched_witness_judges_its_exact_set() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -4438,15 +4487,29 @@ mod tests {
                 beside: Vec::new(),
             }
         );
+        assert_eq!(
+            draft_witness(
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                &[
+                    "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                    "sim/no-livelock"
+                ]
+            ),
+            PatchedWitness {
+                expect: "violated".into(),
+                beside: vec!["sim/no-livelock".into()],
+            }
+        );
         let Task::Case {
             property,
             harness,
             input,
             patched,
+            draft_witness: Some(draft),
             ..
         } = task("session/honest-never-punished", "target-page-refused")
         else {
-            unreachable!("found as a case");
+            unreachable!("found as a node case");
         };
         let set = vec!["header-sync/s5v9/conformant-never-closes".to_owned()];
         assert_eq!(
@@ -4472,7 +4535,52 @@ mod tests {
             harness,
             input,
             subject_source: "s",
+            draft_witness: Some(draft),
         };
+        assert_eq!(
+            draft,
+            &PatchedWitness {
+                expect: "violated".into(),
+                beside: set.clone(),
+            }
+        );
+        let draft_dir = case.path().join("draft");
+        crate::harness::record(
+            entry,
+            crate::harness::RecordInput::Input(&bytes),
+            &draft_dir,
+        )
+        .expect("the case's harness records its committed input");
+        let draft_run = |expect: &str, beside: &[String]| {
+            write_witness(
+                &draft_dir,
+                serde_json::json!({
+                    "property": property,
+                    "expect": expect,
+                    "also_violates": beside,
+                    "passed": true,
+                    "error": null,
+                }),
+            );
+            checks.draft(RunId::Case {
+                property: property.clone(),
+                name: "target-page-refused".into(),
+                run: CaseRun::Draft,
+            })
+        };
+        assert!(draft_run("violated", &set).trigger);
+        for (expect, beside) in [("violated-set", set.clone()), ("violated", Vec::new())] {
+            let refused = draft_run(expect, &beside);
+            assert!(!refused.trigger, "{expect} {beside:?}");
+            assert_eq!(refused.actions, Actions::Incomplete);
+        }
+        fs::remove_file(draft_dir.join("witness.json")).expect("the witness exists");
+        let unwitnessed = checks.draft(RunId::Case {
+            property: property.clone(),
+            name: "target-page-refused".into(),
+            run: CaseRun::Draft,
+        });
+        assert!(!unwitnessed.trigger);
         let read = |expect: &str, beside: &[String]| {
             write_witness(
                 &dir,
@@ -6291,6 +6399,7 @@ mod tests {
             },
             patch: format!("qa/planted/p/{name}.patch"),
             draft: draft.then(|| vec!["p".to_owned()]),
+            draft_witness: draft.then(|| draft_witness("p", &["p"])),
             companions: Vec::new(),
         };
         let tasks = [

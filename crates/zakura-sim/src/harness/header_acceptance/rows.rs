@@ -1287,6 +1287,11 @@ fn hand_written_rows() -> Vec<Row> {
         ("leaked-lease-clone", Found::AtStep),
         ("leaked-reservation-entry", Found::AtStep),
         ("skipped-round-release", Found::AtStep),
+        // hdr-14.4 moved the node-settlement native mutations here, each on
+        // the committed stop-storage seed, which shuts the node down.
+        ("shutdown-kept-queue", Found::AtStep),
+        ("consumed-locator-permit", Found::AtStep),
+        ("forgotten-locator-permit", Found::AtStep),
     ]
     .into_iter()
     .enumerate()
@@ -1310,6 +1315,8 @@ fn hand_written_rows() -> Vec<Row> {
         "stale-retirement",
         "stale-acceptance",
         "stale-close",
+        // hdr-14.4 moved this native mutation here, on the churn witness.
+        "dropped-owner-check",
     ]
     .into_iter()
     .enumerate()
@@ -2881,7 +2888,13 @@ const fn to_move(
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
 pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
-    to_move("consumed-locator-permit", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "consumed-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "consumed-locator-permit",
+        },
+    },
     NativeMutation {
         patch: "cooldown-session-gate",
         class: NativeClass::Moved {
@@ -2889,9 +2902,21 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "cooldown-session-gate",
         },
     },
-    to_move("dropped-owner-check", STALE, "hdr-14.4"),
+    NativeMutation {
+        patch: "dropped-owner-check",
+        class: NativeClass::Moved {
+            property: STALE,
+            case: "dropped-owner-check",
+        },
+    },
     to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
-    to_move("forgotten-locator-permit", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "forgotten-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "forgotten-locator-permit",
+        },
+    },
     NativeMutation {
         patch: "late-fault-unpenalized",
         class: NativeClass::Moved {
@@ -2942,7 +2967,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         },
     },
     to_move("short-payload", COMMIT, "hdr-9c.2a"),
-    to_move("shutdown-kept-queue", TEARDOWN, "hdr-14.4"),
+    NativeMutation {
+        patch: "shutdown-kept-queue",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "shutdown-kept-queue",
+        },
+    },
     to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
     to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
     to_move("skipped-staging", COMMIT, "hdr-9c.1a"),

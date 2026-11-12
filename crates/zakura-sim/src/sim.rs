@@ -852,6 +852,7 @@ impl Sim {
                 && !nothing_enabled(after, &ready, self.sched().next_deadline(), &next_offers);
             cached = Some((phase, next_offers));
             let livelock = spinning.then(|| Violation {
+                subject: None,
                 property: NO_LIVELOCK.to_owned(),
                 step: st.step,
                 witness: vec![st.step],

@@ -756,6 +756,7 @@ fn an_end_violation_counts_beside_earlier_violations() {
 /// An end finding `expected` and `actual` of `property`.
 fn end_finding(property: PropertyId, expected: &str, actual: &str) -> EndViolation {
     EndViolation {
+        subject: None,
         property,
         expected: expected.to_owned(),
         actual: actual.to_owned(),

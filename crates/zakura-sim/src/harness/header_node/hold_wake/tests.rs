@@ -386,6 +386,7 @@ fn every_unhandled_held_reply_at_a_boundary_reaches_the_sidecar() {
     let full = sidecar::<HoldWakes>(&vec![(5, 1), (6, 2)], &[]);
     let found = findings(&full, HOLD_RELEASE_WAKES);
     let violation = |op: u64| crate::Violation {
+        subject: None,
         property: HOLD_RELEASE_WAKES.to_owned(),
         step: 2,
         witness: vec![1, 2],

@@ -766,6 +766,7 @@ mod tests {
         }]);
         let report = PropertyReport {
             violations: vec![Violation {
+                subject: None,
                 property: COMMIT.into(),
                 step: 9,
                 witness: vec![9],

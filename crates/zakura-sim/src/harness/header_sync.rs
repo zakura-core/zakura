@@ -87,7 +87,7 @@ use crate::{
         header_sync_progress::{bounded_adversary_progress, recovery_deadline},
         session::{honest_never_punished, HonestPeers},
     },
-    observe::StorageFact,
+    observe::{ReactorFact, StorageFact},
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
@@ -2661,17 +2661,32 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
 }
 
 /// [`DIRECT_DISPATCH`]'s trigger: a reactor dispatched a storage call,
-/// either to the node's port, whose header storage logs its submission, or
-/// to its action channel, which sets the dispatch guard's flag. So the rule
-/// had a call to judge.
+/// either to the node's port, whose header storage logs a submission tagged
+/// with a call the reactor's tap logged dispatching, or to its action
+/// channel, which sets the dispatch guard's flag. So the rule had a call to
+/// judge. The publisher's submissions carry no reactor call, so serving
+/// headers alone meets nothing here.
 fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
-    view.direct_dispatch_broken
-        || log.entries().iter().any(|entry| {
-            matches!(
-                operation_fact(HEADER_SERVICE, &entry.obs),
-                Some(StorageFact::Submitted { .. })
-            )
+    if view.direct_dispatch_broken {
+        return true;
+    }
+    let dispatched: BTreeSet<u64> = log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Dispatched { call, .. },
+                ..
+            } => Some(*call),
+            _ => None,
         })
+        .collect();
+    log.entries().iter().any(|entry| {
+        matches!(
+            operation_fact(HEADER_SERVICE, &entry.obs),
+            Some(StorageFact::Submitted { call: Some(call), .. }) if dispatched.contains(call)
+        )
+    })
 }
 
 /// [`HEADER_FAULT_PENALIZED`], active.
@@ -3258,6 +3273,136 @@ mod tests {
             .map(|found| found.actual)
             .collect();
         starts_with_each(&ended, &["UntakenFault: operation 3 "]);
+    }
+
+    /// An empty header scope.
+    fn scope() -> crate::observe::WorkScope {
+        crate::observe::WorkScope {
+            header_generation: 1,
+            branch: crate::observe::StorageBranch {
+                anchor: String::new(),
+                target: String::new(),
+            },
+        }
+    }
+
+    /// Logs `fact` on the node's header storage.
+    fn log_storage(log: &mut ObservationLog, fact: StorageFact) {
+        log.push(Observation::Storage {
+            service: HEADER_SERVICE.to_owned(),
+            instance: 0,
+            seq: 0,
+            txn: 0,
+            fact,
+        });
+    }
+
+    /// Logs the node's publisher serving a peer that subscribed from an
+    /// earlier height of the node's own chain: it acquires a header path
+    /// and reads a page of it, as operations 1 and 2, which no reactor
+    /// call submitted.
+    fn log_publisher(log: &mut ObservationLog) {
+        let requests = [
+            StorageRequest::AcquireHeaderPath {
+                peer: "aa".to_owned(),
+                session_id: 3,
+                scope: scope(),
+                target: "bb".to_owned(),
+                locators: vec!["cc".to_owned()],
+            },
+            StorageRequest::ReadHeaderPath {
+                lease: None,
+                scope: scope(),
+                after: "cc".to_owned(),
+                max_headers: 10,
+            },
+        ];
+        for (id, request) in (1..).zip(requests) {
+            log_storage(
+                log,
+                StorageFact::Submitted {
+                    id,
+                    request,
+                    digest: String::new(),
+                    call: None,
+                },
+            );
+        }
+    }
+
+    /// Logs the node's reactor dispatching locator call `call`.
+    fn log_dispatched(log: &mut ObservationLog, call: u64) {
+        log.push(Observation::Reactor {
+            instance: 0,
+            seq: 0,
+            storage_seq: 0,
+            node: "node".to_owned(),
+            event: crate::observe::ReactorFact::Dispatched {
+                call,
+                port: crate::observe::ReactorCall::Locator {
+                    peer: "aa".to_owned(),
+                    session_id: 3,
+                    target: "bb".to_owned(),
+                    scope: scope(),
+                },
+            },
+        });
+    }
+
+    /// An empty view whose dispatch guard's flag is `broken`.
+    fn dispatch_view(broken: bool) -> StorageView {
+        let faults = settled_faults(crate::storage::FaultAttributions::new(
+            &EvidenceStores::default(),
+        ));
+        StorageView {
+            direct_dispatch_broken: broken,
+            ..FaultsOnly(faults).view()
+        }
+    }
+
+    /// Serving headers alone dispatches nothing: an honest peer on the
+    /// node's chain subscribing from an earlier height makes the publisher
+    /// submit storage operations with no reactor call, which leave
+    /// [`DIRECT_DISPATCH`]'s trigger unmet.
+    #[test]
+    fn a_publisher_only_history_dispatched_no_storage_call() {
+        let mut log = ObservationLog::default();
+        log_publisher(&mut log);
+        assert!(!storage_call_dispatched(&dispatch_view(false), &log));
+    }
+
+    /// [`DIRECT_DISPATCH`]'s trigger needs the reactor's own dispatch: a
+    /// submission tagged with a call the reactor dispatched, or the
+    /// dispatch guard's flag. A submission tagged with a call the reactor
+    /// never logged dispatching isn't one.
+    #[test]
+    fn only_a_reactor_dispatch_meets_the_direct_dispatch_trigger() {
+        let reactor_submitted = |log: &mut ObservationLog| {
+            log_storage(
+                log,
+                StorageFact::Submitted {
+                    id: 3,
+                    request: StorageRequest::ContinuationLocator,
+                    digest: String::new(),
+                    call: Some(1),
+                },
+            );
+        };
+        let mut matched = ObservationLog::default();
+        log_publisher(&mut matched);
+        reactor_submitted(&mut matched);
+        log_dispatched(&mut matched, 1);
+        assert!(storage_call_dispatched(&dispatch_view(false), &matched));
+
+        let mut unmatched = ObservationLog::default();
+        log_publisher(&mut unmatched);
+        log_dispatched(&mut unmatched, 2);
+        reactor_submitted(&mut unmatched);
+        assert!(!storage_call_dispatched(&dispatch_view(false), &unmatched));
+
+        let mut flagged = ObservationLog::default();
+        log_publisher(&mut flagged);
+        assert!(storage_call_dispatched(&dispatch_view(true), &flagged));
     }
 
     /// A harness with no view, for checks that read only the log.

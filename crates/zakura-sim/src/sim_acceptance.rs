@@ -3,6 +3,7 @@
 //! implementation plan, sim-7.4).
 
 pub mod agreement;
+pub mod deviations;
 pub mod evaluate;
 pub mod header;
 pub mod judge;

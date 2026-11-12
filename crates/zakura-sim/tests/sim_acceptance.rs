@@ -674,3 +674,40 @@ mod schedule_agreement {
         assert!(agreement(&before, &before.clone(), &HunkMap::default(), &site).is_err());
     }
 }
+
+mod deviations {
+    use std::collections::BTreeSet;
+
+    use zakura_sim::sim_acceptance::deviations::{Evan, DEVIATIONS};
+
+    /// The plan's narrowings, each listed once, and none counts as signed
+    /// off without every sign-off it needs.
+    #[test]
+    fn each_narrowing_is_listed_once_with_its_sign_offs() {
+        let ids: BTreeSet<&str> = DEVIATIONS.iter().map(|d| d.id).collect();
+        assert_eq!(ids.len(), DEVIATIONS.len(), "an ID is listed twice");
+        for id in [
+            "decision-2",
+            "decision-3",
+            "decision-7",
+            "decision-8",
+            "s4.6-sim-cfg-scope",
+            "rule-9-release-and-archive",
+        ] {
+            assert!(ids.contains(id), "{id}");
+        }
+        for deviation in DEVIATIONS {
+            assert!(
+                !deviation.spec.is_empty() && !deviation.claim.is_empty(),
+                "{}",
+                deviation.id
+            );
+            if deviation.evan == Evan::Pending {
+                assert!(!deviation.is_signed_off(), "{}", deviation.id);
+            }
+            if deviation.approval.is_none() {
+                assert!(!deviation.is_signed_off(), "{}", deviation.id);
+            }
+        }
+    }
+}

@@ -478,6 +478,76 @@ const C1_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C6's proving tests: the witness judge's unrelated-report and nested-set
+/// tests, its per-subject joins at the break's step and at the run's end,
+/// each with Rule 25's one-key-off controls, and the evaluator's check of a
+/// set judged on the Draft run.
+const C6_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::not_applicable_needs_its_property_unapplied_and_the_rest_whole",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::an_expected_stop_tolerates_only_stopped_by_violation",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_held_target_refuses_an_unrelated_incomplete",
+    ),
+    sim_test("tests/witness.rs", "a_missing_report_fails"),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_violated_set_needs_exactly_its_members",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::every_member_violation_joins_the_case_s_break",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_member_at_the_break_s_step_joins_by_its_punishment",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::an_end_found_member_joins_the_case_s_end_break_by_subject",
+    ),
+    sim_test(
+        "tests/header_acceptance.rs",
+        "the_evaluator_accepts_genuine_results",
+    ),
+];
+
+/// The nested cases whose catches prove C6: the honest-peer case joined at
+/// its break's step, the wedged loops joined at the end, and the three
+/// sets judged on their Draft runs.
+const C6_CATCHES: &[CaseRef] = &[
+    CaseRef {
+        property: "session/honest-never-punished",
+        name: "target-page-refused",
+    },
+    CaseRef {
+        property: "header-sync/watch-observed-under-flood",
+        name: "wedged-run-loop",
+    },
+    CaseRef {
+        property: "header-sync/watch-observed-under-lifecycle-flood",
+        name: "wedged-run-loop",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        name: "page-past-credit",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/headers-outcome/bad-content-closes",
+        name: "outcome-window-unchecked",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-live",
+        name: "open-repeated",
+    },
+];
+
 /// C7's proving tests: each template's trigger, its sibling-row controls,
 /// and `sender-within-credit` refusing an applied `Open` or `Grant` alone.
 const C7_PROVING: &[TestRef] = &[
@@ -1269,19 +1339,20 @@ pub fn contract_table() -> Vec<Contract> {
             C5_PROVING,
             "E7",
         ),
-        waiting(
-            C6,
-            "Evan",
-            "The witness judge rejects any unrelated NotApplicable whose reason isn't benign, \
-             except StoppedByViolation under the expected stop, or a missing report, and \
-             judges a nested case's exact set in both runs, or on its Draft run for a set that \
-             breaks only after the case's own break, each nested finding from the case's own \
-             break: the same peer and the same punished event or frame.",
-            "E2",
-            "a per-subject join for findings at the break's step, which E2 still joins by step \
-             only, not by peer and punished event or frame. An end finding joins by its \
-             subject, and a set that breaks later is judged on the Draft run's report",
-        ),
+        Contract {
+            proving_catches: C6_CATCHES,
+            ..satisfied(
+                C6,
+                "Evan",
+                "The witness judge rejects any unrelated NotApplicable whose reason isn't \
+                 benign, except StoppedByViolation under the expected stop, or a missing \
+                 report, and judges a nested case's exact set in both runs, or on its Draft run \
+                 for a set that breaks only after the case's own break, each nested finding \
+                 from the case's own break: the same peer and the same punished event or frame.",
+                C6_PROVING,
+                "E2, with Rule 25's subject joins",
+            )
+        },
         satisfied(
             C7,
             "Evan",

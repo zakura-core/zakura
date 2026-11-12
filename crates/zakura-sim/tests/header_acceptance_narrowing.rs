@@ -181,9 +181,11 @@ fn runs(expected: &Expected) -> Vec<RunId> {
         Expected::Caught { case, .. } => [CaseRun::Baseline, CaseRun::Patched, CaseRun::Draft]
             .map(|run| RunId::case(case, run))
             .to_vec(),
-        Expected::MachineCaught { case, .. } => [CaseRun::Baseline, CaseRun::Patched]
-            .map(|run| RunId::case(case, run))
-            .to_vec(),
+        Expected::MachineCaught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            [CaseRun::Baseline, CaseRun::Patched]
+                .map(|run| RunId::case(case, run))
+                .to_vec()
+        }
         Expected::IntegrityCaught { patch, .. } => {
             [CaseRun::Unpatched, CaseRun::Patched, CaseRun::Restored]
                 .map(|run| RunId::native(patch, run))

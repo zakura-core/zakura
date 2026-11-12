@@ -7,7 +7,7 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{sim_test, Approval, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use super::{sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -129,6 +129,11 @@ pub struct Contract {
     /// The tests that prove it. A `Satisfied` contract needs at least one,
     /// each passing at the subject commit.
     pub proving: &'static [TestRef],
+    /// The planted cases whose `Caught` proves it beside its tests (Adam's
+    /// ruling on question 6, 2026-11-12). Each names a case a row catches,
+    /// and a `Satisfied` contract counts only once each one's catch
+    /// verified at the subject commit too.
+    pub proving_catches: &'static [CaseRef],
     /// Its state.
     pub state: ContractState,
     /// The PR or ask that delivers it.
@@ -846,6 +851,67 @@ const C22_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C19's proving tests: its honest half, a live cut at an unread boundary
+/// that the drain reads past and concludes, and the registry's dry-end
+/// rule, which fails an unread boundary as missing evidence.
+const C19_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_node_capacity.rs",
+        "a_drain_reads_past_an_unread_boundary_at_the_cut",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_fails_an_unread_boundary_as_missing_evidence",
+    ),
+];
+
+/// C19's proving catch, its bug-only half through the real reactor:
+/// `release-relocks-budget`, whose reactor stays stopped mid-poll holding
+/// the budget's lock until a dry end, so its run ends at the missing
+/// evidence `HarnessCaught` names (Adam's ruling on question 7).
+const C19_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/chunk-budget-bound",
+    name: "release-relocks-budget",
+}];
+
+/// C2's proving catches: `idle-exit-drops-fault`, whose reactor walks
+/// away from owed work and whose owed penalty concludes `Violated` at the
+/// drain's end, as the end replay's `DroppedFault`, alone. Those are C2's
+/// two bug-only halves.
+const C2_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/header-fault-penalized",
+    name: "idle-exit-drops-fault",
+}];
+
+/// `commit-only-authorized/later-ancestor`: its patched `Draft` run, through
+/// the real reactor tap, gives two `path` findings at one boundary, on the
+/// one page it stages under the wrong ancestor, each in the recorded full
+/// report.
+const LATER_ANCESTOR: CaseRef = CaseRef {
+    property: "header-sync/commit-only-authorized",
+    name: "later-ancestor",
+};
+
+/// C21's proving catches: [`LATER_ANCESTOR`], the real-tap two-finding
+/// history the claim-reading tests can't give, since `ClaimRun` and the
+/// scripted claim cases insert their claim records themselves (Adam's
+/// ruling on question 8).
+const C21_CATCHES: &[CaseRef] = &[LATER_ANCESTOR];
+
+/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]'s
+/// two findings at one boundary, and `overgrant`, whose patched `Draft`
+/// run's first finding is its initial `Open`'s credit break, naming the
+/// update and no page. Both come through the real reactor tap, where the
+/// sidecar test's `ClaimRun` inserts its claim records itself and the real
+/// header run finds no authority break.
+const C22_CATCHES: &[CaseRef] = &[
+    LATER_ANCESTOR,
+    CaseRef {
+        property: "header-sync/commit-only-authorized",
+        name: "overgrant",
+    },
+];
+
 /// C15's proving tests: the release-wake fixtures' runs equal the runs
 /// without the release up to their measured boundary and then settle, on
 /// the committed inputs and on every plan, and two planted wake bypasses'
@@ -1091,6 +1157,7 @@ const fn waiting(
         owner,
         statement,
         proving: &[],
+        proving_catches: &[],
         state: ContractState::Blocked {
             waiting_for: missing,
         },
@@ -1114,6 +1181,7 @@ const fn proved_short(
         owner,
         statement,
         proving,
+        proving_catches: &[],
         state: ContractState::Blocked {
             waiting_for: missing,
         },
@@ -1134,6 +1202,7 @@ const fn satisfied(
         owner,
         statement,
         proving,
+        proving_catches: &[],
         state: ContractState::Satisfied,
         delivery,
     }
@@ -1142,9 +1211,10 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3 and C15 by hf-5. Every other row's
-/// deliveries landed, and its state names what's still missing: C4's, C21's
-/// and C22's proving tests pass, but don't yet prove them.
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C19 and C22 by hf-4 and
+/// hf-9 with their planted catches. Every other row's deliveries landed, and its state
+/// names what's still missing: C4's and C21's proving tests pass, but don't
+/// yet prove them.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1158,22 +1228,25 @@ pub fn contract_table() -> Vec<Contract> {
             C1_PROVING,
             "E1",
         ),
-        waiting(
-            C2,
-            "Adam's harness",
-            "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
-             conclude under C1's drain.",
-            "hf-4, after E1",
-            "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty and \
-             node-abandonment cases at the drain's end are both planted case \
-             header-fault-penalized/idle-exit-drops-fault",
-        ),
+        Contract {
+            proving_catches: C2_CATCHES,
+            ..waiting(
+                C2,
+                "Adam's harness",
+                "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
+                 conclude under C1's drain.",
+                "hf-4, after E1",
+                "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty \
+                 and node-abandonment halves at the drain's end are C2_CATCHES",
+            )
+        },
         Contract {
             id: C3,
             owner: "Evan (trace-3)",
             statement: "Replay refuses a non-equivalent build, then compares the \
                         scenario-relevant meta fields, every step and the end record.",
             proving: C3_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1239,6 +1312,7 @@ pub fn contract_table() -> Vec<Contract> {
                         observes, is dropped, skips a boundary, records outside its run, \
                         publishes past what it delivered, or delivers a different log.",
             proving: C10_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1288,6 +1362,7 @@ pub fn contract_table() -> Vec<Contract> {
             statement: "The registry evaluates every property at a step before it returns \
                         the first Active violation, and keeps every violation found there.",
             proving: C16_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
@@ -1308,46 +1383,53 @@ pub fn contract_table() -> Vec<Contract> {
             C18_PROVING,
             "E10",
         ),
-        waiting(
-            C19,
-            "Adam's harness",
-            "An unread final capacity boundary concludes under C1's drain or fails the run.",
-            "hf-4, with C2",
-            "hf-4's still-unreadable chunk-budget-bound case, which it left to a planted case",
-        ),
+        Contract {
+            proving_catches: C19_CATCHES,
+            ..satisfied(
+                C19,
+                "Adam's harness",
+                "An unread final capacity boundary concludes under C1's drain or fails the run.",
+                C19_PROVING,
+                "hf-4, with C2, and its planted case",
+            )
+        },
         Contract {
             id: C20,
             owner: "Adam's harness",
             statement: "NA_REASONS and NOT_HEADER together list every NaReason, each once, and \
                         NA_REASONS each reason a header ID's report can carry.",
             proving: C20_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        proved_short(
-            C21,
-            "Adam's harness",
-            "Every header check keeps every finding at a boundary, not just its first.",
-            C21_PROVING,
-            "hf-8",
-            "a two-finding history through the real reactor tap, with both findings in the \
-             recorded full report and its fresh replay, since `ClaimRun` and the scripted \
-             claim cases insert their claim records themselves; and sidecar coverage for the \
-             generated `header-sync/s5v9` receiver and sender checks and \
-             `session/honest-never-punished`, which `wire_properties` registers and which can \
-             each find several failures at one boundary",
-        ),
-        proved_short(
-            C22,
-            "Adam's harness",
-            "Each commit-only-authorized finding names its rule kind and its actual subject.",
-            C22_PROVING,
-            "hf-9, and E4 for its proving test",
-            "the two-page and initial-Open overgrant cases through the real reactor tap, with \
-             each finding and its full attribution in the report and the sidecar. The \
-             sidecar test's `ClaimRun` inserts its claim records itself, and the real header \
-             run finds no authority break",
-        ),
+        Contract {
+            proving_catches: C21_CATCHES,
+            ..proved_short(
+                C21,
+                "Adam's harness",
+                "Every header check keeps every finding at a boundary, not just its first.",
+                C21_PROVING,
+                "hf-8",
+                "a planted case whose patched Draft run gives two findings at one boundary, \
+                 as C21_CATCHES' does for commit-only-authorized, for the generated \
+                 `header-sync/s5v9` receiver and sender checks and for \
+                 `session/honest-never-punished`, which `wire_properties` registers and which \
+                 can each find several failures at one boundary. No planted case's run does \
+                 that yet",
+            )
+        },
+        Contract {
+            proving_catches: C22_CATCHES,
+            ..satisfied(
+                C22,
+                "Adam's harness",
+                "Each commit-only-authorized finding names its rule kind and its actual \
+                 subject.",
+                C22_PROVING,
+                "hf-9, and E4 for its proving test",
+            )
+        },
     ]
 }
 
@@ -1520,20 +1602,49 @@ pub const NARROWING: &[Narrowing] = &[
 /// releases. Callees outside this file are their owners' contracts.
 pub const NARROWING_FINGERPRINT: &str = "cbe285413fc88ad5";
 
-/// The [`Key::ContractTest`] results: one `Passes` per proving test of each
-/// `Satisfied` contract.
-pub fn contract_test_results(table: &[Contract]) -> Vec<ExpectedResult> {
-    table
+/// The [`Key::ContractTest`] and [`Key::ContractCatch`] results of each
+/// `Satisfied` contract: one `Passes` per proving test, and per proving
+/// catch the `Caught` or `HarnessCaught` a result of `rows` names for that
+/// case. A catch no row names gets no result, so its key stays uncovered
+/// and blocks.
+pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec<ExpectedResult> {
+    let satisfied = table
         .iter()
-        .filter(|contract| contract.state == ContractState::Satisfied)
-        .flat_map(|contract| {
-            contract.proving.iter().map(|&test| ExpectedResult {
-                keys: vec![contract_test_key(contract.id, test)],
+        .filter(|contract| contract.state == ContractState::Satisfied);
+    let tests = satisfied.clone().flat_map(|contract| {
+        contract.proving.iter().map(|&test| ExpectedResult {
+            keys: vec![contract_test_key(contract.id, test)],
+            gates: Vec::new(),
+            expected: Expected::Passes { test },
+        })
+    });
+    let catches = satisfied.flat_map(|contract| {
+        contract.proving_catches.iter().filter_map(|&case| {
+            let caught = rows.iter().find_map(|result| match result.expected {
+                Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
+                    if c == case =>
+                {
+                    Some(result.expected.clone())
+                }
+                _ => None,
+            })?;
+            Some(ExpectedResult {
+                keys: vec![contract_catch_key(contract.id, case)],
                 gates: Vec::new(),
-                expected: Expected::Passes { test },
+                expected: caught,
             })
         })
-        .collect()
+    });
+    tests.chain(catches).collect()
+}
+
+/// The [`Key::ContractCatch`] for `contract`'s proving catch `case`.
+pub fn contract_catch_key(contract: ContractId, case: CaseRef) -> Key {
+    Key::ContractCatch {
+        contract: contract.name(),
+        property: case.property.to_owned(),
+        name: case.name.to_owned(),
+    }
 }
 
 /// The [`Key::ContractTest`] for `contract`'s proving test `test`.

@@ -55,6 +55,12 @@
 //! violates it without its trigger history, so the gate stays the committed
 //! input, which must violate the case's property.
 //!
+//! A typed case may name `missing_evidence` instead, a harness-caught case
+//! (Adam's ruling on C19): its patched runs count only when they end at a
+//! missing-evidence harness failure of the case's property whose detail
+//! says that text, violating nothing. Every other harness failure is still
+//! a failure.
+//!
 //! `--targets` runs only the cases whose committed fuzz input runs on a harness
 //! that a simulator fuzz target runs, as the fuzz package's
 //! `[package.metadata.zakura-sim.targets]` table maps them, and prints
@@ -233,6 +239,10 @@ struct Case {
     /// input must violate too, and nothing else (C4). Empty for a case that
     /// breaks its property alone.
     set: Vec<String>,
+    /// A harness-caught case's named diagnostic: what the missing evidence
+    /// its patched runs must end at says ([`classify_missing_evidence`]).
+    /// `None` for a case caught by a violation.
+    missing_evidence: Option<String>,
     /// The simulator fuzz target that runs the input's harness, with
     /// `--targets`.
     target: Option<String>,
@@ -395,6 +405,12 @@ struct CaseFile {
     /// case names `set` or `also_violates`, not both.
     #[serde(default)]
     set: Vec<String>,
+    /// A harness-caught case's named diagnostic (Adam's ruling on C19,
+    /// 2026-11-12): its patched run must end at a missing-evidence harness
+    /// failure of the case's property whose detail says this, such as
+    /// `with a boundary unread`, violating nothing. Only a typed case that
+    /// names neither `set` nor `also_violates` may name it.
+    missing_evidence: Option<String>,
 }
 
 /// A committed fuzz input's sidecar, as `zakura-sim`'s tests check it.
@@ -692,6 +708,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 checks,
                 also_violates,
                 set,
+                missing_evidence,
             } = toml::from_str(
                 &fs::read_to_string(&case_file)
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
@@ -733,6 +750,18 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 )
                 .into());
             }
+            // No fuzz target confirms a harness failure, and a nested or
+            // co-violating case is caught by its violations.
+            let harness_caught_alone = matches!(witness, Witness::Typed { .. })
+                && set.is_empty()
+                && also_violates.is_empty();
+            if missing_evidence.is_some() && !harness_caught_alone {
+                return Err(format!(
+                    "{}: a harness-caught case is typed and names no `set` or `also_violates`",
+                    case_file.display()
+                )
+                .into());
+            }
             Ok(Case {
                 property,
                 patch,
@@ -740,6 +769,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 checks,
                 also_violates,
                 set,
+                missing_evidence,
                 target: None,
             })
         })
@@ -1049,10 +1079,14 @@ impl Case {
             .collect()
     }
 
-    /// What `patched`, one of the case's patched runs, shows about it
-    /// ([`classify_set`]).
+    /// What `patched`, one of the case's patched runs, shows about it:
+    /// [`classify_missing_evidence`] for a harness-caught case, and
+    /// [`classify_set`] for any other.
     fn classify(&self, patched: &Run) -> Verdict {
-        classify_set(&self.property, &self.also_violates, &self.set, patched)
+        match &self.missing_evidence {
+            Some(detail) => classify_missing_evidence(&self.property, detail, patched),
+            None => classify_set(&self.property, &self.also_violates, &self.set, patched),
+        }
     }
 }
 
@@ -1614,6 +1648,52 @@ fn classify_set(
         Some(why) => Verdict::WitnessFails(why.clone()),
         None => Verdict::Caught(None),
     }
+}
+
+/// What `patched` shows about a harness-caught case of `property` whose
+/// named diagnostic is `detail`. It's a catch only if the run ended at
+/// `property`'s missing evidence, `<property> lacks evidence after step
+/// <n>: <detail>` as the simulator writes it, whose detail says `detail`,
+/// and violated nothing. Any other harness failure is still
+/// [`Verdict::Harness`], so no other failure ever counts. The witness test
+/// fails at any harness failure, which can't show a trigger history, so its
+/// result doesn't decide this.
+fn classify_missing_evidence(property: &str, detail: &str, patched: &Run) -> Verdict {
+    let (violation, others_violated, outcome, harness) = match patched {
+        Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
+        Run::Ended {
+            violation,
+            others_violated,
+            outcome,
+            harness,
+            ..
+        } => (violation, others_violated, outcome, harness),
+    };
+    if let Some(violated) = violation.iter().chain(others_violated).next() {
+        return Verdict::Unrelated(violated.clone());
+    }
+    if matches!(outcome, Some(EndOutcome::Violated {})) {
+        return Verdict::NotCaught(format!("violated {property} at no harness failure"));
+    }
+    match harness {
+        Some(failure) if names_missing_evidence(property, detail, failure) => Verdict::Caught(None),
+        Some(failure) => Verdict::Harness(failure.clone()),
+        None => outcome.as_ref().map_or(Verdict::Unreported, |outcome| {
+            Verdict::NotCaught(outcome.to_string())
+        }),
+    }
+}
+
+/// Whether `failure` is `property`'s missing evidence whose detail says
+/// `detail`.
+fn names_missing_evidence(property: &str, detail: &str, failure: &str) -> bool {
+    failure
+        .strip_prefix(property)
+        .and_then(|rest| rest.strip_prefix(" lacks evidence after step "))
+        .and_then(|rest| rest.split_once(": "))
+        .is_some_and(|(step, shown)| {
+            !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()) && shown.contains(detail)
+        })
 }
 
 /// `git` in `dir`.
@@ -2237,6 +2317,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            missing_evidence: None,
             target: None,
         };
         let scripted = Case {
@@ -2632,6 +2713,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            missing_evidence: None,
             target: None,
         };
         let judge = |binary: &Path, case: &Case| {
@@ -2708,6 +2790,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            missing_evidence: None,
             target: None,
         };
         let scratch = dir.path().join("case");
@@ -2819,6 +2902,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            missing_evidence: None,
             target: None,
         };
         let scratch = dir.path().join("case");
@@ -2873,6 +2957,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
+            missing_evidence: None,
             target: None,
         };
         let scratch = dir.path().join("case");
@@ -2914,6 +2999,70 @@ mod tests {
     /// with its property and every member of its set violated. A missing
     /// member isn't a catch, and a property outside the set is unrelated.
     /// Its runs ask the witness judge for the same set.
+    /// A harness-caught case counts only its own property's missing
+    /// evidence with its named detail, violating nothing, and any other
+    /// harness failure stays one (Adam's ruling on C19). Only a typed case
+    /// with no set or co-violations may name the detail.
+    #[test]
+    fn a_harness_caught_case_needs_its_named_missing_evidence() {
+        const DETAIL: &str = "with a boundary unread";
+        let ended = |harness: Option<&str>, others: &[&str]| Run::Ended {
+            violation: None,
+            others_violated: others.iter().map(|id| (*id).to_owned()).collect(),
+            outcome: None,
+            harness: harness.map(str::to_owned),
+            witness: Some("the run ended at a harness failure".to_owned()),
+        };
+        let missing =
+            format!("{ID} lacks evidence after step 940: the run ran dry after step 940 {DETAIL}");
+        assert_eq!(
+            classify_missing_evidence(ID, DETAIL, &ended(Some(&missing), &[])),
+            Verdict::Caught(None)
+        );
+        for failure in [
+            format!("other/id lacks evidence after step 940: {DETAIL}"),
+            format!("{ID} lacks evidence after step 940: a gap"),
+            format!("{ID} lacks evidence after step : {DETAIL}"),
+            "source 3's evidence failed: PeerActionFailed".to_owned(),
+        ] {
+            assert_eq!(
+                classify_missing_evidence(ID, DETAIL, &ended(Some(&failure), &[])),
+                Verdict::Harness(failure.clone())
+            );
+        }
+        assert_eq!(
+            classify_missing_evidence(ID, DETAIL, &ended(Some(&missing), &["sim/no-task-panic"])),
+            Verdict::Unrelated("sim/no-task-panic".to_owned())
+        );
+        assert_eq!(
+            classify_missing_evidence(ID, DETAIL, &ended(None, &[])),
+            Verdict::Unreported
+        );
+        let typed = r#"
+            missing_evidence = "with a boundary unread"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "qa/planted/x/case.scenario.json"
+            plan = "qa/planted/x/case.plan.bin"
+        "#;
+        let cases = parse_case(typed).expect("a typed harness-caught case parses");
+        assert_eq!(cases[0].missing_evidence.as_deref(), Some(DETAIL));
+        assert_eq!(
+            cases[0].classify(&ended(Some(&missing), &[])),
+            Verdict::Caught(None)
+        );
+        for refused in [
+            "input = \"a.bin\"\nmissing_evidence = \"x\"".to_owned(),
+            typed.replace("[typed]", "set = [\"x/broader\"]\n[typed]"),
+            typed.replace("[typed]", "also_violates = [\"x/other\"]\n[typed]"),
+        ] {
+            let error = parse_case(&refused)
+                .expect_err("only a typed case alone is harness-caught")
+                .to_string();
+            assert!(error.contains("harness-caught"), "{error}");
+        }
+    }
+
     #[test]
     fn a_nested_case_needs_exactly_its_set() {
         const BROADER: &str = "header-sync/s5v9/conformant-never-closes";
@@ -2944,6 +3093,7 @@ mod tests {
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: set.to_vec(),
+            missing_evidence: None,
             target: Some("header_sync".to_owned()),
         };
         assert_eq!(nested.beside(), set);

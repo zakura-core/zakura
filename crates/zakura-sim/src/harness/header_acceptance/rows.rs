@@ -1432,14 +1432,17 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
             // Built once per case for a fixed set of 26, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
-            expected.extend(caught(
-                WIRE,
-                case(property, name),
-                set,
-                Found::AtStep,
-                generated.gates,
-                true,
-            ));
+            let case = case(property, name);
+            expected.extend(
+                caught(WIRE, case, set, Found::AtStep, generated.gates, true)
+                    .into_iter()
+                    .map(|mut result| {
+                        if let Expected::Caught { not_applicable, .. } = &mut result.expected {
+                            *not_applicable = super::not_applicable::expected(case);
+                        }
+                        result
+                    }),
+            );
         }
         GeneratedCatch::Open(reason) => expected.push(result(
             vec![Key::catch(property)],
@@ -2134,7 +2137,7 @@ fn hand_written_rows() -> Vec<Row> {
             set: &[COMMIT],
             found: Found::AtStep,
             companions: super::companions::COMPANIONS,
-            not_applicable: &[],
+            not_applicable: super::not_applicable::expected(despite),
         },
     ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));

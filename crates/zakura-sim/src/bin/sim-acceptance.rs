@@ -4,7 +4,8 @@
 //! ```text
 //! sim-acceptance plan --repo <dir> --out <plan.json>
 //! sim-acceptance evaluate --repo <dir> --plan <plan.json> --artifacts <dir>
-//!     --header-out <dir> --subject <commit> --subject-source <digest> --out <dir>
+//!     --header-out <dir> --subject <commit> --subject-source <digest>
+//!     --containment <subreaper|best-effort> --out <dir>
 //! ```
 //!
 //! `plan` writes the tasks xtask runs. `evaluate` judges their artifacts,
@@ -42,7 +43,8 @@ mod cli {
     const USAGE: &str = "usage: sim-acceptance plan --repo <dir> --out <plan.json>\n       \
                          sim-acceptance evaluate --repo <dir> --plan <plan.json> \
                          --artifacts <dir> --header-out <dir> --subject <commit> \
-                         --subject-source <digest> --out <dir>";
+                         --subject-source <digest> --containment <subreaper|best-effort> \
+                         --out <dir>";
 
     /// Reads `--flag value` pairs, refusing an unknown, repeated or
     /// missing flag.
@@ -96,6 +98,7 @@ mod cli {
                         "--header-out",
                         "--subject",
                         "--subject-source",
+                        "--containment",
                         "--out",
                     ],
                 )?;
@@ -112,6 +115,7 @@ mod cli {
                     &HeaderRun { out: &header_out },
                     &flags["--subject"],
                     &flags["--subject-source"],
+                    &flags["--containment"],
                 );
                 let out = PathBuf::from(&flags["--out"]);
                 fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;

@@ -132,7 +132,7 @@ async fn a_datagram_is_unreadable_until_delivered_and_resolves_once() {
             NetEvent::Sent {
                 id,
                 len: 5,
-                digest: None
+                digest: Some(<[u8; 32]>::from(sha2::Sha256::digest(b"hello")))
             },
             NetEvent::Delivered { id },
         ]
@@ -144,6 +144,7 @@ async fn payload_digests_tell_equal_lengths_apart_only_while_on() {
     let net = SimNet::new(fifo(0, 10));
     let a = net.bind(addr(1)).unwrap();
     net.bind(addr(2)).unwrap();
+    net.set_payload_digests(false);
     send(&a, addr(2), b"hello");
     net.set_payload_digests(true);
     send(&a, addr(2), b"hello");

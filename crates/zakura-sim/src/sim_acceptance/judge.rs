@@ -202,12 +202,18 @@ pub fn owned_run_passes(
             }
         }
     }
-    for ((field, count), (_, meaning)) in cleanup_counts(&end.cleanup).into_iter().zip(CLEANUP) {
-        if count > 0 && meaning == CleanupMeaning::Fault {
-            return Err(Blocked::Cleanup { field, count });
-        }
-    }
-    Ok(())
+    cleanup_fault(&end.cleanup).map_or(Ok(()), Err)
+}
+
+/// The first cleanup count [`CLEANUP`] calls a fault that's nonzero in
+/// `cleanup`, as a block, or `None` if teardown was clean. It's the one
+/// cleanup rule, for owned runs and for the consumed header runs alike.
+pub fn cleanup_fault(cleanup: &CleanupRecord) -> Option<Blocked> {
+    cleanup_counts(cleanup)
+        .into_iter()
+        .zip(CLEANUP)
+        .find(|((_, count), (_, meaning))| *count > 0 && *meaning == CleanupMeaning::Fault)
+        .map(|((field, count), _)| Blocked::Cleanup { field, count })
 }
 
 /// Whether `end` ended as `expect` says.

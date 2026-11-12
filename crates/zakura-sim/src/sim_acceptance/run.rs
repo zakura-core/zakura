@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::{
     deviations::DEVIATIONS,
     evaluate::{evaluate, header_refusal, Evaluation, HeaderRecordFacts, RowSpec, Verdict},
-    header::{verify, Published},
+    header::{consumed_cleanup, verify, Published},
     judge::{owned_run_passes, Registered, RunExpect},
     manifest::{derive, problems, rows, Expected},
 };
@@ -68,13 +68,17 @@ pub enum Task {
     Seed {
         /// The expected result it produces.
         expected: String,
+        /// The seed's file, relative to the repository's root, which its
+        /// committed end record, if any, sits beside.
+        file: String,
         /// The seed's harness.
         harness: String,
         /// Its full input's SHA-256, its file name in the run's corpus.
         input: String,
     },
-    /// One seed witness recorded with `--witness`, which writes `trace/`
-    /// with its `witness.json`.
+    /// One seed witness recorded with `--witness`, then its trace replayed
+    /// fresh, which writes `trace/` with its `witness.json`, and
+    /// `replay.json`.
     SeedWitness {
         /// The expected result it produces.
         expected: String,
@@ -93,14 +97,6 @@ pub enum Task {
         expected: String,
         /// Its arguments after `cargo`.
         args: Vec<String>,
-    },
-    /// One planted case's verdict, through `cargo xtask planted`, which
-    /// writes `command.json`.
-    Planted {
-        /// The expected result it produces.
-        expected: String,
-        /// The case's property.
-        property: String,
     },
     /// One measured recording, which writes `trace/` and `measure.json`.
     Measure {
@@ -121,7 +117,6 @@ impl Task {
             | Task::Seed { expected, .. }
             | Task::SeedWitness { expected, .. }
             | Task::Command { expected, .. }
-            | Task::Planted { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
     }
@@ -141,8 +136,33 @@ pub struct Sim7Plan {
     pub problems: Vec<String>,
 }
 
-/// The three S4.6 commands, by ID, as `cargo` arguments.
-pub fn command_args(id: &str) -> Option<Vec<String>> {
+/// An S4.6 command, by ID, as `cargo` arguments: the dependency graph, the
+/// normal workspace check, or one `sim-package` row's check in the
+/// simulator build, selecting exactly what `qa/suite.toml` names for it.
+pub fn command_args(repo: &Path, id: &str) -> Option<Vec<String>> {
+    if let Some(name) = id.strip_prefix("check-sim-package/") {
+        let text = fs::read_to_string(repo.join(crate::suite::SUITE_FILE)).ok()?;
+        let suite: crate::suite::SuiteFile = toml::from_str(&text).ok()?;
+        let row = suite.sim_package.iter().find(|row| row.name == name)?;
+        let mut args = vec![
+            "check".to_owned(),
+            "--locked".to_owned(),
+            "-p".to_owned(),
+            name.to_owned(),
+        ];
+        if row.lib {
+            args.push("--lib".to_owned());
+        }
+        match &row.tests {
+            Some(tests) => {
+                for test in tests {
+                    args.extend(["--test".to_owned(), test.clone()]);
+                }
+            }
+            None => args.push("--tests".to_owned()),
+        }
+        return Some(args);
+    }
     let args: &[&str] = match id {
         // As the lint step reads it: the node's package is `zakura`.
         "cargo-tree-excludes-simulator" => &[
@@ -158,21 +178,6 @@ pub fn command_args(id: &str) -> Option<Vec<String>> {
             "none",
         ],
         "check-workspace-normal" => &["check", "--workspace", "--locked"],
-        "check-sim-packages" => &[
-            "check",
-            "--locked",
-            "-p",
-            "zakura-rt",
-            "-p",
-            "zakura-scheduler",
-            "-p",
-            "zakura-sim",
-            "-p",
-            "zakura-storage",
-            "-p",
-            "zakura-quic",
-            "--all-targets",
-        ],
         _ => return None,
     };
     Some(args.iter().map(|arg| (*arg).to_owned()).collect())
@@ -241,6 +246,7 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 Expected::Seed { file } => {
                     seed_inputs.get(file).map(|(harness, input)| Task::Seed {
                         expected: id.clone(),
+                        file: file.clone(),
                         harness: harness.clone(),
                         input: input.clone(),
                     })
@@ -256,13 +262,17 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                         expect: row.witness.clone(),
                     })
                 }),
-                Expected::Command(command) => command_args(command).map(|args| Task::Command {
+                Expected::Command(command) => {
+                    command_args(repo, command).map(|args| Task::Command {
+                        expected: id.clone(),
+                        args,
+                    })
+                }
+                Expected::SelfTest(path) => Some(Task::Test {
                     expected: id.clone(),
-                    args,
-                }),
-                Expected::Planted(property) => Some(Task::Planted {
-                    expected: id.clone(),
-                    property: (*property).to_owned(),
+                    package: "zakura-sim".to_owned(),
+                    file: "tests/sim_acceptance.rs".to_owned(),
+                    test: path.clone(),
                 }),
                 Expected::Measure(harness) => Some(Task::Measure {
                     expected: id.clone(),
@@ -270,7 +280,10 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 }),
                 // Judged from the header record and from seed tasks.
                 Expected::HeaderKey(_) | Expected::EndRecord { .. } => None,
-                Expected::RaceSchedule(_)
+                // The planted runner's verdict alone isn't evidence (Rule 11):
+                // it blocks until each of its runs is kept and judged.
+                Expected::Planted(_)
+                | Expected::RaceSchedule(_)
                 | Expected::Target(_)
                 | Expected::Minimize(_)
                 | Expected::Agreement(_) => {
@@ -285,6 +298,7 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                     expected,
                     Expected::HeaderKey(_)
                         | Expected::EndRecord { .. }
+                        | Expected::Planted(_)
                         | Expected::RaceSchedule(_)
                         | Expected::Target(_)
                         | Expected::Minimize(_)
@@ -299,26 +313,56 @@ pub fn plan(repo: &Path) -> Sim7Plan {
     plan
 }
 
-/// `lane`'s task, from `qa/suite.toml` at `repo`.
+/// `lane`'s task, from `qa/suite.toml` at `repo`. Its required targets
+/// come from the packages, not from what the command happens to select: a
+/// lane naming `--test` targets requires those and its packages' libraries,
+/// and one that doesn't requires every top-level `tests/*.rs` of each
+/// package and its library. A library a `sim-package` row marks `lib =
+/// false` is expected empty, so it isn't required (Rule 11).
 fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
     let text = fs::read_to_string(repo.join(crate::suite::SUITE_FILE)).ok()?;
     let suite: crate::suite::SuiteFile = toml::from_str(&text).ok()?;
     let row = suite.lane.iter().find(|row| row.id == lane)?;
     let (subcommand, args) = row.args.split_once(' ').unwrap_or((&row.args, ""));
-    let package = args
-        .split_whitespace()
-        .skip_while(|word| *word != "-p")
-        .nth(1)
-        .unwrap_or_default();
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let packages: Vec<&str> = words
+        .windows(2)
+        .filter(|pair| pair[0] == "-p")
+        .map(|pair| pair[1])
+        .collect();
+    let named = row.test_targets();
+    let mut required = Vec::new();
+    for package in &packages {
+        let empty_lib = suite
+            .sim_package
+            .iter()
+            .any(|p| p.name == *package && !p.lib);
+        if !empty_lib {
+            required.push(format!("{package}/lib"));
+        }
+        if named.is_empty() {
+            let tests = repo.join("crates").join(package).join("tests");
+            let mut stems: Vec<String> = fs::read_dir(&tests)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    (path.extension()? == "rs")
+                        .then(|| path.file_stem()?.to_str().map(str::to_owned))?
+                })
+                .collect();
+            stems.sort();
+            required.extend(stems.into_iter().map(|stem| format!("{package}/{stem}")));
+        }
+    }
+    if let [package] = packages[..] {
+        required.extend(named.iter().map(|target| format!("{package}/{target}")));
+    }
     Some(Task::Lane {
         expected: expected.to_owned(),
         id: lane.to_owned(),
         command: row.build.command(subcommand, args),
-        required: row
-            .test_targets()
-            .into_iter()
-            .map(|target| format!("{package}/{target}"))
-            .collect(),
+        required,
     })
 }
 
@@ -333,6 +377,9 @@ pub struct Sim7Record {
     pub subject: String,
     /// S's source digest.
     pub subject_source: String,
+    /// How the run contained its children: `subreaper` or `best-effort`.
+    /// Only a subreaper run is an acceptance record.
+    pub containment: String,
     /// Why hdr-14's record can't be consumed, if it can't.
     pub header_refusal: Option<String>,
     /// The manifest's problems at S.
@@ -343,7 +390,8 @@ pub struct Sim7Record {
     pub evaluation: Evaluation,
     /// Every narrowing of the spec, and whether it's signed off.
     pub deviations: Vec<(String, bool)>,
-    /// No row blocked, no manifest problem, and the header record consumed.
+    /// No row blocked, no manifest problem, the plan S's own, the run
+    /// contained under a subreaper, and the header record consumed.
     pub accepted: bool,
     /// Accepted, nothing excluded, and every deviation signed off.
     pub fully_accepted: bool,
@@ -365,15 +413,31 @@ pub fn record(
     header: &HeaderRun<'_>,
     subject: &str,
     subject_source: &str,
+    containment: &str,
 ) -> Sim7Record {
+    let mut problems = plan.problems.clone();
+    // The plan must be S's own: a supplied plan that relabels a task or
+    // drops an unsupported result would otherwise be judged as given.
+    if &self::plan(repo) != plan {
+        problems.push("the supplied plan isn't the plan the manifest at S makes".to_owned());
+    }
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut applicable = 0u64;
     let mut seed_traces: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
-        let verdict = judge_task(task, &dir, subject_source, &mut applicable);
-        if let Task::Seed { input, .. } = task {
-            seed_traces.insert(input.clone(), dir.join("trace"));
+        let bound = fs::read_to_string(dir.join("task.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Task>(&text).ok());
+        let verdict = if bound.as_ref() == Some(task) {
+            judge_task(task, &dir, subject_source, &mut applicable)
+        } else {
+            Verdict::Blocked {
+                why: "the artifact directory's task.json isn't this task".to_owned(),
+            }
+        };
+        if let Task::Seed { file, .. } = task {
+            seed_traces.insert(file.clone(), dir.join("trace"));
         }
         verdicts.insert(task.expected().to_owned(), verdict);
     }
@@ -382,20 +446,15 @@ pub fn record(
     }
     let derived = derive(repo).unwrap_or_default();
     let rows = rows(&derived);
-    // End records: the seed's own trace must end exactly as committed.
-    let seed_report = crate::suite::manifest(repo).map(|m| m.seed_report).ok();
+    // End records: the seed's own trace must end exactly as committed. A
+    // seed's file is its end record's, `name.end.json`, as `name.bin`.
     for row in &rows {
         for expected in &row.expected {
             if let Expected::EndRecord { file } = expected {
-                let input = seed_report.as_ref().and_then(|report| {
-                    let seed = Path::new(file).with_extension("bin");
-                    report
-                        .seeds
-                        .iter()
-                        .find(|row| row.file == seed)
-                        .and_then(|row| row.input_sha256.clone())
-                });
-                let verdict = match input.and_then(|input| seed_traces.get(&input).cloned()) {
+                let seed = file
+                    .strip_suffix(".end.json")
+                    .map(|stem| format!("{stem}.bin"));
+                let verdict = match seed.and_then(|seed| seed_traces.get(&seed).cloned()) {
                     Some(trace) => end_record_matches(repo, file, &trace),
                     None => Verdict::Blocked {
                         why: "no seed run produced this end record's trace".to_owned(),
@@ -433,7 +492,10 @@ pub fn record(
         .iter()
         .map(|d| (d.id.to_owned(), d.is_signed_off()))
         .collect();
-    let accepted = evaluation.accepted && plan.problems.is_empty() && refusal.is_none();
+    let accepted = evaluation.accepted
+        && problems.is_empty()
+        && refusal.is_none()
+        && containment == "subreaper";
     let fully_accepted =
         accepted && evaluation.fully_accepted && deviations.iter().all(|(_, signed)| *signed);
     Sim7Record {
@@ -442,8 +504,9 @@ pub fn record(
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
         subject: subject.to_owned(),
         subject_source: subject_source.to_owned(),
+        containment: containment.to_owned(),
         header_refusal: refusal,
-        problems: plan.problems.clone(),
+        problems,
         unsupported: plan.unsupported.clone(),
         evaluation,
         deviations,
@@ -459,38 +522,85 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
         serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
     };
     match task {
-        Task::Test { test, .. } | Task::FuzzTest { test, .. } => {
+        Task::Test {
+            package,
+            file,
+            test,
+            ..
+        } => {
             let Some(result) = json("test.json") else {
                 return blocked("the test left no test.json".to_owned());
             };
+            let same = result.get("package").and_then(Value::as_str) == Some(package)
+                && result.get("file").and_then(Value::as_str) == Some(file);
+            if !same {
+                return blocked(format!("test.json isn't {package} {file}'s"));
+            }
+            // zakura-sim's binaries embed S's source digest, so theirs must
+            // match. The others carry none, and are the run's own build.
+            if package == "zakura-sim"
+                && result.get("binary_source").and_then(Value::as_str) != Some(source)
+            {
+                return blocked("the test binary doesn't embed S's source digest".to_owned());
+            }
             exactly_one_passed(&result, test)
         }
+        Task::FuzzTest { test, .. } => match json("test.json") {
+            Some(result) => exactly_one_passed(&result, test),
+            None => blocked("the test left no test.json".to_owned()),
+        },
         Task::Lane { required, .. } => match json("lane.json") {
             Some(lane) => lane_passed(&lane, required),
             None => blocked("the lane left no lane.json".to_owned()),
         },
-        Task::Seed { .. } => {
-            let replayed = json("replay.json")
-                .and_then(|r| r.get("exited_ok").and_then(Value::as_bool))
-                .unwrap_or(false);
-            match judge_trace(&dir.join("trace"), source, &RunExpect::Passes, applicable) {
-                Verdict::Verified if !replayed => {
-                    blocked("the seed's trace didn't replay exactly in a fresh process".to_owned())
-                }
-                verdict => verdict,
+        Task::Seed { harness, input, .. } => {
+            if !exited(json("record.json")) {
+                return blocked("the seed's recording didn't exit 0".to_owned());
             }
+            if !exited(json("replay.json")) {
+                return blocked(
+                    "the seed's trace didn't replay exactly in a fresh process".to_owned(),
+                );
+            }
+            judge_trace(
+                &dir.join("trace"),
+                source,
+                (harness, Some(input)),
+                &RunExpect::Passes,
+                applicable,
+            )
         }
         Task::SeedWitness {
-            property, expect, ..
+            harness,
+            input,
+            property,
+            expect,
+            ..
         } => {
-            let passed = json("trace/witness.json")
-                .and_then(|w| w.get("passed").and_then(Value::as_bool))
-                .unwrap_or(false);
-            if !passed {
+            if !exited(json("record.json")) {
+                return blocked("the witness recording didn't exit 0".to_owned());
+            }
+            if !exited(json("replay.json")) {
+                return blocked(
+                    "the witness trace didn't replay exactly in a fresh process".to_owned(),
+                );
+            }
+            let Some(witness) = json("trace/witness.json") else {
+                return blocked("the witness left no witness.json".to_owned());
+            };
+            let same = witness.get("property").and_then(Value::as_str) == Some(property)
+                && witness.get("expect").and_then(Value::as_str) == Some(expect);
+            if !same {
+                return blocked(format!(
+                    "witness.json isn't the witness of {property}, {expect}"
+                ));
+            }
+            if witness.get("passed").and_then(Value::as_bool) != Some(true) {
                 return blocked(format!("the witness of {property} didn't pass"));
             }
-            let also: Vec<String> = json("trace/witness.json")
-                .and_then(|w| serde_json::from_value(w.get("also_violates")?.clone()).ok())
+            let also: Vec<String> = witness
+                .get("also_violates")
+                .and_then(|also| serde_json::from_value(also.clone()).ok())
                 .unwrap_or_default();
             let run_expect = match expect.as_str() {
                 "violated" | "violated-set" => RunExpect::Violates {
@@ -499,21 +609,30 @@ fn judge_task(task: &Task, dir: &Path, source: &str, applicable: &mut u64) -> Ve
                 },
                 _ => RunExpect::Passes,
             };
-            judge_trace(&dir.join("trace"), source, &run_expect, &mut 0)
+            judge_trace(
+                &dir.join("trace"),
+                source,
+                (harness, Some(input)),
+                &run_expect,
+                &mut 0,
+            )
         }
         Task::Command { args, .. } => match json("command.json") {
             Some(command) => command_passed(&command, args),
             None => blocked("the command left no command.json".to_owned()),
         },
-        Task::Planted { property, .. } => match json("command.json") {
-            Some(command) if command.get("exited_ok").and_then(Value::as_bool) == Some(true) => {
-                Verdict::Verified
-            }
-            _ => blocked(format!("`cargo xtask planted {property}` didn't pass")),
-        },
-        Task::Measure { .. } => match json("measure.json") {
-            Some(measure) if measure.get("steps").and_then(Value::as_u64).is_some() => {
-                judge_trace(&dir.join("trace"), source, &RunExpect::Passes, &mut 0)
+        Task::Measure { harness, .. } => match json("measure.json") {
+            Some(measure)
+                if exited(json("record.json"))
+                    && measure.get("steps").and_then(Value::as_u64).is_some() =>
+            {
+                judge_trace(
+                    &dir.join("trace"),
+                    source,
+                    (harness, None),
+                    &RunExpect::Passes,
+                    &mut 0,
+                )
             }
             _ => blocked("the recording left no measure.json".to_owned()),
         },
@@ -617,11 +736,23 @@ fn command_passed(command: &Value, args: &[String]) -> Verdict {
     Verdict::Verified
 }
 
+/// Whether a child's `<name>.json` says it exited 0.
+fn exited(child: Option<Value>) -> bool {
+    child.and_then(|c| c.get("exited_ok").and_then(Value::as_bool)) == Some(true)
+}
+
 /// Judges the trace in `dir` with `owned_run_passes`, taking its
-/// registered properties and statuses from its own meta, and requiring
-/// its build to embed `source`. A passing run's applicable counts are
+/// registered properties and statuses from its own meta. It must be a run
+/// of `binding`'s harness, on its full input's SHA-256 where one is given,
+/// from a build that embeds `source`. A passing run's applicable counts are
 /// added to `applicable`.
-fn judge_trace(dir: &Path, source: &str, expect: &RunExpect, applicable: &mut u64) -> Verdict {
+fn judge_trace(
+    dir: &Path,
+    source: &str,
+    binding: (&str, Option<&str>),
+    expect: &RunExpect,
+    applicable: &mut u64,
+) -> Verdict {
     let trace = match TraceReader::open(dir) {
         Ok(trace) => trace,
         Err(error) => {
@@ -630,6 +761,19 @@ fn judge_trace(dir: &Path, source: &str, expect: &RunExpect, applicable: &mut u6
             }
         }
     };
+    let (harness, input) = binding;
+    if trace.meta.sim != harness {
+        return Verdict::Blocked {
+            why: format!("the trace is a run of {}, not {harness}", trace.meta.sim),
+        };
+    }
+    if let Some(input) = input {
+        if trace.meta.input.as_ref().map(|i| i.sha256.as_str()) != Some(input) {
+            return Verdict::Blocked {
+                why: format!("the trace isn't a run of the input {input}"),
+            };
+        }
+    }
     if trace.meta.build.source != source {
         return Verdict::Blocked {
             why: format!(
@@ -724,7 +868,8 @@ fn header_record(
                     record: &record,
                 },
             )
-        });
+        })
+        .and_then(|results| consumed_cleanup(&results, &artifacts));
     let facts = HeaderRecordFacts {
         subject: record.subject.clone(),
         subreaper: record.containment == Containment::Subreaper,

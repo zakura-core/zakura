@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::sched::{Proof, TestRef, SCHED_MAPPING};
+use super::sched::{Proof, TestRef, SCHED_IDS, SCHED_MAPPING};
 use crate::harness::header_acceptance::{tool::committed_required, Key, Manifest};
 
 /// One expected result, which the tool produces and the evaluator judges.
@@ -56,8 +56,11 @@ pub enum Expected {
     Minimize(&'static str),
     /// One schedule-agreement check, by its pair's name.
     Agreement(String),
-    /// One S4.6 command.
-    Command(&'static str),
+    /// One S4.6 command, by ID.
+    Command(String),
+    /// One of sim-7's own static checks and evaluator controls in
+    /// `tests/sim_acceptance.rs`, by its path in that test binary.
+    SelfTest(String),
     /// One measured recording, by harness.
     Measure(&'static str),
 }
@@ -80,6 +83,7 @@ impl fmt::Display for Expected {
             Expected::Minimize(property) => write!(f, "minimize/{property}"),
             Expected::Agreement(name) => write!(f, "agreement/{name}"),
             Expected::Command(id) => write!(f, "command/{id}"),
+            Expected::SelfTest(path) => write!(f, "self-test/{path}"),
             Expected::Measure(harness) => write!(f, "measure/{harness}"),
         }
     }
@@ -110,6 +114,11 @@ pub struct Derived {
     pub race_schedules: Vec<String>,
     /// Every generated `header-sync/s5v9/…` property hdr-14 requires.
     pub table_properties: Vec<String>,
+    /// Every `qa/suite.toml` `sim-package` row's package, each one S4.6
+    /// compile command.
+    pub sim_packages: Vec<String>,
+    /// Every test in `tests/sim_acceptance.rs`, by its path in that binary.
+    pub self_tests: Vec<String>,
 }
 
 const fn sim(file: &'static str, name: &'static str) -> Expected {
@@ -530,11 +539,16 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "S4.6",
             true,
-            vec![
-                Expected::Command("cargo-tree-excludes-simulator"),
-                Expected::Command("check-workspace-normal"),
-                Expected::Command("check-sim-packages"),
-            ],
+            ["cargo-tree-excludes-simulator", "check-workspace-normal"]
+                .map(|id| Expected::Command(id.to_owned()))
+                .into_iter()
+                .chain(
+                    derived
+                        .sim_packages
+                        .iter()
+                        .map(|name| Expected::Command(format!("check-sim-package/{name}"))),
+                )
+                .collect(),
         ),
         row(
             "S4.7",
@@ -557,6 +571,31 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
             ]
             .map(Expected::Lane)
             .to_vec(),
+        ),
+        row(
+            "sim-7/self-checks",
+            true,
+            derived
+                .self_tests
+                .iter()
+                .cloned()
+                .map(Expected::SelfTest)
+                .chain([
+                    sim("suite", "the_zakura_sim_lanes_run_every_sched4_target"),
+                    sim("suite", "a_lane_without_a_sched4_target_fails"),
+                ])
+                .chain(
+                    [
+                        "sim_acceptance::run::tests::a_test_row_needs_exactly_its_test",
+                        "sim_acceptance::run::tests::a_lane_needs_every_required_target_and_no_failure",
+                        "sim_acceptance::run::tests::the_dependency_graph_row_reads_cargo_tree_itself",
+                    ]
+                    .map(|path| Expected::UnitTest {
+                        package: "zakura-sim",
+                        path,
+                    }),
+                )
+                .collect(),
         ),
         row(
             "sched-4/measurements",
@@ -604,7 +643,22 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
             _ => None,
         })
         .collect();
+    let suite: crate::suite::SuiteFile = toml::from_str(
+        &std::fs::read_to_string(repo.join(crate::suite::SUITE_FILE))
+            .map_err(|error| vec![format!("{}: {error}", crate::suite::SUITE_FILE)])?,
+    )
+    .map_err(|error| vec![format!("{}: {error}", crate::suite::SUITE_FILE)])?;
+    let self_tests = self_tests(
+        &std::fs::read_to_string(repo.join("crates/zakura-sim/tests/sim_acceptance.rs"))
+            .map_err(|error| vec![format!("tests/sim_acceptance.rs: {error}")])?,
+    );
     Ok(Derived {
+        sim_packages: suite
+            .sim_package
+            .iter()
+            .map(|row| row.name.clone())
+            .collect(),
+        self_tests,
         seeds,
         seed_witnesses: manifest
             .seed_witnesses
@@ -636,7 +690,7 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
     }
     let required = ["M7.1", "M7.2", "M7.3", "M7.4", "M7.5", "M7.6", "downstream"]
         .into_iter()
-        .chain(SCHED_MAPPING.iter().map(|(id, _)| *id))
+        .chain(SCHED_IDS.iter().copied())
         .chain(["S4.1", "S4.2", "S4.3", "S4.4", "S4.5", "S4.6", "S4.7"]);
     for id in required {
         if !ids.contains(id) {
@@ -684,8 +738,50 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
         .flat_map(|property| [passing(property), catch(property)])
         .map(|expected| expected.to_string())
         .collect();
+    let selves: BTreeSet<String> = derived
+        .self_tests
+        .iter()
+        .map(|path| Expected::SelfTest(path.clone()).to_string())
+        .collect();
+    if !selves.is_subset(&held("sim-7/self-checks")) || selves.is_empty() {
+        problems.push("the self-check row doesn't hold every sim-7 static check".to_owned());
+    }
     if held("corpus/header-table-pairs") != pairs {
         problems.push("the header table row doesn't hold exactly the generated IDs".to_owned());
     }
     problems
+}
+
+/// Every `#[test]` function in `text`, a test file, by its path in the
+/// test binary: `name`, or `module::name` inside a top-level `mod module {`.
+fn self_tests(text: &str) -> Vec<String> {
+    let mut tests = Vec::new();
+    let mut module: Option<String> = None;
+    let mut is_test = false;
+    for line in text.lines() {
+        if let Some(name) = line
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(" {"))
+        {
+            module = Some(name.to_owned());
+        } else if line == "}" {
+            module = None;
+        }
+        let trimmed = line.trim();
+        if trimmed == "#[test]" {
+            is_test = true;
+        } else if is_test {
+            if let Some(name) = trimmed
+                .strip_prefix("fn ")
+                .and_then(|rest| rest.split('(').next())
+            {
+                tests.push(match &module {
+                    Some(module) => format!("{module}::{name}"),
+                    None => name.to_owned(),
+                });
+                is_test = false;
+            }
+        }
+    }
+    tests
 }

@@ -15,9 +15,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    ffi::OsString,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::Ordering,
@@ -105,9 +103,19 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args, BoxError> {
     Ok(Args {
         only,
         subject: take(&mut flags, "--subject")?,
-        header_out: PathBuf::from(take(&mut flags, "--header-out")?),
-        out: PathBuf::from(take(&mut flags, "--out")?),
+        // Absolute, since children run in the subject checkout.
+        header_out: absolute(PathBuf::from(take(&mut flags, "--header-out")?))?,
+        out: absolute(PathBuf::from(take(&mut flags, "--out")?))?,
         deadline: Duration::from_secs(deadline),
+    })
+}
+
+/// `path` made absolute against this process's working directory.
+fn absolute(path: PathBuf) -> Result<PathBuf, BoxError> {
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()?.join(path)
     })
 }
 
@@ -137,7 +145,7 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     let (_lock, kept) = lock_out(&TOOL, &args.out)?;
     mark_descendants(&TOOL, &args.out);
     let mut sessions = track_sessions(&args.out);
-    contain();
+    let contained = contain();
     let source = subject_source(repo_root, &options, &args.subject)?;
     clear_stale_runs(&TOOL, repo_root, &options, kept.as_deref())?;
     sessions.cleared();
@@ -150,7 +158,7 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     };
     let root = run_dir.join(SUBJECT_DIR);
     add_worktree(repo_root, &run, &root, &args.subject)?;
-    let result = run_at(&root, &run, &args, &source);
+    let result = run_at(&root, &run, &args, &source, contained);
     let removed = remove_worktrees_under(repo_root, &run, &run_dir);
     let summary = result?;
     removed?;
@@ -161,6 +169,7 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
                 .into(),
         );
     }
+    keep_executables(&run_dir)?;
     for target in RUN_TARGETS {
         let target = run_dir.join(target);
         if target.exists() {
@@ -207,7 +216,13 @@ fn subject_source(repo_root: &Path, options: &Options, subject: &str) -> Result<
 
 /// Builds the run's binaries from `root`, plans, runs every task, and
 /// evaluates, returning `evaluate`'s summary.
-fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<String, BoxError> {
+fn run_at(
+    root: &Path,
+    run: &Options,
+    args: &Args,
+    source: &str,
+    contained: bool,
+) -> Result<String, BoxError> {
     let logs = run.out.join("logs");
     let artifacts = run.out.join("artifacts");
     fs::create_dir_all(&logs)?;
@@ -333,7 +348,6 @@ fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<Strin
             "seed" => ctx.seed(fields)?,
             "seed-witness" => ctx.seed_witness(fields)?,
             "command" => ctx.command(fields)?,
-            "planted" => ctx.planted(fields)?,
             "measure" => ctx.measure(fields, &seed_of)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
         }
@@ -354,6 +368,8 @@ fn run_at(root: &Path, run: &Options, args: &Args, source: &str) -> Result<Strin
         .arg(&args.subject)
         .arg("--subject-source")
         .arg(source)
+        .arg("--containment")
+        .arg(crate::acceptance::containment(contained))
         .arg("--out")
         .arg(&run.out);
     let log = logs.join("evaluate.log");
@@ -476,8 +492,13 @@ impl Ctx<'_> {
         flush(&current, &section, &mut targets);
         let mut unrun = Vec::new();
         for (target, binary) in &binaries {
-            let listed = list_tests(binary, false, self);
-            let ignored = list_tests(binary, true, self);
+            let (Some(listed), Some(ignored)) = (
+                list_tests(binary, false, self),
+                list_tests(binary, true, self),
+            ) else {
+                unrun.push(format!("{target}: its binary's --list failed"));
+                continue;
+            };
             let ran: BTreeSet<&str> = targets
                 .get(target)
                 .map(|tests| {
@@ -529,6 +550,12 @@ impl Ctx<'_> {
         let expect = field(task, "expect")?;
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
         self.record(&mut record, "record")?;
+        let mut replay = Command::new(self.release);
+        replay
+            .arg("replay")
+            .arg(self.dir.join("trace"))
+            .current_dir(self.root);
+        self.record(&mut replay, "replay")?;
         Ok(())
     }
 
@@ -557,20 +584,6 @@ impl Ctx<'_> {
         }
         cargo.args(&args);
         self.record(&mut cargo, "command")?;
-        Ok(())
-    }
-
-    /// One planted case's verdict, through `cargo xtask planted` at S.
-    fn planted(&self, task: &Value) -> Result<(), BoxError> {
-        let property = field(task, "property")?;
-        let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-        let mut planted = Command::new(cargo);
-        planted
-            .args(["xtask", "planted", property])
-            .env_remove("RUSTFLAGS")
-            .env("CARGO_TARGET_DIR", self.run.out.join("planted"))
-            .current_dir(self.root);
-        self.record(&mut planted, "command")?;
         Ok(())
     }
 
@@ -604,6 +617,40 @@ impl Ctx<'_> {
     }
 }
 
+/// Copies the run's recording executables, the release and debug
+/// `zakura-sim`, to `<run>/bin/<sha256>/zakura-sim`, with `bin/index.json`
+/// naming which is which, before their build directories go: every trace
+/// sim-7 records keeps the executable that recorded it (Rule 9).
+fn keep_executables(run_dir: &Path) -> Result<(), BoxError> {
+    use sha2::{Digest, Sha256};
+    let mut index = serde_json::Map::new();
+    for (name, path) in [
+        ("release", "build-release/release/zakura-sim"),
+        ("debug", "build/debug/zakura-sim"),
+    ] {
+        let bytes = fs::read(run_dir.join(path))?;
+        let digest: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let dir = run_dir.join("bin").join(&digest);
+        fs::create_dir_all(&dir)?;
+        let kept = dir.join("zakura-sim");
+        fs::write(&kept, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&kept, fs::Permissions::from_mode(0o755))?;
+        }
+        index.insert(name.to_owned(), json!(digest));
+    }
+    fs::write(
+        run_dir.join("bin").join("index.json"),
+        serde_json::to_string_pretty(&Value::Object(index))?,
+    )?;
+    Ok(())
+}
+
 /// A lane's target name from cargo's `Running` line: `<package>/lib` for
 /// the library's unit tests, `<package>/<stem>` for an integration test.
 fn lane_target(package: &str, running: &str) -> String {
@@ -618,8 +665,8 @@ fn lane_target(package: &str, running: &str) -> String {
 }
 
 /// The tests `binary --list` names, or with `ignored` only the ignored
-/// ones.
-fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> BTreeSet<String> {
+/// ones, or `None` if the listing didn't exit 0.
+fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> Option<BTreeSet<String>> {
     let mut list = Command::new(binary);
     list.arg("--list").current_dir(ctx.root);
     if ignored {
@@ -629,13 +676,15 @@ fn list_tests(binary: &Path, ignored: bool, ctx: &Ctx<'_>) -> BTreeSet<String> {
         "list-{}.log",
         if ignored { "ignored" } else { "all" }
     ));
-    let _ = child(&mut list, &log, ctx.run.deadline);
-    fs::read_to_string(&log)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.strip_suffix(": test"))
-        .map(str::to_owned)
-        .collect()
+    child(&mut list, &log, ctx.run.deadline).exited_ok().ok()?;
+    Some(
+        fs::read_to_string(&log)
+            .ok()?
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test"))
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 #[cfg(test)]

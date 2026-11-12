@@ -758,9 +758,13 @@ mod manifest {
                     Expected::Test(t) => read(&format!("crates/{}/tests/{}.rs", t.package, t.file))
                         .contains(&format!("fn {}(", t.name)),
                     Expected::UnitTest { package, path } => {
-                        let (module, name) = path.split_once("::").unwrap();
-                        let name = name.rsplit("::").next().unwrap();
-                        read(&format!("crates/{package}/src/{module}.rs"))
+                        // `a::b::tests::name` is in `src/a/b.rs`.
+                        let segments: Vec<&str> = path.split("::").collect();
+                        let (name, module) = (
+                            segments[segments.len() - 1],
+                            &segments[..segments.len() - 2],
+                        );
+                        read(&format!("crates/{package}/src/{}.rs", module.join("/")))
                             .contains(&format!("fn {name}("))
                     }
                     Expected::FuzzTest(path) => {

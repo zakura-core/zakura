@@ -188,7 +188,8 @@ struct State {
     sockets: BTreeMap<SocketAddr, Binding>,
     next_binding: u64,
     events: Vec<NetEvent>,
-    /// Whether a send records its payload's digest.
+    /// Whether a send records its payload's digest. On from the start, so a
+    /// datagram sent during a run's setup is covered too.
     payload_digests: bool,
 }
 
@@ -283,6 +284,7 @@ impl SimNet {
         Self {
             state: Arc::new(Mutex::new(State {
                 default_model,
+                payload_digests: true,
                 ..State::default()
             })),
         }
@@ -295,8 +297,9 @@ impl SimNet {
     }
 
     /// Makes each later send record its payload's SHA-256 in
-    /// [`NetEvent::Sent`], or stop recording it. Off by default, so a run
-    /// that keeps no record of its steps hashes nothing.
+    /// [`NetEvent::Sent`], or stop recording it. On by default, so a send
+    /// during setup is hashed; a run that keeps no record of its steps
+    /// turns it off as its first step begins, so its steps hash nothing.
     pub fn set_payload_digests(&self, on: bool) {
         self.lock().payload_digests = on;
     }

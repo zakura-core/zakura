@@ -54,7 +54,8 @@ use crate::{
     observe::StreamId,
     peer::{
         discovery::{
-            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold, Request,
+            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, DiscoveryScript,
+            Hold, Request,
         },
         key_index,
         limit::ADVERSARY_RATE,
@@ -503,6 +504,200 @@ pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
     }
 }
 
+/// The second tag byte of the first [`HOSTILE_ACTS`] family. The saved
+/// Plans take `1` to `0x1f`.
+pub const HOSTILE_TAG_BASE: u8 = 0x20;
+
+/// One act per `<label>-closes` ID a discovery scenario reaches, and the
+/// two cadence runs, each with its family's name (mutation plan, mut-6).
+/// [`DiscoveryWire`]'s `draw` runs [`act_scenario`] of the act at index
+/// `i` for the tag `[TAG, HOSTILE_TAG_BASE + i]`, so the generator reaches
+/// stream 4's refusal IDs. Appending keeps every earlier tag's meaning.
+pub const HOSTILE_ACTS: [(&str, DiscoveryAct); 29] = [
+    (
+        "undeclared-type",
+        DiscoveryAct::UndeclaredType { message_type: 0 },
+    ),
+    (
+        "hello-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Hello,
+            bit: 0,
+        },
+    ),
+    (
+        "hello-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Hello,
+        },
+    ),
+    (
+        "hello-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Hello,
+        },
+    ),
+    (
+        "hello-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::HelloSignature,
+        },
+    ),
+    ("hello-burst", DiscoveryAct::HelloBurst),
+    (
+        "get-peers-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::GetPeers,
+            bit: 0,
+        },
+    ),
+    (
+        "get-peers-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-over-margin",
+        DiscoveryAct::OverMargin {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::GetPeersLimit,
+        },
+    ),
+    (
+        "get-peers-request-run",
+        DiscoveryAct::RequestRun {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "peers-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Peers,
+            bit: 0,
+        },
+    ),
+    (
+        "peers-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-unsolicited",
+        DiscoveryAct::Unsolicited {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-over-owed",
+        DiscoveryAct::OverOwed {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::PeersSignature,
+        },
+    ),
+    (
+        "get-services-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::GetServices,
+            bit: 0,
+        },
+    ),
+    (
+        "get-services-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-over-margin",
+        DiscoveryAct::OverMargin {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::GetServicesWanted,
+        },
+    ),
+    (
+        "get-services-request-run",
+        DiscoveryAct::RequestRun {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "services-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Services,
+            bit: 0,
+        },
+    ),
+    (
+        "services-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-unsolicited",
+        DiscoveryAct::Unsolicited {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::ServicesNodeId,
+        },
+    ),
+];
+
+/// The hostile act `prefix` tags, if it starts with one of
+/// [`HOSTILE_ACTS`]' tags.
+pub fn hostile_act(prefix: &[u8]) -> Option<DiscoveryAct> {
+    let [TAG, tag, ..] = prefix else {
+        return None;
+    };
+    let index = usize::from(tag.checked_sub(HOSTILE_TAG_BASE)?);
+    HOSTILE_ACTS.get(index).map(|(_, act)| *act)
+}
+
 /// The honest exchange, with the peer sending `request` once.
 pub fn asking_scenario(request: Request) -> WireScenario {
     let mut scenario = WireScenario::default();
@@ -870,17 +1065,26 @@ impl Subsystem for DiscoveryWire {
         ])
     }
 
-    /// Each saved Plan's tag ([`SavedPlan::tag`]).
+    /// Each saved Plan's tag ([`SavedPlan::tag`]), then each hostile
+    /// act's ([`HOSTILE_ACTS`]).
     fn families() -> Vec<ScenarioFamily> {
+        let hostile = HOSTILE_ACTS
+            .iter()
+            .zip(HOSTILE_TAG_BASE..)
+            .map(|((name, _), tag)| ScenarioFamily::new(name, [TAG, tag]));
         SavedPlan::ALL
             .into_iter()
             .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
+            .chain(hostile)
             .collect()
     }
 
-    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or
-    /// the default scenario.
+    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), the
+    /// hostile act's ([`hostile_act`]), or the default scenario.
     fn draw(prefix: &[u8]) -> WireScenario {
-        SavedPlan::from_tag(prefix).map_or_else(WireScenario::default, SavedPlan::scenario)
+        if let Some(plan) = SavedPlan::from_tag(prefix) {
+            return plan.scenario();
+        }
+        hostile_act(prefix).map_or_else(WireScenario::default, act_scenario)
     }
 }

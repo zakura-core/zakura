@@ -1365,8 +1365,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 // campaign, and item 9 runs `--targets` for a case with a
                 // fuzz target, so its catch needs both, through the target
                 // the committed mapping gives its harness.
-                let target = target_of(&targets, harness);
-                if let Some(why) = case_refusal(&dir, property, name, target.as_deref()) {
+                if let Some(why) = mapped_case_refusal(&targets, &dir, property, name, harness) {
                     fail(&mut patched, why);
                 }
                 match (machine, draft) {
@@ -1703,32 +1702,61 @@ fn case_refusal(dir: &Path, property: &str, name: &str, target: Option<&str>) ->
     })
 }
 
+/// [`case_refusal`] for case `name` of `property` on `harness`, through the
+/// target `targets`, the committed mapping, gives its harness. A mapping
+/// that can't be read refuses every case, so a confirmation naming no
+/// target never stands in for one the mapping would require.
+fn mapped_case_refusal(
+    targets: &Result<BTreeMap<String, String>, String>,
+    dir: &Path,
+    property: &str,
+    name: &str,
+    harness: &str,
+) -> Option<String> {
+    match targets {
+        Ok(targets) => case_refusal(dir, property, name, target_of(targets, harness).as_deref()),
+        Err(why) => Some(format!("the fuzz-target mapping can't be read: {why}")),
+    }
+}
+
 /// Each fuzz target and the harness it runs, from the fuzz package's
 /// `[package.metadata.zakura-sim.targets]` table under `repo`, as the
-/// planted runner reads it. Empty if it can't be read, so a case with a
-/// target then can't be confirmed.
-fn fuzz_targets(repo: &Path) -> BTreeMap<String, String> {
-    let Ok(text) = fs::read_to_string(repo.join("qa/fuzz/sim/Cargo.toml")) else {
-        return BTreeMap::new();
-    };
-    let Ok(manifest) = toml::from_str::<toml::Table>(&text) else {
-        return BTreeMap::new();
-    };
-    manifest
+/// planted runner reads it, or why it can't be read: the manifest is
+/// missing or isn't TOML, it has no such table, or a target maps to
+/// something other than a harness name. A harness the table doesn't name
+/// has no target, which differs from a mapping that can't be read, under
+/// which no case's target can be confirmed.
+fn fuzz_targets(repo: &Path) -> Result<BTreeMap<String, String>, String> {
+    let path = repo.join("qa/fuzz/sim/Cargo.toml");
+    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let manifest = toml::from_str::<toml::Table>(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let targets = manifest
         .get("package")
         .and_then(|p| p.get("metadata"))
         .and_then(|m| m.get("zakura-sim"))
         .and_then(|z| z.get("targets"))
         .and_then(toml::Value::as_table)
-        .map(|targets| {
-            targets
-                .iter()
-                .filter_map(|(target, harness)| {
-                    Some((target.clone(), harness.as_str()?.to_owned()))
+        .ok_or_else(|| {
+            format!(
+                "{} has no [package.metadata.zakura-sim.targets] table",
+                path.display()
+            )
+        })?;
+    targets
+        .iter()
+        .map(|(target, harness)| {
+            harness
+                .as_str()
+                .map(|harness| (target.clone(), harness.to_owned()))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: {target} maps to {harness:?}, not a harness name",
+                        path.display()
+                    )
                 })
-                .collect()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The fuzz target that runs `harness` in `targets`, if one does.
@@ -3487,13 +3515,61 @@ mod tests {
     #[test]
     fn a_harness_s_fuzz_target_is_the_committed_one() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let targets = fuzz_targets(&repo);
+        let targets = fuzz_targets(&repo).expect("the committed mapping reads");
         assert_eq!(
             target_of(&targets, MACHINE).as_deref(),
             Some("header_reactor_policy")
         );
         assert_eq!(target_of(&targets, "header-sync/wire"), None);
-        assert!(fuzz_targets(Path::new("/no/such/repo")).is_empty());
+        // A mapping that's missing, isn't TOML, has no targets table or
+        // maps a target to no harness name is an error, not an empty map.
+        assert!(fuzz_targets(Path::new("/no/such/repo")).is_err());
+        let malformed = tempfile::tempdir().expect("a temp dir can be created");
+        let manifest = malformed.path().join("qa/fuzz/sim/Cargo.toml");
+        fs::create_dir_all(manifest.parent().expect("it has a parent"))
+            .expect("the temp dir is writable");
+        for text in [
+            "not = [toml",
+            "[package]\nname = \"fuzz\"\n",
+            "[package.metadata.zakura-sim.targets]\nheader_sync_storage = 1\n",
+        ] {
+            fs::write(&manifest, text).expect("the temp dir is writable");
+            assert!(fuzz_targets(malformed.path()).is_err(), "{text}");
+        }
+        fs::write(
+            &manifest,
+            "[package.metadata.zakura-sim.targets]\nheader_sync_storage = \"header-sync/storage\"\n",
+        )
+        .expect("the temp dir is writable");
+        let valid = fuzz_targets(malformed.path()).expect("a valid mapping reads");
+        assert_eq!(target_of(&valid, "header-sync/wire"), None);
+
+        // A storage case confirmed through no target: refused under the
+        // committed mapping, which gives its harness one, and under one that
+        // can't be read, and accepted only for a harness a valid mapping
+        // gives none.
+        let case = tempfile::tempdir().expect("a temp dir can be created");
+        for (file, value) in [
+            (
+                VERDICT_FILE,
+                serde_json::json!({"property": "p", "name": "a", "refused": null}),
+            ),
+            (
+                TARGET_FILE,
+                serde_json::json!({"property": "p", "name": "a", "target": null, "refused": null}),
+            ),
+        ] {
+            fs::write(case.path().join(file), value.to_string()).expect("the temp dir is writable");
+        }
+        let storage = "header-sync/storage";
+        let committed = Ok(targets);
+        assert!(mapped_case_refusal(&committed, case.path(), "p", "a", storage).is_some());
+        let unreadable = fuzz_targets(Path::new("/no/such/repo"));
+        assert!(mapped_case_refusal(&unreadable, case.path(), "p", "a", storage).is_some());
+        assert_eq!(
+            mapped_case_refusal(&committed, case.path(), "p", "a", "header-sync/wire"),
+            None
+        );
     }
 
     /// A machine trace counts for a case only if it ran the case's committed

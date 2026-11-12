@@ -488,6 +488,18 @@ impl Judge {
         self.failed.keys().copied().collect()
     }
 
+    /// The failed operations that owe a penalty and whose reply reached the
+    /// reactor, in order: each it took, each still untaken, and, unless the
+    /// harness `stopped` the node, each its teardown dropped with its call.
+    fn delivered(&self, stopped: bool) -> Vec<u64> {
+        let mut delivered: BTreeSet<u64> = self.owed.iter().map(|penalty| penalty.op).collect();
+        delivered.extend(self.failed.keys());
+        if !stopped {
+            delivered.extend(self.dropped_failed.keys());
+        }
+        delivered.into_iter().collect()
+    }
+
     /// Why the rule can't judge everything it read yet, if it can't. The
     /// first of [`Judge::open_at_end`]'s findings.
     fn open(&self, stopped: bool) -> Option<String> {
@@ -772,6 +784,20 @@ impl FaultEvidence {
             })
     }
 
+    /// The failed operations in `entries` whose header-peer fault the rule
+    /// judges, in order: each that owes a penalty and whose reply reached
+    /// the reactor, whether it took the reply ([`owed`]), left it untaken
+    /// ([`untaken`]), or dropped it in a teardown the harness's stop doesn't
+    /// explain (see the module docs). An error if the log's evidence can't
+    /// be read, as [`owed`] says.
+    pub fn delivered(&self, entries: &[Entry]) -> Result<Vec<u64>, String> {
+        let judge = Judge::over(Mode::Scan, &[], entries, &self.attributions);
+        match judge.error {
+            Some(why) => Err(why),
+            None => Ok(judge.delivered(self.stopped())),
+        }
+    }
+
     /// Whom each failed prepare and apply blamed.
     pub fn attributions(&self) -> &FaultAttributions {
         &self.attributions
@@ -920,7 +946,7 @@ impl FaultEnd {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
@@ -1070,7 +1096,7 @@ mod tests {
     }
 
     /// The harness's `Shutdown` of the node.
-    fn shutdown() -> EndFact {
+    pub(crate) fn shutdown() -> EndFact {
         EndFact::Environment {
             peer: "node".to_owned(),
             connection: None,
@@ -1079,7 +1105,7 @@ mod tests {
     }
 
     /// [`evidence`], with `ends` as the node's end facts.
-    fn evidence_ending(blamed: &[(u64, Blame)], ends: &[EndFact]) -> FaultEvidence {
+    pub(crate) fn evidence_ending(blamed: &[(u64, Blame)], ends: &[EndFact]) -> FaultEvidence {
         let attributions = FaultAttributions::new(&EvidenceStores::default());
         for (id, blame) in blamed {
             attributions.insert(NODE, *id, blame.clone());

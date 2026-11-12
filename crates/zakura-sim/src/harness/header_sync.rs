@@ -49,7 +49,7 @@ use super::{
         chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
-        fault::{self, FaultCheck, FaultEvidence},
+        fault::{FaultCheck, FaultEvidence},
         fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
@@ -2705,12 +2705,16 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
     }
 }
 
-/// [`HEADER_FAULT_PENALIZED`]'s trigger: the reactor took the reply of a
-/// failed prepare or apply that owes a penalty ([`fault::owed`]), so the
-/// rule had something to judge. A log whose evidence can't be read owes
-/// nothing here, and the check itself reports why.
+/// [`HEADER_FAULT_PENALIZED`]'s trigger: a failed prepare or apply that
+/// owes a penalty delivered its reply to the reactor, which took it, left
+/// it untaken, or dropped it without the harness stopping the node
+/// ([`FaultEvidence::delivered`]), so the rule had something to judge. A
+/// log whose evidence can't be read owes nothing here, and the check itself
+/// reports why.
 fn penalty_owed(view: &StorageView, log: &ObservationLog) -> bool {
-    fault::owed(log.entries(), view.faults.attributions()).is_ok_and(|owed| !owed.is_empty())
+    view.faults
+        .delivered(log.entries())
+        .is_ok_and(|delivered| !delivered.is_empty())
 }
 
 /// What [`HEADER_FAULT_PENALIZED`] expects, as its violations report it.
@@ -2940,6 +2944,18 @@ mod tests {
         id: u64,
         taken: bool,
     ) {
+        log_failure(log, attributions, id, true, taken);
+    }
+
+    /// [`log_fault`], with its reply reaching the reactor only if
+    /// `delivered`.
+    fn log_failure(
+        log: &mut ObservationLog,
+        attributions: &crate::storage::FaultAttributions,
+        id: u64,
+        delivered: bool,
+        taken: bool,
+    ) {
         use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
         let point = |height| StoragePoint {
@@ -2985,7 +3001,7 @@ mod tests {
                 id,
                 outcome: "engine".to_owned(),
                 result: failed,
-                delivered: true,
+                delivered,
                 generation: 0,
                 state: String::new(),
             },
@@ -3084,6 +3100,68 @@ mod tests {
             &actual,
             &["UntakenFault: operation 4 ", "UntakenFault: operation 7 "],
         );
+    }
+
+    /// Logs the reactor's teardown dropping call `call`, with any reply it
+    /// held.
+    fn log_dropped(log: &mut ObservationLog, call: u64) {
+        log.push(Observation::Reactor {
+            instance: 0,
+            seq: 0,
+            storage_seq: 0,
+            node: "node".to_owned(),
+            event: ReactorFact::CallEnded {
+                call,
+                end: "dropped".to_owned(),
+                op: Some(call),
+            },
+        });
+    }
+
+    /// Whether [`HEADER_FAULT_PENALIZED`]'s trigger holds over what
+    /// `history` logs, in a settled run the harness stopped if `stopped`.
+    fn penalty_triggered(
+        stopped: bool,
+        history: impl FnOnce(&mut ObservationLog, &crate::storage::FaultAttributions),
+    ) -> bool {
+        use crate::harness::header_node::fault::tests::{evidence_ending, shutdown};
+
+        let ends = if stopped {
+            vec![shutdown()]
+        } else {
+            Vec::new()
+        };
+        let faults = evidence_ending(&[], &ends);
+        let mut log = ObservationLog::default();
+        history(&mut log, faults.attributions());
+        penalty_owed(&FaultsOnly(faults).view(), &log)
+    }
+
+    /// [`HEADER_FAULT_PENALIZED`]'s trigger holds for every header-peer
+    /// fault whose reply reached the reactor, since the property judges
+    /// each: one it took, one it left untaken, and one its teardown dropped
+    /// without the harness stopping the node. A drop the harness's stop
+    /// explains and a reply that never reached the reactor leave nothing to
+    /// judge.
+    #[test]
+    fn every_delivered_fault_meets_the_penalty_trigger() {
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, true);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(true, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(false, |log, blamed| {
+            log_failure(log, blamed, 1, false, false);
+        }));
     }
 
     /// A harness whose view holds only a recovery and the adoption and end

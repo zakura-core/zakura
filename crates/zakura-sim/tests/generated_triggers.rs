@@ -598,8 +598,8 @@ fn sent(seq: u64, row: &str, label: Label) -> Observation {
 }
 
 /// `sender-within-credit` needs a page the node sent after it applied the
-/// peer's grant of that page's subscription, before it started writing. The
-/// peer's grant alone, a grant the peer only offered, the node's own
+/// peer's grant or `Open` of that page's subscription, before it started
+/// writing. The applied grant or `Open` alone, a grant the peer only offered, the node's own
 /// subscription update, a grant applied after the write started, a grant of
 /// another subscription, on another QUIC stream or on another connection,
 /// or an ending, which spends no credit, doesn't reach it. A page past its
@@ -616,6 +616,26 @@ fn sender_within_credit_needs_a_page_after_an_applied_grant() {
     ));
     assert!(!reaches(&credit, vec![grant.clone()]));
     assert!(!reaches(&credit, vec![page()]));
+    // The peer's `Open` applied with its initial credit, as its regulation
+    // logs it: alone it doesn't reach the trigger, and before a page it does.
+    let open = Observation::Transport {
+        instance: 0,
+        seq: 1,
+        node: "node".to_owned(),
+        connection: Some(1),
+        remote: "10.0.0.2:4000".to_owned(),
+        event: TransportFact::Regulated {
+            quic_stream: 4,
+            transition: TransitionFact::OpenApplied {
+                subscription: 7,
+                objects: 4,
+                bytes: 64,
+                seq: None,
+            },
+        },
+    };
+    assert!(!reaches(&credit, vec![open.clone()]));
+    assert!(reaches(&credit, vec![open, page()]));
     assert!(!reaches(
         &credit,
         vec![grant.clone(), sent(0, "watch", Label::Conformant)]

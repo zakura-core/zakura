@@ -1137,3 +1137,35 @@ fn owed_to_hf7() {
     let owed = owed(REGISTERED);
     assert!(owed.is_empty(), "{owed:?}");
 }
+
+/// C14's proving tests outside this file, which acceptance requires as
+/// `Passes`, are exactly [`REGISTERED`]'s producer tests, so a store added
+/// here is required there too. A control with one more producer differs.
+#[test]
+fn c14_is_proved_by_every_registered_store_s_producer() {
+    use zakura_sim::harness::header_acceptance::{contract_table, ContractId, ContractState};
+    let c14 = contract_table()
+        .into_iter()
+        .find(|contract| contract.id == ContractId::C14)
+        .expect("C14 has a row");
+    assert_eq!(c14.state, ContractState::Satisfied);
+    let proving: BTreeSet<(String, String)> = c14
+        .proving
+        .iter()
+        .filter(|test| test.package == "zakura-sim" && test.file != "tests/evidence_inventory.rs")
+        .map(|test| (test.file.to_owned(), test.test.to_owned()))
+        .collect();
+    let mut producers: BTreeSet<(String, String)> = REGISTERED
+        .iter()
+        .filter_map(|store| match store.producer {
+            Producer::Test { file, name } => Some((format!("tests/{file}.rs"), name.to_owned())),
+            Producer::OwedToHf7(_) => None,
+        })
+        .collect();
+    assert_eq!(proving, producers);
+    producers.insert((
+        "tests/header_new.rs".to_owned(),
+        "a_new_store_keeps_its_facts".to_owned(),
+    ));
+    assert_ne!(proving, producers);
+}

@@ -18,11 +18,15 @@
 //! partial fact for the whole run and reports a crossing when its last fact
 //! arrives, whichever that is.
 //!
-//! Its work stays linear in the run's frames. A node frame enters only if
-//! its message type is the ending's. A peer frame's write and judgment wait
-//! by identity until its `PeerFrame`, which the peer records first, says
-//! whether it's an update, and are dropped if it isn't. A completed fact
-//! then looks only at the candidates of its own subscription on its stream.
+//! Its work stays linear in the run's frames, and it keeps nothing for
+//! ordinary traffic. A node frame enters only if its message type is the
+//! ending's. A peer frame enters only once its `PeerFrame` shows it's an
+//! update, and its write and judgment always come after that: a peer
+//! records a frame's `PeerFrame` before its write and `peer-written` after
+//! ([`crate::peer`]'s `PeerTask::write`), and the wire evidence fails a run
+//! whose node reads a frame with no `PeerFrame` (`UnlabelledFrame`). A
+//! completed fact then looks only at the candidates of its own subscription
+//! on its stream.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,15 +89,6 @@ struct Update {
     judged: bool,
 }
 
-/// A peer frame's facts that arrived before its `PeerFrame` classified it.
-#[derive(Clone, Copy, Debug, Default)]
-struct Unclassified {
-    /// Its `peer-written` stamp.
-    written: Option<u64>,
-    /// Whether the node judged it.
-    judged: bool,
-}
-
 /// One subscription's candidates on a stream, by frame sequence.
 #[derive(Debug, Default)]
 struct Candidates {
@@ -104,17 +99,15 @@ struct Candidates {
 }
 
 /// The incremental crossing join. Feed it every observation of a run, in
-/// log order, through [`CrossingJoin::observe`]. It holds at most one entry
-/// per ending-typed node frame and per peer frame on a QUIC stream, and
-/// starts empty for each run.
+/// log order, through [`CrossingJoin::observe`]. It holds one entry per
+/// ending-typed node frame and per peer update, and starts empty for each
+/// run.
 #[derive(Debug, Default)]
 pub struct CrossingJoin {
     /// The node's ending-typed frames.
     endings: BTreeMap<FrameKey, Ending>,
     /// The peers' updates.
     updates: BTreeMap<FrameKey, Update>,
-    /// Peer frames whose `PeerFrame` hasn't come yet.
-    unclassified: BTreeMap<FrameKey, Unclassified>,
     /// Each subscription's classified endings and updates.
     candidates: BTreeMap<SubscriptionKey, Candidates>,
     /// The updates already reported, so each crosses once.
@@ -179,7 +172,6 @@ impl CrossingJoin {
                 ..
             } => {
                 let key = (connection, quic_stream, seq);
-                let early = self.unclassified.remove(&key).unwrap_or_default();
                 let (Some(subscription), Some(UPDATE_ROW)) = (exchange, row.as_deref()) else {
                     return Vec::new();
                 };
@@ -188,8 +180,8 @@ impl CrossingJoin {
                     Update {
                         subscription,
                         label,
-                        written: early.written,
-                        judged: early.judged,
+                        written: None,
+                        judged: false,
                     },
                 );
                 self.candidates
@@ -206,13 +198,11 @@ impl CrossingJoin {
                 order,
             } => {
                 let key = (connection, quic_stream, seq);
-                match self.updates.get_mut(&key) {
-                    Some(update) => update.written = Some(order),
-                    None => {
-                        self.unclassified.entry(key).or_default().written = Some(order);
-                        return Vec::new();
-                    }
-                }
+                // Not an update: its `PeerFrame` came first and said so.
+                let Some(update) = self.updates.get_mut(&key) else {
+                    return Vec::new();
+                };
+                update.written = Some(order);
                 self.complete_update(key)
             }
             Observation::FrameJudged {
@@ -222,13 +212,11 @@ impl CrossingJoin {
                 ..
             } => {
                 let key = (connection, quic_stream, seq);
-                match self.updates.get_mut(&key) {
-                    Some(update) => update.judged = true,
-                    None => {
-                        self.unclassified.entry(key).or_default().judged = true;
-                        return Vec::new();
-                    }
-                }
+                // Not an update: its `PeerFrame` came first and said so.
+                let Some(update) = self.updates.get_mut(&key) else {
+                    return Vec::new();
+                };
+                update.judged = true;
                 self.complete_update(key)
             }
             _ => Vec::new(),
@@ -588,9 +576,9 @@ mod tests {
         assert_eq!(crossing.label, Label::BadCursor);
     }
 
-    /// A long run of ordinary traffic keeps nothing: pages and status frames
-    /// from the node aren't the ending's type, and the peer's non-update
-    /// frames drop their early facts once their `PeerFrame` arrives. So
+    /// A long run of ordinary traffic keeps nothing: the node's pages aren't
+    /// the ending's type, and a peer frame its `PeerFrame` shows isn't an
+    /// update leaves its later write and judgment nothing to attach to. So
     /// each fact costs a map lookup, not a scan.
     #[test]
     fn ordinary_traffic_leaves_no_candidates() {
@@ -621,29 +609,14 @@ mod tests {
                 exchange: None,
                 payload: 9,
             };
-            for obs in [page, judged(seq), peer_wrote(seq, 2 * seq + 2), status] {
+            // A peer's frame in the order the peer records it: its
+            // `PeerFrame`, its write, then the node's judgment.
+            for obs in [page, status, peer_wrote(seq, 2 * seq + 2), judged(seq)] {
                 assert_eq!(join.observe(&obs), Vec::new());
             }
         }
         assert!(join.endings.is_empty(), "{:?}", join.endings.len());
         assert!(join.updates.is_empty());
-        assert!(join.unclassified.is_empty());
         assert!(join.candidates.is_empty());
-    }
-
-    /// An update whose write and judgment are logged before its `PeerFrame`
-    /// still crosses: the early facts wait by identity.
-    #[test]
-    fn an_update_classified_late_keeps_its_early_facts() {
-        let [received, node_frame] = peer_read(0, 12, SUB);
-        let log = [
-            node_wrote(0, 10),
-            peer_wrote(1, 11),
-            judged(1),
-            received,
-            node_frame,
-            update(1, Label::Conformant),
-        ];
-        assert_eq!(crossings(&log), crossed());
     }
 }

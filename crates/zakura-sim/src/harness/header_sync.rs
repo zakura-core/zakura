@@ -1112,28 +1112,14 @@ impl HasView for Storage {
         }
     }
 
-    /// Records the run's end in the node's adoption, fault, round and
-    /// publication evidence, for the tip, penalty and teardown rules.
+    /// [`StorageEnd::ended`].
     fn ended(&self, end: &RunEnd) {
-        self.adoption.end(end);
-        self.faults.end(end);
-        self.rounds.end(end);
-        self.outstanding.end(end);
-        self.retirement.end(end);
-        self.publication
-            .end(super::header_node::adoption::settled(end));
+        self.end().ended(end);
     }
 
-    /// [`fault_end_violations`], [`teardown_end_violations`],
-    /// [`outstanding_end_violations`], [`retirement_end_violations`] and
-    /// [`publication_end_violations`].
+    /// [`StorageEnd::violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        let mut found = fault_end_violations(&self.faults, log);
-        found.extend(teardown_end_violations(&self.rounds));
-        found.extend(outstanding_end_violations(&self.outstanding));
-        found.extend(retirement_end_violations(&self.retirement));
-        found.extend(publication_end_violations(&self.publication));
-        found
+        self.end().violations(log)
     }
 
     /// Whether a `Shutdown` step was picked, which begins the node's stop.
@@ -2320,7 +2306,57 @@ pub fn recovered_bound() -> AssumeRecord {
     }
 }
 
+/// The evidence the storage harness's end records into and reads its end
+/// findings from.
+struct StorageEnd<'a> {
+    adoption: &'a AdoptionEvidence,
+    faults: &'a FaultEvidence,
+    rounds: &'a SettlementEvidence,
+    outstanding: &'a OutstandingEvidence,
+    retirement: &'a RetirementEvidence,
+    publication: &'a PublicationEvidence,
+}
+
+impl StorageEnd<'_> {
+    /// Records the run's end in the node's adoption, fault, round,
+    /// outstanding, retirement and publication evidence, for the tip,
+    /// penalty and teardown rules.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
+        self.faults.end(end);
+        self.rounds.end(end);
+        self.outstanding.end(end);
+        self.retirement.end(end);
+        self.publication
+            .end(super::header_node::adoption::settled(end));
+    }
+
+    /// [`fault_end_violations`], [`teardown_end_violations`],
+    /// [`outstanding_end_violations`], [`retirement_end_violations`] and
+    /// [`publication_end_violations`].
+    fn violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        let mut found = fault_end_violations(self.faults, log);
+        found.extend(teardown_end_violations(self.rounds));
+        found.extend(outstanding_end_violations(self.outstanding));
+        found.extend(retirement_end_violations(self.retirement));
+        found.extend(publication_end_violations(self.publication));
+        found
+    }
+}
+
 impl Storage {
+    /// The evidence its end records into and reads ([`StorageEnd`]).
+    fn end(&self) -> StorageEnd<'_> {
+        StorageEnd {
+            adoption: &self.adoption,
+            faults: &self.faults,
+            rounds: &self.rounds,
+            outstanding: &self.outstanding,
+            retirement: &self.retirement,
+            publication: &self.publication,
+        }
+    }
+
     /// Whether `assume` holds after a step: `BoundedAdversary` from the
     /// `recovered` pick on ([`recovered_bound`]), and the recovery
     /// assumptions as [`RecoveryEvidence::holds`] says.
@@ -3531,27 +3567,42 @@ mod tests {
     }
 
     /// A harness that runs only [`HEADER_FAULT_PENALIZED`] over a
-    /// [`FaultHistory`], with the storage harness's end path, so `record`
-    /// writes its full report and sidecar as for a node harness.
-    struct FaultRun(FaultEvidence);
+    /// [`FaultHistory`]: a storage view holding the history's fault
+    /// evidence and empty everything else, which ends through the storage
+    /// harness's own [`StorageEnd`], so `record` writes its full report and
+    /// sidecar as the storage harness's end makes them.
+    struct FaultRun(StorageView);
+
+    impl FaultRun {
+        /// Its view's stores, as [`Storage::end`] names the harness's own.
+        fn end(&self) -> StorageEnd<'_> {
+            StorageEnd {
+                adoption: &self.0.adoption,
+                faults: &self.0.faults,
+                rounds: &self.0.rounds,
+                outstanding: &self.0.outstanding,
+                retirement: &self.0.retirement,
+                publication: &self.0.publication,
+            }
+        }
+    }
 
     impl HasView for FaultRun {
         type View = StorageView;
 
         /// The fault evidence, and empty everything else.
         fn view(&self) -> StorageView {
-            FaultsOnly(self.0.clone()).view()
+            self.0.clone()
         }
 
-        /// Records the end in the fault evidence, as the storage harness
-        /// does.
+        /// [`StorageEnd::ended`].
         fn ended(&self, end: &RunEnd) {
-            self.0.end(end);
+            self.end().ended(end);
         }
 
-        /// [`fault_end_violations`], as the storage harness reports them.
+        /// [`StorageEnd::violations`].
         fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-            fault_end_violations(&self.0, log)
+            self.end().violations(log)
         }
     }
 
@@ -3578,7 +3629,7 @@ mod tests {
             let observations = history.observations(faults.attributions());
             sim.add_source(Box::new(FaultScript(Some(observations))));
             sim.scheduler().spawn_root("reactor", async {});
-            FaultRun(faults)
+            FaultRun(FaultsOnly(faults).view())
         }
 
         /// Only [`HEADER_FAULT_PENALIZED`].

@@ -715,10 +715,11 @@ const C18_PROVING: &[TestRef] = &[
 ];
 
 /// C13's proving tests: the fault store's four histories through a
-/// recorded run's full report and its sidecar, each replayed fresh (two
-/// untaken replies at the end, two breaks at one step, a break beside an
-/// open fault, and a self-exit after a reply beside a harness shutdown at
-/// the same point), and the store and check tests hf-1 to hf-3 added.
+/// recorded run's full report and its sidecar, each ending through the
+/// storage harness's own end wiring and replayed fresh (two untaken
+/// replies at the end, two breaks at one step, a break beside an open
+/// fault, and a self-exit after a reply beside a harness shutdown at the
+/// same point), and the store and check tests hf-1 to hf-3 added.
 const C13_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_sync.rs",

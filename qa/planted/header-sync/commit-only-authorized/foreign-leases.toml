@@ -1,0 +1,16 @@
+# `retain_headers` gives a call every peer's staged leases, not just its
+# own round's. The required failure is `ForeignLease`, at the step that
+# dispatches the second mirror's prepare. The input is the
+# overlapping-forks fixture, scripted because no committed Plan bytes
+# reach it: steering keeps the node's storage from running either
+# mirror's preparation until it has been asked for both, so the second
+# prepare takes its leases while the first round's are still staged.
+# Besides peer_work.rs, which the patch changes, the reactor, the
+# subscriber and the rest of the queue decide when each round stages and
+# prepares, so a change there can move the script off its overlap.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-overlapping-forks.json"
+script = "crates/zakura-sim/tests/fixtures/header-authority-overlapping-forks.script.json"

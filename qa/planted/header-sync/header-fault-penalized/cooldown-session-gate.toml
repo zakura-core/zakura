@@ -1,0 +1,20 @@
+# Restores the gate #2001 removed from `dispatch_misbehavior`: the reactor
+# starts a readmission cooldown only when the faulted work's session is
+# still current. A fault that settles after its session ended still
+# reports `Misbehavior`, but installs no cooldown and reports no
+# `CooldownStarted`. The required failure is `UncooledFault`, at the step
+# after the reactor handled the failed preparation. The input is the
+# late-fault fixture, scripted because no Plan bytes reach it: steering
+# picks the peer's disconnect while the node's storage holds the
+# preparation of its invalid tip, so the preparation fails `InvalidHeader`
+# after the session ended. No redial is needed, since the penalty rule
+# wants the cooldown as soon as the reactor handles the failure.
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides when the node submits that preparation and when the disconnect
+# retires its round. A change there can move the script off its late fault.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-late-fault.json"
+script = "crates/zakura-sim/tests/fixtures/header-wire-late-fault.script.json"

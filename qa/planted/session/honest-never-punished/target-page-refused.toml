@@ -1,0 +1,14 @@
+# Drops the `!reaches` condition from the subscriber's past-target check,
+# so a page that reaches its subscription's target is refused as past it,
+# and the node closes the honest peer's connection with a fault. The page
+# is conformant, so punishing the peer also breaks
+# `conformant-never-closes`, which `NESTS` lists over this ID, and the
+# case's set is both (decision 2). Both are violated at the close, with
+# cause `service_protocol_reject`. The input is the saved honest-sync
+# Plan, whose honest peer serves the node its whole chain.
+input = "crates/zakura-sim/tests/fixtures/header-wire-honest-sync.bin"
+set = ["header-sync/s5v9/conformant-never-closes"]
+# Besides state.rs, which the patch changes, the rest of header sync
+# decides how the honest peer's pages reach the node. A change there can
+# move the input off a page that reaches its target.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

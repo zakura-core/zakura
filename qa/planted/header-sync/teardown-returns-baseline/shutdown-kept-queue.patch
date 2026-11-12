@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 15b6d86dee..da10faafee 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -671,11 +671,11 @@ impl HeaderSyncReactor {
+             }
+             caused!(self, ReactorCause::Pass, self.schedule_cached_statuses());
+         };
+-        caused!(
+-            self,
+-            ReactorCause::Shutdown,
+-            self.retire_all_peer_work(terminal_outcome)
+-        );
++        // Mutation: the shutdown keeps the work queue instead of retiring
++        // its work, so its reservations and leases outlive the reactor and
++        // no round is released.
++        let _ = terminal_outcome;
++        std::mem::forget(std::mem::take(&mut self.peer_work_queue));
+     }
+ 
+     /// Handles the storage completions that are ready now, then reads both

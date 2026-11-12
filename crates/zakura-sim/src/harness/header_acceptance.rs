@@ -320,6 +320,15 @@ pub enum Expected {
         /// its clean runs.
         not_applicable: &'static [ExpectedNa],
     },
+    /// A retired native mutation's witness outside the simulator: its test
+    /// passes unpatched and restored, and fails with the witness's required
+    /// failure patched.
+    UnitCaught {
+        /// The directory under `qa/native-mutations/header-sync/`.
+        patch: &'static str,
+        /// The witness test and the failure it must show.
+        witness: rows::UnitWitness,
+    },
     /// A fresh-process Exact replay of one execution, with its reports and
     /// store snapshots equal.
     Replays {
@@ -561,6 +570,8 @@ pub enum ExpectedId {
     MachineCaught(RunId),
     /// [`Expected::IntegrityCaught`] for this mutation's patched run.
     IntegrityCaught(RunId),
+    /// [`Expected::UnitCaught`] for this mutation's patched run.
+    UnitCaught(RunId),
     /// [`Expected::Replays`] of this execution.
     Replays(RunId),
     /// [`Expected::Passes`] of this test.
@@ -600,6 +611,9 @@ impl Expected {
             Expected::IntegrityCaught { patch, .. } => {
                 ExpectedId::IntegrityCaught(RunId::native(patch, CaseRun::Patched))
             }
+            Expected::UnitCaught { patch, .. } => {
+                ExpectedId::UnitCaught(RunId::native(patch, CaseRun::Patched))
+            }
             Expected::Replays { run } => ExpectedId::Replays(run),
             Expected::Passes { test } => ExpectedId::Passes {
                 package: test.package.to_owned(),
@@ -618,6 +632,7 @@ impl Expected {
             Expected::Caught { .. } => ResultKind::Caught,
             Expected::MachineCaught { .. } => ResultKind::MachineCaught,
             Expected::IntegrityCaught { .. } => ResultKind::IntegrityCaught,
+            Expected::UnitCaught { .. } => ResultKind::UnitCaught,
             Expected::Replays { .. } => ResultKind::Replays,
             Expected::Passes { .. } => ResultKind::Passes,
             Expected::Open { .. } => ResultKind::Open,
@@ -695,6 +710,16 @@ impl Key {
                                     diagnostic,
                                     not_applicable,
                                 }
+                    })
+            }
+            // A retired native mutation's key takes the catch of exactly
+            // the witness its classification pins.
+            (Key::Native { patch }, Expected::UnitCaught { patch: p, witness }) => {
+                patch == p
+                    && NATIVE_MUTATIONS.iter().any(|mutation| {
+                        mutation.patch == patch
+                            && matches!(mutation.class, NativeClass::Retired { witness: w, .. }
+                                if w == *witness)
                     })
             }
             // A duplicate native mutation's key takes the catch of exactly
@@ -781,9 +806,6 @@ impl Key {
                             NativeClass::ToMove { until, .. } => {
                                 same_open(expected, &rows::native_open(until))
                             }
-                            NativeClass::Retired { .. } => {
-                                same_open(expected, &rows::retired_open())
-                            }
                             _ => false,
                         }
                 })
@@ -851,6 +873,8 @@ pub enum ResultKind {
     MachineCaught,
     /// [`Expected::IntegrityCaught`].
     IntegrityCaught,
+    /// [`Expected::UnitCaught`].
+    UnitCaught,
     /// [`Expected::Replays`].
     Replays,
     /// [`Expected::Passes`].

@@ -100,7 +100,7 @@
 //!   test as for `test` in `<i>/<run>`, built and run as a plain build, with
 //!   no simulator cfg, and [`PATCHED_BUILD_FILE`], a [`UnitBuild`]: the
 //!   build's own provenance, since a plain binary embeds no source digest
-//!   ([`unit_refusal`]). No expected result reads it yet.
+//!   ([`unit_refusal`]).
 //!
 //! Every recorded run's report and store snapshot come from its
 //! `full-report.json`, never from the trace's `end` record, which keeps no
@@ -350,11 +350,11 @@ pub enum Task {
         diagnostic: String,
     },
     /// A retired native mutation's witness, a test outside the simulator,
-    /// run unpatched, patched and restored as a plain build
-    /// ([`UNIT_WITNESSES`]). No expected result names it yet, so its key
-    /// stays blocked by its transitional `Open`, and [`assemble`] reads no
-    /// result from it: [`unit_refusal`] is its artifacts' check.
+    /// run unpatched, patched and restored as a plain build, which
+    /// [`unit_refusal`] judges.
     Unit {
+        /// The expected result it produces.
+        expected: ExpectedId,
         /// The mutation's directory name.
         patch: String,
         /// The patch, relative to the repository root.
@@ -371,37 +371,6 @@ pub enum Task {
         shows: Vec<String>,
     },
 }
-
-/// A retired native mutation's witness test outside the simulator and the
-/// failure its README requires of the patched run ([`Task::Unit`]).
-#[derive(Clone, Copy, Debug)]
-pub struct UnitWitness {
-    /// The mutation's directory name.
-    pub patch: &'static str,
-    /// The test's package.
-    pub package: &'static str,
-    /// Its file, relative to the package.
-    pub file: &'static str,
-    /// Its full libtest name.
-    pub test: &'static str,
-    /// The assertion message the patched run must fail with.
-    pub failure: &'static str,
-    /// What that assertion's `left` value must show, in order.
-    pub shows: &'static [&'static str],
-}
-
-/// Each retired mutation's witness. `readmission-unchecked`'s README
-/// requires the 60 s cooldown's event assertion to fail, seeing
-/// `SessionAdmitted` for session 2 after `CooldownStarted`.
-pub static UNIT_WITNESSES: &[UnitWitness] = &[UnitWitness {
-    patch: "readmission-unchecked",
-    package: "zakura-network",
-    file: "src/zakura/header_sync/reactor/tests/observer.rs",
-    test: "zakura::header_sync::reactor::tests::observer::\
-           a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
-    failure: "assertion `left == right` failed: cooldown 60s",
-    shows: &["CooldownStarted", "SessionAdmitted", "session_id: 2"],
-}];
 
 /// What [`plan`] gives: the tasks, and every expected result the tool can't
 /// produce yet, with why.
@@ -635,38 +604,19 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
                 test: history.witness.test.to_owned(),
                 diagnostic: diagnostic.to_owned(),
             }),
+            Expected::UnitCaught { patch, witness } => tasks.push(Task::Unit {
+                expected: id,
+                patch: patch.to_owned(),
+                patch_file: native_patch(repo, patch)?,
+                package: witness.test.package.to_owned(),
+                file: witness.test.file.to_owned(),
+                test: witness.test.test.to_owned(),
+                failure: witness.failure.to_owned(),
+                shows: witness.shows.iter().map(|&show| show.to_owned()).collect(),
+            }),
             Expected::Replays { ref run } => replays.push((id, run.clone())),
             Expected::Open { .. } => {}
         }
-    }
-    // A retired mutation's witness runs for each such key the manifest
-    // holds, though no expected result reads it yet ([`Task::Unit`]).
-    for mutation in super::NATIVE_MUTATIONS {
-        let super::NativeClass::Retired { .. } = mutation.class else {
-            continue;
-        };
-        let key = Key::Native {
-            patch: mutation.patch.to_owned(),
-        };
-        if !manifest
-            .expected
-            .iter()
-            .any(|result| result.keys.contains(&key))
-        {
-            continue;
-        }
-        let Some(witness) = UNIT_WITNESSES.iter().find(|w| w.patch == mutation.patch) else {
-            continue;
-        };
-        tasks.push(Task::Unit {
-            patch: witness.patch.to_owned(),
-            patch_file: native_patch(repo, witness.patch)?,
-            package: witness.package.to_owned(),
-            file: witness.file.to_owned(),
-            test: witness.test.to_owned(),
-            failure: witness.failure.to_owned(),
-            shows: witness.shows.iter().map(|&show| show.to_owned()).collect(),
-        });
     }
     for (id, run) in replays {
         if recorded_at(&tasks, &run).is_none() {
@@ -1473,8 +1423,9 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             continue;
         }
         let actual = match task {
-            // No expected result names a unit witness yet ([`Task::Unit`]).
-            Task::Unit { .. } => continue,
+            Task::Unit { .. } => Actual::UnitCaught {
+                refused: unit_refusal(repo, (subject, subject_source), task, &dir),
+            },
             Task::Test { .. } => test_actual(&dir),
             Task::History {
                 expected,
@@ -1603,9 +1554,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             }
         };
         results.push(ResultRecord {
-            expected: task_expected(task)
-                .expect("a unit task, the only one with no expected result, gave none")
-                .clone(),
+            expected: task_expected(task).clone(),
             commit: subject.to_owned(),
             actual,
         });
@@ -1649,15 +1598,14 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
     }
 }
 
-/// The expected result `task` produces, if one names it: every task but a
-/// [`Task::Unit`].
-fn task_expected(task: &Task) -> Option<&ExpectedId> {
+/// The expected result `task` produces.
+fn task_expected(task: &Task) -> &ExpectedId {
     match task {
         Task::Test { expected, .. }
         | Task::History { expected, .. }
         | Task::Case { expected, .. }
-        | Task::Integrity { expected, .. } => Some(expected),
-        Task::Unit { .. } => None,
+        | Task::Integrity { expected, .. }
+        | Task::Unit { expected, .. } => expected,
     }
 }
 
@@ -2947,7 +2895,22 @@ fn links(
             continue;
         }
         let (id, links) = match task {
-            Task::Unit { .. } => continue,
+            Task::Unit { expected, .. } => (
+                expected.clone(),
+                Links {
+                    result: Some(expected.clone()),
+                    artifacts: ["unpatched", "patched", "restored"]
+                        .into_iter()
+                        .flat_map(|run| {
+                            [
+                                format!("{index}/{run}/{TEST_FILE}"),
+                                format!("{index}/{run}/{PATCHED_BUILD_FILE}"),
+                            ]
+                        })
+                        .collect(),
+                    ..Links::default()
+                },
+            ),
             Task::Test { expected, .. } => (
                 expected.clone(),
                 Links {
@@ -5049,9 +5012,7 @@ mod tests {
         let links = links(&manifest, &plan, |_, _| true);
         let (mut node, mut history, mut integrity) = (false, false, false);
         for (index, task) in plan.tasks.iter().enumerate() {
-            let Some(expected) = task_expected(task) else {
-                continue;
-            };
+            let expected = task_expected(task);
             let key = manifest
                 .expected
                 .iter()
@@ -5103,7 +5064,7 @@ mod tests {
         );
     }
 
-    /// The retired mutation's unit witness is planned, with no expected
+    /// The retired mutation's unit witness is planned from its expected
     /// result, and its runs count only as the caught mutation: the
     /// unpatched and restored runs passing at S, the patched one failing
     /// its required assertion at its own source from a rebuilt executable.
@@ -5122,7 +5083,7 @@ mod tests {
             )
             .expect("the retired mutation's witness is planned")
             .clone();
-        assert_eq!(task_expected(&task), None);
+        assert!(matches!(task_expected(&task), ExpectedId::UnitCaught(_)));
         let Task::Unit {
             patch_file,
             package,

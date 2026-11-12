@@ -189,7 +189,7 @@ fn runs(expected: &Expected) -> Vec<RunId> {
                 .map(|run| RunId::native(patch, run))
                 .to_vec()
         }
-        Expected::Passes { .. } | Expected::Open { .. } => Vec::new(),
+        Expected::UnitCaught { .. } | Expected::Passes { .. } | Expected::Open { .. } => Vec::new(),
     }
 }
 

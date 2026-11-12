@@ -613,8 +613,9 @@ where
 /// run left. A break the step's drain found violates at once. In the fork
 /// fixture, a step after which no task can run, whose drain found every
 /// other settled-point condition, is a settled point, and the engine's tip
-/// there must be a heaviest mirror tip ([`settled`]). It applies once a
-/// drain judged a record, until a drain found a run corrupt.
+/// there must be a heaviest mirror tip ([`settled`]). A step can break
+/// both, and each is its own violation there. It applies once a drain
+/// judged a record, until a drain found a run corrupt.
 ///
 /// [`settled`]: crate::harness::header_node::fork_choice::settled
 fn check_expected_chain_selected<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -624,32 +625,38 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let expected = "the engine selects a max-work eligible tip, scored with its work";
-    let mut breaks = view
+    let selects = "the engine selects a max-work eligible tip, scored with its work";
+    let mut breaks: Vec<(&str, String)> = view
         .claims()
         .at(step, &[Claim::ExpectedChainSelected])
-        .into_iter();
-    if let Some(first) = breaks.next() {
-        for other in breaks {
-            cx.record_violation(expected, other.detail);
-        }
-        return cx.violated(expected, first.detail);
-    }
+        .into_iter()
+        .map(|record| (selects, record.detail))
+        .collect();
     // A corrupt engine state is `commit-only-authorized`'s, and nothing
     // after it is judged here, so no later step counts as passed.
-    if view.fork_choice().tainted_by(step) {
-        return Verdict::NotApplicable;
-    }
+    let tainted = view.fork_choice().tainted_by(step);
     // A settled point needs no task able to run after the step, which only
     // the scheduler's status says.
-    let at_rest = crate::at_rest(cx.status);
-    if let (true, Some(verdict)) = (at_rest, view.fork_choice().settled_at(step)) {
-        if let Some(detail) = verdict {
-            return cx.violated(
-                "a settled node in the fork fixture is on the heaviest mirror chain",
-                detail,
-            );
+    let settled = (!tainted && crate::at_rest(cx.status))
+        .then(|| view.fork_choice().settled_at(step))
+        .flatten();
+    if let Some(Some(detail)) = &settled {
+        breaks.push((
+            "a settled node in the fork fixture is on the heaviest mirror chain",
+            detail.clone(),
+        ));
+    }
+    let mut breaks = breaks.into_iter();
+    if let Some((expected, actual)) = breaks.next() {
+        for (expected, actual) in breaks {
+            cx.record_violation(expected, actual);
         }
+        return cx.violated(expected, actual);
+    }
+    if tainted {
+        return Verdict::NotApplicable;
+    }
+    if settled.is_some() {
         return Verdict::Holds;
     }
     if view.fork_choice().applicable_by(step) {

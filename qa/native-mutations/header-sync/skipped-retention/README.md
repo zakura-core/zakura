@@ -1,5 +1,13 @@
 # Skipped retention
 
+Retired as a duplicate of the planted case
+`qa/planted/header-sync/outstanding-work-bounded/retention-skipped`, which
+dispatches a prepare without retaining its headers in the same `dispatch.rs`
+path. On that case's forks-sharing-a-header input both first violate
+`header-sync/outstanding-work-bounded` at step 738 with the same
+`OutstandingWork` finding, a held call 3 that holds no headers. The witness
+below is the retired mutation's own.
+
 `skipped-retention.patch` has `retain_for_call` give a call that takes no
 handoff none of its round's headers, so a prepare runs without holding the
 capacity its round's leases charge.

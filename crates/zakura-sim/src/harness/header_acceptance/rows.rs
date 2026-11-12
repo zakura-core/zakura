@@ -3073,7 +3073,15 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "skewed-remaining",
         },
     },
-    to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
+    NativeMutation {
+        patch: "skipped-retention",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case outstanding-work-bounded/retention-skipped, \
+                     which dispatches a prepare without retaining its headers in the same \
+                     dispatch path, and on the forks-sharing-a-header input first fails with the \
+                     same held call that holds no headers at step 738",
+        },
+    },
     NativeMutation {
         patch: "skipped-staging",
         class: NativeClass::Moved {

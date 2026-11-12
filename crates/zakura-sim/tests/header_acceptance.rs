@@ -1851,10 +1851,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "skewed-remaining",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1b"),
     ),
-    (
-        "skipped-retention",
-        NativePin::Move("header-sync/outstanding-work-bounded", "hdr-9d.1"),
-    ),
+    ("skipped-retention", NativePin::Retired),
     (
         "skipped-staging",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),

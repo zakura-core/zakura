@@ -386,6 +386,52 @@ async fn pruned_routing_pruned_notfound_retries_archive_without_disconnect() {
     assert_eq!(peers.pruned.written_now().await, None);
 }
 
+/// One peer without the pruned hint cannot take every fallback block request: archive preference
+/// only breaks ties between the two peers that power-of-two-choices samples.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_single_archive_does_not_capture_every_request() {
+    let _init_guard = zakura_test::init();
+    const PRUNED_PEERS: u16 = 9;
+    const SELECTIONS: usize = 400;
+
+    let mut archive = TestPeer::spawn_with_services(1, PeerServices::NODE_NETWORK, None);
+    let mut pruned: Vec<TestPeer> = (0..PRUNED_PEERS)
+        .map(|i| {
+            TestPeer::spawn_with_services(
+                2 + i,
+                PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+                None,
+            )
+        })
+        .collect();
+    let mut discovered = vec![archive.discovered()];
+    discovered.extend(pruned.iter_mut().map(TestPeer::discovered));
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (mut set, _guard) = PeerSetBuilder::new()
+        .with_discover(discover(discovered))
+        .with_minimum_peer_version(minimum)
+        .max_conns_per_ip(usize::from(PRUNED_PEERS) + 1)
+        .build();
+    set.ready().await.expect("all peers are ready");
+    let candidates: HashSet<_> = set.ready_services.keys().copied().collect();
+    assert_eq!(candidates.len(), usize::from(PRUNED_PEERS) + 1);
+
+    let archive_selections = (0..SELECTIONS)
+        .filter(|_| set.select_archive_or_pruned_peer(&candidates) == Some(archive.addr))
+        .count();
+
+    // P2C samples the archive in 2 of every 10 draws, so expect about 80 of 400 selections.
+    // Both bounds are many standard deviations away from that expectation.
+    assert!(
+        archive_selections > 0,
+        "the archive wins whenever it is sampled"
+    );
+    assert!(
+        archive_selections < SELECTIONS / 2,
+        "the archive took {archive_selections} of {SELECTIONS} selections"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_transactions_still_use_pruned_advertisers() {
     let _init_guard = zakura_test::init();

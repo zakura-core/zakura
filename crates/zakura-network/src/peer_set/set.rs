@@ -972,28 +972,34 @@ where
         }
     }
 
-    /// Prefers peers without the pruned hint, falling back to pruned peers when needed.
+    /// Performs P2C on `candidates`, favouring a sampled peer without the pruned hint.
     ///
-    /// Absence of the hint is not proof of retained history: older peers do not report it.
+    /// Of the two sampled peers, one without the hint wins over a pruned one regardless of load;
+    /// otherwise the less-loaded peer wins. This is a bias, not a filter: a single peer without
+    /// the hint among `n` candidates is sampled for about `2/n` of requests, so a peer cannot take
+    /// every block request just by omitting the hint. Absence of the hint is not proof of retained
+    /// history either: older peers and zcashd do not report it.
     fn select_archive_or_pruned_peer(&self, candidates: &HashSet<D::Key>) -> Option<D::Key> {
-        let archives = candidates
-            .iter()
-            .filter(|key| {
-                self.ready_services.get(key).is_some_and(|service| {
-                    !service
-                        .remote_services()
-                        .contains(crate::types::PeerServices::NODE_PRUNED)
-                })
-            })
-            .copied()
-            .collect();
-        self.select_p2c_peer_from_list(&archives)
-            .or_else(|| self.select_p2c_peer_from_list(candidates))
+        self.select_p2c_peer_preferring(candidates, |service| {
+            !service
+                .remote_services()
+                .contains(crate::types::PeerServices::NODE_PRUNED)
+        })
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
-    #[allow(clippy::unwrap_in_result)]
     fn select_p2c_peer_from_list(&self, ready_service_list: &HashSet<D::Key>) -> Option<D::Key> {
+        self.select_p2c_peer_preferring(ready_service_list, |_| false)
+    }
+
+    /// Performs P2C on `ready_service_list`: samples two ready services and returns the one
+    /// `is_preferred` accepts when exactly one of them is accepted, otherwise the less loaded.
+    #[allow(clippy::unwrap_in_result)]
+    fn select_p2c_peer_preferring(
+        &self,
+        ready_service_list: &HashSet<D::Key>,
+        is_preferred: impl Fn(&D::Service) -> bool,
+    ) -> Option<D::Key> {
         match ready_service_list.len() {
             0 => None,
             1 => Some(
@@ -1024,13 +1030,23 @@ where
                 let a_load = self.query_load(&a).expect("supplied services are ready");
                 let b_load = self.query_load(&b).expect("supplied services are ready");
 
-                let selected = if a_load <= b_load { a } else { b };
+                let a_preferred = self.ready_services.get(&a).is_some_and(&is_preferred);
+                let b_preferred = self.ready_services.get(&b).is_some_and(&is_preferred);
+
+                let selected = match (a_preferred, b_preferred) {
+                    (true, false) => a,
+                    (false, true) => b,
+                    _ if a_load <= b_load => a,
+                    _ => b,
+                };
 
                 trace!(
                     a.key = %a.addr_label(self.expose_peer_addresses),
                     a.load = ?a_load,
                     b.key = %b.addr_label(self.expose_peer_addresses),
                     b.load = ?b_load,
+                    ?a_preferred,
+                    ?b_preferred,
                     selected = %selected.addr_label(self.expose_peer_addresses),
                     ?len,
                     "selected service by p2c"

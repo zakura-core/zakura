@@ -70,6 +70,7 @@ use zakura_network::zakura::{
 use zakura_rt::sim::RunId;
 use zakura_scheduler::Status as SchedulerStatus;
 
+use super::authority::{AuthorityFinding, AuthorityRule, AuthoritySubject};
 use crate::{
     peer::peer_of,
     property::EndedBy,
@@ -200,8 +201,8 @@ struct SessionLedger {
     broken: Option<String>,
     /// The identity mismatches not yet drained: an admission whose peer,
     /// direction or session ID isn't its link's or transport row's, which
-    /// `header-sync/commit-only-authorized` claims.
-    claims: Vec<String>,
+    /// `header-sync/commit-only-authorized` claims as a provenance break.
+    claims: Vec<AuthorityFinding>,
     /// Whether an identity join was made since the last drain, which makes
     /// `header-sync/commit-only-authorized` applicable.
     identity_joined: bool,
@@ -522,7 +523,7 @@ impl SessionEvidence {
     /// peer, direction or session ID isn't the one their link's origin or
     /// transport row carries. The service builds each `PeerSession` itself,
     /// so such a mismatch is a production defect with every fact truthful.
-    pub(crate) fn take_claims(&self) -> Vec<String> {
+    pub(crate) fn take_claims(&self) -> Vec<AuthorityFinding> {
         self.change(|ledger| std::mem::take(&mut ledger.claims))
             .unwrap_or_default()
     }
@@ -729,11 +730,14 @@ impl SessionLedger {
             None
         };
         if let Some(expected) = mismatch {
-            let detail = format!(
-                "CommitOnlyAuthorized: the node admitted session {session_id} from {name}, \
-                 {direction:?}, with origin {origin:?}, but its link has {expected}"
-            );
-            self.claims.push(detail);
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                AuthoritySubject::session(peer, session_id, Some(origin.connection)),
+                format!(
+                    "the node admitted session {session_id} from {name}, {direction:?}, with \
+                     origin {origin:?}, but its link has {expected}"
+                ),
+            ));
         }
         if std::mem::replace(&mut link.admitted, true) {
             return Err(format!(
@@ -804,10 +808,15 @@ impl SessionLedger {
         } else {
             None
         };
+        let subject = AuthoritySubject::session(peer, session_id, Some(connection));
         if let Some(expected) = mismatch {
-            self.claims.push(format!(
-                "CommitOnlyAuthorized: {admitted} on connection {connection}'s stream \
-                 {quic_stream}, but its Session row has {expected}"
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                subject.clone(),
+                format!(
+                    "{admitted} on connection {connection}'s stream {quic_stream}, but its \
+                     Session row has {expected}"
+                ),
             ));
         }
         let installs = own9
@@ -822,9 +831,13 @@ impl SessionLedger {
             ));
         }
         if generation != session_id {
-            self.claims.push(format!(
-                "CommitOnlyAuthorized: {admitted} as generation {generation}, but the handler \
-                 installs each generation under its session ID"
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                subject,
+                format!(
+                    "{admitted} as generation {generation}, but the handler installs each \
+                     generation under its session ID"
+                ),
             ));
         }
         own9.origins.insert((peer.clone(), session_id), origin);

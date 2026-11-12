@@ -47,7 +47,7 @@ use super::{
         chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
-        fault::{FaultCheck, FaultEvidence},
+        fault::{self, FaultCheck, FaultEvidence},
         fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
@@ -95,7 +95,7 @@ use crate::{
     },
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Kind, Pending,
-        Property, PropertyId, Source, Sources, Status, Verdict,
+        Property, PropertyId, Source, Sources, Status, TriggerHistory, Verdict,
     },
     storage::HEADER_SERVICE,
     stores::EvidenceStores,
@@ -2645,8 +2645,16 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
         needs: &[Source::Storage, Source::View],
         status: Status::Active,
         check: check_header_fault_penalized::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::View(penalty_owed)),
     }
+}
+
+/// [`HEADER_FAULT_PENALIZED`]'s trigger: the reactor took the reply of a
+/// failed prepare or apply that owes a penalty ([`fault::owed`]), so the
+/// rule had something to judge. A log whose evidence can't be read owes
+/// nothing here, and the check itself reports why.
+fn penalty_owed(view: &StorageView, log: &ObservationLog) -> bool {
+    fault::owed(log.entries(), view.faults.attributions()).is_ok_and(|owed| !owed.is_empty())
 }
 
 /// What [`HEADER_FAULT_PENALIZED`] expects, as its violations report it.

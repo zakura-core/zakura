@@ -370,6 +370,7 @@ impl TapState {
                 step,
                 claim: Claim::of(broken.rule),
                 detail: broken.detail,
+                attribution: None,
             });
         }
         if let Some(rule) = books {
@@ -377,6 +378,7 @@ impl TapState {
                 step,
                 claim: Claim::OutstandingWork,
                 detail: format!("OutstandingWork: the work books don't balance: {rule}"),
+                attribution: None,
             });
         }
         let stale = self
@@ -389,6 +391,7 @@ impl TapState {
                 step,
                 claim: Claim::StaleCompletionEffect,
                 detail,
+                attribution: None,
             });
         }
         // An integrity failure here waits until every claim break is
@@ -411,6 +414,7 @@ impl TapState {
                 step,
                 claim: Claim::ResetInvalidatesWork,
                 detail,
+                attribution: None,
             });
         }
         let outstanding = self
@@ -425,6 +429,7 @@ impl TapState {
                 step,
                 claim: Claim::OutstandingWork,
                 detail,
+                attribution: None,
             });
         }
         let chain = match self
@@ -444,6 +449,7 @@ impl TapState {
                 step,
                 claim: Claim::StaleChainEffect,
                 detail,
+                attribution: None,
             });
         }
         let departed = self
@@ -458,6 +464,7 @@ impl TapState {
                 step,
                 claim: Claim::PeerRetirementProgress,
                 detail,
+                attribution: None,
             });
         }
         let selected = match self
@@ -481,6 +488,7 @@ impl TapState {
                 step,
                 claim: Claim::ExpectedChainSelected,
                 detail,
+                attribution: None,
             });
         }
         let published = self
@@ -495,6 +503,7 @@ impl TapState {
                 step,
                 claim: Claim::StatePublicationConsistent,
                 detail,
+                attribution: None,
             });
         }
         let mut authorized = self.sessions.take_claims();
@@ -510,12 +519,8 @@ impl TapState {
             }
             authorized.extend(authority.drain(step));
         }
-        for detail in authorized {
-            self.claims.record(ClaimRecord {
-                step,
-                claim: Claim::CommitOnlyAuthorized,
-                detail,
-            });
+        for finding in authorized {
+            self.claims.record(finding.record(step));
         }
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         self.rounds.record(Settlement {
@@ -1873,6 +1878,7 @@ impl ReactorTap {
                     step,
                     claim,
                     detail,
+                    attribution: None,
                 });
             }
         }

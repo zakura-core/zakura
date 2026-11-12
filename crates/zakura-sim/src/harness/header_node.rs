@@ -82,8 +82,8 @@ use self::{
     hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     recovery::{
-        Disruption, Driver, Hostile, Prefix, RecoveryEvidence, RecoveryInputs, SelectedChain,
-        RECOVERED, RELINK, UNREACHED,
+        Disruption, Driver, Hostile, Prefix, PrefixCutoff, RecoveryEvidence, RecoveryInputs,
+        SelectedChain, RECOVERED, RELINK, UNREACHED,
     },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -1730,8 +1730,11 @@ pub struct ControlStep {
 /// from then on.
 ///
 /// Each step it picks before a `Recover` counts in the recovery's hostile
-/// prefix ([`recovery::Prefix`]). Once that's full it offers only the
-/// `Recover` step, and the steps between are dropped. The script stops at
+/// prefix ([`recovery::Prefix`]). Once that's full, or past its cutoff
+/// ([`RecoveryEvidence::prefix_ended`]), it offers only the `Recover` step,
+/// whatever its trigger, and the steps between are dropped. A `Recover` it
+/// never picks fails the run at its end ([`ActionSource::holds_work`]).
+/// The script stops at
 /// the `Recover` pick. A typed test's closes after the `Recover` step go on
 /// from the `recovered` pick, each the harness ending a member, which
 /// breaks recovery's membership assumption (hdr-13's loss path).
@@ -1757,6 +1760,8 @@ pub struct Control {
     adoption: Option<AdoptionEvidence>,
     /// What a `Recover` step drives.
     recovery: Option<Driver>,
+    /// The last step taken, for a step cutoff.
+    step: u64,
 }
 
 impl Control {
@@ -1845,6 +1850,7 @@ impl Control {
             fixture,
             adoption: None,
             recovery: None,
+            step: 0,
         }
     }
 
@@ -1873,27 +1879,33 @@ impl Control {
             .is_some_and(|driver| driver.evidence.record().is_some())
     }
 
-    /// Whether the hostile prefix before the `Recover` pick is full
-    /// ([`Prefix`]).
-    fn prefix_full(&self) -> bool {
+    /// Whether the hostile prefix before the `Recover` pick has ended at
+    /// `now`: it's full or past its cutoff
+    /// ([`RecoveryEvidence::prefix_ended`]).
+    fn prefix_ended(&self, now: SimInstant) -> bool {
         self.recovery
             .as_ref()
-            .is_some_and(|driver| driver.evidence.in_prefix() && driver.evidence.prefix().full())
+            .is_some_and(|driver| driver.evidence.prefix_ended(now, self.step))
     }
 
-    /// The index of the script step to offer next: the next one, or once
-    /// the hostile prefix is full, the `Recover` step at or after it,
-    /// skipping the steps between. `None` once the script is done, or with
-    /// the prefix full and no `Recover` step left.
-    fn next_step(&self) -> Option<usize> {
-        if !self.prefix_full() {
-            return (self.next < self.script.len()).then_some(self.next);
-        }
+    /// The index of the first `Recover` step at or after the next one.
+    fn next_recover(&self) -> Option<usize> {
         self.script
             .iter()
             .skip(self.next)
             .position(|step| step.action == ControlAction::Recover)
             .map(|offset| self.next + offset)
+    }
+
+    /// The index of the script step to offer next at `now`: the next one,
+    /// or once the hostile prefix has ended, the `Recover` step at or after
+    /// it, skipping the steps between. `None` once the script is done, or
+    /// with the prefix ended and no `Recover` step left.
+    fn next_step(&self, now: SimInstant) -> Option<usize> {
+        if self.prefix_ended(now) {
+            return self.next_recover();
+        }
+        (self.next < self.script.len()).then_some(self.next)
     }
 
     /// This source, resetting, committing to and stopping `port`, the node
@@ -2056,12 +2068,13 @@ impl Control {
         if self.recovering() && !self.resumed() {
             return None;
         }
-        let index = self.next_step()?;
+        let index = self.next_step(now)?;
         let step = &self.script[index];
-        // A full prefix has ended, so its `Recover` comes at once: its
-        // trigger can wait on a step the cutoff skipped.
+        // An ended prefix's `Recover` comes at once: its trigger can wait on
+        // a step the cutoff skipped, or on node work a stalled node never
+        // does.
         let open = self.ready(step)
-            && (self.prefix_full()
+            && (self.prefix_ended(now)
                 || step
                     .when
                     .as_ref()
@@ -2090,8 +2103,20 @@ impl ActionSource for Control {
                 return;
             }
         }
+        // A time cutoff opens the `Recover`, and no other source need stop
+        // the clock there.
+        if let Some(PrefixCutoff::At(at)) = self
+            .recovery
+            .as_ref()
+            .filter(|driver| driver.evidence.in_prefix() && self.next_recover().is_some())
+            .and_then(|driver| driver.evidence.cutoff())
+        {
+            if at > now {
+                out.push(Boundary::Opens(at));
+            }
+        }
         if let Some(when) = self
-            .next_step()
+            .next_step(now)
             .and_then(|index| self.script[index].when.as_ref())
         {
             self.predicates.borrow().control_boundaries(when, now, out);
@@ -2178,9 +2203,21 @@ impl ActionSource for Control {
     /// growth, so the hold's operation can never finish. A release that's
     /// next waits only on its own trigger, which node work can still meet,
     /// and once a `Recover` is picked every hold retires.
+    ///
+    /// Also a `Recover` step still to come. Past the prefix's cutoff it's
+    /// offered at once, and `Storage::prepare` keeps it from following
+    /// anything that could stop it, so a run that ends without its pick was
+    /// stalled by the harness, and nothing judged its recovery.
     fn holds_work(&self) -> Option<String> {
         if self.recovering() {
             return None;
+        }
+        if let Some(index) = self.next_recover().filter(|_| self.recovery.is_some()) {
+            return Some(format!(
+                "the script's `Recover` of {} (step {index}) was never picked, so nothing \
+                 judged its recovery",
+                self.script[index].peer
+            ));
         }
         let owned_release = |step: &ControlStep| match step.action {
             ControlAction::Release { hold } => self.topology.owns(hold).then_some(hold),
@@ -2197,6 +2234,12 @@ impl ActionSource for Control {
             next.action.name(),
             next.peer
         ))
+    }
+
+    /// Notes the last step taken, for a step cutoff.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        self.step = log.step();
+        Ok(())
     }
 
     /// Checks the next step and queues it for the control task, or carries

@@ -952,8 +952,9 @@ pub static COVERAGE: &[Coverage] = &[
     },
     // The committed recovery fixtures: hdr-11's control and hdr-13's close,
     // fault and departure classes. `cargo xtask planted` runs every case
-    // under the property's directory, hdr-11's `skipped-apply` and hdr-13's
-    // four; this row names one of hdr-13's.
+    // under the property's directory, hdr-11's `skipped-apply`, hdr-13's
+    // four and #2355's `stalled-successor-on-faults`; this row names one of
+    // hdr-13's.
     Coverage {
         property: crate::domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
         passing: passes(

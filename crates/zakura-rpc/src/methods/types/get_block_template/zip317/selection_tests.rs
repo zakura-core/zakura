@@ -873,6 +873,23 @@ fn benchmark_full_mempool_gbt_selection() {
                 .is_none_or(|fixtures| fixtures.split(',').any(|fixture| fixture == *kind))
         }) {
             let fixture = Fixture::full(kind, cost_limit);
+            // At full size the misfit bound can fire, so check here too that the
+            // benchmark's skip rule selects exactly what production selects.
+            let (txs, deps) = fixture.snapshot();
+            let production = select(Mode::Production, txs, deps, &network, height, &miner);
+            let (txs, deps) = fixture.snapshot();
+            let mirrored = variant(
+                txs,
+                deps,
+                limits(&network, height, &miner),
+                Score::Zip401Cost,
+                Misfit::Skip,
+            );
+            assert_eq!(ids(&production), ids(&mirrored), "{era} {kind}");
+            println!(
+            "gbt-check era={era} fixture={kind} production_matches_skip_variant=true misfits={}",
+            mirrored.misfits
+        );
             for phase in ["selection", "template_json"] {
                 let modes = Mode::ALL;
                 let mut results: [Vec<(Duration, Stats)>; Mode::ALL.len()] = Default::default();

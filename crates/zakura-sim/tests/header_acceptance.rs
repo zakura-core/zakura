@@ -1895,7 +1895,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
     ),
     (
         "stale-locator-round",
-        NativePin::Duplicate("header-sync/reset-invalidates-work", "awaiting-kept"),
+        NativePin::Move("header-sync/reset-invalidates-work", "hdr-14.5"),
     ),
     (
         "stale-status-cache",

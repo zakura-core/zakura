@@ -1652,6 +1652,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "stale-locator-round",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "stale-read",
             STORAGE,
             &[RESET] as &'static [&'static str],
@@ -3333,9 +3339,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "stale-locator-round",
-        class: NativeClass::Duplicate {
+        class: NativeClass::Moved {
             property: RESET,
-            case: "awaiting-kept",
+            case: "stale-locator-round",
         },
     },
     NativeMutation {

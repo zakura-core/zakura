@@ -512,7 +512,8 @@ pub const HOSTILE_TAG_BASE: u8 = 0x20;
 /// two cadence runs, each with its family's name (mutation plan, mut-6).
 /// [`DiscoveryWire`]'s `draw` runs [`act_scenario`] of the act at index
 /// `i` for the tag `[TAG, HOSTILE_TAG_BASE + i]`, so the generator reaches
-/// stream 4's refusal IDs. Appending keeps every earlier tag's meaning.
+/// stream 4's refusal IDs. Inserting an act moves [`ASKED`]'s tags, so a
+/// new act goes in with a bump of [`DiscoveryWire`]'s `GENERATOR`.
 pub const HOSTILE_ACTS: [(&str, DiscoveryAct); 29] = [
     (
         "undeclared-type",
@@ -688,14 +689,31 @@ pub const HOSTILE_ACTS: [(&str, DiscoveryAct); 29] = [
     ),
 ];
 
-/// The hostile act `prefix` tags, if it starts with one of
-/// [`HOSTILE_ACTS`]' tags.
-pub fn hostile_act(prefix: &[u8]) -> Option<DiscoveryAct> {
-    let [TAG, tag, ..] = prefix else {
-        return None;
-    };
-    let index = usize::from(tag.checked_sub(HOSTILE_TAG_BASE)?);
-    HOSTILE_ACTS.get(index).map(|(_, act)| *act)
+/// The requests that ask for less than everything, whose answers reach
+/// the `sender-within-owed` IDs in [`asking_scenario`]. Their tags follow
+/// [`HOSTILE_ACTS`]'.
+pub const ASKED: [Request; 2] = [Request::GetOnePeer, Request::GetHeaderSyncService];
+
+/// The families after the saved Plans: each of [`HOSTILE_ACTS`], then
+/// each of [`ASKED`], by name, tag and scenario.
+fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], WireScenario)> {
+    let acts = HOSTILE_ACTS
+        .iter()
+        .map(|(name, act)| (*name, act_scenario(*act)));
+    let asked = ASKED
+        .iter()
+        .map(|request| (request.name(), asking_scenario(*request)));
+    acts.chain(asked)
+        .zip(HOSTILE_TAG_BASE..)
+        .map(|((name, scenario), tag)| (name, [TAG, tag], scenario))
+}
+
+/// The scenario `prefix` tags, if it starts with one of
+/// [`drawn_families`]' tags.
+fn drawn_scenario(prefix: &[u8]) -> Option<WireScenario> {
+    drawn_families()
+        .find(|(_, tag, _)| prefix.get(..2) == Some(&tag[..]))
+        .map(|(_, _, scenario)| scenario)
 }
 
 /// The honest exchange, with the peer sending `request` once.
@@ -1066,25 +1084,22 @@ impl Subsystem for DiscoveryWire {
     }
 
     /// Each saved Plan's tag ([`SavedPlan::tag`]), then each hostile
-    /// act's ([`HOSTILE_ACTS`]).
+    /// act's and asking request's ([`drawn_families`]).
     fn families() -> Vec<ScenarioFamily> {
-        let hostile = HOSTILE_ACTS
-            .iter()
-            .zip(HOSTILE_TAG_BASE..)
-            .map(|((name, _), tag)| ScenarioFamily::new(name, [TAG, tag]));
         SavedPlan::ALL
             .into_iter()
             .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
-            .chain(hostile)
+            .chain(drawn_families().map(|(name, tag, _)| ScenarioFamily::new(name, tag)))
             .collect()
     }
 
     /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), the
-    /// hostile act's ([`hostile_act`]), or the default scenario.
+    /// hostile act's or asking request's ([`drawn_families`]), or the
+    /// default scenario.
     fn draw(prefix: &[u8]) -> WireScenario {
         if let Some(plan) = SavedPlan::from_tag(prefix) {
             return plan.scenario();
         }
-        hostile_act(prefix).map_or_else(WireScenario::default, act_scenario)
+        drawn_scenario(prefix).unwrap_or_default()
     }
 }

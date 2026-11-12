@@ -26,7 +26,7 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
-            WireScenario, FAMILY, HOSTILE_ACTS, SCRIPTED,
+            WireScenario, ASKED, FAMILY, HOSTILE_ACTS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
@@ -324,21 +324,29 @@ fn every_discovery_property_applies_in_its_witness() {
     assert_eq!(fault_closes(&report), Vec::<String>::new());
 }
 
-/// `discovery/wire` draws each act witness from its family's tag, so the
-/// generator reaches stream 4's refusal IDs (mutation plan, mut-6), and
-/// each family's name is its own.
+/// `discovery/wire` draws each act witness, and each asking witness of
+/// [`OWED`], from its family's tag, so the generator reaches stream 4's
+/// refusal and `sender-within-owed` IDs (mutation plan, mut-6). Each
+/// family's name is its own.
 #[test]
-fn each_hostile_family_draws_its_act_witness() {
+fn each_hostile_family_draws_its_witness() {
     let families = DiscoveryWire::families();
-    for (name, act) in HOSTILE_ACTS {
+    let drawn = |name: &str| {
         let family = families
             .iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} isn't a family"));
+        DiscoveryWire::draw(&family.tag)
+    };
+    for (name, act) in HOSTILE_ACTS {
+        assert_eq!(drawn(name), act_scenario(act), "{name}");
+    }
+    assert_eq!(ASKED, OWED.map(|(_, request)| request));
+    for request in ASKED {
         assert_eq!(
-            DiscoveryWire::draw(&family.tag),
-            act_scenario(act),
-            "{name}"
+            drawn(request.name()),
+            asking_scenario(request),
+            "{request:?}"
         );
     }
     let names: BTreeSet<&str> = families.iter().map(|family| family.name).collect();

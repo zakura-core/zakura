@@ -34,14 +34,20 @@
 //! The records are the engine before the run and each engine run's
 //! snapshot, an apply's, a reset's or a harness commit's
 //! (`ControlledPort::harness_commit`), so every engine change has one. The
-//! check applies once it judged an adoption or a commit's publication. A
-//! broken rule is a claim break, which the tap hands
-//! [`Claim::StatePublicationConsistent`](super::claim::Claim) at its drain.
+//! check applies once it judged an adoption, a commit's publication, a
+//! served page or a mirror's refusal. A broken rule is a claim break, which
+//! the tap hands [`Claim::StatePublicationConsistent`](super::claim::Claim)
+//! at its drain.
 //!
 //! - **Served pages are what was read.** Every page a publisher hands its
-//!   writer is the page read it was built from, starts where its
-//!   subscription's previous page left off, and carries its subscription's
-//!   initial target ([`served`]).
+//!   writer is the page read it was built from, and declares that read's
+//!   start ([`served`]).
+//! - **Mirrors take what they're sent.** No mirror's service refuses a
+//!   frame from the node as a protocol violation ([`MirrorRefusals`]). A
+//!   mirror's own subscriber judges each page against its `Open`, so a page
+//!   that matches its read but not what was asked for shows here. Mirrors
+//!   are honest, so the node is to blame, whatever message the mirror
+//!   refused.
 //!
 //! **Liveness facts.** A harness that arms the evidence
 //! ([`PublicationEvidence::armed`]) also gets stamped facts, which the
@@ -67,7 +73,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
 use zakura_network::zakura::{
-    observe::{CreditKind, HeaderSyncObserver, ReactorEvent},
+    observe::{HeaderSyncObserver, ReactorEvent},
     Status, ZakuraPeerId,
 };
 use zakura_scheduler::SimInstant;
@@ -79,7 +85,7 @@ use super::{
 };
 use crate::{
     observe::StorageFact,
-    stores::{debug_snapshot, sorted_snapshot, EvidenceStores, Registered, Snapshot},
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
 };
 
 /// How long a session in a status fixture may be owed its `Status`: the
@@ -164,44 +170,15 @@ struct Store {
     names: Vec<(ZakuraPeerId, String)>,
     /// Each page the served-page rule judged, in order.
     pages: Vec<ServedPage>,
-    /// Each subscription's `Open`, as its subscriber built it, by
-    /// subscriber, session and subscription ([`SubscriberOpens`]).
-    opens: HashMap<served::SubscriptionKey, served::Opened>,
+    /// Each refusal a mirror reported since the last drain
+    /// ([`MirrorRefusals`]).
+    refused: Vec<String>,
 }
 
 impl Snapshot for Store {
-    /// Everything it holds, with each subscription's `Open` sorted.
+    /// Everything it holds.
     fn snapshot(&self) -> serde_json::Value {
-        let Store {
-            applicable,
-            pending,
-            tainted,
-            taint_pending,
-            owed,
-            settled,
-            arming,
-            stamps,
-            facts,
-            names,
-            pages,
-            opens,
-        } = self;
-        serde_json::json!({
-            "fields": debug_snapshot(&(
-                applicable,
-                pending,
-                tainted,
-                taint_pending,
-                owed,
-                settled,
-                arming,
-                stamps,
-                facts,
-                names,
-                pages,
-            )),
-            "opens": sorted_snapshot(opens),
-        })
+        debug_snapshot(self)
     }
 }
 
@@ -326,19 +303,15 @@ impl PublicationEvidence {
         self.with(|store| store.pages.clone())
     }
 
-    /// The observer for the node named `subscriber`, a mirror the node
-    /// under test serves, which records each `Open` its subscriber builds
-    /// ([`SubscriberOpens`]).
-    pub fn subscriber(&self, subscriber: &str) -> Arc<dyn HeaderSyncObserver> {
-        Arc::new(SubscriberOpens {
-            subscriber: subscriber.to_owned(),
+    /// The observer for the mirror named `mirror`, which the node `node`
+    /// under test serves, whose capacity handle records each frame from the
+    /// node the mirror refused ([`MirrorRefusals`]).
+    pub fn mirror(&self, mirror: &str, node: ZakuraPeerId) -> Arc<dyn HeaderSyncObserver> {
+        Arc::new(MirrorRefusals {
+            mirror: mirror.to_owned(),
+            node,
             evidence: self.clone(),
         })
-    }
-
-    /// `subscription`'s `Open`, if its subscriber recorded one.
-    fn opened(&self, subscription: &served::SubscriptionKey) -> Option<served::Opened> {
-        self.with(|store| store.opens.get(subscription).cloned())
     }
 
     /// The peer whose session `session_id` was owed a `Status`, if it was.
@@ -407,48 +380,51 @@ impl PublicationEvidence {
     }
 }
 
-/// A mirror's observer, which records each `Open` the mirror's subscriber
-/// builds for a node, its `CreditIssued` of kind `Open`, so the served-page
-/// rule judges a page's target and first start by what the far end asked
-/// for ([`served`]). The subscriber reports credit only to a capacity handle,
-/// so this is its own. It ignores every other event and adds no
+/// A mirror's observer, whose capacity handle breaks the check when the
+/// mirror's service refuses a frame from the node as a protocol violation
+/// (`FrameRefused`): a served page its subscriber's `receive_page` refuses,
+/// or another message. Mirrors are honest, so the node is to blame. The
+/// service reports the refusal from the session's own task as it refuses,
+/// so a relink that replaces the session meanwhile, or a close cause
+/// recorded first, can't hide it. It ignores every other event and adds no
 /// scheduling point, so the mirror runs as it would unobserved.
-#[derive(Debug)]
-struct SubscriberOpens {
+#[derive(Debug, Clone)]
+struct MirrorRefusals {
     /// The mirror's harness name.
-    subscriber: String,
+    mirror: String,
+    /// The node under test.
+    node: ZakuraPeerId,
     evidence: PublicationEvidence,
 }
 
-impl HeaderSyncObserver for SubscriberOpens {
-    /// Records `event`'s target, its height and locators if it's an
-    /// `Open`'s credit.
+impl HeaderSyncObserver for MirrorRefusals {
+    /// Records `event` if it's the mirror refusing a frame from the node.
     fn observe(&self, event: ReactorEvent) {
-        if let ReactorEvent::CreditIssued {
-            kind: CreditKind::Open,
+        let ReactorEvent::FrameRefused {
+            peer,
             session_id,
-            update,
-            target_height,
-            ..
+            reason,
         } = event
-        {
-            let subscription = (self.subscriber.clone(), session_id, update.subscription_id);
-            let opened = served::Opened {
-                target: update.initial_target_tip_hash,
-                target_height,
-                locators: update.locator_hashes,
-            };
-            self.evidence
-                .change(|store| store.opens.insert(subscription, opened));
+        else {
+            return;
+        };
+        if peer != self.node {
+            return;
         }
+        let detail = format!(
+            "MirrorRefused: {} refused a frame from the node on session {session_id} as \
+             `{reason}`",
+            self.mirror
+        );
+        self.evidence.change(|store| {
+            store.refused.push(detail);
+            store.pending = true;
+        });
     }
 
-    /// This observer, which the subscriber's credit reports go to.
+    /// This observer, which the mirror's service reports refusals to.
     fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
-        Some(Arc::new(SubscriberOpens {
-            subscriber: self.subscriber.clone(),
-            evidence: self.evidence.clone(),
-        }))
+        Some(Arc::new(self.clone()))
     }
 }
 
@@ -573,12 +549,7 @@ impl Publication {
             return;
         }
         // A publisher task reports its pages, not the reactor's.
-        let evidence = self.evidence.clone();
-        let opened = |subscriber: &ZakuraPeerId, session_id, subscription| {
-            let subscriber = evidence.peer_name(subscriber)?;
-            evidence.opened(&(subscriber, session_id, subscription))
-        };
-        if let Some(breaks) = self.served.queued(event, super::tap::peer, opened) {
+        if let Some(breaks) = self.served.queued(event, super::tap::peer) {
             if let ReactorEvent::PageQueued {
                 session_id,
                 subscription_id,
@@ -841,14 +812,21 @@ impl Publication {
         if step == 0 {
             return Vec::new();
         }
-        self.evidence.change(|store| {
-            if std::mem::take(&mut store.pending) {
-                store.applicable.get_or_insert(step);
-            }
-            if std::mem::take(&mut store.taint_pending) {
-                store.tainted.get_or_insert(step);
-            }
-        });
+        let refused = self
+            .evidence
+            .change(|store| {
+                if std::mem::take(&mut store.pending) {
+                    store.applicable.get_or_insert(step);
+                }
+                if std::mem::take(&mut store.taint_pending) {
+                    store.tainted.get_or_insert(step);
+                }
+                std::mem::take(&mut store.refused)
+            })
+            .unwrap_or_default();
+        if !self.tainted {
+            self.breaks.extend(refused);
+        }
         std::mem::take(&mut self.breaks)
     }
 

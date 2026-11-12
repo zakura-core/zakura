@@ -1,0 +1,13 @@
+# The saved schedule `missed-notify.bin` (sched-4 S4.4): the planted race on 2
+# workers, then Plan bytes that reach the race's trigger history.
+# `tests/race_fixtures.rs`'s witness tests read them. It sits outside the
+# seed corpus because it fails by design.
+harness = "race/missed-notify"
+generator = 1
+sha256 = "6439a03126bf870a16e3f14bc011cca767b2deb856f139fadb76409bb6c79ef6"
+scenario_sha256 = "0e4fd8ccc2b76f011bae79384f3039e23f39ecfe9a446e2e887516eb827e62de"
+source = "crates/zakura-sim/tests/race_schedules.rs"
+
+[[witness]]
+property = "race/missed-notify"
+expect = "violated"

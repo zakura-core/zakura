@@ -473,7 +473,7 @@ reason = "no target: the harness has four fixed scenarios, the repair fixtures, 
 [[missing-target]]
 harness = "header-sync/liveness"
 owner = "E5a"
-reason = "no target: the harness has fixed scenarios, the hdr-10 and hdr-11 liveness fixtures, and no plan maps it to a target"
+reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"

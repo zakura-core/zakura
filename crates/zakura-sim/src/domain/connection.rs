@@ -117,13 +117,32 @@ where
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
             needs: &[Source::View, Source::Datagrams],
-            // A draft until a planted bypass fails it. Each service's worker
-            // hands QUIC one frame at a time, and the saturated scenario's
-            // mirrors never queue a second body on a block-sync stream ahead
-            // of another service's frame. Raising block sync's send priority
-            // and its stream's write-ahead from 64 KiB to 4 MiB together
-            // keeps the bound: the longest wait is one body, 500,001 bytes
-            // against a bound of 565,578.
+            // A draft: no planted bypass fails it, because production can't
+            // queue a second body ahead of another service's frame (#2268).
+            // The saturated scenario has bodies to queue: the node asks
+            // mirror-0 for six at once and mirror-1 for four, and each
+            // mirror serves them back to back. QUIC's write path keeps them
+            // from passing another service's frame:
+            // - The stream worker hands QUIC one frame at a time
+            //   (`write_encoded_ordered_frame`), and
+            //   `SendStream::write_chunk` returns only once at most
+            //   `WRITE_AHEAD_BYTES` (64 KiB) of the stream's writes wait for
+            //   quinn-proto. So a body larger than that leaves the connection
+            //   task before the worker hands it the next one.
+            // - quinn-proto buffers at most the send window of stream data
+            //   (`StreamsState::write_limit`), and offers a reopened window
+            //   to the most recently blocked stream first
+            //   (`StreamsState::poll`). So a frame another service writes
+            //   while block sync waits enters QUIC at the next opening.
+            // Raising block sync's send priority and its write-ahead to 4 MiB
+            // together queues four bodies (1.93 MB) on mirror-1's stream,
+            // and its discovery and header-sync frames still reach the node
+            // about one send window later. The longest wait counts one body,
+            // 500,001 bytes against a bound of 565,578, because the node
+            // counts a frame's whole payload when it reads the frame's
+            // header. Frames under 64 KiB can queue several to a stream; no
+            // run shows whether a frame that blocks before them waits behind
+            // them all.
             status: Status::Draft,
             check: check_send_isolated::<S>,
             witness: Some(TriggerHistory::View(written_under_saturation::<S>)),

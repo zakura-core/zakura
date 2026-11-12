@@ -395,7 +395,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
+        "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>] [--only <task>,...]"
     )?;
     writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(

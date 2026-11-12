@@ -2914,6 +2914,16 @@ pub enum NativeClass {
         /// Why.
         reason: &'static str,
     },
+    /// It's a duplicate of the existing planted case `case` under
+    /// `property`, an approved retirement. Its directory stays, so its key
+    /// stays required on gate 6, and that key shares the case's `Caught`:
+    /// it verifies only once that case is caught.
+    Duplicate {
+        /// The covering case's property.
+        property: &'static str,
+        /// The covering case.
+        case: &'static str,
+    },
 }
 
 /// One native mutation's classification.
@@ -2994,13 +3004,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "late-fault-unpenalized",
         },
     },
+    // Duplicates of a planted case: the same mutation one call apart,
+    // first failing with the same finding at the same step.
     NativeMutation {
         patch: "misstored-page",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case commit-only-authorized/stored-order, which \
-                     reverses the same page one call down, in WorkPolicy::stage_page, and on the \
-                     forks-sharing-a-header input first fails with the same UnstagedPage at step \
-                     709",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "stored-order",
         },
     },
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
@@ -3064,11 +3074,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "short-payload",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case \
-                     commit-only-authorized/dropped-payload-header, which plants the same \
-                     entries.pop() in WorkPolicy::begin_prepare and on the forks-sharing-a-header \
-                     input first fails with the same WrongPayload at step 738",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "dropped-payload-header",
         },
     },
     NativeMutation {
@@ -3087,11 +3095,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "skipped-retention",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case outstanding-work-bounded/retention-skipped, \
-                     which dispatches a prepare without retaining its headers in the same \
-                     dispatch path, and on the forks-sharing-a-header input first fails with the \
-                     same held call that holds no headers at step 738",
+        class: NativeClass::Duplicate {
+            property: OUTSTANDING,
+            case: "retention-skipped",
         },
     },
     NativeMutation {
@@ -3103,11 +3109,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "stale-locator-round",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case reset-invalidates-work/awaiting-kept, whose \
-                     adoption also keeps the awaiting target, and on the \
-                     header-reset-held-locator input first fails with the same \
-                     ResetInvalidatesWork at step 207",
+        class: NativeClass::Duplicate {
+            property: RESET,
+            case: "awaiting-kept",
         },
     },
     NativeMutation {
@@ -3141,9 +3145,12 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
-/// or a transitional `Open` until the PR that moves it. A retired one has
-/// no key.
-pub fn native_results() -> Vec<ExpectedResult> {
+/// a transitional `Open` until the PR that moves it or, for a retired one,
+/// until its witness runs, or, for a duplicate, the `Caught` among
+/// `expected` of the planted case covering it, on gate 6. A moved one has
+/// no key, and nor has a duplicate whose case no `Caught` names, so its key
+/// blocks.
+pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
     NATIVE_MUTATIONS
         .iter()
         .filter_map(|mutation| {
@@ -3163,6 +3170,14 @@ pub fn native_results() -> Vec<ExpectedResult> {
                     not_applicable,
                 },
                 NativeClass::Retired { .. } => retired_open(),
+                NativeClass::Duplicate { property, case } => expected
+                    .iter()
+                    .find(|result| {
+                        matches!(result.expected, Expected::Caught { case: c, .. }
+                            if c.property == property && c.name == case)
+                    })?
+                    .expected
+                    .clone(),
                 NativeClass::Moved { .. } => return None,
             };
             Some(result(key, &[Gate::G6], expected))

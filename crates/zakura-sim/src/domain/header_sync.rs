@@ -827,7 +827,8 @@ where
 /// ([`crate::harness::header_node::publication`]) judges each engine run's
 /// publication, each adoption against the engine's records, and each queued
 /// `Status` and tip publication against the latest adoption. A break the
-/// step's drain found violates at once. A tip still owed at a settled end
+/// step's drain found violates at once, once the step's new facts opened
+/// their obligations. A tip still owed at a settled end
 /// is the harness's end violation ([`publication_end_violations`]), and
 /// one owed at any other end leaves the property `Unsettled` at
 /// [`Pending::TipUnpublished`]. It applies once a drain
@@ -862,16 +863,10 @@ where
     let step = cx.step;
     let expected =
         "committed states are published and adopted as recorded, and advertised as adopted";
-    let mut breaks = view
-        .claims()
-        .at(step, &[Claim::StatePublicationConsistent])
-        .into_iter();
-    if let Some(first) = breaks.next() {
-        for other in breaks {
-            cx.record_violation(expected, other.detail);
-        }
-        return cx.violated(expected, first.detail);
-    }
+    let breaks = view.claims().at(step, &[Claim::StatePublicationConsistent]);
+    // A break's boundary can also add facts, whose obligations only this
+    // evaluation sees, since the registry's stamp cursor is already past
+    // them, so they're registered before its breaks are reported.
     let publication = view.publication();
     let shutdown = shutdown_stamp(view.ends());
     for stamp in cx.new_stamps().to_vec() {
@@ -906,14 +901,22 @@ where
         obligation.cardinality = Cardinality::Every;
         cx.oblige(obligation);
     }
-    if publication.tainted_by(step) || !publication.applicable_by(step) {
-        return Verdict::NotApplicable;
-    }
+    let judged = !publication.tainted_by(step) && publication.applicable_by(step);
     // The adoption and its tip's publication are one synchronous call with
     // a preemption point between, so a run cut off there hasn't shown it.
     // A settled end judges it ([`PublicationEvidence::unpublished_at_settled_end`]).
-    if publication.owed().is_some() {
+    if judged && publication.owed().is_some() {
         cx.pending(Pending::TipUnpublished);
+    }
+    let mut breaks = breaks.into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if !judged {
+        return Verdict::NotApplicable;
     }
     Verdict::Holds
 }

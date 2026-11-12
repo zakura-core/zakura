@@ -173,14 +173,24 @@ impl<V: Script> ActionSource for Boundaries<V> {
 /// A fresh `replay_with` of the trace must verify and send the same full
 /// report, so what's returned is what the recorded run found.
 pub(crate) fn sidecar<V: Script>(case: &V::Case, draft: &[String]) -> FullReport {
-    let entry: HarnessEntry = super::entry::<ScriptRun<V>>();
-    let dir = tempfile::tempdir().expect("a temp dir can be created");
     let scenario = serde_json::to_value(case).expect("a case serializes");
+    recorded(&super::entry::<ScriptRun<V>>(), &scenario, draft)
+}
+
+/// [`sidecar`] for any harness `entry`: records `scenario` under the empty
+/// Plan and the `Draft` override `draft`, checks a fresh replay sends the
+/// same full report, and returns it.
+pub(crate) fn recorded(
+    entry: &HarnessEntry,
+    scenario: &serde_json::Value,
+    draft: &[String],
+) -> FullReport {
+    let dir = tempfile::tempdir().expect("a temp dir can be created");
     let trace = super::with_draft(draft, || {
         super::record(
-            &entry,
+            entry,
             super::RecordInput::Plan {
-                scenario: &scenario,
+                scenario,
                 plan: &[],
             },
             dir.path(),
@@ -190,11 +200,10 @@ pub(crate) fn sidecar<V: Script>(case: &V::Case, draft: &[String]) -> FullReport
     let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
         .expect("record writes the full report");
     let full: FullReport = serde_json::from_str(&text).expect("the full report reads back");
-    let replayed =
-        crate::trace::replay_with(&trace, &entry, crate::trace::ReplayOptions::default())
-            .expect("the trace replays");
-    assert!(replayed.verified(), "{case:?}: {replayed:?}");
-    assert_eq!(replayed.report.as_ref(), Some(&full), "{case:?}");
+    let replayed = crate::trace::replay_with(&trace, entry, crate::trace::ReplayOptions::default())
+        .expect("the trace replays");
+    assert!(replayed.verified(), "{scenario}: {replayed:?}");
+    assert_eq!(replayed.report.as_ref(), Some(&full), "{scenario}");
     full
 }
 

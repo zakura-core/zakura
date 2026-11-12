@@ -1017,8 +1017,9 @@ const C15_PROVING: &[TestRef] = &[
 /// distinct ones there surviving into the run's report and the full report
 /// recorded beside its trace, which a fresh replay sends again. The watch
 /// rules find theirs both at the boundary of a third event and at a
-/// settled end, so each path has its test, and the settled end's
-/// store-level regression stays beside them. The
+/// settled end, so each path has its test. The settled end's also has one
+/// through the flood harness's own end path, and its store-level
+/// regression stays beside them. The
 /// claim-reading checks share one test, and `commit-only-authorized` and
 /// `header-fault-penalized` are C22's and C13's. `honest-progress` and
 /// `bounded-adversary-progress` find at most one failure in a run, as their
@@ -1066,6 +1067,10 @@ const C21_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_node/adoption.rs",
         "harness::header_node::adoption::tests::every_unread_publication_at_a_settled_end_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync/flood.rs",
+        "harness::header_sync::flood::tests::the_flood_end_path_reports_every_unread_publication",
     ),
     sim_test(
         "src/harness/header_sync.rs",

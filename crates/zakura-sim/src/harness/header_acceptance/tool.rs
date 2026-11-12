@@ -96,6 +96,11 @@
 //!   which must be the task's `patch_file` at S, and `source`, the patched
 //!   checkout's source digest, which the patched run's test binary and
 //!   checkout and its `history` recording must all name.
+//! * `unit`: for each of `unpatched`, `patched` and `restored`, the task's
+//!   test as for `test` in `<i>/<run>`, built and run as a plain build, with
+//!   no simulator cfg, and [`PATCHED_BUILD_FILE`], a [`UnitBuild`]: the
+//!   build's own provenance, since a plain binary embeds no source digest
+//!   ([`unit_refusal`]). No expected result reads it yet.
 //!
 //! Every recorded run's report and store snapshot come from its
 //! `full-report.json`, never from the trace's `end` record, which keeps no
@@ -344,7 +349,59 @@ pub enum Task {
         /// The diagnostic the patched run must fail with.
         diagnostic: String,
     },
+    /// A retired native mutation's witness, a test outside the simulator,
+    /// run unpatched, patched and restored as a plain build
+    /// ([`UNIT_WITNESSES`]). No expected result names it yet, so its key
+    /// stays blocked by its transitional `Open`, and [`assemble`] reads no
+    /// result from it: [`unit_refusal`] is its artifacts' check.
+    Unit {
+        /// The mutation's directory name.
+        patch: String,
+        /// The patch, relative to the repository root.
+        patch_file: String,
+        /// The witness test's package.
+        package: String,
+        /// Its file, relative to the package.
+        file: String,
+        /// Its full libtest name.
+        test: String,
+        /// The assertion message the patched run must fail with.
+        failure: String,
+        /// What that assertion's `left` value must show, in order.
+        shows: Vec<String>,
+    },
 }
+
+/// A retired native mutation's witness test outside the simulator and the
+/// failure its README requires of the patched run ([`Task::Unit`]).
+#[derive(Clone, Copy, Debug)]
+pub struct UnitWitness {
+    /// The mutation's directory name.
+    pub patch: &'static str,
+    /// The test's package.
+    pub package: &'static str,
+    /// Its file, relative to the package.
+    pub file: &'static str,
+    /// Its full libtest name.
+    pub test: &'static str,
+    /// The assertion message the patched run must fail with.
+    pub failure: &'static str,
+    /// What that assertion's `left` value must show, in order.
+    pub shows: &'static [&'static str],
+}
+
+/// Each retired mutation's witness. `readmission-unchecked`'s README
+/// requires the 60 s cooldown's event assertion to fail, seeing
+/// `SessionAdmitted` for session 2 after `CooldownStarted`.
+pub static UNIT_WITNESSES: &[UnitWitness] = &[UnitWitness {
+    patch: "readmission-unchecked",
+    package: "zakura-network",
+    file: "src/zakura/header_sync/reactor/tests/observer.rs",
+    test: "zakura::header_sync::reactor::tests::observer::\
+           a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
+    failure: "assertion `left == right` failed: cooldown 60s",
+    shows: &["CooldownStarted", "SessionAdmitted", "session_id: 2"],
+}];
 
 /// What [`plan`] gives: the tasks, and every expected result the tool can't
 /// produce yet, with why.
@@ -581,6 +638,35 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             Expected::Replays { ref run } => replays.push((id, run.clone())),
             Expected::Open { .. } => {}
         }
+    }
+    // A retired mutation's witness runs for each such key the manifest
+    // holds, though no expected result reads it yet ([`Task::Unit`]).
+    for mutation in super::NATIVE_MUTATIONS {
+        let super::NativeClass::Retired { .. } = mutation.class else {
+            continue;
+        };
+        let key = Key::Native {
+            patch: mutation.patch.to_owned(),
+        };
+        if !manifest
+            .expected
+            .iter()
+            .any(|result| result.keys.contains(&key))
+        {
+            continue;
+        }
+        let Some(witness) = UNIT_WITNESSES.iter().find(|w| w.patch == mutation.patch) else {
+            continue;
+        };
+        tasks.push(Task::Unit {
+            patch: witness.patch.to_owned(),
+            patch_file: native_patch(repo, witness.patch)?,
+            package: witness.package.to_owned(),
+            file: witness.file.to_owned(),
+            test: witness.test.to_owned(),
+            failure: witness.failure.to_owned(),
+            shows: witness.shows.iter().map(|&show| show.to_owned()).collect(),
+        });
     }
     for (id, run) in replays {
         if recorded_at(&tasks, &run).is_none() {
@@ -1387,6 +1473,8 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             continue;
         }
         let actual = match task {
+            // No expected result names a unit witness yet ([`Task::Unit`]).
+            Task::Unit { .. } => continue,
             Task::Test { .. } => test_actual(&dir),
             Task::History {
                 expected,
@@ -1515,7 +1603,9 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             }
         };
         results.push(ResultRecord {
-            expected: task_expected(task).clone(),
+            expected: task_expected(task)
+                .expect("a unit task, the only one with no expected result, gave none")
+                .clone(),
             commit: subject.to_owned(),
             actual,
         });
@@ -1559,13 +1649,15 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
     }
 }
 
-/// The expected result `task` produces.
-fn task_expected(task: &Task) -> &ExpectedId {
+/// The expected result `task` produces, if one names it: every task but a
+/// [`Task::Unit`].
+fn task_expected(task: &Task) -> Option<&ExpectedId> {
     match task {
         Task::Test { expected, .. }
         | Task::History { expected, .. }
         | Task::Case { expected, .. }
-        | Task::Integrity { expected, .. } => expected,
+        | Task::Integrity { expected, .. } => Some(expected),
+        Task::Unit { .. } => None,
     }
 }
 
@@ -2009,6 +2101,137 @@ fn patched_build_refusal(
     None
 }
 
+/// What each run of a [`Task::Unit`] holds beside its [`TEST_FILE`], in
+/// [`PATCHED_BUILD_FILE`]: the plain build's own provenance, as the runner
+/// measures it, since a plain build embeds no source digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitBuild {
+    /// The commit the checkout was made from, which must be S.
+    pub base: String,
+    /// The SHA-256 of the mutation's patch, which must be its committed
+    /// patch at S, whether or not this run applied it.
+    pub patch_sha256: String,
+    /// The checkout's source digest, read before the build and again after
+    /// the test: S's for the unpatched and restored runs, another for the
+    /// patched one, or `unknown` if the two reads differ.
+    pub source: String,
+    /// The SHA-256 of the test executable the run ran.
+    pub executable_sha256: Option<String>,
+}
+
+/// Why the unit witness task's runs in `dir`, at S (`subject`, whose source
+/// digest is `subject_source`), aren't its mutation caught: each of
+/// `unpatched`, `patched` and `restored` must have run exactly the task's
+/// test, unkilled, in the task's package and file, from a checkout made
+/// from S whose measured source its [`TestRun`] names too, with the
+/// committed patch's digest. The unpatched and restored runs must pass at
+/// S's source. The patched run must fail at another source, from an
+/// executable other than the unpatched run's, with the task's `failure`
+/// as its assertion message and a `left` value showing each of `shows` in
+/// order. Anything else, a build error, a timeout or another panic, isn't
+/// the required failure.
+pub fn unit_refusal(
+    repo: &Path,
+    (subject, subject_source): (&str, &str),
+    task: &Task,
+    dir: &Path,
+) -> Option<String> {
+    let Task::Unit {
+        patch_file,
+        package,
+        file,
+        test,
+        failure,
+        shows,
+        ..
+    } = task
+    else {
+        return Some("not a unit witness task".to_owned());
+    };
+    let committed = digest(&repo.join(patch_file));
+    if committed == "missing" {
+        return Some(format!("the committed patch {patch_file} can't be read"));
+    }
+    let mut executables = BTreeMap::new();
+    for run in ["unpatched", "patched", "restored"] {
+        let at = dir.join(run);
+        let Some(ran) = read_json::<TestRun>(&at.join(TEST_FILE)) else {
+            return Some(format!("{run}: no test artifact"));
+        };
+        let Some(build) = read_json::<UnitBuild>(&at.join(PATCHED_BUILD_FILE)) else {
+            return Some(format!("{run}: no build measurement"));
+        };
+        if ran.killed || ran.package != *package || ran.file != *file {
+            return Some(format!(
+                "{run}: it ran {}/{} (killed: {})",
+                ran.package, ran.file, ran.killed
+            ));
+        }
+        if build.base != subject || build.patch_sha256 != committed {
+            return Some(format!(
+                "{run}: its checkout was made from {} with the patch {}, not S {subject} with \
+                 {committed}",
+                build.base, build.patch_sha256
+            ));
+        }
+        let patched = run == "patched";
+        if !known(Some(&build.source))
+            || ran.checkout_source.as_deref() != Some(build.source.as_str())
+            || patched == (build.source == subject_source)
+        {
+            return Some(format!(
+                "{run}: its checkout's source is {} and its test names {:?}",
+                build.source, ran.checkout_source
+            ));
+        }
+        let Some(executable) = build.executable_sha256 else {
+            return Some(format!("{run}: its test executable wasn't measured"));
+        };
+        executables.insert(run, executable);
+        let result = match ran.tests.as_slice() {
+            [(name, result)] if name == test => result.as_str(),
+            tests => return Some(format!("{run}: the filter ran {tests:?}")),
+        };
+        if !patched && !(result == "ok" && ran.exited_ok) {
+            return Some(format!("{run}: its witness didn't pass"));
+        }
+        if patched && (result != "FAILED" || !fails_assertion(&ran.log, failure, shows)) {
+            return Some(format!(
+                "patched: its witness didn't fail with {failure:?} showing {shows:?}"
+            ));
+        }
+    }
+    (executables.get("patched") == executables.get("unpatched"))
+        .then(|| "the patched run ran the unpatched run's executable".to_owned())
+}
+
+/// Whether `log` holds a failed assertion whose message line is `failure`,
+/// followed by its `left:` line showing each of `shows`, in order.
+fn fails_assertion(log: &str, failure: &str, shows: &[String]) -> bool {
+    let mut lines = log.lines();
+    while lines.by_ref().any(|line| line.trim() == failure) {
+        let Some(left) = lines
+            .next()
+            .and_then(|line| line.trim().strip_prefix("left:"))
+        else {
+            continue;
+        };
+        let mut rest = left;
+        let shown = shows.iter().all(|show| match rest.find(show.as_str()) {
+            Some(at) => {
+                rest = &rest[at + show.len()..];
+                true
+            }
+            None => false,
+        });
+        if shown {
+            return true;
+        }
+    }
+    false
+}
+
 /// Why case `dir`'s provenance check isn't for S, `subject`, with its
 /// committed patch at `patch` (a path under `repo`) applied: its checkout
 /// was made from another commit, its recorded SHA-256 is another patch's,
@@ -2265,6 +2488,19 @@ pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, Str
         if script { "--script" } else { "--plan" }.to_owned(),
         file.display().to_string(),
     ])
+}
+
+/// The [`record_args`] of the one declaration under `declared_dir` of
+/// `harness`'s history `case` by `test`, found as [`assemble`] finds it
+/// ([`declaration`]), or why there isn't exactly one. The runner records
+/// each history task's run, and each integrity run's history, from these.
+pub fn declared_record_args(
+    declared_dir: &Path,
+    harness: &str,
+    test: &str,
+    case: &str,
+) -> Result<Vec<String>, String> {
+    record_args(harness, &declaration(declared_dir, harness, test, case)?)
 }
 
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
@@ -2711,6 +2947,7 @@ fn links(
             continue;
         }
         let (id, links) = match task {
+            Task::Unit { .. } => continue,
             Task::Test { expected, .. } => (
                 expected.clone(),
                 Links {
@@ -4812,7 +5049,9 @@ mod tests {
         let links = links(&manifest, &plan, |_, _| true);
         let (mut node, mut history, mut integrity) = (false, false, false);
         for (index, task) in plan.tasks.iter().enumerate() {
-            let expected = task_expected(task);
+            let Some(expected) = task_expected(task) else {
+                continue;
+            };
             let key = manifest
                 .expected
                 .iter()
@@ -4862,6 +5101,100 @@ mod tests {
             node && history && integrity,
             "the plan has a node case, a history and an integrity mutation"
         );
+    }
+
+    /// The retired mutation's unit witness is planned, with no expected
+    /// result, and its runs count only as the caught mutation: the
+    /// unpatched and restored runs passing at S, the patched one failing
+    /// its required assertion at its own source from a rebuilt executable.
+    /// A patched run that fails another way, at S's source or from the
+    /// unpatched executable, a restored run that fails, or a run from
+    /// another base or patch, isn't.
+    #[test]
+    fn a_unit_witness_counts_only_its_required_failure() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let task = plan
+            .tasks
+            .iter()
+            .find(
+                |task| matches!(task, Task::Unit { patch, .. } if patch == "readmission-unchecked"),
+            )
+            .expect("the retired mutation's witness is planned")
+            .clone();
+        assert_eq!(task_expected(&task), None);
+        let Task::Unit {
+            patch_file,
+            package,
+            file,
+            test,
+            ..
+        } = &task
+        else {
+            unreachable!("found as a unit task");
+        };
+        let patch = digest(&repo.join(patch_file));
+        let required = "thread 'x' panicked at observer.rs:2086:9:\n\
+                        assertion `left == right` failed: cooldown 60s\n  \
+                        left: [Misbehavior, CooldownStarted { cooldown: 60s }, SessionAdmitted { \
+                        session_id: 2 }]\n right: [Misbehavior, CooldownStarted, SessionRefused]\n";
+        let write = |dir: &Path, run: &str, source: &str, exe: &str, result: &str, log: &str| {
+            let at = dir.join(run);
+            fs::create_dir_all(&at).unwrap();
+            let ran = TestRun {
+                package: package.clone(),
+                file: file.clone(),
+                tests: vec![(test.clone(), result.to_owned())],
+                killed: false,
+                exited_ok: result == "ok",
+                log: log.to_owned(),
+                binary_source: Some(NOT_EMBEDDED.to_owned()),
+                checkout_source: Some(source.to_owned()),
+            };
+            fs::write(at.join(TEST_FILE), serde_json::to_string(&ran).unwrap()).unwrap();
+            let build = UnitBuild {
+                base: "s".to_owned(),
+                patch_sha256: patch.clone(),
+                source: source.to_owned(),
+                executable_sha256: Some(exe.to_owned()),
+            };
+            fs::write(
+                at.join(PATCHED_BUILD_FILE),
+                serde_json::to_string(&build).unwrap(),
+            )
+            .unwrap();
+        };
+        type Patched<'a> = (&'a str, &'a str, &'a str, &'a str);
+        let caught = |patched: Patched<'_>, restored: &str, base: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "unpatched", "src-s", "exe-s", "ok", "");
+            let (source, exe, result, log) = patched;
+            write(dir.path(), "patched", source, exe, result, log);
+            write(dir.path(), "restored", "src-s", "exe-s", restored, "");
+            unit_refusal(&repo, (base, "src-s"), &task, dir.path())
+        };
+        let required_failure = ("src-p", "exe-p", "FAILED", required);
+        assert_eq!(caught(required_failure, "ok", "s"), None);
+        let panicked =
+            "assertion `left == right` failed: cooldown 0ns\n  left: [SessionAdmitted]\n";
+        for (patched, restored, base) in [
+            (("src-p", "exe-p", "FAILED", panicked), "ok", "s"),
+            (
+                ("src-p", "exe-p", "FAILED", "error: could not compile"),
+                "ok",
+                "s",
+            ),
+            (("src-p", "exe-p", "ok", required), "ok", "s"),
+            (("src-s", "exe-p", "FAILED", required), "ok", "s"),
+            (("src-p", "exe-s", "FAILED", required), "ok", "s"),
+            (required_failure, "FAILED", "s"),
+            (required_failure, "ok", "another"),
+        ] {
+            assert!(
+                caught(patched, restored, base).is_some(),
+                "{patched:?} {restored} {base}"
+            );
+        }
     }
 
     /// A digest the evaluator would accept as naming an execution.

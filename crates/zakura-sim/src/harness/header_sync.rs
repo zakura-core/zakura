@@ -3168,8 +3168,13 @@ mod tests {
     ) -> bool {
         use crate::harness::header_node::fault::tests::{evidence_ending, shutdown};
 
+        // A drop the harness's stop explains is stamped after its
+        // `Shutdown` (see `FaultEvidence::dropped_in_stop`).
         let ends = if stopped {
-            vec![shutdown()]
+            vec![
+                shutdown(),
+                crate::harness::header_node::ends::EndFact::CallDropped { call: 1 },
+            ]
         } else {
             Vec::new()
         };

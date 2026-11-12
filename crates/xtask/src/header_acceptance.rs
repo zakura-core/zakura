@@ -75,7 +75,7 @@
 //! `--out` must be on a local filesystem, where `flock` and `rename` hold.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -89,7 +89,7 @@ use serde_json::{json, Value};
 
 use crate::{
     acceptance::{
-        add_worktree, checkout_digest, child, clear_stale_runs, contain, containment, git,
+        add_worktree, checkout_digest, child, clear_stale_runs, contain, containment, git, head_of,
         lock_out, mark_descendants, publish_record, remove_worktree, remove_worktrees_under, reset,
         resolved, run_id, source_digest, stop_if_interrupted, text, track_sessions, Ended, Options,
         Tool, ESCAPED, RECORD, RUNS, SOURCE_DIGEST, SUBJECT_DIR,
@@ -1889,7 +1889,7 @@ fn run_unit(
             fs::write(dir.join("setup.log"), format!("{run}: {why}\n"))?;
             break;
         }
-        let source = checkout_digest(options, worktree)
+        let source = checkout_digest(&TOOL, options, worktree)
             .ok()
             .map(|read| read.source)
             .filter(|source| source != provenance::UNKNOWN);
@@ -1905,7 +1905,7 @@ fn run_unit(
         )?;
         // The source is read again after the run, so a build or test that
         // changed the checkout's sources isn't credited to the first read.
-        let after = checkout_digest(options, worktree)
+        let after = checkout_digest(&TOOL, options, worktree)
             .ok()
             .map(|read| read.source)
             .filter(|after| Some(after) == source.as_ref());

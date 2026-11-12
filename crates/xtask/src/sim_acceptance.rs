@@ -490,7 +490,7 @@ fn run_at(
                     Some(source),
                     fields,
                     &dir,
-                    &run.out.join("tests"),
+                    (&run.out.join("tests"), None, true),
                 )?;
                 // hdr-14's runner writes the build's messages beside its
                 // `test.json`, so the binary it ran is the one test binary

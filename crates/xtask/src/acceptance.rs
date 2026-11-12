@@ -627,6 +627,27 @@ pub(crate) fn git(options: &Options, dir: &Path, args: &[&OsStr]) -> Result<(), 
         })
 }
 
+/// The commit `dir`'s checkout was made from, its `HEAD`, read by `git
+/// rev-parse` under the run's deadline, or [`planted::provenance::UNKNOWN`] if git
+/// can't say.
+pub(crate) fn head_of(options: &Options, dir: &Path) -> String {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let log = options.out.join("logs").join(format!(
+        "head-{}.log",
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut command = planted::git(dir);
+    command.args(["rev-parse", "--verify", "HEAD"]);
+    if !child(&mut command, &log, options.deadline).exited() {
+        return planted::provenance::UNKNOWN.to_owned();
+    }
+    fs::read_to_string(&log)
+        .ok()
+        .and_then(|text| text.lines().last().map(str::trim).map(str::to_owned))
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| planted::provenance::UNKNOWN.to_owned())
+}
+
 /// How a child ended, with its log.
 pub(crate) struct Ended {
     /// The end.

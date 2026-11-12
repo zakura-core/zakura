@@ -346,7 +346,10 @@ pub fn staged_page(
 /// [`PATH_BREAK`]: `commit-only-authorized` is violated in `properties`,
 /// and one of its violations is the claim record in `claims`, the claim
 /// store's snapshot, whose attribution is a `path` break of `page` as the
-/// peer sent it, `sent`.
+/// peer sent it, `sent`. A violation is a record's when it's at the
+/// record's step and its `actual` is the record's detail, which is how the
+/// property reports a break, so the same detail retained at another
+/// boundary doesn't stand in for a break dropped at its own.
 pub fn path_break(
     properties: &[PropertyReport],
     claims: &Value,
@@ -378,10 +381,9 @@ pub fn path_break(
         record["claim"] == "CommitOnlyAuthorized"
             && record["attribution"] == expected
             && record["detail"].as_str().is_some_and(|detail| {
-                report
-                    .violations
-                    .iter()
-                    .any(|violation| violation.actual.contains(detail))
+                report.violations.iter().any(|violation| {
+                    record["step"].as_u64() == Some(violation.step) && violation.actual == detail
+                })
             })
     });
     if found {
@@ -857,7 +859,8 @@ mod tests {
     /// The path-break companion requires the retained violation to be a
     /// `path` break of exactly the page the peer sent: another rule,
     /// another frame, another peer, other hashes or an unretained break
-    /// doesn't count.
+    /// doesn't count, and nor does a violation with the break's detail at
+    /// another step, or one at its step with another detail.
     #[test]
     fn the_path_break_names_the_sent_page() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
@@ -875,6 +878,17 @@ mod tests {
         assert!(path_break(&properties, &store, &page, &sent()).is_err());
         let (store, mut properties) = claims("path", 3);
         properties[0].violations.clear();
+        assert!(path_break(&properties, &store, &page, &sent()).is_err());
+        // The break found at step 9 was dropped from the report, which
+        // keeps a violation with the same detail from step 8: only the
+        // step differs.
+        let (store, mut properties) = claims("path", 3);
+        properties[0].violations[0].step = 8;
+        assert!(path_break(&properties, &store, &page, &sent()).is_err());
+        // The same step with another break's detail, which holds the
+        // record's as a prefix.
+        let (store, mut properties) = claims("path", 3);
+        properties[0].violations[0].actual.push_str(" of another");
         assert!(path_break(&properties, &store, &page, &sent()).is_err());
     }
 }

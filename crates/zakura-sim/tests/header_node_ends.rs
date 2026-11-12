@@ -24,9 +24,10 @@ use zakura_sim::{
         header_sync::{Storage, StorageScenario},
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
+    observe::ReactorFact,
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
-    MemorySink, PlanInput, RunReport,
+    MemorySink, Observation, PlanInput, RunReport,
 };
 
 /// What [`run`] returns: the report, the node's end facts with their
@@ -252,7 +253,9 @@ fn overlapping_relinks_each_name_their_own_connection() {
 
 /// A `Shutdown` step records one end for the node under test, with no
 /// connection, at its pick. The links its stop closes record nothing more,
-/// and a reactor the harness stopped isn't recorded as exited.
+/// and a reactor the harness stopped isn't recorded as exited. The calls
+/// its stop drops are the tap's facts, which
+/// [`each_dropped_call_is_recorded_after_the_shutdown_it_follows`] checks.
 #[test]
 fn a_shutdown_records_one_end_at_its_pick() {
     let scenario = StorageScenario {
@@ -265,8 +268,12 @@ fn a_shutdown_records_one_end_at_its_pick() {
     };
     for input in inputs(8, 256) {
         let ran = run(&scenario, input);
+        let ends: Vec<EndFact> = facts(&ran.ends)
+            .into_iter()
+            .filter(|fact| !matches!(fact, EndFact::CallDropped { .. }))
+            .collect();
         assert_eq!(
-            facts(&ran.ends),
+            ends,
             [environment("node", None, EnvironmentAction::Shutdown)]
         );
         assert!(ran
@@ -275,6 +282,64 @@ fn a_shutdown_records_one_end_at_its_pick() {
             .iter()
             .any(|pick| pick.identity == "peer:node:shutdown"));
     }
+}
+
+/// The tap records each call the reactor drops, as the log's `CallEnded`
+/// `dropped` shows, once and in the log's order, as a `CallDropped` whose
+/// stamp orders it against the `Shutdown`. A stop's drops come after it.
+/// The run's log is unchanged: the fact is view-side only.
+#[test]
+fn each_dropped_call_is_recorded_after_the_shutdown_it_follows() {
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Shutdown,
+            when: Some(Trigger::Submitted(Select::nth(OpKind::Prepare, 1))),
+        }],
+        ..StorageScenario::default()
+    };
+    let mut dropped_any = false;
+    for input in inputs(8, 256) {
+        let ran = run(&scenario, input);
+        let logged: Vec<u64> = ran
+            .report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Reactor {
+                    event: ReactorFact::CallEnded { call, end, .. },
+                    ..
+                } if end == "dropped" => Some(*call),
+                _ => None,
+            })
+            .collect();
+        let recorded: Vec<(u64, u64)> = ran
+            .ends
+            .iter()
+            .filter_map(|(stamp, fact)| match fact {
+                EndFact::CallDropped { call } => Some((*stamp, *call)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded.iter().map(|(_, call)| *call).collect::<Vec<_>>(),
+            logged
+        );
+        let shutdown = ran
+            .ends
+            .iter()
+            .find(|(_, fact)| *fact == environment("node", None, EnvironmentAction::Shutdown))
+            .map(|(stamp, _)| *stamp)
+            .expect("the node shuts down");
+        assert!(
+            recorded.iter().all(|(stamp, _)| *stamp > shutdown),
+            "{:?}",
+            ran.ends
+        );
+        dropped_any |= !logged.is_empty();
+    }
+    assert!(dropped_any, "some stop drops a call");
 }
 
 /// The end facts take the node's stamps, which other stores take too: the

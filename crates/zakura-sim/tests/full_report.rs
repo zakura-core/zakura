@@ -11,6 +11,7 @@ use zakura_sim::{
     harness::{self, RecordInput},
     record::{FullReport, FULL_REPORT_FILE},
     trace::{replay, ReplayError, ReplayOptions, Trace, TraceReader, MAX_REPORT_BYTES},
+    witness::Expect,
     PropertyOutcome,
 };
 
@@ -143,6 +144,76 @@ fn a_machine_trace_keeps_its_full_report() {
     assert!(outcomes
         .iter()
         .any(|(property, _)| *property == "discovery/record-book"));
+}
+
+/// The planted race recorded through its witness test, as the planted
+/// runner records it: the sidecar holds the report the judge read, with the
+/// violation that stopped the run, and a replay sends the same report.
+#[test]
+fn a_planted_witness_recording_keeps_its_full_report() {
+    let input = violating_input();
+    let dir = TempDir::new().unwrap();
+    let (trace, judged) = harness::record_witness(
+        harness::find(RACE).unwrap(),
+        RecordInput::Input(&input),
+        dir.path(),
+        RACE,
+        Expect::Violated,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(judged, Ok(()));
+    let recorded = full_report(dir.path());
+    let race = recorded
+        .properties
+        .iter()
+        .find(|found| found.property == RACE)
+        .expect("the report has every property");
+    let stopped = trace
+        .end
+        .unwrap()
+        .violation
+        .expect("the race ended the run");
+    assert_eq!(race.violations.len(), 1);
+    assert_eq!(race.violations[0].step, stopped.step);
+    let replayed = replay(&open(dir.path()), ReplayOptions::default()).unwrap();
+    assert!(replayed.verified(), "{replayed:?}");
+    assert_eq!(replayed.report.as_ref(), Some(&recorded));
+}
+
+/// A machine harness recorded through its witness test keeps the report
+/// its judge read too: the outcomes its `end` record holds, and the report
+/// a replay sends.
+#[test]
+fn a_machine_witness_recording_keeps_its_full_report() {
+    let book = "discovery/record-book";
+    let dir = TempDir::new().unwrap();
+    let (trace, _) = harness::record_witness(
+        harness::find(book).unwrap(),
+        RecordInput::Input(&[0, 1, 2, 3, 4, 5, 6, 7]),
+        dir.path(),
+        book,
+        Expect::Holds,
+        &[],
+    )
+    .unwrap();
+    let recorded = full_report(dir.path());
+    let outcomes: Vec<(&str, &PropertyOutcome)> = recorded
+        .properties
+        .iter()
+        .map(|found| (found.property.as_str(), &found.outcome))
+        .collect();
+    let end = trace.end.unwrap();
+    let ended: Vec<(&str, &PropertyOutcome)> = end
+        .properties
+        .iter()
+        .map(|found| (found.property.as_str(), &found.outcome))
+        .collect();
+    assert_eq!(outcomes, ended);
+    assert!(outcomes.iter().any(|(property, _)| *property == book));
+    let replayed = replay(&open(dir.path()), ReplayOptions::default()).unwrap();
+    assert!(replayed.verified(), "{replayed:?}");
+    assert_eq!(replayed.report.as_ref(), Some(&recorded));
 }
 
 /// A recording never overwrites a full report already beside the trace, nor

@@ -1468,6 +1468,11 @@ impl HasView for Liveness {
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
     }
+
+    /// The storage harness's store snapshot.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        self.0.snapshot()
+    }
 }
 
 impl Subsystem for Liveness {
@@ -1496,21 +1501,21 @@ impl Subsystem for Liveness {
     /// late-page fixture's page delay on [`OWNER`], and the storage
     /// harness's recovery finish off, since [`Finish`] ends every fixture.
     fn prepare(scenario: &LivenessScenario) -> Ports {
-        let retirement = scenario
-            .roles()
-            .map_or_else(RetirementEvidence::default, RetirementEvidence::armed);
         let delayed_page = (*scenario == LivenessScenario::LatePage).then(|| DelayedPage {
             mirror: OWNER.to_owned(),
             by: LATE_PAGE_DELAY,
         });
-        Ports {
-            hold_wake: HoldWakeEvidence::armed(),
-            publication: PublicationEvidence::armed(scenario.arming()),
-            retirement,
+        let ports = Ports {
             delayed_page,
             finishes: false,
             ..Storage::prepare(&scenario.storage())
+        };
+        if let Some(roles) = scenario.roles() {
+            ports.retirement.arm(roles);
         }
+        ports.hold_wake.arm();
+        ports.publication.arm(scenario.arming());
+        ports
     }
 
     /// The storage harness on the fixture, with its [`Finish`] source and

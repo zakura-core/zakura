@@ -29,6 +29,88 @@ pub struct Violation {
     pub expected: String,
     /// What the run did.
     pub actual: String,
+    /// What the finding is about, when its rule names it, so a nested
+    /// case's finding can be joined to the case's own break by subject
+    /// (C6). `None` for a rule that names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<FindingSubject>,
+}
+
+/// The subject a finding names (C6): what its rule found wrong, so two
+/// findings of different rules about the same subject can be told from two
+/// about different ones.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum FindingSubject {
+    /// A state the node published on its committed watch that the run
+    /// loop never read, by its state version as its `Debug` form spells it.
+    Publication {
+        /// The state version.
+        state_version: String,
+    },
+    /// The node's punishment of a peer: a fault close or `Misbehavior` of
+    /// its connection ([`FindingSubject::punishment`]).
+    Punishment {
+        /// The punished connection, the peer's.
+        connection: u64,
+        /// The punishing observation's position in the run's log.
+        event: u64,
+        /// The frame the node last judged on the connection before it,
+        /// which it answered, or `None` if it judged none.
+        frame: Option<FrameRef>,
+    },
+}
+
+impl FindingSubject {
+    /// The punishment of `connection` the observation at `at` in `entries`,
+    /// a run's log, makes, with the frame the node last judged on that
+    /// connection before it.
+    pub fn punishment(entries: &[crate::observe::Entry], at: usize, connection: u64) -> Self {
+        let frame = entries[..at]
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.obs {
+                Observation::FrameJudged {
+                    connection: judged,
+                    stream,
+                    quic_stream: Some(quic_stream),
+                    seq,
+                } if *judged == connection => Some(FrameRef {
+                    connection,
+                    kind: stream.kind,
+                    version: stream.version,
+                    quic_stream: *quic_stream,
+                    inbound: true,
+                    seq: *seq,
+                }),
+                _ => None,
+            });
+        FindingSubject::Punishment {
+            connection,
+            // A log position always fits in a u64 on supported targets.
+            event: at as u64,
+            frame,
+        }
+    }
+}
+
+/// One transport frame: its connection, its stream's kind and version, its
+/// QUIC stream, its direction and its sequence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameRef {
+    /// Its connection.
+    pub connection: u64,
+    /// Its stream's kind.
+    pub kind: u16,
+    /// Its stream's version.
+    pub version: u16,
+    /// Its QUIC stream.
+    pub quic_stream: u64,
+    /// Whether the peer sent it to the node, rather than the node to it.
+    pub inbound: bool,
+    /// Its position among its direction's frames on the stream.
+    pub seq: u64,
 }
 
 /// One property's outcome over a whole run (properties.md, Verdicts and

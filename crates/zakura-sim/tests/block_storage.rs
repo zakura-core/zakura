@@ -281,6 +281,7 @@ fn block_shutdown_releases_everything_and_logs_nothing() {
     let blocks = Blocks::new();
     let mut stop = zakura_sim::check::after_step(|cx| {
         (cx.step == 12).then(|| zakura_sim::Violation {
+            subject: None,
             property: "test/stop".to_owned(),
             step: cx.step,
             witness: vec![cx.step],

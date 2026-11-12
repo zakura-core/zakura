@@ -25,6 +25,7 @@ fn no_advance_while_ready() {
         let mut checker = check::after_step(|cx| {
             let advanced = cx.pick.to_string().starts_with("advance-time:");
             let violation = (advanced && before.get() == Status::Running).then(|| Violation {
+                subject: None,
                 property: "test/no-advance-while-ready".into(),
                 step: cx.step,
                 witness: vec![cx.step],

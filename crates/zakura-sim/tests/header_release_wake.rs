@@ -22,7 +22,9 @@ use std::{
 };
 
 use serde_json::Value;
+use support::patched::{run_ok, Worktree};
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL, CAPACITY_RELEASE_WAKES},
@@ -157,15 +159,25 @@ fn deferred(facts: &[(u64, WakeFact)]) -> bool {
 /// `header-sync/capacity-release-wakes` holds on `input` through the
 /// registered harness, and the run reaches its trigger history. Returns
 /// the facts between the wake and the waiting offer's read.
-fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, WakeFact)> {
+fn committed_input_holds(scenario: WakeScenario, input: &[u8], case: &str) -> Vec<(u64, WakeFact)> {
     let entry = harness::find(ReleaseWake::NAME).expect("the harness is registered");
-    let result = (entry.witness)(
+    // The witness run is the manifest history `case`, which the acceptance
+    // tool records from this declaration (C18).
+    let result = run_declared(
+        ReleaseWake::NAME,
+        case,
         &entry.scenario(&input[..ReleaseWake::SCENARIO_BYTES]),
         plan(input),
-        CAPACITY_RELEASE_WAKES,
-        Expect::Holds,
-        &[],
-        &mut MemorySink::default(),
+        |scenario, plan, sink| {
+            (entry.witness)(
+                scenario,
+                plan,
+                CAPACITY_RELEASE_WAKES,
+                Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     );
     assert_eq!(result, Ok(()));
     let (report, facts) = run(scenario, plan(input));
@@ -176,7 +188,11 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
 /// waiting offer's read.
 #[test]
 fn the_release_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Release, RELEASE_INPUT);
+    let between = committed_input_holds(
+        WakeScenario::Release,
+        RELEASE_INPUT,
+        "committed release input",
+    );
     assert!(!deferred(&between), "{between:?}");
 }
 
@@ -184,7 +200,11 @@ fn the_release_wake_input_holds_capacity_release_wakes() {
 /// deferred to the refill before the waiting offer's read.
 #[test]
 fn the_deferred_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Deferred, DEFERRED_INPUT);
+    let between = committed_input_holds(
+        WakeScenario::Deferred,
+        DEFERRED_INPUT,
+        "committed deferred input",
+    );
     assert!(deferred(&between), "{between:?}");
 }
 
@@ -651,9 +671,10 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
 #[test]
 fn an_undeclared_fixture_opens_no_wake() {
     let scenario = WakeScenario::Release;
+    let prepared = ReleaseWake::prepare(&scenario);
     let ports = Ports {
-        wake: WakeEvidence::default(),
-        ..ReleaseWake::prepare(&scenario)
+        wake: WakeEvidence::new(&prepared.stores, None),
+        ..prepared
     };
     let wake = ports.wake.clone();
     let report = run_prepared::<ReleaseWake>(
@@ -1132,5 +1153,112 @@ fn regenerate_release_wake_seeds() {
             ),
         );
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
+    }
+}
+
+/// The planted wake bypasses [`a_bypassed_wake_s_patched_draft_run_settles`]
+/// builds, under `qa/planted/header-sync/capacity-release-wakes/`, each with
+/// the committed input it's caught on: returned headers no longer waking
+/// the reactor, on the release fixture, and a refused cached pass no
+/// longer arming its refill deadline, on the deferred one.
+const WAKE_BYPASSES: [(&str, &str); 2] = [
+    ("missed-release-wake", "header-release-wake.bin"),
+    ("missed-refill-deadline", "header-release-wake-deferred.bin"),
+];
+
+/// C15 (hf-5): a planted wake bypass's patched run settles, on each wake
+/// fixture. Each case of [`WAKE_BYPASSES`] is applied in a scratch worktree
+/// of `HEAD`, beside the planted runner's, and built as the runner builds a
+/// patched simulator, with its `planted` profile in a target directory of
+/// its own. That build records the case's committed input as a `Draft` run
+/// of `capacity-release-wakes`, so the run goes on past the violation.
+///
+/// The bypass stops the wake, so the property is violated, and nothing
+/// else is: teardown and outstanding work hold, so every released round
+/// settles and no container outlives its owner. The fixture's release of
+/// `mirror-1`'s hold is picked once, live, after the violation's last
+/// witness step and before the drain, and the drain runs dry with no
+/// harness failure and nothing leaked. A fresh replay by the same build
+/// matches exactly.
+#[test]
+fn a_bypassed_wake_s_patched_draft_run_settles() {
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("release-wake-bypass");
+    let worktree = Worktree::of_head(&work);
+    for (case, input) in WAKE_BYPASSES {
+        let patched = worktree.build_patched(&format!(
+            "qa/planted/header-sync/capacity-release-wakes/{case}.patch"
+        ));
+        let out = work.join(case);
+        if out.exists() {
+            fs::remove_dir_all(&out).expect("the old recording is removable");
+        }
+        run_ok(
+            Command::new(&patched)
+                .args(["record", "--sim", ReleaseWake::NAME, "--input"])
+                .arg(
+                    worktree
+                        .path
+                        .join("crates/zakura-sim/tests/fixtures")
+                        .join(input),
+                )
+                .args(["--draft", CAPACITY_RELEASE_WAKES, "--out"])
+                .arg(&out),
+        );
+        let lines: Vec<Value> = fs::read_to_string(out.join("trace.jsonl"))
+            .expect("the patched run wrote its trace")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each trace line is JSON"))
+            .collect();
+        assert_eq!(
+            lines[0]["meta"]["draft"],
+            serde_json::json!([CAPACITY_RELEASE_WAKES]),
+            "{case}: the run is a Draft run of the property"
+        );
+        let end = &lines.last().expect("the trace has an end")["end"];
+        let violated: Vec<(&str, &Value)> = end["properties"]
+            .as_array()
+            .expect("the end lists each property")
+            .iter()
+            .filter_map(|property| {
+                Some((
+                    property["property"].as_str()?,
+                    property["outcome"].get("violated")?,
+                ))
+            })
+            .collect();
+        let [(id, wake)] = violated[..] else {
+            panic!("{case}: only the bypassed property is violated: {violated:?}");
+        };
+        assert_eq!(id, CAPACITY_RELEASE_WAKES, "{case}");
+        let last_witness = wake["witness"]
+            .as_array()
+            .and_then(|witness| witness.iter().filter_map(Value::as_u64).max())
+            .expect("the violation names its witness steps");
+        let steps = end["steps"].as_u64().expect("the end counts its steps");
+        let drained = end["drain"]["steps"]
+            .as_u64()
+            .expect("the drain counts its steps");
+        let settles: Vec<u64> = lines
+            .iter()
+            .filter(|line| line["pick"] == "peer:node:settle")
+            .filter_map(|line| line["step"].as_u64())
+            .collect();
+        let [settle] = settles[..] else {
+            panic!("{case}: the release is picked once: {settles:?}");
+        };
+        assert!(
+            last_witness < settle && settle <= steps - drained,
+            "{case}: the release comes after the violation ({last_witness}) and before the \
+             drain ({}): {settle}",
+            steps - drained
+        );
+        assert_ne!(end["outcome"], "harness", "{case}: {end}");
+        assert!(end["harness"].is_null(), "{case}: {end}");
+        assert_eq!(
+            end["drain"]["exhausted"], false,
+            "{case}: the drain runs dry: {end}"
+        );
+        assert_eq!(end["cleanup"]["leaked"], 0, "{case}: {end}");
+        run_ok(Command::new(&patched).arg("replay").arg(&out));
     }
 }

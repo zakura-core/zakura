@@ -539,6 +539,7 @@ impl<S: HasView> RegistryChecker<S> {
                 witness: vec![last],
                 expected: found.expected,
                 actual: found.actual,
+                subject: found.subject,
             });
         }
     }
@@ -1039,6 +1040,7 @@ fn concluded<S: HasView>(
     witness.sort_unstable();
     witness.dedup();
     Violation {
+        subject: None,
         property: property.id.to_string(),
         step,
         witness,
@@ -1222,6 +1224,7 @@ mod tests {
         for fact in facts {
             match *fact {
                 Fact::Violated => state.violations.push(Violation {
+                    subject: None,
                     property: "test/p".to_owned(),
                     step: 1,
                     witness: vec![1],
@@ -1375,6 +1378,7 @@ mod tests {
     #[test]
     fn leading_outcome_decides_every_harness_end() {
         let violation = Violation {
+            subject: None,
             property: "test/p".to_owned(),
             step: 3,
             witness: vec![2, 3],

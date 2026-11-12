@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -25,6 +26,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
+    record::{FullReport, FULL_REPORT_FILE},
     MemorySink, Observation, PlanInput, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
@@ -134,14 +136,17 @@ fn witnesses() -> [(&'static str, StorageScenario); 4] {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> RunReport {
-    let report = run_prepared::<Storage>(
-        scenario,
-        Storage::prepare(scenario),
-        input,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> RunReport {
+    let report = run_prepared::<Storage>(scenario, Storage::prepare(scenario), input, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     report
@@ -213,8 +218,16 @@ fn a_harness_commit_is_judged_as_an_engine_run() {
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
-        for input in inputs(8, 256) {
-            let report = run(&scenario, input);
+        for (index, input) in inputs(8, 256).into_iter().enumerate() {
+            // Each run is a manifest history, which the acceptance tool
+            // records from this declaration (C18).
+            let report = run_declared(
+                Storage::NAME,
+                &format!("{name} plan {index} of inputs(8, 256)"),
+                &scenario,
+                input,
+                run_into,
+            );
             assert!(
                 matches!(
                     outcome(&report, COMMIT_ONLY_AUTHORIZED),
@@ -475,4 +488,123 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             "{name}: {replayed:?}"
         );
     }
+}
+
+/// A header run recorded through `zakura-sim record` keeps its node's
+/// evidence stores in the full report beside the trace, exactly as the
+/// same run froze them in this process, so the harness's
+/// `HasView::snapshot` reaches the sidecar. Each claim record there that
+/// carries an attribution names its rule and subject, and a fresh-process
+/// replay matches the report, and refuses it once one stored fact is gone.
+#[test]
+fn a_recorded_header_run_keeps_its_stores_in_the_full_report() {
+    let name = "forks-sharing-a-header";
+    let scenario_json =
+        fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+    let scenario: StorageScenario =
+        serde_json::from_str(&scenario_json).expect("the witness is a scenario");
+    let plan = fs::read(fixture(name, "plan")).expect("the witness's plan is committed");
+    let prepared = Storage::prepare(&scenario);
+    let stores = prepared.stores.clone();
+    run_prepared::<Storage>(
+        &scenario,
+        prepared,
+        zakura_sim::Plan::from_fuzz(&plan),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let frozen = stores
+        .frozen_snapshot()
+        .expect("the run froze the node's stores");
+
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let trace = dir.path().join("trace");
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        Storage::NAME,
+        "--scenario",
+        &scenario_json,
+        "--plan",
+        fixture(name, "plan").to_str().expect("the path is UTF-8"),
+        "--out",
+        trace.to_str().expect("the path is UTF-8"),
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let full: FullReport = serde_json::from_str(
+        &fs::read_to_string(trace.join(FULL_REPORT_FILE)).expect("record writes the report"),
+    )
+    .expect("the report reads back");
+    assert_eq!(full.snapshot.as_ref(), Some(&frozen));
+    let snapshot = full.snapshot.expect("the header harness has a snapshot");
+    let rows: Vec<&serde_json::Value> = snapshot
+        .as_array()
+        .expect("the node's stores are a list")
+        .iter()
+        .collect();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|store| store["store"].as_str().expect("each store is named"))
+        .collect();
+    for store in [
+        "claims",
+        "authority",
+        "sessions",
+        "session_ends",
+        "fork_choice",
+    ] {
+        assert!(names.contains(&store), "{store}: {names:?}");
+    }
+    let claims = rows
+        .iter()
+        .find(|store| store["store"] == "claims")
+        .and_then(|store| store["snapshot"].as_array())
+        .expect("the claims store is a list");
+    for row in claims {
+        if let Some(attribution) = row.get("attribution") {
+            assert!(
+                attribution["rule"].is_string() && attribution["subject"]["subject"].is_string(),
+                "{row}"
+            );
+        }
+    }
+
+    let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert!(
+        replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
+        "{replayed:?}"
+    );
+
+    // The same recording with one stored fact, the session view's last
+    // link, dropped from its snapshot, and nothing else changed, is refused.
+    let path = trace.join(FULL_REPORT_FILE);
+    let mut edited: FullReport =
+        serde_json::from_str(&fs::read_to_string(&path).expect("record writes the report"))
+            .expect("the report reads back");
+    let dropped = edited
+        .snapshot
+        .as_mut()
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("the node's stores are a list")
+        .iter_mut()
+        .find(|store| store["store"] == "sessions")
+        .and_then(|store| store["snapshot"]["links"].as_array_mut())
+        .expect("the session view keeps its links")
+        .pop();
+    assert!(dropped.is_some(), "the witness's sessions linked");
+    fs::write(&path, edited.to_line()).expect("the report is rewritten");
+    let refused = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("a different report.snapshot"),
+        "{refused:?}"
+    );
 }

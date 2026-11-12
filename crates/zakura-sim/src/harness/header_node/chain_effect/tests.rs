@@ -87,7 +87,7 @@ fn breaks(
     steps: Vec<(Vec<StorageFact>, EngineAt)>,
     events: &[ReactorEvent],
 ) -> (Vec<String>, ChainEffectEvidence) {
-    let evidence = ChainEffectEvidence::default();
+    let evidence = ChainEffectEvidence::new(&EvidenceStores::default());
     let mut check = ChainEffect::new(evidence.clone(), engine(2, "s0"));
     for (facts, after) in steps {
         check.storage(&facts, after);
@@ -135,7 +135,7 @@ fn an_apply_must_change_the_engine_under_its_own_authority() {
 /// reports it ahead of the failure.
 #[test]
 fn a_break_survives_missing_evidence() {
-    let evidence = ChainEffectEvidence::default();
+    let evidence = ChainEffectEvidence::new(&EvidenceStores::default());
     let mut check = ChainEffect::new(evidence.clone(), engine(2, "s0"));
     check.storage(&[apply(1, 1, "a")], engine(2, "s0"));
     check.storage(&[completed(1, "s1"), committed(4, "s2")], engine(3, "s2"));
@@ -185,7 +185,10 @@ fn adoption_never_moves_back() {
 #[test]
 fn an_unsubmitted_apply_is_missing_evidence() {
     for fact in [committed(4, "s1"), completed(4, "s1")] {
-        let mut check = ChainEffect::new(ChainEffectEvidence::default(), engine(2, "s0"));
+        let mut check = ChainEffect::new(
+            ChainEffectEvidence::new(&EvidenceStores::default()),
+            engine(2, "s0"),
+        );
         check.storage(std::slice::from_ref(&fact), engine(3, "s1"));
         assert!(
             check
@@ -195,4 +198,16 @@ fn an_unsubmitted_apply_is_missing_evidence() {
             "{fact:?}"
         );
     }
+}
+
+/// A drain's applicability noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_chain_effect_store_drops_its_applicability() {
+    crate::stores::assert_freeze_drops_writes(
+        ChainEffectEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.applicable = Some(1));
+        },
+        ChainEffectEvidence::any,
+    );
 }

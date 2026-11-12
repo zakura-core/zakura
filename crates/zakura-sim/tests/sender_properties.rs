@@ -236,6 +236,7 @@ fn every_sender_violation_at_a_step_is_reported() {
         .find(|r| r.property == LIMIT)
         .expect("registered");
     let found = |seq: u64| Violation {
+        subject: None,
         property: LIMIT.to_owned(),
         step: 1,
         witness: vec![1],

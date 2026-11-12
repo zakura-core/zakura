@@ -158,15 +158,24 @@ impl HasView for Flood {
         self.0.ended(end);
     }
 
-    /// The storage harness's end violations, then the flooded queue's watch
-    /// property's ([`watch_end_violations`]).
+    /// The storage harness's end violations, then each queue's watch
+    /// property's ([`watch_end_violations`]), the flooded queue's first. A
+    /// loop that wedges with a publication unread leaves it unread under
+    /// both queues' rules, so both report it.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = self.0.end_violations(log);
-        found.extend(watch_end_violations(
-            &self.0.adoption,
-            self.1.queue(),
-            self.stopping(),
-        ));
+        let flooded = self.1.queue();
+        let other = match flooded {
+            EventQueue::Wire => EventQueue::Lifecycle,
+            EventQueue::Lifecycle => EventQueue::Wire,
+        };
+        for queue in [flooded, other] {
+            found.extend(watch_end_violations(
+                &self.0.adoption,
+                queue,
+                self.stopping(),
+            ));
+        }
         found
     }
 
@@ -179,6 +188,11 @@ impl HasView for Flood {
     /// The storage harness's stamped facts.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
+    }
+
+    /// The storage harness's store snapshot.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        self.0.snapshot()
     }
 }
 

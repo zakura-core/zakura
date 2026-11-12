@@ -33,15 +33,13 @@
 //! log order. Each fact takes the node's next stamp ([`super::stamp`]),
 //! which the storage view hands the registry as its view-side facts.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::BTreeMap;
 
 use zakura_scheduler::SimInstant;
 
 use super::{policy::Predicates, stamp::Stamps};
 use crate::observe::{ReactorFact, StorageFact, StorageRequest, StorageResult};
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// A fact the hold-wake check found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,19 +96,36 @@ struct Store {
     facts: Vec<(u64, HoldWakeFact)>,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// One node's hold-wake facts, shared by its storage source and whoever
 /// reads them. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct HoldWakeEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct HoldWakeEvidence(Registered<Store>);
 
 impl HoldWakeEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> HoldWakeEvidence {
+        HoldWakeEvidence(stores.register("hold_wake", Store::default()))
+    }
+
     /// Evidence a harness's storage source fills, for a harness that
     /// registers `header-sync/hold-release-wakes`. The default stays empty.
-    pub fn armed() -> HoldWakeEvidence {
-        HoldWakeEvidence(Arc::new(Mutex::new(Store {
-            armed: true,
-            ..Store::default()
-        })))
+    pub fn armed(stores: &EvidenceStores) -> HoldWakeEvidence {
+        let evidence = HoldWakeEvidence::new(stores);
+        evidence.arm();
+        evidence
+    }
+
+    /// Asks for the facts, as [`HoldWakeEvidence::armed`] does, for a
+    /// harness that registers the property on prepared ports.
+    pub fn arm(&self) {
+        self.change(|store| store.armed = true);
     }
 
     /// Whether [`HoldWakeEvidence::armed`] made it.
@@ -120,18 +135,24 @@ impl HoldWakeEvidence {
 
     /// Stamps facts from `stamps`, the node's, from now on.
     pub(crate) fn stamp_with(&self, stamps: Stamps) {
-        self.with(|store| store.stamps = stamps);
+        self.change(|store| store.stamps = stamps);
     }
 
     /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
-    fn with<R>(&self, read: impl FnOnce(&mut Store) -> R) -> R {
-        read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Keeps `fact` with the next stamp.
     fn push(&self, fact: HoldWakeFact) {
-        self.with(|store| {
+        self.change(|store| {
             let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
         });

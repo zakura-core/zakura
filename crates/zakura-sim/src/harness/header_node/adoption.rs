@@ -14,10 +14,7 @@
 //! ([`super::publication`]), whose status deadline replaced
 //! `StatusOverdue`.
 
-use std::{
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::time::Duration;
 
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion, VerifiedGeneration};
@@ -27,7 +24,10 @@ use zakura_network::zakura::{
 };
 
 use super::stamp::Stamps;
-use crate::RunEnd;
+use crate::{
+    stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
+    RunEnd,
+};
 
 /// How long after an adoption that changes a session's status the
 /// reactor's status publisher may wait before it queues that status:
@@ -279,8 +279,21 @@ pub enum WatchRead {
     Holds,
     /// A publication is still waiting for its read or its third event.
     Open,
-    /// The loop took too many events before reading a publication.
-    Broken(String),
+    /// The loop took too many events before reading a publication: each
+    /// publication it broke the rule for, in publication order, at least
+    /// one.
+    Broken(Vec<String>),
+}
+
+/// What answered one publication under the watch rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationRead {
+    /// A watch read at or past it.
+    Read,
+    /// A third event from the queue, first: its break.
+    Broken,
+    /// Neither, yet.
+    Open,
 }
 
 /// What a check found.
@@ -305,38 +318,50 @@ struct Store {
     horizon: Duration,
     /// Whether the run settled, once it has ended.
     settled: Option<bool>,
-    /// Set when the run's log froze. Facts after it are dropped.
-    frozen: bool,
+}
+
+impl Snapshot for Store {
+    /// The stamp counter, every fact, the horizon and the settled end.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
 }
 
 /// One reactor's adoption facts, shared by its tap and the harness's view.
 /// Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct AdoptionEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct AdoptionEvidence(Registered<Store>);
 
 impl AdoptionEvidence {
-    /// Locks the store. Every change completes under the lock, and nothing
-    /// else is called while it's held.
-    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Locks the store for reading. Nothing else is called while it's held.
+    fn store(&self) -> Guard<'_, Store> {
+        self.0.lock()
     }
 
-    /// Evidence that stamps its facts from `stamps`.
-    pub(super) fn stamped_by(stamps: Stamps) -> AdoptionEvidence {
-        AdoptionEvidence(Arc::new(Mutex::new(Store {
-            stamps,
-            ..Store::default()
-        })))
+    /// A store in `stores` with stamps of its own, for a harness with no
+    /// tap to share them.
+    pub fn new(stores: &EvidenceStores) -> AdoptionEvidence {
+        AdoptionEvidence::stamped_by(stores, Stamps::default())
+    }
+
+    /// A store in `stores` that stamps its facts from `stamps`.
+    pub(super) fn stamped_by(stores: &EvidenceStores, stamps: Stamps) -> AdoptionEvidence {
+        AdoptionEvidence(stores.register(
+            "adoption",
+            Store {
+                stamps,
+                ..Store::default()
+            },
+        ))
     }
 
     /// Records `fact`, reported at `at`, with the next stamp, unless the
     /// evidence is frozen.
     pub(super) fn record(&self, at: Duration, fact: AdoptionFact) {
-        let mut store = self.store();
-        if !store.frozen {
+        self.0.write(|store| {
             let stamp = store.stamps.next();
             store.facts.push(Stamped { stamp, at, fact });
-        }
+        });
     }
 
     /// Records that a `Commit` step left the node's engine at
@@ -354,24 +379,14 @@ impl AdoptionEvidence {
         );
     }
 
-    /// Stops recording facts. The tap calls it when the run's log freezes,
-    /// as the session view does: the scheduler's shutdown still runs a task
-    /// stopped partway through a poll to its end, with the run's clock
-    /// installed, and a fact it reports then would rewrite what the run ended
-    /// with.
-    pub(super) fn freeze(&self) {
-        self.store().frozen = true;
-    }
-
     /// Records that the run reached `at`.
     pub(super) fn reach(&self, at: Duration) {
-        let mut store = self.store();
-        store.horizon = store.horizon.max(at);
+        self.0.write(|store| store.horizon = store.horizon.max(at));
     }
 
     /// Records how the run ended, and whether it [`settled`].
     pub fn end(&self, end: &RunEnd) {
-        self.store().settled = Some(settled(end));
+        self.0.write(|store| store.settled = Some(settled(end)));
     }
 
     /// Whether the run [`settled`] with a publication still waiting for its
@@ -423,42 +438,75 @@ impl AdoptionEvidence {
     /// change and its next watch check.
     ///
     /// A publication that neither a read nor a third event has answered yet
-    /// is [`WatchRead::Open`].
+    /// is [`WatchRead::Open`]. Each publication whose third event came
+    /// first is its own break.
     pub fn watch_read(&self, queue: EventQueue) -> WatchRead {
-        let store = self.store();
         let mut found = WatchRead::Nothing;
+        let mut breaks = Vec::new();
+        for (state_version, read) in self.publication_reads(queue) {
+            found = match (read, found) {
+                (PublicationRead::Broken, found) => {
+                    breaks.push(format!(
+                        "the reactor took {} {queue:?} events after state {state_version:?} \
+                         was published, with no watch read of it",
+                        WATCH_READ_EVENTS + 1
+                    ));
+                    found
+                }
+                (PublicationRead::Open, _) | (_, WatchRead::Open) => WatchRead::Open,
+                (PublicationRead::Read, _) => WatchRead::Holds,
+            };
+        }
+        if breaks.is_empty() {
+            found
+        } else {
+            WatchRead::Broken(breaks)
+        }
+    }
+
+    /// The first published state still waiting for its watch read under
+    /// `queue` ([`WatchRead::Open`]), which an unread end names as its
+    /// subject.
+    pub fn unread_publication(&self, queue: EventQueue) -> Option<StateVersion> {
+        self.publication_reads(queue)
+            .into_iter()
+            .find_map(|(state_version, read)| {
+                (read == PublicationRead::Open).then_some(state_version)
+            })
+    }
+
+    /// Each `Published` state in order, with what answered it under
+    /// `queue` ([`AdoptionEvidence::watch_read`]'s rule).
+    fn publication_reads(&self, queue: EventQueue) -> Vec<(StateVersion, PublicationRead)> {
+        let store = self.store();
+        let mut reads = Vec::new();
         for (index, published) in store.facts.iter().enumerate() {
             let AdoptionFact::Published { state_version, .. } = published.fact else {
                 continue;
             };
             let mut taken = 0;
-            let mut answered = false;
+            let mut read = PublicationRead::Open;
             for later in &store.facts[index + 1..] {
                 match &later.fact {
                     AdoptionFact::WatchObserved {
-                        state_version: read,
-                    } if *read >= state_version => {
-                        answered = true;
+                        state_version: observed,
+                    } if *observed >= state_version => {
+                        read = PublicationRead::Read;
                         break;
                     }
                     AdoptionFact::EventTaken { queue: from, .. } if *from == queue => {
                         taken += 1;
                         if taken == WATCH_READ_EVENTS + 1 {
-                            return WatchRead::Broken(format!(
-                                "the reactor took {taken} {queue:?} events after state \
-                                 {state_version:?} was published, with no watch read of it"
-                            ));
+                            read = PublicationRead::Broken;
+                            break;
                         }
                     }
                     _ => {}
                 }
             }
-            found = match (answered, found) {
-                (false, _) | (_, WatchRead::Open) => WatchRead::Open,
-                (true, _) => WatchRead::Holds,
-            };
+            reads.push((state_version, read));
         }
-        found
+        reads
     }
 
     /// Whether some published state had `queue` compete with its watch
@@ -567,7 +615,7 @@ mod tests {
     /// Evidence holding `facts`, each at its time in milliseconds, reaching
     /// `horizon_ms`.
     fn evidence(facts: Vec<(u64, AdoptionFact)>, horizon_ms: u64) -> AdoptionEvidence {
-        let evidence = AdoptionEvidence::default();
+        let evidence = AdoptionEvidence::new(&crate::stores::EvidenceStores::default());
         for (at, fact) in facts {
             evidence.record(Duration::from_millis(at), fact);
         }
@@ -773,6 +821,150 @@ mod tests {
                 1,
             );
             assert!(violates(&broken.generation(), "StaleGeneration"));
+        }
+    }
+
+    /// An adoption fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_adoption_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            super::AdoptionEvidence::new,
+            |adoption| adoption.record(Duration::ZERO, commit(1)),
+            super::AdoptionEvidence::facts,
+        );
+    }
+
+    /// Adoption evidence with no tap behind it.
+    #[derive(Clone)]
+    struct Adoptions(AdoptionEvidence);
+
+    impl Default for Adoptions {
+        /// An empty store in a handle of its own.
+        fn default() -> Self {
+            Adoptions(AdoptionEvidence::new(
+                &crate::stores::EvidenceStores::default(),
+            ))
+        }
+    }
+
+    impl crate::domain::header_sync::AdoptionView for Adoptions {
+        fn adoption(&self) -> &AdoptionEvidence {
+            &self.0
+        }
+    }
+
+    impl crate::property::HasView for Adoptions {
+        type View = Adoptions;
+
+        /// A copy sharing the store.
+        fn view(&self) -> Adoptions {
+            self.clone()
+        }
+
+        /// The store, as a node harness reports its own.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            Some(self.0 .0.stores().report_snapshot())
+        }
+    }
+
+    impl crate::harness::scripted::Script for Adoptions {
+        const NAME: &'static str = "test/two-unread-publications";
+        /// Whether step 1's three events come from the lifecycle queue,
+        /// rather than the wire's.
+        type Case = bool;
+
+        /// Both watch rules.
+        fn properties(
+        ) -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Adoptions>>>
+        {
+            vec![
+                crate::domain::header_sync::watch_observed_under_flood(),
+                crate::domain::header_sync::watch_observed_under_lifecycle_flood(),
+            ]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> crate::property::Sources {
+            use crate::property::Source;
+            crate::property::Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// At step 1: states 2 and 3 published back to back, then three
+        /// events from the case's queue with no watch read, as the
+        /// reactor's tap reports them.
+        fn observe(&self, lifecycle: &bool, log: &mut crate::ObservationLog) {
+            if log.step() != 1 {
+                return;
+            }
+            for version in [2, 3] {
+                self.0.record(Duration::ZERO, commit(version));
+            }
+            let queue = if *lifecycle {
+                EventQueue::Lifecycle
+            } else {
+                EventQueue::Wire
+            };
+            for queued in [3, 2, 1] {
+                self.0.record(
+                    Duration::ZERO,
+                    AdoptionFact::EventTaken {
+                        queue,
+                        point: TakePoint::TurnStart,
+                        queued,
+                    },
+                );
+            }
+        }
+    }
+
+    /// C21 through the sidecar, for each watch rule: two states published
+    /// back to back and both unread when the loop takes its third event
+    /// from the flooded queue are two violations at that step, each naming
+    /// its own state, in the full report recorded beside the trace and its
+    /// fresh replay. The other queue's rule reports neither.
+    #[test]
+    fn every_unread_publication_at_a_boundary_reaches_the_sidecar() {
+        use crate::{
+            domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+            harness::scripted::{findings, sidecar},
+        };
+        for (lifecycle, flooded, other, queue) in [
+            (
+                false,
+                WATCH_OBSERVED_UNDER_FLOOD,
+                WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+                EventQueue::Wire,
+            ),
+            (
+                true,
+                WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+                WATCH_OBSERVED_UNDER_FLOOD,
+                EventQueue::Lifecycle,
+            ),
+        ] {
+            let full = sidecar::<Adoptions>(&lifecycle, &[]);
+            let found = findings(&full, flooded);
+            let violation = |version: u64| crate::Violation {
+                subject: None,
+                property: flooded.to_owned(),
+                step: 1,
+                witness: vec![1],
+                expected: "each published state is read from the committed watch before a third \
+                           event from the flooded queue"
+                    .to_owned(),
+                actual: format!(
+                    "the reactor took 3 {queue:?} events after state {:?} was published, with \
+                     no watch read of it",
+                    StateVersion::new(version)
+                ),
+            };
+            assert_eq!(found.violations, [violation(2), violation(3)], "{flooded}");
+            assert_eq!(
+                found.outcome,
+                crate::PropertyOutcome::Violated { witness: vec![1] },
+                "{flooded}"
+            );
+            assert!(findings(&full, other).violations.is_empty(), "{other}");
         }
     }
 }

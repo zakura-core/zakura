@@ -190,6 +190,11 @@ impl HasView for RepairHarness {
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
     }
+
+    /// The storage harness's store snapshot.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        self.0.snapshot()
+    }
 }
 
 impl Subsystem for RepairHarness {

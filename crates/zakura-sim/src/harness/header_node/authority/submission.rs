@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use zakura_network::zakura::observe::{HeaderWorkEnd, PortCall, ReactorEvent};
 
+use super::{AuthorityFinding, AuthorityRule, AuthoritySubject};
 use crate::{
     observe::{StorageFact, StoragePoint, StorageRequest, WorkOwner},
     storage::{hash, hex, point, work_owner},
@@ -49,12 +50,13 @@ enum Sent {
 pub(super) struct Submission {
     /// Each prepare or apply call's dispatch.
     dispatched: HashMap<u64, Sent>,
-    /// Each call's submitted request not yet judged.
-    submitted: HashMap<u64, StorageRequest>,
+    /// Each call's submitted request not yet judged, with its storage
+    /// operation.
+    submitted: HashMap<u64, (u64, StorageRequest)>,
     /// Each apply call's prepare, by the prepare's handoff.
     prepare_of: HashMap<u64, u64>,
     judged: HashSet<u64>,
-    breaks: Vec<String>,
+    breaks: Vec<AuthorityFinding>,
 }
 
 impl Submission {
@@ -123,6 +125,7 @@ impl Submission {
         let mut judged = false;
         for fact in facts {
             if let StorageFact::Submitted {
+                id,
                 request,
                 call: Some(call),
                 ..
@@ -132,15 +135,21 @@ impl Submission {
                 if self.dispatched.contains_key(call)
                     && (self.judged.contains(call) || self.submitted.contains_key(call))
                 {
-                    self.breaks.push(format!(
-                        "CommitOnlyAuthorized: call {call} reached storage again, with a {} \
-                         request",
-                        request_kind(request)
+                    self.breaks.push(AuthorityFinding::new(
+                        AuthorityRule::Submission,
+                        AuthoritySubject::Call {
+                            call: *call,
+                            op: *id,
+                        },
+                        format!(
+                            "call {call} reached storage again, with a {} request",
+                            request_kind(request)
+                        ),
                     ));
                     judged = true;
                     continue;
                 }
-                self.submitted.insert(*call, request.clone());
+                self.submitted.insert(*call, (*id, request.clone()));
                 judged |= self.judge(*call);
             }
         }
@@ -148,20 +157,22 @@ impl Submission {
     }
 
     /// The breaks found since the last call.
-    pub(super) fn take_breaks(&mut self) -> Vec<String> {
+    pub(super) fn take_breaks(&mut self) -> Vec<AuthorityFinding> {
         std::mem::take(&mut self.breaks)
     }
 
     /// Judges call `call`'s submission once its dispatch and its request are
     /// known. Returns whether it judged it.
     fn judge(&mut self, call: u64) -> bool {
-        let (Some(sent), Some(request)) = (self.dispatched.get(&call), self.submitted.get(&call))
+        let (Some(sent), Some((op, request))) =
+            (self.dispatched.get(&call), self.submitted.get(&call))
         else {
             return false;
         };
         if self.judged.contains(&call) {
             return false;
         }
+        let op = *op;
         let mut found = Vec::new();
         match (sent, request) {
             (
@@ -249,8 +260,10 @@ impl Submission {
         self.judged.insert(call);
         self.submitted.remove(&call);
         for detail in found {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: call {call} reached storage with {detail}"
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::Submission,
+                AuthoritySubject::Call { call, op },
+                format!("call {call} reached storage with {detail}"),
             ));
         }
         true

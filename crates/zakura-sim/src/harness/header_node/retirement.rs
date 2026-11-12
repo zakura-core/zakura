@@ -72,10 +72,7 @@
 //!
 //! [`Claim::PeerRetirementProgress`]: super::claim::Claim::PeerRetirementProgress
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use zakura_chain::block;
 use zakura_scheduler::SimInstant;
@@ -92,6 +89,7 @@ use super::{
     stamp::Stamps,
 };
 use crate::observe::{StorageFact, StorageRequest};
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// A session, by its peer and session ID.
 type Session = (ZakuraPeerId, u64);
@@ -221,20 +219,37 @@ struct Store {
     settled: Option<bool>,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// When the departed-work check first applied, shared by the tap and
 /// whoever reads it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct RetirementEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct RetirementEvidence(Registered<Store>);
 
 impl RetirementEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> RetirementEvidence {
+        RetirementEvidence(stores.register("retirement", Store::default()))
+    }
+
     /// Evidence with the hand-off rule armed for the fixture `roles` names,
     /// one that leaves the taker one thing to wait for (Rule 8). The default
     /// keeps only the departed-work rule.
-    pub fn armed(roles: Roles) -> RetirementEvidence {
-        RetirementEvidence(Arc::new(Mutex::new(Store {
-            roles: Some(roles),
-            ..Store::default()
-        })))
+    pub fn armed(stores: &EvidenceStores, roles: Roles) -> RetirementEvidence {
+        let evidence = RetirementEvidence::new(stores);
+        evidence.arm(roles);
+        evidence
+    }
+
+    /// Arms the hand-off rule for the fixture's `roles`, as
+    /// [`RetirementEvidence::armed`] does, on prepared ports.
+    pub fn arm(&self, roles: Roles) {
+        self.change(|store| store.roles = Some(roles));
     }
 
     /// The fixture's mirrors, if the harness armed the hand-off rule.
@@ -251,7 +266,7 @@ impl RetirementEvidence {
 
     /// Stamps facts from `stamps`, the node's, from now on.
     pub(super) fn stamp_with(&self, stamps: Stamps) {
-        self.with(|store| store.stamps = stamps);
+        self.change(|store| store.stamps = stamps);
     }
 
     /// Whether [`RetirementEvidence::armed`] made it.
@@ -261,7 +276,7 @@ impl RetirementEvidence {
 
     /// Keeps `fact` with the next stamp.
     fn push(&self, fact: HandoffFact) {
-        self.with(|store| {
+        self.change(|store| {
             let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
         });
@@ -283,10 +298,16 @@ impl RetirementEvidence {
         self.with(|store| store.facts.clone())
     }
 
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a session departed, or a kept repair's excuse ended, since
@@ -299,7 +320,7 @@ impl RetirementEvidence {
     /// Records how the run ended: whether it settled, as
     /// [`super::adoption::settled`] decides.
     pub fn end(&self, end: &crate::RunEnd) {
-        self.with(|store| store.settled = Some(super::adoption::settled(end)));
+        self.change(|store| store.settled = Some(super::adoption::settled(end)));
     }
 
     /// The slot rule's breaks at a settled end, judged on the state the run
@@ -457,7 +478,7 @@ impl Retirement {
         }
         match event {
             ReactorEvent::CauseSet { cause } => {
-                self.evidence.with(|store| {
+                self.evidence.change(|store| {
                     store.unjudged = false;
                     store.unjudged_breaks.clear();
                 });
@@ -633,7 +654,7 @@ impl Retirement {
         }
         self.departed_at_seq
             .insert(session.clone(), (self.port_seq)());
-        self.evidence.with(|store| store.unjudged = true);
+        self.evidence.change(|store| store.unjudged = true);
         // A departure once the harness began stopping the node is its stop,
         // which makes nothing applicable.
         if !self.shut_down()
@@ -643,7 +664,7 @@ impl Retirement {
                 .chain(&self.slots)
                 .any(|slot| slot.peer == *peer && slot.session_id == session_id)
         {
-            self.evidence.with(|store| store.pending = true);
+            self.evidence.change(|store| store.pending = true);
         }
         // Only a live repair's call excuses, and only the round that call
         // is for, which must have a slot of this session as it departed.
@@ -830,7 +851,7 @@ impl Retirement {
         }
         match self.permits {
             None => {
-                self.evidence.with(|store| store.unread = true);
+                self.evidence.change(|store| store.unread = true);
                 Fixture::Unread
             }
             Some(0) => Fixture::Broken,
@@ -907,7 +928,7 @@ impl Retirement {
         let before = self.excused.len();
         self.excused.retain(|_, excuse| !ends(excuse));
         if self.excused.len() != before {
-            self.evidence.with(|store| store.unjudged = true);
+            self.evidence.change(|store| store.unjudged = true);
             self.provisional();
         }
     }
@@ -923,7 +944,8 @@ impl Retirement {
             .filter(|(key, _)| !self.reported.contains(key))
             .map(|(_, detail)| detail)
             .collect();
-        self.evidence.with(|store| store.unjudged_breaks = pending);
+        self.evidence
+            .change(|store| store.unjudged_breaks = pending);
     }
 
     /// Each slot that names a departed session and isn't a kept repair's,
@@ -964,7 +986,7 @@ impl Retirement {
     /// Records when the check first applied, then hands over the breaks
     /// found since the last drain, which the tap records at `step`.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }

@@ -16,7 +16,7 @@ use crate::{
         Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory,
         Verdict,
     },
-    Observation, ObservationLog,
+    FindingSubject, Observation, ObservationLog,
 };
 
 /// A peer the scenario marks `HonestPeer` is never punished.
@@ -54,8 +54,31 @@ where
         needs: &[Source::View, Source::Closes, Source::Storage],
         status: Status::Active,
         check: check_honest_never_punished::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::View(honest_frame_judged::<S::View>)),
     }
+}
+
+/// [`HONEST_NEVER_PUNISHED`]'s trigger: on the connection of a peer the
+/// scenario marks `HonestPeer`, the node judged a frame, so it had a frame
+/// it could have punished that peer for, or it punished the peer, as the
+/// check counts a punishment, even before judging anything. The
+/// connection's peer is found as the check finds a punished one's, from its
+/// latest transport row before the event.
+fn honest_frame_judged<V: HonestPeers>(view: &V, log: &ObservationLog) -> bool {
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let connection = match &entry.obs {
+            Observation::FrameJudged { connection, .. }
+            | Observation::Misbehavior { connection } => *connection,
+            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+                *connection
+            }
+            _ => return false,
+        };
+        remote_of(&entries[..at], connection)
+            .and_then(peer_at)
+            .is_some_and(|peer| view.is_honest(peer))
+    })
 }
 
 /// Checks [`HONEST_NEVER_PUNISHED`] on the step's observations. It applies
@@ -101,17 +124,18 @@ where
             violations.push((
                 format!("honest peer-{peer}'s connection {connection} is never punished"),
                 punishment,
+                FindingSubject::punishment(entries, at, connection),
             ));
         }
     }
     let mut violations = violations.into_iter();
-    let Some((expected, actual)) = violations.next() else {
+    let Some((expected, actual, subject)) = violations.next() else {
         return verdict;
     };
-    for (expected, actual) in violations {
-        cx.record_violation(expected, actual);
+    for (expected, actual, subject) in violations {
+        cx.record_violation_about(expected, actual, subject);
     }
-    cx.violated(expected, actual)
+    cx.violated_about(expected, actual, subject)
 }
 
 /// The scenario peer that binds `remote`, if any.

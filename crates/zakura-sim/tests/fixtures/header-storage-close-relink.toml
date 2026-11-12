@@ -18,3 +18,7 @@ expect = "holds"
 [[witness]]
 property = "header-sync/teardown-returns-baseline"
 expect = "holds"
+
+[[witness]]
+property = "header-sync/outstanding-work-bounded"
+expect = "holds"

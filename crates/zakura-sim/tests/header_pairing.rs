@@ -24,8 +24,9 @@ use zakura_header_chain::{
 };
 use zakura_network::zakura::{
     observe::{
-        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase, PortCall,
-        ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose, StorageCallKind,
+        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase,
+        HeaderWorkEnd, PortCall, ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose,
+        StorageCallKind,
     },
     spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
@@ -36,6 +37,7 @@ use zakura_node_services::header_chain::{
     ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
 use zakura_scheduler::SimInstant;
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -174,7 +176,13 @@ fn held_vct_source(sim: &mut Sim, port: &Arc<ControlledPort>, tap: ReactorTap) -
         }],
         ..Policy::converging()
     };
-    PolicySource::new(sim, port.clone(), held, Effects::default()).with_tap(tap)
+    PolicySource::new(
+        sim,
+        port.clone(),
+        held,
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap)
 }
 
 /// How [`dropped_call_run`] ends the reactor.
@@ -202,17 +210,18 @@ fn dropped_call_run_reading(
 ) -> (RunReport, EndEvidence, (CapacityEvidence, ClaimEvidence)) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let capacity = CapacityEvidence::default();
+    let stores = EvidenceStores::default();
+    let capacity = CapacityEvidence::new(&stores);
     let (observer, tap) = ReactorTap::with_evidence(
         &mut sim,
         &port,
         "node",
-        SessionEvidence::default(),
-        ReservationEvidence::default(),
+        SessionEvidence::new(&stores),
+        ReservationEvidence::new(&stores),
         capacity.clone(),
-        SettlementEvidence::default(),
-        StaleEvidence::default(),
-        EndEvidence::default(),
+        SettlementEvidence::new(&stores),
+        StaleEvidence::new(&stores),
+        EndEvidence::new(&stores),
     );
     let ends = tap.ends();
     let claims = tap.claims();
@@ -340,7 +349,7 @@ fn a_drop_with_no_receipt_fails_at_teardown() {
         &mut sim,
         port.clone(),
         Policy::converging(),
-        Effects::default(),
+        Effects::new(&EvidenceStores::default()),
     )
     .with_tap(tap);
     sim.add_source(Box::new(source));
@@ -489,8 +498,13 @@ fn teardown_ends(
     if noticed {
         tap.shutdown().begin();
     }
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         for event in events {
@@ -551,8 +565,13 @@ fn a_leaked_reservation_fails_at_teardown() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let capacity = observer
@@ -607,6 +626,74 @@ fn a_reactor_that_returns_is_recorded_not_failed() {
     assert!(detail.starts_with("ReactorGone"), "{detail}");
 }
 
+/// Runs a tapped reactor that reports `events` and then `again`, a fact
+/// the ledger already took, and requires the run to fail on the work books
+/// with `refusal`, the ledger's rule and detail. The control, the same
+/// history without `again`, fails on none of it.
+fn refused_twice(events: &[ReactorEvent], again: ReactorEvent, refusal: &str) {
+    let expected = format!("OutstandingWork: the work books don't balance: {refusal}");
+    let control = teardown_after(events.to_vec(), false, false);
+    if let Some(HarnessFailure::SourceEvidence { detail, .. }) = &control.end.harness {
+        assert_ne!(detail, &expected, "the control takes each fact once");
+    }
+    let mut repeated = events.to_vec();
+    repeated.push(again);
+    let report = teardown_after(repeated, false, false);
+    assert_eq!(evidence_failure(&report), expected);
+}
+
+/// The ledger takes each call's dispatch once (C17): a second `Dispatched`
+/// for call 1 is refused as `CallReused`.
+#[test]
+fn a_call_dispatched_twice_is_refused() {
+    let work = open_work(5);
+    refused_twice(
+        &work[..6],
+        work[5].clone(),
+        "CallReused: call 1 dispatched twice",
+    );
+}
+
+/// The ledger takes each call's end once (C17): call 1 ending a second
+/// time is refused as `CallEndedTwice`.
+#[test]
+fn a_call_ended_twice_is_refused() {
+    let ended = ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::NotSubmitted,
+    };
+    let mut events = Vec::from(open_work(6));
+    events.push(ended.clone());
+    refused_twice(&events, ended, "CallEndedTwice: call 1 ended again");
+}
+
+/// The ledger takes each call's hold of its round's headers once (C17):
+/// call 1 holding round 1's headers again is refused as `HeldTwice`.
+#[test]
+fn headers_held_twice_are_refused() {
+    let work = open_work(7);
+    refused_twice(
+        &work,
+        work[6].clone(),
+        "HeldTwice: call 1 took headers again",
+    );
+}
+
+/// The ledger takes the end of each call's hold once (C17): call 1 ending
+/// round 1's headers again is refused as `EndedTwice`.
+#[test]
+fn held_headers_ended_twice_are_refused() {
+    let ended = ReactorEvent::HeadersEnded {
+        call: 1,
+        incarnation: 1,
+        headers: 5,
+        end: HeaderWorkEnd::Stale,
+    };
+    let mut events = Vec::from(open_work(8));
+    events.push(ended.clone());
+    refused_twice(&events, ended, "EndedTwice: call 1 ended its headers again");
+}
+
 /// An announced stop still runs the teardown checks: work it leaves open
 /// fails the run as the ledger names it, under the work-books claim.
 #[test]
@@ -628,8 +715,13 @@ fn a_run_that_ends_mid_stop_fails() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -653,8 +745,13 @@ fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let rounds = tap.rounds();
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -700,8 +797,13 @@ fn a_cut_off_stop_with_no_property_still_fails() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     tap.shutdown().begin();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let _observer = observer;
@@ -970,7 +1072,7 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
                 sim.add_source(Box::new(FailsOnPanic(panicking.clone())));
             }
             let dispatch = DispatchFlag::default();
-            let effects = Effects::default();
+            let effects = Effects::new(&EvidenceStores::default());
             let policy = Policy {
                 holds,
                 ..Policy::converging()
@@ -1181,7 +1283,7 @@ fn observer_panic_run(input: PlanInput) -> RunReport {
         input,
         |sim| {
             let dispatch = DispatchFlag::default();
-            let effects = Effects::default();
+            let effects = Effects::new(&EvidenceStores::default());
             let storage =
                 PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
             let (observer, tap) = ReactorTap::new(sim, &node, "node");
@@ -1321,8 +1423,13 @@ fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let claims = tap.claims();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         for event in events {

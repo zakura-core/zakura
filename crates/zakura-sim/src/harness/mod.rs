@@ -14,6 +14,7 @@ pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;
 pub mod block_work;
+pub mod cleanup;
 pub mod coverage;
 pub mod discovery;
 pub mod discovery_machine;
@@ -27,6 +28,8 @@ pub mod machine;
 pub mod policy;
 mod record;
 pub mod scenario;
+#[cfg(test)]
+pub(crate) mod scripted;
 pub mod sync;
 pub mod sync_wire;
 pub mod wire_node;

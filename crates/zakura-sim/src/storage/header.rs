@@ -17,9 +17,7 @@
 //! harness's view reads.
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
-    rc::Rc,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -42,6 +40,7 @@ use crate::{
         HeaderStorageState, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StorageRequest, StorageResult, StorageState, WorkOwner,
     },
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
@@ -158,20 +157,37 @@ impl Blame {
 /// operation ID: the part of their result the logged
 /// [`StorageResult::PrepareFailed`] and [`StorageResult::ApplyFailed`] leave
 /// out. The storage source fills it as it logs each completion, so it holds
-/// exactly the failures the log does. Cloning shares it.
-#[derive(Clone, Debug, Default)]
-pub struct FaultAttributions(Rc<RefCell<BTreeMap<(u64, u64), Blame>>>);
+/// exactly the failures the log does. It freezes with the node's other
+/// evidence stores. Cloning shares it.
+#[derive(Clone, Debug)]
+pub struct FaultAttributions(Registered<Attributions>);
+
+/// What [`FaultAttributions`] holds, by storage instance and operation ID.
+#[derive(Debug, Default)]
+pub(crate) struct Attributions(BTreeMap<(u64, u64), Blame>);
+
+impl Snapshot for Attributions {
+    /// Every attribution, in key order.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(&self.0)
+    }
+}
 
 impl FaultAttributions {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> FaultAttributions {
+        FaultAttributions(stores.register("attributions", Attributions::default()))
+    }
+
     /// Whom operation `id` of storage `instance` blamed, if it's a failed
     /// prepare or apply the log holds.
     pub fn get(&self, instance: u64, id: u64) -> Option<Blame> {
-        self.0.borrow().get(&(instance, id)).cloned()
+        self.0.read(|all| all.0.get(&(instance, id)).cloned())
     }
 
     /// Every attribution so far, by instance and operation ID.
     pub fn all(&self) -> BTreeMap<(u64, u64), Blame> {
-        self.0.borrow().clone()
+        self.0.read(|all| all.0.clone())
     }
 
     /// Records whom `fact` blamed, if it completes a failed prepare or apply
@@ -194,7 +210,7 @@ impl FaultAttributions {
 
     /// Records that operation `id` of storage `instance` blamed `blame`.
     pub(crate) fn insert(&self, instance: u64, id: u64, blame: Blame) {
-        self.0.borrow_mut().insert((instance, id), blame);
+        self.0.write(|all| all.0.insert((instance, id), blame));
     }
 }
 
@@ -209,7 +225,17 @@ impl HeaderStorage {
     /// If `port` isn't pristine, since then the model can't know its owner
     /// state. That's a fixture bug.
     pub fn new(sim: &mut Sim, port: Arc<ControlledPort>) -> Self {
-        Self::with_latency(sim, port, None)
+        Self::with_latency(sim, port, None, &EvidenceStores::default())
+    }
+
+    /// [`HeaderStorage::new`], keeping its evidence in `stores`, its node's,
+    /// which it attaches to `sim`'s run.
+    ///
+    /// # Panics
+    ///
+    /// As [`HeaderStorage::new`] does, or if another run attached `stores`.
+    pub fn in_stores(sim: &mut Sim, port: Arc<ControlledPort>, stores: &EvidenceStores) -> Self {
+        Self::with_latency(sim, port, None, stores)
     }
 
     /// A source for `port` that must complete each operation within
@@ -220,14 +246,16 @@ impl HeaderStorage {
     ///
     /// As [`HeaderStorage::new`] does.
     pub fn bounded(sim: &mut Sim, port: Arc<ControlledPort>, max_latency: Duration) -> Self {
-        Self::with_latency(sim, port, Some(max_latency))
+        Self::with_latency(sim, port, Some(max_latency), &EvidenceStores::default())
     }
 
-    /// The source both constructors build, with its checkpoint registered.
+    /// The source every constructor builds, with its checkpoint registered
+    /// and its evidence in `stores`, attached to `sim`'s run.
     fn with_latency(
         sim: &mut Sim,
         port: Arc<ControlledPort>,
         max_latency: Option<Duration>,
+        stores: &EvidenceStores,
     ) -> Self {
         assert!(
             port.is_pristine(),
@@ -242,6 +270,7 @@ impl HeaderStorage {
             live,
         );
         let id = sim.register(checkpoint.clone());
+        stores.attach(sim);
         HeaderStorage {
             port,
             max_latency,
@@ -253,7 +282,7 @@ impl HeaderStorage {
                 index => format!("{SERVICE}-{index}"),
             },
             id,
-            attributions: FaultAttributions::default(),
+            attributions: FaultAttributions::new(stores),
             runs: Vec::new(),
             publications: Vec::new(),
             page_reads: Vec::new(),
@@ -901,5 +930,15 @@ mod tests {
         assert!(!succeeds(&ordinary, Outcome::Fault(Fault::Timeout)));
         assert!(!succeeds(&ordinary, Outcome::Rejected));
         assert!(succeeds(&[Outcome::Rejected], Outcome::Rejected));
+    }
+
+    /// An attribution inserted after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_attribution_store_drops_a_blame() {
+        crate::stores::assert_freeze_drops_writes(
+            super::FaultAttributions::new,
+            |attributions| attributions.insert(0, 1, super::Blame::None),
+            super::FaultAttributions::all,
+        );
     }
 }

@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -268,14 +269,17 @@ fn witnesses() -> [(&'static str, StorageScenario); 10] {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> RunReport {
-    let report = run_prepared::<Storage>(
-        scenario,
-        Storage::prepare(scenario),
-        input,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> RunReport {
+    let report = run_prepared::<Storage>(scenario, Storage::prepare(scenario), input, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     report
@@ -325,8 +329,16 @@ fn resets(report: &RunReport) -> Vec<u64> {
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
-        for input in inputs(8, 256) {
-            let report = run(&scenario, input);
+        for (index, input) in inputs(8, 256).into_iter().enumerate() {
+            // Each run is a manifest history, which the acceptance tool
+            // records from this declaration (C18).
+            let report = run_declared(
+                Storage::NAME,
+                &format!("{name} plan {index} of inputs(8, 256)"),
+                &scenario,
+                input,
+                run_into,
+            );
             assert!(
                 matches!(
                     outcome(&report, RESET_INVALIDATES_WORK),

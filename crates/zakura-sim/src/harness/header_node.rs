@@ -46,7 +46,7 @@ use std::{
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -92,6 +92,7 @@ use crate::{
     observe::StorageFact,
     sim::Generators,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
@@ -278,7 +279,7 @@ impl Policy {
 /// [`Trigger::Closed`], [`Trigger::Grown`], [`Trigger::Reset`] and
 /// [`Trigger::Released`], and the names it counts tapped reactor facts
 /// under.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Effects {
     /// Each node's peer identity and name, which [`Topology::new`] fills,
     /// so [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`]
@@ -303,8 +304,49 @@ pub struct Effects {
     /// When the node under test's header-sync session on each link ended,
     /// since the run's start, by connection ID. Each link's cancellation
     /// hooks record it, inside the `cancel` that ends the session, so no
-    /// harness read touches a token.
-    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+    /// harness read touches a token. It's evidence, kept in the node's
+    /// stores, so the scheduler's shutdown, which cancels every link, adds
+    /// nothing.
+    pub ended: Registered<SessionEnds>,
+}
+
+/// What [`Effects::ended`] holds: when each link's session ended, by
+/// connection ID.
+#[derive(Debug, Default)]
+pub struct SessionEnds(BTreeMap<u64, Duration>);
+
+impl Snapshot for SessionEnds {
+    /// Every end, by connection.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(&self.0)
+    }
+}
+
+impl Effects {
+    /// No effects yet, with the session ends kept in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> Effects {
+        Effects {
+            names: Rc::default(),
+            links: Rc::default(),
+            grown: Rc::default(),
+            reset: Rc::default(),
+            released: Rc::default(),
+            owned: Rc::default(),
+            failure: Rc::default(),
+            ended: stores.register("session_ends", SessionEnds::default()),
+        }
+    }
+
+    /// The node's stores, which keep its session ends.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.ended.stores()
+    }
+
+    /// When each link's session ended, by connection ID, as
+    /// [`Effects::ended`] holds it now.
+    pub fn session_ends(&self) -> BTreeMap<u64, Duration> {
+        self.ended.read(|ended| ended.0.clone())
+    }
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -344,8 +386,9 @@ impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
     /// `sim`. Its predicates count `effects` too.
     pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
+        let stores = effects.stores().clone();
         PolicySource {
-            storage: HeaderStorage::new(sim, port.clone()),
+            storage: HeaderStorage::in_stores(sim, port.clone(), &stores),
             tap: None,
             hold_wake: None,
             port,
@@ -360,7 +403,7 @@ impl PolicySource {
             grown: 0,
             reset: 0,
             released: 0,
-            recovery: RecoveryEvidence::default(),
+            recovery: RecoveryEvidence::new(&stores),
             drained: false,
         }
     }
@@ -923,6 +966,9 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
+    /// The position in the control script of the step being carried out,
+    /// while one is, which each environment fact it records names.
+    acting: Cell<Option<usize>>,
     /// The mirror whose pages the harness holds back, if any.
     delayed_page: Option<DelayedPage>,
 }
@@ -1068,8 +1114,8 @@ pub const CHURN_RELINKS: u32 = 8;
 /// it, so a relink that returns after the pick closes its own link and
 /// stops. The pick sets [`Topology::stopping`] before the sweep runs, so a
 /// link the check passes is already in the sweep's copy.
-async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
-    let Some(index) = start.recv().await else {
+async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<(usize, usize)>) {
+    let Some((index, position)) = start.recv().await else {
         return;
     };
     drop(start);
@@ -1077,8 +1123,12 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
         if topology.stopping() {
             return;
         }
-        let (link, _far) = topology.open(index, 0, true);
-        topology.close(&link);
+        // Each relink and close is the churn step's own.
+        let _far = topology.acting_as(Some(position), || {
+            let (link, far) = topology.open(index, 0, true);
+            topology.close(&link);
+            far
+        });
         if topology.stopping() {
             return;
         }
@@ -1102,6 +1152,7 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
+            acting: Cell::new(None),
             delayed_page: None,
         }
     }
@@ -1171,11 +1222,23 @@ impl Topology {
     }
 
     /// Records in the node under test's tap that the harness's `action` on
-    /// `peer` ends `connection`, as [`ends`] describes.
+    /// `peer` ends `connection`, as [`ends`] describes, naming the control
+    /// step being carried out, if one is ([`Topology::acting_as`]).
     fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
         if let Some(tap) = &self.tap {
-            tap.environment(peer, connection, action);
+            tap.environment(peer, connection, action, self.acting.get());
         }
+    }
+
+    /// Runs `act` as the execution of the control script's step at
+    /// `position`, so every environment fact it records names that step,
+    /// or none for `None`. `act` must not wait, or another task's facts
+    /// could take its step.
+    fn acting_as<R>(&self, position: Option<usize>, act: impl FnOnce() -> R) -> R {
+        let outer = self.acting.replace(position);
+        let done = act();
+        self.acting.set(outer);
+        done
     }
 
     /// Closes `link` as the harness's own action, which the node under
@@ -1322,18 +1385,18 @@ impl Topology {
         // cancelled, or when the node cancels its own session token alone, as
         // it does to refuse or retire the session. A hook runs inside that
         // `cancel` and is no scheduling point, so it records the instant.
+        // It holds the store weakly: a store can hold the token, and so the
+        // hook, which would otherwise own the registry that owns the store.
         let ended = |token: &CancellationToken| {
-            let ended = self.effects.ended.clone();
+            let ended = self.effects.ended.downgrade();
             token.on_cancel(move || {
                 // The run's own teardown cancels after its evidence froze.
                 let Some(now) = zakura_scheduler::hooks::now() else {
                     return;
                 };
-                ended
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .entry(id)
-                    .or_insert(now.since_start());
+                ended.write(|ended| {
+                    ended.0.entry(id).or_insert(now.since_start());
+                });
             });
         };
         for token in &tokens {
@@ -1469,11 +1532,7 @@ impl Topology {
     /// admitted.
     pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let ended = self
-            .effects
-            .ended
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let ended = self.effects.session_ends();
         links
             .iter()
             .enumerate()
@@ -1608,7 +1667,7 @@ pub enum Reset {
 
 impl ControlAction {
     /// The action's name in its identity.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",
@@ -1685,7 +1744,9 @@ pub struct Control {
     next: usize,
     /// Set once a `Shutdown` step was picked.
     shut_down: bool,
-    to_task: mpsc::Sender<ControlStep>,
+    /// Each queued step, with its position in the script, or `None` for a
+    /// recovery's relink, which no script step names.
+    to_task: mpsc::Sender<(Option<usize>, ControlStep)>,
     /// How many queued steps the task hasn't carried out yet.
     queued: Rc<Cell<usize>>,
     /// The node under test's port, for the steps the step loop carries out.
@@ -1708,17 +1769,18 @@ impl Control {
         script: Vec<ControlStep>,
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
-        let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
+        let (to_task, mut steps) =
+            mpsc::channel::<(Option<usize>, ControlStep)>(script.len().max(1));
         let task_topology = topology.clone();
         let queued = Rc::new(Cell::new(0));
         let task_queued = queued.clone();
         // One task per churn step, so each churned mirror competes for
         // steps on its own. The control task starts them in script order.
-        let mut to_churn: VecDeque<mpsc::Sender<usize>> = script
+        let mut to_churn: VecDeque<mpsc::Sender<(usize, usize)>> = script
             .iter()
             .filter(|step| step.action == ControlAction::Churn)
             .map(|_| {
-                let (start, started) = mpsc::channel::<usize>(1);
+                let (start, started) = mpsc::channel::<(usize, usize)>(1);
                 sim.scheduler()
                     .spawn_root("churn", churn(topology.clone(), started));
                 start
@@ -1729,30 +1791,35 @@ impl Control {
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
             let topology = task_topology;
-            while let Some(step) = steps.recv().await {
+            while let Some((position, step)) = steps.recv().await {
                 let link = || {
                     topology
                         .link_to(&step.peer)
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => topology.close(&link()),
-                    ControlAction::Relink => {
+                    ControlAction::Close => {
+                        topology.acting_as(position, || topology.close(&link()))
+                    }
+                    ControlAction::Relink => topology.acting_as(position, || {
                         let link = link();
                         topology.link(link.dialer, link.listener);
-                    }
+                    }),
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => topology.flood(&step.peer, &generators),
+                    ControlAction::Flood => {
+                        topology.acting_as(position, || topology.flood(&step.peer, &generators))
+                    }
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
                             .pop_front()
                             .expect("each churn step has its own task");
+                        let position = position.expect("a churn is a script step");
                         // The churn task gives up at a shutdown, which can be
                         // picked while this step waits in the queue. Its
                         // mirror then has nothing left to churn.
-                        let _ = start.send(index).await;
+                        let _ = start.send((index, position)).await;
                     }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
@@ -2162,7 +2229,7 @@ impl ActionSource for Control {
                     };
                     self.queued.set(self.queued.get() + 1);
                     self.to_task
-                        .try_send(step)
+                        .try_send((None, step))
                         .expect("recovery relinks only once the task took every step");
                     return;
                 }
@@ -2241,11 +2308,12 @@ impl ActionSource for Control {
         }
         if step.action == ControlAction::Shutdown {
             self.shut_down = true;
-            self.topology.expect_shutdown();
+            self.topology
+                .acting_as(Some(index), || self.topology.expect_shutdown());
         }
         self.queued.set(self.queued.get() + 1);
         self.to_task
-            .try_send(step)
+            .try_send((Some(index), step))
             .expect("the channel holds the whole script, and the task outlives the run");
     }
 }
@@ -2260,5 +2328,27 @@ impl HeaderNode {
     /// Cancels the reactor, as zakurad's shutdown ends header sync.
     pub(crate) fn cancel(&self) {
         self.shutdown.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Effects;
+    use crate::stores::assert_freeze_drops_writes;
+
+    /// A session end recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_session_ends_store_drops_an_end() {
+        assert_freeze_drops_writes(
+            Effects::new,
+            |effects| {
+                effects
+                    .ended
+                    .write(|ended| ended.0.insert(1, Duration::ZERO));
+            },
+            |effects| effects.ended.read(|ended| ended.0.clone()),
+        );
     }
 }

@@ -27,14 +27,12 @@
 //! An apply execution, or any completion, whose submission storage never
 //! reported is missing evidence, which fails the run.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
 
 use zakura_network::zakura::observe::ReactorEvent;
 
 use crate::observe::{StorageFact, StorageRequest, WorkScope};
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// The engine's state as the check compares it: its header generation,
 /// its finality anchor's hash, and its state digest, as hex.
@@ -57,16 +55,34 @@ struct Store {
     pending: bool,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// When the stale-chain check first applied, shared by the tap and whoever
 /// reads it. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct ChainEffectEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct ChainEffectEvidence(Registered<Store>);
 
 impl ChainEffectEvidence {
-    /// Runs `change` on the store. Nothing else is called while the lock
-    /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> ChainEffectEvidence {
+        ChainEffectEvidence(stores.register("chain_effect", Store::default()))
+    }
+
+    /// Runs `read` on the store. Nothing else is called while the lock is
+    /// held.
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -185,7 +201,7 @@ impl ChainEffect {
     pub(super) fn drain(&mut self, step: u64) -> Result<Vec<String>, String> {
         // Marked even with evidence missing, so a break the tap takes ahead
         // of that failure keeps its trigger history.
-        self.evidence.with(|store| {
+        self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -205,7 +221,7 @@ impl ChainEffect {
 
     /// Notes that a fact made the check applicable.
     fn applies(&self) {
-        self.evidence.with(|store| store.pending = true);
+        self.evidence.change(|store| store.pending = true);
     }
 
     /// Judges apply operation `id`'s execution, which left the engine's

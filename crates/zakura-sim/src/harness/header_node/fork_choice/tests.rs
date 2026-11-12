@@ -53,7 +53,7 @@ fn seeded(
     port: &EnginePort,
     snapshot: &EngineSnapshot,
 ) -> (ForkChoice, ForkChoiceEvidence, Result<Vec<String>, String>) {
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence.clone(),
         fixture.clone(),
@@ -160,7 +160,7 @@ fn the_seeds_copied_score_is_judged() {
     let mut state = port.durable_state();
     state.metadata.header_best_score = snapshot.header_best_score;
     let mut check = ForkChoice::new(
-        ForkChoiceEvidence::default(),
+        ForkChoiceEvidence::new(&EvidenceStores::default()),
         fixture,
         [1, 2],
         &state,
@@ -282,7 +282,7 @@ fn a_header_outside_the_fixture_is_not_judged() {
     let mut foreign = key.0;
     foreign[0] ^= 1;
     state.graph.nodes.insert(block::Hash(foreign), node);
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let snapshot = selecting(port.snapshot(), tip(&fixture, 1, 5), work(&fixture, 1, 5));
     let mut check = ForkChoice::new(evidence.clone(), fixture, [1, 2], &state, &snapshot, now());
     assert_eq!(check.drain(1), Ok(Vec::new()));
@@ -400,7 +400,7 @@ fn a_deferred_admission_stays_ineligible() {
         .expect("a valid time");
     let lighter = selecting(port.snapshot(), tip(&fixture, 1, 5), work(&fixture, 1, 5));
     let anchor = selecting(port.snapshot(), fixture.anchor(), U256::zero());
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence,
         fixture.clone(),
@@ -427,7 +427,7 @@ fn a_deferred_admission_stays_ineligible() {
 fn the_seed_waits_for_step_one() {
     let (fixture, port) = weighted();
     let wrong = selecting(port.snapshot(), tip(&fixture, 2, 3), U256::zero());
-    let evidence = ForkChoiceEvidence::default();
+    let evidence = ForkChoiceEvidence::new(&EvidenceStores::default());
     let mut check = ForkChoice::new(
         evidence.clone(),
         fixture,
@@ -440,4 +440,147 @@ fn the_seed_waits_for_step_one() {
     assert!(!evidence.any());
     assert_eq!(check.drain(1).expect("no evidence is missing").len(), 1);
     assert!(evidence.applicable_by(1));
+}
+
+/// A settled point counted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_fork_choice_store_drops_a_settled_point() {
+    crate::stores::assert_freeze_drops_writes(
+        ForkChoiceEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.settled_points += 1);
+        },
+        ForkChoiceEvidence::settled_points,
+    );
+}
+
+/// A claims store and fork-choice evidence with no tap behind them.
+#[derive(Clone)]
+struct Forks {
+    claims: crate::harness::header_node::claim::ClaimEvidence,
+    fork: ForkChoiceEvidence,
+}
+
+impl Default for Forks {
+    /// Empty stores in one handle of their own.
+    fn default() -> Self {
+        let stores = EvidenceStores::default();
+        Forks {
+            claims: crate::harness::header_node::claim::ClaimEvidence::new(&stores),
+            fork: ForkChoiceEvidence::new(&stores),
+        }
+    }
+}
+
+impl crate::domain::header_sync::ForkView for Forks {
+    fn claims(&self) -> &crate::harness::header_node::claim::ClaimEvidence {
+        &self.claims
+    }
+
+    fn fork_choice(&self) -> &ForkChoiceEvidence {
+        &self.fork
+    }
+}
+
+impl crate::property::HasView for Forks {
+    type View = Forks;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> Forks {
+        self.clone()
+    }
+
+    /// The stores, as a node harness reports its own.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.fork.0.stores().report_snapshot())
+    }
+}
+
+/// The claim break [`Forks`]' one boundary keeps.
+const UNSELECTED: &str = "ExpectedChainSelected: the engine's tip isn't a max-work eligible one";
+
+/// The convergence break [`Forks`]' one boundary keeps at its settled point.
+const UNCONVERGED: &str = "the settled engine's tip isn't a heaviest mirror tip";
+
+impl crate::harness::scripted::Script for Forks {
+    const NAME: &'static str = "test/fork-choice-findings";
+    type Case = ();
+
+    /// Only `expected-chain-selected`.
+    fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Forks>>> {
+        vec![crate::domain::header_sync::expected_chain_selected()]
+    }
+
+    /// The schedule and the view.
+    fn sources() -> crate::property::Sources {
+        use crate::property::Source;
+        crate::property::Sources::observed(&[Source::Schedule, Source::View])
+    }
+
+    /// At step 1, after which no task can run: a selection break the drain
+    /// found, and a settled point whose convergence broke, with the check
+    /// applicable, as the tap keeps them.
+    fn observe(&self, (): &(), log: &mut crate::ObservationLog) {
+        let step = log.step();
+        if step != 1 {
+            return;
+        }
+        self.claims
+            .record(crate::harness::header_node::claim::ClaimRecord {
+                step,
+                claim: crate::harness::header_node::claim::Claim::ExpectedChainSelected,
+                detail: UNSELECTED.to_owned(),
+                attribution: None,
+            });
+        self.fork.change(|store| {
+            store.applicable = Some(step);
+            store.settled = Some((step, Some(UNCONVERGED.to_owned())));
+            store.settled_points += 1;
+        });
+    }
+}
+
+/// C21 through the sidecar: a step whose drain found a selection break
+/// and a settled point off the heaviest mirror chain, with no task able to
+/// run after it, is two `expected-chain-selected` violations there, both
+/// in the full report recorded beside the trace and its fresh replay.
+#[test]
+fn a_selection_break_beside_a_settled_break_reaches_the_sidecar() {
+    use crate::{
+        domain::header_sync::EXPECTED_CHAIN_SELECTED,
+        harness::scripted::{findings, sidecar},
+    };
+    let full = sidecar::<Forks>(&(), &[]);
+    let found = findings(&full, EXPECTED_CHAIN_SELECTED);
+    let actual: Vec<(u64, &str, &str)> = found
+        .violations
+        .iter()
+        .map(|violation| {
+            (
+                violation.step,
+                violation.expected.as_str(),
+                violation.actual.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                1,
+                "the engine selects a max-work eligible tip, scored with its work",
+                UNSELECTED
+            ),
+            (
+                1,
+                "a settled node in the fork fixture is on the heaviest mirror chain",
+                UNCONVERGED
+            ),
+        ]
+    );
+    assert_eq!(found.end_found, 0, "both at their step: {found:?}");
+    assert_eq!(
+        found.outcome,
+        crate::PropertyOutcome::Violated { witness: vec![1] }
+    );
 }

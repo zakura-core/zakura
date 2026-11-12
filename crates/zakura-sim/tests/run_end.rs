@@ -163,6 +163,7 @@ fn drain_admits_no_external() {
 fn violation_stops_at_once() {
     let mut checker = check::after_step(|cx| {
         (cx.step == 5).then(|| Violation {
+            subject: None,
             property: "test/stop".into(),
             step: cx.step,
             witness: vec![2, 5],
@@ -195,6 +196,7 @@ fn violation_stops_at_once() {
 fn a_closure_step_violation_survives_a_late_harness_failure() {
     let end_finding = PropertyReport {
         violations: vec![Violation {
+            subject: None,
             property: "test/stop".into(),
             step: 5,
             witness: vec![5],
@@ -208,6 +210,7 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
     // finding (Sol 2 and Terra 2, round 3).
     let same_at_end = PropertyReport {
         violations: vec![Violation {
+            subject: None,
             property: "test/stop".into(),
             step: 5,
             witness: vec![2, 5],
@@ -239,6 +242,7 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
         let mut checker = FnChecker::new(
             |cx: &check::StepCtx<'_>| {
                 (cx.step == 5).then(|| Violation {
+                    subject: None,
                     property: "test/stop".into(),
                     step: cx.step,
                     witness: vec![2, 5],
@@ -284,6 +288,7 @@ fn a_closure_step_violation_survives_a_late_harness_failure() {
 fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
     let end_only = PropertyReport {
         violations: vec![Violation {
+            subject: None,
             property: "test/stop".into(),
             step: 5,
             witness: vec![5],
@@ -300,6 +305,7 @@ fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
         let mut checker = FnChecker::new(
             |cx: &check::StepCtx<'_>| {
                 (cx.step == 5).then(|| Violation {
+                    subject: None,
                     property: "test/stop".into(),
                     step: cx.step,
                     witness: vec![2, 5],
@@ -334,6 +340,7 @@ fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
 #[test]
 fn a_closure_merge_keeps_every_step_finding_in_order() {
     let step = |at: u64, witness: Vec<u64>| Violation {
+        subject: None,
         property: "test/stop".into(),
         step: at,
         witness,
@@ -380,6 +387,7 @@ fn a_closure_merge_keeps_every_step_finding_in_order() {
 #[test]
 fn a_dropped_end_finding_leaves_the_step_finding() {
     let finding = |step: u64, witness: Vec<u64>| Violation {
+        subject: None,
         property: "test/two".into(),
         step,
         witness,

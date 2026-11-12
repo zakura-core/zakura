@@ -176,6 +176,7 @@ fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         return Verdict::NotApplicable;
     }
     Verdict::Violated(Violation {
+        subject: None,
         property: cx.id().to_string(),
         step: cx.step,
         witness: (1..=cx.step).collect(),

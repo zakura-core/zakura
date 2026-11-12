@@ -860,8 +860,14 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         .iter()
         .find(|property| property.property == HONEST_NEVER_PUNISHED)
         .expect("registered");
-    let found = |expected: &str, actual: &str| Violation {
-        subject: None,
+    // Each names its punishment: the connection and the punishing
+    // observation's place in the log, with no frame judged before it.
+    let found = |expected: &str, actual: &str, connection: u64, event: u64| Violation {
+        subject: Some(zakura_sim::FindingSubject::Punishment {
+            connection,
+            event,
+            frame: None,
+        }),
         property: "session/honest-never-punished".to_owned(),
         step: 2,
         witness: vec![2],
@@ -873,11 +879,15 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         [
             found(
                 "honest peer-0's connection 1 is never punished",
-                "a close with cause ordered_read_rejected"
+                "a close with cause ordered_read_rejected",
+                1,
+                3
             ),
             found(
                 "honest peer-0's connection 2 is never punished",
-                "a Misbehavior"
+                "a Misbehavior",
+                2,
+                4
             ),
         ]
     );

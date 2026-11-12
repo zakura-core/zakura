@@ -249,10 +249,10 @@ shared = [
     "crates/zakura-network/src/zakura/handler.rs",
 ]
 # Each table's witness, which the runner runs once per shared-path patch.
-# The block-sync harness's relay checks each header but never runs
-# `admit_inbound_message` (handler.rs), so a break to that admission step
-# (its size check, cadence charge and row `expect`) reaches stream 6 only
-# in production. Its runs count only through discovery/s4v2.
+# The block-sync harness's relay runs the admission step's row `expect` and
+# cadence charge (`admit_tabled_message`, handler.rs) but not its size
+# check, which needs negotiated connection limits. A break to the size
+# check counts only through discovery/s4v2.
 tables = [
     { table = "block-sync/s6v3", witness = { test = "each_probe_fault_reaches_its_exact_id", test_target = "block_table" } },
     { table = "discovery/s4v2", witness = { test = "hello_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" } },
@@ -412,9 +412,21 @@ families = ["hello-reserved-flags"]
 
 [[drawn-witness]]
 patch = "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "block-sync/s6v3/status/cadence-never-closes"
+harness = "block-sync/storage"
+families = ["status-cadence-burst"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
 property = "discovery/s4v2/hello/cadence-never-closes"
 harness = "discovery/wire"
 families = ["hello-burst"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "block-sync/s6v3/undeclared-type-closes"
+harness = "block-sync/storage"
+families = ["undeclared-type"]
 
 [[drawn-witness]]
 patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"

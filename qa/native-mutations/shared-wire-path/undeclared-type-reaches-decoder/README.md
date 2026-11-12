@@ -9,9 +9,9 @@ decoder judges it.
 This breaks one guard only. Guards on the rule's path:
 
 - the stream reader's header check, which the patch breaks;
-- every tabled stream behind a QUIC reader: `admit_inbound_message` in
-  `handler.rs` looks the frame's row up with an `expect` that the filter
-  admitted only declared types;
+- every tabled stream behind a QUIC reader, and the block-sync harness's
+  relay: `admit_tabled_message` in `handler.rs` looks the frame's row up
+  with an `expect` that the filter admitted only declared types;
 - discovery: then `wire_codec::decode_frame` refuses an unknown type;
 - block sync: then the routine's `SessionGuard::admit`
   (`transport/guard.rs`) refuses a disallowed type, and
@@ -20,18 +20,15 @@ This breaks one guard only. Guards on the rule's path:
 Fault class: request authorization. The node reads the payload of a frame
 its table refuses.
 
-Witness: `discovery/s4v2`, `hello_acts_apply_in_their_witnesses` in
-`crates/zakura-sim/tests/discovery_wire_witness.rs`. Its first act sends the
-peer's `Hello` as type 0.
+Witnesses:
 
-`block-sync/s6v3` has no case, because the block-sync harness can't reach
-the patch's first symptom. In production, a stream-6 reader reaches the
-`expect` and panics, as discovery's does. The block-sync harness links the
-node over in-memory channels, and its relay checks each header with
-`StreamReader::admits` but never runs `admit_inbound_message`. Its frame
-reaches the routine's `SessionGuard::admit` instead, which refuses it with
-`service_protocol_reject`, so a stream-6 run would hold. The `expect` is the
-same for every tabled stream, so the discovery case covers it.
+- `discovery/s4v2`: `hello_acts_apply_in_their_witnesses` in
+  `crates/zakura-sim/tests/discovery_wire_witness.rs`. Its first act sends
+  the peer's `Hello` as type 0.
+- `block-sync/s6v3`: `each_probe_fault_reaches_its_exact_id` in
+  `crates/zakura-sim/tests/block_table.rs`. Its `undeclared-type` scenario
+  sends a frame of type 9. The harness's relay runs `admit_tabled_message`
+  through `StreamAdmission` after the header check.
 
 ```sh
 export RUSTFLAGS="--cfg zakura_sim" CXXFLAGS="-include cstdint"
@@ -41,11 +38,18 @@ git apply undeclared-type-reaches-decoder.patch
 git apply -R undeclared-type-reaches-decoder.patch
 ```
 
+For `block-sync/s6v3`, run the same steps with
+`--test block_table -- --exact each_probe_fault_reaches_its_exact_id`.
+
+Required failure for `block-sync/s6v3`: the run ends at
+`block-sync/s6v3/undeclared-type-closes`.
+
 Required failure for `discovery/s4v2`: the run ends at
 `discovery/s4v2/undeclared-type-closes`.
 
-Expected result: killed by another rule, `sim/no-task-panic`. The handler's
-`expect` panics in the stream reader task before the codec runs. The run
+Expected result: killed by another rule, `sim/no-task-panic`. The `expect`
+panics before the codec or the routine runs: in the stream reader task on
+discovery, and in the relay task (`block-relay`) on block sync. The run
 stops at the panic, so the `undeclared-type-closes` obligation stays open
 and the ID reports `inconclusive`. The filter is the only check before the
 `expect`, so this panic is the patch's first symptom on every tabled stream

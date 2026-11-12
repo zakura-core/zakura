@@ -3405,6 +3405,341 @@ mod tests {
         starts_with_each(&ended, &["UntakenFault: operation 3 "]);
     }
 
+    /// One of the fault store's histories C13 needs through the run's full
+    /// report and its sidecar. Each is scripted on the node's storage and
+    /// reactor, with every failure an `invalid_header` blamed on `aa`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    enum FaultHistory {
+        /// Operations 1 and 2 fail, and their replies reach the reactor,
+        /// which never takes them.
+        TwoUntaken,
+        /// The reactor takes and handles operations 1 and 2's replies in
+        /// one step, with no penalty for either.
+        TwoBreaks,
+        /// The reactor handles operation 1's reply with no penalty, beside
+        /// operation 2's reply, which it never takes.
+        BreakBesideOpen,
+        /// The reactor's teardown drops call 1, which holds operation 1's
+        /// reply, and then the reactor returns by itself.
+        ExitAfterReply,
+        /// The same drop after the harness's `Shutdown` of the node.
+        ShutdownAfterReply,
+    }
+
+    use crate::harness::header_node::ends::EndFact;
+
+    impl FaultHistory {
+        /// The node's end facts, which the tap would record.
+        fn ends(self) -> Vec<EndFact> {
+            use crate::harness::header_node::fault::tests::shutdown;
+            let dropped = EndFact::CallDropped { call: 1 };
+            match self {
+                FaultHistory::ExitAfterReply => {
+                    vec![dropped, EndFact::ReactorExited { step: 1 }]
+                }
+                FaultHistory::ShutdownAfterReply => vec![shutdown(), dropped],
+                _ => vec![shutdown()],
+            }
+        }
+
+        /// The one step's storage and reactor observations, with each
+        /// failure's blame kept in `attributions`.
+        fn observations(
+            self,
+            attributions: &crate::storage::FaultAttributions,
+        ) -> Vec<Observation> {
+            use crate::observe::ReactorFact;
+
+            let mut log = ObservationLog::default();
+            match self {
+                FaultHistory::TwoUntaken => {
+                    log_fault(&mut log, attributions, 1, false);
+                    log_fault(&mut log, attributions, 2, false);
+                }
+                FaultHistory::TwoBreaks => {
+                    for call in [1, 2] {
+                        log_fault(&mut log, attributions, call, true);
+                        log_handled(&mut log, call);
+                    }
+                }
+                FaultHistory::BreakBesideOpen => {
+                    log_fault(&mut log, attributions, 1, true);
+                    log_handled(&mut log, 1);
+                    log_fault(&mut log, attributions, 2, false);
+                }
+                FaultHistory::ExitAfterReply | FaultHistory::ShutdownAfterReply => {
+                    log_fault(&mut log, attributions, 1, false);
+                    log.push(Observation::Reactor {
+                        instance: 0,
+                        seq: 0,
+                        storage_seq: 0,
+                        node: "node".to_owned(),
+                        event: ReactorFact::CallEnded {
+                            call: 1,
+                            end: "dropped".to_owned(),
+                            op: Some(1),
+                        },
+                    });
+                    log.push(Observation::Storage {
+                        service: HEADER_SERVICE.to_owned(),
+                        instance: 0,
+                        seq: 0,
+                        txn: 0,
+                        fact: StorageFact::ReplyDropped { id: 1 },
+                    });
+                }
+            }
+            log.entries()
+                .iter()
+                .map(|entry| entry.obs.clone())
+                .collect()
+        }
+    }
+
+    /// Logs its observations at step 1, the first after setup.
+    struct FaultScript(Option<Vec<Observation>>);
+
+    impl crate::ActionSource for FaultScript {
+        fn enabled(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<(crate::Identity, u64)>) {}
+
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<crate::Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the script offers no actions");
+        }
+
+        /// Logs the script's observations at step 1.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 1 {
+                for observation in self.0.take().unwrap_or_default() {
+                    log.push(observation);
+                }
+            }
+            Ok(())
+        }
+
+        /// Nothing: it finishes no submitted work.
+        fn recovery(&self, _now: zakura_scheduler::SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+        /// Nothing: it has no holds.
+        fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+        /// None: it holds no submitted work.
+        fn holds_work(&self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A harness that runs only [`HEADER_FAULT_PENALIZED`] over a
+    /// [`FaultHistory`], with the storage harness's end path, so `record`
+    /// writes its full report and sidecar as for a node harness.
+    struct FaultRun(FaultEvidence);
+
+    impl HasView for FaultRun {
+        type View = StorageView;
+
+        /// The fault evidence, and empty everything else.
+        fn view(&self) -> StorageView {
+            FaultsOnly(self.0.clone()).view()
+        }
+
+        /// Records the end in the fault evidence, as the storage harness
+        /// does.
+        fn ended(&self, end: &RunEnd) {
+            self.0.end(end);
+        }
+
+        /// [`fault_end_violations`], as the storage harness reports them.
+        fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+            fault_end_violations(&self.0, log)
+        }
+    }
+
+    impl Subsystem for FaultRun {
+        const NAME: &'static str = "test/fault-history";
+        const GENERATOR: u32 = 1;
+        const SCENARIO_BYTES: usize = 0;
+        type Scenario = FaultHistory;
+        type Prepared = ();
+
+        /// The default config.
+        fn config(_: &FaultHistory) -> RunConfig {
+            RunConfig::default()
+        }
+
+        /// Nothing to set up.
+        fn prepare(_: &FaultHistory) {}
+
+        /// The history's end facts and blames, its script, and one task
+        /// that runs step 1.
+        fn build(sim: &mut Sim, history: &FaultHistory, (): ()) -> Self {
+            let faults =
+                crate::harness::header_node::fault::tests::evidence_ending(&[], &history.ends());
+            let observations = history.observations(faults.attributions());
+            sim.add_source(Box::new(FaultScript(Some(observations))));
+            sim.scheduler().spawn_root("reactor", async {});
+            FaultRun(faults)
+        }
+
+        /// Only [`HEADER_FAULT_PENALIZED`].
+        fn properties() -> Vec<Property<Self>> {
+            vec![header_fault_penalized::<Self>()]
+        }
+
+        /// The schedule, the node's storage and the view.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+        }
+
+        /// Unused: the histories are built by hand.
+        fn draw(_: &[u8]) -> FaultHistory {
+            unreachable!("the histories are built by hand")
+        }
+    }
+
+    /// Records `history` through `record`, under the `Draft` override
+    /// `draft`, and returns [`HEADER_FAULT_PENALIZED`]'s report from the
+    /// full report beside its trace. A fresh replay of the trace verifies
+    /// and sends the same full report, so the sidecar holds what the run
+    /// found.
+    fn fault_sidecar(history: FaultHistory, draft: &[String]) -> crate::record::PropertyFindings {
+        const ENTRY: crate::harness::HarnessEntry = crate::harness::entry::<FaultRun>();
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let scenario = serde_json::to_value(history).expect("a history serializes");
+        let trace = crate::harness::with_draft(draft, || {
+            crate::harness::record(
+                &ENTRY,
+                crate::harness::RecordInput::Plan {
+                    scenario: &scenario,
+                    plan: &[],
+                },
+                dir.path(),
+            )
+        })
+        .expect("the history records");
+        let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
+            .expect("record writes the full report");
+        let full: crate::record::FullReport =
+            serde_json::from_str(&text).expect("the full report reads back");
+        let replayed =
+            crate::trace::replay_with(&trace, &ENTRY, crate::trace::ReplayOptions::default())
+                .expect("the trace replays");
+        assert!(replayed.verified(), "{history:?}: {replayed:?}");
+        assert_eq!(replayed.report.as_ref(), Some(&full), "{history:?}");
+        full.properties
+            .into_iter()
+            .find(|found| found.property == HEADER_FAULT_PENALIZED)
+            .expect("the report has the property")
+    }
+
+    /// Each violation's step and actual, in order.
+    fn steps_and_actuals(report: &crate::record::PropertyFindings) -> Vec<(u64, String)> {
+        report
+            .violations
+            .iter()
+            .map(|violation| (violation.step, violation.actual.clone()))
+            .collect()
+    }
+
+    /// The untaken reply finding for operation `op`.
+    fn untaken_finding(op: u64) -> String {
+        format!(
+            "UntakenFault: operation {op} failed with a header-peer fault whose reply reached \
+             the reactor, which never took it"
+        )
+    }
+
+    /// C13: two replies that reached the reactor and were never taken are
+    /// two findings at the settled end, both in the full report and its
+    /// sidecar.
+    #[test]
+    fn two_untaken_replies_reach_the_sidecar() {
+        let report = fault_sidecar(FaultHistory::TwoUntaken, &[]);
+        assert!(
+            matches!(report.outcome, crate::PropertyOutcome::Violated { .. }),
+            "{report:?}"
+        );
+        let found = steps_and_actuals(&report);
+        let actuals: Vec<&str> = found.iter().map(|(_, actual)| actual.as_str()).collect();
+        assert_eq!(
+            actuals,
+            [untaken_finding(1), untaken_finding(2)],
+            "{found:?}"
+        );
+        assert_eq!(report.end_found, 2, "both at the run's end: {report:?}");
+    }
+
+    /// C13: two penalties broken while one step's calls were handled are
+    /// two findings at that step, both in the full report and its sidecar.
+    #[test]
+    fn two_breaks_at_one_step_reach_the_sidecar() {
+        let report = fault_sidecar(FaultHistory::TwoBreaks, &[]);
+        let found = steps_and_actuals(&report);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(report.end_found, 0, "both at their step: {report:?}");
+        for ((step, actual), op) in found.iter().zip([1, 2]) {
+            assert_eq!(*step, 1, "{found:?}");
+            assert!(
+                actual.starts_with(&format!("UnpenalizedFault: prepare operation {op} ")),
+                "{found:?}"
+            );
+        }
+    }
+
+    /// C13: a break beside an open fault. The break is a finding at its
+    /// step, and the reply still untaken is one at the settled end the
+    /// `Draft` run reaches, both in the full report and its sidecar.
+    #[test]
+    fn a_break_beside_an_open_fault_reaches_the_sidecar() {
+        let report = fault_sidecar(
+            FaultHistory::BreakBesideOpen,
+            &[HEADER_FAULT_PENALIZED.to_owned()],
+        );
+        let found = steps_and_actuals(&report);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, 1, "{found:?}");
+        assert!(
+            found[0]
+                .1
+                .starts_with("UnpenalizedFault: prepare operation 1 "),
+            "{found:?}"
+        );
+        assert_eq!(report.end_found, 1, "the second is the end's: {report:?}");
+        assert_eq!(found[1].1, untaken_finding(2), "{found:?}");
+    }
+
+    /// C13: a reactor that dropped a failed reply and then returned by
+    /// itself lost it, which the full report and its sidecar keep as
+    /// violated. The same drop after the harness's `Shutdown` clears it, so
+    /// the rule owes nothing there and never applies.
+    #[test]
+    fn a_self_exit_after_a_reply_is_violated_and_a_shutdown_clears_it() {
+        let lost = fault_sidecar(FaultHistory::ExitAfterReply, &[]);
+        assert!(
+            matches!(lost.outcome, crate::PropertyOutcome::Violated { .. }),
+            "{lost:?}"
+        );
+        let actuals: Vec<String> = steps_and_actuals(&lost)
+            .into_iter()
+            .map(|(_, actual)| actual)
+            .collect();
+        assert_eq!(
+            actuals,
+            [
+                "DroppedFault: operation 1 failed with a header-peer fault whose reply reached \
+              the reactor, and the reactor's teardown dropped call 1, which held it, without \
+              the harness stopping the node"
+            ]
+        );
+        let cleared = fault_sidecar(FaultHistory::ShutdownAfterReply, &[]);
+        assert_eq!(
+            cleared.outcome,
+            crate::PropertyOutcome::not_applicable(crate::NaReason::NeverApplied),
+            "{cleared:?}"
+        );
+        assert!(cleared.violations.is_empty(), "{cleared:?}");
+    }
+
     /// An empty header scope.
     fn scope() -> crate::observe::WorkScope {
         crate::observe::WorkScope {

@@ -1836,12 +1836,10 @@ fn each_page_finding_names_its_own_page() {
     );
 }
 
-/// C22 (b): an initial `Open` granting more than its peer reserved breaks
-/// the credit rule before any page, as the `overgrant` planted case does.
-/// Its finding names that `Open`, by subscription, kind and sequence, and
-/// no page.
-#[test]
-fn an_open_credit_break_names_its_update_and_no_page() {
+/// The findings one drain gives for an initial `Open` that grants 10
+/// headers on a reservation of 9, before any page, as the `overgrant`
+/// planted case does.
+pub(crate) fn overgrant_breaks() -> Vec<AuthorityFinding> {
     let chain = main_chain(4);
     let genesis = HeaderFixture::regtest().anchor().hash;
     let mut check = Authority::new(
@@ -1855,7 +1853,15 @@ fn an_open_credit_break_names_its_update_and_no_page() {
     for event in &events {
         check.observe(event, true, false);
     }
-    let found = check.drain(1);
+    check.drain(1)
+}
+
+/// C22 (b): an initial `Open` granting more than its peer reserved breaks
+/// the credit rule before any page ([`overgrant_breaks`]). Its finding
+/// names that `Open`, by subscription, kind and sequence, and no page.
+#[test]
+fn an_open_credit_break_names_its_update_and_no_page() {
+    let found = overgrant_breaks();
     let subject = AuthoritySubject::Update {
         peer: peer(&mirror()),
         session: 7,

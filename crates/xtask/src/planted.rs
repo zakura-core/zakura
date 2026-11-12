@@ -2742,6 +2742,64 @@ mod tests {
         assert!(matches!(verdict, Verdict::Failed(_)), "{verdict:?}");
     }
 
+    /// C4: a baseline and a campaign run have deadlines too. A baseline
+    /// recording that hangs is killed at its deadline, ends `Killed`, and
+    /// fails the case's baseline. A campaign whose first run hangs ends
+    /// there as a failed campaign, never a catch.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_baseline_or_campaign_run_is_killed_and_never_passes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let hangs = dir.path().join("hangs");
+        // `wait_until_executable` runs it with no arguments.
+        fs::write(&hangs, "#!/bin/sh\n[ $# -gt 0 ] || exit 0\nsleep 60\n").unwrap();
+        fs::set_permissions(&hangs, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&hangs);
+        let case = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Input("a.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: Vec::new(),
+            target: None,
+        };
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let baseline = record(
+            Command::new(&hangs),
+            "header-sync/storage",
+            &case.witness.located(dir.path()),
+            ID,
+            Expect::Holds,
+            &scratch.join("baseline"),
+            Some((deadline, &NEVER_INTERRUPTED)),
+        )
+        .expect("the fake binary starts");
+        assert!(matches!(baseline, Run::Killed(_)), "{baseline:?}");
+        assert!(
+            baseline_failure(ID, &baseline).is_some(),
+            "a killed baseline fails the case"
+        );
+        let verdict = campaign(
+            &hangs,
+            "header-sync/storage",
+            &case,
+            &scratch.join("campaign"),
+            deadline,
+        )
+        .expect("the fake binary starts");
+        assert!(
+            matches!(&verdict, Verdict::CampaignFails { verdict, .. }
+                if matches!(**verdict, Verdict::Failed(_))),
+            "{verdict:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
     /// C4: a nested case's exact set. Its committed input is a catch only
     /// with its property and every member of its set violated. A missing
     /// member isn't a catch, and a property outside the set is unrelated.

@@ -714,6 +714,260 @@ const C18_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C13's proving tests: the fault store's four histories through a
+/// recorded run's full report and its sidecar, each replayed fresh (two
+/// untaken replies at the end, two breaks at one step, a break beside an
+/// open fault, and a self-exit after a reply beside a harness shutdown at
+/// the same point), and the store and check tests hf-1 to hf-3 added.
+const C13_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_break_beside_an_open_fault_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_self_exit_after_a_reply_is_violated_and_a_shutdown_clears_it",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::the_fault_check_reports_every_break_at_a_step",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::the_end_reports_every_open_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::every_break_is_reported_once",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_break_beside_an_open_fault_reports_both",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::only_the_harness_stop_clears_a_dropped_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_drop_clears_its_fault_only_after_the_stop_began",
+    ),
+];
+
+/// C22's proving tests: the authority checker naming each finding's rule
+/// and subject, two page breaks at one step and the `overgrant` case's
+/// credit break on its `Open` with no page, each as reported and through a
+/// recorded run's sidecar, and a real header run's sidecar keeping every
+/// claim's attribution.
+const C22_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_page_finding_names_its_own_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::an_open_credit_break_names_its_update_and_no_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_finding_joins_on_its_full_identity",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::findings_one_key_apart_stay_distinct",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_ledger_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_the_overgrant_update_and_no_page",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "tests/header_authority.rs",
+        "a_recorded_header_run_keeps_its_stores_in_the_full_report",
+    ),
+];
+
+/// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
+const fn planted_test(test: &'static str) -> TestRef {
+    TestRef {
+        package: "xtask",
+        file: "src/planted.rs",
+        test,
+    }
+}
+
+/// C4's proving tests: the planted runner's classification of baseline and
+/// patched runs, its fresh replay of every catch, typed and fuzz-input, a
+/// deadline killing a hung baseline, patched or campaign run, and its
+/// set-aware judgment of a nested case. The fresh-replay and hang tests are
+/// `cfg(unix)`, which the acceptance host, Linux, builds.
+const C4_PROVING: &[TestRef] = &[
+    planted_test("planted::tests::planted_passes_only_on_its_own_id"),
+    planted_test("planted::tests::witness_flags_carry_the_co_violations"),
+    planted_test("planted::tests::listed_co_violations_are_expected"),
+    planted_test("planted::tests::planted_requires_the_trigger_history"),
+    planted_test("planted::tests::planted_requires_passing_baseline"),
+    planted_test("planted::tests::planted_patch_must_apply"),
+    planted_test("planted::tests::a_patch_may_not_change_the_witness"),
+    planted_test("planted::tests::campaign_failures_name_their_input"),
+    planted_test("planted::tests::every_catch_needs_its_fresh_replay"),
+    planted_test("planted::tests::the_runner_replays_every_caught_case"),
+    planted_test("planted::tests::a_replay_miss_reads_the_exit_status"),
+    planted_test("planted::tests::a_hung_patched_run_is_killed_and_never_caught"),
+    planted_test("planted::tests::a_hung_baseline_or_campaign_run_is_killed_and_never_passes"),
+    planted_test("planted::tests::a_nested_case_needs_exactly_its_set"),
+    planted_test("planted::tests::a_typed_case_watches_and_runs_its_files"),
+];
+
+/// C17's proving tests: the freeze comparison's controls, a store whose
+/// freeze is skipped and a cleanup-time append to the log each failing it,
+/// the header witnesses keeping their stores and log through cleanup,
+/// each registered store's post-freeze pair, the store inventory, and the
+/// pairer's and the ledger's tests that each takes a fact once, the
+/// ledger's fed through the tap so the simulator build runs them.
+const C17_PROVING: &[TestRef] = &[
+    sim_test("src/stores.rs", "stores::tests::a_registered_store_keeps_its_freeze_through_cleanup"),
+    sim_test(
+        "src/stores.rs",
+        "stores::tests::a_store_whose_freeze_is_skipped_fails_the_comparison",
+    ),
+    sim_test(
+        "src/stores.rs",
+        "stores::tests::an_append_to_the_log_during_cleanup_fails_the_comparison",
+    ),
+    sim_test("src/stores.rs", "stores::tests::a_store_registered_after_the_freeze_starts_frozen"),
+    sim_test("tests/header_cleanup.rs", "storage_witnesses_keep_their_stores_through_cleanup"),
+    sim_test("tests/header_cleanup.rs", "the_wire_witness_keeps_its_stores_through_cleanup"),
+    sim_test(
+        "tests/header_cleanup.rs",
+        "the_release_wake_witnesses_keep_their_stores_through_cleanup",
+    ),
+    sim_test("tests/header_cleanup.rs", "a_completed_storage_run_releases_its_stores"),
+    sim_test(
+        "src/peer/evidence.rs",
+        "peer::evidence::tests::a_frozen_sent_page_store_drops_a_page",
+    ),
+    sim_test(
+        "src/storage/header.rs",
+        "storage::header::tests::a_frozen_attribution_store_drops_a_blame",
+    ),
+    sim_test(
+        "src/harness/header_node.rs",
+        "harness::header_node::tests::a_frozen_session_ends_store_drops_an_end",
+    ),
+    sim_test(
+        "src/harness/header_node/ends.rs",
+        "harness::header_node::ends::tests::a_frozen_end_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::a_frozen_adoption_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/session/tests.rs",
+        "harness::header_node::session::tests::a_frozen_session_view_drops_an_event",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_frozen_cooldown_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/publication/tests.rs",
+        "harness::header_node::publication::tests::a_frozen_publication_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/claim.rs",
+        "harness::header_node::claim::tests::a_frozen_settlement_store_drops_a_row",
+    ),
+    sim_test(
+        "src/harness/header_node/claim.rs",
+        "harness::header_node::claim::tests::a_frozen_claim_store_drops_a_break",
+    ),
+    sim_test(
+        "src/harness/header_node/capacity.rs",
+        "harness::header_node::capacity::tests::a_frozen_capacity_store_drops_a_boundary",
+    ),
+    sim_test(
+        "src/harness/header_node/reservation.rs",
+        "harness::header_node::reservation::tests::a_frozen_reservation_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/stale/tests.rs",
+        "harness::header_node::stale::tests::a_frozen_stale_store_drops_a_window",
+    ),
+    sim_test(
+        "src/harness/header_node/round_life/tests.rs",
+        "harness::header_node::round_life::tests::a_frozen_round_life_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/retirement/tests.rs",
+        "harness::header_node::retirement::tests::a_frozen_retirement_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/outstanding/tests.rs",
+        "harness::header_node::outstanding::tests::a_frozen_outstanding_store_drops_a_peak",
+    ),
+    sim_test(
+        "src/harness/header_node/hold_wake/tests.rs",
+        "harness::header_node::hold_wake::tests::a_frozen_hold_wake_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/fork_choice/tests.rs",
+        "harness::header_node::fork_choice::tests::a_frozen_fork_choice_store_drops_a_settled_point",
+    ),
+    sim_test(
+        "src/harness/header_node/chain_effect/tests.rs",
+        "harness::header_node::chain_effect::tests::a_frozen_chain_effect_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::a_frozen_authority_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/wake.rs",
+        "harness::header_node::wake::tests::a_frozen_wake_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/recovery.rs",
+        "harness::header_node::recovery::tests::frozen_recovery_stores_drop_a_start_and_a_spend",
+    ),
+    sim_test("tests/evidence_inventory.rs", "every_shared_field_is_a_registered_store_or_allowed"),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "every_registered_store_names_its_checkpoint_and_producer",
+    ),
+    sim_test("tests/evidence_inventory.rs", "the_scan_follows_aliases"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_finds_atomics"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_reads_enum_variant_fields"),
+    sim_test(
+        "src/harness/header_node/pair.rs",
+        "harness::header_node::pair::tests::an_operation_or_a_call_pairs_once",
+    ),
+    sim_test("tests/header_pairing.rs", "a_call_dispatched_twice_is_refused"),
+    sim_test("tests/header_pairing.rs", "a_call_ended_twice_is_refused"),
+    sim_test("tests/header_pairing.rs", "headers_held_twice_are_refused"),
+    sim_test("tests/header_pairing.rs", "held_headers_ended_twice_are_refused"),
+];
+
 /// A contract that waits for `delivery`, with no proving test yet.
 const fn blocked(
     id: ContractId,
@@ -773,10 +1027,11 @@ const fn satisfied(
 }
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
-/// E10, C18 by E10 with hdr-14.7b's binding, and C14 by hf-6's store
-/// inventory. Every other row's deliveries landed, and its state names the
-/// proving test still missing.
+/// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
+/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
+/// stores, C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every
+/// other row's deliveries landed, and its state names the proving test
+/// still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -809,15 +1064,13 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        waiting(
+        satisfied(
             C4,
             "Evan (xt/planted.rs)",
             "The planted runner classifies baseline and patched runs, replays every catch \
              fresh, puts a deadline on every run and judges nested cases by their set.",
+            C4_PROVING,
             "E6",
-            "runner tests the acceptance build runs: the fresh-replay and hung-run tests are \
-             cfg(unix), which the static check counts as gated, and no test hangs a baseline \
-             or campaign run",
         ),
         waiting(
             C5,
@@ -891,14 +1144,13 @@ pub fn contract_table() -> Vec<Contract> {
             C12_PROVING,
             "E9",
         ),
-        waiting(
+        satisfied(
             C13,
             "Adam's harness",
             "The fault store keeps every distinct fault and every break, and a dropped call \
              clears an untaken fault only after the harness's Shutdown.",
+            C13_PROVING,
             "hf-1, hf-2, hf-3",
-            "the four fault-store histories through the final report and its sidecar, which \
-             hf-1 to hf-3 test at the store and check level only",
         ),
         satisfied(
             C14,
@@ -927,16 +1179,14 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        waiting(
+        satisfied(
             C17,
             "Adam's harness",
             "Evidence stores freeze with the log and snapshot equal across cleanup, the whole \
              ObservationLog at the freeze equals the one Sim::run returns, and the pairer and \
              ledger consume each fact once.",
+            C17_PROVING,
             "hf-6",
-            "tests of the ledger's CallReused, CallEndedTwice and HeldTwice refusals, and \
-             ledger consumption tests the simulator build runs, since zakura-network's lib \
-             tests don't build under cfg(zakura_sim)",
         ),
         satisfied(
             C18,
@@ -970,12 +1220,12 @@ pub fn contract_table() -> Vec<Contract> {
             "a two-finding report and sidecar test for every header check, those hdr-9, \
              hdr-10 and hdr-12 added after hf-8 included",
         ),
-        waiting(
+        satisfied(
             C22,
             "Adam's harness",
             "Each commit-only-authorized finding names its rule kind and its actual subject.",
+            C22_PROVING,
             "hf-9, and E4 for its proving test",
-            "the overgrant credit break at report level, and both cases through the sidecar",
         ),
     ]
 }

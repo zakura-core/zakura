@@ -2292,10 +2292,11 @@ fn scripted_bypasses_never_satisfy_a_catch() {
 /// Every `#[test]` or `#[tokio::test]` function in `source`, by its full
 /// libtest name inside the file (`module::name` for one in an inline
 /// module), and whether its own attributes or an enclosing module's keep it
-/// from running: an `#[ignore]`, or a `cfg` other than the two the
-/// acceptance run's test builds turn on, `test` and `zakura_sim`. Doc
-/// comments and other attributes may sit between the test attribute and
-/// the `fn`.
+/// from running: an `#[ignore]`, or a `cfg` the acceptance run's test
+/// builds leave off. They turn on `test` and `zakura_sim`, and run on
+/// Linux, the only host whose record counts (`Containment::Subreaper`), so
+/// `unix` and `target_os = "linux"` are on too. Doc comments and other
+/// attributes may sit between the test attribute and the `fn`.
 fn test_fns(source: &str) -> BTreeMap<String, bool> {
     use proc_macro2::{Delimiter, TokenStream, TokenTree};
     /// Whether `attribute` keeps the item it's on from running in the
@@ -2320,12 +2321,18 @@ fn test_fns(source: &str) -> BTreeMap<String, bool> {
         }
     }
     /// Whether a `cfg` predicate holds in the acceptance run's test builds,
-    /// where `test` and `zakura_sim` are on and nothing else is known on:
-    /// `all`, `any` and `not` evaluate, and any other option is off.
+    /// where `test`, `zakura_sim`, `unix` and `target_os = "linux"` are on
+    /// and nothing else is known on: `all`, `any` and `not` evaluate, and
+    /// any other option is off.
     fn enabled(predicate: TokenStream) -> bool {
         let tokens: Vec<TokenTree> = predicate.into_iter().collect();
         match tokens.as_slice() {
-            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim",
+            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim" || name == "unix",
+            [TokenTree::Ident(name), TokenTree::Punct(eq), TokenTree::Literal(value)]
+                if eq.as_char() == '=' =>
+            {
+                name == "target_os" && value.to_string() == "\"linux\""
+            }
             [TokenTree::Ident(name), TokenTree::Group(args)] => {
                 let mut parts = Vec::new();
                 let mut part = Vec::new();
@@ -2703,6 +2710,9 @@ fn an_unnamed_replay_test() {{}}
          #[test]\n#[cfg(all(test, zakura_sim))]\nfn h() {}\n\
          #[test]\n#[cfg(all(test, windows))]\nfn i() {}\n\
          #[test]\n#[cfg(not(feature = \"slow\"))]\nfn j() {}\n\
+         #[test]\n#[cfg(target_os = \"linux\")]\nfn k() {}\n\
+         #[test]\n#[cfg(target_os = \"macos\")]\nfn l() {}\n\
+         #[test]\n#[cfg(not(unix))]\nfn n() {}\n\
          #[cfg(test)]\nmod on {\n    #[test]\n    #[cfg(zakura_sim)]\n    fn g() {}\n}\n\
          #[tokio::test(flavor = \"multi_thread\")]\nasync fn e() {}\n\
          fn not_a_test() {}\n",
@@ -2710,7 +2720,7 @@ fn an_unnamed_replay_test() {{}}
     let expected: BTreeMap<String, bool> = [
         ("a", false),
         ("m::a", false),
-        ("b", true),
+        ("b", false),
         ("c", true),
         ("d", false),
         ("e", false),
@@ -2719,6 +2729,9 @@ fn an_unnamed_replay_test() {{}}
         ("h", false),
         ("i", true),
         ("j", false),
+        ("k", false),
+        ("l", true),
+        ("n", true),
     ]
     .map(|(name, cfg)| (name.to_owned(), cfg))
     .into_iter()
@@ -2733,6 +2746,15 @@ fn an_unnamed_replay_test() {{}}
         ..xtask
     })
     .is_err());
+    // A real `#[cfg(unix)]` runner test resolves, since only a Linux run's
+    // record counts.
+    assert_eq!(
+        test_exists(TestRef {
+            test: "planted::tests::a_hung_patched_run_is_killed_and_never_caught",
+            ..xtask
+        }),
+        Ok(())
+    );
     // A real `#[tokio::test]` resolves, and an ignored test doesn't.
     assert_eq!(
         test_exists(TestRef {

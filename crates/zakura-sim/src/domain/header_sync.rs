@@ -2688,4 +2688,238 @@ mod tests {
             "{rows}"
         );
     }
+
+    /// The claim records the tap's drain of `step` keeps for the
+    /// `overgrant` case's credit break on its initial `Open`.
+    fn overgrant_records(step: u64) -> Vec<ClaimRecord> {
+        crate::harness::header_node::authority::tests::overgrant_breaks()
+            .into_iter()
+            .map(|finding| finding.record(step))
+            .collect()
+    }
+
+    /// C22 (b), as reported: the `overgrant` case's credit break on its
+    /// initial `Open` is a `header-sync/commit-only-authorized` violation
+    /// naming the credit rule and that `Open` by its update, with no page,
+    /// and the claims store keeps its attribution with no page either.
+    #[test]
+    fn commit_only_authorized_reports_the_overgrant_update_and_no_page() {
+        let (report, probe) = run_probed(
+            commit_only_authorized(),
+            &[Scripted::Recorded(overgrant_records)],
+        );
+        let records = overgrant_records(1);
+        let [record] = records.as_slice() else {
+            panic!("one credit break: {records:?}");
+        };
+        let [violation] = report.properties[0].violations.as_slice() else {
+            panic!("one violation: {:?}", report.properties[0]);
+        };
+        assert_eq!(violation.property, COMMIT_ONLY_AUTHORIZED);
+        assert_eq!(violation.step, 1);
+        assert_eq!(violation.actual, record.detail);
+        assert!(
+            violation
+                .actual
+                .starts_with("CommitOnlyAuthorized [credit] update Open sequence 0 peer "),
+            "{violation:?}"
+        );
+        assert!(!violation.actual.contains("page"), "{violation:?}");
+        let attribution = claims_attributions(&probe.rounds.stores().snapshot());
+        assert_eq!(
+            attribution,
+            [
+                serde_json::to_value(record.attribution.as_ref().expect("an authority break"))
+                    .expect("an attribution serializes")
+            ]
+        );
+        assert_eq!(
+            attribution[0]["subject"]["subject"], "update",
+            "{attribution:?}"
+        );
+        assert!(
+            !attribution[0].to_string().contains("\"page\""),
+            "{attribution:?}"
+        );
+    }
+
+    /// Each claims store row's attribution in `snapshot`, a node's stores'.
+    fn claims_attributions(snapshot: &serde_json::Value) -> Vec<serde_json::Value> {
+        snapshot
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|store| store["store"] == "claims")
+            .and_then(|store| store["snapshot"].as_array().cloned())
+            .expect("the claims store is in the node's snapshot")
+            .iter()
+            .map(|row| row["attribution"].clone())
+            .collect()
+    }
+
+    /// C22's two report-level cases, which a [`ClaimRun`] records.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum ClaimCase {
+        /// The authority checker's two page breaks at one step.
+        TwoPages,
+        /// The `overgrant` case's credit break on its initial `Open`.
+        Overgrant,
+    }
+
+    impl ClaimCase {
+        /// The claim records the case's drain keeps at a step.
+        fn records(self) -> fn(u64) -> Vec<ClaimRecord> {
+            match self {
+                ClaimCase::TwoPages => two_page_records,
+                ClaimCase::Overgrant => overgrant_records,
+            }
+        }
+    }
+
+    /// [`Probe`] as a harness `record` writes a full report for: its claims
+    /// recorded at step 1 as the tap's drain records them, and its stores
+    /// as the report's snapshot.
+    struct ClaimRun(Probe);
+
+    impl HasView for ClaimRun {
+        type View = Probe;
+
+        /// The probe.
+        fn view(&self) -> Probe {
+            self.0.clone()
+        }
+
+        /// The probe's stores, as a node harness reports its own.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            Some(self.0.rounds.stores().report_snapshot())
+        }
+    }
+
+    impl crate::harness::Subsystem for ClaimRun {
+        const NAME: &'static str = "test/claim-case";
+        const GENERATOR: u32 = 1;
+        const SCENARIO_BYTES: usize = 0;
+        type Scenario = ClaimCase;
+        type Prepared = ();
+
+        /// The default config.
+        fn config(_: &ClaimCase) -> crate::RunConfig {
+            crate::RunConfig::default()
+        }
+
+        /// Nothing to set up.
+        fn prepare(_: &ClaimCase) {}
+
+        /// The case's records at step 1, from one task that runs it.
+        fn build(sim: &mut Sim, case: &ClaimCase, (): ()) -> Self {
+            let probe = Probe::default();
+            sim.add_source(Box::new(Boundaries {
+                script: [Scripted::Recorded(case.records())].into_iter().collect(),
+                probe: probe.clone(),
+            }));
+            sim.scheduler().spawn_root("reactor", async {});
+            ClaimRun(probe)
+        }
+
+        /// Only [`COMMIT_ONLY_AUTHORIZED`].
+        fn properties() -> Vec<Property<Self>> {
+            vec![commit_only_authorized()]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// Unused: the cases are built by hand.
+        fn draw(_: &[u8]) -> ClaimCase {
+            unreachable!("the cases are built by hand")
+        }
+    }
+
+    /// C22 through the sidecar: each case recorded through `record` keeps,
+    /// in the full report beside its trace, every finding with its rule
+    /// kind and its own subject, the two pages each named and the
+    /// overgrant's `Open` named by its update with no page, and the claims
+    /// store's attributions in the report's snapshot. A fresh replay
+    /// verifies and sends the same full report.
+    #[test]
+    fn each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar() {
+        const ENTRY: crate::harness::HarnessEntry = crate::harness::entry::<ClaimRun>();
+        for case in [ClaimCase::TwoPages, ClaimCase::Overgrant] {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            let scenario = serde_json::to_value(case).expect("a case serializes");
+            let trace = crate::harness::record(
+                &ENTRY,
+                crate::harness::RecordInput::Plan {
+                    scenario: &scenario,
+                    plan: &[],
+                },
+                dir.path(),
+            )
+            .expect("the case records");
+            let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
+                .expect("record writes the full report");
+            let full: crate::record::FullReport =
+                serde_json::from_str(&text).expect("the full report reads back");
+            let records = case.records()(1);
+            let found = full
+                .properties
+                .iter()
+                .find(|found| found.property == COMMIT_ONLY_AUTHORIZED)
+                .expect("the report has the property");
+            let actual: Vec<&str> = found
+                .violations
+                .iter()
+                .map(|violation| violation.actual.as_str())
+                .collect();
+            let details: Vec<&str> = records
+                .iter()
+                .map(|record| record.detail.as_str())
+                .collect();
+            assert_eq!(actual, details, "{case:?}");
+            assert!(
+                found.violations.iter().all(|violation| violation.step == 1),
+                "{case:?}: {found:?}"
+            );
+            let expected: Vec<serde_json::Value> = records
+                .iter()
+                .map(|record| {
+                    serde_json::to_value(record.attribution.as_ref().expect("an authority break"))
+                        .expect("an attribution serializes")
+                })
+                .collect();
+            let kept =
+                claims_attributions(full.snapshot.as_ref().expect("the run keeps its stores"));
+            assert_eq!(kept, expected, "{case:?}");
+            let subjects: Vec<&serde_json::Value> = kept
+                .iter()
+                .map(|kept| &kept["subject"]["subject"])
+                .collect();
+            match case {
+                ClaimCase::TwoPages => {
+                    assert_eq!(subjects, ["page", "page"], "{kept:?}");
+                    assert_ne!(kept[0]["subject"], kept[1]["subject"], "{kept:?}");
+                    assert!(
+                        actual.iter().all(|line| line.contains("[path] page")),
+                        "{actual:?}"
+                    );
+                }
+                ClaimCase::Overgrant => {
+                    assert_eq!(subjects, ["update"], "{kept:?}");
+                    assert!(!kept[0].to_string().contains("\"page\""), "{kept:?}");
+                    assert!(
+                        actual[0].starts_with("CommitOnlyAuthorized [credit] update Open ")
+                            && !actual[0].contains("page"),
+                        "{actual:?}"
+                    );
+                }
+            }
+            let replayed =
+                crate::trace::replay_with(&trace, &ENTRY, crate::trace::ReplayOptions::default())
+                    .expect("the trace replays");
+            assert!(replayed.verified(), "{case:?}: {replayed:?}");
+            assert_eq!(replayed.report.as_ref(), Some(&full), "{case:?}");
+        }
+    }
 }

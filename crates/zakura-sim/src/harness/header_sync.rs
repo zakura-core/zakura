@@ -1584,6 +1584,11 @@ pub struct WireScenario {
     pub peers: Vec<PeerSpec>,
     /// How the run completes the node's storage operations.
     pub policy: Policy,
+    /// The run's step budget in place of [`wire_config`]'s, for a history
+    /// the default budget can't reach. `None`, and absent from the JSON,
+    /// leaves the budget to [`Harness::config`](crate::Harness::config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
 }
 
 impl WireScenario {
@@ -1607,6 +1612,7 @@ impl Default for WireScenario {
             node: Chain::default(),
             peers: vec![PeerSpec::dialing()],
             policy: Policy::converging(),
+            budget: None,
         }
     }
 }
@@ -1826,8 +1832,9 @@ impl Subsystem for HeaderWire {
     type Scenario = WireScenario;
     type Prepared = WirePorts;
 
-    /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// [`wire_config`], with the scenario's own budget if it names one, or
+    /// else twice its budget for a scenario with status bursts or an
+    /// over-credit objects page. Emptying a `Status` bucket
     /// takes about 600 frames, and the node about 40 steps to read each. The
     /// node must read the whole 45 KB page before it can count objects, so
     /// with every datagram delivered at once, that run spends up to about
@@ -1841,10 +1848,10 @@ impl Subsystem for HeaderWire {
         });
         let config = wire_config();
         RunConfig {
-            budget: if burst {
-                2 * config.budget
-            } else {
-                config.budget
+            budget: match (scenario.budget, burst) {
+                (Some(budget), _) => budget,
+                (None, true) => 2 * config.budget,
+                (None, false) => config.budget,
             },
             ..config
         }
@@ -2855,6 +2862,28 @@ impl OperationIds {
 mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
+
+    /// A wire scenario's own budget replaces the harness's, burst or not,
+    /// and an unset one is left out of the JSON, so every committed
+    /// scenario's digest stays.
+    #[test]
+    fn a_wire_scenario_budget_replaces_the_harness_budget() {
+        let mut scenario = WireScenario::default();
+        assert_eq!(HeaderWire::config(&scenario).budget, wire_config().budget);
+        let json = serde_json::to_value(&scenario).unwrap();
+        assert!(json.get("budget").is_none(), "{json}");
+        scenario.budget = Some(120_000);
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.peers[0].script.push(PeerAction::Act {
+            act: Act::StatusBurst,
+        });
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.budget = None;
+        assert_eq!(
+            HeaderWire::config(&scenario).budget,
+            2 * wire_config().budget
+        );
+    }
 
     /// The fork fixture's window constants restate production's, and its
     /// header cap leaves more than a refill batch of window.

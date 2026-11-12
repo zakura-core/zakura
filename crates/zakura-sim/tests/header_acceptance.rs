@@ -1687,6 +1687,7 @@ fn every_planted_case_is_named_by_one_row_of_its_kind() {
                 found: Found::AtStep,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             };
         }
     });
@@ -2937,6 +2938,7 @@ fn every_transitional_row_names_an_open_pr() {
         harness,
         found,
         not_applicable,
+        patched_not_applicable,
         companions,
         ..
     } = caught
@@ -2958,6 +2960,7 @@ fn every_transitional_row_names_an_open_pr() {
             set: &["sim/no-task-panic"],
             found,
             not_applicable,
+            patched_not_applicable,
             companions,
         },
     });
@@ -4042,6 +4045,7 @@ fn manifest() -> Manifest {
                 found: Found::AtStep,
                 companions: &["close"],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -4057,6 +4061,7 @@ fn manifest() -> Manifest {
                 found: Found::AtEnd,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -4394,6 +4399,7 @@ fn duplicate_caught() -> Expected {
         found: Found::AtStep,
         companions: &[],
         not_applicable: &[],
+        patched_not_applicable: None,
     }
 }
 

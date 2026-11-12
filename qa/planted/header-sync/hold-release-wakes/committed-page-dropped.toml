@@ -12,6 +12,12 @@ checks = [
     "crates/zakura-network/src/zakura/regulation",
 ]
 
+# A mirror runs the same publisher, so with this patch a campaign input
+# that draws a recovery fixture leaves the source's successor unserved, and
+# the node never makes progress after the recovery: it breaks
+# `bounded-adversary-progress` too.
+also_violates = ["header-sync/bounded-adversary-progress"]
+
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-hold-serving-read.json"

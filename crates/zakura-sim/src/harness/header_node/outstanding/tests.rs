@@ -1,15 +1,16 @@
 //! The outstanding-work rule's rows, fed by hand.
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority,
+    BodyWorkAuthority, BodyWorkEpoch, BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId, VerifiedGeneration,
 };
 use zakura_network::zakura::{
     observe::{
         CallEnd, HeaderRequestTerminal, HeaderTargetPhase, PortCall, ReactorCause, ReactorEvent,
-        ReactorSizes, RequestRef, ReservationPurpose, ServeInUse, SubscriberChange,
+        ReactorSizes, RepairSources, RequestRef, ReservationPurpose, ServeInUse, SubscriberChange,
     },
     HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
@@ -69,9 +70,13 @@ fn held() -> HeldHeaders {
     HeldHeaders::new(|| Some(HashSet::from([block::Hash([3; 32])])))
 }
 
-/// The rule after mirror 2's admission, with a peer limit of 8.
+/// The departed VCT repair suppliers the rule under test allows.
+const DEPARTED: usize = 4;
+
+/// The rule after mirror 2's admission, with a peer limit of 8 and a
+/// departed limit of [`DEPARTED`].
 fn rule() -> Outstanding {
-    let mut rule = Outstanding::new(OutstandingEvidence::default(), 8, held());
+    let mut rule = Outstanding::new(OutstandingEvidence::default(), 8, DEPARTED, held());
     rule.observe(&admitted(mirror(2), 1));
     rule
 }
@@ -81,7 +86,7 @@ fn rule() -> Outstanding {
 #[test]
 fn matching_sizes_hold_and_apply() {
     let evidence = OutstandingEvidence::default();
-    let mut rule = Outstanding::new(evidence.clone(), 8, held());
+    let mut rule = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     rule.observe(&admitted(mirror(2), 1));
     rule.observe(&locator(1, mirror(2)));
     rule.observe(&sizes(|sizes| {
@@ -433,6 +438,26 @@ fn a_row_past_its_bound_breaks() {
     let breaks = rule.drain(2);
     assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(breaks[0].contains("17 slots"), "{breaks:?}");
+}
+
+/// The pruned-peer map holds up to the admitted peer limit, as #2209 caps
+/// it, and breaks past it.
+#[test]
+fn pruned_peers_past_the_peer_limit_break() {
+    let mut rule = rule();
+    rule.observe(&sizes(|sizes| {
+        sizes.pruned_peers = (0..8).map(|n| mirror(n + 10)).collect();
+    }));
+    assert_eq!(rule.drain(1), Vec::<String>::new());
+    rule.observe(&sizes(|sizes| {
+        sizes.pruned_peers = (0..9).map(|n| mirror(n + 10)).collect();
+    }));
+    let breaks = rule.drain(2);
+    assert_eq!(breaks.len(), 1, "{breaks:?}");
+    assert!(
+        breaks[0].contains("9 pruned peers, past its 8"),
+        "{breaks:?}"
+    );
 }
 
 /// Open locator calls past the 16 permits break the rule, even when each
@@ -800,7 +825,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
     );
 
     let evidence = OutstandingEvidence::default();
-    let mut shut = Outstanding::new(evidence.clone(), 8, held());
+    let mut shut = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     shut.observe(&ReactorEvent::PublisherStarted {
         peer: mirror(2),
         session_id: 1,
@@ -816,13 +841,14 @@ fn ended_subscriptions_shutdown_and_released_slots() {
         violation: None,
         drain: None,
         harness: None,
+        rest: Some(zakura_scheduler::Status::Quiescent),
     });
     assert_eq!(evidence.lingering_at_rest(), [(mirror(2), 1)]);
 
     // A publisher whose session's token was cancelled lingers at rest,
     // whatever cancelled it, and one whose token holds doesn't.
     let evidence = OutstandingEvidence::default();
-    let mut cancelled = Outstanding::new(evidence.clone(), 8, held());
+    let mut cancelled = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     for session_id in [6, 7] {
         cancelled.observe(&ReactorEvent::PublisherStarted {
             peer: mirror(3),
@@ -841,6 +867,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
         violation: None,
         drain: None,
         harness: None,
+        rest: Some(zakura_scheduler::Status::Quiescent),
     });
     assert_eq!(evidence.lingering_at_rest(), [(mirror(3), 6)]);
 
@@ -982,4 +1009,397 @@ fn retained_paths_hold_at_sixteen_and_break_past_it() {
         rule.storage(&fact(17));
         assert_eq!(rule.drain(3), Vec::<String>::new(), "{row}");
     }
+}
+
+/// What `outstanding-work-bounded` reads, with no tap behind it.
+#[derive(Clone, Default)]
+struct Probe {
+    claims: super::super::claim::ClaimEvidence,
+    outstanding: OutstandingEvidence,
+}
+
+impl crate::domain::header_sync::OutstandingView for Probe {
+    fn claims(&self) -> &super::super::claim::ClaimEvidence {
+        &self.claims
+    }
+
+    fn outstanding(&self) -> &OutstandingEvidence {
+        &self.outstanding
+    }
+}
+
+impl crate::property::HasView for Probe {
+    type View = Probe;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> Probe {
+        self.clone()
+    }
+
+    /// Keeps the run's end for the end check.
+    fn ended(&self, end: &crate::RunEnd) {
+        self.outstanding.end(end);
+    }
+
+    /// [`crate::domain::header_sync::outstanding_end_violations`].
+    fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+        crate::domain::header_sync::outstanding_end_violations(&self.outstanding)
+    }
+}
+
+/// How [`lingering_outcome`]'s run leaves the scheduler at its end.
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+    /// Every task finishes.
+    Quiescent,
+    /// A ready task never gets the one worker.
+    Starved,
+    /// A task waits forever on nothing that can wake it.
+    Deadlocked,
+}
+
+/// `outstanding-work-bounded`'s outcome over a run with one worker, where
+/// a publisher whose session's token is cancelled is still running from
+/// the start, and the run's tasks end as `ends` says.
+fn lingering_outcome(ends: Ends) -> crate::PropertyOutcome {
+    use crate::property::{Assumptions, Registry, RegistryChecker, Source, Sources};
+    let probe = Probe::default();
+    let mut publisher = Outstanding::new(probe.outstanding.clone(), 8, DEPARTED, held());
+    publisher.observe(&ReactorEvent::PublisherStarted {
+        peer: mirror(3),
+        session_id: 6,
+    });
+    let token = CancellationToken::new();
+    publisher.session_cancel(&mirror(3), 6, token.clone());
+    token.cancel();
+    let registry = Registry::new(vec![
+        crate::domain::header_sync::outstanding_work_bounded::<Probe>(),
+    ])
+    .expect("one property");
+    let mut checker = RegistryChecker::new(
+        registry,
+        std::rc::Rc::new(probe),
+        Assumptions::none(),
+        &Sources::observed(&[Source::View]),
+    );
+    let config = crate::RunConfig {
+        scheduler: zakura_scheduler::SchedulerConfig {
+            workers: 1,
+            stack_size: 64 * 1024,
+            ..zakura_scheduler::SchedulerConfig::default()
+        },
+        budget: 0,
+        drain_bound: 1_000,
+        ..crate::RunConfig::default()
+    };
+    let mut sim = crate::Sim::new(config, crate::Plan::from_fuzz(&[]));
+    // The holder yields holding the lock, the waiter takes the only worker
+    // and parks on it, and the holder is ready with no worker to run on.
+    let lock = std::sync::Arc::new(zakura_rt::sync::Mutex::new(()));
+    let held_lock = lock.clone();
+    sim.scheduler().spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held_lock.lock().unwrap();
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    match ends {
+        Ends::Quiescent => {}
+        Ends::Starved => {
+            sim.scheduler().spawn_root("waiter", async move {
+                drop(lock.lock().unwrap());
+            });
+        }
+        Ends::Deadlocked => {
+            sim.scheduler()
+                .spawn_root("stuck", std::future::pending::<()>());
+        }
+    }
+    let report = sim.run(&mut checker, &mut crate::MemorySink::default());
+    report.properties[0].outcome.clone()
+}
+
+/// Sol 1 and Terra 2: a cancelled publisher isn't judged at a worker-starved
+/// step, where a ready task has no worker yet, only once the run is at
+/// rest.
+#[test]
+fn a_worker_starved_step_does_not_judge_a_cancelled_publisher() {
+    assert!(
+        matches!(
+            lingering_outcome(Ends::Quiescent),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "a run at rest judges it"
+    );
+    assert!(
+        !matches!(
+            lingering_outcome(Ends::Starved),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "{:?}",
+        lingering_outcome(Ends::Starved)
+    );
+}
+
+/// Evan, #2283 review: a deadlocked dry end is at rest, since no worker
+/// count unsticks it and a lost wake shows up as one, so it judges a
+/// cancelled publisher still running, as a quiescent end does.
+#[test]
+fn a_deadlocked_end_judges_a_cancelled_publisher() {
+    assert!(
+        matches!(
+            lingering_outcome(Ends::Deadlocked),
+            crate::PropertyOutcome::Violated { .. }
+        ),
+        "{:?}",
+        lingering_outcome(Ends::Deadlocked)
+    );
+}
+
+/// Mirror `n`'s VCT repair source, its peer's digest.
+fn source(n: u8) -> SourceId {
+    SourceId::from_digest(mirror(n).digest())
+}
+
+/// A VCT repair context read, call `call`, for the repair owner of
+/// request `request`.
+fn context(call: u64, request: u64) -> ReactorEvent {
+    let authority = BodyWorkAuthority {
+        header: HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(1),
+            branch: BranchId::new(block::Hash([1; 32]), block::Hash([3; 32])),
+        },
+        verified_generation: VerifiedGeneration::new(1),
+        body_work_epoch: BodyWorkEpoch::new(0),
+    };
+    ReactorEvent::Dispatched {
+        call,
+        op: PortCall::VctContext {
+            owner: authority.bind(
+                u64::MAX,
+                NonZeroU64::new(request).expect("tests name nonzero requests"),
+            ),
+            height: block::Height(2),
+        },
+    }
+}
+
+/// The departed repair suppliers stay within the departed limit: at it
+/// they hold, and one past it breaks. Every set may hold the admitted
+/// peer's source and each departed one, which is the per-set bound.
+#[test]
+fn repair_sources_at_and_one_past_the_departed_limit() {
+    let at_limit = |sizes: &mut ReactorSizes| {
+        let departed: Vec<SourceId> = (0..4).map(|n| source(n + 10)).collect();
+        let every: Vec<SourceId> = std::iter::once(source(2))
+            .chain(departed.iter().copied())
+            .collect();
+        sizes.repair_sources = RepairSources {
+            tried: every.clone(),
+            excluded_input: every.clone(),
+            busy: every.clone(),
+            target_refusals: every,
+            departed,
+        };
+    };
+    let mut held = rule();
+    held.observe(&sizes(at_limit));
+    assert_eq!(held.drain(1), Vec::<String>::new());
+
+    let mut past = rule();
+    past.observe(&sizes(|sizes| {
+        at_limit(sizes);
+        sizes.repair_sources.departed.push(source(14));
+    }));
+    let found = past.drain(1);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("holds 5 departed repair sources, past its 4")),
+        "{found:?}"
+    );
+}
+
+/// A departed supplier's held history may not name an admitted peer, and
+/// a set's key must be an admitted peer's source or a held departure, so a
+/// departed source that's never held or pruned breaks.
+#[test]
+fn a_stray_repair_source_breaks_its_row() {
+    let mut connected = rule();
+    connected.observe(&sizes(|sizes| {
+        sizes.repair_sources.tried = vec![source(2)];
+        sizes.repair_sources.departed = vec![source(2)];
+    }));
+    let found = connected.drain(1);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("which are admitted peers")),
+        "{found:?}"
+    );
+
+    let rows: [(&str, Mutation); 4] = [
+        (
+            "tried repair sources",
+            Box::new(|sizes| sizes.repair_sources.tried = vec![source(9)]),
+        ),
+        (
+            "excluded repair sources",
+            Box::new(|sizes| sizes.repair_sources.excluded_input = vec![source(9)]),
+        ),
+        (
+            "busy repair sources",
+            Box::new(|sizes| sizes.repair_sources.busy = vec![source(9)]),
+        ),
+        (
+            "repair target refusals",
+            Box::new(|sizes| sizes.repair_sources.target_refusals = vec![source(9)]),
+        ),
+    ];
+    for (row, change) in rows {
+        let mut stray = rule();
+        stray.observe(&sizes(&change));
+        let found = stray.drain(1);
+        assert!(
+            found
+                .iter()
+                .any(|found| found.contains(&format!("holds {row} ["))
+                    && found.contains("held departures")),
+            "{row}: {found:?}"
+        );
+        let mut departed = rule();
+        departed.observe(&sizes(|sizes| {
+            change(sizes);
+            sizes.repair_sources.departed = vec![source(9)];
+        }));
+        assert_eq!(departed.drain(1), Vec::<String>::new(), "{row}");
+    }
+}
+
+/// One open repair context read per owner holds, and a second for the same
+/// owner breaks. A replaced episode's read, under another owner, may still
+/// be open beside its successor's.
+#[test]
+fn repair_context_reads_at_and_one_past_one_per_owner() {
+    let mut one = rule();
+    one.observe(&context(1, 1));
+    one.observe(&context(2, 2));
+    one.observe(&sizes(|sizes| {
+        sizes.storage_calls = vec![1, 2];
+        sizes.port_futures = 2;
+    }));
+    assert_eq!(one.drain(1), Vec::<String>::new());
+
+    let mut two = rule();
+    two.observe(&context(1, 1));
+    two.observe(&context(2, 1));
+    two.observe(&sizes(|sizes| {
+        sizes.storage_calls = vec![1, 2];
+        sizes.port_futures = 2;
+    }));
+    let found = two.drain(1);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("holds 2 open repair context reads")),
+        "{found:?}"
+    );
+}
+
+/// An open repair context read may stay open up to the request timeout
+/// after its dispatch, and breaks one moment past it.
+#[test]
+fn a_repair_context_read_past_its_timeout_breaks() {
+    let dispatched = Duration::from_secs(5);
+    for (now, breaks) in [
+        (dispatched + REPAIR_CONTEXT_TIMEOUT, false),
+        (
+            dispatched + REPAIR_CONTEXT_TIMEOUT + Duration::from_millis(1),
+            true,
+        ),
+    ] {
+        let mut rule = rule();
+        rule.at(Some(dispatched));
+        rule.observe(&context(1, 1));
+        rule.at(Some(now));
+        rule.observe(&sizes(|sizes| {
+            sizes.storage_calls = vec![1];
+            sizes.port_futures = 1;
+        }));
+        let found = rule.drain(1);
+        assert_eq!(
+            found
+                .iter()
+                .any(|found| found.contains("past the 30s request timeout")),
+            breaks,
+            "{now:?}: {found:?}"
+        );
+    }
+}
+
+/// A repair context read that ends past the request timeout breaks at its
+/// `CallEnded`, even when no `Sizes` report saw it open that late.
+#[test]
+fn a_repair_context_read_ending_past_its_timeout_breaks() {
+    let dispatched = Duration::from_secs(5);
+    for (ended, breaks) in [
+        (dispatched + REPAIR_CONTEXT_TIMEOUT, false),
+        (
+            dispatched + REPAIR_CONTEXT_TIMEOUT + Duration::from_millis(1),
+            true,
+        ),
+    ] {
+        let mut rule = rule();
+        rule.at(Some(dispatched));
+        rule.observe(&context(1, 1));
+        rule.at(Some(dispatched + REPAIR_CONTEXT_TIMEOUT));
+        rule.observe(&sizes(|sizes| {
+            sizes.storage_calls = vec![1];
+            sizes.port_futures = 1;
+        }));
+        rule.at(Some(ended));
+        rule.observe(&ReactorEvent::CallEnded {
+            call: 1,
+            end: CallEnd::TimedOut,
+        });
+        let found = rule.drain(1);
+        assert_eq!(
+            found
+                .iter()
+                .any(|found| found.contains("ended a repair context read")),
+            breaks,
+            "{ended:?}: {found:?}"
+        );
+    }
+}
+
+/// A read still open at the shutdown unit's `Sizes`, or dropped by the
+/// teardown, isn't judged by age, since a reactor parked on a fatal
+/// local-operation deadline stops polling its calls until shutdown.
+#[test]
+fn a_shutdown_judges_no_repair_context_read_by_age() {
+    let late = Duration::from_secs(5) + REPAIR_CONTEXT_TIMEOUT * 2;
+    let mut rule = rule();
+    rule.at(Some(Duration::from_secs(5)));
+    rule.observe(&context(1, 1));
+    rule.at(Some(late));
+    rule.observe(&ReactorEvent::CauseSet {
+        cause: ReactorCause::Shutdown,
+    });
+    rule.observe(&sizes(|sizes| {
+        sizes.storage_calls = vec![1];
+        sizes.port_futures = 1;
+    }));
+    rule.observe(&ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::Dropped,
+    });
+    let found = rule.drain(1);
+    assert!(
+        !found
+            .iter()
+            .any(|found| found.contains("repair context read")),
+        "{found:?}"
+    );
 }

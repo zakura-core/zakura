@@ -71,8 +71,14 @@ const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 const HOLD: &str = "header-sync/hold-release-wakes";
 /// `header-sync/peer-retirement-progress`.
 const RETIREMENT: &str = "header-sync/peer-retirement-progress";
+/// `header-sync/expected-chain-selected`.
+const SELECTED: &str = "header-sync/expected-chain-selected";
+/// `header-sync/state-publication-consistent`.
+const PUBLICATION: &str = "header-sync/state-publication-consistent";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
+/// `header-sync/bounded-adversary-progress`.
+const RECOVERY_ID: &str = "header-sync/bounded-adversary-progress";
 /// `header-sync/watch-observed-under-flood`.
 const WATCH_WIRE: &str = "header-sync/watch-observed-under-flood";
 /// `header-sync/watch-observed-under-lifecycle-flood`.
@@ -88,7 +94,7 @@ const HONEST: &str = "session/honest-never-punished";
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
-const STORAGE_REGISTERS: [&str; 12] = [
+const STORAGE_REGISTERS: [&str; 14] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -100,6 +106,8 @@ const STORAGE_REGISTERS: [&str; 12] = [
     CHAIN,
     COMMIT,
     RETIREMENT,
+    SELECTED,
+    PUBLICATION,
     OUTSTANDING,
 ];
 
@@ -127,6 +135,8 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
+    matrix.push((STORAGE, RECOVERY_ID, Status::Active));
+    matrix.push((LIVENESS, RECOVERY_ID, Status::Active));
     matrix
 }
 
@@ -162,6 +172,8 @@ const G24: &[Gate] = &[Gate::G2, Gate::G4];
 const G3: &[Gate] = &[Gate::G3];
 /// Gates 3 and 4: sender cadence.
 const G34: &[Gate] = &[Gate::G3, Gate::G4];
+/// Gates 1, 3 and 4.
+const G134: &[Gate] = &[Gate::G1, Gate::G3, Gate::G4];
 /// Gate 5 alone.
 const G5: &[Gate] = &[Gate::G5];
 /// Gate 1 alone.
@@ -310,14 +322,43 @@ const CHAIN_CASES: [&str; 4] = [
     "reset-inside-status-floor ",
 ];
 /// Each authority witness's name, as its witness test prefixes its executions.
-const AUTHORITY_CASES: [&str; 3] = [
+const AUTHORITY_CASES: [&str; 4] = [
     "forks-sharing-a-header ",
     "multi-page-sync ",
     "relinked-mid-round ",
+    "harness-commit ",
+];
+/// Each fork-choice witness's name, as its witness test prefixes its
+/// executions.
+const SELECTED_CASES: [&str; 7] = [
+    "stronger-first ",
+    "stronger-last ",
+    "three-forks ",
+    "equal-work ",
+    "heavier-offered-to-longer ",
+    "invalidated-then-reconsidered ",
+    "harness-commit ",
+];
+/// Each publication witness's name, as its witness test prefixes its
+/// executions.
+const PUBLICATION_CASES: [&str; 13] = [
+    "startup-only ",
+    "quiet-reset ",
+    "invalidate-only ",
+    "grow ",
+    "reset-inside-status-floor ",
+    "harness-commit ",
+    "sync ",
+    "served ",
+    "served-one-header ",
+    "served-from-a-lower-locator ",
+    "served-in-pages ",
+    "served-after-growth ",
+    "served-across-a-reset ",
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
-const OUTSTANDING_CASES: [&str; 9] = [
+const OUTSTANDING_CASES: [&str; 10] = [
     "header-authority-forks-sharing-a-header",
     "header-authority-relinked-mid-round",
     "header-reset-held-apply",
@@ -327,6 +368,7 @@ const OUTSTANDING_CASES: [&str; 9] = [
     "header-outstanding-churn",
     "header-outstanding-serving-churn",
     "header-outstanding-serving-replaced",
+    "header-outstanding-capacity-waits",
 ];
 
 /// The committed reset witnesses, each holding and applying
@@ -362,6 +404,28 @@ const AUTHORITY_WITNESSES: HistoryRef = HistoryRef {
     case: "forks-sharing-a-header plan 0 of inputs(8, 256)",
 };
 
+/// The fork-choice witnesses, each holding and applying
+/// `expected-chain-selected`.
+const SELECTED_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_chain_selected.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "stronger-first plan 0 of inputs(8, 256)",
+};
+
+/// The publication witnesses, each holding and applying
+/// `state-publication-consistent`.
+const PUBLICATION_WITNESSES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: sim_test(
+        "tests/header_publication.rs",
+        "every_witness_holds_and_applies",
+    ),
+    case: "startup-only plan 0 of inputs(8, 256)",
+};
+
 /// The committed outstanding-work witnesses, each holding and applying
 /// `outstanding-work-bounded` under its committed Plan.
 const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
@@ -371,6 +435,25 @@ const OUTSTANDING_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_witnesses_hold_outstanding_work_bounded",
     ),
     case: "header-authority-forks-sharing-a-header",
+};
+
+/// Each committed repair input, as its witness test names its execution.
+const REPAIR_OUTSTANDING_CASES: [&str; 4] = [
+    "committed header-repair-applied input",
+    "committed header-repair-prepare-departs input",
+    "committed header-repair-apply-departs input",
+    "committed header-repair-supplier-pruned input",
+];
+
+/// The committed repair inputs, each holding and applying
+/// `outstanding-work-bounded` under its committed Plan.
+const REPAIR_OUTSTANDING: HistoryRef = HistoryRef {
+    harness: REPAIR,
+    witness: sim_test(
+        "tests/header_repair.rs",
+        "the_committed_repair_inputs_hold_outstanding_work_bounded",
+    ),
+    case: "committed header-repair-applied input",
 };
 
 /// Each committed hold-release fixture, by its fixture stem, which its
@@ -415,6 +498,27 @@ const RETIRE_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_fixtures_match_their_names",
     ),
     case: "header-retire-timeout",
+};
+
+/// Each committed recovery fixture, by its fixture stem, which its witness
+/// test runs under the fixed Plan: hdr-11's control and hdr-13's close,
+/// fault and departure classes.
+const RECOVERY_CASES: [&str; 4] = [
+    "header-recovery-successor",
+    "header-recovery-closes",
+    "header-recovery-faults",
+    "header-recovery-departure",
+];
+
+/// The committed recovery fixtures, each holding and applying
+/// `bounded-adversary-progress` under the fixed Plan.
+const RECOVERY_WITNESS: HistoryRef = HistoryRef {
+    harness: LIVENESS,
+    witness: sim_test(
+        "tests/header_recovery_progress.rs",
+        "the_committed_fixtures_match_their_names",
+    ),
+    case: "header-recovery-successor",
 };
 
 /// The flood witness test, which runs both committed flood inputs.
@@ -728,6 +832,8 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         (&RESET_CASES[..], RESET_WITNESSES, RESET),
         (&CHAIN_CASES[..], CHAIN_WITNESSES, CHAIN),
         (&AUTHORITY_CASES[..], AUTHORITY_WITNESSES, COMMIT),
+        (&SELECTED_CASES[..], SELECTED_WITNESSES, SELECTED),
+        (&PUBLICATION_CASES[..], PUBLICATION_WITNESSES, PUBLICATION),
     ] {
         for prefix in cases {
             for case in plan_cases(prefix, "inputs(8, 256)", 8) {
@@ -744,6 +850,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             OUTSTANDING,
         ));
     }
+    for case in REPAIR_OUTSTANDING_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..REPAIR_OUTSTANDING
+            },
+            OUTSTANDING,
+        ));
+    }
     // Each committed hdr-10 liveness fixture under the fixed Plan.
     for (cases, history, id) in [
         (&HOLD_CASES[..], HOLD_WITNESSES, HOLD),
@@ -752,6 +867,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         for &case in cases {
             histories.push((HistoryRef { case, ..history }, id));
         }
+    }
+    for case in RECOVERY_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..RECOVERY_WITNESS
+            },
+            RECOVERY_ID,
+        ));
     }
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
@@ -881,6 +1005,9 @@ pub fn witness_tests() -> Vec<TestRef> {
         OUTSTANDING_WITNESSES.witness,
         HOLD_WITNESSES.witness,
         RETIRE_WITNESSES.witness,
+        SELECTED_WITNESSES.witness,
+        PUBLICATION_WITNESSES.witness,
+        RECOVERY_WITNESS.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
         MID_PREPARE.witness,
@@ -1250,6 +1377,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "insertion-bump-skipped-by-commit",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "insertion-bump-skipped-held",
             STORAGE,
             &[RESET] as &'static [&'static str],
@@ -1424,6 +1557,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "corrupted-best-score",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-best-score-by-commit",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1651,6 +1790,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "v1-record-charged-twice",
+            REPAIR,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "wrong-acknowledgement",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -1760,6 +1905,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "departed-source-unpruned",
+            REPAIR,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "ended-kept",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
@@ -1844,7 +1995,19 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "unbounded-slots",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "unknown-as-known",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "waits-kept",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,
@@ -1918,6 +2081,200 @@ fn hand_written_rows() -> Vec<Row> {
         &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS],
         retirement,
     ));
+
+    let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
+    for (index, (name, harness, set, found)) in [
+        (
+            "every-session-refused",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "later-sessions-refused",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "missing-cooldown-refuses",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "service-rejects-valid-streams",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "offer-by-height",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "score-corrupted",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "score-corrupted-by-commit",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "selector-prefers-length",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        selected.extend(caught(
+            harness,
+            case(SELECTED, name),
+            set,
+            found,
+            G2,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(SELECTED, storage_harnesses, selected));
+
+    let mut publication = holds(PUBLICATION, G134, PUBLICATION_WITNESSES);
+    // `stale-status-cache` and `unsent-tip` are the adopted-state native
+    // mutations, moved here as cases of their own names.
+    for (index, (name, harness, set, found)) in [
+        (
+            "ancestor-field",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-locator-dropped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-page-height",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "first-page-target",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "mixed-adoption",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "old-fields-after-reset",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "page-order",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "permanent-refusal",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "postponed-while-changing",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "publication-skipped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-status-cache",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "store-dropped",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stored-version-kept",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "target-as-ancestor",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        // The unsent tip shows only when the run comes to rest, as the
+        // property's end finding.
+        (
+            "unsent-tip",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtEnd,
+        ),
+        (
+            "watch-ignored",
+            LIVENESS,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "watch-ignored-in-storage",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "wrong-fork-served",
+            STORAGE,
+            &[PUBLICATION] as &'static [&'static str],
+            Found::AtStep,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        publication.extend(caught(
+            harness,
+            case(PUBLICATION, name),
+            set,
+            found,
+            G134,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(PUBLICATION, storage_harnesses, publication));
 
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);
@@ -2010,6 +2367,29 @@ fn hand_written_rows() -> Vec<Row> {
         }),
         expected: progressing,
     });
+
+    let recovery = RECOVERY_ID;
+    let mut recovering = holds(recovery, NONE, RECOVERY_WITNESS);
+    // hdr-11's control bypass, then hdr-13's: each violates only this ID
+    // on its committed fixture (a case's `also_violates` covers only its
+    // campaign's departure inputs).
+    for name in [
+        "skipped-apply",
+        "stalled-successor",
+        "faulted-target-remembered",
+        "refusal-never-lifts",
+        "pause-outlasts-cooldown",
+    ] {
+        recovering.extend(caught(
+            LIVENESS,
+            case(recovery, name),
+            &[RECOVERY_ID],
+            Found::AtStep,
+            NONE,
+            name == "stalled-successor",
+        ));
+    }
+    rows.push(sim_row(recovery, &[STORAGE, LIVENESS], recovering));
 
     let mut reactor = vec![result(
         vec![Key::passing(REACTOR)],
@@ -2555,11 +2935,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         "header-sync/reset-invalidates-work",
         "hdr-9a.2",
     ),
-    to_move(
-        "stale-status-cache",
-        "header-sync/state-publication-consistent",
-        "hdr-12b",
-    ),
+    NativeMutation {
+        patch: "stale-status-cache",
+        class: NativeClass::Moved {
+            property: "header-sync/state-publication-consistent",
+            case: "stale-status-cache",
+        },
+    },
     to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
     NativeMutation {
         patch: "unreleased-retirement",
@@ -2568,11 +2950,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "unreleased-retirement",
         },
     },
-    to_move(
-        "unsent-tip",
-        "header-sync/state-publication-consistent",
-        "hdr-12b",
-    ),
+    NativeMutation {
+        patch: "unsent-tip",
+        class: NativeClass::Moved {
+            property: "header-sync/state-publication-consistent",
+            case: "unsent-tip",
+        },
+    },
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
@@ -2645,9 +3029,8 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
-    "the_not_applicable_inventory_equals_a_source_scan",
+    "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
-    "the_source_scan_refuses_an_unlisted_producer",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -2761,33 +3144,27 @@ pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> 
         .collect()
 }
 
-/// The `NotApplicable` reasons' expected results. On `main` a report
-/// doesn't name its reason, so no test can tell two reasons apart until E1
-/// (C1) makes `NotApplicable` carry one.
+/// The `NotApplicable` reasons' expected results, one per reason a header
+/// ID can carry ([`super::reasons::NA_REASONS`]).
 pub fn reason_results() -> Vec<ExpectedResult> {
-    let mut results = Vec::new();
-    for producer in super::reasons::NA_REASONS {
-        for (index, construction) in producer.constructions.iter().enumerate() {
-            if construction.kind != super::reasons::NaKind::MissingEvidence {
-                results.push(result(
-                    vec![Key::NaReason {
-                        file: producer.file.to_owned(),
-                        function: producer.function.to_owned(),
-                        index,
-                    }],
-                    &[Gate::G6],
-                    REASON_TEST,
-                ));
-            }
-        }
-    }
-    results
+    super::reasons::NA_REASONS
+        .iter()
+        .map(|entry| {
+            result(
+                vec![Key::NaReason {
+                    reason: entry.reason,
+                }],
+                &[Gate::G6],
+                REASON_TEST,
+            )
+        })
+        .collect()
 }
 
-/// A `NotApplicable` reason's test, until a report names its reason (E1).
+/// A `NotApplicable` reason's test, until E1's tests show each at its
+/// trigger.
 pub const REASON_TEST: Expected = Expected::Open {
-    reason: "a test that shows this reason at its trigger, once a report names its \
-             NotApplicable reason",
+    reason: "a test that shows this reason at its trigger",
     owner: "Adam's side",
     approval: Approval::Pending,
     until: Some("E1"),

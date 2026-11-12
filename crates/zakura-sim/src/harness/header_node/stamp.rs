@@ -31,6 +31,11 @@ impl Stamps {
             .expect("a run stamps fewer than 2^64 facts")
     }
 
+    /// The last stamp handed out, or 0 before the first.
+    pub fn issued(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
     /// Every stamp handed out after `after`, or every one with `None`, in
     /// increasing order.
     pub fn after(&self, after: Option<u64>) -> Vec<u64> {
@@ -49,9 +54,11 @@ mod tests {
     fn stamps_count_up_across_clones() {
         let stamps = Stamps::default();
         assert_eq!(stamps.after(None), Vec::<u64>::new());
+        assert_eq!(stamps.issued(), 0);
         let clone = stamps.clone();
         assert_eq!((stamps.next(), clone.next(), stamps.next()), (1, 2, 3));
         assert_eq!(stamps.after(None), [1, 2, 3]);
+        assert_eq!(clone.issued(), 3);
         assert_eq!(clone.after(Some(1)), [2, 3]);
         assert_eq!(stamps.after(Some(3)), Vec::<u64>::new());
     }

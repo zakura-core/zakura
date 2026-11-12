@@ -1,0 +1,10 @@
+# The subscriber's byte window counts each header's auxiliary record twice
+# when the Open chooses V1, so a V1 Open grants more bytes than its
+# reserved headers' smallest pages. Only V1 is mischarged, so the storage
+# witnesses, whose Opens carry no auxiliary schema, still hold. The input
+# is the repair harness's successful VCT repair, whose round opens under
+# V1 and whose mirror serves the auxiliary records. The reactor's repair
+# path, the subscriber and the page format decide when the repair opens
+# and under which schema, so a change there can move the input off it.
+input = "crates/zakura-sim/tests/fixtures/header-repair-applied.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync"]

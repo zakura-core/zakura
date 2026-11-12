@@ -448,17 +448,28 @@ impl RepairRequirement {
 pub(in crate::zakura::header_sync) struct RepairRequirementSlot(Option<RepairRequirement>);
 
 impl RepairRequirementSlot {
-    /// The entries of the current requirement's source sets and maps, or 0
+    /// The current requirement's source sets and maps, by key, or all empty
     /// with none.
     #[cfg(any(test, zakura_sim))]
-    pub fn source_entries(&self) -> usize {
-        self.0.as_ref().map_or(0, |requirement| {
-            requirement.tried_sources.len()
-                + requirement.excluded_input_sources.len()
-                + requirement.busy_sources.len()
-                + requirement.target_refusals.len()
-                + requirement.departed_sources.len()
-        })
+    pub fn sources(&self) -> crate::zakura::header_sync::observe::RepairSources {
+        /// `sources`, copied and in ascending order.
+        fn sorted<'s>(sources: impl Iterator<Item = &'s SourceId>) -> Vec<SourceId> {
+            let mut sources: Vec<SourceId> = sources.copied().collect();
+            sources.sort_unstable();
+            sources
+        }
+        self.0
+            .as_ref()
+            .map(
+                |requirement| crate::zakura::header_sync::observe::RepairSources {
+                    tried: sorted(requirement.tried_sources.iter()),
+                    excluded_input: sorted(requirement.excluded_input_sources.iter()),
+                    busy: sorted(requirement.busy_sources.keys()),
+                    target_refusals: sorted(requirement.target_refusals.keys()),
+                    departed: sorted(requirement.departed_sources.keys()),
+                },
+            )
+            .unwrap_or_default()
     }
 
     /// Return the sole current task.

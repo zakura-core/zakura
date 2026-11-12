@@ -1,0 +1,23 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index e4c6d7bee1..b19efa1c00 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2648,6 +2648,18 @@ impl HeaderSyncReactor {
+         };
+         let status = Status::from_snapshot(&snapshot, self.page_limits);
+         let now = Instant::now();
++        // Mutation: a new generation is stored with the previous tip, while
++        // the adoption, its `Status` and its tip publication carry the new
++        // one.
++        let mut snapshot = snapshot;
++        if let Some(old) = self
++            .committed_snapshot
++            .as_ref()
++            .filter(|old| old.header_generation != snapshot.header_generation)
++        {
++            snapshot.frontiers.header_best = old.frontiers.header_best;
++            snapshot.header_best_score = old.header_best_score;
++        }
+         self.committed_snapshot = Some(snapshot);
+         observe!(self, ReactorEvent::stored(self.committed_snapshot.as_ref()));
+         self.schedule_current_vct_repair();

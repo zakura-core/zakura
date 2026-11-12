@@ -14,9 +14,17 @@
 # the input off its held read.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
 # A reactor that no longer wakes for a reply also never hands a departed
-# peer's target off, so a campaign input that draws a departure fixture
-# breaks `peer-retirement-progress`'s hand-off too.
-also_violates = ["header-sync/peer-retirement-progress"]
+# peer's target off, and never makes progress after a recovery, so a
+# campaign input that draws a departure or recovery fixture breaks
+# `peer-retirement-progress`'s hand-off or `bounded-adversary-progress`
+# too. A reactor that has returned also never sends the `Status` a
+# publication fixture's session is owed, so an input that draws one breaks
+# `state-publication-consistent`'s status deadline.
+also_violates = [
+    "header-sync/peer-retirement-progress",
+    "header-sync/bounded-adversary-progress",
+    "header-sync/state-publication-consistent",
+]
 
 [typed]
 harness = "header-sync/liveness"

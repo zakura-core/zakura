@@ -27,6 +27,7 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_scheduler::{SchedulerConfig, SimInstant, Status};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::after_step,
     observe::{StorageFact, StorageRequest, StorageResult, StorageState},
@@ -604,10 +605,29 @@ fn shutdown_releases_everything_and_logs_nothing() {
             sim.add_source(Box::new(storage));
             held = Some((port, semaphore));
         },
-        &mut zakura_sim::NoChecks,
+        // A violation stops the run at the step that submits the call,
+        // before the drain could complete it.
+        &mut zakura_sim::check::after_step(|cx| {
+            let submitted = cx.observations().any(|obs| {
+                matches!(
+                    obs,
+                    Observation::Storage {
+                        fact: StorageFact::Submitted { .. },
+                        ..
+                    }
+                )
+            });
+            submitted.then(|| zakura_sim::Violation {
+                property: "test/stop".to_owned(),
+                step: cx.step,
+                witness: vec![cx.step],
+                expected: "a stop before the call completes".to_owned(),
+                actual: format!("step {}", cx.step),
+            })
+        }),
     );
     let (port, semaphore) = held.expect("setup ran");
-    assert_eq!(report.end.outcome, Outcome::Budget);
+    assert_eq!(report.end.outcome, Outcome::Violation);
     let logged = heads(&report);
     assert!(
         matches!(logged.as_slice(), [StorageFact::Submitted { .. }]),
@@ -999,6 +1019,21 @@ impl<S: ActionSource> ActionSource for SkipAt<S> {
         }
         self.inner.observe(log)
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A run where one task reads membership through a controlled port, with
@@ -1067,6 +1102,21 @@ impl<S: ActionSource> ActionSource for Divert<S> {
             log.push(last.obs.clone());
         }
         Ok(())
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 
@@ -1229,6 +1279,21 @@ impl<S: ActionSource> ActionSource for Rewrite<S> {
             log.push(obs);
         }
         Ok(())
+    }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
     }
 }
 
@@ -1440,6 +1505,25 @@ impl<S: ActionSource> ActionSource for DropAfter<S> {
         }
         Ok(())
     }
+
+    /// Forwards to `inner` while it's held.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &self.inner {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut self.inner {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|inner| inner.holds_work())
+    }
 }
 
 /// Storage dropped while the run is live, right after its final
@@ -1492,7 +1576,7 @@ fn always(_: &mut CheckCtx<'_, Calm>) -> Verdict {
 /// failure, and the property reports `harness-failed`, not `held`, both in
 /// the report and in the serialized end record.
 #[test]
-fn a_property_is_inconclusive_after_an_evidence_failure() {
+fn a_property_is_harness_failed_after_an_evidence_failure() {
     const CALM: PropertyId = PropertyId::new("test/always");
     let property = Property {
         id: CALM,
@@ -1541,13 +1625,11 @@ fn a_property_is_inconclusive_after_an_evidence_failure() {
     };
     // The stolen facts are the last ones, so the state is ahead of them.
     assert!(detail.starts_with("Stale"), "{detail}");
-    let inconclusive = PropertyOutcome::Inconclusive {
-        reason: "harness-failed".to_owned(),
-    };
-    assert_eq!(report.properties[0].outcome, inconclusive);
+    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
+    assert_eq!(report.properties[0].outcome, harness_failed);
     let end = lines.last().expect("the run ends with an end record");
     assert!(
-        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
         "{end}"
     );
 }
@@ -1865,6 +1947,28 @@ impl ActionSource for SharedSource {
             None => Ok(()),
         }
     }
+
+    /// Forwards to the shared source while it's there.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &*self.0.borrow() {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to the shared source while it's there.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut *self.0.borrow_mut() {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to the shared source while it's there.
+    fn holds_work(&self) -> Option<String> {
+        self.0
+            .borrow()
+            .as_ref()
+            .and_then(|inner| inner.holds_work())
+    }
 }
 
 /// A checker that drops the shared storage at `when`, and records the
@@ -1897,6 +2001,11 @@ impl zakura_sim::Checker for Dropper {
             let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
         }
         Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
     }
 }
 
@@ -2006,14 +2115,12 @@ fn storage_dropped_after_the_last_step_fails_the_run() {
         assert!(detail.starts_with("Dropped"), "{when:?}: {detail}");
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "harness-failed".to_owned()
-            },
+            PropertyOutcome::not_applicable(NaReason::HarnessFailed),
             "{when:?}"
         );
         let end = lines.last().expect("the run ends with an end record");
         assert!(
-            end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+            end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
             "{when:?}: {end}"
         );
     }
@@ -2024,13 +2131,11 @@ fn storage_dropped_after_the_last_step_fails_the_run() {
 fn assert_harness_failed(report: &RunReport, lines: &[String]) {
     assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Inconclusive {
-            reason: "harness-failed".to_owned()
-        }
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
     );
     let end = lines.last().expect("the run ends with an end record");
     assert!(
-        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        end.contains(r#""not-applicable":{"reason":"harness-failed"}"#),
         "{end}"
     );
 }
@@ -2039,7 +2144,7 @@ fn assert_harness_failed(report: &RunReport, lines: &[String]) {
 /// outranks the drop, and the property still reports `harness-failed`,
 /// though `at_end` reported it held.
 #[test]
-fn a_dropping_at_end_that_draws_is_still_inconclusive() {
+fn a_dropping_at_end_that_draws_is_still_harness_failed() {
     let (report, lines, saw) = late_drop_run(LateDrop::AtEndDrawing);
     assert_eq!(
         saw,
@@ -2068,12 +2173,17 @@ impl zakura_sim::Checker for DrawsAtEnd {
         let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
         Vec::new()
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// D2 covers any harness failure, not only storage's: with no storage at
-/// all, a draw in `at_end` leaves a property that held inconclusive.
+/// all, a draw in `at_end` leaves a property that held `HarnessFailed`.
 #[test]
-fn a_drawing_at_end_without_storage_is_inconclusive() {
+fn a_drawing_at_end_without_storage_is_harness_failed() {
     let property = Property {
         id: PropertyId::new("test/always"),
         claim: "always holds",
@@ -2164,6 +2274,21 @@ impl<S: ActionSource> ActionSource for RefuseBefore<S> {
         }
         self.inner.observe(log)
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// A checker that uses the port in `at_end` as `poke` says.
@@ -2188,6 +2313,11 @@ impl zakura_sim::Checker for PokeAtEnd {
             Poke::Nothing | Poke::RefuseBefore(_) => {}
         }
         Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
     }
 }
 

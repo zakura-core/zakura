@@ -2,11 +2,19 @@
 # generator version it was built for, and its SHA-256. Its first byte
 # picks the repair fixture, then come the Plan bytes.
 harness = "header-sync/repair"
-generator = 1
+generator = 2
 sha256 = "4ec9dfd6451de27bf8f57ba8a4a2f48a4555686e0c98609db7ee639594378449"
 scenario_sha256 = "84955f920f1fed51ee01ae1d699cbd681f705f6807a8e7e8ba8dd37c3b51de09"
 source = "crates/zakura-sim/tests/header_repair.rs"
 
 [[witness]]
 property = "header-sync/stale-completion-inert"
+expect = "holds"
+
+[[witness]]
+property = "header-sync/commit-only-authorized"
+expect = "holds"
+
+[[witness]]
+property = "header-sync/outstanding-work-bounded"
 expect = "holds"

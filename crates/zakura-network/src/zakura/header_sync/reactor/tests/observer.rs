@@ -74,6 +74,7 @@ impl Recorder {
                             ..
                         }
                         | ReactorEvent::SnapshotAdopted { .. }
+                        | ReactorEvent::SnapshotStored { .. }
                         | ReactorEvent::StatusQueued { .. }
                         | ReactorEvent::StatusDeferred { .. }
                         | ReactorEvent::TipPublished { .. }

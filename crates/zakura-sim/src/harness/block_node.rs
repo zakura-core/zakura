@@ -86,7 +86,7 @@ use crate::{
     harness::policy::LinkEffect,
     observe::{StorageFact, StorageRequest, StorageResult},
     storage::{decode_block, BlockStorage, BLOCK_SERVICE},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
 /// Polls `future` once outside any task: before a run, or in the step loop.
@@ -153,23 +153,9 @@ impl Base {
     /// Whether the base offers `outcome` for an operation whose legal
     /// outcomes now are `legal`.
     pub fn offers(self, legal: &[BlockOutcome], outcome: BlockOutcome) -> bool {
-        let success = |outcome: &BlockOutcome| {
-            matches!(
-                outcome,
-                BlockOutcome::Answer
-                    | BlockOutcome::Admit
-                    | BlockOutcome::Apply
-                    | BlockOutcome::Serve
-                    | BlockOutcome::Verdict(Verdict::Committed)
-            )
-        };
         match self {
             Base::Any => true,
-            Base::SuccessOnly => {
-                success(&outcome)
-                    || (outcome == BlockOutcome::Verdict(Verdict::Duplicate)
-                        && !legal.iter().any(success))
-            }
+            Base::SuccessOnly => crate::storage::block_succeeds(legal, outcome),
         }
     }
 }
@@ -338,6 +324,23 @@ impl ActionSource for PolicySource {
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
         self.storage.execute(local, log);
+    }
+
+    /// The storage's recovery set, which no hold filters. Block holds have
+    /// no owner that releases them in the drain.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
+        self.storage.recovery(now, out);
+    }
+
+    /// Forwards to the storage. The policy retires nothing of its own:
+    /// `recovery` already ignores every hold, and `execute` reads none.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.storage.enter_drain(log);
+    }
+
+    /// The storage's stranded work.
+    fn holds_work(&self) -> Option<String> {
+        self.storage.holds_work()
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
@@ -768,6 +771,26 @@ impl ActionSource for MirrorReadSource {
             predicates.record_mirror(event);
         }
         Ok(())
+    }
+
+    /// `serve` for each queued read the mirror doesn't withhold, which no
+    /// hold filters.
+    fn recovery(&self, _: SimInstant, out: &mut RecoveryOffer) {
+        let queue = self.reads.queue();
+        for (id, read) in &queue.pending {
+            if !read.served && !read.withheld {
+                out.actions
+                    .push((Identity::storage(&read.mirror, *id, "serve"), *id));
+            }
+        }
+    }
+
+    /// Nothing: `recovery` already ignores every hold.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: a withheld read waits for its caller to drop it.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

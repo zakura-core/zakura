@@ -13,6 +13,8 @@ use std::{
 
 use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::property::Pending;
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::TEARDOWN_RETURNS_BASELINE,
     harness::{
@@ -176,14 +178,13 @@ fn a_shutdown_stops_the_node_and_passes_its_teardown_checks() {
 }
 
 /// A run cut off right after it picks `Shutdown`, before the control task
-/// carries it out, leaves the stop honestly unfinished: its drain was cut
-/// off at its bound. It's no harness failure, and
-/// `header-sync/teardown-returns-baseline` is inconclusive, so a chosen stop
+/// carries it out, with no drain to finish the stop, ends at the drain's
+/// bound: a harness failure that names the open teardown, so a chosen stop
 /// still never ends silently untaken. The stop counts from its pick. The
 /// test searches budgets for a run whose last step is that pick, with no
 /// drain.
 #[test]
-fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
+fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
     let scenario = scenario(
         Vec::new(),
         vec![ControlStep {
@@ -218,7 +219,14 @@ fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
             (last == Some("peer:node:shutdown")).then_some(report)
         })
         .expect("some budget ends the run at the shutdown pick");
-    assert_eq!(cut.end.harness, None, "{:?}", cut.end);
+    assert_eq!(
+        cut.end.harness,
+        Some(zakura_sim::HarnessFailure::DrainBound {
+            open: format!("{TEARDOWN_RETURNS_BASELINE} {}", Pending::TeardownOpen),
+        }),
+        "{:?}",
+        cut.end
+    );
     let teardown = cut
         .properties
         .iter()
@@ -226,9 +234,7 @@ fn a_run_cut_off_at_the_shutdown_pick_is_inconclusive() {
         .map(|property| property.outcome.clone());
     assert_eq!(
         teardown,
-        Some(PropertyOutcome::Inconclusive {
-            reason: "teardown-open".to_owned()
-        })
+        Some(PropertyOutcome::not_applicable(NaReason::HarnessFailed))
     );
 }
 
@@ -315,6 +321,7 @@ fn a_control_step_waits_for_a_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::default(),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario
     };
@@ -333,6 +340,7 @@ fn a_continuation_counts_as_another_reservation() {
         mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
             chain: Chain::main(300),
             dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..scenario(
             Vec::new(),
@@ -375,7 +383,8 @@ fn relink_witness(admissions: u32) -> StorageScenario {
 /// A hold can wait for a session admission: the old session's prepare is
 /// released once the node admits the replacement, its second session from
 /// `mirror-0`, and so completes after the relink. Waiting for a third
-/// admission, which never comes, keeps it held for good.
+/// admission, which never comes, keeps it held through the live phase, and
+/// only the drain, which retires the hold, completes it.
 #[test]
 fn a_hold_waits_for_the_replacements_admission() {
     let scenario = relink_witness(2);
@@ -394,7 +403,12 @@ fn a_hold_waits_for_the_replacements_admission() {
     for input in inputs(4, 256) {
         let report = run(&never, input);
         let (prepare, _) = first_prepare(&report).expect("the node prepares");
-        assert_eq!(completed(&report, prepare), None);
+        let live = report.end.steps - report.end.drain.map_or(0, |drain| drain.steps);
+        let done = completed(&report, prepare);
+        assert!(
+            done.is_some_and(|done| done > live),
+            "{done:?} after {live} live steps"
+        );
     }
 }
 

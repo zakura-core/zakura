@@ -18,6 +18,142 @@ use crate::{
     AddressBook,
 };
 
+/// Cache ranking uses measured RTT, retaining book order for measured ties.
+#[test]
+fn peer_cache_ranks_by_rtt_with_stable_ties() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for (ip, millis) in [
+        (1, None),
+        (2, Some(50)),
+        (3, Some(10)),
+        (4, Some(10)),
+        (5, None),
+    ] {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        // Start with the measured response: adjacent same-state updates are ignored
+        // by the address book's concurrent-update guard.
+        book.update(MetaAddr::new_responded(
+            addr,
+            millis.map(std::time::Duration::from_millis),
+        ));
+    }
+    let before: Vec<_> = book.peers.ordered_values().cloned().collect();
+    let ranked = book.cacheable(Utc::now());
+    assert_eq!(
+        ranked
+            .iter()
+            .map(|peer| peer.rtt().map(|rtt| rtt.as_millis()))
+            .collect::<Vec<_>>(),
+        vec![Some(10), Some(10), Some(50), None, None]
+    );
+    let rtt = Some(std::time::Duration::from_millis(10));
+    assert_eq!(
+        ranked
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Gossip-only peers have no measured preference and do not keep a fixed cache prefix.
+#[test]
+fn peer_cache_shuffles_unmeasured_gossip() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let measured = "127.0.0.9:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(
+        measured,
+        Some(std::time::Duration::from_millis(10)),
+    ));
+    let mut expected = std::collections::HashSet::new();
+    for ip in 1..=8 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        expected.insert(addr);
+        book.update(
+            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
+                .new_gossiped_change()
+                .unwrap(),
+        );
+    }
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let cached = book.cacheable(Utc::now());
+        assert_eq!(cached[0].addr, measured, "measured peers retain priority");
+        let unknown: Vec<_> = cached[1..].iter().map(|peer| peer.addr).collect();
+        assert_eq!(
+            unknown
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        orders.insert(unknown);
+    }
+    // Sixteen identical independent shuffles of eight peers have probability (8!)^-15.
+    assert!(
+        orders.len() > 1,
+        "unmeasured gossip must not retain deterministic priority"
+    );
+}
+
+/// Known non-nodes remain recorded at runtime but are not saved for restart.
+#[test]
+fn peer_cache_excludes_known_non_node_services() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let non_node = "127.0.0.1:8233".parse().unwrap();
+    let full_node = "127.0.0.2:8233".parse().unwrap();
+    let unknown = "127.0.0.3:8233".parse().unwrap();
+    for (addr, services) in [
+        (non_node, PeerServices::empty()),
+        (full_node, PeerServices::NODE_NETWORK),
+    ] {
+        book.update(MetaAddr::new_connected(addr, &services, false));
+        book.update(MetaAddr::new_responded(
+            addr,
+            Some(std::time::Duration::from_millis(10)),
+        ));
+    }
+    book.update(MetaAddr::new_responded(
+        unknown,
+        Some(std::time::Duration::from_millis(20)),
+    ));
+    assert!(!book
+        .get(non_node)
+        .unwrap()
+        .last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(book.get(unknown).unwrap().services, None);
+    assert_eq!(
+        book.cacheable(Utc::now())
+            .iter()
+            .map(|peer| peer.addr)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([full_node, unknown])
+    );
+}
+
 /// Make sure an empty address book is actually empty.
 #[test]
 fn address_book_empty() {

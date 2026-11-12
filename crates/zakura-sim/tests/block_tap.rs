@@ -162,6 +162,21 @@ macro_rules! forward {
         fn execute(&mut self, local: u64, log: &mut ObservationLog) {
             self.inner.execute(local, log);
         }
+
+        /// Forwards to `inner`.
+        fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+            self.inner.recovery(now, out);
+        }
+
+        /// Forwards to `inner`.
+        fn enter_drain(&mut self, log: &mut ObservationLog) {
+            self.inner.enter_drain(log);
+        }
+
+        /// Forwards to `inner`.
+        fn holds_work(&self) -> Option<String> {
+            self.inner.holds_work()
+        }
     };
 }
 
@@ -246,6 +261,25 @@ impl<S: ActionSource> ActionSource for DropAfter<S> {
             self.inner = None;
         }
         Ok(())
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        if let Some(inner) = &self.inner {
+            inner.recovery(now, out);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        if let Some(inner) = &mut self.inner {
+            inner.enter_drain(log);
+        }
+    }
+
+    /// Forwards to `inner` while it's held.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|inner| inner.holds_work())
     }
 }
 

@@ -1,12 +1,17 @@
 //! `header-sync/repair`: `header-sync/storage` on the repair fixtures
 //! ([`RepairScenario`]), where the node under test runs a VCT body repair
-//! against a mirror that holds the repaired headers' tree records. Its one
+//! against a mirror that, in all but one fixture, holds the repaired
+//! headers' tree records. Its one
 //! scenario byte picks the fixture, and the rest of an input is Plan bytes.
 //!
 //! Every fixture first makes one stale prepare, so
 //! `header-sync/stale-completion-inert` applies, then publishes the repair.
-//! The repair round is kept when its peer leaves while it prepares or
-//! applies, so its calls are never stale, and its apply still succeeds.
+//! In the first three, the repair round is kept when its peer leaves while
+//! it prepares or applies, so its calls are never stale, and its apply
+//! still succeeds. In [`RepairScenario::SupplierPruned`] the supplier lacks the tree
+//! records, so the repair fails and charges it, and the supplier's
+//! departure exercises the repair requirement's held history for
+//! `header-sync/outstanding-work-bounded`.
 
 use std::sync::Arc;
 
@@ -38,7 +43,8 @@ pub const TIP: u32 = 3;
 /// it and the selected suffix past it, up to [`TIP`].
 pub const REPAIR_HEIGHT: u32 = 2;
 
-/// The mirror that holds the tree records and supplies the repair.
+/// The mirror that supplies the repair. It holds the repaired headers'
+/// tree records in every fixture but [`RepairScenario::SupplierPruned`].
 pub const SUPPLIER: &str = "mirror-0";
 
 /// The mirror one header ahead whose round's prepare ends stale.
@@ -60,6 +66,15 @@ pub enum RepairScenario {
     /// The supplier leaves while the repair applies. The node keeps the
     /// round, and the apply's reply settles it.
     ApplyDeparts,
+    /// The supplier holds no tree records, so it answers the repair
+    /// `HistoryPruned`, and the handler that retires the repair round
+    /// charges it as tried. Its close is offered once that round has
+    /// retired. The reactor handles the departure only after that handler
+    /// finishes, so the charge comes first and the node holds the
+    /// supplier's history as a departed one's. The step has no deadline,
+    /// so a Plan that keeps it waiting until the step budget ends the run
+    /// before the departure. The repair never applies.
+    SupplierPruned,
 }
 
 impl RepairScenario {
@@ -100,10 +115,17 @@ impl RepairScenario {
             ),
         ];
         let departs = match self {
-            RepairScenario::Applied => None,
+            RepairScenario::Applied | RepairScenario::SupplierPruned => None,
             RepairScenario::PrepareDeparts => Some(prepare(2)),
             RepairScenario::ApplyDeparts => Some(apply(1)),
         };
+        if self == RepairScenario::SupplierPruned {
+            controls.push(step(
+                SUPPLIER,
+                ControlAction::Close,
+                Trigger::Retired(SUPPLIER.to_owned()),
+            ));
+        }
         if let Some(select) = departs {
             holds.push(hold(select.clone(), SUPPLIER));
             controls.push(step(
@@ -118,10 +140,12 @@ impl RepairScenario {
                 MirrorSpec {
                     chain: Chain::main(TIP),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
                 MirrorSpec {
                     chain: Chain::main(TIP + 1),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 },
             ],
             policy: Policy {
@@ -136,7 +160,7 @@ impl RepairScenario {
 
 /// `header-sync/storage` on a [`RepairScenario`], with the node's
 /// checkpoint ceiling at [`TIP`] and [`SUPPLIER`]'s headers carrying tree
-/// records.
+/// records, except in [`RepairScenario::SupplierPruned`].
 pub struct RepairHarness(Storage);
 
 impl HasView for RepairHarness {
@@ -157,6 +181,11 @@ impl HasView for RepairHarness {
         self.0.end_violations(log)
     }
 
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
     /// The storage harness's wake facts' stamps.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
@@ -165,7 +194,7 @@ impl HasView for RepairHarness {
 
 impl Subsystem for RepairHarness {
     const NAME: &'static str = "header-sync/repair";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = RepairScenario;
     type Prepared = Ports;
@@ -177,7 +206,7 @@ impl Subsystem for RepairHarness {
 
     /// The storage harness's ports, with the node's port resolving repairs
     /// up to [`TIP`] and [`SUPPLIER`]'s chain carrying the fixture's tree
-    /// records.
+    /// records, except in [`RepairScenario::SupplierPruned`].
     fn prepare(scenario: &RepairScenario) -> Ports {
         let storage = scenario.storage();
         let ports = Storage::prepare(&storage);
@@ -185,7 +214,11 @@ impl Subsystem for RepairHarness {
         let node = ControlledPort::over(Arc::new(engine));
         preload(node.engine(), &ports.fixture, &storage.node);
         let supplier = EnginePort::new(&ports.fixture);
-        preload_with_tree_aux(&supplier, &ports.fixture, &storage.mirrors[0].chain);
+        if *scenario == RepairScenario::SupplierPruned {
+            preload(&supplier, &ports.fixture, &storage.mirrors[0].chain);
+        } else {
+            preload_with_tree_aux(&supplier, &ports.fixture, &storage.mirrors[0].chain);
+        }
         let mut mirrors = ports.mirrors.clone();
         mirrors[0] = Arc::new(supplier);
         Ports {
@@ -210,14 +243,16 @@ impl Subsystem for RepairHarness {
         storage_sources()
     }
 
-    /// The scenario byte modulo 3: 0 [`RepairScenario::Applied`], 1
+    /// The scenario byte modulo 4: 0 [`RepairScenario::Applied`], 1
     /// [`RepairScenario::PrepareDeparts`], 2
-    /// [`RepairScenario::ApplyDeparts`].
+    /// [`RepairScenario::ApplyDeparts`], 3
+    /// [`RepairScenario::SupplierPruned`].
     fn draw(prefix: &[u8]) -> RepairScenario {
-        match prefix.first().map_or(0, |byte| byte % 3) {
+        match prefix.first().map_or(0, |byte| byte % 4) {
             0 => RepairScenario::Applied,
             1 => RepairScenario::PrepareDeparts,
-            _ => RepairScenario::ApplyDeparts,
+            2 => RepairScenario::ApplyDeparts,
+            _ => RepairScenario::SupplierPruned,
         }
     }
 }

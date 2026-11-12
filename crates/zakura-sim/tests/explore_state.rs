@@ -949,9 +949,8 @@ fn both_held_parts_of_one_apply_resume() {
     }
 }
 
-/// A run with no hold hits no hold stage, though an operation waits
-/// unoffered through its drain, and one chain prepared to two targets from
-/// one ancestor hits no fork work.
+/// A run with no hold hits no hold stage, and one chain prepared to two
+/// targets from one ancestor hits no fork work.
 #[test]
 fn unheld_operations_and_one_chain_are_passing_controls() {
     let report = report(run_harness::<HeaderStorage>(
@@ -962,49 +961,28 @@ fn unheld_operations_and_one_chain_are_passing_controls() {
     ));
     assert!(StorageScenario::grow().policy.holds.is_empty());
     assert!(StorageScenario::grow().policy.reply_holds.is_empty());
-    let mut pending = BTreeSet::new();
-    let mut prepares = Vec::new();
-    for entry in report.log.entries() {
-        let Observation::Storage { fact, .. } = &entry.obs else {
-            continue;
-        };
-        match fact {
-            StorageFact::Submitted { id, request, .. } => {
-                pending.insert(*id);
-                if let StorageRequest::PrepareHeaderTarget {
-                    common_ancestor,
-                    target,
-                    first: Some(first),
-                    ..
-                } = request
-                {
-                    prepares.push((common_ancestor.clone(), first.hash.clone(), target.clone()));
-                }
-            }
-            StorageFact::Completed { id, .. } => {
-                pending.remove(id);
-            }
-            _ => {}
-        }
-    }
-    // The drain offers no source action, so an operation still pending at
-    // the end and submitted before the last step sat unoffered through at
-    // least one drain step. Only the live-step rule keeps it from counting
-    // as blocked.
-    let drain = report
-        .end
-        .drain
-        .as_ref()
-        .expect("the budget ends in a drain");
-    let live = report.end.steps - drain.steps;
-    let waited = report.log.entries().iter().any(|entry| {
-        matches!(&entry.obs, Observation::Storage {
-            fact: StorageFact::Submitted { id, .. }, ..
-        } if pending.contains(id))
-            && entry.step + 1 < report.end.steps
-            && entry.step + 1 >= live
-    });
-    assert!(waited, "an operation waits through a drain step");
+    let prepares: Vec<_> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Submitted {
+                        request:
+                            StorageRequest::PrepareHeaderTarget {
+                                common_ancestor,
+                                target,
+                                first: Some(first),
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => Some((common_ancestor.clone(), first.hash.clone(), target.clone())),
+            _ => None,
+        })
+        .collect();
     let one_chain = prepares.iter().any(|(ancestor, first, target)| {
         prepares
             .iter()

@@ -190,6 +190,12 @@ pub enum Trigger<K> {
     /// holds only once the reactor has acted on the departure. Never holds
     /// without a tap.
     SessionEnded(String),
+    /// The header node under test's reactor retired a round from this peer,
+    /// as its tap reports: once per retirement, whatever its reason. It
+    /// counts from the step the retirement was reported in, which can stop
+    /// the reactor partway through the handler that retired the round.
+    /// Never holds without a tap.
+    Retired(String),
     /// The header node under test's reactor kept this peer's offer waiting
     /// for header room, as its tap reports: once per refusal. Never holds
     /// without a tap.
@@ -282,7 +288,8 @@ pub(crate) enum Event {
 /// [`Trigger::Closed`], [`Trigger::Linked`], [`Trigger::Grown`],
 /// [`Trigger::Reset`], [`Trigger::Prepared`],
 /// [`Trigger::ReservationOpened`], [`Trigger::SessionAdmitted`],
-/// [`Trigger::SessionEnded`], [`Trigger::HeadroomWait`] and [`Trigger::StorageStopped`] count it.
+/// [`Trigger::SessionEnded`], [`Trigger::Retired`], [`Trigger::HeadroomWait`] and
+/// [`Trigger::StorageStopped`] count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -301,6 +308,8 @@ pub enum LinkEffect {
     SessionAdmitted,
     /// The node under test's reactor handled a peer's session ending.
     SessionEnded,
+    /// The node under test's reactor retired a round from a peer.
+    Retired,
     /// The node under test's reactor kept a peer's offer waiting for room.
     HeadroomWait,
     /// An actor's storage shut down.
@@ -371,6 +380,9 @@ pub struct Predicates<F: Family> {
     links: Vec<(LinkEffect, String)>,
     /// The holds a `Release` step opened.
     released: BTreeSet<usize>,
+    /// False once [`Predicates::stop_catching`] was called, so no hold or
+    /// reply hold picks a later submission.
+    catching: bool,
 }
 
 impl<F: Family> Predicates<F> {
@@ -386,7 +398,15 @@ impl<F: Family> Predicates<F> {
             handled: Vec::new(),
             links: Vec::new(),
             released: BTreeSet::new(),
+            catching: true,
         }
+    }
+
+    /// Stops every hold and reply hold from picking an operation submitted
+    /// from now on, so it completes and replies as the base offers.
+    /// Operations already picked stay held.
+    pub fn stop_catching(&mut self) {
+        self.catching = false;
     }
 
     /// These predicates with `reply_holds` too. Call before anything is
@@ -416,8 +436,8 @@ impl<F: Family> Predicates<F> {
         op.hold = self
             .holds
             .iter()
-            .position(|hold| !hold.select.held && op.matches(&hold.select));
-        if F::commits(kind) {
+            .position(|hold| self.catching && !hold.select.held && op.matches(&hold.select));
+        if self.catching && F::commits(kind) {
             op.reply_hold = self
                 .reply_holds
                 .iter()
@@ -566,6 +586,7 @@ impl<F: Family> Predicates<F> {
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
             Trigger::SessionEnded(peer) => links(LinkEffect::SessionEnded, peer),
+            Trigger::Retired(peer) => links(LinkEffect::Retired, peer),
             Trigger::HeadroomWait(peer) => links(LinkEffect::HeadroomWait, peer),
             Trigger::StorageStopped(peer) => links(LinkEffect::StorageStopped, peer),
             Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
@@ -663,6 +684,12 @@ impl<F: Family> Predicates<F> {
                 since,
             },
         ))
+    }
+
+    /// The index of the hold that picked operation `key`'s current stage at
+    /// its submission, if one did.
+    pub(crate) fn hold_of(&self, key: F::Key) -> Option<usize> {
+        self.ops.get(&key)?.last()?.hold
     }
 
     /// Whether a hold picked operation `key`'s current stage at its

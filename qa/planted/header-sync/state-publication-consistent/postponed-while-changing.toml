@@ -1,0 +1,12 @@
+# The status publisher waits until two seconds after the latest change
+# before it queues. On the status-changing witness a harness commit lands
+# once a second, so each change postpones the publication again and the
+# session's first changed `Status` isn't queued within the 3 s deadline.
+# The status publisher's timing decides when a changed `Status` goes, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-status-changing.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-status-changing.plan"

@@ -14,17 +14,19 @@ use crate::{
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         ends::{EndEvidence, EndFact, EnvironmentAction},
+        fork_choice::ForkChoiceEvidence,
         hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
+        publication::{PublicationEvidence, PublicationFact, STATUS_DEADLINE},
         retirement::{HandoffFact, RetirementEvidence},
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
     },
     property::{
-        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind,
-        LivenessBound, ObligationKey, Property, PropertyId, Source, Status, Subject,
-        TriggerHistory, Unit, Verdict,
+        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Kind, LivenessBound,
+        ObligationKey, Pending, Property, PropertyId, Source, Status, Subject, TriggerHistory,
+        Unit, Verdict,
     },
     ObservationLog,
 };
@@ -81,9 +83,9 @@ where
 /// claim break the tap found at this step: `BudgetOverCapacity` on a read,
 /// or `OverBudget` on a reported reservation. A boundary whose read found
 /// the budget's lock held judges nothing. With the reactor stopped
-/// mid-poll, as it is inside a release, that's allowed, and a run that ends
-/// there is inconclusive. Otherwise no task should hold the lock, so the
-/// missing read is missing evidence.
+/// mid-poll, as it is inside a release, that's allowed, and the boundary
+/// stays pending ([`Pending::UnreadBoundary`]). Otherwise no task should
+/// hold the lock, so the missing read is missing evidence.
 fn check_chunk_budget_bound<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -97,7 +99,7 @@ where
             "the header budget's lock was held at the boundary after step {step}, with the \
              reactor not stopped mid-poll"
         )),
-        Some(BoundaryRead::UnreadMidPoll) => cx.unsettled(Inconclusive::UnreadBoundary),
+        Some(BoundaryRead::UnreadMidPoll) => cx.pending(Pending::UnreadBoundary),
         Some(BoundaryRead::Read) | None => {}
     }
     let records = view
@@ -206,14 +208,17 @@ where
 ///
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a
-/// released round unsettled is inconclusive while storage still holds a
+/// released round unsettled stays pending while storage still holds a
 /// call with that round's headers or the drain was cut off at its bound,
 /// since that call could still settle it. A run that ends at rest, idle or
 /// with its drain run dry, with no such call pending can never settle it,
 /// so [`teardown_end_violations`] violates it then. A run that ends with a
-/// stop begun and the node unsettled is inconclusive only when its drain
+/// stop begun and the node unsettled stays pending only when its drain
 /// was cut off at its bound. Otherwise the tap fails it as
-/// `ShutdownIncomplete`. The node half of the claim is about a stopped
+/// `ShutdownIncomplete`. A drain cut off at its bound ends the run as the
+/// harness failure `DrainBound`, which keeps only the violations steps
+/// found, so a mark still pending there leaves the property
+/// `HarnessFailed`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
 /// round-level case relies on that. A step with a released round a claim
@@ -227,7 +232,7 @@ where
     let step = cx.step;
     let row = view.rounds().at(step);
     if row.is_some_and(|row| row.unsettled > 0 || (row.shutdown && !row.settled)) {
-        cx.unsettled(Inconclusive::TeardownOpen);
+        cx.pending(Pending::TeardownOpen);
     }
     let expected = "a released round, and a stopped node, keeps no reservation, lease or held \
                     headers once settled, and no locator permit a pending storage read doesn't \
@@ -440,7 +445,9 @@ where
 
 /// Checks [`OUTSTANDING_WORK_BOUNDED`] at the boundary after a step: it's
 /// violated by an `OutstandingWork` claim break the tap found at this
-/// step, and holds once a drain judged a `Sizes`.
+/// step, or, after a step that leaves the scheduler at rest
+/// ([`crate::at_rest`]), by a publisher still running under its session's
+/// cancelled token, and holds once a drain judged a `Sizes`.
 fn check_outstanding_work_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -450,15 +457,30 @@ where
     let step = cx.step;
     let expected = "the reactor's and the serving side's containers stay within their bounds \
                     and keep only live keys, and no publisher outlives its session";
-    let mut breaks = view
+    let mut breaks: Vec<String> = view
         .claims()
         .at(step, &[Claim::OutstandingWork])
-        .into_iter();
+        .into_iter()
+        .map(|record| record.detail)
+        .collect();
+    // Not quiescence: a source action, such as the drain finishing a read
+    // the publisher waits on, can still end a publisher that ignored its
+    // cancellation, and hide it.
+    if crate::at_rest(cx.status) {
+        let lingering = view.outstanding().lingering_cancelled();
+        if !lingering.is_empty() {
+            breaks.push(format!(
+                "OutstandingWork: nothing can run after step {step}, yet publishers still run \
+                 for the cancelled sessions {lingering:?}"
+            ));
+        }
+    }
+    let mut breaks = breaks.into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {
-            cx.record_violation(expected, other.detail);
+            cx.record_violation(expected, other);
         }
-        return cx.violated(expected, first.detail);
+        return cx.violated(expected, first);
     }
     if view.outstanding().applicable_by(step) {
         Verdict::Holds
@@ -543,6 +565,104 @@ where
 /// [`STALE_CHAIN_EFFECT_INERT`]'s trigger history: the check applied.
 fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
     view.chain_effect().any()
+}
+
+/// The node's engine selects a max-work eligible tip of the headers it
+/// holds, and scores it with its work above the anchor. In the fork
+/// fixture, a settled node is on the heaviest mirror chain.
+pub const EXPECTED_CHAIN_SELECTED: &str = "header-sync/expected-chain-selected";
+
+/// What the fork-choice check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait ForkView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the node's fork-choice check first applied.
+    fn fork_choice(&self) -> &ForkChoiceEvidence;
+}
+
+/// [`EXPECTED_CHAIN_SELECTED`], as a harness whose view is a [`ForkView`]
+/// registers it.
+pub fn expected_chain_selected<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ForkView,
+{
+    Property {
+        id: PropertyId::new(EXPECTED_CHAIN_SELECTED),
+        claim: "at every engine snapshot record, the node's engine selects a max-work eligible \
+                tip of the headers it holds, by the fixture's work and the resets in force, \
+                with any max-work tip allowed on a tie, and scores it with that tip's work \
+                above the anchor; and in the fork fixture, at every settled point, the \
+                engine is on a max-work tip over all mirrors' chains",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_expected_chain_selected::<S>,
+        witness: Some(TriggerHistory::View(fork_choice_applied::<S::View>)),
+    }
+}
+
+/// Checks [`EXPECTED_CHAIN_SELECTED`] at the boundary after a step.
+///
+/// The tap's fork-choice check
+/// ([`crate::harness::header_node::fork_choice`]) judges the engine before
+/// the run and the record each apply's, reset's and harness commit's engine
+/// run left. A break the step's drain found violates at once. In the fork
+/// fixture, a step after which no task can run, whose drain found every
+/// other settled-point condition, is a settled point, and the engine's tip
+/// there must be a heaviest mirror tip ([`settled`]). It applies once a
+/// drain judged a record, until a drain found a run corrupt.
+///
+/// [`settled`]: crate::harness::header_node::fork_choice::settled
+fn check_expected_chain_selected<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ForkView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the engine selects a max-work eligible tip, scored with its work";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::ExpectedChainSelected])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    // A corrupt engine state is `commit-only-authorized`'s, and nothing
+    // after it is judged here, so no later step counts as passed.
+    if view.fork_choice().tainted_by(step) {
+        return Verdict::NotApplicable;
+    }
+    // A settled point needs no task able to run after the step, which only
+    // the scheduler's status says.
+    let at_rest = crate::at_rest(cx.status);
+    if let (true, Some(verdict)) = (at_rest, view.fork_choice().settled_at(step)) {
+        if let Some(detail) = verdict {
+            return cx.violated(
+                "a settled node in the fork fixture is on the heaviest mirror chain",
+                detail,
+            );
+        }
+        return Verdict::Holds;
+    }
+    if view.fork_choice().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`EXPECTED_CHAIN_SELECTED`]'s trigger history: the check judged a
+/// record.
+fn fork_choice_applied<V: ForkView>(view: &V, _: &ObservationLog) -> bool {
+    view.fork_choice().any()
 }
 
 /// The node stages, prepares and commits only headers it asked for, and
@@ -646,6 +766,275 @@ where
 /// [`COMMIT_ONLY_AUTHORIZED`]'s trigger history: the check applied.
 fn authority_applied<V: AuthorityView>(view: &V, _: &ObservationLog) -> bool {
     view.authority().any()
+}
+
+/// The node's port publishes every committed engine state as it was, the
+/// reactor adopts only engine records, faithfully, and adopts each commit
+/// before quiescence, and every `Status` and tip it publishes names its
+/// latest adoption, a changed `Status` in time.
+pub const STATE_PUBLICATION_CONSISTENT: &str = "header-sync/state-publication-consistent";
+
+/// What the publication check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait PublicationView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the node's publication check first applied, the tip it still
+    /// owes, and, armed, its stamped facts.
+    fn publication(&self) -> &PublicationEvidence;
+
+    /// The harness's environment actions and the reactor's own exit.
+    fn ends(&self) -> &EndEvidence;
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`], as a harness whose view is a
+/// [`PublicationView`] registers it.
+pub fn state_publication_consistent<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: PublicationView,
+{
+    Property {
+        id: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
+        claim: "the node's port publishes every committed engine state on its selected-chain \
+                watch as committed, in the step that commits it; the reactor adopts only \
+                states some engine record holds, equal to that record, and adopts each \
+                commit before quiescence unless the harness began stopping it; and every \
+                Status it queues and tip it publishes names its latest adoption, and in a \
+                status fixture a changed Status is queued within the deadline",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_state_publication::<S>,
+        witness: Some(TriggerHistory::View(publication_applied::<S::View>)),
+    }
+}
+
+/// Checks [`STATE_PUBLICATION_CONSISTENT`] at the boundary after a step.
+///
+/// The tap's publication check
+/// ([`crate::harness::header_node::publication`]) judges each engine run's
+/// publication, each adoption against the engine's records, and each queued
+/// `Status` and tip publication against the latest adoption. A break the
+/// step's drain found violates at once. A tip still owed at a settled end
+/// is the harness's end violation ([`publication_end_violations`]), and
+/// one owed at any other end leaves the property `Unsettled` at
+/// [`Pending::TipUnpublished`]. It applies once a drain
+/// judged an adoption or a commit's publication, until a drain found a run
+/// corrupt, which is `commit-only-authorized`'s.
+///
+/// Where the harness armed the evidence, two rules oblige the node too
+/// ([`crate::harness::header_node::publication`] lists the facts):
+///
+/// - **Adoption happens.** Each commit obliges an adoption of its state
+///   version or a later one before quiescence, so watch coalescing is
+///   fine. A commit once the harness's `Shutdown` step began, or one an
+///   earlier adoption already covers, opens nothing, and the step answers
+///   every open one (Rule 13). A reactor that exits by itself answers
+///   nothing.
+/// - **A changed status is queued in time.** In a status fixture, each
+///   session's debt obliges a queued `Status` advertising the newest
+///   adoption within [`STATUS_DEADLINE`] of the debt. The harness closing
+///   or relinking the session's link, or its `Shutdown` step, answers it,
+///   and a debt opened after such a step opens nothing
+///   ([`session_left`]), since the node can still adopt or admit before
+///   it reads the close or its reactor stops. The node ending the session answers nothing.
+///
+/// A taint answers every obligation, since a corrupt run's consequences
+/// are its owner's.
+fn check_state_publication<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: PublicationView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected =
+        "committed states are published and adopted as recorded, and advertised as adopted";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::StatePublicationConsistent])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    let publication = view.publication();
+    let shutdown = shutdown_stamp(view.ends());
+    for stamp in cx.new_stamps().to_vec() {
+        let (subject, bound) = match publication.fact(stamp) {
+            Some(PublicationFact::Committed { state_version, .. }) => {
+                let covered = publication
+                    .adopted_before(stamp)
+                    .is_some_and(|adopted| adopted >= state_version);
+                if covered || shutdown.is_some_and(|shutdown| shutdown < stamp) {
+                    continue;
+                }
+                (adoption_subject(state_version), None)
+            }
+            Some(PublicationFact::StatusOwed { session_id, .. }) => {
+                if session_left(&view, session_id, stamp) {
+                    continue;
+                }
+                (
+                    Subject::Session(session_id.to_string()),
+                    Some(LivenessBound::VirtualTime(STATUS_DEADLINE)),
+                )
+            }
+            _ => continue,
+        };
+        let mut obligation =
+            cx.fact_obligation(Some(stamp), subject, publication_answer::<S::View>);
+        if let Some(bound) = bound {
+            obligation.bound = bound;
+        }
+        // One adoption covers every commit up to its version, and a
+        // shutdown or a taint answers every obligation.
+        obligation.cardinality = Cardinality::Every;
+        cx.oblige(obligation);
+    }
+    if publication.tainted_by(step) || !publication.applicable_by(step) {
+        return Verdict::NotApplicable;
+    }
+    // The adoption and its tip's publication are one synchronous call with
+    // a preemption point between, so a run cut off there hasn't shown it.
+    // A settled end judges it ([`PublicationEvidence::unpublished_at_settled_end`]).
+    if publication.owed().is_some() {
+        cx.pending(Pending::TipUnpublished);
+    }
+    Verdict::Holds
+}
+
+/// The prefix of an adoption obligation's subject, before the committed
+/// state version it waits on.
+const ADOPTION_OWNER: &str = "adoption-of-state-version-";
+
+/// The subject of the obligation to adopt `state_version` or a later one.
+fn adoption_subject(state_version: u64) -> Subject {
+    Subject::Owner(format!("{ADOPTION_OWNER}{state_version}"))
+}
+
+/// Whether the harness's environment `fact` ended session `session_id`:
+/// a `Close` of its connection (a session's ID is its link's connection),
+/// a `Relink` of its peer to a newer connection, or a `Shutdown`, which
+/// closes every link.
+fn ends_session(publication: &PublicationEvidence, fact: &EndFact, session_id: u64) -> bool {
+    match fact {
+        EndFact::Environment {
+            action: EnvironmentAction::Shutdown,
+            ..
+        } => true,
+        EndFact::Environment {
+            action: EnvironmentAction::Close,
+            connection,
+            ..
+        } => *connection == Some(session_id),
+        EndFact::Environment {
+            peer,
+            action: EnvironmentAction::Relink,
+            connection,
+        } => {
+            connection.is_some_and(|newer| newer > session_id)
+                && publication
+                    .owed_peer(session_id)
+                    .and_then(|owed| publication.peer_name(&owed))
+                    .is_some_and(|name| name == *peer)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the harness ended session `session_id` ([`ends_session`]) before
+/// the fact with `stamp`, so a debt opened then is on a session the harness
+/// already ended, which the node may still adopt into or admit before it
+/// reads the close. A relinked peer's new session is a newer connection, so
+/// it still owes.
+fn session_left<V: PublicationView>(view: &V, session_id: u64, stamp: u64) -> bool {
+    let publication = view.publication();
+    view.ends()
+        .facts()
+        .into_iter()
+        .any(|(at, fact)| at < stamp && ends_session(publication, &fact, session_id))
+}
+
+/// What the fact with `stamp` means for the obligation `key` names, as
+/// [`check_state_publication`] describes.
+fn publication_answer<V: PublicationView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let publication = view.publication();
+    let owed = match &key.subject {
+        Subject::Owner(owner) => owner
+            .strip_prefix(ADOPTION_OWNER)
+            .and_then(|version| version.parse::<u64>().ok())
+            .map(Ok),
+        Subject::Session(session) => session.parse::<u64>().ok().map(Err),
+        _ => None,
+    };
+    let Some(owed) = owed else {
+        return FactAnswer::Unrelated;
+    };
+    match (publication.fact(stamp), owed) {
+        (Some(PublicationFact::Tainted), _) => return FactAnswer::Discharges,
+        (Some(PublicationFact::Adopted { state_version }), Ok(committed))
+            if state_version >= committed =>
+        {
+            return FactAnswer::Discharges
+        }
+        (Some(PublicationFact::StatusPaid { session_id }), Err(session))
+            if session_id == session =>
+        {
+            return FactAnswer::Discharges
+        }
+        (Some(_), _) => return FactAnswer::Unrelated,
+        (None, _) => {}
+    }
+    let ended = view.ends().fact(stamp).is_some_and(|fact| match owed {
+        // A shutdown ends every adoption obligation, and nothing else does.
+        Ok(_) => matches!(
+            fact,
+            EndFact::Environment {
+                action: EnvironmentAction::Shutdown,
+                ..
+            }
+        ),
+        Err(session) => ends_session(publication, &fact, session),
+    });
+    if ended {
+        FactAnswer::Discharges
+    } else {
+        FactAnswer::Unrelated
+    }
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`]'s trigger history: the check judged an
+/// adoption or a commit's publication.
+fn publication_applied<V: PublicationView>(view: &V, _: &ObservationLog) -> bool {
+    view.publication().any()
+}
+
+/// [`STATE_PUBLICATION_CONSISTENT`]'s end violation: a settled run ended
+/// with an adopted tip never published on the reactor's tip watch, though
+/// no task was left partway through publishing it (hdr-4's
+/// `UnpublishedTip`). A harness whose view is a [`PublicationView`] reports
+/// it from [`HasView::end_violations`], after it handed the run's end to
+/// [`PublicationEvidence::end`].
+pub fn publication_end_violations(publication: &PublicationEvidence) -> Vec<EndViolation> {
+    publication
+        .unpublished_at_settled_end()
+        .map(|tip| EndViolation {
+            property: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
+            expected: "every adopted tip is published before the run comes to rest".to_owned(),
+            actual: format!(
+                "UnpublishedTip: the run came to rest with {tip:?} adopted and never published"
+            ),
+        })
+        .into_iter()
+        .collect()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer
@@ -1037,14 +1426,14 @@ where
         }
     }
     // A departure the slot rule hasn't judged at a unit boundary yet
-    // leaves the run inconclusive if it ends here (Rule 2), and a trigger
-    // the check couldn't read the fixture for leaves it so wherever it
-    // ends (Rule 3).
+    // leaves the run unsettled if it ends here (Rule 2), and a trigger the
+    // check couldn't read the fixture for leaves it so wherever it ends
+    // (Rule 3).
     if view.retirement().unjudged() {
-        cx.unsettled(Inconclusive::UnreadBoundary);
+        cx.pending(Pending::UnjudgedDeparture);
     }
     if view.retirement().unread() {
-        cx.unsettled(Inconclusive::UnreadTrigger);
+        cx.pending(Pending::UnreadTrigger);
     }
     let expected = "no work outlives its departed session";
     let mut breaks = view
@@ -1348,7 +1737,7 @@ where
 /// Checks the watch rule for `queue` over the view's adoption evidence
 /// ([`AdoptionEvidence::watch_read`]). It applies once a state is
 /// published. A publication still waiting for its read or its third event
-/// leaves the run inconclusive if it ends there, unless
+/// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
 /// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
 where
@@ -1359,7 +1748,7 @@ where
         WatchRead::Nothing => Verdict::NotApplicable,
         WatchRead::Holds => Verdict::Holds,
         WatchRead::Open => {
-            cx.unsettled(Inconclusive::ObligationOpen);
+            cx.pending(Pending::WatchOpen);
             Verdict::Holds
         }
         WatchRead::Broken(why) => cx.violated(
@@ -1504,10 +1893,53 @@ mod tests {
             stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
-        property::{Property, Status},
-        ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
+        property::{Pending, Property, Status},
+        ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NaReason, ObservationLog,
+        Outcome, PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
+
+    /// Terra 3: a released round left stuck breaks the teardown rule only at
+    /// an end the scheduler settled at, a deadlocked one included, never a
+    /// worker-starved one, where the ready task that would settle it never
+    /// got to run.
+    #[test]
+    fn a_stuck_round_breaks_teardown_only_at_a_settled_end() {
+        use zakura_scheduler::Status as SchedulerStatus;
+        for (rest, breaks) in [
+            (SchedulerStatus::Quiescent, true),
+            (SchedulerStatus::WaitingOnExternal, true),
+            (SchedulerStatus::WaitingOnTime, true),
+            (SchedulerStatus::WorkerStarved, false),
+            (SchedulerStatus::Deadlock, true),
+        ] {
+            let rounds = SettlementEvidence::default();
+            rounds.record(Settlement {
+                step: 3,
+                released: 1,
+                unsettled: 1,
+                stuck: 1,
+                tainted: 0,
+                shutdown: false,
+                settled: false,
+            });
+            rounds.end(&RunEnd {
+                outcome: Outcome::Budget,
+                steps: 3,
+                violation: None,
+                drain: Some(crate::end::Drain {
+                    steps: 1,
+                    exhausted: false,
+                }),
+                harness: None,
+                rest: Some(rest),
+            });
+            assert_eq!(
+                !teardown_end_violations(&rounds).is_empty(),
+                breaks,
+                "{rest:?}"
+            );
+        }
+    }
 
     /// The model's capacity and refill interval are production's.
     #[test]
@@ -1687,6 +2119,17 @@ mod tests {
             }
             Ok(())
         }
+
+        /// Nothing: it finishes no submitted work.
+        fn recovery(&self, _now: zakura_scheduler::SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+        /// Nothing: it has no holds.
+        fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+        /// None: it holds no submitted work.
+        fn holds_work(&self) -> Option<String> {
+            None
+        }
     }
 
     /// Runs `chunk-budget-bound` over one task that yields until `script`
@@ -1740,18 +2183,27 @@ mod tests {
         );
     }
 
-    /// A run that ends at an unread boundary mid-poll is inconclusive.
+    /// D4 site 2: a run whose dry end comes at an unread boundary mid-poll
+    /// can never read it, so the run fails as missing evidence, never a
+    /// verdict, and the property is `HarnessFailed`.
     #[test]
-    fn a_run_ending_unread_mid_poll_is_inconclusive() {
+    fn a_run_ending_unread_mid_poll_is_missing_evidence() {
         let report = run(&[
             Scripted::Read(10),
             Scripted::Unread(BoundaryRead::UnreadMidPoll),
         ]);
+        assert!(
+            matches!(
+                &report.end.harness,
+                Some(HarnessFailure::MissingEvidence { property, step: 2, .. })
+                    if property == CHUNK_BUDGET_BOUND
+            ),
+            "{:?}",
+            report.end
+        );
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "unread-boundary".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::HarnessFailed)
         );
     }
 
@@ -1841,7 +2293,7 @@ mod tests {
         );
     }
 
-    /// A run that ends with a released round unsettled is inconclusive
+    /// A run that ends with a released round unsettled stays unsettled
     /// while storage still holds a call with its headers, and violated once
     /// it came to rest with a round that has none, since nothing can settle
     /// that round then, whatever another round still waits on.
@@ -1858,9 +2310,9 @@ mod tests {
         assert!(matches!(report.end.outcome, Outcome::Idle { .. }));
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "teardown-open".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::Unsettled {
+                site: Pending::TeardownOpen
+            })
         );
         let report = run_property(
             teardown_returns_baseline(),
@@ -1930,7 +2382,7 @@ mod tests {
     }
 
     /// A stop holds the property unsettled until the node settles, and then
-    /// it applies and holds. A run cut off before is inconclusive.
+    /// it applies and holds. A run cut off before is unsettled.
     #[test]
     fn node_settlement_settles_teardown() {
         let report = run_property(
@@ -1950,9 +2402,9 @@ mod tests {
         );
         assert_eq!(
             report.properties[0].outcome,
-            PropertyOutcome::Inconclusive {
-                reason: "teardown-open".to_owned()
-            }
+            PropertyOutcome::not_applicable(NaReason::Unsettled {
+                site: Pending::TeardownOpen
+            })
         );
     }
 

@@ -178,13 +178,18 @@ impl TryFrom<[u8; 32]> for ValueCommitment {
     type Error = &'static str;
 
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
-        let possible_point = pallas::Affine::from_bytes(&bytes);
+        Self::from_decoded(pallas::Affine::from_bytes(&bytes).into())
+    }
+}
 
-        if possible_point.is_some().into() {
-            Ok(Self(possible_point.unwrap()))
-        } else {
-            Err("Invalid pallas::Affine value")
-        }
+impl ValueCommitment {
+    /// Returns the value commitment for an encoding that `point` is the
+    /// [`pallas::Affine`] decoding of, from `from_bytes` or `batch_from_bytes`,
+    /// or `None` if it does not decode.
+    ///
+    /// Returns an error if the encoding is not a canonical point.
+    pub(crate) fn from_decoded(point: Option<pallas::Affine>) -> Result<Self, &'static str> {
+        point.map(Self).ok_or("Invalid pallas::Affine value")
     }
 }
 

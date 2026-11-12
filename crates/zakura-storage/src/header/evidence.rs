@@ -277,7 +277,8 @@ pub enum ResultIdentity {
     Acquired {
         /// The new lease.
         lease: LeaseKey,
-        /// Where its path starts.
+        /// Where its path starts, one of the request's locators, which the
+        /// owner model checks.
         common_ancestor: Frontier,
         /// Its target.
         target: Frontier,
@@ -300,6 +301,11 @@ pub enum ResultIdentity {
         count: u32,
         /// Whether it reached the target.
         complete: bool,
+        /// Each served header's hash and its parent's, in order: the read
+        /// result's own path. The owner model checks it's a path from the
+        /// read's start to `last`, and the simulator compares the page a
+        /// publisher then hands its writer with it.
+        links: Vec<(block::Hash, block::Hash)>,
     },
     /// The read's `Unavailable` reply.
     PageUnavailable,
@@ -397,6 +403,11 @@ impl ResultIdentity {
                     last,
                     count,
                     complete: page.complete,
+                    links: page
+                        .headers
+                        .iter()
+                        .map(|header| (header.hash(), header.previous_block_hash))
+                        .collect(),
                 }
             }
             HeaderReply::ReadHeaderPath(Ok(ReadPathReply::Unavailable)) => {

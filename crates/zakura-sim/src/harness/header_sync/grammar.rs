@@ -335,6 +335,7 @@ fn decode_as(
                 } else {
                     Dialer::Node
                 },
+                max_headers_per_response: None,
             })
             .collect(),
         policy: Policy {
@@ -346,6 +347,7 @@ fn decode_as(
             bound_ms: (header[BOUND] != 0).then(|| u64::from(header[BOUND]) * BOUND_UNIT_MS),
             holds: Vec::new(),
             reply_holds: Vec::new(),
+            disruptions: Vec::new(),
         },
         controls: Vec::new(),
         weights: Weights {
@@ -472,6 +474,12 @@ impl Order {
 /// reply holds', then its control steps'. Fails if the grammar can't
 /// express some part of it.
 pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
+    if !scenario.policy.disruptions.is_empty() {
+        return Err(Unencodable(format!(
+            "the grammar has no disruption, but it declares {:?}",
+            scenario.policy.disruptions
+        )));
+    }
     let mirrors = scenario.mirrors.len();
     if !(1..=MAX_MIRRORS).contains(&mirrors) {
         return Err(Unencodable(format!(
@@ -505,6 +513,11 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         .iter()
         .zip(header[MIRRORS..].as_chunks_mut::<MIRROR>().0)
     {
+        if let Some(limit) = spec.max_headers_per_response {
+            return Err(Unencodable(format!(
+                "a mirror's response limit is {limit}, which the grammar can't express"
+            )));
+        }
         encode_chain(&spec.chain, &mut record[..3])?;
         record[3] = match spec.dialer {
             Dialer::Mirror => 0,

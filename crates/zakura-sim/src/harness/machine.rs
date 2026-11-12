@@ -27,7 +27,7 @@ use crate::{
     },
     record::{
         machine::{MachineScenario, MachineStep},
-        InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
+        FullReport, InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
     },
     sim::Pick,
     trace::{
@@ -225,7 +225,9 @@ pub fn meta(machine: &Machine, value: &Value) -> Result<MetaRecord, HarnessError
         rng: RNG.into(),
         fixtures: Vec::new(),
         properties: registered(machine),
+        draft: Vec::new(),
         input: None,
+        plan: None,
         derived_from: None,
     })
 }
@@ -284,6 +286,7 @@ fn run_checked(
         violation: None,
         drain: None,
         harness: checker.harness_failure(),
+        rest: None,
     };
     sink.record(Record::Init(InitRecord::default()));
     for (number, work) in history {
@@ -339,8 +342,10 @@ fn run_checked(
             pick: &identity,
             enabled: &enabled,
             phase: Phase::Live,
+            budget: u64::MAX,
             now: SimInstant::ZERO,
             status: SchedulerStatus::Quiescent,
+            quiescent: true,
             log: &log,
         };
         end.violation = checker.after_step(&cx);
@@ -373,20 +378,39 @@ fn run_checked(
             status: IdleStatus::Quiescent,
         }
     };
+    // A machine's history runs no tasks, so an idle end is quiescent. A
+    // harness end keeps no violation, as `Sim::run`'s doesn't.
+    end.rest = matches!(end.outcome, Outcome::Idle { .. }).then_some(SchedulerStatus::Quiescent);
+    if end.outcome == Outcome::Harness {
+        end.violation = None;
+    }
     let mut properties = checker.at_end(&end, &log);
+    // A failure either checker found at the end fails a run that didn't
+    // already fail, the registry's first, as in `Sim::run`.
+    let mut late = checker.harness_failure();
     if let Some(extra) = extra {
         properties.extend(extra.at_end(&end, &log));
+        late = late.or_else(|| extra.harness_failure());
+    }
+    // A fresh harness end, as `Sim::run`'s, so nothing of the outcome it
+    // replaces, such as its rest or its violation, stays on it.
+    if let (None, Some(failure)) = (&end.harness, late) {
+        end = RunEnd {
+            outcome: Outcome::Harness,
+            steps: end.steps,
+            violation: None,
+            drain: None,
+            harness: Some(failure),
+            rest: None,
+        };
     }
     // As in `Sim::run`: a harness failure leaves no property held, since the
-    // run's evidence may be incomplete. The report and the end record both
-    // take these.
+    // run's evidence may be incomplete, and trims each report's end findings.
+    // The report, the full report and the end record all take these.
     if end.outcome == Outcome::Harness {
         properties = properties
             .into_iter()
-            .map(|report| PropertyReport {
-                outcome: report.outcome.after_harness_failure(),
-                ..report
-            })
+            .map(PropertyReport::after_harness_failure)
             .collect();
     }
     let report = RunReport {
@@ -400,6 +424,7 @@ fn run_checked(
     let record = report.end_record();
     crate::trace::end_records::write_end(&record);
     sink.record(Record::End(record));
+    sink.report(&FullReport::new(&report.properties, None));
     match report.end.harness.clone() {
         Some(failure) => Err(HarnessError::Run {
             failure,
@@ -471,5 +496,10 @@ impl RecordSink for WitnessSink<'_> {
             }
         }
         self.sink.record(record);
+    }
+
+    /// Forwards to the sink.
+    fn report(&mut self, report: &FullReport) {
+        self.sink.report(report);
     }
 }

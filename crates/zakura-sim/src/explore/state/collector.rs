@@ -230,7 +230,9 @@ impl Collect for StateCollector {
                 continue;
             };
             let point = match to {
-                Lifecycle::Applicable => continue,
+                // An assumption loss ends obligations without the node
+                // doing anything, so it's no point of the node's.
+                Lifecycle::Applicable | Lifecycle::AssumptionLost => continue,
                 Lifecycle::Obliged => ObligationPoint::Opened,
                 Lifecycle::Discharged => ObligationPoint::Discharged,
                 Lifecycle::Expired => ObligationPoint::Expired,

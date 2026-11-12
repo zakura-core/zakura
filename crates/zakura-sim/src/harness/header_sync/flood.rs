@@ -70,6 +70,7 @@ impl FloodScenario {
         let at_tip = || MirrorSpec {
             chain: Chain::main(NODE_TIP),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         };
         let step = |peer: String, action| ControlStep {
             peer,
@@ -95,6 +96,7 @@ impl FloodScenario {
                 mirrors.push(MirrorSpec {
                     chain: Chain::main(NODE_TIP + 1),
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 });
                 let locator = Select::nth(OpKind::Locator, 1);
                 holds.push(Hold {
@@ -163,9 +165,15 @@ impl HasView for Flood {
         found.extend(watch_end_violations(
             &self.0.adoption,
             self.1.queue(),
-            self.0.topology.shutdown_picked(),
+            self.stopping(),
         ));
         found
+    }
+
+    /// Whether a `Shutdown` step was picked, the stop that exempts an
+    /// unread publication from [`watch_end_violations`].
+    fn stopping(&self) -> bool {
+        self.0.topology.shutdown_picked()
     }
 
     /// The storage harness's stamped facts.

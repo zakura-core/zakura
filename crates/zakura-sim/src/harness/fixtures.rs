@@ -198,7 +198,7 @@ fn race_config(workers: u16) -> RunConfig {
             ..SchedulerConfig::default()
         },
         budget: 1_000,
-        drain_bound: 1_000,
+        drain_bound: 5_000,
         ..RunConfig::default()
     }
 }

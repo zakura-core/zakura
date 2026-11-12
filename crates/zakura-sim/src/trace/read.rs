@@ -211,9 +211,9 @@ impl Parsed {
                         PropertyOutcome::Violated { witness } => {
                             witness.iter().all(|&step| in_trace(step))
                         }
-                        PropertyOutcome::Held { .. }
-                        | PropertyOutcome::NotApplicable
-                        | PropertyOutcome::Inconclusive { .. } => true,
+                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable { .. } => {
+                            true
+                        }
                     }
             });
         if good {

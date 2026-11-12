@@ -162,6 +162,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_recovery_progress.rs"
+test = "regenerate_recovery_fixtures"
+run = false
+reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"
 test = "regenerate_chain_witnesses"
 run = false
@@ -196,6 +202,24 @@ file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
 test = "regenerate_planted_guard_scenarios"
 run = false
 reason = "a tool, not a test: it rewrites the planted cases' scenarios"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_chain_selected.rs"
+test = "regenerate_selection_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_publication_liveness.rs"
+test = "regenerate_liveness_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed liveness witnesses from their fixtures"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_publication.rs"
+test = "regenerate_publication_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed publication witnesses from their builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_storage_seeds.rs"
@@ -422,12 +446,12 @@ reason = "no target: the harness has two fixed scenarios, the wake fixtures, and
 [[missing-target]]
 harness = "header-sync/repair"
 owner = "E5a"
-reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
+reason = "no target: the harness has four fixed scenarios, the repair fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "header-sync/liveness"
 owner = "E5a"
-reason = "no target: the harness has fixed scenarios, the hdr-10 liveness fixtures, and no plan maps it to a target"
+reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"
@@ -452,24 +476,6 @@ id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/expected-chain-selected"
-kind = "property"
-owner = "H4"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/state-publication-consistent"
-kind = "property"
-owner = "H4"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
-id = "header-sync/bounded-adversary-progress"
-kind = "property"
-owner = "H5"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
 id = "sync/stale-block-completion-inert"

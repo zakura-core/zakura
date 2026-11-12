@@ -1,0 +1,11 @@
+# The publisher drops an update that the subscription rules refuse with
+# `AfterClose`, as it drops a crossed update, instead of refusing it, so
+# the reader keeps the connection open. Its input is the saved after-close
+# Plan, whose adversary sends a `Grant` after its `Close`, so
+# `header-sync/s5v9/subscribe-headers/after-close-closes` is the only ID
+# it breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+input = "crates/zakura-sim/tests/fixtures/header-wire-after-close.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

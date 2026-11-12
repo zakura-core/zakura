@@ -23,6 +23,7 @@ use std::{
 
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL, CAPACITY_RELEASE_WAKES},
@@ -157,15 +158,25 @@ fn deferred(facts: &[(u64, WakeFact)]) -> bool {
 /// `header-sync/capacity-release-wakes` holds on `input` through the
 /// registered harness, and the run reaches its trigger history. Returns
 /// the facts between the wake and the waiting offer's read.
-fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, WakeFact)> {
+fn committed_input_holds(scenario: WakeScenario, input: &[u8], case: &str) -> Vec<(u64, WakeFact)> {
     let entry = harness::find(ReleaseWake::NAME).expect("the harness is registered");
-    let result = (entry.witness)(
+    // The witness run is the manifest history `case`, which the acceptance
+    // tool records from this declaration (C18).
+    let result = run_declared(
+        ReleaseWake::NAME,
+        case,
         &entry.scenario(&input[..ReleaseWake::SCENARIO_BYTES]),
         plan(input),
-        CAPACITY_RELEASE_WAKES,
-        Expect::Holds,
-        &[],
-        &mut MemorySink::default(),
+        |scenario, plan, sink| {
+            (entry.witness)(
+                scenario,
+                plan,
+                CAPACITY_RELEASE_WAKES,
+                Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     );
     assert_eq!(result, Ok(()));
     let (report, facts) = run(scenario, plan(input));
@@ -176,7 +187,11 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
 /// waiting offer's read.
 #[test]
 fn the_release_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Release, RELEASE_INPUT);
+    let between = committed_input_holds(
+        WakeScenario::Release,
+        RELEASE_INPUT,
+        "committed release input",
+    );
     assert!(!deferred(&between), "{between:?}");
 }
 
@@ -184,7 +199,11 @@ fn the_release_wake_input_holds_capacity_release_wakes() {
 /// deferred to the refill before the waiting offer's read.
 #[test]
 fn the_deferred_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Deferred, DEFERRED_INPUT);
+    let between = committed_input_holds(
+        WakeScenario::Deferred,
+        DEFERRED_INPUT,
+        "committed deferred input",
+    );
     assert!(deferred(&between), "{between:?}");
 }
 

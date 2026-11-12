@@ -214,13 +214,14 @@ const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-
 fn the_close_relink_input_holds_chunk_budget_bound() {
     let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
     let (prefix, plan) = CLOSE_RELINK_INPUT.split_at(Storage::SCENARIO_BYTES);
-    let result = (entry.witness)(
+    let result = run_declared(
+        Storage::NAME,
+        "committed close-relink input",
         &entry.scenario(prefix),
         Plan::from_fuzz(plan),
-        CHUNK_BUDGET_BOUND,
-        Expect::Holds,
-        &[],
-        &mut MemorySink::default(),
+        |scenario, plan, sink| {
+            (entry.witness)(scenario, plan, CHUNK_BUDGET_BOUND, Expect::Holds, &[], sink)
+        },
     );
     assert_eq!(result, Ok(()));
 }

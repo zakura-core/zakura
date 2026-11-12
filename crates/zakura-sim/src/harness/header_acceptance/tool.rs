@@ -1468,6 +1468,14 @@ fn history_execution(
         }
         Err(why) => fail(&mut execution, why),
     }
+    let errors = inventory_errors(
+        &inventory_cases(package, file, name),
+        &declared(&dir.join("declared")),
+        name,
+    );
+    if !errors.is_empty() {
+        fail(&mut execution, errors.join("; "));
+    }
     if trace_source(&recording).as_deref() != Some(subject_source) {
         fail(
             &mut execution,
@@ -1721,6 +1729,67 @@ fn declaration(
             named.len()
         )),
     }
+}
+
+/// Every counted history the committed inventory
+/// ([`counted_histories`](super::rows::counted_histories)) names for the
+/// witness test `test` in `package`'s `file`, as its harness and case.
+pub fn inventory_cases(package: &str, file: &str, test: &str) -> BTreeSet<(String, String)> {
+    super::rows::counted_histories()
+        .into_iter()
+        .filter(|history| {
+            (
+                history.witness.package,
+                history.witness.file,
+                history.witness.test,
+            ) == (package, file, test)
+        })
+        .map(|history| (history.harness.to_owned(), history.case.to_owned()))
+        .collect()
+}
+
+/// Why the declarations a counted witness test made under
+/// `ZAKURA_SIM_HISTORIES`, `declared`, aren't exactly `inventory`, the
+/// counted histories the committed inventory names for it
+/// ([`inventory_cases`]): one it names that the test didn't declare, one
+/// the test declared that it doesn't name or declared twice, or one
+/// another test declared. Empty when they match, or when the inventory
+/// names no history for the test, which then counts none.
+pub fn inventory_errors(
+    inventory: &BTreeSet<(String, String)>,
+    declared: &[(std::path::PathBuf, DeclaredHistory)],
+    test: &str,
+) -> Vec<String> {
+    if inventory.is_empty() {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, history) in declared {
+        let key = (history.harness.clone(), history.case.clone());
+        if !libtest_names(&history.test, test) {
+            errors.push(format!(
+                "{} declared {} on {}, inside {test}'s run",
+                history.test, history.case, history.harness
+            ));
+        } else if !inventory.contains(&key) {
+            errors.push(format!(
+                "{test} declared {} on {}, which the inventory doesn't count",
+                history.case, history.harness
+            ));
+        } else if !seen.insert(key) {
+            errors.push(format!(
+                "{test} declared {} on {} twice",
+                history.case, history.harness
+            ));
+        }
+    }
+    for (harness, case) in inventory.difference(&seen) {
+        errors.push(format!(
+            "{test} didn't declare its counted history {case} on {harness}"
+        ));
+    }
+    errors
 }
 
 /// Whether libtest's thread name `thread` names the test `test`: the test
@@ -3833,6 +3902,74 @@ mod tests {
             fs::write(dir.join("run/witness.json"), witness.to_string())
                 .expect("the temp dir is writable");
         }
+    }
+
+    /// A counted witness test's declarations must be exactly the counted
+    /// histories the committed inventory names for it. The storage
+    /// witness's 32 plans declared once each pass. One missing, one extra,
+    /// one declared twice and one declared by another test each fail, and a
+    /// test the inventory names nothing for isn't checked.
+    #[test]
+    fn a_counted_test_declares_exactly_its_inventory() {
+        let (file, test) = (
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        );
+        let inventory = inventory_cases("zakura-sim", file, test);
+        assert_eq!(inventory.len(), 32, "{inventory:?}");
+        let declare = |cases: &[(&str, &str)]| -> Vec<(std::path::PathBuf, DeclaredHistory)> {
+            cases
+                .iter()
+                .map(|(by, case)| {
+                    (
+                        std::path::PathBuf::new(),
+                        DeclaredHistory {
+                            test: format!("a::{by}"),
+                            harness: NODE.to_owned(),
+                            case: (*case).to_owned(),
+                        },
+                    )
+                })
+                .collect()
+        };
+        let all: Vec<(&str, &str)> = inventory
+            .iter()
+            .map(|(_, case)| (test, case.as_str()))
+            .collect();
+        assert_eq!(
+            inventory_errors(&inventory, &declare(&all), test),
+            Vec::<String>::new()
+        );
+        let errors =
+            |cases: Vec<(&str, &str)>| inventory_errors(&inventory, &declare(&cases), test);
+        let missing = errors(all[1..].to_vec());
+        assert!(
+            missing.len() == 1 && missing[0].contains("didn't declare"),
+            "{missing:?}"
+        );
+        let mut extra = all.clone();
+        extra.push((test, "plan 32 of inputs(32, 256)"));
+        let extra = errors(extra);
+        assert!(
+            extra.len() == 1 && extra[0].contains("doesn't count"),
+            "{extra:?}"
+        );
+        let mut twice = all.clone();
+        twice.push(all[0]);
+        let twice = errors(twice);
+        assert!(twice.len() == 1 && twice[0].contains("twice"), "{twice:?}");
+        let mut other = all.clone();
+        other[0].0 = "another_test";
+        let other = errors(other);
+        assert!(
+            other.iter().any(|error| error.contains("another_test")),
+            "{other:?}"
+        );
+        assert!(inventory_cases("zakura-sim", file, "not_counted").is_empty());
+        assert_eq!(
+            inventory_errors(&BTreeSet::new(), &declare(&all), "not_counted"),
+            Vec::<String>::new()
+        );
     }
 
     /// A history's trigger comes only from a witness file judging the

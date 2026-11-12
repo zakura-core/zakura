@@ -25,6 +25,7 @@ use std::{
 use serde_json::Value;
 use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::{
@@ -91,15 +92,18 @@ fn plans() -> Vec<PlanInput> {
 /// Runs `scenario` under `plan`. The run must end without a harness
 /// failure or a violation that stopped it.
 fn run(scenario: &WireScenario, plan: PlanInput) -> (RunReport, WirePorts) {
+    run_into(scenario, plan, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &WireScenario,
+    plan: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, WirePorts) {
     let ports = HeaderWire::prepare(scenario);
-    let report = run_prepared::<HeaderWire>(
-        scenario,
-        ports.clone(),
-        plan,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<HeaderWire>(scenario, ports.clone(), plan, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     (report, ports)
@@ -201,8 +205,12 @@ fn the_progress_fixture_holds_honest_progress() {
         Expect::Holds,
     );
     let scenario = progress_scenario();
-    for plan in plans() {
-        let (report, ports) = run(&scenario, plan);
+    let mut cases = vec!["committed plan".to_owned(), "empty plan".to_owned()];
+    cases.extend((0..4).map(|index| format!("plan {index} of inputs(4, 16384)")));
+    for (case, plan) in cases.iter().zip(plans()) {
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let (report, ports) = run_declared(HeaderWire::NAME, case, &scenario, plan, run_into);
         assert_eq!(
             outcome(&report, HONEST_PROGRESS),
             &PropertyOutcome::Held { applicable: 1 }

@@ -10,6 +10,7 @@ mod support;
 use std::{cell::RefCell, collections::HashMap, fs, path::PathBuf, process::Command, rc::Rc};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -409,11 +410,19 @@ fn each_served_witness_serves_what_it_names() {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure, returning the report and the view after it.
 fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, StorageView) {
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, StorageView) {
     let prepared = Viewed::prepare(scenario);
     let slot = prepared.1.clone();
-    let report =
-        run_prepared::<Viewed>(scenario, prepared, input, &mut MemorySink::default(), None)
-            .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<Viewed>(scenario, prepared, input, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     let storage = slot.borrow_mut().take().expect("the harness was built");
@@ -435,8 +444,16 @@ fn outcome<'r>(report: &'r RunReport, property: &str) -> &'r PropertyOutcome {
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
-        for input in inputs(8, 256) {
-            let (report, _) = run(&scenario, input);
+        for (index, input) in inputs(8, 256).into_iter().enumerate() {
+            // Each run is a manifest history, which the acceptance tool
+            // records from this declaration (C18).
+            let (report, _) = run_declared(
+                Storage::NAME,
+                &format!("{name} plan {index} of inputs(8, 256)"),
+                &scenario,
+                input,
+                run_into,
+            );
             assert!(
                 matches!(
                     outcome(&report, STATE_PUBLICATION_CONSISTENT),

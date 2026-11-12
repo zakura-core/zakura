@@ -20,6 +20,7 @@ use support::{byte_inputs, inputs};
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
@@ -102,6 +103,15 @@ impl Run {
 /// finish, never at its budget, with no violation or harness failure, and
 /// with every property but this one holding or not applying.
 fn run(fixture: RecoveryFixture, input: PlanInput) -> Run {
+    run_into(fixture, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    fixture: RecoveryFixture,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> Run {
     let scenario = LivenessScenario::Recovery(fixture);
     let ports = Liveness::prepare(&scenario);
     let recovery = ports.recovery.clone();
@@ -115,14 +125,8 @@ fn run(fixture: RecoveryFixture, input: PlanInput) -> Run {
         });
         None
     });
-    let report = run_prepared::<Liveness>(
-        &scenario,
-        ports,
-        input,
-        &mut MemorySink::default(),
-        Some(&mut checker),
-    )
-    .unwrap_or_else(|error| panic!("{fixture:?}: {error}"));
+    let report = run_prepared::<Liveness>(&scenario, ports, input, sink, Some(&mut checker))
+        .unwrap_or_else(|error| panic!("{fixture:?}: {error}"));
     let end = &report.end;
     assert!(
         matches!(end.outcome, Outcome::Idle { .. }),
@@ -268,7 +272,15 @@ fn the_committed_fixtures_match_their_names() {
         let LivenessScenario::Recovery(recovery) = fixture else {
             unreachable!("committed fixtures are recovery fixtures");
         };
-        let run = run(recovery, zakura_sim::Plan::from_fuzz(&plan));
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let run = run_declared(
+            Liveness::NAME,
+            &format!("header-recovery-{name}"),
+            &fixture,
+            zakura_sim::Plan::from_fuzz(&plan),
+            |_, input, sink| run_into(recovery, input, sink),
+        );
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
             &PropertyOutcome::Held { applicable: 1 },

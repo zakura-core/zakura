@@ -10,6 +10,7 @@ mod support;
 use std::{fs, io::Write, path::Path, path::PathBuf, process::Command};
 
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     domain::header_sync::{WATCH_OBSERVED_UNDER_FLOOD, WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD},
     explore::{classify, ExploreOutcome},
@@ -119,13 +120,20 @@ fn the_committed_flood_inputs_hold_their_watch_rules() {
     let entry = harness::find(Flood::NAME).expect("the harness is registered");
     for seed in SEEDS {
         let input = committed(seed);
-        let result = (entry.witness)(
+        let result = run_declared(
+            Flood::NAME,
+            &format!(
+                "committed {} flood input",
+                match seed.1 {
+                    FloodScenario::Wire => "wire",
+                    FloodScenario::Lifecycle => "lifecycle",
+                }
+            ),
             &entry.scenario(&input[..Flood::SCENARIO_BYTES]),
             plan(input),
-            seed.2,
-            Expect::Holds,
-            &[],
-            &mut MemorySink::default(),
+            |scenario, plan, sink| {
+                (entry.witness)(scenario, plan, seed.2, Expect::Holds, &[], sink)
+            },
         );
         assert_eq!(result, Ok(()), "{}", seed.0);
     }

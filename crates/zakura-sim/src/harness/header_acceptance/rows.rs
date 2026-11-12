@@ -1637,6 +1637,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "foreign-leases",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "forwarded-length",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -2967,7 +2973,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "dropped-owner-check",
         },
     },
-    to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "foreign-leases",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "foreign-leases",
+        },
+    },
     NativeMutation {
         patch: "forgotten-locator-permit",
         class: NativeClass::Moved {

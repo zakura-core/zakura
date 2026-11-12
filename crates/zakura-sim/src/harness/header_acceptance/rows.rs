@@ -1775,6 +1775,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "skipped-staging",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "stored-excess-credit",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -3028,7 +3034,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
     to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
-    to_move("skipped-staging", COMMIT, "hdr-9c.1a"),
+    NativeMutation {
+        patch: "skipped-staging",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skipped-staging",
+        },
+    },
     to_move(
         "stale-locator-round",
         "header-sync/reset-invalidates-work",

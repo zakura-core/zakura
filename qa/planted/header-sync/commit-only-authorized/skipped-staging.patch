@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-index e85c1376f2..cf09e58a26 100644
+index 519a229164..ad6404bb25 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-@@ -666,16 +666,12 @@ impl PeerWorkQueue {
+@@ -816,16 +816,12 @@ impl PeerWorkQueue {
              }
              return false;
          }
@@ -12,7 +12,7 @@ index e85c1376f2..cf09e58a26 100644
 +        // a build without debug assertions.
 +        let _ = (ancestor, entries, cursor);
          #[cfg(any(test, zakura_sim))]
-         self.report_staged(peer, hashes);
+         self.report_staged(peer, ancestor, hashes);
 -        debug_assert_eq!(
 -            self.owned_header_count(peer),
 -            self.policy

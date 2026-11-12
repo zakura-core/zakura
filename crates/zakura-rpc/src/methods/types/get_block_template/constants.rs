@@ -16,18 +16,9 @@ use zakura_chain::parameters::subsidy::FundingStreamReceiver::{self, *};
 /// <https://github.com/zcash/zcash/blob/420f8dfe38fd6b2465a665324366c2ae14aa98f4/src/rpc/mining.cpp#L626>
 pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 
-/// How long a long poll answered on a new tip waits for the mempool's transactions before it
-/// falls back to the coinbase-only template.
-///
-/// The bound keeps a lagging mempool from holding back work on the new tip. On a Mainnet node
-/// running this code, over 46 new blocks with up to 7 transactions waiting, we have not
-/// observed worse than 3.5 ms from the node seeing a new block to returning the full template.
-/// The mempool's part of that was at most 0.3 ms.
-pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// How many long polls answered on a new tip may build a full template at the same time.
 ///
-/// Each one may ask the mempool, selects from its transactions and queues a template build.
+/// Each one selects from the mempool's published transactions and queues a template build.
 /// Without a limit, every long poll woken by one tip change would do that at once. A long
 /// poll over the limit answers with the coinbase-only template instead of waiting.
 ///

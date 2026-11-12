@@ -121,11 +121,11 @@ use types::{
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MAX_TEMPLATE_REBUILDS, MEMPOOL_LONG_POLL_INTERVAL,
-            NEW_TIP_MEMPOOL_WAIT, ZCASHD_FUNDING_STREAM_ORDER,
+            ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
         shared_template::ReadyTemplate,
-        trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
+        trace::{next_request_id, BuildTimes, EmptyReason, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
     },
@@ -2045,37 +2045,26 @@ where
     }
 
     /// Returns the mempool's transactions for the first answer on the new tip `tip_hash`, if
-    /// the mempool has processed that block and holds any.
+    /// the mempool has already published them, or why the answer is coinbase-only.
     ///
-    /// Reads them with [`Self::mempool_on_tip`].
-    ///
-    /// Returns `None` when the mempool is empty, answers that it is still on an older tip,
-    /// takes longer than [`NEW_TIP_MEMPOOL_WAIT`], or fails. The caller then answers with the
-    /// coinbase-only template, so the mempool never delays work on a new tip by more than
-    /// that wait.
-    async fn populated_mempool_on_new_tip(
+    /// Never waits and never asks the mempool. Removing a large block's transactions takes the
+    /// mempool tens of milliseconds, and miners want work on the new tip at once, so a long
+    /// poll that wakes before the mempool has finished the block answers coinbase-only. The
+    /// client's next long poll returns the full template as soon as the mempool publishes it.
+    fn populated_mempool_on_new_tip(
         &self,
         tip_hash: block::Hash,
-    ) -> Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)> {
-        match tokio::time::timeout(NEW_TIP_MEMPOOL_WAIT, self.mempool_on_tip(tip_hash)).await {
-            Ok(Ok(Some((transactions, dependencies)))) if !transactions.is_empty() => {
-                Some((transactions, dependencies))
+    ) -> std::result::Result<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>), EmptyReason>
+    {
+        match self.mempool_snapshots.latest() {
+            Some(snapshot) if snapshot.last_seen_tip_hash == tip_hash => {
+                if snapshot.transactions.is_empty() {
+                    Err(EmptyReason::MempoolEmpty)
+                } else {
+                    Ok((snapshot.transactions, snapshot.transaction_dependencies))
+                }
             }
-            Ok(Ok(_empty_or_on_an_older_tip)) => None,
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    ?error,
-                    "mempool request failed on a new tip; answering with the coinbase-only template"
-                );
-                None
-            }
-            Err(_elapsed) => {
-                tracing::debug!(
-                    ?NEW_TIP_MEMPOOL_WAIT,
-                    "mempool did not answer in time on a new tip; answering with the coinbase-only template"
-                );
-                None
-            }
+            _older_tip_or_withdrawn => Err(EmptyReason::MempoolNotReady),
         }
     }
 
@@ -2083,7 +2072,7 @@ where
     /// cannot be offered at once.
     ///
     /// That is the case when the mempool holds no transactions for the new tip or has not
-    /// caught up with it (see [`Self::populated_mempool_on_new_tip`]), when a shielded
+    /// published them yet (see [`Self::populated_mempool_on_new_tip`]), when a shielded
     /// coinbase built in advance saves the miner its proof time, or when as many long polls
     /// as may build a full first answer at once are already doing so (see
     /// [`GetBlockTemplateHandler::try_reserve_full_first_answer`]). Miners want work on the
@@ -2092,10 +2081,12 @@ where
     /// mempool has any. Returns `Ok(None)` when the template was superseded, like
     /// [`Self::finish_mining_template`].
     ///
-    /// Traces the returned template under `request_id`.
+    /// Traces the returned template and `empty_reason` under `request_id`.
+    #[allow(clippy::too_many_arguments)]
     async fn new_tip_template(
         &self,
         request_id: u64,
+        empty_reason: EmptyReason,
         precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
@@ -2130,7 +2121,7 @@ where
         if let Some(GetBlockTemplateResponse::TemplateMode(template)) = &response {
             self.gbt
                 .trace
-                .empty_returned(request_id, template, build_times);
+                .empty_returned(request_id, template, empty_reason, build_times);
         }
         Ok(response)
     }
@@ -4094,33 +4085,36 @@ where
                         let coinbase_has_head_start = precomputed_coinbase.is_some()
                             && coinbase_needs_proof(&self.network, next_height, miner_params);
                         let populated_mempool = if coinbase_has_head_start {
-                            None
+                            Err(EmptyReason::CoinbaseBuiltAhead)
                         } else if let Some(place) = self.gbt.try_reserve_full_first_answer() {
-                            let populated_mempool =
-                                self.populated_mempool_on_new_tip(tip_hash).await;
-                            if populated_mempool.is_some() {
+                            let populated_mempool = self.populated_mempool_on_new_tip(tip_hash);
+                            if populated_mempool.is_ok() {
                                 full_first_answer = Some(place);
                             }
                             populated_mempool
                         } else {
-                            None
+                            Err(EmptyReason::NoBuildSlot)
                         };
 
-                        let Some(populated_mempool) = populated_mempool else {
-                            if let Some(template) = self
-                                .new_tip_template(
-                                    request_id,
-                                    precomputed_coinbase,
-                                    miner_params,
-                                    &chain_info,
-                                    &rejection_state,
-                                    client_long_poll_id.as_ref(),
-                                )
-                                .await?
-                            {
-                                return Ok(template);
+                        let populated_mempool = match populated_mempool {
+                            Ok(populated_mempool) => populated_mempool,
+                            Err(empty_reason) => {
+                                if let Some(template) = self
+                                    .new_tip_template(
+                                        request_id,
+                                        empty_reason,
+                                        precomputed_coinbase,
+                                        miner_params,
+                                        &chain_info,
+                                        &rejection_state,
+                                        client_long_poll_id.as_ref(),
+                                    )
+                                    .await?
+                                {
+                                    return Ok(template);
+                                }
+                                continue 'rebuild;
                             }
-                            continue 'rebuild;
                         };
                         Some(populated_mempool)
                     } else {

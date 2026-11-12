@@ -20,7 +20,7 @@ use zakura_sim::{
     domain::header_sync::CHUNK_BUDGET_BOUND,
     harness::{
         self,
-        header_acceptance::history::declare,
+        header_acceptance::history::run_declared,
         header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::SettlementEvidence,
@@ -48,10 +48,14 @@ use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
 /// Runs `scenario` on freshly prepared ports under `input`. The run must end
 /// without a violation or harness failure. Returns its report and the
 /// probe's readings.
-fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Vec<CapacityReading>) {
+fn run(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+) -> (RunReport, Vec<CapacityReading>) {
     let ports = Storage::prepare(scenario);
     let capacity = ports.capacity.clone();
-    let report = run_prepared::<Storage>(scenario, ports, input, &mut MemorySink::default(), None)
+    let report = run_prepared::<Storage>(scenario, ports, input, sink, None)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
@@ -161,13 +165,13 @@ fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
     for (index, input) in inputs(16, 256).into_iter().enumerate() {
         // Each run is a manifest history, which the acceptance tool
         // records from this declaration (C18).
-        declare(
+        let (report, readings) = run_declared(
             Storage::NAME,
             &format!("plan {index} of inputs(16, 256)"),
             &scenario,
-            &input,
+            input,
+            run,
         );
-        let (report, readings) = run(&scenario, input);
         assert!(
             readings
                 .iter()

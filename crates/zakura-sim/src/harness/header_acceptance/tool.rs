@@ -82,7 +82,7 @@ use super::{
         evaluate, Actions, Actual, Companion, End, Evaluation, ExecMeta, Execution,
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
-    history::{declared, DeclaredHistory, PLAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
+    history::{declared, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -1762,7 +1762,9 @@ pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, Str
 
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
 /// on `harness`: its scenario and its Plan bytes or script, by digest
-/// (C18).
+/// (C18), or its steps aren't the ones the declaring test's own run took,
+/// its [`RAN_FILE`] ([`super::history::run_declared`]). A declaration with
+/// no such file wasn't run where it was declared, so it names no history.
 fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
     let (file, script) = match declared_plan(declaration) {
         Ok(found) => found,
@@ -1775,6 +1777,18 @@ fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<Str
         script,
         dir,
     )
+    .or_else(|| {
+        let Some(ran) = read_json::<Ran>(&declaration.join(RAN_FILE)) else {
+            return Some("its declaration has no steps from its test's own run".to_owned());
+        };
+        let recorded = crate::trace::TraceReader::open(dir).ok()?;
+        (Ran::of(&recorded.steps) != ran).then(|| {
+            format!(
+                "its recording took other steps than its test's own run, which took {}",
+                ran.steps
+            )
+        })
+    })
 }
 
 /// Whether `dir`'s `witness.json` judges `property` expecting `expect`
@@ -3710,6 +3724,13 @@ mod tests {
             serde_json::to_string(&history).expect("it serializes"),
         )
         .expect("the temp dir is writable");
+        let recorded =
+            crate::trace::TraceReader::open(storage_recording()).expect("the recording reads back");
+        fs::write(
+            declared.join("0").join(RAN_FILE),
+            serde_json::to_string(&Ran::of(&recorded.steps)).expect("it serializes"),
+        )
+        .expect("the temp dir is writable");
         let recording = dir.join("history");
         fs::create_dir_all(&recording).expect("the temp dir is writable");
         for file in ["trace.jsonl", FULL_REPORT_FILE] {
@@ -3724,6 +3745,66 @@ mod tests {
                 end["harness"] = Value::String(failure.to_owned());
             }
         });
+    }
+
+    /// A declaration binds to the run its test made through
+    /// [`run_declared_in`](super::super::history::run_declared_in): the
+    /// tool's recording of the declared scenario and Plan takes the steps the
+    /// test's own run took. A test whose run used a Plan one byte off from
+    /// the one it declared is refused, and so is a declaration no run
+    /// followed.
+    #[test]
+    fn a_declaration_binds_to_the_run_its_test_made() {
+        use super::super::history::run_declared_in;
+        let entry = crate::harness::find(NODE).expect("the storage harness is registered");
+        let (scenario, plan) = storage_history();
+        let mut off = plan.clone();
+        off[0] = off[0].wrapping_add(1);
+        let declared = |ran: Option<Vec<u8>>| {
+            let root = tempfile::tempdir().expect("a temp dir can be created");
+            let declared = plan.clone();
+            run_declared_in(
+                Some(root.path()),
+                NODE,
+                "plan 0",
+                &scenario,
+                crate::PlanInput::Bytes(declared),
+                |scenario, declared, sink| {
+                    let Some(ran) = ran else {
+                        return;
+                    };
+                    let input = match ran.as_slice() == plan.as_slice() {
+                        true => declared,
+                        false => crate::PlanInput::Bytes(ran),
+                    };
+                    (entry.run)(scenario, input, sink).expect("the history runs");
+                },
+            );
+            let out = root.path().join("run");
+            crate::harness::record(
+                entry,
+                crate::harness::RecordInput::Plan {
+                    scenario: &scenario,
+                    plan: &plan,
+                },
+                &out,
+            )
+            .expect("the declaration records");
+            declared_refusal(NODE, &root.path().join("0"), &out)
+        };
+        assert_eq!(declared(Some(plan.clone())), None);
+        let one_off = declared(Some(off));
+        assert!(
+            one_off
+                .as_ref()
+                .is_some_and(|why| why.contains("other steps")),
+            "{one_off:?}"
+        );
+        let unrun = declared(None);
+        assert!(
+            unrun.as_ref().is_some_and(|why| why.contains("no steps")),
+            "{unrun:?}"
+        );
     }
 
     /// Writes into `dir` what the runner leaves for a history task whose

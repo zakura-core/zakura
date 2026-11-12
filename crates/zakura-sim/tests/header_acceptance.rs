@@ -628,7 +628,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
     // only another owner, or only another reason.
     for key in [
         Key::Native {
-            patch: "foreign-leases".into(),
+            patch: "own9-join".into(),
         },
         Key::NarrowingTest { entry: "N1".into() },
     ] {
@@ -837,7 +837,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
         let at = covering(
             m,
             &Key::Native {
-                patch: "foreign-leases".into(),
+                patch: "own9-join".into(),
             },
         );
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
@@ -1926,10 +1926,7 @@ fn every_native_mutation_is_classified() {
         ("hdr-9c.2a", "header-sync/teardown-returns-baseline"),
     ] {
         let mut changed = NATIVE_MUTATIONS.to_vec();
-        let at = changed
-            .iter()
-            .position(|m| m.patch == "foreign-leases")
-            .unwrap();
+        let at = changed.iter().position(|m| m.patch == "own9-join").unwrap();
         changed[at].class = NativeClass::ToMove { property, until };
         assert_eq!(native_pin_errors(&changed).len(), 1, "{property} {until}");
     }
@@ -2005,24 +2002,21 @@ fn every_native_mutation_is_classified() {
     // refused, since the inventory still names it.
     let dropped: Vec<rows::NativeMutation> = NATIVE_MUTATIONS
         .iter()
-        .filter(|m| m.patch != "foreign-leases")
+        .filter(|m| m.patch != "own9-join")
         .copied()
         .collect();
     let fewer: Vec<String> = native_dirs()
         .into_iter()
-        .filter(|dir| dir != "foreign-leases")
+        .filter(|dir| dir != "own9-join")
         .collect();
     assert!(!native_errors(&dropped, &fewer, &cases, &manifest.expected).is_empty());
     // A move's record outlives its directory: once moved, its planted case
     // must exist under its property and a catch must name it.
     let mut moved = NATIVE_MUTATIONS.to_vec();
-    let at = moved
-        .iter()
-        .position(|m| m.patch == "foreign-leases")
-        .unwrap();
+    let at = moved.iter().position(|m| m.patch == "own9-join").unwrap();
     let dirs: Vec<String> = native_dirs()
         .into_iter()
-        .filter(|dir| dir != "foreign-leases")
+        .filter(|dir| dir != "own9-join")
         .collect();
     // Moved, it needs a planted case of its own name under its property,
     // named by a Caught. An existing, caught case of another name doesn't
@@ -2030,7 +2024,7 @@ fn every_native_mutation_is_classified() {
     let mut with_case = cases.clone();
     with_case.push((
         "header-sync/commit-only-authorized".into(),
-        "foreign-leases".into(),
+        "own9-join".into(),
     ));
     let mut named = manifest.expected.clone();
     let caught = named
@@ -2043,13 +2037,13 @@ fn every_native_mutation_is_classified() {
         .clone();
     let mut own = caught;
     if let Expected::Caught { case, .. } = &mut own.expected {
-        case.name = "foreign-leases";
+        case.name = "own9-join";
     }
     named.push(own);
     for (property, case, cases, expected, ok) in [
         (
             "header-sync/commit-only-authorized",
-            "foreign-leases",
+            "own9-join",
             &with_case,
             &named,
             true,
@@ -2063,14 +2057,14 @@ fn every_native_mutation_is_classified() {
         ),
         (
             "header-sync/commit-only-authorized",
-            "foreign-leases",
+            "own9-join",
             &cases,
             &manifest.expected,
             false,
         ),
         (
             "header-sync/teardown-returns-baseline",
-            "foreign-leases",
+            "own9-join",
             &with_case,
             &named,
             false,

@@ -32,7 +32,7 @@ use crate::zakura::{ServicePeerDirection, SessionOrigin, ZakuraPeerId};
 mod ledger;
 
 pub use crate::zakura::regulation::ServeInUse;
-pub use ledger::{ClaimBreak, ClaimRule, HeaderWorkLedger};
+pub use ledger::{ClaimBreak, ClaimRule, ClaimSubject, HeaderWorkLedger};
 
 /// The header chunk budget's capacity, so a model can pin its own constant
 /// to it.

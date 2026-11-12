@@ -335,6 +335,67 @@ fn status_debts_open_at_admission_and_at_a_change() {
     );
 }
 
+/// One adoption that changes what every paid session was advertised opens
+/// a debt for each, stamped in session order, so the facts and their
+/// stamps don't depend on how the check holds its sessions.
+#[test]
+fn an_adoption_stamps_its_debts_in_session_order() {
+    let (fixture, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let seed = port.snapshot();
+    adopt(&mut check, &seed);
+    check.observe(&tip_published(&seed, true), true);
+    let sessions = [7, 2, 9, 4, 1, 12, 5, 3];
+    for session_id in sessions {
+        check.observe(
+            &ReactorEvent::SessionAdmitted {
+                peer: mirror(),
+                session_id,
+                direction: zakura_network::zakura::ServicePeerDirection::Inbound,
+                replaced: None,
+                origin: None,
+            },
+            true,
+        );
+        let ReactorEvent::StatusQueued { peer, status, .. } = status_queued(&seed) else {
+            unreachable!("`status_queued` queues a status");
+        };
+        check.observe(
+            &ReactorEvent::StatusQueued {
+                peer,
+                session_id,
+                status,
+            },
+            true,
+        );
+    }
+    let paid = evidence.facts().len();
+    let run = commit(&fixture, &port, 2);
+    check.run(&run, false);
+    check.publications(&port.take_publications());
+    adopt(&mut check, &run.snapshot);
+    let owed: Vec<(u64, u64)> = evidence.facts()[paid..]
+        .iter()
+        .filter_map(|(stamp, fact)| match fact {
+            PublicationFact::StatusOwed { session_id, .. } => Some((*stamp, *session_id)),
+            _ => None,
+        })
+        .collect();
+    let mut ordered = sessions;
+    ordered.sort_unstable();
+    assert_eq!(
+        owed.iter().map(|(_, session)| *session).collect::<Vec<_>>(),
+        ordered,
+        "{owed:?}"
+    );
+    assert!(
+        owed.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "{owed:?}"
+    );
+}
+
 /// A refused queue attempt (`StatusDeferred`) neither pays a session's
 /// debt nor opens another, so the deadline stays the one admission opened,
 /// and the `Status` its retry queues pays it.

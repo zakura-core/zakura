@@ -675,7 +675,7 @@ fn fork_choice_applied<V: ForkView>(view: &V, _: &ObservationLog) -> bool {
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
-const AUTHORITY_CLAIMS: [Claim; 13] = [
+pub(crate) const AUTHORITY_CLAIMS: [Claim; 13] = [
     Claim::CommitOnlyAuthorized,
     Claim::ForeignPage,
     Claim::UnstagedPage,

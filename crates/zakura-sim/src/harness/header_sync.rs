@@ -1431,7 +1431,7 @@ impl Subsystem for Storage {
         }
         ports
             .fork_choice
-            .watch_link_ends(effects.ended.clone(), mirror_links);
+            .watch_link_ends(&effects.ended, mirror_links);
         let control = Control::new(
             sim,
             topology.clone(),

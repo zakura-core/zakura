@@ -74,7 +74,7 @@ use zakura_storage::header::{
     fixture::HeaderFixture,
 };
 
-use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot, WeakRegistered};
 use crate::{observe::StorageFact, storage::hash};
 
 /// What [`ForkChoiceEvidence`] keeps.
@@ -103,10 +103,12 @@ struct Store {
 }
 
 /// The topology's record of when each link's session ended, by connection
-/// ID, and which mirror each of the node's links joins.
+/// ID, and which mirror each of the node's links joins. The record is
+/// another of the node's stores, held weakly so this store doesn't own the
+/// registry that owns it.
 #[derive(Debug)]
 struct LinkEnds {
-    ended: Registered<super::SessionEnds>,
+    ended: WeakRegistered<super::SessionEnds>,
     mirrors: Vec<(u64, String)>,
 }
 
@@ -194,9 +196,10 @@ impl ForkChoiceEvidence {
     /// decision.
     pub fn watch_link_ends(
         &self,
-        ended: Registered<super::SessionEnds>,
+        ended: &Registered<super::SessionEnds>,
         mirrors: Vec<(u64, String)>,
     ) {
+        let ended = ended.downgrade();
         self.change(|store| store.link_ends = Some(LinkEnds { ended, mirrors }));
     }
 
@@ -213,13 +216,15 @@ impl ForkChoiceEvidence {
         // The topology's hooks take the ended map's lock inside a `cancel`,
         // so it's read with the store's lock released.
         let ended: Vec<String> = link_ends.map_or_else(Vec::new, |(ended, mirrors)| {
-            ended.read(|ended| {
-                mirrors
-                    .into_iter()
-                    .filter(|(connection, _)| ended.0.contains_key(connection))
-                    .map(|(_, mirror)| mirror)
-                    .collect()
-            })
+            ended
+                .read(|ended| {
+                    mirrors
+                        .into_iter()
+                        .filter(|(connection, _)| ended.0.contains_key(connection))
+                        .map(|(_, mirror)| mirror)
+                        .collect()
+                })
+                .expect("the node's registry owns its session ends while this store is read")
         });
         self.with(|store| {
             store

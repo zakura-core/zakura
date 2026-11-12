@@ -266,7 +266,8 @@ struct Store {
 impl Snapshot for Store {
     /// Everything it holds, with each running publisher's token as whether
     /// it has one: a token is a live handle, which the scheduler's shutdown
-    /// rightly cancels, not evidence.
+    /// rightly cancels, not evidence. The running publishers are sorted,
+    /// since the check lists them from a hashed set.
     fn snapshot(&self) -> serde_json::Value {
         let Store {
             peaks,
@@ -277,13 +278,15 @@ impl Snapshot for Store {
             at_rest,
             reported,
         } = self;
-        let running: Vec<_> = running
-            .iter()
-            .map(|(peer, session_id, token)| (peer, session_id, token.is_some()))
-            .collect();
-        debug_snapshot(&(
-            peaks, applicable, pending, running, shut_down, at_rest, reported,
-        ))
+        let running = sorted_snapshot(
+            running
+                .iter()
+                .map(|(peer, session_id, token)| (peer, session_id, token.is_some())),
+        );
+        serde_json::json!({
+            "fields": debug_snapshot(&(peaks, applicable, pending, shut_down, at_rest, reported)),
+            "running": running,
+        })
     }
 }
 
@@ -1591,4 +1594,4 @@ impl Outstanding {
 
 #[cfg(test)]
 mod tests;
-use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
+use crate::stores::{debug_snapshot, sorted_snapshot, EvidenceStores, Registered, Snapshot};

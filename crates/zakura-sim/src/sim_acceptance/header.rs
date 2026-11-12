@@ -136,7 +136,8 @@ pub fn executed_traces(actual: &Actual) -> Vec<&str> {
             all.extend(companions.iter().map(|c| c.trace.as_str()));
             all
         }
-        Actual::MachineCaught { baseline, patched } => traces(&[baseline, patched]),
+        Actual::MachineCaught { baseline, patched }
+        | Actual::HarnessCaught { baseline, patched } => traces(&[baseline, patched]),
         Actual::IntegrityCaught {
             unpatched,
             patched,
@@ -156,6 +157,7 @@ pub fn executed_traces(actual: &Actual) -> Vec<&str> {
         | Actual::Test {
             ran: _,
             binary_source: _,
+            checkout_source: _,
         } => Vec::new(),
     }
 }

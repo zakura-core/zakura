@@ -2771,3 +2771,50 @@ pub(crate) fn foreign_page_records(step: u64) -> Vec<ClaimRecord> {
             .collect()
     })
 }
+
+/// A page that arrived on another peer's or another session's stream than
+/// its round's, and skips a header, gives a path finding that names the
+/// page as it arrived, with the round fixed, which is the subject the
+/// ledger's `ForeignPage` gives the same page. Each arrival differs from
+/// the round in one key.
+#[test]
+fn a_path_finding_names_its_pages_arrival() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request_on(&mirror(), 7, 1, 1, chain[3].hash, genesis.hash);
+    for (peer_id, session) in [(other_mirror(), 7), (mirror(), 8)] {
+        let mut page = page_on(&round, Some(4), genesis, &[chain[1].hash]);
+        if let ReactorEvent::PageStaged {
+            from_peer,
+            from_session,
+            reserved_left,
+            ..
+        } = &mut page
+        {
+            *from_peer = peer_id.clone();
+            *from_session = session;
+            *reserved_left = 9;
+        }
+        let arrival =
+            AuthoritySubject::page(&(peer_id.clone(), session, 1), &[chain[1].hash], Some(4));
+        let found = findings(&[
+            adopted(),
+            reserved(1, 10),
+            open_on(&mirror(), 7, 1, chain[3], &[genesis.hash]),
+            started(round.clone(), &[genesis.hash]),
+            page.clone(),
+        ]);
+        assert_eq!(
+            attributions(&found),
+            [blamed(AuthorityRule::Path, arrival.clone())],
+            "{peer_id:?} session {session}: {found:?}"
+        );
+        let (ledger_round, mut events) = ledger_round();
+        assert_eq!(ledger_round, round);
+        events.push(page);
+        assert_eq!(
+            attributed(&ledger_claims(&events), ClaimRule::ForeignPage).subject,
+            arrival
+        );
+    }
+}

@@ -33,8 +33,10 @@
 //! `Draft` override, beside its `property`, `expect`, `also_violates`,
 //! `passed` and `error`. The full report names its `trace` and `source`
 //! the same way. A witness file or full report whose `trace`, `source` or
-//! `draft` isn't the trace's beside it is no witness or report of that run
-//! ([`judged_refusal`]). Its *fresh replay*, where the contract asks for
+//! `draft` isn't the trace's beside it is no witness or report of that run.
+//! Every artifact below is bound to what its reader expects by the one
+//! check, [`binding::check`], which each artifact kind's declared fields go
+//! through (Rule 25). Its *fresh replay*, where the contract asks for
 //! one, is the directory [`REPLAY_DIR`] inside it, written by a separate
 //! `zakura-sim replay <run> --report <run>/replay/full-report.json` with the
 //! same binary that recorded the run: the replay's own `full-report.json`,
@@ -113,12 +115,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
+    binding::{self, known, Expect, Field},
     contracts::RunBy,
     evaluate::{
         evaluate, Actions, Actual, Companion, End, Evaluation, ExecMeta, Execution,
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{declared, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
+    refs::TriggerRef,
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -154,10 +158,14 @@ pub fn task_binding(run_id: &str, index: usize, task: &Task) -> serde_json::Valu
 }
 
 /// Whether `artifacts`' directory for `task`, at `index`, is the one the
-/// run `run_id` wrote for it ([`task_binding`]).
+/// run `run_id` wrote for it ([`task_binding`], [`binding::TASK`]).
 fn task_bound(artifacts: &Path, run_id: &str, index: usize, task: &Task) -> bool {
-    read_json::<serde_json::Value>(&artifacts.join(index.to_string()).join(TASK_FILE))
-        == Some(task_binding(run_id, index, task))
+    let expect = Expect::new()
+        .with(Field::RunId, run_id)
+        .with(Field::TaskIndex, index)
+        .with(Field::Task, task);
+    let path = artifacts.join(index.to_string()).join(TASK_FILE);
+    binding::read(&binding::TASK, &path, &expect).is_ok()
 }
 
 /// What an artifacts directory says of the run that wrote it, at its root.
@@ -845,14 +853,19 @@ fn test_actual(dir: &Path) -> Actual {
 /// The SHA-256 of `path`'s bytes in hex, or `missing` if it can't be read,
 /// which names the one execution an artifact records.
 fn digest(path: &Path) -> String {
+    file_digest(path).unwrap_or_else(|| "missing".to_owned())
+}
+
+/// The SHA-256 of `path`'s bytes in hex, if it can be read.
+fn file_digest(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
-    match fs::read(path) {
-        Ok(bytes) => Sha256::digest(&bytes)
+    let bytes = fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
-        Err(_) => "missing".to_owned(),
-    }
+    )
 }
 
 /// `path` as `T`, or `None` if it's missing or malformed.
@@ -860,67 +873,12 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-/// What an artifact that judged a recorded run says of that run: the
-/// digest of the trace it judged, the source the judging build embeds and,
-/// for a witness file, the `Draft` override the run used. Unknown fields
-/// are the artifact's own.
-#[derive(Clone, Debug, Deserialize)]
-struct Judged {
-    /// The SHA-256 of the judged `trace.jsonl`, in hex.
-    trace: String,
-    /// The judging build's source digest.
-    source: String,
-    /// The run's `Draft` override, which a companions file doesn't name.
-    draft: Option<Vec<String>>,
-}
-
-/// Why `artifact`, an artifact judging the recorded run in `dir`, isn't
-/// that run's: it names no [`Judged`] binding, the trace it judged isn't
-/// `dir`'s, by digest, its judging build isn't the one `dir`'s trace
-/// records, or it names a `Draft` override other than the trace's. Every
-/// artifact the tool credits to a recorded run, its witness file
-/// ([`bound_witness`]), a `Draft` run's companions ([`companions_of`]) and
-/// its recording's and fresh replay's full reports ([`bound_report`]), is
-/// checked here, so one written beside another run never counts for this
-/// one.
-fn judged_refusal(dir: &Path, artifact: &Value) -> Option<String> {
-    let Ok(judged) = serde_json::from_value::<Judged>(artifact.clone()) else {
-        return Some("it names no trace it judged".to_owned());
-    };
-    let trace = match crate::trace::TraceReader::open(dir) {
-        Ok(trace) => trace,
-        Err(error) => return Some(format!("{}: {error}", dir.display())),
-    };
-    if judged.trace != trace.id {
-        return Some(format!(
-            "it judged trace {}, not {}",
-            judged.trace, trace.id
-        ));
-    }
-    if !known(Some(&judged.source)) || judged.source != trace.meta.build.source {
-        return Some(format!(
-            "it was judged by a build of {}, and the trace was recorded by one of {}",
-            judged.source, trace.meta.build.source
-        ));
-    }
-    match judged.draft {
-        Some(draft) if draft != trace.meta.draft => Some(format!(
-            "it names the Draft override {draft:?}, and the trace ran {:?}",
-            trace.meta.draft
-        )),
-        _ => None,
-    }
-}
-
-/// `dir`'s `witness.json`, if it judged `dir`'s own trace
-/// ([`judged_refusal`]), or why not.
+/// `dir`'s `witness.json`, if it judged `dir`'s own trace, build and
+/// `Draft` override ([`binding::WITNESS`]), or why not.
 fn bound_witness(dir: &Path) -> Result<Value, String> {
-    let witness = read_json::<Value>(&dir.join("witness.json"))
-        .ok_or_else(|| "no readable witness file".to_owned())?;
-    match judged_refusal(dir, &witness) {
-        Some(why) => Err(format!("its witness file isn't its trace's: {why}")),
-        None => Ok(witness),
-    }
+    Expect::of_trace(dir)
+        .and_then(|expect| binding::read(&binding::WITNESS, &dir.join("witness.json"), &expect))
+        .map_err(|why| format!("its witness file isn't its trace's: {why}"))
 }
 
 /// A run's declared actions, from its recorded `trace` and `full` report
@@ -948,19 +906,10 @@ fn actions(trace: &Trace, full: &FullReport, end: &End, witnessed: bool) -> Acti
     }
 }
 
-/// The source digest a trace's binary recorded in its meta (`build.source`),
-/// or `None` if the trace has none or it's `unknown`.
-fn trace_source(dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(dir.join("trace.jsonl")).ok()?;
-    let first: Value = serde_json::from_str(text.lines().next()?).ok()?;
-    let source = first.get("meta")?.get("build")?.get("source")?.as_str()?;
-    (!source.is_empty() && source != "unknown").then(|| source.to_owned())
-}
-
 /// The full report (C8) in `at`'s [`FULL_REPORT_FILE`], read as the trace
 /// reader reads its files (a regular file within
 /// [`MAX_REPORT_BYTES`](crate::trace::MAX_REPORT_BYTES)), if it reports the
-/// recorded run in `dir` ([`judged_refusal`]). `at` is `dir` for the
+/// recorded run in `dir` ([`binding::FULL_REPORT`]). `at` is `dir` for the
 /// recording's own report and its [`REPLAY_DIR`] for its fresh replay's.
 fn bound_report(dir: &Path, at: &Path) -> Result<FullReport, String> {
     let path = at.join(FULL_REPORT_FILE);
@@ -971,7 +920,9 @@ fn bound_report(dir: &Path, at: &Path) -> Result<FullReport, String> {
         Ok(None) => return Err(format!("{}: missing", path.display())),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    if let Some(why) = judged_refusal(dir, &value) {
+    if let Err(why) = Expect::of_trace(dir)
+        .and_then(|expect| binding::check(&binding::FULL_REPORT, &value, &expect))
+    {
         return Err(format!(
             "{}: it isn't a report of {}'s trace: {why}",
             path.display(),
@@ -1112,7 +1063,7 @@ pub fn read_execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> E
 /// The fresh replay (C3, C8) of the recorded run `run` in `dir`, from its
 /// [`REPLAY_DIR`]: it's exact only if its child exited 0, wasn't killed
 /// and said it replayed this trace with every pick, draw and observation
-/// matched. Its full report, which must report `dir`'s trace
+/// matched ([`binding::REPLAY_LOG`]). Its full report, which must report `dir`'s trace
 /// ([`bound_report`]), is compared with the recording's, outcomes and
 /// violations apart from the store snapshot, so a changed stored fact fails
 /// it even when every report is the same. Its meta is the recording's: the
@@ -1134,14 +1085,17 @@ fn replay_actual(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
         run_by,
         input: None,
     };
-    let matched = format!("replayed trace {of}: ");
+    let expect = Expect::new().with_read(
+        Field::Trace,
+        file_digest(&dir.join("trace.jsonl")),
+        "the recorded trace can't be read",
+    );
     let exact = ran.as_ref().is_some_and(|ran| {
         ran.exited_ok
             && !ran.killed
-            && ran.log.lines().any(|line| {
-                line.starts_with(&matched)
-                    && line.ends_with("every pick, draw and observation matched")
-            })
+            && binding::replay_claims(&ran.log)
+                .iter()
+                .any(|claim| binding::check(&binding::REPLAY_LOG, claim, &expect).is_ok())
     });
     let (reports_equal, stores_equal) = match (
         recorded.as_ref().map(|(_, report)| report),
@@ -1162,13 +1116,6 @@ fn replay_actual(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
         stores_equal,
         fresh: ran.is_some(),
     }
-}
-
-/// Whether `source` is a digest at all: not missing, empty, `unknown` or
-/// [`NOT_EMBEDDED`], none of which names a source, so two of them never
-/// match.
-fn known(source: Option<&str>) -> bool {
-    source.is_some_and(|source| !source.is_empty() && source != "unknown" && source != NOT_EMBEDDED)
 }
 
 /// Whether `failure`, a harness failure's `Display` form, is the source
@@ -1309,11 +1256,11 @@ fn integrity_execution(
             ) if fails_with(failure, diagnostic) => Ok(()),
             (_, other) => Err(format!("its recorded history ended {other:?}")),
         };
-        let from_checkout = if trace_source(&history) == checkout && checkout.is_some() {
-            Ok(())
-        } else {
-            Err("its recorded history isn't from the checkout its test ran in".to_owned())
-        };
+        let expect =
+            Expect::new().with_read(Field::Source, checkout, "its checkout wasn't measured");
+        let from_checkout = binding::check_trace(&history, &expect).map_err(|why| {
+            format!("its recorded history isn't from the checkout its test ran in: {why}")
+        });
         match bound.and(agrees).and(from_checkout) {
             Ok(()) => {
                 claimed = Some(input.clone());
@@ -1628,16 +1575,17 @@ impl CaseChecks<'_> {
         if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
             fail(&mut execution, why);
         }
-        let measured = read_json::<ProvenanceCheck>(&self.dir.join(PROVENANCE_FILE));
+        let measured = measured_source(self.dir);
         if let Some(why) = provenance_refusal(self.dir) {
             fail(&mut execution, why);
-        } else if trace_source(&dir).is_none()
-            || measured.map(|check| check.source) != trace_source(&dir)
-            || trace_source(&dir).as_deref() == Some(self.subject_source)
-        {
+        } else if let Err(why) = if measured.as_deref() == Some(self.subject_source) {
+            Err("the measured patched checkout is S's own".to_owned())
+        } else {
+            binding::check_trace(&dir, &measured_expect(measured))
+        } {
             fail(
                 &mut execution,
-                "its trace's build source isn't the measured patched checkout's".to_owned(),
+                format!("its trace's build source isn't the measured patched checkout's: {why}"),
             );
         }
         execution
@@ -1645,28 +1593,31 @@ impl CaseChecks<'_> {
 }
 
 /// The companions judged on `draft`, the case's `Draft` run in `dir`, from
-/// its [`COMPANIONS_FILE`]. They count only from the case's own build, the
-/// source its provenance check measured, so a file from any other build
-/// shows none, and each names the trace it judged, which the evaluator
-/// requires to be `draft`'s. A case with no declared companions reads
-/// none.
+/// its [`COMPANIONS_FILE`] ([`binding::COMPANIONS`]). They count only from
+/// the case's own build, the source its provenance check measured, and
+/// only for the `Draft` trace beside them, so a file from any other build
+/// or for any other trace shows none. A case with no declared companions
+/// reads none.
 fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Companion> {
     if declared.is_empty() {
         return Vec::new();
     }
-    let measured = read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE));
-    let file = dir.join("draft").join(COMPANIONS_FILE);
-    let Some(run) = read_json::<CompanionsRun>(&file) else {
+    let draft_dir = dir.join("draft");
+    let run = Expect::of_trace(&draft_dir)
+        .map(|expect| expect.with_read(Field::Source, measured_source(dir), "no provenance check"))
+        .and_then(|expect| {
+            binding::read(
+                &binding::COMPANIONS,
+                &draft_dir.join(COMPANIONS_FILE),
+                &expect,
+            )
+        })
+        .and_then(|artifact| {
+            serde_json::from_value::<CompanionsRun>(artifact).map_err(|error| error.to_string())
+        });
+    let Ok(run) = run else {
         return Vec::new();
     };
-    if !known(Some(&run.source)) || measured.map(|check| check.source) != Some(run.source.clone()) {
-        return Vec::new();
-    }
-    if read_json::<Value>(&file)
-        .is_none_or(|artifact| judged_refusal(&dir.join("draft"), &artifact).is_some())
-    {
-        return Vec::new();
-    }
     run.companions
         .into_iter()
         .map(|verdict| Companion {
@@ -1741,10 +1692,13 @@ fn history_execution(
     if !errors.is_empty() {
         fail(&mut execution, errors.join("; "));
     }
-    if trace_source(&recording).as_deref() != Some(subject_source) {
+    if let Err(why) = binding::check_trace(
+        &recording,
+        &Expect::new().with(Field::Source, subject_source),
+    ) {
         fail(
             &mut execution,
-            "its trace's build source isn't the subject's".to_owned(),
+            format!("its trace's build source isn't the subject's: {why}"),
         );
     }
     execution
@@ -1761,23 +1715,37 @@ fn credit_sources(
     baseline: &mut Execution,
     patched: &mut Execution,
 ) {
-    if trace_source(&dir.join("baseline")).as_deref() != Some(subject_source) {
+    if let Err(why) = binding::check_trace(
+        &dir.join("baseline"),
+        &Expect::new().with(Field::Source, subject_source),
+    ) {
         fail(
             baseline,
-            "its trace's build source isn't the subject's".to_owned(),
+            format!("its trace's build source isn't the subject's: {why}"),
         );
     }
-    let measured = read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE));
     if let Some(why) = provenance_refusal(dir) {
         fail(patched, why);
-    } else if trace_source(&dir.join("patched")).is_none()
-        || measured.map(|check| check.source) != trace_source(&dir.join("patched"))
+    } else if let Err(why) =
+        binding::check_trace(&dir.join("patched"), &measured_expect(measured_source(dir)))
     {
         fail(
             patched,
-            "its trace's build source isn't the measured patched checkout's".to_owned(),
+            format!("its trace's build source isn't the measured patched checkout's: {why}"),
         );
     }
+}
+
+/// The source case `dir`'s provenance check measured in its patched
+/// checkout, if it has one.
+fn measured_source(dir: &Path) -> Option<String> {
+    read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)).map(|check| check.source)
+}
+
+/// What a run of the measured patched checkout `measured` must name as its
+/// build: that source, and none without a measurement.
+fn measured_expect(measured: Option<String>) -> Expect {
+    Expect::new().with_read(Field::Source, measured, "no provenance check measured it")
 }
 
 /// Why the planted runner didn't credit case `name` of `property` in `dir`:
@@ -1799,32 +1767,40 @@ fn case_refusal(
 /// Why `dir`'s [`VERDICT_FILE`] isn't the planted runner's catch of case
 /// `name` of `property` on `dir`'s own runs: it's missing, refused, names
 /// another case, or judged a baseline or patched trace other than the one
-/// beside it, such as an older attempt's.
+/// beside it, such as an older attempt's ([`binding::VERDICT`]).
 fn verdict_refusal(dir: &Path, property: &str, name: &str) -> Option<String> {
-    let Some(check) = read_json::<VerdictCheck>(&dir.join(VERDICT_FILE)) else {
-        return Some("no planted verdict".to_owned());
-    };
-    if check.property != property || check.name != name {
-        return Some(format!("it judges {}/{}", check.property, check.name));
+    let trace = |run: &str| file_digest(&dir.join(run).join("trace.jsonl"));
+    let expect = Expect::new()
+        .with(Field::Property, property)
+        .with(Field::Case, name)
+        .with_read(
+            Field::BaselineTrace,
+            trace("baseline"),
+            "the case has no baseline trace",
+        )
+        .with_read(
+            Field::PatchedTrace,
+            trace("patched"),
+            "the case has no patched trace",
+        );
+    let check =
+        binding::read(&binding::VERDICT, &dir.join(VERDICT_FILE), &expect).and_then(|artifact| {
+            serde_json::from_value::<VerdictCheck>(artifact)
+                .map_err(|error| format!("its planted verdict: {error}"))
+        });
+    match check {
+        Ok(check) => check.refused,
+        Err(why) => Some(why),
     }
-    for (run, judged) in [("baseline", &check.baseline), ("patched", &check.patched)] {
-        let trace = digest(&dir.join(run).join("trace.jsonl"));
-        if trace == "missing" || *judged != trace {
-            return Some(format!(
-                "its planted verdict judged the {run} trace {judged}, and the case's is {trace}"
-            ));
-        }
-    }
-    check.refused
 }
 
 /// Why `dir`'s [`TARGET_FILE`] isn't case `name` of `property`'s
 /// confirmation through `target`: it's missing, refused, names another case
 /// or target, or ran a build other than the one the case's provenance check
 /// measured. With a target, it must also name the case's committed `input`
-/// and its own run in [`CONFIRMATION_DIR`] ([`judged_refusal`]), which must
-/// have run that input on `harness`, the harness `target` maps to. Without
-/// one, it names no input or run.
+/// and its own run in [`CONFIRMATION_DIR`], whose trace must have run that
+/// input on `harness`, the harness `target` maps to, from that build.
+/// Without one, it names no input or run ([`binding::TARGET`]).
 fn target_refusal(
     repo: &Path,
     dir: &Path,
@@ -1832,72 +1808,83 @@ fn target_refusal(
     (harness, target): (&str, Option<&str>),
     input: &CaseInput,
 ) -> Option<String> {
-    let artifact = read_json::<Value>(&dir.join(TARGET_FILE));
-    let Some(check) = artifact
-        .clone()
-        .and_then(|artifact| serde_json::from_value::<TargetCheck>(artifact).ok())
-    else {
-        return Some("no target confirmation".to_owned());
+    let run = dir.join(CONFIRMATION_DIR);
+    let ran = match (target, input) {
+        (None, _) => None,
+        (Some(_), CaseInput::Fuzz { input }) => match committed_input(repo, input) {
+            Ok(ran) => Some((input, ran)),
+            Err(why) => return Some(why),
+        },
+        (Some(_), _) => {
+            return Some("a typed case has no fuzz input for its target to run".to_owned())
+        }
     };
-    if check.property != property || check.name != name {
-        return Some(format!("it judges {}/{}", check.property, check.name));
+    let expect = match &ran {
+        None => Ok(Expect::new()
+            .with(Field::Trace, Value::Null)
+            .with(Field::InputSha256, Value::Null)),
+        Some((_, ran)) => {
+            Expect::of_trace(&run).map(|expect| expect.with(Field::InputSha256, ran.sha256.clone()))
+        }
     }
-    if check.target.as_deref() != target {
-        return Some(format!(
-            "its target confirmation names {:?}, and its harness maps to {target:?}",
-            check.target
-        ));
-    }
+    .map(|expect| {
+        expect
+            .with(Field::Property, property)
+            .with(Field::Case, name)
+            .with(Field::Target, target)
+            .with_read(Field::Source, measured_source(dir), "no provenance check")
+    });
+    let check = expect
+        .and_then(|expect| binding::read(&binding::TARGET, &dir.join(TARGET_FILE), &expect))
+        .and_then(|artifact| {
+            serde_json::from_value::<TargetCheck>(artifact)
+                .map_err(|error| format!("its target confirmation: {error}"))
+        });
+    let check = match check {
+        Ok(check) => check,
+        Err(why) => return Some(format!("its target confirmation isn't this case's: {why}")),
+    };
     if let Some(why) = check.refused {
         return Some(why);
     }
-    let measured = read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)).map(|c| c.source);
-    if !known(Some(&check.source)) || measured.as_ref() != Some(&check.source) {
-        return Some(format!(
-            "its target confirmation ran a build of {}, and the measured patched checkout is \
-             {measured:?}",
-            check.source
-        ));
-    }
-    let (Some(_), Some(trace), Some(ran)) = (target, &check.trace, &check.input_sha256) else {
-        return (target.is_some() || check.trace.is_some() || check.input_sha256.is_some()).then(
-            || {
-                format!(
-                    "its target confirmation names the run {:?} on the input {:?} for the \
-                     target {target:?}",
-                    check.trace, check.input_sha256
-                )
-            },
-        );
-    };
-    let CaseInput::Fuzz { input } = input else {
-        return Some("a typed case has no fuzz input for its target to run".to_owned());
-    };
-    let committed = digest(&repo.join(input));
-    if *ran != committed {
-        return Some(format!(
-            "its target confirmation ran the input {ran}, and {input} is {committed}"
-        ));
-    }
-    let run = dir.join(CONFIRMATION_DIR);
-    if let Some(why) = artifact.and_then(|artifact| judged_refusal(&run, &artifact)) {
-        return Some(format!(
-            "its target confirmation isn't its run {trace}'s: {why}"
-        ));
-    }
     // A run of another harness on the same build and input confirms
     // nothing through this target.
-    match crate::trace::TraceReader::open(&run) {
-        Ok(trace) if trace.meta.sim != harness => {
-            return Some(format!(
-                "its target confirmation's trace ran {}, not {harness}",
-                trace.meta.sim
-            ));
-        }
-        Ok(_) => {}
-        Err(error) => return Some(format!("{}: {error}", run.display())),
+    let (input, ran) = ran?;
+    binding::check_trace(&run, &ran.expect().with(Field::Harness, harness))
+        .err()
+        .map(|why| format!("its target confirmation's run didn't run {input} on {harness}: {why}"))
+}
+
+/// A committed fuzz input as a trace's meta names it.
+struct CommittedInput {
+    /// Its SHA-256 in hex.
+    sha256: String,
+    /// Its length.
+    len: usize,
+}
+
+impl CommittedInput {
+    /// What a trace that ran it must name ([`binding::TRACE_META`]).
+    fn expect(&self) -> Expect {
+        Expect::new()
+            .with(Field::InputSha256, &self.sha256)
+            .with(Field::InputLen, self.len)
     }
-    input_refusal(repo, input, &run)
+}
+
+/// The committed fuzz input at `input`, a path under `repo`, or why it
+/// can't be read.
+fn committed_input(repo: &Path, input: &str) -> Result<CommittedInput, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(repo.join(input))
+        .map_err(|_| format!("the committed input {input} can't be read"))?;
+    Ok(CommittedInput {
+        sha256: Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        len: bytes.len(),
+    })
 }
 
 /// [`case_refusal`] for case `case`, `(property, name)`, of `input` on
@@ -1976,39 +1963,48 @@ fn target_of(targets: &BTreeMap<String, String>, harness: &str) -> Option<String
 /// Why the integrity mutation's patched run in `dir` isn't S with its
 /// committed patch `patch_file` (a path under `repo`) applied: its
 /// [`PatchedBuild`] is missing, names a base other than `subject` or a
-/// patch other than `patch_file`'s, or its test binary, checkout or
-/// recorded history doesn't name the source it measured. A previous
-/// patched directory for the same mutation, from another source, then
-/// never counts.
+/// patch other than `patch_file`'s ([`binding::PATCHED_BUILD`]), or its
+/// test binary, checkout or recorded history doesn't name the source it
+/// measured. A previous patched directory for the same mutation, from
+/// another source, then never counts.
 fn patched_build_refusal(
     repo: &Path,
     patch_file: &str,
     subject: &str,
     dir: &Path,
 ) -> Option<String> {
-    let Some(build) = read_json::<PatchedBuild>(&dir.join(PATCHED_BUILD_FILE)) else {
-        return Some("no patched build measurement".to_owned());
+    let expect = Expect::new().with(Field::Base, subject).with_read(
+        Field::PatchSha256,
+        file_digest(&repo.join(patch_file)),
+        "its committed patch can't be read",
+    );
+    let build = binding::read(
+        &binding::PATCHED_BUILD,
+        &dir.join(PATCHED_BUILD_FILE),
+        &expect,
+    )
+    .and_then(|artifact| {
+        serde_json::from_value::<PatchedBuild>(artifact)
+            .map_err(|error| format!("its patched build measurement: {error}"))
+    });
+    let build = match build {
+        Ok(build) => build,
+        Err(why) => {
+            return Some(format!(
+                "its patched checkout isn't S plus {patch_file}: {why}"
+            ))
+        }
     };
-    if build.base != subject {
-        return Some(format!(
-            "its patched checkout was made from {}, not S, {subject}",
-            build.base
-        ));
-    }
-    let committed = digest(&repo.join(patch_file));
-    if committed == "missing" || build.patch_sha256 != committed {
-        return Some(format!(
-            "its patched checkout applied a patch with SHA-256 {}, and {patch_file} is \
-             {committed}",
-            build.patch_sha256
-        ));
-    }
     let measured = Some(build.source.as_str());
     let test = read_json::<TestRun>(&dir.join(TEST_FILE));
     let ran = test.as_ref().is_some_and(|test| {
         test.binary_source.as_deref() == measured && test.checkout_source.as_deref() == measured
     });
-    if !known(measured) || !ran || trace_source(&dir.join("history")).as_deref() != measured {
+    let recorded = binding::check_trace(
+        &dir.join("history"),
+        &Expect::new().with(Field::Source, &build.source),
+    );
+    if !known(measured) || !ran || recorded.is_err() {
         return Some(format!(
             "its test and recorded history aren't from the measured patched source {}",
             build.source
@@ -2020,52 +2016,35 @@ fn patched_build_refusal(
 /// Why case `dir`'s provenance check isn't for S, `subject`, with its
 /// committed patch at `patch` (a path under `repo`) applied: its checkout
 /// was made from another commit, its recorded SHA-256 is another patch's,
-/// or either can't be read. An older checkout with the same patch then
-/// never counts as S's catch.
+/// or either can't be read ([`binding::PROVENANCE`]). An older checkout
+/// with the same patch then never counts as S's catch.
 fn rebuild_refusal(repo: &Path, patch: &str, subject: &str, dir: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let Ok(bytes) = fs::read(repo.join(patch)) else {
+    let Some(committed) = file_digest(&repo.join(patch)) else {
         return Some(format!("the committed patch {patch} can't be read"));
     };
-    let committed: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    match read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)) {
-        Some(check) if check.base != subject => Some(format!(
-            "its rebuild's checkout was made from {}, not S, {subject}",
-            check.base
-        )),
-        Some(check) if check.patch_sha256 == committed => None,
-        Some(check) => Some(format!(
-            "its rebuild applied a patch with SHA-256 {}, and {patch} is {committed}",
-            check.patch_sha256
-        )),
-        None => Some("no provenance check".to_owned()),
-    }
+    let expect = Expect::new()
+        .with(Field::Base, subject)
+        .with(Field::PatchSha256, committed);
+    binding::read(&binding::PROVENANCE, &dir.join(PROVENANCE_FILE), &expect)
+        .and_then(|artifact| {
+            serde_json::from_value::<ProvenanceCheck>(artifact)
+                .map_err(|error| format!("its provenance check: {error}"))
+        })
+        .err()
+        .map(|why| format!("its rebuild isn't S plus {patch}: {why}"))
 }
 
 /// Why the trace in `dir` didn't run the committed fuzz input at `input` (a
 /// path under `repo`): its meta's `input` names another SHA-256 or length,
-/// or either can't be read.
+/// or either can't be read ([`binding::TRACE_META`]).
 fn input_refusal(repo: &Path, input: &str, dir: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let Ok(bytes) = fs::read(repo.join(input)) else {
-        return Some(format!("the committed input {input} can't be read"));
+    let committed = match committed_input(repo, input) {
+        Ok(committed) => committed,
+        Err(why) => return Some(why),
     };
-    let committed: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let recorded = fs::read_to_string(dir.join("trace.jsonl"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text.lines().next()?).ok())
-        .and_then(|first| first.get("meta")?.get("input").cloned());
-    let matches = recorded.as_ref().is_some_and(|input| {
-        input.get("sha256").and_then(Value::as_str) == Some(committed.as_str())
-            && input.get("len").and_then(Value::as_u64) == u64::try_from(bytes.len()).ok()
-    });
-    (!matches).then(|| format!("its trace ran {recorded:?}, not the committed input {input}"))
+    binding::check_trace(dir, &committed.expect())
+        .err()
+        .map(|why| format!("it didn't run the committed input {input}: {why}"))
 }
 
 /// A typed Plan file's reference as `meta.plan` names it: Plan bytes by
@@ -2086,7 +2065,8 @@ fn plan_ref(path: &Path, script: bool) -> Result<PlanRef, String> {
 /// the Plan in `plan_file` (C18): its harness isn't `harness`, its meta's
 /// scenario isn't the one `harness` describes the file's scenario with, it
 /// names a fuzz input, or its `meta.plan` isn't the file's Plan, bytes or
-/// script as `script` says. Any file that can't be read refuses it too.
+/// script as `script` says ([`binding::TRACE_META`]). Any file that can't
+/// be read refuses it too.
 fn typed_refusal(
     harness: &str,
     scenario_file: &Path,
@@ -2097,33 +2077,27 @@ fn typed_refusal(
     let check = || -> Result<(), String> {
         let trace = crate::trace::TraceReader::open(dir)
             .map_err(|error| format!("{}: {error}", dir.display()))?;
-        if trace.meta.sim != harness {
-            return Err(format!("its trace ran {}, not {harness}", trace.meta.sim));
-        }
         let text = fs::read_to_string(scenario_file)
             .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
         let scenario: Value = serde_json::from_str(&text)
             .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
         let entry = crate::harness::find(harness).map_err(|error| error.to_string())?;
         let described = (entry.meta)(&scenario).map_err(|error| error.to_string())?;
-        if described.scenario != trace.meta.scenario {
-            return Err(format!(
-                "its trace's scenario isn't {}'s",
-                scenario_file.display()
-            ));
-        }
-        if trace.meta.input.is_some() {
-            return Err("its trace names a fuzz input, not a typed Plan".to_owned());
-        }
         let committed = plan_ref(plan_file, script)?;
-        if trace.meta.plan.as_ref() != Some(&committed) {
-            return Err(format!(
-                "its trace ran the Plan {:?}, not {}'s {committed:?}",
-                trace.meta.plan,
+        // A typed run names its Plan and no fuzz input.
+        let expect = Expect::new()
+            .with(Field::Harness, harness)
+            .with(Field::Scenario, &described.scenario)
+            .with(Field::InputSha256, Value::Null)
+            .with(Field::Plan, &committed);
+        let meta = serde_json::to_value(&trace.meta).map_err(|error| error.to_string())?;
+        binding::check(&binding::TRACE_META, &meta, &expect).map_err(|why| {
+            format!(
+                "it isn't a run of {} under {}: {why}",
+                scenario_file.display(),
                 plan_file.display()
-            ));
-        }
-        Ok(())
+            )
+        })
     };
     check().err()
 }
@@ -2278,7 +2252,7 @@ pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, Str
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
 /// on `harness`: its scenario and its Plan bytes or script, by digest
 /// (C18), or its steps aren't the ones the declaring test's own run took,
-/// its [`RAN_FILE`] ([`super::history::run_declared`]). A declaration with
+/// its [`RAN_FILE`] ([`super::history::run_declared`], [`binding::RAN`]). A declaration with
 /// no such file wasn't run where it was declared, so it names no history.
 fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
     let (file, script) = match declared_plan(declaration) {
@@ -2293,34 +2267,49 @@ fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<Str
         dir,
     )
     .or_else(|| {
-        let Some(ran) = read_json::<Ran>(&declaration.join(RAN_FILE)) else {
+        let Some(ran) = read_json::<Value>(&declaration.join(RAN_FILE)) else {
             return Some("its declaration has no steps from its test's own run".to_owned());
         };
-        let recorded = crate::trace::TraceReader::open(dir).ok()?;
-        (Ran::of(&recorded.steps) != ran).then(|| {
-            format!(
-                "its recording took other steps than its test's own run, which took {}",
-                ran.steps
-            )
-        })
+        let recorded = Ran::of(&crate::trace::TraceReader::open(dir).ok()?.steps);
+        let expect = Expect::new()
+            .with(Field::Steps, recorded.steps)
+            .with(Field::StepsDigest, &recorded.digest);
+        binding::check(&binding::RAN, &ran, &expect)
+            .err()
+            .map(|why| format!("its recording took other steps than its test's own run: {why}"))
     })
 }
 
 /// Whether `dir`'s `witness.json` judged `dir`'s own trace
-/// ([`bound_witness`]) and `property` expecting `expect` (`holds`,
-/// `not-applicable`, `violated` or `violated-set`) with exactly `beside`
-/// as its `also_violates`, in order. A witness file for another trace,
-/// property, role or set isn't this run's trigger evidence.
+/// ([`bound_witness`]) and the trigger `property` expecting `expect`
+/// (`holds`, `not-applicable`, `violated` or `violated-set`) with exactly
+/// `beside` as its `also_violates`, in order ([`TriggerRef`]). A witness
+/// file for another trace, property, role or set isn't this run's trigger
+/// evidence.
 fn witness_judges(dir: &Path, property: &str, expect: &str, beside: &[String]) -> bool {
-    bound_witness(dir).is_ok_and(|witness| {
-        let also: Option<Vec<&str>> = witness
-            .get("also_violates")
-            .map_or(Some(Vec::new()), |also| {
-                also.as_array()?.iter().map(Value::as_str).collect()
-            });
-        witness.get("property").and_then(Value::as_str) == Some(property)
-            && witness.get("expect").and_then(Value::as_str) == Some(expect)
-            && also.is_some_and(|also| also.iter().copied().eq(beside.iter().map(String::as_str)))
+    let want = TriggerRef {
+        property: property.to_owned(),
+        expect: expect.to_owned(),
+        also_violates: beside.to_vec(),
+    };
+    bound_witness(dir).is_ok_and(|witness| trigger_of(&witness).as_ref() == Some(&want))
+}
+
+/// The trigger `witness`, a witness file, judged: its property, its
+/// expectation and its `also_violates`, none when it names none.
+fn trigger_of(witness: &Value) -> Option<TriggerRef> {
+    let also_violates = match witness.get("also_violates") {
+        None => Vec::new(),
+        Some(also) => also
+            .as_array()?
+            .iter()
+            .map(|id| id.as_str().map(str::to_owned))
+            .collect::<Option<_>>()?,
+    };
+    Some(TriggerRef {
+        property: witness.get("property")?.as_str()?.to_owned(),
+        expect: witness.get("expect")?.as_str()?.to_owned(),
+        also_violates,
     })
 }
 
@@ -3385,7 +3374,10 @@ mod tests {
             Some(Report::Held { .. })
         ));
         assert_eq!(run.meta.input, None);
-        assert_eq!(trace_source(dir.path()).as_deref(), Some("s"));
+        assert_eq!(
+            binding::check_trace(dir.path(), &Expect::new().with(Field::Source, "s")),
+            Ok(())
+        );
 
         // A malformed middle line, or an end cut off before its newline.
         let malformed = recorded();

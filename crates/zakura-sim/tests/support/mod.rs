@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod feed;
+pub mod one_key_off;
 pub mod prepare_fault;
 pub mod script;
 pub mod steer;

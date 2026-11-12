@@ -22,20 +22,20 @@ use zakura_chain::{
 use zakura_node_services::mempool::TransactionDependencies;
 
 use super::{
-    indexed::{
-        package, parents, Pool, MAX_PACKING_SCAN_ENTRIES, PACKING_THRESHOLD_BYTES,
-        SELECTION_STOP_BYTES,
-    },
+    indexed::{package, parents, Pool, MAX_CONSECUTIVE_MISFITS, SELECTION_STOP_BYTES},
     BlockTemplateLimits, SelectedMempoolTx,
 };
 
-/// Once the template is within this many bytes of full, [`Misfit::Skip`]
-/// gives up after [`MAX_CONSECUTIVE_MISFITS`] packages in a row do not fit.
-const NEARLY_FULL_BYTES: usize = 50_000;
+/// The previous production selector packed only when more than this many
+/// bytes were left after the main pass.
+const PACKING_THRESHOLD_BYTES: usize = 50_000;
 
-/// Consecutive misfits [`Misfit::Skip`] tolerates in a nearly full template.
-/// Matches Bitcoin Core's `MAX_CONSECUTIVE_FAILURES`.
-const MAX_CONSECUTIVE_MISFITS: usize = 1_000;
+/// The previous production selector packed from at most this many entries.
+const MAX_PACKING_SCAN_ENTRIES: usize = 100;
+
+/// [`Misfit::SkipUntilNearlyFull`] only applies the misfit bound once the
+/// template is within this many bytes of full.
+const NEARLY_FULL_BYTES: usize = 50_000;
 
 /// What a package's fee is divided by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,12 +54,15 @@ pub(super) enum Score {
 /// What the main pass does when the best package does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Misfit {
-    /// End the main pass, then pack from the next entries, like the
-    /// production selector.
+    /// End the main pass, then pack from the next entries. The selector
+    /// before skip-and-continue.
     StopThenPack,
-    /// Skip the package and keep going, until the template is nearly full
-    /// and [`MAX_CONSECUTIVE_MISFITS`] packages in a row did not fit.
+    /// Skip the package with the production stop rule.
     Skip,
+    /// Skip the package, applying the misfit bound only once the template is
+    /// within [`NEARLY_FULL_BYTES`] of full. When sigops or the shielded
+    /// budget run out with bytes to spare, this scans the whole mempool.
+    SkipUntilNearlyFull,
 }
 
 /// Block capacity after the coinbase, for pricing each limit in bytes.
@@ -257,6 +260,11 @@ impl VariantSelector {
             match self.misfit {
                 Misfit::StopThenPack => break,
                 Misfit::Skip => {
+                    if consecutive_misfits >= MAX_CONSECUTIVE_MISFITS {
+                        break;
+                    }
+                }
+                Misfit::SkipUntilNearlyFull => {
                     if consecutive_misfits >= MAX_CONSECUTIVE_MISFITS
                         && self.limits.remaining_bytes <= NEARLY_FULL_BYTES
                     {
@@ -276,7 +284,7 @@ impl VariantSelector {
         }
     }
 
-    /// Mirrors the production packing pass.
+    /// The previous production packing pass.
     fn pack(&mut self) {
         if self.limits.remaining_bytes <= PACKING_THRESHOLD_BYTES {
             return;

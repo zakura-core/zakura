@@ -25,6 +25,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
+    record::{FullReport, FULL_REPORT_FILE},
     MemorySink, Observation, PlanInput, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
@@ -475,4 +476,98 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             "{name}: {replayed:?}"
         );
     }
+}
+
+/// A header run recorded through `zakura-sim record` keeps its node's
+/// evidence stores in the full report beside the trace, exactly as the
+/// same run froze them in this process, so the harness's
+/// `HasView::snapshot` reaches the sidecar. Each claim record there that
+/// carries an attribution names its rule and subject, and a fresh-process
+/// replay matches the report.
+#[test]
+fn a_recorded_header_run_keeps_its_stores_in_the_full_report() {
+    let name = "forks-sharing-a-header";
+    let scenario_json =
+        fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+    let scenario: StorageScenario =
+        serde_json::from_str(&scenario_json).expect("the witness is a scenario");
+    let plan = fs::read(fixture(name, "plan")).expect("the witness's plan is committed");
+    let prepared = Storage::prepare(&scenario);
+    let stores = prepared.stores.clone();
+    run_prepared::<Storage>(
+        &scenario,
+        prepared,
+        zakura_sim::Plan::from_fuzz(&plan),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let frozen = stores
+        .frozen_snapshot()
+        .expect("the run froze the node's stores");
+
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let trace = dir.path().join("trace");
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        Storage::NAME,
+        "--scenario",
+        &scenario_json,
+        "--plan",
+        fixture(name, "plan").to_str().expect("the path is UTF-8"),
+        "--out",
+        trace.to_str().expect("the path is UTF-8"),
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let full: FullReport = serde_json::from_str(
+        &fs::read_to_string(trace.join(FULL_REPORT_FILE)).expect("record writes the report"),
+    )
+    .expect("the report reads back");
+    assert_eq!(full.snapshot.as_ref(), Some(&frozen));
+    let snapshot = full.snapshot.expect("the header harness has a snapshot");
+    let rows: Vec<&serde_json::Value> = snapshot
+        .as_array()
+        .expect("the node's stores are a list")
+        .iter()
+        .collect();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|store| store["store"].as_str().expect("each store is named"))
+        .collect();
+    for store in [
+        "claims",
+        "authority",
+        "sessions",
+        "session_ends",
+        "fork_choice",
+    ] {
+        assert!(names.contains(&store), "{store}: {names:?}");
+    }
+    let claims = rows
+        .iter()
+        .find(|store| store["store"] == "claims")
+        .and_then(|store| store["snapshot"].as_array())
+        .expect("the claims store is a list");
+    for row in claims {
+        if let Some(attribution) = row.get("attribution") {
+            assert!(
+                attribution["rule"].is_string() && attribution["subject"]["subject"].is_string(),
+                "{row}"
+            );
+        }
+    }
+
+    let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert!(
+        replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
+        "{replayed:?}"
+    );
 }

@@ -134,3 +134,25 @@ fn the_release_wake_witnesses_keep_their_stores_through_cleanup() {
         holds::<ReleaseWake>(&scenario, storage_stores);
     }
 }
+
+/// A completed storage run drops every handle on its node's stores with
+/// the harness, so repeated runs don't keep each other's evidence. A store
+/// holding another store's owning handle would keep the registry alive
+/// through itself, which this catches.
+#[test]
+fn a_completed_storage_run_releases_its_stores() {
+    for scenario in [worked_example(), storage_witnesses::competing_mirrors()] {
+        let prepared = Storage::prepare(&scenario);
+        let handle = storage_stores(&prepared);
+        let released = handle.downgrade();
+        let Compared { drift, .. } =
+            run_compared::<Storage>(&scenario, prepared, &handle, PlanInput::Bytes(Vec::new()))
+                .unwrap_or_else(|error| panic!("{scenario:?}: {error}"));
+        assert_eq!(drift, None);
+        drop(handle);
+        assert!(
+            released.upgrade().is_none(),
+            "the run's harness kept its node's stores alive on {scenario:?}"
+        );
+    }
+}

@@ -3,8 +3,13 @@
 //!
 //! Each subject names only what its evidence holds. A finding about a
 //! page names that page, and one about anything else, a round at its
-//! `Started`, an update, a cursor, a storage call, a session or an engine
-//! run, names that instead, so a finding with no page never gets one.
+//! `Started`, an update, a cursor, a storage call, a call's hold of a
+//! round, a handoff, a session or an engine run, names that instead, so a
+//! finding with no page never gets one.
+//!
+//! The work ledger's claim rules that the property reports name their
+//! page, hold or handoff as the ledger's [`ClaimSubject`] gives it
+//! ([`ledger_attribution`]).
 //!
 //! Peers are their digest and hashes their bytes in order, both as hex,
 //! as the observation log and storage's facts write them, so a subject
@@ -17,7 +22,10 @@ use std::fmt;
 use serde::Serialize;
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
-use zakura_network::zakura::ZakuraPeerId;
+use zakura_network::zakura::{
+    observe::{ClaimBreak, ClaimRule, ClaimSubject},
+    ZakuraPeerId,
+};
 
 use super::Subscription;
 use crate::harness::header_node::{
@@ -178,6 +186,25 @@ pub enum AuthoritySubject {
         height: u32,
         /// The cursor header's hash.
         hash: String,
+    },
+    /// A storage call's hold of a round's headers, which a work-ledger
+    /// claim names: the call, and the round the event names it taking or
+    /// ending.
+    Hold {
+        /// The reactor's call number.
+        call: u64,
+        /// The round's incarnation.
+        round: u64,
+    },
+    /// A prepare handing a round's headers to an apply, which a
+    /// work-ledger claim names.
+    Handoff {
+        /// The prepare's call number.
+        prepare: u64,
+        /// The apply's call number.
+        apply: u64,
+        /// The round's incarnation.
+        round: u64,
     },
     /// A prepare or apply call's submission.
     Call {
@@ -373,6 +400,17 @@ impl fmt::Display for AuthoritySubject {
                     CursorFact::Acceptance => "acceptance",
                 }
             ),
+            AuthoritySubject::Hold { call, round } => {
+                write!(f, "call {call} hold of round {round}")
+            }
+            AuthoritySubject::Handoff {
+                prepare,
+                apply,
+                round,
+            } => write!(
+                f,
+                "handoff of round {round} from call {prepare} to call {apply}"
+            ),
             AuthoritySubject::Call { call, op } => write!(f, "call {call} op {op}"),
             AuthoritySubject::Session {
                 peer,
@@ -398,6 +436,87 @@ impl fmt::Display for AuthoritySubject {
             },
         }
     }
+}
+
+/// The rule a work-ledger claim breaks, for the claim rules
+/// `header-sync/commit-only-authorized` reports, or `None` for the
+/// ledger's accounting rules, which other properties report.
+///
+/// A page from another session or subscription than its round's is the
+/// page's provenance, as a supply from another source than its peer's
+/// is. A page that left its round holding other headers is its path. A
+/// page that overspent its reservation is credit. A call holding a round's
+/// headers for another owner, round or lease, more than the round owns, or
+/// a round that staged nothing, breaks the owner's binding. A prepare
+/// sending other headers, a call that isn't the prepare or apply it names,
+/// and a handoff to an apply for other work each break its submission.
+fn ledger_rule(rule: ClaimRule) -> Option<AuthorityRule> {
+    Some(match rule {
+        ClaimRule::ForeignPage | ClaimRule::WrongSource => AuthorityRule::Provenance,
+        ClaimRule::UnstagedPage => AuthorityRule::Path,
+        ClaimRule::OverReservation => AuthorityRule::Credit,
+        ClaimRule::WrongOwner
+        | ClaimRule::WrongRound
+        | ClaimRule::ForeignLease
+        | ClaimRule::HeldUnowned
+        | ClaimRule::UnstagedHeaders => AuthorityRule::OwnerBinding,
+        ClaimRule::WrongPayload | ClaimRule::WrongCall | ClaimRule::BadHandoff => {
+            AuthorityRule::Submission
+        }
+        ClaimRule::OverBudget
+        | ClaimRule::LeakedReservation
+        | ClaimRule::LeakedLease
+        | ClaimRule::OpenOwnership
+        | ClaimRule::OpenReservation
+        | ClaimRule::UnreleasedObsoleteRound
+        | ClaimRule::UnreleasedRound
+        | ClaimRule::UnreleasedDepartedRound => return None,
+    })
+}
+
+/// The ledger's `subject` as a finding names it.
+fn ledger_subject(subject: &ClaimSubject) -> AuthoritySubject {
+    match subject {
+        ClaimSubject::Page {
+            peer: peer_id,
+            session_id,
+            subscription,
+            frame,
+            hashes,
+        } => AuthoritySubject::page(
+            &(peer_id.clone(), *session_id, *subscription),
+            hashes,
+            *frame,
+        ),
+        ClaimSubject::Hold { call, incarnation } => AuthoritySubject::Hold {
+            call: *call,
+            round: *incarnation,
+        },
+        ClaimSubject::Handoff {
+            prepare,
+            apply,
+            incarnation,
+        } => AuthoritySubject::Handoff {
+            prepare: *prepare,
+            apply: *apply,
+            round: *incarnation,
+        },
+    }
+}
+
+/// The attribution a claim record keeps for `claim`, a work-ledger break:
+/// its rule ([`ledger_rule`]) and the subject the ledger named, for a
+/// rule `header-sync/commit-only-authorized` reports, or `None` for the
+/// ledger's other rules.
+pub(crate) fn ledger_attribution(claim: &ClaimBreak) -> Option<Attribution> {
+    let rule = ledger_rule(claim.rule)?;
+    let Some(subject) = &claim.subject else {
+        unreachable!("the ledger names a subject for every rule the property reports");
+    };
+    Some(Attribution {
+        rule,
+        subject: ledger_subject(subject),
+    })
 }
 
 /// What a `CommitOnlyAuthorized` claim record names, for the full report.

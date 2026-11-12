@@ -1746,6 +1746,17 @@ fn each_page_finding_names_its_own_page() {
         "{}",
         rendered[0]
     );
+    // A header both the subject and the detail print is spelled the same
+    // in both, in its byte order, and never in its display order.
+    for (line, shared) in [(&rendered[0], skipping.1[0]), (&rendered[1], locator.1[1])] {
+        let (subject, detail) = line
+            .split_once(": ")
+            .expect("a rendered finding puts its detail after its subject");
+        let spelled = crate::storage::hash(shared);
+        assert!(subject.contains(&spelled), "{line}");
+        assert!(detail.contains(&spelled), "{line}");
+        assert!(!line.contains(&shared.to_string()), "{line}");
+    }
 
     let stores = EvidenceStores::default();
     let claims = ClaimEvidence::new(&stores);

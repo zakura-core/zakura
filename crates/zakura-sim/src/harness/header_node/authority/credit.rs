@@ -70,6 +70,7 @@ use zakura_network::zakura::{
 };
 
 use super::{
+    finding::{spell_cursor, spell_frontier, spell_hash, spell_maybe_frontier, spell_subscription},
     AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, Subscription, UpdateKind,
 };
 use crate::observe::{StorageFact, StorageResult};
@@ -222,8 +223,9 @@ impl Credit {
                 self.breaks.push(credit(
                     &AuthoritySubject::cursor(&key, CursorFact::Acceptance, *through),
                     format!(
-                        "session {session_id} subscription {subscription} accepted through \
-                         {through:?} off the reactor's task, outside an apply call's completion"
+                        "session {session_id} subscription {subscription} accepted through {} off \
+                         the reactor's task, outside an apply call's completion",
+                        spell_frontier(*through)
                     ),
                 ));
                 true
@@ -405,7 +407,9 @@ impl Credit {
                         &subject,
                         format!(
                             "session {session_id} subscription {subscription}'s primitive stored \
-                             {stored:?} accepted, not the {cursor:?} asked for"
+                             {} accepted, not the {} asked for",
+                            spell_acknowledged(*stored),
+                            spell_acknowledged(cursor)
                         ),
                     ));
                 }
@@ -447,8 +451,9 @@ impl Credit {
             self.breaks.push(credit(
                 &AuthoritySubject::cursor(&key, CursorFact::Acceptance, through),
                 format!(
-                    "session {session} subscription {subscription} accepted through \
-                     {through:?} in apply call {call}'s completion, whose apply {why}"
+                    "session {session} subscription {subscription} accepted through {} in \
+                     apply call {call}'s completion, whose apply {why}",
+                    spell_frontier(through)
                 ),
             ));
         }
@@ -521,7 +526,8 @@ impl Credit {
         if update.initial_target_tip_hash != live.target {
             found.push(format!(
                 "names target {}, not its Open's {}",
-                update.initial_target_tip_hash, live.target
+                spell_hash(update.initial_target_tip_hash),
+                spell_hash(live.target)
             ));
         }
         if update.tree_aux_schema != live.schema {
@@ -539,9 +545,9 @@ impl Credit {
         }
         if acknowledged(update) != live.acknowledged {
             found.push(format!(
-                "acknowledges {:?}, not {:?}",
-                acknowledged(update),
-                live.acknowledged
+                "acknowledges {}, not {}",
+                spell_acknowledged(acknowledged(update)),
+                spell_acknowledged(live.acknowledged)
             ));
         }
         live.sequence = update.update_sequence;
@@ -602,12 +608,14 @@ impl Credit {
             ));
         }
         let (through, headers, bytes) = cursor;
+        let shown = spell_frontier(through);
         if through != page_last {
             self.breaks.push(credit(
                 subject,
                 format!(
                     "session {session} subscription {subscription} recorded \
-                     cursor {through:?} for a page ending at {page_last:?}"
+                     cursor {shown} for a page ending at {}",
+                    spell_frontier(page_last)
                 ),
             ));
         }
@@ -616,7 +624,7 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} recorded \
-                     cursor {through:?} at {headers} headers and {bytes} bytes, but its pages \
+                     cursor {shown} at {headers} headers and {bytes} bytes, but its pages \
                      consumed {:?}",
                     live.consumed
                 ),
@@ -728,8 +736,14 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription}'s Open \
-                     starts at {start:?}, not its first locator {first:?} at {height:?} with \
-                     nothing consumed"
+                     starts at {}, not its first locator {} at {height:?} with \
+                     nothing consumed",
+                    spell_cursor(
+                        Frontier::new(start.height, start.hash),
+                        start.headers,
+                        start.bytes
+                    ),
+                    first.map_or_else(|| "none".to_owned(), spell_hash)
                 ),
             ));
         }
@@ -739,13 +753,14 @@ impl Credit {
     /// `subject` names.
     fn accept(&mut self, key: &Subscription, subject: &AuthoritySubject, cursor: Acknowledged) {
         let (through, ..) = cursor;
+        let shown = spell_frontier(through);
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
             self.breaks.push(credit(
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     through {through:?}, but the subscriber never opened it"
+                     through {shown}, but the subscriber never opened it"
                 ),
             ));
             return;
@@ -755,7 +770,8 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     {cursor:?}, which no claim recorded"
+                     {}, which no claim recorded",
+                    spell_acknowledged(cursor)
                 ),
             ));
         }
@@ -764,7 +780,7 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     through {through:?}, which no staged page ends at"
+                     through {shown}, which no staged page ends at"
                 ),
             ));
         }
@@ -776,8 +792,8 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     through {through:?}, below its earlier acceptance {:?}",
-                    live.accepted
+                     through {shown}, below its earlier acceptance {}",
+                    spell_maybe_frontier(live.accepted)
                 ),
             ));
         }
@@ -796,7 +812,7 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     through {through:?} outside an apply call's completion"
+                     through {shown} outside an apply call's completion"
                 ),
             ));
             return;
@@ -806,7 +822,8 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted through \
-                     {through:?} in apply call {call}'s completion, an apply for {applied:?}"
+                     {shown} in apply call {call}'s completion, an apply for {}",
+                    spell_subscription(applied)
                 ),
             ));
             return;
@@ -816,8 +833,10 @@ impl Credit {
                 subject,
                 format!(
                     "session {session} subscription {subscription} accepted \
-                     through {through:?} in apply call {call}'s completion, not its round's last \
-                     page staged before that apply, {before:?} (now {last_staged:?})"
+                     through {shown} in apply call {call}'s completion, not its round's last \
+                     page staged before that apply, {} (now {})",
+                    spell_maybe_frontier(before),
+                    spell_maybe_frontier(last_staged)
                 ),
             ));
         }
@@ -828,6 +847,12 @@ impl Credit {
 /// A credit-rule break by `subject`, as `detail` says.
 fn credit(subject: &AuthoritySubject, detail: String) -> AuthorityFinding {
     AuthorityFinding::new(AuthorityRule::Credit, subject.clone(), detail)
+}
+
+/// `cursor` as a finding spells it ([`spell_cursor`]).
+fn spell_acknowledged(cursor: Acknowledged) -> String {
+    let (through, headers, bytes) = cursor;
+    spell_cursor(through, headers, bytes)
 }
 
 /// The cursor `update` acknowledges.

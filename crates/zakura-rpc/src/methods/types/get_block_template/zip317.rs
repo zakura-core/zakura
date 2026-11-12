@@ -1,17 +1,10 @@
-//! The [ZIP-317 block production algorithm](https://zips.z.cash/zip-0317#block-production).
+//! Block template transaction selection.
 //!
-//! This is recommended algorithm, so these calculations are not consensus-critical,
-//! or standardised across node implementations:
-//! > it is sufficient to use floating point arithmetic to calculate the argument to `floor`
-//! > when computing `size_target`, since there is no consensus requirement for this to be
-//! > exactly the same between implementations.
-
-use std::collections::{HashMap, HashSet};
-
-use rand_10::{
-    distr::{Distribution, Open01},
-    rng as thread_rng, Rng,
-};
+//! [ZIP-317 block production](https://zips.z.cash/zip-0317#block-production)
+//! recommends a fee-weighted random selection, which is not consensus-critical
+//! or standardised across node implementations. Zakura instead selects
+//! deterministically from the mempool's mining order, and keeps the ZIP's block
+//! size, sigop, and unpaid action limits.
 
 use zakura_chain::{
     amount::{self, Amount},
@@ -30,6 +23,10 @@ use zakura_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::{CoinbaseResourceUsage, TransactionTemplate};
+
+mod mining_order;
+
+use mining_order::MiningOrderSelector;
 
 #[cfg(test)]
 mod selection_benchmarks;
@@ -70,19 +67,28 @@ fn block_template_overhead_bytes(net: &Network) -> usize {
     header_bytes + transaction_count_bytes
 }
 
-/// Selects mempool transactions for block production according to [ZIP-317],
-/// using fee-independent coinbase resource usage and the mempool.
+/// Selects mempool transactions for a block template in the mempool's mining
+/// order, using fee-independent coinbase resource usage.
+///
+/// `mempool_txs` must be in the order of the mempool's `FullTransactions`
+/// response: descending ancestor-package fee per cost, then ascending insertion
+/// time and transaction ID. Selection is deterministic for a given snapshot.
+/// It adds the best remaining package of a transaction and its unselected
+/// ancestors until one does not fit, then fills a large remaining gap from the
+/// next entries in the order.
+///
+/// Every mempool transaction pays the [ZIP-317] conventional fee, so the
+/// template has no unpaid actions.
 ///
 /// The reserved maximum coinbase transaction size includes the largest valid
 /// coinbase input script, so mining pools can append their tags. Coinbase size
 /// and sigops do not depend on the reward amount, which lets selection avoid
 /// generating a zero-fee shielded proof.
 ///
-/// Returns selected transactions from `mempool_txs`, or an error if coinbase
-/// resource usage cannot be calculated from the parent balance.
+/// Returns the selected transactions with parents before their children, or an
+/// error if coinbase resource usage cannot be calculated from the parent balance.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
-#[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
 pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
@@ -93,98 +99,9 @@ pub fn select_mempool_transactions(
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     let coinbase_resources =
         TransactionTemplate::coinbase_resource_usage(net, height, miner_params, nsm_value_balance)?;
+    let limits = BlockTemplateLimits::initial(net, height, coinbase_resources);
 
-    let tx_dependencies = mempool_tx_deps.dependencies();
-    let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
-        mempool_txs
-            .into_iter()
-            .map(|tx| (tx.transaction.id().mined_id(), tx))
-            .partition(|(tx_id, _tx)| !tx_dependencies.contains_key(tx_id));
-
-    // Setup the transaction lists.
-    let (conventional_fee_txs, low_fee_txs): (Vec<_>, Vec<_>) = independent_mempool_txs
-        .into_values()
-        .partition(VerifiedUnminedTx::pays_conventional_fee);
-
-    let mut selected_txs = Vec::new();
-
-    // Set up limit tracking.
-    let mut limits = BlockTemplateLimits::initial(net, height, coinbase_resources);
-    let mut rng = thread_rng();
-
-    // Exhaust conventional-fee candidates before considering low-fee ones.
-    for candidates in [conventional_fee_txs, low_fee_txs] {
-        for candidate_tx in fee_weighted_order(candidates, &mut rng) {
-            checked_add_transaction(
-                candidate_tx,
-                &mut dependent_mempool_txs,
-                &mut selected_txs,
-                &mempool_tx_deps,
-                &mut limits,
-            );
-        }
-    }
-
-    Ok(selected_txs)
-}
-
-/// Orders candidates by fee weight without replacement in O(n log n) time.
-///
-/// Independent exponential clocks with rates equal to the fee weights give
-/// each remaining candidate a probability proportional to its weight of being
-/// next. Sorting those clocks is equivalent to repeated weighted draws, without
-/// rebuilding cumulative weights after every draw or accumulating subtraction
-/// error. Each candidate occurs exactly once, even if it does not fit the block.
-fn fee_weighted_order(
-    transactions: Vec<VerifiedUnminedTx>,
-    rng: &mut impl Rng,
-) -> impl Iterator<Item = VerifiedUnminedTx> {
-    let mut candidates: Vec<_> = transactions
-        .into_iter()
-        .map(|tx| {
-            // Verified transactions have finite, strictly positive fee weights.
-            // Open01 keeps the logarithm finite and strictly negative.
-            let uniform: f64 = Open01.sample(rng);
-            let clock = -uniform.ln() / f64::from(tx.fee_weight_ratio);
-            (clock, tx)
-        })
-        .collect();
-
-    candidates.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
-    candidates.into_iter().map(|(_, tx)| tx)
-}
-
-/// Checks if every item in `candidate_tx_deps` is present in `selected_txs`.
-///
-/// Requires items in `selected_txs` to be unique to work correctly.
-fn has_direct_dependencies(
-    candidate_tx_deps: Option<&HashSet<transaction::Hash>>,
-    selected_txs: &Vec<SelectedMempoolTx>,
-) -> bool {
-    let Some(deps) = candidate_tx_deps else {
-        return true;
-    };
-
-    if selected_txs.len() < deps.len() {
-        return false;
-    }
-
-    let mut num_available_deps = 0;
-    for tx in selected_txs {
-        #[cfg(test)]
-        let (_, tx) = tx;
-        if deps.contains(&tx.transaction.id().mined_id()) {
-            num_available_deps += 1;
-        } else {
-            continue;
-        }
-
-        if num_available_deps == deps.len() {
-            return true;
-        }
-    }
-
-    false
+    Ok(MiningOrderSelector::new(mempool_txs, mempool_tx_deps, limits).select())
 }
 
 /// Returns the depth of a transaction's dependencies in the block for a candidate
@@ -207,79 +124,6 @@ fn dependencies_depth(
     current_level
 }
 
-/// Tries to add `candidate_tx` and its dependents to `selected_txs`.
-///
-/// If it fits in the supplied limits, adds it to `selected_txs`, updates the
-/// limits, and considers dependents whose dependencies have all been selected.
-fn checked_add_transaction(
-    candidate_tx: VerifiedUnminedTx,
-    dependent_txs: &mut HashMap<transaction::Hash, VerifiedUnminedTx>,
-    selected_txs: &mut Vec<SelectedMempoolTx>,
-    mempool_tx_deps: &TransactionDependencies,
-    limits: &mut BlockTemplateLimits,
-) {
-    if !limits.try_add(&candidate_tx) {
-        return;
-    }
-
-    let tx_dependencies = mempool_tx_deps.dependencies();
-    let selected_tx_id = &candidate_tx.transaction.id().mined_id();
-    debug_assert!(
-        !tx_dependencies.contains_key(selected_tx_id),
-        "all candidate transactions should be independent"
-    );
-
-    #[cfg(not(test))]
-    selected_txs.push(candidate_tx);
-
-    #[cfg(test)]
-    selected_txs.push((0, candidate_tx));
-
-    // Try adding any dependent transactions if all of their dependencies have been selected.
-
-    let mut current_level_dependents = mempool_tx_deps.direct_dependents(selected_tx_id);
-    while !current_level_dependents.is_empty() {
-        let mut next_level_dependents = HashSet::new();
-
-        for dependent_tx_id in &current_level_dependents {
-            // ## Note
-            //
-            // A necessary condition for adding the dependent tx is that it spends unmined outputs coming only from
-            // the selected txs, which come from the mempool. If the tx also spends in-chain outputs, it won't
-            // be added. This behavior is not specified by consensus rules and can be changed at any time,
-            // meaning that such txs could be added.
-            if has_direct_dependencies(tx_dependencies.get(dependent_tx_id), selected_txs) {
-                let Some(candidate_tx) = dependent_txs.remove(dependent_tx_id) else {
-                    continue;
-                };
-
-                // Transactions that don't pay the conventional fee should not have
-                // the same probability of being included as their dependencies.
-                if !candidate_tx.pays_conventional_fee() {
-                    continue;
-                }
-
-                if !limits.try_add(&candidate_tx) {
-                    continue;
-                }
-
-                #[cfg(not(test))]
-                selected_txs.push(candidate_tx);
-
-                #[cfg(test)]
-                selected_txs.push((
-                    dependencies_depth(dependent_tx_id, mempool_tx_deps),
-                    candidate_tx,
-                ));
-
-                next_level_dependents.extend(mempool_tx_deps.direct_dependents(dependent_tx_id));
-            }
-        }
-
-        current_level_dependents = next_level_dependents;
-    }
-}
-
 /// Tracks the remaining capacity of a block template against every limit a
 /// candidate mempool transaction can exhaust: the ZIP-317 byte, sigop, and
 /// unpaid-action limits, and, once ZIP 218 is active, the per-pool shielded
@@ -287,6 +131,7 @@ fn checked_add_transaction(
 ///
 /// The shielded fields start at [`u32::MAX`] while ZIP 218 is inactive, so the
 /// new limits have no effect on those templates.
+#[derive(Clone)]
 struct BlockTemplateLimits {
     remaining_bytes: usize,
     remaining_sigops: u32,

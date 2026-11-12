@@ -120,7 +120,7 @@ pub enum Request {
     /// Request a [`VerifiedUnminedTx`] and its dependencies by its mined id.
     TransactionWithDepsByMinedId(transaction::Hash),
 
-    /// Get all the [`VerifiedUnminedTx`] in the mempool.
+    /// Get all the [`VerifiedUnminedTx`] in the mempool, in mining order.
     ///
     /// Equivalent to `TransactionsById(TransactionIds)`,
     /// but each transaction also includes the `miner_fee` and `legacy_sigop_count` fields.
@@ -211,7 +211,12 @@ pub enum Response {
     // TODO: make the Transactions response return VerifiedUnminedTx,
     //       and remove the FullTransactions variant
     FullTransactions {
-        /// All [`VerifiedUnminedTx`]s in the mempool
+        /// All [`VerifiedUnminedTx`]s in the mempool, in mining order.
+        ///
+        /// Transactions are ordered by the descending fee per ZIP-401 cost of
+        /// the package they form with their unconfirmed ancestors, then by
+        /// ascending insertion time and transaction ID. Block template
+        /// selection relies on this order.
         transactions: Vec<VerifiedUnminedTx>,
 
         /// All transaction dependencies in the mempool

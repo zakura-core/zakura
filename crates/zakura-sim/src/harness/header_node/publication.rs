@@ -68,7 +68,11 @@
 //! `NotApplicable` from that drain on, as `expected-chain-selected` does
 //! ([`super::fork_choice`]).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
@@ -441,8 +445,9 @@ pub(super) struct Publication {
     adopted: Option<Adoption>,
     /// The state version of an adoption not yet stored.
     unstored: Option<u64>,
-    /// Each admitted session the node still holds, in a status fixture.
-    sessions: HashMap<u64, Session>,
+    /// Each admitted session the node still holds, in a status fixture, by
+    /// ID, so an adoption stamps the debts it opens in session order.
+    sessions: BTreeMap<u64, Session>,
     /// The served-page rule's state.
     served: served::ServedPages,
     /// Whether the commit-contents check found a run corrupt, after which
@@ -463,7 +468,7 @@ impl Publication {
             committed: Vec::new(),
             adopted: None,
             unstored: None,
-            sessions: HashMap::new(),
+            sessions: BTreeMap::new(),
             served: served::ServedPages::default(),
             tainted: false,
             breaks: Vec::new(),

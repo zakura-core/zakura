@@ -1367,7 +1367,9 @@ fn judge_planted(
 }
 
 /// A fuzz target's verdict (Rule 11): `zakura-sim targets` reported it
-/// ready, from a fuzz binary built from S's clean source, and every run the target
+/// ready, from a fuzz binary built from a clean checkout at S's commit
+/// (its own source digest also covers the fuzz package, so it isn't S's),
+/// and every run the target
 /// made is accounted for. Each begin record has its end, each run is of
 /// the target's harness on one of its admitted seeds (libFuzzer may rerun
 /// a seed, an observed atom), every seed ran at least once, and every run
@@ -1403,7 +1405,6 @@ fn judge_target(
     }
     if row.pointer("/build/git").and_then(Value::as_str) != Some(bound.commit)
         || row.pointer("/build/dirty").and_then(Value::as_bool) != Some(false)
-        || row.pointer("/build/source").and_then(Value::as_str) != Some(bound.source)
     {
         return blocked(format!("{name}'s fuzz binary wasn't built from S's commit"));
     }

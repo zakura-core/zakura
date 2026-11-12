@@ -144,6 +144,12 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
         return run_in_subject(repo_root, args(args_in)?);
     }
     let args = args(args_in)?;
+    // The header run's record is an input: retiring it, or writing over
+    // it, would lose it.
+    let (out, header) = (resolved(&args.out), resolved(&args.header_out));
+    if out.starts_with(&header) || header.starts_with(&out) {
+        return Err(UsageError("--out and --header-out must not overlap").into());
+    }
     let options = Options {
         out: args.out.clone(),
         deadline: args.deadline,
@@ -173,12 +179,7 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     let summary = result?;
     removed?;
     stop_if_interrupted()?;
-    if ESCAPED.load(Ordering::Relaxed) {
-        return Err(
-            "a child's descendants couldn't be confirmed gone, so the record can't be trusted"
-                .into(),
-        );
-    }
+    escaped()?;
     for target in RUN_TARGETS {
         let target = run_dir.join(target);
         if target.exists() {
@@ -187,8 +188,13 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     }
     write_checksums(&run_dir)?;
     publish_record(&args.out, &run_dir)?;
-    println!("{summary}");
-    println!("record: {}", args.out.join(RECORD).display());
+    // Nothing after the record is published can fail the run.
+    {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = write!(stdout, "{summary}");
+        let _ = writeln!(stdout, "record: {}", args.out.join(RECORD).display());
+    }
     Ok(())
 }
 
@@ -266,6 +272,22 @@ fn run_in_subject(repo_root: &Path, args: Args) -> Result<(), BoxError> {
     let contained = contain();
     let source = subject_source(repo_root, &run, &args.subject)?;
     run_at(repo_root, &run, &args, &source, contained)?;
+    stop_if_interrupted()?;
+    // This process's own children: a survivor fails the run here, so the
+    // caller never publishes it.
+    escaped()?;
+    Ok(())
+}
+
+/// Fails if any child's descendants couldn't be confirmed gone, since a
+/// survivor could have changed what later tasks read.
+fn escaped() -> Result<(), BoxError> {
+    if ESCAPED.load(Ordering::Relaxed) {
+        return Err(
+            "a child's descendants couldn't be confirmed gone, so the record can't be trusted"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -496,6 +518,7 @@ fn run_at(
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
         }
         ctx.check_checkout()?;
+        escaped()?;
     }
 
     // Before the evaluator, which binds each trace to the kept release build.

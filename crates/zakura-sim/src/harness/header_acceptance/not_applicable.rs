@@ -311,6 +311,12 @@ const CASES: &[CaseNa] = &[
     ),
     wire(
         "header-sync/header-fault-penalized",
+        "idle-exit-drops-fault",
+        PENALTY,
+        PENALTY_UNDECLARED,
+    ),
+    wire(
+        "header-sync/header-fault-penalized",
         "late-fault-unpenalized",
         PENALTY,
         PENALTY_UNDECLARED,
@@ -1334,6 +1340,15 @@ const PATCHED: &[PatchedNa] = &[
                 site: Pending::WatchOpen,
             },
         )],
+    },
+    // Found at the end: the reactor returns before it takes the late
+    // failure, so no completion ends stale.
+    PatchedNa {
+        property: "header-sync/header-fault-penalized",
+        name: "idle-exit-drops-fault",
+        applies: &[],
+        never: &["header-sync/stale-completion-inert"],
+        other: &[],
     },
     // Found at the end: with nothing applied, nothing goes stale.
     PatchedNa {

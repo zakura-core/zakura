@@ -411,7 +411,7 @@ fn every_node_catch_declares_its_not_applicable() {
             );
         }
     }
-    assert_eq!(cases.len(), 216, "every node planted case");
+    assert_eq!(cases.len(), 217, "every node planted case");
 }
 
 /// A catch's case, harness and declared list.
@@ -423,7 +423,7 @@ type Shape = Vec<(&'static str, &'static str)>;
 /// Each node catch's declared list is exactly its genuine baseline's
 /// `NotApplicable` reports, with every other ID but its target held and
 /// none violated: the whole-report rule the evaluator applies to the
-/// baseline. Running all 216 baselines takes minutes, so this runs the
+/// baseline. Running all 217 baselines takes minutes, so this runs the
 /// first case, by target and name, of each distinct list on each harness,
 /// which is one per shape `not_applicable` declares.
 #[test]

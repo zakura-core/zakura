@@ -97,7 +97,6 @@ use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_rpc::EarlyMinedBlockChannel;
-use zakura_state::StorageMode;
 
 use zakura::{
     drive_block_sync_actions, query_block_sync_frontiers, zakura_header_sync_driver_startup,
@@ -295,13 +294,12 @@ impl StartCmd {
         }
     }
 
-    /// Returns the services advertised to legacy P2P peers.
-    fn advertised_services(config: &ZakuradConfig) -> PeerServices {
-        if config.zcashd_compat.enabled || config.state.storage_mode == StorageMode::Archive {
-            PeerServices::NODE_NETWORK
-        } else {
-            PeerServices::empty()
-        }
+    /// Returns the services advertised to legacy P2P peers in every storage mode.
+    ///
+    /// Pruned nodes advertise block service so peers can discover and reconnect to them.
+    /// Requests for block bodies outside their retention window still return `notfound`.
+    fn advertised_services() -> PeerServices {
+        PeerServices::NODE_NETWORK
     }
 
     fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
@@ -586,7 +584,7 @@ impl StartCmd {
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
         ));
 
-        let advertised_services = Self::advertised_services(&config);
+        let advertised_services = Self::advertised_services();
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
@@ -1497,7 +1495,6 @@ mod tests {
     use crate::config::ZakuradConfig;
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
-    use zakura_state::{PruningConfig, StorageMode};
 
     #[tokio::test]
     async fn shutdown_cannot_mask_a_ready_writer_failure() {
@@ -1522,21 +1519,8 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_advertises_node_network_when_pruned() {
-        let mut config = ZakuradConfig::default();
-        config.state.storage_mode = StorageMode::Pruned(PruningConfig::default());
-
-        assert_eq!(
-            StartCmd::advertised_services(&config),
-            PeerServices::empty()
-        );
-
-        config.zcashd_compat.enabled = true;
-
-        assert_eq!(
-            StartCmd::advertised_services(&config),
-            PeerServices::NODE_NETWORK
-        );
+    fn advertised_services_include_node_network_without_configuration() {
+        assert_eq!(StartCmd::advertised_services(), PeerServices::NODE_NETWORK);
     }
 
     #[test]

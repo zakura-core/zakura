@@ -233,9 +233,10 @@ refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
 `"dual"` setting also enables the experimental Zakura P2P v2 stack, but the
 zcashd sidecar still connects over Zakura's legacy listener.
 
-Pruned storage is supported for the fronting Zakura. When zcashd-compat is
-enabled, Zakura advertises `NODE_NETWORK` even in pruned mode so that the
-sidecar can sync. Pruning still limits which block bodies Zakura can serve:
+Pruned storage is supported for the fronting Zakura. All Zakura nodes advertise
+`NODE_NETWORK`, including pruned nodes with or without zcashd-compat enabled,
+so peers can discover, reconnect to, and download recent blocks from them.
+Pruning still limits which block bodies Zakura can serve:
 zcashd's current chainstate must be recent enough that every block it still
 needs is inside Zakura's configured retention window. The default and minimum
 retention on Mainnet and Testnet is 10,000 blocks, and operators can configure

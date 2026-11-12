@@ -588,7 +588,8 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 /// A receiver template's trigger is the node judging a frame its row's rule
 /// covers, with the template's label: a `<label>-closes` ID's label on its
 /// row (any row for `undeclared-type`), a conformant frame on the stream for
-/// `conformant-never-closes`, a frame into an empty cadence bucket on the row
+/// `conformant-never-closes`, on each punished connection the property
+/// counts as well ([`punishments_follow_conformant`]), a frame into an empty cadence bucket on the row
 /// for `cadence-never-closes`, any frame on the row for
 /// `receiver-work-authorized` and `receiver-serving-bounded`, and a page of
 /// the subscription on a connection the node granted it credit on for
@@ -643,8 +644,36 @@ pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLo
                 .map_or(before, |sent_at| &before[..sent_at]);
             sent(before, connection, stream, quic_stream, seq)
                 .is_ok_and(|frame| receiver_reached(layout, &id, sent_before, connection, &frame))
-        }),
+        }) && (id.template != Template::ConformantNeverCloses
+            || punishments_follow_conformant(&id, entries)),
     }
+}
+
+/// True if each punishment in `entries` that `conformant-never-closes`
+/// counts against the node, a fault close or `Misbehavior` of a connection
+/// whose judged frames are all conformant, came after the node judged a
+/// conformant frame of `id`'s stream on that connection, so a violation's
+/// trigger history is on its own connection, not another's. A punishment
+/// with missing evidence reaches nothing.
+fn punishments_follow_conformant(id: &GeneratedId<'_>, entries: &[Entry]) -> bool {
+    entries.iter().enumerate().all(|(at, entry)| {
+        let connection = match &entry.obs {
+            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+                *connection
+            }
+            Observation::Misbehavior { connection } => *connection,
+            _ => return true,
+        };
+        let Ok(judged) = judged(&entries[..at], connection) else {
+            return false;
+        };
+        // As `check_never_closes` counts it: a punishment before anything
+        // was judged counts too.
+        let on_stream = judged.iter().any(|frame| frame.stream == id.stream);
+        let counted = judged.iter().all(|frame| frame.label == Label::Conformant)
+            && (judged.is_empty() || on_stream);
+        !counted || on_stream
+    })
 }
 
 /// True if `frame`, which the node judged on `connection` and the peer sent

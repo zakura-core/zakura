@@ -773,7 +773,7 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
 
 /// Tests that `GetTransaction` returns the stored transaction bytes for a
 /// display-order ID, reports unknown IDs as not found, and rejects IDs that
-/// are not 32 bytes without reading the state.
+/// are not 32 bytes, and requests over the size limit, without reading the state.
 async fn test_get_transaction(
     mut client: IndexerClient<tonic::transport::Channel>,
     mut mock_read_service: MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
@@ -785,6 +785,16 @@ async fn test_get_transaction(
         .await
         .expect_err("a transaction ID that is not 32 bytes should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    // A request over the server's size limit is refused from its length prefix, before the
+    // oversized ID is buffered or decoded.
+    let status = client
+        .get_transaction(tonic::Request::new(TransactionRequest {
+            txid: vec![0; crate::indexer::server::MAX_REQUEST_MESSAGE_BYTES],
+        }))
+        .await
+        .expect_err("a request over the size limit should be rejected");
+    assert_eq!(status.code(), tonic::Code::OutOfRange);
 
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
     let transaction = block.transactions[0].clone();

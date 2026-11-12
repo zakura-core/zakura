@@ -40,6 +40,14 @@ const MAX_CONNECTIONS: usize = 64;
 /// Maximum number of concurrent HTTP/2 streams on each connection.
 const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 64;
 
+/// Maximum encoded size of a request message, in bytes.
+///
+/// tonic rejects a longer message from its length prefix, before buffering or decoding it, so a
+/// caller cannot make the server allocate an oversized field that a handler would only reject
+/// afterwards. The largest valid request names every non-finalized chain tip and a receipt
+/// session, which takes under 400 bytes; tonic's default would admit 4 MiB.
+pub(crate) const MAX_REQUEST_MESSAGE_BYTES: usize = 4096;
+
 /// Maximum time an unauthenticated connection may spend negotiating TLS.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -139,9 +147,9 @@ where
     let server_task: JoinHandle<Result<(), BoxError>> = spawn_erased(async move {
         // The generated service dispatches on the method path itself, and answers unknown
         // methods with `Unimplemented`, so a single service needs no tonic router.
-        server
-            .serve_with_incoming(IndexerServer::new(indexer_service), incoming)
-            .await?;
+        let indexer_server = IndexerServer::new(indexer_service)
+            .max_decoding_message_size(MAX_REQUEST_MESSAGE_BYTES);
+        server.serve_with_incoming(indexer_server, incoming).await?;
 
         Ok(())
     });

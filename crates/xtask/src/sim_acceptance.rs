@@ -918,10 +918,14 @@ impl Ctx<'_> {
         let harness = field(task, "harness")?;
         let input = self.root.join(field(task, "input")?);
         let cargo_path = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        // Every run it makes, at any depth, writes its records here.
+        let planted_runs = self.dir.join("planted-runs");
+        fs::create_dir_all(&planted_runs)?;
         let mut verdict = Command::new(&cargo_path);
         verdict
             .args(["xtask", "planted", property])
             .env_remove("RUSTFLAGS")
+            .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &planted_runs)
             .current_dir(self.root);
         self.record(&mut verdict, "planted", json!({}))?;
         let index = self
@@ -957,7 +961,17 @@ impl Ctx<'_> {
             "zakura-sim",
         ]);
         self.record(&mut build, "build-patched", json!({}))?;
-        let Ok(bytes) = fs::read(work.join("target/release/zakura-sim")) else {
+        // A build that didn't exit 0 in time keeps nothing, even if it left
+        // an executable.
+        let built = fs::read_to_string(self.dir.join("build-patched.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|build| build.get("exited_ok")?.as_bool())
+            == Some(true);
+        let Some(bytes) = built
+            .then(|| fs::read(work.join("target/release/zakura-sim")).ok())
+            .flatten()
+        else {
             return Ok(());
         };
         let patched_sha256 = sha256_hex(&bytes);

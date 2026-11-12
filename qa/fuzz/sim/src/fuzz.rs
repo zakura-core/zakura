@@ -117,13 +117,9 @@ fn run(
 ) {
     let counters = feedback.as_ref().map(Feedback::counters);
     crate::stats::begin(entry);
-    let atom = begin_atom(entry, input);
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
         worker.explore_with(entry, input, feedback, move |input, run, classified| {
-            if let Some(atom) = &atom {
-                end_atom(atom, run);
-            }
             let _acting = crate::stats::record(entry, run, classified, counters);
             then(entry, input, run, classified)
         });
@@ -141,66 +137,6 @@ fn run(
             );
         }
     });
-}
-
-/// The variable naming the directory where each run writes its begin and
-/// end records for sim-7's acceptance tool (the sim-7 plan's Rule 11).
-/// Unset, as in ordinary fuzzing, nothing is written.
-pub const ACCEPTANCE_RUNS_VAR: &str = "ZAKURA_SIM_ACCEPTANCE_RUNS";
-
-/// [`ACCEPTANCE_RUNS_VAR`]'s directory, read once per process.
-fn acceptance_runs() -> Option<&'static Path> {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| env::var_os(ACCEPTANCE_RUNS_VAR).map(PathBuf::from))
-        .as_deref()
-}
-
-/// One run's records: `<dir>/<pid>-<n>`, plus `.begin.json` or `.end.json`.
-struct Atom {
-    /// The records' path without its suffix.
-    stem: PathBuf,
-    /// The run's harness.
-    harness: &'static str,
-    /// Its input's SHA-256.
-    input_sha256: String,
-}
-
-/// Writes the run's begin record, naming its harness and input, before it
-/// starts, if the acceptance tool asked for records. A begin with no end
-/// shows a run that never finished. Panics if it can't write, so the
-/// tool's row fails rather than missing a run.
-fn begin_atom(entry: &'static HarnessEntry, input: &[u8]) -> Option<Atom> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = acceptance_runs()?;
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let atom = Atom {
-        stem: dir.join(format!("{}-{n}", std::process::id())),
-        harness: entry.name,
-        input_sha256: zakura_sim::seed::sha256(input),
-    };
-    let begin = serde_json::json!({ "harness": atom.harness, "input_sha256": atom.input_sha256 });
-    write_atom(&atom, "begin", &begin);
-    Some(atom)
-}
-
-/// Writes the run's end record: its harness, input, and the `end` record
-/// the run wrote, cleanup included, or the harness error that stopped it.
-fn end_atom(atom: &Atom, run: &ExploreRun) {
-    let end = serde_json::json!({
-        "harness": atom.harness,
-        "input_sha256": atom.input_sha256,
-        "end": run.report().map(|report| report.end_record()),
-        "error": run.result.as_ref().err().map(ToString::to_string),
-    });
-    write_atom(atom, "end", &end);
-}
-
-/// Writes `record` as `atom`'s `<kind>.json`.
-fn write_atom(atom: &Atom, kind: &str, record: &serde_json::Value) {
-    let path = atom.stem.with_extension(format!("{kind}.json"));
-    std::fs::write(&path, record.to_string())
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
 
 /// `ZAKURA_SIM_ABANDON_LIMIT`, read once per process.

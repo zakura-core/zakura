@@ -10,6 +10,7 @@
 //! M1 implementation plan.
 #![cfg(zakura_sim)]
 
+pub mod acceptance_runs;
 pub mod action;
 pub mod campaign;
 pub mod check;

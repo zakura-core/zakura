@@ -148,9 +148,8 @@ fn reached(obs: &Value) -> Option<String> {
 /// `--observe` log a fresh replay wrote beside it. The log must be bound
 /// to the trace: one line per step from 0 for setup, each
 /// `{"step":<n>,"obs":<obs>}` for its own step, with `<obs>` hashing to
-/// the observation digest the trace records for that step. `init`'s digest
-/// is taken before the setup tasks' spawns land in step 0, so line 0 binds
-/// when a prefix of its observations hashes to it.
+/// the observation digest the trace records for that step, `init`'s for
+/// step 0.
 pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
     use sha2::{Digest as _, Sha256};
     let trace = crate::trace::TraceReader::open(dir)
@@ -188,14 +187,7 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
                 dir.display()
             ));
         };
-        let bound = if n == 0 {
-            array_prefixes(text)
-                .iter()
-                .any(|prefix| digest.as_deref() == Some(hash(prefix.as_bytes()).as_str()))
-        } else {
-            digest.as_deref() == Some(hash(text.as_bytes()).as_str())
-        };
-        if !bound {
+        if digest.as_deref() != Some(hash(text.as_bytes()).as_str()) {
             return Err(format!(
                 "{}: log line {n} doesn't match the trace's observation digest",
                 dir.display()
@@ -219,33 +211,6 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
         });
     }
     Ok(views)
-}
-
-/// Each prefix of the JSON array `text`, as its own array text with the
-/// original bytes of its elements: `[]`, `[a]`, `[a,b]` and so on. Only
-/// top-level commas, outside strings and nested values, split elements.
-fn array_prefixes(text: &str) -> Vec<String> {
-    let inner = text
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or_default();
-    let mut prefixes = vec!["[]".to_owned()];
-    let (mut depth, mut in_string, mut escaped) = (0u32, false, false);
-    for (index, byte) in inner.bytes().enumerate() {
-        match byte {
-            _ if escaped => escaped = false,
-            b'\\' if in_string => escaped = true,
-            b'"' => in_string = !in_string,
-            b'{' | b'[' if !in_string => depth += 1,
-            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
-            b',' if !in_string && depth == 0 => prefixes.push(format!("[{}]", &inner[..index])),
-            _ => {}
-        }
-    }
-    if !inner.is_empty() {
-        prefixes.push(format!("[{inner}]"));
-    }
-    prefixes
 }
 
 /// `views` without each observation's `site`, for two runs whose fix is a
@@ -328,8 +293,8 @@ pub fn first_differing_step(before: &[StepView], after: &[StepView], map: &HunkM
 /// Checks that `before` and `after` agree up to their first differing
 /// step, and that the difference is at `site` on `after`'s side: either an
 /// observation `site` names that `before`'s step doesn't hold, or `site`'s
-/// pick, with the same draws on both sides, followed by different
-/// observations. A site that's merely present beside an unrelated
+/// pick, with the same draws on both sides, followed by an observation of
+/// the picked task that `before`'s step doesn't hold. A site that's merely present beside an unrelated
 /// difference doesn't count.
 pub fn agreement(
     before: &[StepView],
@@ -355,9 +320,21 @@ pub fn agreement(
                 .obs
                 .iter()
                 .any(|obs| names(obs) && !before_obs.contains(obs));
+            // After the site's pick, the change must be the picked task's:
+            // one of its observations that the other run's step doesn't hold.
+            let picked = site
+                .at
+                .strip_prefix("task:")
+                .and_then(|rest| rest.rsplit_once(':'))
+                .map(|(task, _)| task);
+            let changed_by_pick = view.obs.iter().any(|obs| {
+                picked.is_some()
+                    && obs.get("task").and_then(Value::as_str) == picked
+                    && !before_obs.contains(obs)
+            });
             let after_pick = view.pick == site.at
                 && before_view.is_some_and(|b| {
-                    b.pick != view.pick || (b.draws == view.draws && before_obs != view.obs)
+                    b.pick != view.pick || (b.draws == view.draws && changed_by_pick)
                 });
             changed_obs || after_pick
         });
@@ -387,17 +364,5 @@ mod tests {
         assert_eq!(back.map("peer.rs", 85), Some(85));
         assert_eq!(map.map("peer.rs", 97), None);
         assert_eq!(back.map("peer.rs", 90), None);
-    }
-
-    /// Each prefix keeps its elements' bytes, and commas inside strings or
-    /// nested values don't split.
-    #[test]
-    fn array_prefixes_split_only_top_level_elements() {
-        let text = r#"[{"a":"x,y"},{"b":[1,2]}]"#;
-        assert_eq!(
-            super::array_prefixes(text),
-            ["[]", r#"[{"a":"x,y"}]"#, r#"[{"a":"x,y"},{"b":[1,2]}]"#]
-        );
-        assert_eq!(super::array_prefixes("[]"), ["[]"]);
     }
 }

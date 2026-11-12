@@ -1,0 +1,101 @@
+//! Each simulation run's begin and end records, for sim-7's acceptance
+//! tool (the sim-7 plan's Rule 11: every run any tool makes, at any depth,
+//! writes its own). They're written only when [`RUNS_VAR`] names a
+//! directory, so an ordinary run pays one read of an unset variable per
+//! process. Every harness run passes through
+//! [`crate::harness::run_reading`], which writes them.
+
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+};
+
+use crate::sim::RunReport;
+
+/// The variable naming the directory the records go to.
+pub const RUNS_VAR: &str = "ZAKURA_SIM_ACCEPTANCE_RUNS";
+
+/// The variable naming the phase a tool's child runs in, such as
+/// `fuzz-target`, which each record carries. A run with none set is
+/// `in-process`.
+pub const PHASE_VAR: &str = "ZAKURA_SIM_ACCEPTANCE_PHASE";
+
+/// [`RUNS_VAR`]'s directory, read once per process.
+fn dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os(RUNS_VAR).map(PathBuf::from))
+        .as_deref()
+}
+
+/// [`PHASE_VAR`], read once per process.
+fn phase() -> &'static str {
+    static PHASE: OnceLock<String> = OnceLock::new();
+    PHASE.get_or_init(|| std::env::var(PHASE_VAR).unwrap_or_else(|_| "in-process".to_owned()))
+}
+
+thread_local! {
+    /// The SHA-256 of the full fuzz input the thread's current run is of,
+    /// if its caller named one ([`with_input`]).
+    static INPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with `input`, a full fuzz input, as the input of the runs it
+/// makes on this thread. Hashes nothing unless records are being written.
+pub fn with_input<T>(input: &[u8], f: impl FnOnce() -> T) -> T {
+    if dir().is_none() {
+        return f();
+    }
+    let previous = INPUT.with(|slot| slot.replace(Some(crate::seed::sha256(input))));
+    let out = f();
+    INPUT.with(|slot| *slot.borrow_mut() = previous);
+    out
+}
+
+/// One run's records: `<dir>/<pid>-<n>` with `.begin.json` or `.end.json`.
+pub(crate) struct Atom {
+    /// The records' path without their suffix.
+    stem: PathBuf,
+    /// The record's identity fields: the harness, its input and the phase.
+    identity: serde_json::Value,
+}
+
+/// Writes the begin record of a run of `harness` before it starts, if
+/// records are being written. A begin with no end shows a run that never
+/// finished. Panics if it can't write, so the row fails rather than missing
+/// a run.
+pub(crate) fn begin(harness: &str) -> Option<Atom> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = dir()?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let atom = Atom {
+        stem: dir.join(format!("{}-{n}", std::process::id())),
+        identity: serde_json::json!({
+            "harness": harness,
+            "input_sha256": INPUT.with(|slot| slot.borrow().clone()),
+            "phase": phase(),
+        }),
+    };
+    write(&atom, "begin", &atom.identity);
+    Some(atom)
+}
+
+/// Writes `atom`'s end record: its identity and the `end` record the run
+/// wrote, cleanup included.
+pub(crate) fn end(atom: Option<Atom>, report: &RunReport) {
+    let Some(atom) = atom else { return };
+    let mut record = atom.identity.clone();
+    record["end"] =
+        serde_json::to_value(report.end_record()).expect("an end record holds only plain data");
+    write(&atom, "end", &record);
+}
+
+/// Writes `record` as `atom`'s `<kind>.json`.
+fn write(atom: &Atom, kind: &str, record: &serde_json::Value) {
+    let path = atom.stem.with_extension(format!("{kind}.json"));
+    std::fs::write(&path, record.to_string())
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}

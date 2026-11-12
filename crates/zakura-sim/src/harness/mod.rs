@@ -234,6 +234,7 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
+    let atom = crate::acceptance_runs::begin(S::NAME);
     // Before setup, so a datagram setup sends is hashed only if the run
     // records its steps.
     let _records_steps = crate::net::RecordsSteps::set(sink.wants_steps());
@@ -262,6 +263,7 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     // handles close mid-run.
     drop(checker);
     drop(this);
+    crate::acceptance_runs::end(atom, &report);
     match (&report.end.outcome, &report.end.harness) {
         (Outcome::Harness, Some(failure)) => Err(HarnessError::Run {
             failure: failure.clone(),

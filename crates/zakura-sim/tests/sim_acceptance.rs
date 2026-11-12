@@ -672,10 +672,10 @@ mod schedule_agreement {
     fn a_site_beside_an_unrelated_difference_fails() {
         let map = HunkMap::default();
         let pick = Site {
-            at: "task:t".to_owned(),
+            at: "task:t:poll#1".to_owned(),
         };
-        let before = [reach(1, "task:t", "src/a.rs:1")];
-        let mut after = [reach(1, "task:t", "src/a.rs:1")];
+        let before = [reach(1, "task:t:poll#1", "src/a.rs:1")];
+        let mut after = [reach(1, "task:t:poll#1", "src/a.rs:1")];
         after[0].draws = before[0].draws.clone();
         after[0]
             .obs
@@ -694,6 +694,12 @@ mod schedule_agreement {
         assert!(
             agreement(&before, &drawn, &map, &pick).is_err(),
             "only a draw differs"
+        );
+        let mut other_task: Vec<StepView> = after.to_vec();
+        other_task[0].obs[1] = json!({ "obs": "task-exited", "task": "u" });
+        assert!(
+            agreement(&before, &other_task, &map, &pick).is_err(),
+            "a change after the site's pick that isn't the picked task's"
         );
         let shared = Site {
             at: "src/a.rs:1".to_owned(),

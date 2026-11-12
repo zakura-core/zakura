@@ -148,7 +148,7 @@ pub struct RunReport {
 impl RunReport {
     /// The `end` record the run wrote, or would have written to a sink that
     /// keeps records.
-    pub fn end_record(&self) -> EndRecord {
+    pub(crate) fn end_record(&self) -> EndRecord {
         end_record(&self.end, &self.properties, self.cleanup, &self.picks)
     }
 }
@@ -541,12 +541,16 @@ impl Sim {
             source.record_contents(record_steps);
         }
         let observed = self.observe_sources(st);
+        // The first ready set logs the setup tasks' spawns into step 0, so
+        // it's read before `init`'s digest, which then covers all of step
+        // 0's observations. It draws nothing and moves nothing.
+        let first = observed.is_ok().then(|| self.ready(st));
         let obs = record_steps.then(|| digest(st.log.of_step(st.step)));
         sink.record(Record::Init(InitRecord { draws, obs }));
         if let Err(failure) = observed {
             return st.end_harness(failure);
         }
-        let mut ready = match self.ready(st) {
+        let mut ready = match first.expect("read whenever setup's sources observed cleanly") {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
         };

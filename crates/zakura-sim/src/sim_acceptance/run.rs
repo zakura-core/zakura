@@ -962,6 +962,7 @@ pub fn record(
         (sha256_hex(&kept) == digest).then_some(digest)
     });
     let bound = Bound {
+        repo,
         commit: subject,
         source: subject_source,
         release,
@@ -1267,6 +1268,8 @@ pub fn record(
 
 /// What every judged artifact must be bound to.
 struct Bound<'a> {
+    /// The checkout of S.
+    repo: &'a Path,
     /// S's commit.
     commit: &'a str,
     /// S's source digest.
@@ -1309,6 +1312,25 @@ fn judge_planted(
     if !exited(runner_json(dir, "planted.json", binding)) {
         return blocked("`cargo xtask planted` didn't pass".to_owned());
     }
+    // Every run the planted runner made, at any depth, is a consumed run:
+    // its own classifier judged the outcome, and its cleanup is judged
+    // here by the one rule.
+    match run_records(&dir.join("planted-runs")) {
+        Ok(runs) if runs.is_empty() => {
+            return blocked("`cargo xtask planted` recorded no runs".to_owned())
+        }
+        Ok(runs) => {
+            if let Some((run, fault)) = runs.iter().find_map(|run| {
+                super::judge::cleanup_fault(&run.end.cleanup).map(|fault| (run, fault))
+            }) {
+                return blocked(format!("a planted run ({}): {fault}", run.stem));
+            }
+        }
+        Err(why) => return blocked(why),
+    }
+    if !exited(runner_json(dir, "build-patched.json", binding)) {
+        return blocked("the patched build didn't finish".to_owned());
+    }
     let Some(patched_sha) = kept_patched(dir, binding) else {
         return blocked("the run didn't keep the patched build it recorded with".to_owned());
     };
@@ -1318,6 +1340,7 @@ fn judge_planted(
     // The patched build embeds its own source, S plus the patch, so its
     // trace is bound to that build and to S's commit rather than S's digest.
     let patched_bound = Bound {
+        repo: bound.repo,
         commit: bound.commit,
         source: &patched.meta.build.source,
         release: Some(patched_sha),
@@ -1366,14 +1389,81 @@ fn judge_planted(
     )
 }
 
+/// One run's records, as [`crate::acceptance_runs`] writes them.
+struct RunRecord {
+    /// The records' file stem, `<pid>-<n>`.
+    stem: String,
+    /// The harness.
+    harness: String,
+    /// The full input's SHA-256, where the caller named it.
+    input: Option<String>,
+    /// The tool phase it ran in.
+    phase: String,
+    /// The `end` record it wrote.
+    end: crate::record::EndRecord,
+}
+
+/// Every run recorded under `dir`: each begin record must have its end,
+/// each end its begin, and the two must name the same harness, input and
+/// phase.
+fn run_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
+    let entries = fs::read_dir(dir).map_err(|_| "the tool left no run records".to_owned())?;
+    let read = |path: &Path| -> Option<Value> {
+        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    };
+    let mut begins = BTreeMap::new();
+    let mut ends = BTreeMap::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = file.strip_suffix(".begin.json") {
+            begins.insert(stem.to_owned(), entry.path());
+        } else if let Some(stem) = file.strip_suffix(".end.json") {
+            ends.insert(stem.to_owned(), entry.path());
+        } else {
+            return Err(format!("{file} isn't a run record"));
+        }
+    }
+    if let Some(stem) = begins.keys().find(|stem| !ends.contains_key(*stem)) {
+        return Err(format!("run {stem} began but never ended"));
+    }
+    let mut runs = Vec::new();
+    for (stem, path) in &ends {
+        let begin = begins
+            .get(stem)
+            .and_then(|path| read(path))
+            .ok_or_else(|| format!("run {stem} has no readable begin record"))?;
+        let end = read(path).ok_or_else(|| format!("run {stem}'s end record doesn't read"))?;
+        for field in ["harness", "input_sha256", "phase"] {
+            if begin.get(field) != end.get(field) {
+                return Err(format!(
+                    "run {stem}'s begin and end name different {field}s"
+                ));
+            }
+        }
+        let text = |field: &str| end.get(field).and_then(Value::as_str).map(str::to_owned);
+        runs.push(RunRecord {
+            stem: stem.clone(),
+            harness: text("harness").unwrap_or_default(),
+            input: text("input_sha256"),
+            phase: text("phase").unwrap_or_default(),
+            end: end
+                .get("end")
+                .and_then(|end| serde_json::from_value(end.clone()).ok())
+                .ok_or_else(|| format!("run {stem} left no end record"))?,
+        });
+    }
+    Ok(runs)
+}
+
 /// A fuzz target's verdict (Rule 11): `zakura-sim targets` reported it
 /// ready, from a fuzz binary built from a clean checkout at S's commit
 /// (its own source digest also covers the fuzz package, so it isn't S's),
 /// and every run the target
-/// made is accounted for. Each begin record has its end, each run is of
-/// the target's harness on one of its admitted seeds (libFuzzer may rerun
-/// a seed, an observed atom), every seed ran at least once, and every run
-/// passes through [`owned_run_passes`], cleanup included.
+/// made is accounted for ([`run_records`]): each run is of the target's
+/// harness on one of its admitted seeds (libFuzzer may rerun a seed, an
+/// observed atom), every seed ran both in `targets`' own process and as a
+/// fuzz-target iteration, and every run passes through
+/// [`owned_run_passes`], cleanup included.
 fn judge_target(
     dir: &Path,
     binding: &TaskBinding,
@@ -1403,8 +1493,12 @@ fn judge_target(
     if row.get("status").and_then(Value::as_str) != Some("ready") {
         return blocked(format!("{name} isn't ready"));
     }
+    // The fuzz build's source digest covers the fuzz package too, so it's
+    // computed from S the same way the build computes it.
+    let fuzz_source = crate::campaign::fuzz_source(bound.repo);
     if row.pointer("/build/git").and_then(Value::as_str) != Some(bound.commit)
         || row.pointer("/build/dirty").and_then(Value::as_bool) != Some(false)
+        || row.pointer("/build/source").and_then(Value::as_str) != Some(fuzz_source.as_str())
     {
         return blocked(format!("{name}'s fuzz binary wasn't built from S's commit"));
     }
@@ -1420,60 +1514,38 @@ fn judge_target(
             .map(|p| p.id.clone())
             .collect(),
     };
-    let runs = dir.join("runs");
-    let Ok(entries) = fs::read_dir(&runs) else {
-        return blocked("the target left no run records".to_owned());
+    let runs = match run_records(&dir.join("runs")) {
+        Ok(runs) => runs,
+        Err(why) => return blocked(why),
     };
-    let mut begins = BTreeSet::new();
-    let mut ends = BTreeMap::new();
-    for entry in entries.flatten() {
-        let file = entry.file_name().to_string_lossy().into_owned();
-        if let Some(stem) = file.strip_suffix(".begin.json") {
-            begins.insert(stem.to_owned());
-        } else if let Some(stem) = file.strip_suffix(".end.json") {
-            ends.insert(stem.to_owned(), entry.path());
-        } else {
-            return blocked(format!("{file} isn't a run record"));
-        }
-    }
-    if let Some(stem) = begins.iter().find(|stem| !ends.contains_key(*stem)) {
-        return blocked(format!("run {stem} began but never ended"));
-    }
-    let mut ran = BTreeSet::new();
-    for (stem, path) in &ends {
-        if !begins.contains(stem) {
-            return blocked(format!("run {stem} ended without beginning"));
-        }
-        let Some(record) = fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        else {
-            return blocked(format!("run {stem}'s end record doesn't read"));
-        };
-        let input = record.get("input_sha256").and_then(Value::as_str);
-        if record.get("harness").and_then(Value::as_str) != Some(harness)
-            || !input.is_some_and(|input| seeds.iter().any(|seed| seed == input))
-        {
+    // Every run is the harness on one of its seeds, and passes; each seed
+    // ran both in `targets`' own process and as a fuzz-target iteration.
+    let mut ran: BTreeSet<(String, String)> = BTreeSet::new();
+    for run in &runs {
+        let input = run.input.as_deref();
+        if run.harness != harness || !input.is_some_and(|input| seeds.iter().any(|s| s == input)) {
             return blocked(format!(
-                "run {stem} isn't a run of one of {harness}'s seeds"
+                "run {} isn't a run of one of {harness}'s seeds",
+                run.stem
             ));
         }
-        let Some(end) = record
-            .get("end")
-            .and_then(|end| serde_json::from_value::<crate::record::EndRecord>(end.clone()).ok())
-        else {
-            return blocked(format!("run {stem} left no end record"));
-        };
-        if let Err(why) = owned_run_passes(&end, &registered, &RunExpect::Passes) {
-            return blocked(format!("run {stem}: {why}"));
+        if let Err(why) = owned_run_passes(&run.end, &registered, &RunExpect::Passes) {
+            return blocked(format!("run {}: {why}", run.stem));
         }
-        ran.extend(input.map(str::to_owned));
+        ran.insert((run.phase.clone(), input.unwrap_or_default().to_owned()));
     }
-    match seeds.iter().find(|seed| !ran.contains(*seed)) {
-        Some(seed) => blocked(format!("the target never ran seed {seed}")),
-        None if seeds.is_empty() => blocked(format!("{harness} has no admitted seed")),
-        None => Verdict::Verified,
+    for phase in ["in-process", "fuzz-target"] {
+        if let Some(seed) = seeds
+            .iter()
+            .find(|seed| !ran.contains(&(phase.to_owned(), (*seed).clone())))
+        {
+            return blocked(format!("the target's {phase} runs never ran seed {seed}"));
+        }
     }
+    if seeds.is_empty() {
+        return blocked(format!("{harness} has no admitted seed"));
+    }
+    Verdict::Verified
 }
 
 /// The discovery agreement pair's verdict, from the planted task's runs in

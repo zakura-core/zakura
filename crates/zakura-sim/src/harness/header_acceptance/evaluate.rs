@@ -858,15 +858,22 @@ impl<'a> Evidence<'a> {
     /// execution's role, whether its `Draft` override is empty and who runs
     /// it ([`roles`]).
     fn context(&self, result: &ExpectedResult) -> ResultCtx {
-        let harness = expected_harness(self.manifest, &result.expected);
-        ResultCtx {
-            kind: result.expected.kind(),
-            machine: harness
-                .as_deref()
-                .is_some_and(|harness| self.manifest.machines.contains(&harness)),
-            harness,
-            executions: roles(&result.expected),
-        }
+        result_context(self.manifest, &result.expected)
+    }
+}
+
+/// What the narrowing entries decide on for `expected` in `manifest`, as
+/// the evaluator gives it: its kind, its harness and machine flag, and each
+/// execution's role ([`roles`]), all from the manifest.
+pub fn result_context(manifest: &Manifest, expected: &Expected) -> ResultCtx {
+    let harness = expected_harness(manifest, expected);
+    ResultCtx {
+        kind: expected.kind(),
+        machine: harness
+            .as_deref()
+            .is_some_and(|harness| manifest.machines.contains(&harness)),
+        harness,
+        executions: roles(expected),
     }
 }
 

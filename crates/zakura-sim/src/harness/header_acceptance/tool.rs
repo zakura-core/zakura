@@ -503,7 +503,7 @@ fn history_task(
 /// recorded run's directory within it, `run` for a history and the role's
 /// name for a planted case's run. `None` if no task records it, as for a
 /// native mutation's run, whose witness test isn't a recorded run.
-fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)> {
+pub fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)> {
     tasks.iter().enumerate().find_map(|(index, task)| {
         let dir = match (task, run) {
             (Task::History { expected, .. }, RunId::History { .. })
@@ -864,6 +864,12 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
         leaked: end.cleanup.leaked as u64,
         actions,
     }
+}
+
+/// The execution `run` recorded in `dir`, by `run_by` on `harness`, as
+/// [`assemble`] reads every recorded run before its role's own checks.
+pub fn read_execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution {
+    execution(dir, run, harness, run_by)
 }
 
 /// The fresh replay (C3, C8) of the recorded run `run` in `dir`, from its

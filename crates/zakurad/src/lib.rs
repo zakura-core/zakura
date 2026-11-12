@@ -122,6 +122,11 @@
 #[macro_use]
 extern crate tracing;
 
+// Keep the build-only dependency explicit: it builds the checkpoint utility
+// for acceptance tests, and the feature forwards that utility's build flag.
+#[cfg(any(test, feature = "zakura-checkpoints"))]
+extern crate zakura_utils as _;
+
 /// Error type alias to make working with tower traits easier.
 ///
 /// Note: the 'static lifetime bound means that the *type* cannot have any

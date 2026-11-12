@@ -837,7 +837,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
         let at = covering(
             m,
             &Key::Native {
-                patch: "short-cooldown".into(),
+                patch: "shutdown-kept-queue".into(),
             },
         );
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
@@ -2813,7 +2813,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let penalized = "header-sync/header-fault-penalized";
+    let honest = "session/honest-never-punished";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -2834,17 +2834,17 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: penalized.into(),
-            name: "late-fault".into(),
+            property: honest.into(),
+            name: "punished-honest".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: penalized,
-                name: "late-fault",
+                property: honest,
+                name: "punished-honest",
             },
             harness,
-            set: &["header-sync/header-fault-penalized"],
+            set: &["session/honest-never-punished"],
             found,
             not_applicable,
             companions,

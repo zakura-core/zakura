@@ -52,6 +52,7 @@ use zakura_network::zakura::{
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
+use finding::{spell_frontier, spell_hash, spell_hashes};
 pub use finding::{
     Attribution, AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, EngineRunRef,
     ResetFact, UpdateKind,
@@ -323,8 +324,9 @@ impl Authority {
         let mut found = Vec::new();
         if !self.started.contains(subscription) && locator != open.locators {
             found.push(format!(
-                "handed on locator {locator:?}, not its Open's {:?}",
-                open.locators
+                "handed on locator {}, not its Open's {}",
+                spell_hashes(locator),
+                spell_hashes(&open.locators)
             ));
         }
         let owner = request.owner;
@@ -339,7 +341,8 @@ impl Authority {
         if authority.branch.target_tip_hash != open.target {
             found.push(format!(
                 "has an owner targeting {}, not its Open's {}",
-                authority.branch.target_tip_hash, open.target
+                spell_hash(authority.branch.target_tip_hash),
+                spell_hash(open.target)
             ));
         }
         if self
@@ -348,7 +351,7 @@ impl Authority {
         {
             found.push(format!(
                 "has an owner anchored at {}, not the adopted anchor",
-                authority.branch.anchor_hash
+                spell_hash(authority.branch.anchor_hash)
             ));
         }
         for detail in found {
@@ -392,38 +395,38 @@ impl Authority {
         let mut found = Vec::new();
         if !declared_ok {
             found.push(format!(
-                "declared ancestor {ancestor:?}, not {}",
-                expected.map_or_else(
-                    || "one of its Open's locators".to_owned(),
-                    |last| format!("{last:?}")
-                )
+                "declared ancestor {}, not {}",
+                spell_frontier(ancestor),
+                expected.map_or_else(|| "one of its Open's locators".to_owned(), spell_frontier)
             ));
         }
         let mut parent = ancestor;
         for (index, hash) in hashes.iter().enumerate() {
             let height = block::Height(parent.height.0.saturating_add(1));
+            let spelled = spell_hash(*hash);
             if !self.children(parent).contains(hash) {
                 found.push(format!(
-                    "carried {hash} at height {}, which isn't a fixture or declared child of {parent:?}",
-                    height.0
+                    "carried {spelled} at height {}, which isn't a fixture or declared child of {}",
+                    height.0,
+                    spell_frontier(parent)
                 ));
                 break;
             }
             if height > open.target_height {
                 found.push(format!(
-                    "carried {hash} at height {}, above its target's {}",
+                    "carried {spelled} at height {}, above its target's {}",
                     height.0, open.target_height.0
                 ));
             } else if height == open.target_height
                 && (*hash != open.target || index + 1 != hashes.len())
             {
                 found.push(format!(
-                    "carried {hash} at its target's height {} without ending at the target",
+                    "carried {spelled} at its target's height {} without ending at the target",
                     height.0
                 ));
             }
             if *hash != open.target && open.locators.contains(hash) {
-                found.push(format!("carried its Open's locator {hash}"));
+                found.push(format!("carried its Open's locator {spelled}"));
             }
             parent = Frontier::new(height, *hash);
         }

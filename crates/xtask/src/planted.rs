@@ -6,10 +6,12 @@
 //! change that bypasses the property's guard, with `<name>.toml` beside it
 //! naming what must find the bug: either the committed fuzz input, whose
 //! own sidecar names its harness, or a typed case, a `[typed]` table naming
-//! the harness, a committed scenario as that harness's JSON and the Plan
-//! bytes it runs under. A typed case is for a scenario the harness's
+//! the harness, a committed scenario as that harness's JSON and the Plan it
+//! runs under: either Plan bytes (`plan`) or a scripted Plan as JSON
+//! (`script`), never both. A typed case is for a scenario the harness's
 //! grammar can't encode, such as one with a control step or more mirrors
-//! than the grammar takes.
+//! than the grammar takes, and a script is for a history no Plan bytes
+//! reach, such as one a test steers to.
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
@@ -21,7 +23,7 @@
 //!    expecting `holds`;
 //! 2. applies the patch, which must not change, delete or rename the
 //!    case's witness files (its input and sidecar, or its scenario and
-//!    Plan bytes), so both runs read the same committed witness. It then
+//!    Plan file), so both runs read the same committed witness. It then
 //!    rebuilds and records the input again, which must violate the case's
 //!    property and no property outside the case's `also_violates`, and pass
 //!    its witness test expecting `violated` beside those;
@@ -241,16 +243,50 @@ struct Case {
 enum Witness {
     /// A committed fuzz input, whose sidecar names its harness.
     Input(PathBuf),
-    /// A committed scenario, as `harness`'s JSON, run under the Plan bytes
-    /// in `plan`.
+    /// A committed scenario, as `harness`'s JSON, run under the Plan in
+    /// `plan`.
     Typed {
         /// The harness.
         harness: String,
         /// The scenario file.
         scenario: PathBuf,
-        /// The Plan bytes file.
-        plan: PathBuf,
+        /// The Plan file.
+        plan: PlanFile,
     },
+}
+
+/// A typed case's committed Plan, by its file's path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PlanFile {
+    /// Plan bytes, which `zakura-sim record --plan` reads.
+    Bytes(PathBuf),
+    /// A scripted Plan as JSON, which `zakura-sim record --script` reads.
+    Script(PathBuf),
+}
+
+impl PlanFile {
+    /// The file's path.
+    fn path(&self) -> &Path {
+        match self {
+            PlanFile::Bytes(path) | PlanFile::Script(path) => path,
+        }
+    }
+
+    /// The same kind of Plan at `root` joined with its path.
+    fn under(&self, root: &Path) -> PlanFile {
+        match self {
+            PlanFile::Bytes(path) => PlanFile::Bytes(root.join(path)),
+            PlanFile::Script(path) => PlanFile::Script(root.join(path)),
+        }
+    }
+
+    /// The `zakura-sim record` flag that reads it.
+    fn flag(&self) -> &'static str {
+        match self {
+            PlanFile::Bytes(_) => "--plan",
+            PlanFile::Script(_) => "--script",
+        }
+    }
 }
 
 impl Witness {
@@ -264,11 +300,13 @@ impl Witness {
     }
 
     /// Its committed files: the input and its sidecar, or the scenario and
-    /// the Plan bytes.
+    /// the Plan file.
     fn files(&self) -> Vec<PathBuf> {
         match self {
             Witness::Input(input) => vec![input.clone(), input.with_extension("toml")],
-            Witness::Typed { scenario, plan, .. } => vec![scenario.clone(), plan.clone()],
+            Witness::Typed { scenario, plan, .. } => {
+                vec![scenario.clone(), plan.path().to_path_buf()]
+            }
         }
     }
 
@@ -278,7 +316,7 @@ impl Witness {
             Witness::Input(input) => Located::Input(root.join(input)),
             Witness::Typed { scenario, plan, .. } => Located::Typed {
                 scenario: root.join(scenario),
-                plan: root.join(plan),
+                plan: plan.under(root),
             },
         }
     }
@@ -289,12 +327,12 @@ impl Witness {
 pub(super) enum Located {
     /// A full fuzz input.
     Input(PathBuf),
-    /// A scenario file and its Plan bytes file.
+    /// A scenario file and its Plan file.
     Typed {
         /// The scenario file.
         scenario: PathBuf,
-        /// The Plan bytes file.
-        plan: PathBuf,
+        /// The Plan file.
+        plan: PlanFile,
     },
 }
 
@@ -307,8 +345,26 @@ struct TypedFile {
     /// The scenario, as the harness's JSON, relative to the repository
     /// root.
     scenario: PathBuf,
-    /// The Plan bytes, relative to the repository root.
-    plan: PathBuf,
+    /// The Plan bytes, relative to the repository root. A typed case names
+    /// this or `script`, never both.
+    plan: Option<PathBuf>,
+    /// A scripted Plan as JSON, relative to the repository root, for a
+    /// history no Plan bytes reach.
+    script: Option<PathBuf>,
+}
+
+impl TypedFile {
+    /// The table's one Plan file, or why it doesn't name exactly one.
+    fn plan_file(&self) -> Result<PlanFile, String> {
+        match (&self.plan, &self.script) {
+            (Some(plan), None) => Ok(PlanFile::Bytes(plan.clone())),
+            (None, Some(script)) => Ok(PlanFile::Script(script.clone())),
+            (plan, _) => Err(format!(
+                "a typed case names either `plan` or `script`, and this names {}",
+                if plan.is_some() { "both" } else { "neither" }
+            )),
+        }
+    }
 }
 
 /// A case's `<name>.toml`.
@@ -643,17 +699,12 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
             let witness = match (input, typed) {
                 (Some(input), None) => Witness::Input(input),
-                (
-                    None,
-                    Some(TypedFile {
-                        harness,
-                        scenario,
-                        plan,
-                    }),
-                ) => Witness::Typed {
-                    harness,
-                    scenario,
-                    plan,
+                (None, Some(typed)) => Witness::Typed {
+                    plan: typed
+                        .plan_file()
+                        .map_err(|error| format!("{}: {error}", case_file.display()))?,
+                    harness: typed.harness,
+                    scenario: typed.scenario,
                 },
                 (input, _) => {
                     return Err(format!(
@@ -1371,8 +1422,8 @@ fn record(
 }
 
 /// `zakura-sim record`'s arguments for `input`: `--input` and the file, or
-/// `--scenario` with the scenario file's text and `--plan` with the Plan
-/// bytes file.
+/// `--scenario` with the scenario file's text, then `--plan` with the Plan
+/// bytes file or `--script` with the scripted Plan's file.
 fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
     Ok(match input {
         Located::Input(path) => vec!["--input".into(), path.into()],
@@ -1381,8 +1432,8 @@ fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
             fs::read_to_string(scenario)
                 .map_err(|error| format!("{}: {error}", scenario.display()))?
                 .into(),
-            "--plan".into(),
-            plan.into(),
+            plan.flag().into(),
+            plan.path().into(),
         ],
     })
 }
@@ -2123,6 +2174,7 @@ mod tests {
             ("src/lib.rs", "fn a() {}\n"),
             ("s.json", "{}\n"),
             ("p.bin", "plan\n"),
+            ("p.json", "{}\n"),
             ("a.bin", "input\n"),
             ("a.toml", "harness = \"h\"\n"),
         ] {
@@ -2153,6 +2205,10 @@ mod tests {
             write("src/lib.rs")();
             write("p.bin")();
         });
+        let script = patch("script.patch", &|| {
+            write("src/lib.rs")();
+            write("p.json")();
+        });
         let moved = patch("moved.patch", &|| {
             fs::rename(root.join("s.json"), root.join("t.json")).unwrap()
         });
@@ -2166,12 +2222,20 @@ mod tests {
             witness: Witness::Typed {
                 harness: "h".to_owned(),
                 scenario: "s.json".into(),
-                plan: "p.bin".into(),
+                plan: PlanFile::Bytes("p.bin".into()),
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
             set: Vec::new(),
             target: None,
+        };
+        let scripted = Case {
+            witness: Witness::Typed {
+                harness: "h".to_owned(),
+                scenario: "s.json".into(),
+                plan: PlanFile::Script("p.json".into()),
+            },
+            ..typed.clone()
         };
         let fuzz = Case {
             witness: Witness::Input("a.bin".into()),
@@ -2195,7 +2259,15 @@ mod tests {
         assert_eq!(judge(&typed, &code), None, "a code patch goes on");
         assert_eq!(judge(&fuzz, &code), None, "a code patch goes on");
         assert_eq!(judge(&typed, &plan), touches(&["p.bin"]));
+        assert_eq!(judge(&scripted, &code), None, "a code patch goes on");
+        assert_eq!(judge(&scripted, &script), touches(&["p.json"]));
+        assert_eq!(
+            judge(&scripted, &plan),
+            None,
+            "another case's Plan bytes aren't this witness"
+        );
         assert_eq!(judge(&typed, &moved), touches(&["s.json"]));
+        assert_eq!(judge(&scripted, &moved), touches(&["s.json"]));
         assert_eq!(judge(&fuzz, &sidecar), touches(&["a.toml"]));
         assert_eq!(judge(&fuzz, &input), touches(&["a.bin"]));
         assert_eq!(
@@ -2409,7 +2481,22 @@ mod tests {
             Witness::Typed {
                 harness: "header-sync/storage".to_owned(),
                 scenario: "qa/planted/x/case.scenario.json".into(),
-                plan: "qa/planted/x/case.plan.bin".into(),
+                plan: PlanFile::Bytes("qa/planted/x/case.plan.bin".into()),
+            }
+        );
+        let scripted = r#"
+            [typed]
+            harness = "header-sync/wire"
+            scenario = "qa/planted/x/case.scenario.json"
+            script = "qa/planted/x/case.script.json"
+        "#;
+        let scripted = parse_case(scripted).expect("a scripted case parses");
+        assert_eq!(
+            scripted[0].witness,
+            Witness::Typed {
+                harness: "header-sync/wire".to_owned(),
+                scenario: "qa/planted/x/case.scenario.json".into(),
+                plan: PlanFile::Script("qa/planted/x/case.script.json".into()),
             }
         );
         let both = r#"
@@ -2440,10 +2527,33 @@ mod tests {
             harness = "header-sync/storage"
             scenario = "s.json"
         "#;
-        assert!(
-            parse_case(missing).is_err(),
-            "a typed case needs its Plan bytes"
-        );
+        let error = parse_case(missing)
+            .expect_err("a typed case needs its Plan")
+            .to_string();
+        assert!(error.contains("`plan` or `script`"), "{error}");
+        assert!(error.contains("names neither"), "{error}");
+        let both = r#"
+            [typed]
+            harness = "header-sync/wire"
+            scenario = "s.json"
+            plan = "p.bin"
+            script = "p.json"
+        "#;
+        let error = parse_case(both)
+            .expect_err("Plan bytes and a script are refused")
+            .to_string();
+        assert!(error.contains("`plan` or `script`"), "{error}");
+        assert!(error.contains("names both"), "{error}");
+        let outside = r#"
+            [typed]
+            harness = "header-sync/wire"
+            scenario = "s.json"
+            script = "/p.json"
+        "#;
+        let error = parse_case(outside)
+            .expect_err("a script outside is refused")
+            .to_string();
+        assert!(error.contains("isn't a plain path"), "{error}");
     }
 
     /// A catch, a fuzz input's or a typed case's, passes only if its
@@ -2507,7 +2617,7 @@ mod tests {
             witness: Witness::Typed {
                 harness: "header-sync/storage".to_owned(),
                 scenario: "s.json".into(),
-                plan: "p.bin".into(),
+                plan: PlanFile::Bytes("p.bin".into()),
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
@@ -2680,15 +2790,16 @@ mod tests {
         assert!(error.contains("not both"), "{error}");
     }
 
-    /// A typed case watches its scenario and Plan bytes, and runs with
-    /// `--scenario` holding the scenario's text.
+    /// A typed case watches its scenario and Plan file, and runs with
+    /// `--scenario` holding the scenario's text and `--plan` or `--script`
+    /// naming its Plan file.
     #[test]
     fn a_typed_case_watches_and_runs_its_files() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let witness = Witness::Typed {
             harness: "header-sync/storage".to_owned(),
             scenario: "s.json".into(),
-            plan: "p.bin".into(),
+            plan: PlanFile::Bytes("p.bin".into()),
         };
         assert_eq!(
             witness.files(),
@@ -2707,6 +2818,24 @@ mod tests {
                 OsString::from(r#"{"mirrors":2}"#),
                 OsString::from("--plan"),
                 dir.path().join("p.bin").into_os_string(),
+            ]
+        );
+        let scripted = Witness::Typed {
+            harness: "header-sync/wire".to_owned(),
+            scenario: "s.json".into(),
+            plan: PlanFile::Script("p.json".into()),
+        };
+        assert_eq!(
+            scripted.files(),
+            vec![PathBuf::from("s.json"), PathBuf::from("p.json")]
+        );
+        assert_eq!(
+            input_args(&scripted.located(dir.path())).expect("the scenario reads"),
+            vec![
+                OsString::from("--scenario"),
+                OsString::from(r#"{"mirrors":2}"#),
+                OsString::from("--script"),
+                dir.path().join("p.json").into_os_string(),
             ]
         );
         let input = Witness::Input("a.bin".into());

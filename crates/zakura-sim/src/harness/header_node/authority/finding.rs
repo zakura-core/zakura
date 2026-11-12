@@ -8,7 +8,9 @@
 //!
 //! Peers are their digest and hashes their bytes in order, both as hex,
 //! as the observation log and storage's facts write them, so a subject
-//! joins with the run's other evidence.
+//! joins with the run's other evidence. A finding's detail spells every
+//! hash the same way, through the `spell_*` functions here, so a rendered
+//! finding names each header once, however often it prints it.
 
 use std::fmt;
 
@@ -271,6 +273,45 @@ impl AuthoritySubject {
             connection,
         }
     }
+}
+
+/// `hash` as a finding spells it: its bytes in order, as hex.
+pub(crate) fn spell_hash(hash: block::Hash) -> String {
+    crate::storage::hash(hash)
+}
+
+/// `hashes` in order, as `[a, b]`, each as [`spell_hash`] spells it.
+pub(crate) fn spell_hashes(hashes: &[block::Hash]) -> String {
+    let hashes: Vec<String> = hashes.iter().copied().map(spell_hash).collect();
+    format!("[{}]", hashes.join(", "))
+}
+
+/// `frontier` as `{height} {hash}`, as a cursor subject renders it.
+pub(crate) fn spell_frontier(frontier: Frontier) -> String {
+    format!("{} {}", frontier.height.0, spell_hash(frontier.hash))
+}
+
+/// [`spell_frontier`] of `frontier`, or `none`.
+pub(crate) fn spell_maybe_frontier(frontier: Option<Frontier>) -> String {
+    frontier.map_or_else(|| "none".to_owned(), spell_frontier)
+}
+
+/// A cursor at `through`, with `headers` headers and `bytes` bytes
+/// consumed through it.
+pub(crate) fn spell_cursor(through: Frontier, headers: u64, bytes: u64) -> String {
+    format!(
+        "{} with {headers} headers and {bytes} bytes",
+        spell_frontier(through)
+    )
+}
+
+/// `subscription` as a subject names its keys.
+pub(crate) fn spell_subscription(subscription: &Subscription) -> String {
+    let (peer_id, session, subscription) = subscription;
+    format!(
+        "peer {} session {session} subscription {subscription}",
+        peer(peer_id)
+    )
 }
 
 /// Writes `value`, or `none`.

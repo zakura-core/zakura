@@ -1967,6 +1967,7 @@ impl Subsystem for HeaderWire {
                 listening,
                 chain: ports.chains[index].clone(),
                 records: ports.records.clone(),
+                order: net.order(),
                 closed: ports.closed.clone(),
                 taken: 0,
             };

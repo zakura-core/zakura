@@ -70,7 +70,9 @@ use crate::{
 /// Version 42 adds `meta.plan`, the Plan bytes or script a run took its
 /// choices from when no `input.bin` did.
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.
-pub const FORMAT_VERSION: u32 = 43;
+/// Version 44 adds the run's wire-event `order` stamp to `frame-written`,
+/// `peer-written` and `peer-received`.
+pub const FORMAT_VERSION: u32 = 44;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -1420,6 +1422,7 @@ mod tests {
                     quic_stream: 4,
                     seq: 0,
                     message_type: 1,
+                    order: 1,
                 },
             ),
             transport(22, None, TransportFact::CloseDecided { cause: None }),
@@ -1756,6 +1759,7 @@ mod tests {
                 connection: 1,
                 quic_stream: 4,
                 seq: 0,
+                order: 2,
             },
             Observation::PeerClosed {
                 connection: 1,
@@ -1771,6 +1775,7 @@ mod tests {
                     objects: 250,
                     bytes: 65_750,
                 }),
+                order: 3,
             },
             Observation::PeerReceived {
                 connection: 1,
@@ -1779,6 +1784,7 @@ mod tests {
                 message_type: 3,
                 payload: 263,
                 credit: None,
+                order: 4,
             },
             Observation::NodeFrame {
                 connection: 1,

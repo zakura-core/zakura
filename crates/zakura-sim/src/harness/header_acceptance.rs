@@ -40,6 +40,7 @@ pub mod history;
 pub mod inventory;
 pub mod not_applicable;
 pub mod reasons;
+pub mod refs;
 pub mod required;
 pub mod rows;
 pub mod tool;

@@ -3053,14 +3053,23 @@ fn the_gate_requirements_match_their_obligations() {
         };
         assert!(!key.covers(&transitional, NARROWING), "{row}");
     }
-    // A requirement's own Open with only its owner changed.
-    for name in ["gate-2/bad-content-close-claim", "gate-1/a-a-and-a-b-a"] {
+    // A requirement's own Open with only its owner changed, or its own
+    // test with only its name changed.
+    for name in [
+        "gate-2/bad-content-close-claim",
+        "gate-1/topology-freshness",
+        "gate-1/a-a-and-a-b-a",
+        "gate-1/replay-store-control",
+    ] {
         let requirement = GATE_REQUIREMENTS.iter().find(|r| r.name == name).unwrap();
         let mut changed = requirement.expected.clone();
-        if let Expected::Open { owner, .. } = &mut changed {
-            *owner = "someone else";
+        match &mut changed {
+            Expected::Open { owner, .. } => *owner = "someone else",
+            Expected::Passes { test } => test.test = "another_test",
+            other => panic!("{name}: {other:?}"),
         }
         let key = Key::Requirement { name: name.into() };
+        assert!(key.covers(&requirement.expected, NARROWING), "{name}");
         assert!(!key.covers(&changed, NARROWING), "{name}");
     }
 }

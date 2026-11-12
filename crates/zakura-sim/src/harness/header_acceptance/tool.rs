@@ -1896,6 +1896,65 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
     })
 }
 
+/// Which history a run of [`a_a_and_a_b_a`] records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Which {
+    /// The history under comparison.
+    A,
+    /// A different history, run between two of A's.
+    B,
+}
+
+/// Gate 1's A/A and A/B/A comparison, in this one process: `record` writes
+/// history A's run into a fresh directory, then A again, then a distinct
+/// history B, then A once more, each a recorded run under `root`. A's
+/// three runs must have the same trace and the same full report, every
+/// outcome and violation and the stores' snapshot (C8), so neither a rerun
+/// nor anything B leaves behind changes it. B must be another execution,
+/// with a trace of its own. A run that can't be
+/// read, such as one with no full report, is a missing comparison.
+pub fn a_a_and_a_b_a(
+    root: &Path,
+    record: &mut dyn FnMut(Which, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut read = |which: Which, name: &str| -> Result<(Trace, FullReport), String> {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        record(which, &dir).map_err(|why| format!("{name}: {why}"))?;
+        recorded(&dir).map_err(|why| format!("{name} is a missing comparison: {why}"))
+    };
+    let first = read(Which::A, "a")?;
+    let again = read(Which::A, "a-again")?;
+    let other = read(Which::B, "b")?;
+    let after = read(Which::A, "a-after-b")?;
+    let same = |(trace, report): &(Trace, FullReport)| (trace.id == first.0.id, *report == first.1);
+    match same(&again) {
+        (true, true) => {}
+        (trace, report) => {
+            return Err(format!(
+                "A's second run differs: same trace {trace}, same full report {report}"
+            ))
+        }
+    }
+    // A trace holds every pick, draw and observation digest, so another
+    // execution has another trace.
+    if other.0.id == first.0.id {
+        return Err("B resolves to A's execution".to_owned());
+    }
+    match same(&after) {
+        (true, true) => Ok(()),
+        (trace, report) => Err(format!(
+            "A's run after B differs: same trace {trace}, same full report {report}"
+        )),
+    }
+}
+
+/// The fresh replay of the recorded run `run` in `dir`, by `run_by`, as
+/// [`assemble`] reads a `Replays` result from the runner's artifacts.
+pub fn read_replay(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
+    replay_actual(dir, run, run_by)
+}
+
 /// Where one obligation's evidence is.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

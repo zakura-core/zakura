@@ -148,6 +148,9 @@ const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
 /// The file of the despite-close case's companion tests.
 const DESPITE_CLOSE_TESTS: &str = "tests/header_despite_close.rs";
+/// The acceptance tool's integration tests: gate 1's A/A and A/B/A
+/// comparison and its replay store control.
+const TOOL_TESTS: &str = "tests/header_acceptance_tool.rs";
 
 /// The file of `header-sync/wire`'s receiver-direction table checks, whose
 /// per-row content tests carry the fault close a content rejection owes.
@@ -2849,11 +2852,11 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-1/a-a-and-a-b-a",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_A_A_AND_A_B_A,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.7b"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TOOL_TESTS,
+                "each_history_is_the_same_alone_and_after_another",
+            ),
         },
     },
     GateRequirement {
@@ -2879,11 +2882,11 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-1/replay-store-control",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_REPLAY_STORE_CONTROL,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.7b"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TOOL_TESTS,
+                "a_changed_stored_fact_fails_the_replay_comparison",
+            ),
         },
     },
     GateRequirement {

@@ -147,12 +147,6 @@ impl Permit {
     }
 }
 
-/// Why `gate-1/a-a-and-a-b-a` is open until hdr-14.7b, whose fresh-process
-/// recordings and replays it compares.
-pub const GATE_1_A_A_AND_A_B_A: &str =
-    "the acceptance tool runs each history A twice and between a distinct B in \
-                     one process, and compares traces, reports and store snapshots";
-
 /// Why `gate-1/topology-freshness` is open until hf-7.
 pub const GATE_1_TOPOLOGY_FRESHNESS: &str =
     "a topology change with no reactor event shows in the next view";
@@ -161,11 +155,6 @@ pub const GATE_1_TOPOLOGY_FRESHNESS: &str =
 pub const GATE_1_STORE_INVENTORY: &str =
     "every store a header check reads is registered, behind a checkpoint and \
                      has a producer test";
-
-/// Why `gate-1/replay-store-control` is open until hdr-14.7b.
-pub const GATE_1_REPLAY_STORE_CONTROL: &str =
-    "a changed stored fact with every report the same must fail the replay \
-                     comparison";
 
 /// Why `gate-2/end-boundary-preservation` is open until hdr-14.8.
 pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
@@ -202,11 +191,10 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/a-a-and-a-b-a",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_A_A_AND_A_B_A,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "each_history_is_the_same_alone_and_after_another",
+        )),
     },
     GateObligation {
         name: "gate-1/topology-freshness",
@@ -229,11 +217,10 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/replay-store-control",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_REPLAY_STORE_CONTROL,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "a_changed_stored_fact_fails_the_replay_comparison",
+        )),
     },
     GateObligation {
         name: "gate-2/conformant-control-per-fault",

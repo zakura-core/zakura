@@ -711,3 +711,89 @@ mod deviations {
         }
     }
 }
+
+mod manifest {
+    use std::sync::OnceLock;
+
+    use zakura_sim::{
+        harness::header_acceptance::{tool::committed_required, Manifest},
+        seed,
+        sim_acceptance::manifest::{derive, problems, rows, Derived, Expected},
+        suite::{SuiteFile, SUITE_FILE},
+    };
+
+    /// The derived families at this checkout, read once.
+    fn derived() -> &'static Derived {
+        static DERIVED: OnceLock<Derived> = OnceLock::new();
+        DERIVED.get_or_init(|| derive(&seed::repo_root()).unwrap())
+    }
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(seed::repo_root().join(path)).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_committed_manifest_has_no_problems() {
+        let derived = derived();
+        assert!(!derived.seeds.is_empty() && !derived.end_records.is_empty());
+        assert_eq!(
+            derived.race_schedules.len(),
+            6,
+            "{:?}",
+            derived.race_schedules
+        );
+        assert!(!derived.table_properties.is_empty());
+        assert_eq!(problems(&rows(derived), derived), Vec::<String>::new());
+    }
+
+    /// Every result names something that exists at this checkout.
+    #[test]
+    fn every_named_result_exists() {
+        let suite: SuiteFile = toml::from_str(&read(SUITE_FILE)).unwrap();
+        let required = committed_required(&seed::repo_root(), &Manifest::committed());
+        let adapter = read("qa/fuzz/sim/src/fuzz/adapter.rs");
+        for row in rows(derived()) {
+            for expected in &row.expected {
+                let ok = match expected {
+                    Expected::Test(t) => read(&format!("crates/{}/tests/{}.rs", t.package, t.file))
+                        .contains(&format!("fn {}(", t.name)),
+                    Expected::UnitTest { package, path } => {
+                        let (module, name) = path.split_once("::").unwrap();
+                        let name = name.rsplit("::").next().unwrap();
+                        read(&format!("crates/{package}/src/{module}.rs"))
+                            .contains(&format!("fn {name}("))
+                    }
+                    Expected::FuzzTest(path) => {
+                        adapter.contains(&format!("fn {}(", path.rsplit("::").next().unwrap()))
+                    }
+                    Expected::Lane(id) => suite.lane.iter().any(|lane| lane.id == *id),
+                    Expected::HeaderKey(key) => required.contains_key(key),
+                    _ => true,
+                };
+                assert!(ok, "{}: {expected}", row.id);
+            }
+        }
+    }
+
+    /// A row that loses one derived member, or a requirement that loses its
+    /// row, is a problem, so the evaluator refuses the manifest.
+    #[test]
+    fn a_manifest_missing_a_derived_member_or_a_row_is_refused() {
+        let derived = derived();
+        let mut short = rows(derived);
+        let saved = short
+            .iter_mut()
+            .find(|r| r.id == "corpus/saved-plan-suite")
+            .unwrap();
+        saved.expected.pop();
+        assert_eq!(problems(&short, derived).len(), 1);
+        let mut missing = rows(derived);
+        missing.retain(|r| r.id != "S3.4");
+        assert_eq!(problems(&missing, derived), ["requirement S3.4 has no row"]);
+        let mut extra_seed = derived.clone();
+        extra_seed
+            .seeds
+            .push("crates/zakura-sim/tests/fixtures/new.bin".to_owned());
+        assert_eq!(problems(&rows(derived), &extra_seed).len(), 1);
+    }
+}

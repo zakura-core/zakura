@@ -878,7 +878,7 @@ fn saved_plans_replay_their_end_records() {
             }
             SavedPlan::Reopen => {
                 held(HONEST_NEVER_PUNISHED);
-                let [(_, first), (_, second), ..] = header_sessions(&report)[..] else {
+                let [(_, first, _), (_, second, _), ..] = header_sessions(&report)[..] else {
                     panic!("{}: two header sessions", plan.name());
                 };
                 assert_eq!(first.0, second.0, "{}: one connection", plan.name());
@@ -895,18 +895,21 @@ fn saved_plans_replay_their_end_records() {
     }
 }
 
-/// The old-page history, from `report`'s logged facts: the node admits a
-/// second header session on the first one's connection; the first
-/// preparation's submission comes before that admission and its completion
-/// after; and after the admission the node judges, on the first session's
-/// stream, a `headers` page that peer sent.
+/// The old-page history, from `report`'s logged facts. The node admits a
+/// second header session on the first one's connection. The first session's
+/// first preparation is submitted before that admission and completes after
+/// it. And at that completion the node judges, on the first session's stream,
+/// a `headers` page of the preparation's own subscription that it hadn't
+/// judged before: the page the preparation was for, since the wire evidence
+/// judges an invalid page only when its preparation completes.
 fn old_page_judged_after_reopen(report: &RunReport) {
     let entries = report.log.entries();
-    let [(_, first), (reopened, second), ..] = header_sessions(report)[..] else {
+    let sessions = header_sessions(report);
+    let [(_, first, first_id), (reopened, second, _), ..] = sessions[..] else {
         panic!("old-page-after-reopen: two header sessions");
     };
     assert_eq!(first.0, second.0, "one connection");
-    let (submitted, prepare) = entries
+    let (submitted, prepare, subscription) = entries
         .iter()
         .enumerate()
         .find_map(|(at, entry)| match &entry.obs {
@@ -915,14 +918,14 @@ fn old_page_judged_after_reopen(report: &RunReport) {
                 fact:
                     StorageFact::Submitted {
                         id,
-                        request: StorageRequest::PrepareHeaderTarget { .. },
+                        request: StorageRequest::PrepareHeaderTarget { owner, .. },
                         ..
                     },
                 ..
-            } => Some((at, *id)),
+            } if owner.session_id == first_id => Some((at, *id, owner.request_id)),
             _ => None,
         })
-        .expect("the node submits a preparation");
+        .expect("the first session submits a preparation");
     let completed = entries
         .iter()
         .position(|entry| {
@@ -941,6 +944,7 @@ fn old_page_judged_after_reopen(report: &RunReport) {
         "the first preparation spans the reopen: submitted {submitted}, reopened {reopened}, \
          completed {completed}"
     );
+    // The first session's pages of the preparation's subscription.
     let pages: Vec<u64> = entries
         .iter()
         .filter_map(|entry| match &entry.obs {
@@ -949,25 +953,37 @@ fn old_page_judged_after_reopen(report: &RunReport) {
                 quic_stream: Some(quic_stream),
                 seq,
                 row: Some(row),
+                exchange: Some(exchange),
                 ..
-            } if (*connection, *quic_stream) == first && row == "headers" => Some(*seq),
+            } if (*connection, *quic_stream) == first
+                && row == "headers"
+                && *exchange == subscription =>
+            {
+                Some(*seq)
+            }
             _ => None,
         })
         .collect();
-    let late = entries[reopened..].iter().any(|entry| {
-        matches!(
-            entry.obs,
-            Observation::FrameJudged {
-                connection,
-                quic_stream: Some(quic_stream),
-                seq,
-                ..
-            } if (connection, quic_stream) == first && pages.contains(&seq)
-        )
-    });
+    let judged_at = |page: u64| {
+        entries.iter().position(|entry| {
+            matches!(
+                entry.obs,
+                Observation::FrameJudged {
+                    connection,
+                    quic_stream: Some(quic_stream),
+                    seq,
+                    ..
+                } if (connection, quic_stream) == first && seq == page
+            )
+        })
+    };
+    let late = pages
+        .iter()
+        .any(|&page| judged_at(page).is_some_and(|at| at > completed));
     assert!(
         late,
-        "no page of the first session was judged after the reopen"
+        "no page of the preparation's subscription was first judged at its completion, after \
+         the reopen"
     );
 }
 
@@ -1052,8 +1068,9 @@ fn fuzz_13_saved_plans_replay_exact_in_a_fresh_process() {
 }
 
 /// Each header-sync session the node admitted in `report`, in log order:
-/// where its `Session` row is, and its connection and QUIC stream.
-fn header_sessions(report: &RunReport) -> Vec<(usize, (u64, u64))> {
+/// where its `Session` row is, its connection and QUIC stream, and its
+/// session ID.
+fn header_sessions(report: &RunReport) -> Vec<(usize, (u64, u64), u64)> {
     report
         .log
         .entries()
@@ -1064,8 +1081,11 @@ fn header_sessions(report: &RunReport) -> Vec<(usize, (u64, u64))> {
                 connection,
                 quic_stream,
                 kind,
+                session_id,
                 ..
-            } if kind == ZAKURA_STREAM_HEADER_SYNC => Some((at, (connection, quic_stream))),
+            } if kind == ZAKURA_STREAM_HEADER_SYNC => {
+                Some((at, (connection, quic_stream), session_id))
+            }
             _ => None,
         })
         .collect()

@@ -19,7 +19,7 @@
 
 use std::{
     fmt::Debug,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
 };
 
 use serde_json::{json, Value};
@@ -123,6 +123,48 @@ impl<T> Debug for Registered<T> {
     }
 }
 
+/// A [`Registered`] store's handle that doesn't own it
+/// ([`Registered::downgrade`]), for a store that reads another. A store
+/// holding an owning handle would own its own registry, which owns it, so
+/// neither would ever drop.
+pub struct WeakRegistered<T> {
+    cell: Weak<Cell<T>>,
+}
+
+impl<T> Clone for WeakRegistered<T> {
+    /// Another non-owning handle to the same store.
+    fn clone(&self) -> Self {
+        WeakRegistered {
+            cell: Weak::clone(&self.cell),
+        }
+    }
+}
+
+impl<T> Debug for WeakRegistered<T> {
+    /// The store's name, if it's still alive.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cell.upgrade() {
+            Some(cell) => write!(formatter, "WeakRegistered({})", cell.name),
+            None => write!(formatter, "WeakRegistered(dropped)"),
+        }
+    }
+}
+
+impl<T> WeakRegistered<T> {
+    /// Runs `read` on the value, or returns `None` if the store dropped.
+    pub(crate) fn read<R>(&self, read: impl FnOnce(&T) -> R) -> Option<R> {
+        self.cell.upgrade().map(|cell| read(&cell.lock().value))
+    }
+
+    /// Runs `write` on the value, as [`Registered::write`] does, or returns
+    /// `None` if the store dropped.
+    pub(crate) fn write<R>(&self, write: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let cell = self.cell.upgrade()?;
+        let mut slot = cell.lock();
+        (!slot.frozen).then(|| write(&mut slot.value))
+    }
+}
+
 /// A store's value, locked: read through `Deref`, changed only through
 /// [`Guard::live`], which a frozen store refuses.
 pub(crate) struct Guard<'a, T>(MutexGuard<'a, Slot<T>>);
@@ -170,6 +212,13 @@ impl<T> Registered<T> {
     /// The handle that built the store.
     pub fn stores(&self) -> &EvidenceStores {
         &self.stores
+    }
+
+    /// A handle on the store that doesn't keep it alive.
+    pub fn downgrade(&self) -> WeakRegistered<T> {
+        WeakRegistered {
+            cell: Arc::downgrade(&self.cell),
+        }
     }
 }
 
@@ -240,6 +289,12 @@ impl EvidenceStores {
     /// Whether `other` is this handle.
     pub fn same(&self, other: &EvidenceStores) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A handle that doesn't keep the stores alive, so a reader can tell
+    /// when the last owning handle dropped them.
+    pub fn downgrade(&self) -> WeakEvidenceStores {
+        WeakEvidenceStores(Arc::downgrade(&self.0))
     }
 
     /// Freezes every store in `sim`'s run once its log freezes
@@ -329,6 +384,18 @@ impl EvidenceStores {
     #[cfg(test)]
     fn enroll(&self, store: Arc<dyn Store>) {
         self.registry().stores.push(store);
+    }
+}
+
+/// An [`EvidenceStores`] handle that doesn't own its stores
+/// ([`EvidenceStores::downgrade`]).
+#[derive(Clone, Debug)]
+pub struct WeakEvidenceStores(Weak<Mutex<Registry>>);
+
+impl WeakEvidenceStores {
+    /// The owning handle, or `None` once every owning handle dropped.
+    pub fn upgrade(&self) -> Option<EvidenceStores> {
+        self.0.upgrade().map(EvidenceStores)
     }
 }
 

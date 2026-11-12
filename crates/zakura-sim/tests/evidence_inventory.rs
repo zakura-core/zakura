@@ -288,8 +288,9 @@ const REGISTERED: &[Store] = &[
             "each_recorded_end_is_its_links_cancellation",
         ),
     ),
-    // A second handle on `Effects::ended`, which the fork-choice check
-    // reads for the mirrors' link ends, so the same producer test.
+    // A second, non-owning handle on `Effects::ended`, which the
+    // fork-choice check reads for the mirrors' link ends, so the same
+    // producer test.
     store(
         "src/harness/header_node/fork_choice.rs",
         "LinkEnds",
@@ -752,9 +753,15 @@ fn shared_through(ty: &str, aliases: &BTreeMap<String, Vec<String>>) -> bool {
     false
 }
 
-/// Whether `ty` is a registered store's cell.
+/// Whether `ty` is a registered store's cell, or a non-owning handle on
+/// one, which a store holds to read another of its node's stores.
 fn registered(ty: &str) -> bool {
-    ty.starts_with("Registered<") || ty.starts_with("crate::stores::Registered<")
+    ["Registered<", "WeakRegistered<"].iter().any(|cell| {
+        ty.starts_with(cell)
+            || ty
+                .strip_prefix("crate::stores::")
+                .is_some_and(|ty| ty.starts_with(cell))
+    })
 }
 
 /// Every field the scan reads, and every alias, from the crate's sources.

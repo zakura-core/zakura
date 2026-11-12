@@ -582,6 +582,10 @@ const C12_PROVING: &[TestRef] = &[
 /// inventory's own checks, one of which pins this list to it.
 const C14_PROVING: &[TestRef] = &[
     sim_test(
+        "tests/header_despite_close.rs",
+        "the_staging_companion_needs_the_rejected_page_staged",
+    ),
+    sim_test(
         "tests/header_node_ends.rs",
         "close_and_relink_steps_record_the_connections_they_end",
     ),

@@ -1739,6 +1739,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "owner-swap",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "projection-to-side-tip",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -2948,7 +2954,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     to_move("misstored-page", COMMIT, "hdr-9c.1a"),
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
-    to_move("owner-swap", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "owner-swap",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "owner-swap",
+        },
+    },
     NativeMutation {
         patch: "raw-budget-lease",
         class: NativeClass::Integrity {

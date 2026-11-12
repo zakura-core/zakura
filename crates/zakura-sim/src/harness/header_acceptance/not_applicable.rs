@@ -1,21 +1,24 @@
-//! The `NotApplicable` reports the generated IDs' planted cases and the
-//! despite-close case expect on their counted runs, beside their targets.
+//! The `NotApplicable` reports the generated IDs' planted cases, the
+//! despite-close case and `stale-locator-round` expect on their counted
+//! runs, beside their targets.
 //!
 //! The evaluator holds every property of a counted run outside its target
 //! to `Held`, or to the `NotApplicable` reason its row lists for it
-//! ([`super::evaluate`]). Each of these cases runs a focused
-//! `header-sync/wire` input that applies only a few of the harness's IDs, so
-//! [`CASES`] names, per case, the IDs its run applies and the IDs whose
-//! assumptions its scenario doesn't declare, as its recorded baseline
-//! reports them. Every other wire ID in [`harness_matrix`] never applied
-//! there. [`expected`] spells that out as the row's list.
+//! ([`super::evaluate`]). Each of these cases runs a focused input that
+//! applies only some of its harness's IDs, so [`CASES`] names, per case,
+//! the IDs its run applies and the IDs whose assumptions its scenario
+//! doesn't declare, as its recorded baseline reports them. Every other ID
+//! [`harness_matrix`] registers on its harness never applied there.
+//! [`expected`] spells that out as the row's list.
 //!
-//! Seven cases' `Draft` runs, which go on past the patched break, report
+//! Eight cases' `Draft` runs, which go on past the patched break, report
 //! otherwise, so no one list fits both runs: `target-page-refused`,
 //! `outcome-window-unchecked`, `page-misnamed`, `after-close-dropped` and
 //! `repeated-locator-unchecked` apply other IDs, `page-past-credit` also
-//! breaks `sim/no-livelock`, and `exhausted-cadence-throttled` ends at a
-//! harness failure. Their lists are their baselines'.
+//! breaks `sim/no-livelock`, `open-repeated` also breaks
+//! `conformant-never-closes` and `session/honest-never-punished`, and
+//! `exhausted-cadence-throttled` ends at a harness failure. Their lists are
+//! their baselines'.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
@@ -81,16 +84,18 @@ const ADVERSARY: &[&str] = &[
     "header-sync/honest-progress",
 ];
 
-/// What the scenario of the node serving an honest subscriber doesn't
-/// declare: no livelock bound, and the node isn't expected to progress.
+/// What the scenario of the node serving an honest subscriber, or syncing
+/// from honest peers, doesn't declare: no livelock bound, and the node
+/// isn't expected to progress.
 const SERVING: &[&str] = &["sim/no-livelock", "header-sync/honest-progress"];
 
 /// A case's target.
 enum Target {
-    /// `header-sync/s5v9/<suffix>`, one of header sync's generated IDs.
+    /// `header-sync/s5v9/<suffix>`, one of header sync's generated IDs, on
+    /// the wire harness.
     Generated(&'static str),
-    /// A hand-written ID.
-    Id(&'static str),
+    /// A hand-written ID, and the harness the case runs on.
+    Id(&'static str, &'static str),
 }
 
 /// One case's runs: its target and name, the IDs beside the target that
@@ -124,7 +129,7 @@ const fn generated(
 /// Each case's runs, as its recorded baseline reports them.
 const CASES: &[CaseNa] = &[
     CaseNa {
-        property: Target::Id("header-sync/commit-only-authorized"),
+        property: Target::Id("header-sync/commit-only-authorized", WIRE),
         name: "staged-despite-close",
         applies: &[
             "sim/no-task-panic",
@@ -143,6 +148,63 @@ const CASES: &[CaseNa] = &[
         ],
         undeclared: ADVERSARY,
     },
+    CaseNa {
+        property: Target::Id("header-sync/reset-invalidates-work", "header-sync/storage"),
+        name: "stale-locator-round",
+        applies: &[
+            "sim/no-task-panic",
+            "harness/direct-dispatch",
+            "header-sync/storage-operation-ids",
+            "header-sync/chunk-budget-bound",
+            "header-sync/teardown-returns-baseline",
+            "header-sync/stale-completion-inert",
+            "header-sync/stale-chain-effect-inert",
+            "header-sync/commit-only-authorized",
+            "header-sync/outstanding-work-bounded",
+            "header-sync/expected-chain-selected",
+            "header-sync/state-publication-consistent",
+        ],
+        undeclared: &["sim/no-livelock", "header-sync/bounded-adversary-progress"],
+    },
+    generated(
+        "headers/bad-content-closes",
+        "unlinked-page-dropped",
+        SUBSCRIBED,
+        ADVERSARY,
+    ),
+    generated(
+        "status/sender-cadence",
+        "pacing-floors-cut",
+        &[
+            "sim/no-task-panic",
+            "harness/direct-dispatch",
+            "header-sync/chunk-budget-bound",
+            "header-sync/commit-only-authorized",
+            "header-sync/s5v9/conformant-never-closes",
+            "session/honest-never-punished",
+        ],
+        SERVING,
+    ),
+    generated(
+        "subscribe-headers/sender-within-live",
+        "open-repeated",
+        &[
+            "sim/no-task-panic",
+            "harness/direct-dispatch",
+            "header-sync/chunk-budget-bound",
+            "header-sync/commit-only-authorized",
+            "header-sync/s5v9/conformant-never-closes",
+            "header-sync/s5v9/status/sender-cadence",
+            "header-sync/storage-operation-ids",
+            "header-sync/teardown-returns-baseline",
+            "header-sync/reset-invalidates-work",
+            "header-sync/stale-completion-inert",
+            "header-sync/stale-chain-effect-inert",
+            "header-sync/s5v9/subscribe-headers/sender-within-credit",
+            "session/honest-never-punished",
+        ],
+        SERVING,
+    ),
     generated(
         "conformant-never-closes",
         "target-page-refused",
@@ -355,7 +417,7 @@ const CASES: &[CaseNa] = &[
 ];
 
 /// The `NotApplicable` reports `case`'s counted runs expect beside its
-/// target, if [`CASES`] holds it: each wire ID it doesn't apply, as
+/// target, if [`CASES`] holds it: each ID of its harness it doesn't apply, as
 /// `undeclared` where its scenario doesn't declare the ID's assumptions and
 /// `never-applied` otherwise. A case it doesn't hold expects none, so a
 /// catch declared without its runs' reports can't verify.
@@ -365,22 +427,20 @@ pub fn expected(case: CaseRef) -> &'static [ExpectedNa] {
         // Two names, built once, so the leak is bounded.
         let never: &'static str = Box::leak(NaReason::NeverApplied.name().into_owned().into());
         let undeclared: &'static str = Box::leak(NaReason::Undeclared.name().into_owned().into());
-        let wire: Vec<&'static str> = harness_matrix()
-            .into_iter()
-            .filter(|(harness, _, _)| *harness == WIRE)
-            .map(|(_, id, _)| id)
-            .collect();
+        let matrix = harness_matrix();
         CASES
             .iter()
             .map(|entry| {
-                let property = match entry.property {
-                    Target::Generated(suffix) => format!("header-sync/s5v9/{suffix}"),
-                    Target::Id(id) => id.to_owned(),
+                let (property, on) = match entry.property {
+                    Target::Generated(suffix) => (format!("header-sync/s5v9/{suffix}"), WIRE),
+                    Target::Id(id, harness) => (id.to_owned(), harness),
                 };
-                let list = wire
+                let list = matrix
                     .iter()
-                    .filter(|id| **id != property && !entry.applies.contains(id))
-                    .map(|&id| ExpectedNa {
+                    .filter(|(harness, id, _)| {
+                        *harness == on && *id != property && !entry.applies.contains(id)
+                    })
+                    .map(|&(_, id, _)| ExpectedNa {
                         property: id,
                         reason: if entry.undeclared.contains(&id) {
                             undeclared

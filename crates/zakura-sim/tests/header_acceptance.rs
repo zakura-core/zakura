@@ -4850,6 +4850,8 @@ fn the_wire_catches_declare_their_baselines_not_applicable() {
 
 /// Every generated ID's catch and the despite-close case declare their
 /// runs' `NotApplicable` reports, each a wire ID other than the target.
+/// (`stale-locator-round` declares its own on the storage harness, beside
+/// its row's other storage catches, which declare none yet.)
 #[test]
 fn every_wire_catch_declares_its_not_applicable() {
     use zakura_sim::harness::header_acceptance::companions::DESPITE_CLOSE;

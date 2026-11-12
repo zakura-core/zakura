@@ -449,6 +449,7 @@ impl Ctx<'_> {
         let mut cargo = cargo(self.root, &self.run.out.join("fuzz"));
         cargo.args([
             "test",
+            "--locked",
             "--manifest-path",
             "qa/fuzz/sim/Cargo.toml",
             "--no-default-features",

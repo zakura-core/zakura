@@ -687,6 +687,29 @@ const C14_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C18's proving tests: a case trace refused against another fixture's
+/// input, a typed trace refused against another valid scenario or other
+/// Plan bytes, a scripted Plan recorded, replayed and refused against
+/// another script, and a steered witness recorded and replayed through the
+/// executable.
+const C18_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_case_trace_ran_its_committed_input_and_witness",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_typed_trace_binds_to_its_scenario_and_plan",
+    ),
+    sim_test("tests/record.rs", "recording_a_script_names_it"),
+    sim_test("tests/record.rs", "recording_plan_bytes_writes_no_input"),
+    sim_test("tests/cli.rs", "record_a_script_against_a_scenario"),
+    sim_test(
+        "tests/header_wire_prepare_fault.rs",
+        "the_late_fault_fixture_records_and_replays_in_a_fresh_process",
+    ),
+];
+
 /// A contract that waits for `delivery`, with no proving test yet.
 const fn blocked(
     id: ContractId,
@@ -747,8 +770,9 @@ const fn satisfied(
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
-/// E10, and C14 by hf-6's store inventory. Every other row's deliveries
-/// landed, and its state names the proving test still missing.
+/// E10, C18 by E10 with hdr-14.7b's binding, and C14 by hf-6's store
+/// inventory. Every other row's deliveries landed, and its state names the
+/// proving test still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -796,8 +820,8 @@ pub fn contract_table() -> Vec<Contract> {
             "Every executed binary's source digest is computed and equals the checkout it \
              should come from, and unknown never matches.",
             "E7",
-            "hdr-14.7b's standalone witness runs, which the stale-binary control must cover, \
-             since E7 left test binaries to the tool",
+            "a stale-binary control for a standalone witness history the tool records, beside \
+             the catch and contract-test controls",
         ),
         waiting(
             C6,
@@ -909,14 +933,13 @@ pub fn contract_table() -> Vec<Contract> {
              ledger consumption tests the simulator build runs, since zakura-network's lib \
              tests don't build under cfg(zakura_sim)",
         ),
-        waiting(
+        satisfied(
             C18,
             "Evan (trace-3)",
             "Each trace names exactly the scenario and input or Plan it ran, and the \
              executable records and replays scripted Plans.",
+            C18_PROVING,
             "E10",
-            "hdr-14.7b's binding of a trace's scenario and Plan to its manifest entry, with \
-             its refusal controls",
         ),
         waiting(
             C19,

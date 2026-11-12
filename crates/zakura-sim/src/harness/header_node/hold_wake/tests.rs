@@ -277,3 +277,125 @@ fn a_frozen_hold_wake_store_drops_a_fact() {
         HoldWakeEvidence::facts,
     );
 }
+
+/// Hold-wake and end evidence with no tap behind them.
+#[derive(Clone)]
+struct HoldWakes {
+    hold: HoldWakeEvidence,
+    ends: crate::harness::header_node::ends::EndEvidence,
+}
+
+impl Default for HoldWakes {
+    /// Empty stores in one handle of their own.
+    fn default() -> Self {
+        let stores = EvidenceStores::default();
+        HoldWakes {
+            hold: HoldWakeEvidence::armed(&stores),
+            ends: crate::harness::header_node::ends::EndEvidence::new(&stores),
+        }
+    }
+}
+
+impl crate::domain::header_sync::HoldWakeView for HoldWakes {
+    fn hold_wake(&self) -> &HoldWakeEvidence {
+        &self.hold
+    }
+
+    fn ends(&self) -> &crate::harness::header_node::ends::EndEvidence {
+        &self.ends
+    }
+}
+
+impl crate::property::HasView for HoldWakes {
+    type View = HoldWakes;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> HoldWakes {
+        self.clone()
+    }
+
+    /// The hold-wake store's stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        Some(
+            self.hold
+                .facts()
+                .into_iter()
+                .map(|(stamp, _)| stamp)
+                .filter(|stamp| after.is_none_or(|after| *stamp > after))
+                .collect(),
+        )
+    }
+
+    /// The stores, as a node harness reports its own.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.hold.0.stores().report_snapshot())
+    }
+}
+
+impl crate::harness::scripted::Script for HoldWakes {
+    const NAME: &'static str = "test/two-held-replies";
+    /// Each held reply's reactor call and storage operation, all delivered
+    /// at step 1.
+    type Case = Vec<(u64, u64)>;
+
+    /// Only `hold-release-wakes`.
+    fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<HoldWakes>>>
+    {
+        vec![crate::domain::header_sync::hold_release_wakes()]
+    }
+
+    /// The schedule and the view.
+    fn sources() -> crate::property::Sources {
+        use crate::property::Source;
+        crate::property::Sources::observed(&[Source::Schedule, Source::View])
+    }
+
+    /// Delivers the case's held replies at the boundary after step 1, as
+    /// the storage source would.
+    fn observe(&self, case: &Self::Case, log: &mut crate::ObservationLog) {
+        if log.step() == 1 {
+            for &(call, op) in case {
+                self.hold.push(HoldWakeFact::Opened {
+                    call,
+                    op,
+                    at: SimInstant::ZERO,
+                });
+            }
+        }
+    }
+
+    /// Two: the replies arrive after the first, and nothing runs after the
+    /// second.
+    fn steps(_: &Self::Case) -> usize {
+        2
+    }
+}
+
+/// C21, as reported and through the sidecar: two held replies one boundary
+/// delivered that the reactor never handles are two
+/// `hold-release-wakes` violations expiring together at quiescence, each
+/// naming its own operation, in the full report recorded beside the trace
+/// and its fresh replay.
+#[test]
+fn every_unhandled_held_reply_at_a_boundary_reaches_the_sidecar() {
+    use crate::{
+        domain::header_sync::HOLD_RELEASE_WAKES,
+        harness::scripted::{findings, sidecar},
+        property::Subject,
+    };
+    let full = sidecar::<HoldWakes>(&vec![(5, 1), (6, 2)], &[]);
+    let found = findings(&full, HOLD_RELEASE_WAKES);
+    let violation = |op: u64| crate::Violation {
+        property: HOLD_RELEASE_WAKES.to_owned(),
+        step: 2,
+        witness: vec![1, 2],
+        expected: format!("{:?} discharged before quiescence", Subject::Operation(op)),
+        actual: "the scheduler is Quiescent after step 2 with the obligation from step 1 open"
+            .to_owned(),
+    };
+    assert_eq!(found.violations, [violation(1), violation(2)]);
+    assert!(
+        matches!(found.outcome, crate::PropertyOutcome::Violated { .. }),
+        "{found:?}"
+    );
+}

@@ -4023,10 +4023,7 @@ mod tests {
     /// completes before its submission, and step 1's facts break nothing.
     #[test]
     fn every_operation_id_finding_at_a_step_is_reported() {
-        let report = run_operation_ids(vec![
-            vec![submitted(1), completed(1), submitted(2)],
-            vec![completed(1), completed(3), completed(2)],
-        ]);
+        let report = run_operation_ids(two_operation_id_findings());
         let property = &report.properties[0];
         assert_eq!(
             property.outcome,
@@ -4048,6 +4045,110 @@ mod tests {
                     "operation 3 completed before its submission"
                 ),
             ]
+        );
+    }
+
+    /// The steps [`every_operation_id_finding_at_a_step_is_reported`] and
+    /// its sidecar twin log: step 2 completes operation 1 again and
+    /// operation 3 before its submission.
+    fn two_operation_id_findings() -> Vec<Vec<StorageFact>> {
+        vec![
+            vec![submitted(1), completed(1), submitted(2)],
+            vec![completed(1), completed(3), completed(2)],
+        ]
+    }
+
+    /// A view-less harness that logs [`two_operation_id_findings`].
+    #[derive(Clone, Default)]
+    struct OperationIdRun;
+
+    impl HasView for OperationIdRun {
+        type View = ();
+
+        /// Nothing.
+        fn view(&self) {}
+    }
+
+    impl crate::harness::scripted::Script for OperationIdRun {
+        const NAME: &'static str = "test/two-operation-id-findings";
+        type Case = ();
+
+        /// Only [`OPERATION_IDS`].
+        fn properties() -> Vec<Property<crate::harness::scripted::ScriptRun<OperationIdRun>>> {
+            vec![Property {
+                id: PropertyId::new(OPERATION_IDS),
+                claim: "operation IDs",
+                kind: Kind::Safety,
+                assumes: &[],
+                needs: &[Source::Storage],
+                status: Status::Active,
+                check: check_operation_ids,
+                witness: None,
+            }]
+        }
+
+        /// The schedule and the node's storage.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::Storage])
+        }
+
+        /// Logs each step's facts on the node's header storage, numbered in
+        /// order, from step 1.
+        fn observe(&self, (): &(), log: &mut ObservationLog) {
+            let steps = two_operation_id_findings();
+            let Some(facts) = usize::try_from(log.step())
+                .ok()
+                .and_then(|step| step.checked_sub(1))
+                .and_then(|index| steps.get(index))
+            else {
+                return;
+            };
+            let before = (log.step() - 1) * 3;
+            for (seq, fact) in (before + 1..).zip(facts.iter().cloned()) {
+                log.push(Observation::Storage {
+                    service: HEADER_SERVICE.to_owned(),
+                    instance: 0,
+                    seq,
+                    txn: seq,
+                    fact,
+                });
+            }
+        }
+
+        /// One step per [`two_operation_id_findings`] step.
+        fn steps((): &()) -> usize {
+            two_operation_id_findings().len()
+        }
+    }
+
+    /// C21 through the sidecar: [`every_operation_id_finding_at_a_step_is_reported`]'s
+    /// two findings at step 2 are both in the full report recorded beside
+    /// the trace and its fresh replay.
+    #[test]
+    fn every_operation_id_finding_at_a_step_reaches_the_sidecar() {
+        use crate::harness::scripted::{findings, sidecar};
+        let full = sidecar::<OperationIdRun>(&(), &[]);
+        let found = findings(&full, OPERATION_IDS);
+        let violation = |expected: &str, actual: &str| crate::Violation {
+            property: OPERATION_IDS.to_owned(),
+            step: 2,
+            witness: vec![2],
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        };
+        assert_eq!(
+            found.violations,
+            [
+                violation("operation 1 completes once", "operation 1 completed again"),
+                violation(
+                    "a completion of a submitted operation, at most 2",
+                    "operation 3 completed before its submission"
+                ),
+            ]
+        );
+        assert_eq!(
+            found.outcome,
+            crate::PropertyOutcome::Violated { witness: vec![2] }
         );
     }
 

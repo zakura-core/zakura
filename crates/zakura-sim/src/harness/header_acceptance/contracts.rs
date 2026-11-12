@@ -714,6 +714,34 @@ const C18_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C5's proving tests: a stale-binary control for a catch, whose baseline
+/// must come from S's build and its patched run from the checkout its
+/// provenance check measured, one for a standalone witness history, whose
+/// trace and witness test must both come from S's build, and one for a
+/// contract test, C5's own, whose binary must embed the subject's source,
+/// each with an unknown digest matching nothing, even on both sides, and a
+/// dirty checkout's agreeing digests anchoring nothing. Each runs in a
+/// `zakura-sim` test binary, which embeds the source digest the evaluator
+/// bootstraps C5 from.
+const C5_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::each_case_trace_comes_from_its_credited_binary",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_history_from_a_stale_binary_is_refused",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_applies_contracts_and_narrowing",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_binds_runners_and_traces",
+    ),
+];
+
 /// C13's proving tests: the fault store's four histories through a
 /// recorded run's full report and its sidecar, each ending through the
 /// storage harness's own end wiring and replayed fresh (two untaken
@@ -804,6 +832,73 @@ const C22_PROVING: &[TestRef] = &[
     sim_test(
         "tests/header_authority.rs",
         "a_recorded_header_run_keeps_its_stores_in_the_full_report",
+    ),
+];
+
+/// C15's proving tests: the release-wake fixtures' runs equal the runs
+/// without the release up to their measured boundary and then settle, on
+/// the committed inputs and on every plan, and two planted wake bypasses'
+/// patched `Draft` runs, one on each fixture, settle too, with the release
+/// picked after the bypassed wake's violation.
+const C15_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_fixtures_settle_after_their_measured_boundary_and_not_before",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_wake_fixtures_hold_under_every_plan",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "a_bypassed_wake_s_patched_draft_run_settles",
+    ),
+];
+
+/// C21's proving tests: for each `header-sync` check the header node
+/// harnesses register that can find two failures at one boundary, two
+/// distinct ones there surviving into the run's report and the full report
+/// recorded beside its trace, which a fresh replay sends again. The
+/// claim-reading checks share one test, and `commit-only-authorized` and
+/// `header-fault-penalized` are C22's and C13's. `honest-progress` and
+/// `bounded-adversary-progress` find at most one failure in a run, as their
+/// checks say, so they have none.
+const C21_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::every_operation_id_finding_at_a_step_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_check_keeps_two_findings_at_a_boundary_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/fork_choice/tests.rs",
+        "harness::header_node::fork_choice::tests::a_selection_break_beside_a_settled_break_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/wake.rs",
+        "harness::header_node::wake::tests::every_unanswered_wake_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/hold_wake/tests.rs",
+        "harness::header_node::hold_wake::tests::every_unhandled_held_reply_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::every_unread_publication_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
     ),
 ];
 
@@ -971,25 +1066,6 @@ const C17_PROVING: &[TestRef] = &[
     sim_test("tests/header_pairing.rs", "held_headers_ended_twice_are_refused"),
 ];
 
-/// A contract that waits for `delivery`, with no proving test yet.
-const fn blocked(
-    id: ContractId,
-    owner: &'static str,
-    statement: &'static str,
-    delivery: &'static str,
-) -> Contract {
-    Contract {
-        id,
-        owner,
-        statement,
-        proving: &[],
-        state: ContractState::Blocked {
-            waiting_for: delivery,
-        },
-        delivery,
-    }
-}
-
 /// A contract whose delivery landed but whose proving tests don't yet cover
 /// it, waiting for `missing`.
 const fn waiting(
@@ -1053,11 +1129,12 @@ const fn satisfied(
 }
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
-/// E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's stores,
-/// and C13 by hf-1 to hf-3. Every other row's deliveries landed, and its
-/// state names what's still missing: C4's and C22's proving tests pass,
-/// but don't yet prove them.
+/// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
+/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C21 by hf-8 with E4's
+/// sidecar. Every other row's deliveries landed, and its state names
+/// what's still missing: C4's and C22's proving tests pass, but don't yet
+/// prove them.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1101,14 +1178,13 @@ pub fn contract_table() -> Vec<Contract> {
              only from a binary embedding the subject's source digest, and `xtask`'s test \
              binary embeds none",
         ),
-        waiting(
+        satisfied(
             C5,
             "Evan",
             "Every executed binary's source digest is computed and equals the checkout it \
              should come from, and unknown never matches.",
+            C5_PROVING,
             "E7",
-            "a stale-binary control for a standalone witness history the tool records, beside \
-             the catch and contract-test controls",
         ),
         waiting(
             C6,
@@ -1188,16 +1264,13 @@ pub fn contract_table() -> Vec<Contract> {
             C14_PROVING,
             "hf-6's store inventory",
         ),
-        // hf-5 (#2197) made the unpatched fixtures settle, which
-        // `the_fixtures_settle_after_their_measured_boundary_and_not_before`
-        // shows. No test yet shows a bypassed wake's patched run settling,
-        // the half a Draft run needs, so C15 stays blocked.
-        blocked(
+        satisfied(
             C15,
             "Adam's harness",
             "Release-wake fixtures release their remaining hold after the measured boundary, \
              including when a bypass stops the wake, so a Draft run can finish.",
-            "a test that a bypassed wake's patched run settles (hf-5's remaining half)",
+            C15_PROVING,
+            "hf-5",
         ),
         Contract {
             id: C16,
@@ -1241,13 +1314,12 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        waiting(
+        satisfied(
             C21,
             "Adam's harness",
             "Every header check keeps every finding at a boundary, not just its first.",
+            C21_PROVING,
             "hf-8",
-            "a two-finding report and sidecar test for every header check, those hdr-9, \
-             hdr-10 and hdr-12 added after hf-8 included",
         ),
         proved_short(
             C22,

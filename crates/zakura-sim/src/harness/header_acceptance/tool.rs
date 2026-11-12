@@ -710,21 +710,28 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-/// A run's declared actions, by its harness and how it ended. A machine's
-/// driver runs its whole input and stops only at its first model mismatch
-/// (Rule 17's machine histories end as their driver does), so a completed
-/// machine run carried out its input, a stopped one a prefix of it, and any
-/// other end none it can show. A node history's actions, its scripted acts
-/// and control steps, must each be derived from its bound scenario and shown
-/// from the trace to reach their documented effect, not just picked
-/// (item 0, "each history's declared actions must run"). No node harness
-/// derives them yet, so a node run is `Incomplete`, and its result blocks.
-fn actions(harness: &str, end: &End) -> Actions {
-    let machine = crate::harness::find(harness).is_ok_and(|entry| entry.machine);
-    match (machine, end) {
-        (true, End::Completed) => Actions::Complete,
-        (true, End::Violation { .. }) => Actions::Prefix,
-        _ => Actions::Incomplete,
+/// A run's declared actions, from its recorded `trace` and `full` report
+/// and how it ended. A machine's driver runs its whole input and stops only
+/// at its first model mismatch (Rule 17's machine histories end as their
+/// driver does), so a completed machine run carried out its input, a
+/// stopped one a prefix of it, and any other end none it can show. A node
+/// run's actions are derived from its bound scenario and judged on its
+/// trace and stores ([`super::actions`]); `witnessed` says whether a
+/// witness judgement of this trace passed. A harness neither knows is
+/// `Incomplete`, so its result blocks.
+fn actions(trace: &Trace, full: &FullReport, end: &End, witnessed: bool) -> Actions {
+    let harness = trace.meta.sim.as_str();
+    match crate::harness::find(harness).map(|entry| entry.machine) {
+        Ok(true) => match end {
+            End::Completed => Actions::Complete,
+            End::Violation { .. } => Actions::Prefix,
+            _ => Actions::Incomplete,
+        },
+        Ok(false) => match super::actions::declared(harness, &trace.meta.scenario) {
+            Ok(declared) => super::actions::judge(&declared, trace, full, end, witnessed),
+            Err(_) => Actions::Incomplete,
+        },
+        Err(_) => Actions::Incomplete,
     }
 }
 
@@ -844,8 +851,13 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
         },
         OutcomeKind::Idle | OutcomeKind::Budget => End::Completed,
     };
-    let actions = actions(&recorded.meta.sim, &end_kind);
     let witness: Option<Value> = read_json(&dir.join("witness.json"));
+    let witnessed = witness
+        .as_ref()
+        .and_then(|w| w.get("passed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let actions = actions(&recorded, &full, &end_kind, witnessed);
     Execution {
         trace,
         run,
@@ -861,11 +873,7 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
             .iter()
             .map(|found| (found.property.clone(), report(&found.outcome)))
             .collect(),
-        trigger: witness
-            .as_ref()
-            .and_then(|w| w.get("passed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        trigger: witnessed,
         // A usize count always fits in a u64 on supported targets.
         leaked: end.cleanup.leaked as u64,
         actions,
@@ -2679,23 +2687,98 @@ mod tests {
 
     /// A machine run's actions follow its driver: completed is its whole
     /// input, stopped at a violation a prefix, anything else none. A node
-    /// run's actions need effect evidence the tool doesn't have yet, so
-    /// they're incomplete however it ends or whatever it picked.
+    /// run's actions come from its bound scenario: the committed
+    /// close-and-relink history picks its four control steps in order and
+    /// the `ends` store shows each one acted, so it's complete, and a run a
+    /// violation stopped is judged as a prefix. Controls: a declared step
+    /// that was never picked, one picked whose effect the store doesn't
+    /// show, a picked peer action the scenario doesn't declare, and a later
+    /// step the scenario holds that a hand list of the first four would
+    /// leave out, ending before it's picked, each make the run incomplete.
     #[test]
     fn a_run_s_actions_follow_its_harness() {
-        assert!(crate::harness::find(MACHINE).is_ok_and(|entry| entry.machine));
-        assert!(crate::harness::find(NODE).is_ok_and(|entry| !entry.machine));
         let violation = End::Violation {
             property: "t/a".into(),
         };
-        assert_eq!(actions(MACHINE, &End::Completed), Actions::Complete);
-        assert_eq!(actions(MACHINE, &violation), Actions::Prefix);
-        assert_eq!(actions(MACHINE, &End::Killed), Actions::Incomplete);
-        assert_eq!(actions(NODE, &End::Completed), Actions::Incomplete);
-        assert_eq!(actions(NODE, &violation), Actions::Incomplete);
+        let machine = crate::trace::TraceReader::open(recorded().path()).expect("it reads");
+        let machine_report = full_report(recorded().path()).unwrap_or_else(|_| FullReport {
+            properties: Vec::new(),
+            snapshot: None,
+        });
+        let judged =
+            |trace: &Trace, report: &FullReport, end: &End| actions(trace, report, end, false);
         assert_eq!(
-            actions("no/such-harness", &End::Completed),
+            judged(&machine, &machine_report, &End::Completed),
+            Actions::Complete
+        );
+        assert_eq!(
+            judged(&machine, &machine_report, &violation),
+            Actions::Prefix
+        );
+        assert_eq!(
+            judged(&machine, &machine_report, &End::Killed),
             Actions::Incomplete
+        );
+
+        let trace = crate::trace::TraceReader::open(storage_recording()).expect("it reads");
+        let report = full_report(storage_recording()).expect("the recording has its report");
+        assert_eq!(judged(&trace, &report, &End::Completed), Actions::Complete);
+        assert_eq!(judged(&trace, &report, &violation), Actions::Prefix);
+        assert_eq!(judged(&trace, &report, &End::Killed), Actions::Incomplete);
+
+        let last = "peer:mirror-1:relink";
+        let mut unpicked = trace.clone();
+        unpicked.steps.retain(|step| step.pick != last);
+        assert_eq!(
+            judged(&unpicked, &report, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut unshown = report.clone();
+        for store in unshown
+            .snapshot
+            .as_mut()
+            .and_then(Value::as_array_mut)
+            .expect("a node run keeps its stores")
+        {
+            if store["store"] == "ends" {
+                let text = store["snapshot"].as_str().expect("a Debug snapshot");
+                let relinked =
+                    "Environment { peer: \"mirror-1\", connection: Some(4), action: Relink }";
+                assert!(text.contains(relinked), "{text}");
+                store["snapshot"] = Value::String(text.replace(relinked, "Dropped"));
+            }
+        }
+        assert_eq!(
+            judged(&trace, &unshown, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut undeclared = trace.clone();
+        let mut extra = undeclared.steps[0].clone();
+        extra.pick = "peer:mirror-0:grow".to_owned();
+        undeclared.steps.push(extra);
+        assert_eq!(
+            judged(&undeclared, &report, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut later = trace.clone();
+        later.meta.scenario["controls"]
+            .as_array_mut()
+            .expect("the scenario lists its controls")
+            .push(serde_json::json!({ "peer": "mirror-0", "action": "close" }));
+        assert_eq!(
+            judged(&later, &report, &End::Completed),
+            Actions::Incomplete
+        );
+        let declared = super::super::actions::declared(NODE, &later.meta.scenario)
+            .expect("the scenario derives");
+        assert_eq!(declared.len(), 5);
+        assert_eq!(
+            super::super::actions::judge(&declared[..4], &later, &report, &End::Completed, false),
+            Actions::Complete,
+            "a hand list of the first four steps would have passed it"
         );
     }
 

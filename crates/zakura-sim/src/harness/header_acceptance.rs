@@ -31,6 +31,7 @@
 //! without its file and package, or a case's name without its property. The evaluator's controls change one field at a time and require
 //! the result to stop counting.
 
+pub mod actions;
 pub mod companions;
 pub mod contracts;
 pub mod evaluate;

@@ -589,7 +589,7 @@ mod sched_mapping {
 mod schedule_agreement {
     use serde_json::json;
     use zakura_sim::sim_acceptance::agreement::{
-        agreement, first_differing_step, HunkMap, Site, StepView,
+        agreement, first_differing_step, without_lines, HunkMap, Site, StepView,
     };
 
     /// A patch that removes three lines (10 to 12) of `src/peer.rs`.
@@ -663,6 +663,72 @@ mod schedule_agreement {
         let before = [reach(1, "task:t", "src/peer.rs:11")];
         let after = [reach(1, "task:t", "src/peer.rs:11")];
         assert_eq!(first_differing_step(&before, &after, &map), Some(1));
+    }
+
+    /// The declared site must be the difference itself: a site pick
+    /// beside a different draw, or a site observation both runs hold
+    /// beside another that differs, fails.
+    #[test]
+    fn a_site_beside_an_unrelated_difference_fails() {
+        let map = HunkMap::default();
+        let pick = Site {
+            at: "task:t".to_owned(),
+        };
+        let before = [reach(1, "task:t", "src/a.rs:1")];
+        let mut after = [reach(1, "task:t", "src/a.rs:1")];
+        after[0].draws = before[0].draws.clone();
+        after[0]
+            .obs
+            .push(json!({ "obs": "task-exited", "task": "t" }));
+        assert_eq!(
+            agreement(&before, &after, &map, &pick),
+            Ok(1),
+            "the obs after the pick differ"
+        );
+        let mut drawn: Vec<StepView> = after.to_vec();
+        drawn[0].obs = before[0].obs.clone();
+        drawn[0].draws = serde_json::from_value(json!([
+            { "draw": "t:rng#1", "bound": "0x0", "value": "0x1", "by": "bytes" }
+        ]))
+        .unwrap();
+        assert!(
+            agreement(&before, &drawn, &map, &pick).is_err(),
+            "only a draw differs"
+        );
+        let shared = Site {
+            at: "src/a.rs:1".to_owned(),
+        };
+        assert!(
+            agreement(&before, &after, &map, &shared).is_err(),
+            "both runs hold the site's observation"
+        );
+    }
+
+    /// Two equivalent operations on different lines of two code paths
+    /// match once the lines are dropped, so the first difference is the
+    /// next one in an operation, not the location.
+    #[test]
+    fn a_location_only_difference_vanishes_without_lines() {
+        let before = [
+            reach(1, "task:t", "src/a.rs:10"),
+            reach(2, "task:t", "src/a.rs:11"),
+        ];
+        let mut after = [
+            reach(1, "task:t", "src/a.rs:20"),
+            reach(2, "task:t", "src/a.rs:21"),
+        ];
+        after[1].obs[0]["at"] = json!("cancelled#1");
+        let map = HunkMap::default();
+        assert_eq!(first_differing_step(&before, &after, &map), Some(1));
+        let (before, after) = (
+            without_lines(before.to_vec()),
+            without_lines(after.to_vec()),
+        );
+        assert_eq!(first_differing_step(&before, &after, &map), Some(2));
+        let site = Site {
+            at: "t:cancelled#1".to_owned(),
+        };
+        assert_eq!(agreement(&before, &after, &map, &site), Ok(2));
     }
 
     #[test]

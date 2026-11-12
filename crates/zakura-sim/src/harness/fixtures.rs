@@ -540,8 +540,9 @@ pub struct TimerCancel {
 impl Fixture for TimerCancel {
     const NAME: &'static str = "race/timer-cancel";
     const EXPECTED: &'static str = "no timeout after the cancel";
-    /// The timer reaches the fixed `select`, which checks the cancel first.
-    const AGREEMENT_SITE: &'static str = "timer.1:select#1";
+    /// After its `select`, the fixed timer takes the cancel where the race
+    /// sleeps on.
+    const AGREEMENT_SITE: &'static str = "timer.1:cancelled#1";
     /// True once the timer chose its timeout after the cancel.
     type View = bool;
 

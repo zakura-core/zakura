@@ -1727,7 +1727,11 @@ fn judge_task(
                     "the fixed run isn't the saved schedule's Plan bytes on the fix".to_owned(),
                 );
             }
-            let views = |side: &str| super::agreement::step_views(&dir.join(side));
+            // A race's fix is another code path, not a patch, so the two
+            // runs compare without source lines.
+            let views = |side: &str| {
+                super::agreement::step_views(&dir.join(side)).map(super::agreement::without_lines)
+            };
             match (views("base"), views("fixed")) {
                 (Ok(base), Ok(fixed)) => match super::agreement::agreement(
                     &base,

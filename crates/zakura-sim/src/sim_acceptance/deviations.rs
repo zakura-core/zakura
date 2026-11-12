@@ -72,7 +72,7 @@ pub const DEVIATIONS: &[Deviation] = &[
                 run up to their first differing step, which is at the fix's site (S4.4 and \
                 S4.7); identical schedules wait on Recover replay",
         approval: None,
-        evan: Evan::Pending,
+        evan: Evan::Agreed("Evan, 2026-11-11"),
     },
     Deviation {
         id: "s4.6-sim-cfg-scope",

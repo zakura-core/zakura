@@ -145,18 +145,18 @@ fn reached(obs: &Value) -> Option<String> {
 }
 
 /// The step views of the trace in `dir`, from its steps and the
-/// `--observe` log a fresh replay wrote beside it, one line per step from
-/// 0 for setup. The log must have exactly one line per step.
+/// `--observe` log a fresh replay wrote beside it. The log must be bound
+/// to the trace: one line per step from 0 for setup, each
+/// `{"step":<n>,"obs":<obs>}` for its own step, with `<obs>` hashing to
+/// the observation digest the trace records for that step.
 pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
+    use sha2::{Digest as _, Sha256};
     let trace = crate::trace::TraceReader::open(dir)
         .map_err(|error| format!("{}: {error}", dir.display()))?;
     let log = crate::sim_acceptance::header::read_bounded_text(
         &dir.join(crate::trace::OBSERVATIONS_FILE),
     )?;
-    let lines: Vec<Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
-        .collect::<Result<_, _>>()?;
+    let lines: Vec<&str> = log.lines().collect();
     if lines.len() != trace.steps.len() + 1 {
         return Err(format!(
             "{}: the observation log has {} lines for {} steps",
@@ -165,28 +165,77 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
             trace.steps.len()
         ));
     }
-    let obs = |n: usize| -> Vec<Value> {
-        lines[n]
-            .get("obs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
+    let digests = std::iter::once(trace.init.as_ref().and_then(|init| init.obs.clone()))
+        .chain(trace.steps.iter().map(|step| step.obs.clone()));
+    let mut obs = Vec::with_capacity(lines.len());
+    for (n, (line, digest)) in lines.iter().zip(digests).enumerate() {
+        let text = line
+            .strip_prefix(&format!(r#"{{"step":{n},"obs":"#))
+            .and_then(|rest| rest.strip_suffix('}'))
+            .ok_or_else(|| format!("{}: log line {n} isn't step {n}'s", dir.display()))?;
+        let hashed: String = Sha256::digest(text.as_bytes())[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest.as_deref() != Some(hashed.as_str()) {
+            return Err(format!(
+                "{}: log line {n} doesn't match the trace's observation digest",
+                dir.display()
+            ));
+        }
+        let parsed: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let Value::Array(items) = parsed else {
+            return Err(format!(
+                "{}: log line {n}'s observations aren't a list",
+                dir.display()
+            ));
+        };
+        obs.push(items);
+    }
+    let mut obs = obs.into_iter();
     let mut views = vec![StepView {
         step: 0,
         pick: String::new(),
         draws: trace.init.map(|init| init.draws).unwrap_or_default(),
-        obs: obs(0),
+        obs: obs.next().unwrap_or_default(),
     }];
-    for (n, step) in trace.steps.into_iter().enumerate() {
+    for step in trace.steps {
         views.push(StepView {
             step: step.step,
             pick: step.pick,
             draws: step.draws,
-            obs: obs(n + 1),
+            obs: obs.next().unwrap_or_default(),
         });
     }
     Ok(views)
+}
+
+/// `views` without each observation's `site`, for two runs whose fix is a
+/// different code path rather than a patch, such as a race fixture's base
+/// and fixed variants. Equivalent operations then match whatever lines
+/// their two paths are on, and the first difference is in an operation,
+/// an object or a pick.
+pub fn without_lines(views: Vec<StepView>) -> Vec<StepView> {
+    fn strip(value: &Value) -> Value {
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "site")
+                    .map(|(key, value)| (key.clone(), strip(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(strip).collect()),
+            other => other.clone(),
+        }
+    }
+    views
+        .into_iter()
+        .map(|view| StepView {
+            obs: view.obs.iter().map(strip).collect(),
+            ..view
+        })
+        .collect()
 }
 
 /// `obs` with every `site` that names a `file:line` mapped across `map`,
@@ -239,7 +288,11 @@ pub fn first_differing_step(before: &[StepView], after: &[StepView], map: &HunkM
 }
 
 /// Checks that `before` and `after` agree up to their first differing
-/// step, and that `after`'s side of that step is at `site`.
+/// step, and that the difference is at `site` on `after`'s side: either an
+/// observation `site` names that `before`'s step doesn't hold, or `site`'s
+/// pick, with the same draws on both sides, followed by different
+/// observations. A site that's merely present beside an unrelated
+/// difference doesn't count.
 pub fn agreement(
     before: &[StepView],
     after: &[StepView],
@@ -248,15 +301,27 @@ pub fn agreement(
 ) -> Result<u64, String> {
     let step = first_differing_step(before, after, map)
         .ok_or("the two runs never differ, so the patch changed nothing observable")?;
+    let names = |obs: &Value| {
+        obs.get("site").and_then(Value::as_str) == Some(site.at.as_str())
+            || reached(obs).as_deref() == Some(site.at.as_str())
+    };
+    let before_view = before.iter().find(|view| view.step == step);
+    let before_obs: Vec<Value> = before_view
+        .map(|view| view.obs.iter().map(|o| mapped(o, map)).collect())
+        .unwrap_or_default();
     let at_site = after
         .iter()
         .find(|view| view.step == step)
         .is_some_and(|view| {
-            view.pick == site.at
-                || view.obs.iter().any(|obs| {
-                    obs.get("site").and_then(Value::as_str) == Some(site.at.as_str())
-                        || reached(obs).as_deref() == Some(site.at.as_str())
-                })
+            let changed_obs = view
+                .obs
+                .iter()
+                .any(|obs| names(obs) && !before_obs.contains(obs));
+            let after_pick = view.pick == site.at
+                && before_view.is_some_and(|b| {
+                    b.pick != view.pick || (b.draws == view.draws && before_obs != view.obs)
+                });
+            changed_obs || after_pick
         });
     if at_site {
         Ok(step)

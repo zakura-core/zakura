@@ -146,8 +146,12 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
     }
     let args = args(args_in)?;
     // The header run's record is an input: retiring it, or writing over
-    // it, would lose it.
-    let (out, header) = (resolved(&args.out), resolved(&args.header_out));
+    // it, would lose it. `--out` is created first, so a path through a
+    // directory that doesn't exist yet, or a `..`, resolves to where it
+    // really points.
+    fs::create_dir_all(&args.out)?;
+    let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| resolved(path));
+    let (out, header) = (real(&args.out), real(&args.header_out));
     if out.starts_with(&header) || header.starts_with(&out) {
         return Err(UsageError("--out and --header-out must not overlap").into());
     }
@@ -155,7 +159,6 @@ pub(super) fn run(repo_root: &Path, args_in: impl Iterator<Item = String>) -> Re
         out: args.out.clone(),
         deadline: args.deadline,
     };
-    fs::create_dir_all(&args.out)?;
     let (_lock, kept) = lock_out(&TOOL, &args.out)?;
     mark_descendants(&TOOL, &args.out);
     let mut sessions = track_sessions(&args.out);

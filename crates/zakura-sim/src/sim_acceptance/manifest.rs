@@ -192,16 +192,15 @@ fn row(id: &str, never_excluded: bool, expected: Vec<Expected>) -> Row {
     }
 }
 
-/// The discovery pair and the six race pairs the agreement rows compare.
-pub const AGREEMENTS: &[&str] = &[
-    "discovery/wait-complete-wakes",
-    "race/lost-update",
-    "race/snapshot-reserve",
-    "race/missed-notify",
-    "race/timer-cancel",
-    "race/ab-ba",
-    "race/abort-without-join",
-];
+/// The race agreement pairs: one per registered race fixture, so a new
+/// fixture joins S4.4 by itself ([`problems`] checks each has a saved
+/// schedule).
+fn race_agreements() -> Vec<Expected> {
+    crate::harness::fixtures::Which::ALL
+        .iter()
+        .map(|which| Expected::Agreement(which.property().to_owned()))
+        .collect()
+}
 
 /// Every row, in the plan's order, with its families from `derived`.
 pub fn rows(derived: &Derived) -> Vec<Row> {
@@ -559,11 +558,7 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                     ],
                 ),
                 vec![sim("race_schedules", "each_race_has_a_saved_schedule")],
-                AGREEMENTS
-                    .iter()
-                    .filter(|name| name.starts_with("race/"))
-                    .map(|name| Expected::Agreement((*name).to_owned()))
-                    .collect(),
+                race_agreements(),
             ]
             .concat(),
         ),
@@ -864,6 +859,22 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
                 problems.push(format!("{lane}'s target list doesn't have {target}"));
             }
         }
+    }
+    // Every race fixture has a saved schedule, and every saved schedule a
+    // fixture, so S4.4's agreement rows and the saved-plan row cover the
+    // same races.
+    let fixtures: BTreeSet<String> = crate::harness::fixtures::Which::ALL
+        .iter()
+        .map(|which| which.property().to_owned())
+        .collect();
+    let schedules: BTreeSet<String> = derived
+        .race_schedules
+        .iter()
+        .map(|name| format!("race/{name}"))
+        .collect();
+    if fixtures != schedules {
+        problems
+            .push("the race fixtures and the saved race schedules aren't the same set".to_owned());
     }
     if held("corpus/header-table-pairs") != pairs {
         problems.push("the header table row doesn't hold exactly the generated IDs".to_owned());

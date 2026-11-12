@@ -4224,7 +4224,7 @@ fn na(reason: &str) -> Report {
 }
 
 /// A test result for `test`, which ran `ran` with `outcome`, from a binary
-/// embedding the subject's source.
+/// embedding the subject's source, in a checkout of it.
 fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
     Actual::Test {
         ran: vec![TestRan {
@@ -4234,6 +4234,7 @@ fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
             outcome,
         }],
         binary_source: Some(SOURCE.into()),
+        checkout_source: Some(SOURCE.into()),
     }
 }
 
@@ -5411,6 +5412,25 @@ fn the_evaluator_applies_contracts_and_narrowing() {
         let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
         assert!(blocked(&state(&manifest(), &stale, &c5_key)));
     }
+    // Nor does C5's own test from S's binary run in a checkout that has
+    // since moved, or one never measured: only its checkout differs, and
+    // C5's bootstrap still verifies with both of S's.
+    let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
+    assert_eq!(
+        state(&manifest(), &results(), &c5_key),
+        ObligationState::Verified
+    );
+    for checkout in [None, Some("another-source".to_owned())] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t5).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &quiet)));
+        assert!(blocked(&state(&manifest(), &moved, &c5_key)));
+    }
     // An unknown digest anchors nothing, even when the caller's subject,
     // the result file and every test binary all agree on it: C5's own test
     // blocks, so its dependents do, and so does a composition check.
@@ -5975,6 +5995,18 @@ fn the_evaluator_binds_runners_and_traces() {
     }
     assert!(blocked(&state(&manifest(), &stale, &t3_key)));
     assert!(blocked(&state(&manifest(), &stale, &Key::passing("t/a"))));
+    // So does one from S's binary that ran in another checkout, whose files
+    // it read, or in one never measured.
+    for checkout in [Some("old-source".to_owned()), None] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t3).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &t3_key)));
+    }
     // So does one whose digest couldn't be read, for a proving test and for
     // a narrowing test, which then releases nothing.
     let mut unread = results();

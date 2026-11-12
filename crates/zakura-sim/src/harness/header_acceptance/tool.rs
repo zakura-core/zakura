@@ -790,14 +790,17 @@ pub struct TargetCheck {
 }
 
 /// A test result from its artifact: every test libtest reported, in the
-/// package and file xtask ran. A killed child fails every test it ran, a
-/// child that didn't exit 0 fails every test it reported `ok`, and an
-/// unreadable artifact is a result that ran nothing.
+/// package and file xtask ran, with the sources of its binary and of the
+/// checkout it ran in, both of which the evaluator requires to be S's. A
+/// killed child fails every test it ran, a child that didn't exit 0 fails
+/// every test it reported `ok`, and an unreadable artifact is a result that
+/// ran nothing.
 fn test_actual(dir: &Path) -> Actual {
     let Some(run) = read_json::<TestRun>(&dir.join(TEST_FILE)) else {
         return Actual::Test {
             ran: Vec::new(),
             binary_source: None,
+            checkout_source: None,
         };
     };
     let ran = run
@@ -818,6 +821,7 @@ fn test_actual(dir: &Path) -> Actual {
     Actual::Test {
         ran,
         binary_source: run.binary_source,
+        checkout_source: run.checkout_source,
     }
 }
 
@@ -1659,13 +1663,13 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
 
 /// A history task's run, `run`, in `dir`: its witness test (`test`, as
 /// package, file, name and case) must have passed at S from a binary
-/// embedding S, and declared the history once ([`declaration`]); then
-/// `dir/run`, S's recording of that declaration, must bind to it (C18) and
-/// come from S's build. Its trigger comes only from a `witness.json` that
-/// judges the task's own `witness`, its property and expectation, as a
-/// planted run's must ([`CaseChecks::planted`]): one judging another
-/// property or expectation fails the run, and a task with no expectation
-/// shows no trigger.
+/// embedding S, in a checkout of S, and declared the history once
+/// ([`declaration`]); then `dir/run`, S's recording of that declaration,
+/// must bind to it (C18) and come from S's build. Its trigger comes only
+/// from a `witness.json` that judges the task's own `witness`, its property
+/// and expectation, as a planted run's must ([`CaseChecks::planted`]): one
+/// judging another property or expectation fails the run, and a task with
+/// no expectation shows no trigger.
 fn history_execution(
     dir: &Path,
     run: RunId,
@@ -1693,7 +1697,9 @@ fn history_execution(
             && ran.file == file
             && !ran.killed
             && ran.exited_ok
+            && known(Some(subject_source))
             && ran.binary_source.as_deref() == Some(subject_source)
+            && ran.checkout_source.as_deref() == Some(subject_source)
             && ran.tests == [(name.to_owned(), "ok".to_owned())]
     });
     if !passed {
@@ -4773,7 +4779,8 @@ mod tests {
     }
 
     /// A test artifact's results: a killed child fails every test it ran,
-    /// and an unreadable artifact ran nothing.
+    /// and an unreadable artifact ran nothing. Its binary's and checkout's
+    /// sources are each carried as measured, even when they differ.
     #[test]
     fn a_test_artifact_is_read_by_name() {
         let dir = tempfile::tempdir().expect("a temp dir can be created");
@@ -4786,7 +4793,7 @@ mod tests {
                 exited_ok,
                 log: String::new(),
                 binary_source: Some("source".into()),
-                checkout_source: Some("source".into()),
+                checkout_source: Some("t".into()),
             };
             fs::write(
                 dir.path().join(TEST_FILE),
@@ -4802,6 +4809,19 @@ mod tests {
         assert_eq!(
             outcomes(test_actual(dir.path())),
             [TestOutcome::Passed, TestOutcome::Skipped]
+        );
+        // It carries both measured sources for the evaluator to judge.
+        let Actual::Test {
+            binary_source,
+            checkout_source,
+            ..
+        } = test_actual(dir.path())
+        else {
+            unreachable!("a test artifact reads as a test result");
+        };
+        assert_eq!(
+            (binary_source.as_deref(), checkout_source.as_deref()),
+            (Some("source"), Some("t"))
         );
         // `ok` and then a nonzero exit or a signal isn't a pass.
         write(false, false);
@@ -5054,14 +5074,20 @@ mod tests {
 
     /// C5, for a standalone witness history: its run counts only when the
     /// binary that recorded its trace and the one its witness test ran in
-    /// both embed the subject's source digest. A trace recorded by a binary
-    /// built from other source, or one embedding the `unknown` marker, a
-    /// witness test from a stale binary or one that embeds no digest, each
-    /// fail the run, naming why. An unknown digest matches nothing, not
-    /// even an unknown subject's.
+    /// both embed the subject's source digest, and that test ran in a
+    /// checkout of S. A trace recorded by a binary built from other source,
+    /// or one embedding the `unknown` marker, a witness test from a stale
+    /// binary or one that embeds no digest, and one that ran in another
+    /// checkout or one whose checkout wasn't measured, each fail the run,
+    /// naming why. An unknown digest matches nothing, not even an unknown
+    /// subject's.
     #[test]
     fn a_history_from_a_stale_binary_is_refused() {
-        let read = |subject: &str, trace: Option<&str>, binary: Option<&str>| {
+        type Measured<'a> = Option<Option<&'a str>>;
+        let read = |subject: &str,
+                    trace: Option<&str>,
+                    binary: Option<&str>,
+                    checkout: Measured| {
             let dir = tempfile::tempdir().expect("a temp dir can be created");
             history_task_dir(dir.path(), None);
             if let Some(source) = trace {
@@ -5078,6 +5104,15 @@ mod tests {
                 fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
                     .expect("the temp dir is writable");
             }
+            if let Some(source) = checkout {
+                let path = dir.path().join(TEST_FILE);
+                let mut ran: TestRun =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                        .expect("it reads back");
+                ran.checkout_source = source.map(str::to_owned);
+                fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                    .expect("the temp dir is writable");
+            }
             history_execution(
                 dir.path(),
                 history_run(),
@@ -5088,7 +5123,7 @@ mod tests {
             )
             .end
         };
-        let fresh = read("s", None, None);
+        let fresh = read("s", None, None, None);
         assert!(!matches!(fresh, End::Failed { .. }), "{fresh:?}");
         let refused = |end: End, why: &str| {
             assert!(
@@ -5098,13 +5133,17 @@ mod tests {
         };
         let stale_trace = "its trace's build source isn't the subject's";
         let stale_test = "its witness test zakura-sim/tests/header_node.rs::test didn't pass at S";
-        refused(read("s", Some("stale"), None), stale_trace);
-        refused(read("s", Some("unknown"), None), stale_trace);
-        refused(read("s", None, Some("stale")), stale_test);
-        refused(read("s", None, Some(NOT_EMBEDDED)), stale_test);
+        refused(read("s", Some("stale"), None, None), stale_trace);
+        refused(read("s", Some("unknown"), None, None), stale_trace);
+        refused(read("s", None, Some("stale"), None), stale_test);
+        refused(read("s", None, Some(NOT_EMBEDDED), None), stale_test);
+        // A binary of S run in a checkout that has since moved, or whose
+        // checkout wasn't measured: only `checkout_source` differs.
+        refused(read("s", None, None, Some(Some("t"))), stale_test);
+        refused(read("s", None, None, Some(None)), stale_test);
         // Unknown on both sides, the subject's and every binary's.
         refused(
-            read("unknown", Some("unknown"), Some("unknown")),
+            read("unknown", Some("unknown"), Some("unknown"), None),
             stale_trace,
         );
     }

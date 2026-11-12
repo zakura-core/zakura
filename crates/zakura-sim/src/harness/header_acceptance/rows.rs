@@ -135,7 +135,8 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
     add(REACTOR, &[REACTOR]);
     add(PUBLISHER, &[PUBLISHER]);
     matrix.push((WIRE, PROGRESS_ID, Status::Draft));
-    matrix.push((LIVENESS, RECOVERY_ID, Status::Draft));
+    matrix.push((STORAGE, RECOVERY_ID, Status::Active));
+    matrix.push((LIVENESS, RECOVERY_ID, Status::Active));
     matrix
 }
 
@@ -499,7 +500,17 @@ const RETIRE_WITNESSES: HistoryRef = HistoryRef {
     case: "header-retire-timeout",
 };
 
-/// The committed recovery control, holding and applying
+/// Each committed recovery fixture, by its fixture stem, which its witness
+/// test runs under the fixed Plan: hdr-11's control and hdr-13's close,
+/// fault and departure classes.
+const RECOVERY_CASES: [&str; 4] = [
+    "header-recovery-successor",
+    "header-recovery-closes",
+    "header-recovery-faults",
+    "header-recovery-departure",
+];
+
+/// The committed recovery fixtures, each holding and applying
 /// `bounded-adversary-progress` under the fixed Plan.
 const RECOVERY_WITNESS: HistoryRef = HistoryRef {
     harness: LIVENESS,
@@ -857,7 +868,15 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             histories.push((HistoryRef { case, ..history }, id));
         }
     }
-    histories.push((RECOVERY_WITNESS, RECOVERY_ID));
+    for case in RECOVERY_CASES {
+        histories.push((
+            HistoryRef {
+                case,
+                ..RECOVERY_WITNESS
+            },
+            RECOVERY_ID,
+        ));
+    }
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
@@ -2066,6 +2085,30 @@ fn hand_written_rows() -> Vec<Row> {
     let mut selected = holds(SELECTED, G2, SELECTED_WITNESSES);
     for (index, (name, harness, set, found)) in [
         (
+            "every-session-refused",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "later-sessions-refused",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "missing-cooldown-refuses",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
+            "service-rejects-valid-streams",
+            STORAGE,
+            &[SELECTED],
+            Found::AtStep,
+        ),
+        (
             "offer-by-height",
             STORAGE,
             &[SELECTED] as &'static [&'static str],
@@ -2327,25 +2370,26 @@ fn hand_written_rows() -> Vec<Row> {
 
     let recovery = RECOVERY_ID;
     let mut recovering = holds(recovery, NONE, RECOVERY_WITNESS);
-    recovering.extend(caught(
-        LIVENESS,
-        case(recovery, "skipped-apply"),
-        &[RECOVERY_ID],
-        Found::AtStep,
-        NONE,
-        false,
-    ));
-    rows.push(Row {
-        property: recovery,
-        tier: Tier::Sim,
-        harnesses: &[LIVENESS],
-        status: Status::Draft,
-        promotion: Some(Promotion {
-            condition: "hdr-13 adds the hostile prefixes and Evan agrees to promote it",
-            owner: "Evan",
-        }),
-        expected: recovering,
-    });
+    // hdr-11's control bypass, then hdr-13's: each violates only this ID
+    // on its committed fixture (a case's `also_violates` covers only its
+    // campaign's departure inputs).
+    for name in [
+        "skipped-apply",
+        "stalled-successor",
+        "faulted-target-remembered",
+        "refusal-never-lifts",
+        "pause-outlasts-cooldown",
+    ] {
+        recovering.extend(caught(
+            LIVENESS,
+            case(recovery, name),
+            &[RECOVERY_ID],
+            Found::AtStep,
+            NONE,
+            name == "stalled-successor",
+        ));
+    }
+    rows.push(sim_row(recovery, &[STORAGE, LIVENESS], recovering));
 
     let mut reactor = vec![result(
         vec![Key::passing(REACTOR)],
@@ -2985,9 +3029,8 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
-    "the_not_applicable_inventory_equals_a_source_scan",
+    "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
-    "the_source_scan_refuses_an_unlisted_producer",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -3101,33 +3144,27 @@ pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> 
         .collect()
 }
 
-/// The `NotApplicable` reasons' expected results. On `main` a report
-/// doesn't name its reason, so no test can tell two reasons apart until E1
-/// (C1) makes `NotApplicable` carry one.
+/// The `NotApplicable` reasons' expected results, one per reason a header
+/// ID can carry ([`super::reasons::NA_REASONS`]).
 pub fn reason_results() -> Vec<ExpectedResult> {
-    let mut results = Vec::new();
-    for producer in super::reasons::NA_REASONS {
-        for (index, construction) in producer.constructions.iter().enumerate() {
-            if construction.kind != super::reasons::NaKind::MissingEvidence {
-                results.push(result(
-                    vec![Key::NaReason {
-                        file: producer.file.to_owned(),
-                        function: producer.function.to_owned(),
-                        index,
-                    }],
-                    &[Gate::G6],
-                    REASON_TEST,
-                ));
-            }
-        }
-    }
-    results
+    super::reasons::NA_REASONS
+        .iter()
+        .map(|entry| {
+            result(
+                vec![Key::NaReason {
+                    reason: entry.reason,
+                }],
+                &[Gate::G6],
+                REASON_TEST,
+            )
+        })
+        .collect()
 }
 
-/// A `NotApplicable` reason's test, until a report names its reason (E1).
+/// A `NotApplicable` reason's test, until E1's tests show each at its
+/// trigger.
 pub const REASON_TEST: Expected = Expected::Open {
-    reason: "a test that shows this reason at its trigger, once a report names its \
-             NotApplicable reason",
+    reason: "a test that shows this reason at its trigger",
     owner: "Adam's side",
     approval: Approval::Pending,
     until: Some("E1"),

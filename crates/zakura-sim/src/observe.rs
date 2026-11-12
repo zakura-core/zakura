@@ -199,6 +199,13 @@ pub enum Observation {
         /// frame to an empty bucket: its charge returned
         /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
+        /// The exchange or subscription the frame names, in the key space
+        /// of [`Observation::PeerFrame`]'s `exchange`: header sync's
+        /// subscription ID. `None` for a frame whose message names none,
+        /// such as a status or a discovery message, whose exchanges run in
+        /// order on their stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
@@ -1832,6 +1839,32 @@ pub(crate) fn peer_transport_entries<'o>(
             matches!(
                 obs,
                 Observation::PeerTransport { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
+/// The entries the scripted peers' evidence logged in `observations`, in
+/// order: what [`crate::evidence::EvidenceKind::Peer`] covers. A run's peers
+/// share one checkpoint, so it names no instance.
+pub(crate) fn peer_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerFrame { .. }
+                    | Observation::PeerWritten { .. }
+                    | Observation::PeerReceived { .. }
+                    | Observation::PeerClosed { .. }
+                    | Observation::NodeFrame { .. }
+                    | Observation::FrameJudged { .. }
+                    | Observation::ConnectionClosed { .. }
+                    | Observation::Misbehavior { .. }
+                    | Observation::ActRan { .. }
+                    | Observation::ActSkipped { .. }
             )
         })
         .collect()

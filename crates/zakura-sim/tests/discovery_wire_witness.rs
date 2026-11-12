@@ -20,6 +20,7 @@ use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
+use zakura_sim::NaReason;
 use zakura_sim::{
     domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
@@ -275,7 +276,7 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
     for suffix in UNREACHED {
         assert_eq!(
             *outcome(report, &id(suffix)),
-            PropertyOutcome::NotApplicable,
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
             "{witness:?}: {suffix}"
         );
     }
@@ -590,6 +591,6 @@ fn late_response_admitted_applies_in_its_saved_plan() {
     assert_eq!(fault_closes(&report), Vec::<String>::new());
     assert_eq!(
         *outcome(&run(&WireScenario::default()), LATE_RESPONSE_ADMITTED),
-        PropertyOutcome::NotApplicable
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
 }

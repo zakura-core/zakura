@@ -35,6 +35,9 @@ use zakura_node_services::mempool::TransactionDependencies;
 use crate::methods::types::transaction::{CoinbaseResourceUsage, TransactionTemplate};
 
 #[cfg(test)]
+mod selection_benchmarks;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

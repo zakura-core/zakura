@@ -40,8 +40,19 @@ type EvictionCandidate = (
 /// Metadata and dependencies copied together on the first request after a mutation.
 pub(super) type MiningSnapshot = (Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>);
 
+/// An ancestor-package fee per cost, highest first, followed by the oldest
+/// insertion time and transaction hash.
+type MiningCandidate = (
+    Reverse<EvictionCost>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    transaction::Hash,
+);
+
 #[cfg(feature = "mempool-bench")]
 pub(super) mod benchmarks;
+
+#[cfg(test)]
+mod mining_tests;
 
 // Imports for doc links
 #[allow(unused_imports)]
@@ -83,6 +94,10 @@ pub struct VerifiedSet {
 
     /// One current eviction candidate per transaction, ordered cheapest first.
     eviction_order: BTreeSet<EvictionCandidate>,
+
+    /// One candidate per transaction, scored with its unconfirmed ancestors.
+    /// Higher fee per cost comes first, with older insertion times breaking ties.
+    mining_order: BTreeSet<MiningCandidate>,
 
     #[cfg(test)]
     eviction_score_evaluations: std::sync::atomic::AtomicUsize,
@@ -130,16 +145,19 @@ impl Drop for VerifiedSet {
 }
 
 impl VerifiedSet {
-    /// Returns immutable lists from the same verified-set revision.
+    /// Returns immutable lists from the same verified-set revision, with the
+    /// transactions in [`Self::mining_transactions`] order.
     pub fn mining_snapshot(&mut self) -> MiningSnapshot {
-        self.mining_snapshot
-            .get_or_insert_with(|| {
-                (
-                    Arc::new(self.transactions.values().cloned().collect()),
-                    Arc::new(self.transaction_dependencies.clone()),
-                )
-            })
-            .clone()
+        if let Some(snapshot) = &self.mining_snapshot {
+            return snapshot.clone();
+        }
+
+        let snapshot = (
+            Arc::new(self.mining_transactions().cloned().collect()),
+            Arc::new(self.transaction_dependencies.clone()),
+        );
+        self.mining_snapshot = Some(snapshot.clone());
+        snapshot
     }
 
     /// Returns the current shared lists only if a reader already requested them.
@@ -150,6 +168,18 @@ impl VerifiedSet {
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the set.
     pub fn transactions(&self) -> &HashMap<transaction::Hash, VerifiedUnminedTx> {
         &self.transactions
+    }
+
+    /// Returns transactions by descending ancestor-package fee per cost, then
+    /// ascending insertion time and TXID.
+    ///
+    /// Each package includes the transaction and all its distinct unconfirmed
+    /// ancestors. These are baseline scores before a template selects parents;
+    /// the ordering does not itself put parents before children.
+    pub(super) fn mining_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> {
+        self.mining_order
+            .iter()
+            .map(|(_, _, id)| &self.transactions[id])
     }
 
     /// Returns a reference to the [`TransactionDependencies`] in the set.
@@ -220,6 +250,7 @@ impl VerifiedSet {
         self.mining_snapshot = None;
         self.transactions.clear();
         self.eviction_order.clear();
+        self.mining_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
         self.sprout_nullifiers.clear();
@@ -292,7 +323,7 @@ impl VerifiedSet {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
         self.mining_snapshot = None;
         let affected = self.dependency_group(ancestors);
-        self.remove_eviction_candidates(&affected);
+        self.remove_ordering_candidates(&affected);
 
         let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
@@ -317,7 +348,7 @@ impl VerifiedSet {
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
-        self.insert_eviction_candidates(&self.dependency_group([tx_id]));
+        self.insert_ordering_candidates(&self.dependency_group([tx_id]));
 
         self.report_metrics();
 
@@ -442,27 +473,58 @@ impl VerifiedSet {
         )
     }
 
-    /// Removes a group's candidates before mutating transactions or dependencies.
-    fn remove_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+    /// Returns the mining candidate using all distinct unconfirmed ancestors.
+    fn mining_candidate(&self, id: transaction::Hash) -> MiningCandidate {
+        let parents = self
+            .transaction_dependencies
+            .dependencies()
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .copied();
+        let score = self
+            .ancestors(parents)
+            .iter()
+            .map(|ancestor| Self::eviction_cost(&self.transactions[ancestor]))
+            .fold(
+                Self::eviction_cost(&self.transactions[&id]),
+                EvictionCost::combine,
+            );
+        (Reverse(score), self.transactions[&id].time, id)
+    }
+
+    /// Removes a group's ordering entries before changing its transactions or
+    /// dependency edges.
+    fn remove_ordering_candidates(&mut self, group: &HashSet<transaction::Hash>) {
         let removed = HashSet::new();
         for &id in group {
-            let candidate = self.eviction_candidate(id, &removed);
+            let eviction = self.eviction_candidate(id, &removed);
+            let mining = self.mining_candidate(id);
             assert!(
-                self.eviction_order.remove(&candidate),
+                self.eviction_order.remove(&eviction),
                 "every stored transaction has its current eviction candidate"
+            );
+            assert!(
+                self.mining_order.remove(&mining),
+                "every stored transaction has its current mining candidate"
             );
         }
     }
 
-    /// Restores candidates for the group's survivors after a mutation.
-    fn insert_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+    /// Restores ordering entries for a group's survivors after a mutation.
+    fn insert_ordering_candidates(&mut self, group: &HashSet<transaction::Hash>) {
         let removed = HashSet::new();
         for &id in group {
             if self.transactions.contains_key(&id) {
-                let candidate = self.eviction_candidate(id, &removed);
+                let eviction = self.eviction_candidate(id, &removed);
+                let mining = self.mining_candidate(id);
                 assert!(
-                    self.eviction_order.insert(candidate),
-                    "a group's old candidates were removed before its mutation"
+                    self.eviction_order.insert(eviction),
+                    "a group's old eviction candidates were removed before its mutation"
+                );
+                assert!(
+                    self.mining_order.insert(mining),
+                    "a group's old mining candidates were removed before its mutation"
                 );
             }
         }
@@ -596,10 +658,10 @@ impl VerifiedSet {
             .filter(|id| self.transactions.contains_key(id))
             .flat_map(|&id| self.dependency_group([id]))
             .collect();
-        self.remove_eviction_candidates(&affected);
+        self.remove_ordering_candidates(&affected);
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
-        self.insert_eviction_candidates(&affected);
+        self.insert_ordering_candidates(&affected);
     }
 
     /// Removes the listed transactions and their descendants.
@@ -640,7 +702,7 @@ impl VerifiedSet {
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
         self.mining_snapshot = None;
         let affected = self.dependency_group([*key_to_remove]);
-        self.remove_eviction_candidates(&affected);
+        self.remove_ordering_candidates(&affected);
         let removed_transactions: Vec<_> = self
             .transaction_dependencies
             .remove_all(key_to_remove)
@@ -661,12 +723,12 @@ impl VerifiedSet {
             })
             .collect();
 
-        self.insert_eviction_candidates(&affected);
+        self.insert_ordering_candidates(&affected);
         self.report_metrics();
         removed_transactions
     }
 
-    /// Panics if any dependency group exceeds the admission limit.
+    /// Checks ordering-index consistency and the dependency-group bound.
     #[cfg(test)]
     pub(super) fn assert_dependency_groups_are_bounded(&self) {
         let removed = HashSet::new();
@@ -676,6 +738,12 @@ impl VerifiedSet {
             .map(|&id| self.eviction_candidate(id, &removed))
             .collect();
         assert_eq!(self.eviction_order, expected);
+        let expected: BTreeSet<_> = self
+            .transactions
+            .keys()
+            .map(|&id| self.mining_candidate(id))
+            .collect();
+        assert_eq!(self.mining_order, expected);
         for &start in self.transactions.keys() {
             let mut group = HashSet::new();
             let mut pending = vec![start];

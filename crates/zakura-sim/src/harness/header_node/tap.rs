@@ -34,8 +34,9 @@
 //! `ReactorGone`. A run that ends idle, or at its
 //! budget with a drain that ran dry, before that read fails as
 //! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
-//! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
-//! reports as inconclusive.
+//! stop honestly unfinished. That run ends as the harness failure
+//! `DrainBound`, so `header-sync/teardown-returns-baseline` keeps only the
+//! violations its steps found, and is otherwise `HarnessFailed`.
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
@@ -761,16 +762,15 @@ impl LiveEvidence for TapState {
     /// it still holds its observer, so its last events and the teardown
     /// checks haven't happened.
     ///
-    /// A budget end whose drain was cut off at its bound leaves the stop
-    /// honestly unfinished, which the teardown property reports as
-    /// inconclusive. Any other end means no task could run, yet the reactor
-    /// never let go.
+    /// A violation's ending stops the run before the stop could finish.
+    /// Any other end the run asks about ran dry, so no task could run, yet
+    /// the reactor never let go. A drain cut off at its bound is already a
+    /// harness failure, which the run doesn't ask about.
     fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
-        // A cut-off stop is the teardown property's to report, if one read
-        // the last drain's settlement.
-        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted)
-            && self.rounds.read_at(end.steps);
-        (!cut_off && self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
+        if end.outcome == Outcome::Violation {
+            return None;
+        }
+        (self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
             .then_some("ShutdownIncomplete: the run ended before the stopped reactor's task ended")
     }
 }
@@ -962,9 +962,9 @@ impl TapState {
         // deferred passes, taken events, watch reads, stored snapshots, the
         // reactor's and the service's sizes, completed targets, publisher
         // starts and ends, the queue's slots, cursor claims and acceptances
-        // and the subscriber's and publisher's containers and the serving
-        // reports stay out of the log, whose format pinned Plans fix, and a
-        // teardown's returns after the run are expected.
+        // and the subscriber's and publisher's containers, the serving
+        // reports and frame refusals stay out of the log, whose format pinned
+        // Plans fix, and a teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -982,6 +982,7 @@ impl TapState {
                 | ReactorEvent::PublisherServing { .. }
                 | ReactorEvent::PublicationChanged { .. }
                 | ReactorEvent::SessionAtCapacity { .. }
+                | ReactorEvent::FrameRefused { .. }
                 | ReactorEvent::ServingPeers { .. }
                 | ReactorEvent::ServingAcquired { .. }
                 | ReactorEvent::PublisherStarted { .. }
@@ -2236,6 +2237,17 @@ impl ActionSource for ReactorTap {
             Ok(()) => Ok(()),
             Err(error) => self.state.fail_after_claims(step, error),
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

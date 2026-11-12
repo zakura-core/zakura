@@ -1,4 +1,4 @@
-//! M1.5: a budget leaves an open liveness claim inconclusive, the drain
+//! M1.5: a drain cut off at its bound is a harness failure, the drain
 //! admits nothing external, and a violation ends the run at once.
 #![cfg(zakura_sim)]
 
@@ -12,8 +12,8 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::{self, FnChecker, Phase},
     sim::NO_LIVELOCK,
-    ActionSource, Boundary, Identity, NoChecks, Observation, ObservationLog, Outcome, Plan,
-    PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
+    ActionSource, Boundary, HarnessFailure, Identity, NoChecks, Observation, ObservationLog,
+    Outcome, Plan, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Violation,
 };
 
 /// A task that yields `n` times, then finishes.
@@ -24,29 +24,28 @@ async fn yields(n: u32) {
 }
 
 /// A checker for a liveness claim, "`done.1` finishes". It reports the claim
-/// held if the task exited, and inconclusive if the run ended at its budget
-/// first.
+/// held if the task exited, and violated otherwise.
 fn finishes() -> impl check::Checker {
     FnChecker::new(
         |_: &check::StepCtx<'_>| None,
-        |end: &RunEnd, log: &ObservationLog| {
+        |_: &RunEnd, log: &ObservationLog| {
             let exited = log.entries().iter().any(
                 |e| matches!(&e.obs, Observation::TaskExited { task, .. } if task == "done.1"),
             );
-            let outcome = match (exited, end.outcome) {
-                (true, _) => PropertyOutcome::Held { applicable: 1 },
-                (false, Outcome::Budget) => PropertyOutcome::Inconclusive {
-                    reason: "open at the budget".into(),
-                },
-                (false, _) => PropertyOutcome::Violated { witness: vec![] },
+            let outcome = match exited {
+                true => PropertyOutcome::Held { applicable: 1 },
+                false => PropertyOutcome::Violated { witness: vec![] },
             };
             vec![PropertyReport::new("test/done-finishes", outcome)]
         },
     )
 }
 
+/// #1840 rule 2: a drain cut off at its bound with a task still spinning,
+/// and nothing open, is a harness failure naming the task, never a budget
+/// end whose claims read as held.
 #[test]
-fn budget_open_obligation_inconclusive() {
+fn a_drain_cut_off_while_a_task_spins_is_drain_bound() {
     let config = RunConfig {
         drain_bound: 20,
         ..config(2, 10)
@@ -57,16 +56,36 @@ fn budget_open_obligation_inconclusive() {
         |sim| {
             sim.scheduler().spawn_root("done", yields(1_000));
         },
-        &mut finishes(),
+        &mut NoChecks,
     );
-    assert_eq!(report.end.outcome, Outcome::Budget);
+    assert_eq!(report.end.outcome, Outcome::Harness);
     let drain = report.end.drain.unwrap();
     assert!(drain.exhausted && drain.steps == 20);
     assert_eq!(report.end.steps, 30);
-    assert!(matches!(
+    assert!(
+        matches!(
+            &report.end.harness,
+            Some(HarnessFailure::DrainBound { open }) if open.starts_with("task:done.1:")
+        ),
+        "{:?}",
+        report.end.harness
+    );
+
+    // A closure checker's end-only violation is an end finding, so the
+    // harness failure drops it rather than blame the task it couldn't judge.
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("done", yields(1_000));
+        },
+        &mut finishes(),
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Inconclusive { .. }
-    ));
+        PropertyOutcome::not_applicable(zakura_sim::NaReason::HarnessFailed)
+    );
 
     // A task that finishes during the drain discharges the claim.
     let report = run(
@@ -97,6 +116,17 @@ impl ActionSource for Always {
 
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         self.0.set(self.0.get() + 1);
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -154,6 +184,234 @@ fn violation_stops_at_once() {
     assert_eq!(report.picks.len(), 5);
     assert_eq!(report.end.violation.unwrap().step, 5);
     assert!(report.log.entries().iter().all(|e| e.step <= 5));
+}
+
+/// A closure checker's step violation is a step finding, so a harness
+/// failure found after it, here a report naming a step past the run's end,
+/// keeps it `Violated`, whatever the end closure reports for the property:
+/// a bare `Violated`, one with an end finding of its own (Terra 5, round
+/// 2), or `HarnessFailed` itself.
+#[test]
+fn a_closure_step_violation_survives_a_late_harness_failure() {
+    let end_finding = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![5],
+            expected: "an end".into(),
+            actual: "the end".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![5] })
+    };
+    // The end closure reports the step's own violation again, as an end
+    // finding (Sol 2 and Terra 2, round 3).
+    let same_at_end = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![2, 5],
+            expected: "fewer steps".into(),
+            actual: "step 5".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::Violated {
+                witness: vec![2, 5],
+            },
+        )
+    };
+    for stop in [
+        PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::Violated {
+                witness: vec![2, 5],
+            },
+        ),
+        end_finding,
+        same_at_end,
+        PropertyReport::new(
+            "test/stop",
+            PropertyOutcome::not_applicable(zakura_sim::NaReason::HarnessFailed),
+        ),
+    ] {
+        let mut checker = FnChecker::new(
+            |cx: &check::StepCtx<'_>| {
+                (cx.step == 5).then(|| Violation {
+                    property: "test/stop".into(),
+                    step: cx.step,
+                    witness: vec![2, 5],
+                    expected: "fewer steps".into(),
+                    actual: "step 5".into(),
+                })
+            },
+            move |_: &RunEnd, _: &ObservationLog| {
+                let late = PropertyReport {
+                    holds_since: Some(1_000),
+                    ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
+                };
+                vec![stop.clone(), late]
+            },
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        assert!(matches!(
+            report.end.harness,
+            Some(HarnessFailure::HoldsSinceOutsideRun { .. })
+        ));
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated {
+                witness: vec![2, 5]
+            }
+        );
+    }
+}
+
+/// Terra 1, round 4: a report that retains a step violation says so, at an
+/// ordinary violation end too, whatever the end closure reported: `Held`,
+/// or `Violated` with an end finding's witness. The outcome's witness is
+/// the first retained violation's.
+#[test]
+fn a_closure_report_with_a_step_violation_is_violated_with_its_witness() {
+    let end_only = PropertyReport {
+        violations: vec![Violation {
+            property: "test/stop".into(),
+            step: 5,
+            witness: vec![5],
+            expected: "an end".into(),
+            actual: "the end".into(),
+        }],
+        end_found: 1,
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![5] })
+    };
+    for stop in [
+        PropertyReport::new("test/stop", PropertyOutcome::Held { applicable: 1 }),
+        end_only,
+    ] {
+        let mut checker = FnChecker::new(
+            |cx: &check::StepCtx<'_>| {
+                (cx.step == 5).then(|| Violation {
+                    property: "test/stop".into(),
+                    step: cx.step,
+                    witness: vec![2, 5],
+                    expected: "fewer steps".into(),
+                    actual: "step 5".into(),
+                })
+            },
+            move |_: &RunEnd, _: &ObservationLog| vec![stop.clone()],
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Violation);
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated {
+                witness: vec![2, 5]
+            }
+        );
+    }
+}
+
+/// Terra, round 9: a step violation survives a late harness failure even
+/// when the end closure reports nothing for its property, and the merged
+/// step findings keep the order they were found in, so an earlier step
+/// finding the end closure carries stays first and gives the witness.
+#[test]
+fn a_closure_merge_keeps_every_step_finding_in_order() {
+    let step = |at: u64, witness: Vec<u64>| Violation {
+        property: "test/stop".into(),
+        step: at,
+        witness,
+        expected: "fewer steps".into(),
+        actual: format!("step {at}"),
+    };
+    let late = || PropertyReport {
+        holds_since: Some(1_000),
+        ..PropertyReport::new("test/late", PropertyOutcome::Held { applicable: 1 })
+    };
+    let earlier = PropertyReport {
+        violations: vec![step(2, vec![2])],
+        ..PropertyReport::new("test/stop", PropertyOutcome::Violated { witness: vec![2] })
+    };
+    for (reports, witness) in [(vec![late()], vec![2, 5]), (vec![earlier, late()], vec![2])] {
+        let mut checker = FnChecker::new(
+            move |cx: &check::StepCtx<'_>| (cx.step == 5).then(|| step(5, vec![2, 5])),
+            move |_: &RunEnd, _: &ObservationLog| reports.clone(),
+        );
+        let report = run(
+            config(2, 1_000),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("a", yields(100));
+            },
+            &mut checker,
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        let stop = report
+            .properties
+            .iter()
+            .find(|p| p.property == "test/stop")
+            .expect("the step violation keeps a report");
+        assert_eq!(stop.outcome, PropertyOutcome::Violated { witness });
+        let steps: Vec<u64> = stop.violations.iter().map(|v| v.step).collect();
+        assert!(steps.windows(2).all(|w| w[0] <= w[1]), "{steps:?}");
+        assert_eq!(stop.end_found, 0);
+    }
+}
+
+/// Sol 2, round 2: a report's end finding that names a step outside the
+/// run is dropped as a harness failure, and the step finding before it
+/// stays, so the trim's count of end findings follows what's left.
+#[test]
+fn a_dropped_end_finding_leaves_the_step_finding() {
+    let finding = |step: u64, witness: Vec<u64>| Violation {
+        property: "test/two".into(),
+        step,
+        witness,
+        expected: "nothing".into(),
+        actual: "something".into(),
+    };
+    let mut checker = FnChecker::new(
+        |_: &check::StepCtx<'_>| None,
+        move |_: &RunEnd, _: &ObservationLog| {
+            vec![PropertyReport {
+                violations: vec![finding(2, vec![2]), finding(99_999, vec![99_999])],
+                end_found: 1,
+                ..PropertyReport::new("test/two", PropertyOutcome::Violated { witness: vec![2] })
+            }]
+        },
+    );
+    let report = run(
+        config(2, 1_000),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("a", yields(5));
+        },
+        &mut checker,
+    );
+    assert!(matches!(
+        report.end.harness,
+        Some(HarnessFailure::EvidenceOutsideRun { step: 99_999, .. })
+    ));
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Violated { witness: vec![2] }
+    );
 }
 
 #[test]
@@ -393,6 +651,17 @@ impl ActionSource for WaitsOnDrop {
     fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
     fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {}
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Drop for WaitsOnDrop {

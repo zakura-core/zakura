@@ -266,6 +266,7 @@ fn hand_built_scenarios_round_trip() {
                     deadline_ms: None,
                 }],
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: vec![step(
                 "mirror-1",

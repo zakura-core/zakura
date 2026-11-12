@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 43cd9b5124..8f088701c7 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1110,6 +1110,12 @@ impl HeaderSyncReactor {
+             self.startup.config.unproductive_peer_cooldown,
+             self.admitted_peer_limit(),
+         );
++        // Planted: a departed peer's readmission pause outlasts the
++        // configured cooldown by a century.
++        self.state.unproductive_peer_cooldowns.insert(
++            peer.clone(),
++            Instant::now() + std::time::Duration::from_secs(u64::from(u32::MAX)),
++        );
+         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
+             self.retry_vct_repair(
+                 owner,

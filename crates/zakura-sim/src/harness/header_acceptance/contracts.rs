@@ -22,8 +22,8 @@ pub enum ContractId {
     C4,
     /// Build provenance for every execution.
     C5,
-    /// The witness judge rejects unrelated `Inconclusive` and judges nested
-    /// sets.
+    /// The witness judge rejects an unrelated incomplete `NotApplicable` and
+    /// judges nested sets.
     C6,
     /// Trigger histories.
     C7,
@@ -322,16 +322,10 @@ const C16_PROVING: &[TestRef] = &[
 ];
 
 /// C20's proving tests.
-const C20_PROVING: &[TestRef] = &[
-    sim_test(
-        "tests/header_acceptance.rs",
-        "the_not_applicable_inventory_equals_a_source_scan",
-    ),
-    sim_test(
-        "tests/header_acceptance.rs",
-        "the_source_scan_refuses_an_unlisted_producer",
-    ),
-];
+const C20_PROVING: &[TestRef] = &[sim_test(
+    "tests/header_acceptance.rs",
+    "the_not_applicable_inventory_lists_every_reason",
+)];
 
 /// A contract that waits for `delivery`, with no proving test yet.
 const fn blocked(
@@ -400,7 +394,8 @@ pub fn contract_table() -> Vec<Contract> {
         blocked(
             C6,
             "Evan",
-            "The witness judge rejects any unrelated Inconclusive or missing report, and \
+            "The witness judge rejects any unrelated NotApplicable whose reason isn't benign, \
+             except StoppedByViolation under the expected stop, or a missing report, and \
              judges a nested case's exact set in both runs, each nested finding from the \
              case's own break: the same peer and the same punished event or frame.",
             "E2",
@@ -506,8 +501,8 @@ pub fn contract_table() -> Vec<Contract> {
         Contract {
             id: C20,
             owner: "Adam's harness",
-            statement: "NA_REASONS lists every NotApplicable a header check or the registry \
-                        constructs, and a source scan finds none outside it.",
+            statement: "NA_REASONS and NOT_HEADER together list every NaReason, each once, and \
+                        NA_REASONS each reason a header ID's report can carry.",
             proving: C20_PROVING,
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",

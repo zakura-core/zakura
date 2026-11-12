@@ -1158,17 +1158,19 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             Task::History {
                 expected,
                 harness,
+                property,
+                expect,
                 package,
                 file,
                 test,
                 case,
-                ..
             } => Actual::Run(history_execution(
                 &dir,
                 history_of(expected)
                     .expect("a history task's result names its history")
                     .clone(),
                 harness,
+                (property, expect.as_deref()),
                 (package, file, test, case),
                 subject_source,
             )),
@@ -1417,17 +1419,33 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
 /// package, file, name and case) must have passed at S from a binary
 /// embedding S, and declared the history once ([`declaration`]); then
 /// `dir/run`, S's recording of that declaration, must bind to it (C18) and
-/// come from S's build.
+/// come from S's build. Its trigger comes only from a `witness.json` that
+/// judges the task's own `witness`, its property and expectation, as a
+/// planted run's must ([`CaseChecks::planted`]): one judging another
+/// property or expectation fails the run, and a task with no expectation
+/// shows no trigger.
 fn history_execution(
     dir: &Path,
     run: RunId,
     harness: &str,
+    witness: (&str, Option<&str>),
     test: (&str, &str, &str, &str),
     subject_source: &str,
 ) -> Execution {
     let (package, file, name, case) = test;
     let recording = dir.join("run");
     let mut execution = execution(&recording, run, harness, RunBy::Tool);
+    match witness {
+        (property, Some(expect)) if !witness_judges(&recording, property, expect) => {
+            execution.trigger = false;
+            fail(
+                &mut execution,
+                format!("its witness file doesn't judge {property} expecting {expect}"),
+            );
+        }
+        (_, None) => execution.trigger = false,
+        _ => {}
+    }
     let passed = read_json::<TestRun>(&dir.join(TEST_FILE)).is_some_and(|ran| {
         ran.package == package
             && ran.file == file
@@ -3706,6 +3724,70 @@ mod tests {
                 end["harness"] = Value::String(failure.to_owned());
             }
         });
+    }
+
+    /// Writes into `dir` what the runner leaves for a history task whose
+    /// test `test` declared [`storage_history`] as `plan 0`: the test's
+    /// passing artifact from a binary embedding `s`, its declaration, and
+    /// S's recording of it in `dir/run` with `witness` as its witness file.
+    fn history_task_dir(dir: &Path, witness: Option<Value>) {
+        declare_and_record(dir, "test", "plan 0", "s", None);
+        fs::rename(dir.join("history"), dir.join("run")).expect("the temp dir is writable");
+        let ran = TestRun {
+            package: "zakura-sim".into(),
+            file: "tests/header_node.rs".into(),
+            tests: vec![("test".into(), "ok".into())],
+            killed: false,
+            exited_ok: true,
+            log: String::new(),
+            binary_source: Some("s".into()),
+            checkout_source: Some("s".into()),
+        };
+        fs::write(
+            dir.join(TEST_FILE),
+            serde_json::to_string(&ran).expect("a test run serializes"),
+        )
+        .expect("the temp dir is writable");
+        if let Some(witness) = witness {
+            fs::write(dir.join("run/witness.json"), witness.to_string())
+                .expect("the temp dir is writable");
+        }
+    }
+
+    /// A history's trigger comes only from a witness file judging the
+    /// task's own property and expectation. One a single field off, its
+    /// property or its expectation, fails the run and shows no trigger, and
+    /// a task with no expectation shows none from a stray passing file.
+    #[test]
+    fn a_history_s_trigger_comes_from_its_own_witness() {
+        let read = |witness: Value, expect: Option<&str>| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            history_task_dir(dir.path(), Some(witness));
+            history_execution(
+                dir.path(),
+                history_run(),
+                NODE,
+                ("p/a", expect),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        let judged = |property: &str, expect: &str| serde_json::json!({ "property": property, "expect": expect, "passed": true });
+        let own = read(judged("p/a", "holds"), Some("holds"));
+        assert!(own.trigger, "{:?}", own.end);
+        assert!(!matches!(own.end, End::Failed { .. }), "{:?}", own.end);
+        for other in [judged("p/b", "holds"), judged("p/a", "applicable")] {
+            let run = read(other.clone(), Some("holds"));
+            assert!(!run.trigger, "{other}");
+            assert!(
+                matches!(&run.end, End::Failed { why } if why.contains("doesn't judge p/a")),
+                "{other}: {:?}",
+                run.end
+            );
+        }
+        let unexpected = read(judged("p/a", "holds"), None);
+        assert!(!unexpected.trigger);
+        assert!(!matches!(unexpected.end, End::Failed { .. }));
     }
 
     /// Each integrity run's end is read from its test artifact: passing

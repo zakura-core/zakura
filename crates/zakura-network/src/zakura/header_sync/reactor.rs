@@ -3558,5 +3558,5 @@ pub use machine_tests::{
     HeaderReactorView,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;

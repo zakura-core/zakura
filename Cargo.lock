@@ -2890,6 +2890,7 @@ dependencies = [
  "zakura-orchard",
  "zakura-primitives",
  "zakura-protocol",
+ "zakura-rt",
  "zakura-sapling-crypto",
  "zakura-script",
  "zakura-state",

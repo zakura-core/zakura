@@ -2059,7 +2059,10 @@ async fn mempool_publishes_the_work_of_a_new_block_before_doing_it() -> Result<(
 
     let block2: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    // The mempool never held block 2's coinbase, so its outputs are not counted.
+    // The block's spends and nullifiers are counted exactly. Its held outputs are estimated
+    // without looking its transactions up: at most one of its one transaction is held, at the
+    // held average of one output each.
+    let estimated_held_outputs = block2.transactions.len().min(3);
     let block_parts: usize = block2
         .transactions
         .iter()
@@ -2070,7 +2073,8 @@ async fn mempool_publishes_the_work_of_a_new_block_before_doing_it() -> Result<(
                 + tx.orchard_nullifiers().count()
                 + tx.ironwood_nullifiers().count()
         })
-        .sum();
+        .sum::<usize>()
+        + estimated_held_outputs;
     let expected = MempoolTipWork {
         mempool_transactions: 3,
         block_parts,

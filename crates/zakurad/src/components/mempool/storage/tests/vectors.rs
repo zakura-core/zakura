@@ -808,11 +808,11 @@ fn benchmark_mempool_txid_lookup() {
     }
 }
 
-/// A block's transparent outputs count as work only for the transactions the mempool held,
-/// since it never touches the outputs of the others. A block with many outputs from
-/// transactions the mempool never held is light work for a mempool that holds little.
+/// A block's transparent outputs count as work only up to what the transactions the mempool
+/// held create, since it never touches the outputs of the others. A block with many outputs
+/// from transactions the mempool never held is light work for a mempool that holds little.
 #[test]
-fn tip_work_counts_block_outputs_only_for_transactions_the_mempool_held() -> Result<()> {
+fn tip_work_counts_block_outputs_only_up_to_what_the_mempool_held() -> Result<()> {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = Storage::new(&Config::default());
@@ -838,16 +838,20 @@ fn tip_work_counts_block_outputs_only_for_transactions_the_mempool_held() -> Res
             + tx.ironwood_nullifiers().count()
     };
 
-    let work = storage.tip_work(&[never_held.hash()], std::slice::from_ref(&never_held));
-    assert_eq!(work.block_parts, checked_parts(&never_held));
+    // The estimate is bounded by the held transaction's 3 outputs, not the block's 60,000.
+    let work = storage.tip_work(std::slice::from_ref(&never_held));
+    assert_eq!(
+        work.block_parts,
+        checked_parts(&never_held) + held_tx.outputs().len()
+    );
     assert!(
         work.work() < 10,
         "60,000 outputs the mempool never held are not work: {work:?}"
     );
 
-    // The held transaction's outputs are counted when the block mines it.
+    // However many block transactions there are, at most the held one is counted.
     let block = [held_tx.clone(), never_held.clone()];
-    let work = storage.tip_work(&[held_tx.hash(), never_held.hash()], &block);
+    let work = storage.tip_work(&block);
     assert_eq!(
         work.block_parts,
         checked_parts(&held_tx) + checked_parts(&never_held) + held_tx.outputs().len()

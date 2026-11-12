@@ -798,9 +798,7 @@ impl Mempool {
         };
         let (tip_hash, _height) = tip_action.best_tip_hash_and_height();
         let work = match tip_action {
-            TipAction::Grow { block } => {
-                storage.tip_work(&block.transaction_hashes, &block.transactions)
-            }
+            TipAction::Grow { block } => storage.tip_work(&block.transactions),
             TipAction::Reset { .. } => MempoolTipWork::default(),
         };
         self.snapshot_sender.start_tip(tip_hash, work);

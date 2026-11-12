@@ -177,7 +177,7 @@ impl VerifiedSet {
     /// block: the transparent outputs they spend and the nullifiers they reveal.
     ///
     /// The outputs they create are not counted: a block only touches the outputs of the
-    /// transactions it mines, which [`Self::held_output_parts`] counts.
+    /// transactions it mines (see [`Self::created_output_count`]).
     pub fn scanned_parts(&self) -> usize {
         self.spent_outpoints.len()
             + self.sprout_nullifiers.len()
@@ -186,20 +186,10 @@ impl VerifiedSet {
             + self.ironwood_nullifiers.len()
     }
 
-    /// Returns the number of transparent outputs created by the transactions in `mined_ids`
-    /// that the set holds: the outputs it removes one by one when a block mines them.
-    ///
-    /// A mined transaction the set does not hold costs nothing here, however many outputs it
-    /// creates.
-    pub fn held_output_parts<'a>(
-        &self,
-        mined_ids: impl IntoIterator<Item = &'a transaction::Hash>,
-    ) -> usize {
-        mined_ids
-            .into_iter()
-            .filter_map(|id| self.transactions.get(id))
-            .map(|tx| tx.transaction.transaction().outputs().len())
-            .sum()
+    /// Returns the number of transparent outputs created by the transactions in the set:
+    /// the outputs it removes one by one when a block mines those transactions.
+    pub fn created_output_count(&self) -> usize {
+        self.created_outputs.len()
     }
 
     /// Returns the total cost of the verified transactions in the set.

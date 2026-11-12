@@ -86,8 +86,10 @@ pub struct MempoolTipWork {
     /// which the mempool collects to check its transactions against, and the outputs created
     /// by the block's transactions that the mempool held, which it removes with them.
     ///
-    /// Outputs created by transactions the mempool never held are not counted: it never
-    /// touches them, so a block with many such outputs is not reported as heavy work.
+    /// The held outputs are estimated: at most as many block transactions as the mempool
+    /// holds, each creating the average outputs of a held transaction. Outputs created by
+    /// transactions the mempool never held are not counted, so a block with many such outputs
+    /// is not reported as heavy work.
     pub block_parts: usize,
 
     /// The transparent outputs the mempool's transactions spend, and the nullifiers they

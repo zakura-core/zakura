@@ -64,6 +64,9 @@ use crate::{
 mod tests;
 
 mod recent_by_ip;
+mod unconditional_peers;
+
+use unconditional_peers::{keep_unconditional_peers_connected, unconditional_peer_dial_addrs};
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
 ///
@@ -341,7 +344,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
-            .with_peer_registry(peer_registry)
+            .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
@@ -413,7 +416,7 @@ where
     ];
 
     if let Some(tcp_listener) = tcp_listener {
-        // Connect peerset_tx to the 3 peer sources:
+        // Connect peerset_tx to the 4 peer sources:
         //
         // 1. Incoming peer connections, via a listener.
         let listen_fut = accept_inbound_connections(
@@ -429,7 +432,22 @@ where
             listen_fut.in_current_span(),
         ))));
 
-        // 2. Initial peers, specified in the config and cached on disk.
+        // 2. Unconditional peers, which are dialed again whenever they are not connected.
+        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
+        if !unconditional_dial_addrs.is_empty() {
+            let unconditional_peers_fut = keep_unconditional_peers_connected(
+                config.clone(),
+                unconditional_dial_addrs,
+                peer_registry,
+                outbound_connector.clone(),
+                peerset_tx.clone(),
+            );
+            task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
+                unconditional_peers_fut.in_current_span(),
+            ))));
+        }
+
+        // 3. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
             config.clone(),
             outbound_connector.clone(),
@@ -439,7 +457,7 @@ where
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
 
-        // 3. Outgoing peers we connect to in response to load.
+        // 4. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count

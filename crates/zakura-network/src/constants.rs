@@ -258,6 +258,27 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 /// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
 pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How often Zakura checks whether each dialed unconditional peer is still connected.
+///
+/// A peer that is no longer connected is dialed again within this interval, unless it
+/// is waiting out a redial delay.
+pub const UNCONDITIONAL_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The shortest delay between two dials to the same unconditional peer.
+///
+/// Each further dial that does not lead to a lasting connection doubles the delay, up to
+/// [`MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`].
+pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest delay between two dials to the same unconditional peer, before jitter.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(60);
+
+/// How long a connection to an unconditional peer must last to reset its redial delay.
+///
+/// A peer that keeps dropping new connections is dialed at the maximum delay, instead of
+/// in a tight loop.
+pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
+
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
 ///

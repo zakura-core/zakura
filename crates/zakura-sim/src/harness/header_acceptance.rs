@@ -293,6 +293,11 @@ pub enum Expected {
         companions: &'static [&'static str],
         /// Other properties of the harness expected `NotApplicable`.
         not_applicable: &'static [ExpectedNa],
+        /// The same for the patched build's completed runs, its `Draft` run
+        /// and a patched run found at the end, where they differ: those go
+        /// on past the break, so they can apply other IDs or never reach
+        /// some the baseline applies. `None` means `not_applicable`.
+        patched_not_applicable: Option<&'static [ExpectedNa]>,
     },
     /// A machine harness's planted case: the baseline holds and the patched
     /// run violates exactly the machine's ID.

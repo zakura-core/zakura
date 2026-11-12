@@ -35,7 +35,7 @@ use zakura_sim::{
         StorageResult, TransportFact,
     },
     peer::{
-        adversary::{Act, ContentRule},
+        adversary::{Act, ContentRule, CursorField, Row},
         honest::HonestSpec,
         peer_addr, PeerAction, PeerSpec, NODE_ADDR,
     },
@@ -898,6 +898,25 @@ fn over_credit_objects_eager_delivery_holds_no_livelock() {
     assert_eq!(report.end.violation, None, "{:?}", report.end);
 }
 
+/// The saved acts that are planted cases' inputs for the `<label>-closes`
+/// ID their frame reaches, under `qa/planted/header-sync/s5v9/` (hdr-14.5).
+const CLOSES_CAUGHT: [Act; 9] = [
+    Act::UndeclaredType { message_type: 0 },
+    Act::ReservedFlags {
+        row: Row::Status,
+        bit: 0,
+    },
+    Act::ShortPayload { row: Row::Status },
+    Act::LongPayload { row: Row::Status },
+    Act::Unsolicited { row: Row::Headers },
+    Act::OverCreditHeader,
+    Act::OverLive,
+    Act::AfterClose,
+    Act::BadCursor {
+        field: CursorField::Hash,
+    },
+];
+
 /// Rewrites every saved Plan: its input, its sidecar and its end record.
 /// The honest sync's Plan is the first of M5.1's 64 inputs. Each act's is
 /// the default Plan, the one M5-E1's action test runs, and so is the
@@ -920,9 +939,10 @@ fn regenerate_saved_plans() {
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        // The progress fixture, honest sync and the three refused-page acts
-        // are planted cases' inputs, which `cargo xtask planted` records as witnesses
-        // expecting a hold.
+        // The progress fixture, honest sync, the three refused-page acts and
+        // the acts whose `<label>-closes` ID a planted case catches on them
+        // are planted cases' inputs, which `cargo xtask planted` records as
+        // witnesses expecting a hold.
         let holds = |property: &str| {
             format!("\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n")
         };
@@ -935,6 +955,14 @@ fn regenerate_saved_plans() {
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
             SavedPlan::HonestSync => holds(HONEST_NEVER_PUNISHED),
+            SavedPlan::Act(act) if CLOSES_CAUGHT.contains(&act) => {
+                let row = if act.label() == Label::OverCredit {
+                    "subscribe-headers"
+                } else {
+                    act.row().name()
+                };
+                holds(&judging(act.label(), row))
+            }
             SavedPlan::Act(_) => String::new(),
         };
         let sidecar = format!(

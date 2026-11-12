@@ -366,3 +366,34 @@ fn every_block_has_words() {
     let blocked = owned_run_passes(&end, &registered(), &RunExpect::Passes).unwrap_err();
     assert_eq!(blocked.to_string(), "cleanup `leaked` is 2");
 }
+
+/// The first difference between two records names its path, so a record
+/// from another run, or another run's result file, is refused with where
+/// they differ.
+#[test]
+fn a_record_differs_from_another_run_at_a_named_path() {
+    use zakura_sim::sim_acceptance::header::first_difference;
+    let published = json!({
+        "subject": "s", "artifacts": "runs/a",
+        "verified": [{ "key": "k1", "links": ["runs/a/1"] }], "stray": [],
+    });
+    assert_eq!(first_difference(&published, &published.clone()), None);
+    let mut other_run = published.clone();
+    other_run["verified"][0]["links"][0] = json!("runs/b/1");
+    assert_eq!(
+        first_difference(&published, &other_run).as_deref(),
+        Some("verified.0.links.0")
+    );
+    let mut shorter = published.clone();
+    shorter["verified"] = json!([]);
+    assert_eq!(
+        first_difference(&published, &shorter).as_deref(),
+        Some("verified.0")
+    );
+    let mut extra = published.clone();
+    extra["blocked"] = json!([]);
+    assert_eq!(
+        first_difference(&published, &extra).as_deref(),
+        Some("blocked")
+    );
+}

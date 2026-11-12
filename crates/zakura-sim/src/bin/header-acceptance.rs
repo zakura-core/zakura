@@ -6,12 +6,15 @@
 //! header-acceptance evaluate --repo <dir> --plan <plan.json> --artifacts <dir>
 //!     --subject <commit> --subject-source <digest> --run-id <id>
 //!     --containment <subreaper|best-effort> --out <dir>
+//! header-acceptance verify --repo <dir> --plan <plan.json> --artifacts <dir>
+//!     --run-id <id> --subject-source <digest> --record <record.json> --out <dir>
 //! ```
 //!
 //! `plan` writes the tasks xtask runs. `evaluate` reads their artifacts,
 //! writes `results.json` and `record.json` under `--out`, and prints the
 //! record's counts. It exits 0 whether or not acceptance passes, since the
-//! record says which.
+//! record says which. `verify` rebuilds a published record from its run's
+//! plan and artifacts and exits 0 only if it's the same record (sim-7.4).
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 
@@ -47,7 +50,10 @@ mod cli {
     const USAGE: &str = "usage: header-acceptance plan --repo <dir> --out <plan.json>\n       \
                          header-acceptance evaluate --repo <dir> --plan <plan.json> \
                          --artifacts <dir> --subject <commit> --subject-source <digest> \
-                         --run-id <id> --containment <subreaper|best-effort> --out <dir>";
+                         --run-id <id> --containment <subreaper|best-effort> --out <dir>\n       \
+                         header-acceptance verify --repo <dir> --plan <plan.json> \
+                         --artifacts <dir> --run-id <id> --subject-source <digest> \
+                         --record <record.json> --out <dir>";
 
     /// Reads `--flag value` pairs, refusing an unknown or repeated flag.
     fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
@@ -140,6 +146,44 @@ mod cli {
                     record.stray.len(),
                     record.accepted
                 );
+                Ok(())
+            }
+            "verify" => {
+                let flags = flags(
+                    rest,
+                    &[
+                        "--repo",
+                        "--plan",
+                        "--artifacts",
+                        "--run-id",
+                        "--subject-source",
+                        "--record",
+                        "--out",
+                    ],
+                )?;
+                let read = |flag: &str| {
+                    fs::read_to_string(&flags[flag]).map_err(|e| format!("{}: {e}", flags[flag]))
+                };
+                let plan: RunPlan = serde_json::from_str(&read("--plan")?)
+                    .map_err(|e| format!("{}: {e}", flags["--plan"]))?;
+                let record: tool::Record = serde_json::from_str(&read("--record")?)
+                    .map_err(|e| format!("{}: {e}", flags["--record"]))?;
+                let (artifacts, out) = (
+                    PathBuf::from(&flags["--artifacts"]),
+                    PathBuf::from(&flags["--out"]),
+                );
+                zakura_sim::sim_acceptance::header::verify(
+                    &PathBuf::from(&flags["--repo"]),
+                    &zakura_sim::sim_acceptance::header::Published {
+                        plan: &plan,
+                        artifacts: &artifacts,
+                        out: &out,
+                        run_id: &flags["--run-id"],
+                        subject_source: &flags["--subject-source"],
+                        record: &record,
+                    },
+                )?;
+                println!("subject {}: the record matches its run", record.subject);
                 Ok(())
             }
             _ => Err(USAGE.to_owned()),

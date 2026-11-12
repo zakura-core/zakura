@@ -18,7 +18,7 @@ use zakura_sim::{
         self,
         header_acceptance::{
             contracts::RunBy,
-            evaluate::Actual,
+            evaluate::{Actual, End},
             sim_test,
             tool::{self, ReplayRun, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
             HistoryRef, RunId,
@@ -163,6 +163,95 @@ fn a_changed_stored_fact_fails_the_replay_comparison() {
     replay(dir.path());
     let (exact, _, stores_equal, _) = read(dir.path());
     assert!(!exact && !stores_equal);
+}
+
+/// Gate 1's full-report binding control: runs A and B, one mirror serving
+/// the same fork shape on two fixture branches, have the same outcomes and
+/// different stores. Each reads back as itself. With A's
+/// recording and replay reports copied beside B's trace and B's own
+/// successful replay log, B's recording reads as no run and its replay's
+/// reports don't compare, and so with only the replay's report swapped. A
+/// report that names no trace is no report of B's either.
+#[test]
+fn another_run_s_full_reports_beside_a_trace_are_refused() {
+    let plan = tempfile::tempdir().expect("a temp dir can be created");
+    let plan = plan.path().join("plan.bin");
+    std::fs::write(&plan, b"").expect("the temp dir is writable");
+    let recorded = |branch: u8| {
+        let scenario = serde_json::json!({
+            "controls": [],
+            "mirrors": [{
+                "chain": {"main": 2, "fork": {"branch": branch, "len": 3}},
+                "dialer": "mirror",
+            }],
+            "node": {"main": 0, "fork": null},
+            "policy": {"base": "success-only", "bound_ms": 5000, "holds": []},
+        })
+        .to_string();
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let (ok, log) = sim(&[
+            "record",
+            "--sim",
+            "header-sync/storage",
+            "--scenario",
+            &scenario,
+            "--plan",
+            plan.to_str().expect("the path is UTF-8"),
+            "--out",
+            dir.path().to_str().expect("the path is UTF-8"),
+        ]);
+        assert!(ok, "{log}");
+        replay(dir.path());
+        dir
+    };
+    let full = |dir: &Path| -> FullReport {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.join(FULL_REPORT_FILE)).expect("the report exists"),
+        )
+        .expect("it reads")
+    };
+    let outcomes = |report: &FullReport| -> Vec<(String, zakura_sim::PropertyOutcome)> {
+        report
+            .properties
+            .iter()
+            .map(|found| (found.property.clone(), found.outcome.clone()))
+            .collect()
+    };
+    let execution =
+        |dir: &Path| tool::read_execution(dir, history(), "header-sync/storage", RunBy::Tool).end;
+    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let a = recorded(1);
+    let b = recorded(2);
+    let (a_full, b_full) = (full(a.path()), full(b.path()));
+    assert_eq!(outcomes(&a_full), outcomes(&b_full));
+    assert_ne!(a_full.snapshot, b_full.snapshot);
+    for dir in [a.path(), b.path()] {
+        assert!(!matches!(execution(dir), End::Failed { .. }), "{dir:?}");
+        assert_eq!(read(dir), (true, true, true, true), "{dir:?}");
+    }
+
+    let copy = |from: &Path, to: &Path| std::fs::copy(from, to).map(|_| ()).expect("it copies");
+    let refused =
+        |end: End| matches!(end, End::Failed { why } if why.contains("isn't a report of"));
+    copy(
+        &a.path().join(FULL_REPORT_FILE),
+        &b.path().join(FULL_REPORT_FILE),
+    );
+    let replayed = |dir: &Path| dir.join(REPLAY_DIR).join(FULL_REPORT_FILE);
+    copy(&replayed(a.path()), &replayed(b.path()));
+    assert!(refused(execution(b.path())));
+    assert_eq!(read(b.path()), (true, false, false, true));
+
+    let b = recorded(2);
+    copy(&replayed(a.path()), &replayed(b.path()));
+    assert!(!matches!(execution(b.path()), End::Failed { .. }));
+    assert_eq!(read(b.path()), (true, false, false, true));
+
+    let b = recorded(2);
+    edit_report(&b.path().join(FULL_REPORT_FILE), |report| {
+        report.trace = None
+    });
+    assert!(refused(execution(b.path())));
 }
 
 /// The runner contract's `record` arguments for a declared history record

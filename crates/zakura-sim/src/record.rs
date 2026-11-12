@@ -340,6 +340,10 @@ pub const FULL_REPORT_FILE: &str = "full-report.json";
 /// in report order, and the harness's evidence snapshot at the run's end.
 /// The `end` record keeps only outcomes, since violations grow with the
 /// run, so this is what a later judge reads instead of rerunning.
+///
+/// A harness sends it unbound. `record`, and a replay of a trace, bind it
+/// to the trace it reports ([`FullReport::of_trace`]), so a report written
+/// beside another run's trace names a trace that isn't there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FullReport {
@@ -348,10 +352,19 @@ pub struct FullReport {
     /// What [`crate::property::HasView::snapshot`] showed after the run's
     /// end and before shutdown, or `None` for a harness that keeps none.
     pub snapshot: Option<serde_json::Value>,
+    /// The ID of the trace it reports, the SHA-256 of that `trace.jsonl`
+    /// ([`Trace::id`](crate::trace::Trace::id)), or `None` while unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+    /// The source digest of the build that ran it
+    /// ([`BuildInfo::source`](crate::trace::meta::BuildInfo::source)), or
+    /// `None` while unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl FullReport {
-    /// The full report of `properties` and `snapshot`.
+    /// The full report of `properties` and `snapshot`, unbound.
     pub fn new(properties: &[PropertyReport], snapshot: Option<serde_json::Value>) -> Self {
         FullReport {
             properties: properties
@@ -364,6 +377,18 @@ impl FullReport {
                 })
                 .collect(),
             snapshot,
+            trace: None,
+            source: None,
+        }
+    }
+
+    /// This report bound to the trace whose ID is `trace`, as run by this
+    /// build.
+    pub fn of_trace(self, trace: &str) -> Self {
+        FullReport {
+            trace: Some(trace.to_owned()),
+            source: Some(crate::trace::meta::BuildInfo::current().source),
+            ..self
         }
     }
 

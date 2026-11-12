@@ -140,8 +140,10 @@ mod cli {
              whatever their status, as a planted case's Draft run does. The trace's\n\
              meta records them, and `replay` applies them too.\n\
              `record` writes the run's full report, every violation and the harness's\n\
-             evidence snapshot, to full-report.json beside the trace. `replay` compares its\n\
-             own with it, and `--report` writes the replay's to a file.\n\
+             evidence snapshot, to full-report.json beside the trace, naming that trace's\n\
+             digest and this build's source. `replay` compares its own with it, and\n\
+             `--report` writes the replay's, naming the replayed trace and this build's\n\
+             source, to a file.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\

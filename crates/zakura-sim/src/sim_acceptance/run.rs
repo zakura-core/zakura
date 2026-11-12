@@ -2066,11 +2066,7 @@ fn judge_target(
 
 /// Why the planted runner's own runs don't pass, if they don't. The case is
 /// sim-7's own, so each run must be of `harness` and passes through
-/// [`owned_run_passes`] by its role: the baseline, exactly once, holds; the patched run, exactly once,
-/// violates the case's property; each campaign input the runner's inventory
-/// lists ran exactly once, as a run that held or one the property's
-/// violation stopped; a replay is judged as the run it replays. No other
-/// role is allowed.
+/// [`owned_run_passes`]; [`planted_judged`] then judges each by its phase.
 fn planted_runs_refusal(
     dir: &Path,
     binding: &TaskBinding,
@@ -2088,7 +2084,7 @@ fn planted_runs_refusal(
         property: DISCOVERY_CASE.0.to_owned(),
         also: Vec::new(),
     };
-    let mut counted: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
+    let mut judged = Vec::with_capacity(runs.len());
     for run in runs {
         if run.harness != harness {
             return Some(format!("planted run {} isn't a run of {harness}", run.stem));
@@ -2097,27 +2093,63 @@ fn planted_runs_refusal(
             return Some(format!("{} isn't a harness at S", run.harness));
         };
         let registered = registered(entry);
-        let held = owned_run_passes(&run.end, &registered, &RunExpect::Passes);
-        let caught = owned_run_passes(&run.end, &registered, &violates);
-        let named = run.input.as_deref();
-        let in_campaign = named.is_some_and(|named| campaign.iter().any(|c| c == named));
-        let verdict = match run.phase.as_str() {
-            "baseline" | "patched" if named != Some(input) => {
+        judged.push(PlantedRun {
+            stem: &run.stem,
+            phase: &run.phase,
+            input: run.input.as_deref(),
+            held: owned_run_passes(&run.end, &registered, &RunExpect::Passes)
+                .map_err(|why| why.to_string()),
+            caught: owned_run_passes(&run.end, &registered, &violates)
+                .map_err(|why| why.to_string()),
+        });
+    }
+    planted_judged(&judged, input, &campaign)
+}
+
+/// One planted run, as [`planted_judged`] judges it.
+struct PlantedRun<'a> {
+    /// Its records' file stem.
+    stem: &'a str,
+    /// The planted runner's phase for it.
+    phase: &'a str,
+    /// The full input it ran, where its caller named it.
+    input: Option<&'a str>,
+    /// Whether it passed as a run whose properties held.
+    held: Result<(), String>,
+    /// Whether it passed as a run the case's property violated.
+    caught: Result<(), String>,
+}
+
+/// Why `runs` aren't the planted runner's runs of the case's `input` and
+/// its `campaign` inventory, if they aren't. The baseline and its fresh
+/// replay (`replay-baseline`) each hold, exactly once; the patched run and
+/// its fresh replay (`replay-patched`) each violate the case's property,
+/// exactly once; each listed campaign input ran as often as it's listed,
+/// as a run that held or one the violation stopped. No other phase is
+/// allowed.
+fn planted_judged(runs: &[PlantedRun<'_>], input: &str, campaign: &[String]) -> Option<String> {
+    const CASE_PHASES: [&str; 4] = ["baseline", "replay-baseline", "patched", "replay-patched"];
+    let mut counted: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
+    for run in runs {
+        let verdict = match run.phase {
+            phase if CASE_PHASES.contains(&phase) && run.input != Some(input) => {
                 return Some(format!(
                     "planted run {} isn't of the case's input",
                     run.stem
                 ));
             }
-            "baseline" => held,
-            "patched" => caught,
-            // The replay of the patched run must violate as it did.
-            "replay" if named == Some(input) => caught,
-            // A campaign run, or the replay of one that missed, holds or is
-            // stopped by the property's violation.
-            "campaign" | "replay" if in_campaign => held.or(caught),
-            "campaign" | "replay" => {
+            "baseline" | "replay-baseline" => run.held.clone(),
+            "patched" | "replay-patched" => run.caught.clone(),
+            "campaign"
+                if run
+                    .input
+                    .is_some_and(|named| campaign.iter().any(|c| c == named)) =>
+            {
+                run.held.clone().or_else(|_| run.caught.clone())
+            }
+            "campaign" => {
                 return Some(format!(
-                    "planted run {} isn't of the case's input or a listed campaign input",
+                    "planted run {} isn't of a listed campaign input",
                     run.stem
                 ));
             }
@@ -2131,19 +2163,18 @@ fn planted_runs_refusal(
         if let Err(why) = verdict {
             return Some(format!("planted {} run {}: {why}", run.phase, run.stem));
         }
-        *counted.entry((run.phase.as_str(), named)).or_default() += 1;
+        *counted.entry((run.phase, run.input)).or_default() += 1;
     }
     let count = |key: (&str, Option<&str>)| counted.get(&key).copied().unwrap_or(0);
-    // Exactly one baseline, one patched run and its one replay.
-    for role in ["baseline", "patched", "replay"] {
-        if count((role, Some(input))) != 1 {
+    for phase in CASE_PHASES {
+        if count((phase, Some(input))) != 1 {
             return Some(format!(
-                "the planted runner didn't make exactly one {role} run of the case's input"
+                "the planted runner didn't make exactly one {phase} run of the case's input"
             ));
         }
     }
     let mut wanted: BTreeMap<&str, usize> = BTreeMap::new();
-    for listed in &campaign {
+    for listed in campaign {
         *wanted.entry(listed.as_str()).or_default() += 1;
     }
     for (listed, want) in &wanted {
@@ -3073,6 +3104,57 @@ mod tests {
         std::fs::write(dir.path().join("lane.json"), file.to_string()).unwrap();
         assert!(super::runner_json(dir.path(), "lane.json", &binding("run-a")).is_some());
         assert!(super::runner_json(dir.path(), "lane.json", &binding("run-b")).is_none());
+    }
+
+    /// The planted runner's runs pass as it writes them: one baseline and
+    /// its replay that hold, one patched run and its replay that violate,
+    /// and each listed campaign input once. A replay of the wrong outcome,
+    /// a missing or doubled one, an old-style `replay`, or an unlisted
+    /// campaign input blocks.
+    #[test]
+    fn the_planted_runs_are_judged_by_phase() {
+        use super::{planted_judged, PlantedRun};
+        let run = |phase: &'static str, input: &'static str, holds: bool| PlantedRun {
+            stem: phase,
+            phase,
+            input: Some(input),
+            held: if holds {
+                Ok(())
+            } else {
+                Err("violated".to_owned())
+            },
+            caught: if holds {
+                Err("held".to_owned())
+            } else {
+                Ok(())
+            },
+        };
+        let campaign = ["c1".to_owned()];
+        let written = || {
+            vec![
+                run("baseline", "case", true),
+                run("replay-baseline", "case", true),
+                run("patched", "case", false),
+                run("replay-patched", "case", false),
+                run("campaign", "c1", true),
+            ]
+        };
+        assert_eq!(planted_judged(&written(), "case", &campaign), None);
+        let mut violated_baseline = written();
+        violated_baseline[1] = run("replay-baseline", "case", false);
+        assert!(planted_judged(&violated_baseline, "case", &campaign).is_some());
+        let mut missing = written();
+        missing.remove(3);
+        assert!(planted_judged(&missing, "case", &campaign).is_some());
+        let mut doubled = written();
+        doubled.push(run("replay-patched", "case", false));
+        assert!(planted_judged(&doubled, "case", &campaign).is_some());
+        let mut old_style = written();
+        old_style[3] = run("replay", "case", false);
+        assert!(planted_judged(&old_style, "case", &campaign).is_some());
+        let mut unlisted = written();
+        unlisted[4] = run("campaign", "c2", true);
+        assert!(planted_judged(&unlisted, "case", &campaign).is_some());
     }
 
     /// An artifact tree holding a link isn't read.

@@ -995,7 +995,12 @@ fn check_case(
     }
     // The baseline replays fresh with its own binary too (C4), so the
     // acceptance tool reads both of the case's runs with their replays.
-    if let Some(why) = replay_misses(baseline_binary, &scratch.join("baseline"), RUN_DEADLINE)? {
+    if let Some(why) = replay_misses(
+        baseline_binary,
+        &scratch.join("baseline"),
+        RUN_DEADLINE,
+        "replay-baseline",
+    )? {
         return Ok(Verdict::BaselineFails(format!(
             "its trace doesn't replay Exact: {why}"
         )));
@@ -1088,7 +1093,9 @@ fn judge_patched(
         )?,
         verdict => return Ok(verdict),
     };
-    fresh_replay(verdict, || replay_misses(zakura_sim, &trace, deadline))
+    fresh_replay(verdict, || {
+        replay_misses(zakura_sim, &trace, deadline, "replay-patched")
+    })
 }
 
 impl Case {
@@ -1559,11 +1566,13 @@ const REPLAY_FILE: &str = "replay.json";
 /// it did. The replay writes its full report to `<trace>/replay/`, beside
 /// `replay.json`, its child's end and output, which the acceptance tool
 /// reads as the run's fresh replay (C4, C8). A replay past `deadline` is
-/// killed and misses.
+/// killed and misses. `phase` names it to sim-7's acceptance tool
+/// ([`in_phase`]) as the replay of the baseline or of the patched run.
 fn replay_misses(
     zakura_sim: &Path,
     trace: &Path,
     deadline: Duration,
+    phase: &str,
 ) -> Result<Option<String>, BoxError> {
     let dir = trace.join(REPLAY_DIR);
     if dir.exists() {
@@ -1571,7 +1580,7 @@ fn replay_misses(
     }
     fs::create_dir_all(&dir)?;
     let log = dir.join("replay.log");
-    let mut replay = in_phase(Command::new(zakura_sim), "replay");
+    let mut replay = in_phase(Command::new(zakura_sim), phase);
     replay
         .arg("replay")
         .arg(trace)
@@ -2946,19 +2955,24 @@ mod tests {
         let matched = fake("matched", "test \"$1\" = replay || exit 2");
         let missed = fake("missed", "echo 'pick 3 differs' >&2; exit 1");
         assert_eq!(
-            replay_misses(&matched, dir.path(), RUN_DEADLINE).unwrap(),
+            replay_misses(&matched, dir.path(), RUN_DEADLINE, "replay-patched").unwrap(),
             None
         );
-        let why = replay_misses(&missed, dir.path(), RUN_DEADLINE)
+        let why = replay_misses(&missed, dir.path(), RUN_DEADLINE, "replay-patched")
             .unwrap()
             .expect("a failed replay says why");
         assert!(why.contains("pick 3 differs"), "{why}");
         // A replay that hangs is killed at its deadline, and misses.
         // `wait_until_executable` runs it with no arguments.
         let hangs = fake("hangs", "[ $# -gt 0 ] || exit 0\nsleep 60");
-        let why = replay_misses(&hangs, dir.path(), Duration::from_millis(200))
-            .unwrap()
-            .expect("a hung replay misses");
+        let why = replay_misses(
+            &hangs,
+            dir.path(),
+            Duration::from_millis(200),
+            "replay-patched",
+        )
+        .unwrap()
+        .expect("a hung replay misses");
         assert!(why.contains("ran past its deadline"), "{why}");
     }
 

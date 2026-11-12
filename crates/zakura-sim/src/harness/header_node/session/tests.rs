@@ -172,17 +172,18 @@ fn every_join_mismatch_breaks() {
     ] {
         let view = linked(&[1]);
         assert_eq!(broken(&view, &[event]), None);
-        let claims = view.take_claims();
+        let claims: Vec<String> = view.take_claims().iter().map(ToString::to_string).collect();
         assert!(
             matches!(&claims[..], [claim]
-                if claim.starts_with("CommitOnlyAuthorized:") && claim.contains(expected)),
+                if claim.starts_with("CommitOnlyAuthorized [provenance] session ")
+                    && claim.contains(expected)),
             "{claims:?}"
         );
         assert!(view.take_joined(), "a mismatched identity still joins");
     }
     let view = linked(&[1]);
     assert_eq!(broken(&view, &[admitted(1, None, origin(1))]), None);
-    assert_eq!(view.take_claims(), Vec::<String>::new());
+    assert_eq!(view.take_claims(), Vec::new());
     assert!(view.take_joined(), "a matching identity joins");
     assert!(!view.take_joined(), "the join is drained once");
 }
@@ -355,10 +356,11 @@ fn every_own9_mismatch_breaks() {
     ];
     for (view, event, why) in claimed {
         assert_eq!(broken(&view, &[event]), None);
-        let claims = view.take_claims();
+        let claims: Vec<String> = view.take_claims().iter().map(ToString::to_string).collect();
         assert!(
             matches!(&claims[..], [claim]
-                if claim.starts_with("CommitOnlyAuthorized: ") && claim.contains(why)),
+                if claim.starts_with("CommitOnlyAuthorized [provenance] session ")
+                    && claim.contains(why)),
             "{why}: {claims:?}"
         );
         assert!(view.take_joined(), "a mismatched identity still joins");

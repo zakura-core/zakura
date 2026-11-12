@@ -15,6 +15,7 @@ use zakura_network::zakura::{
 };
 
 use super::*;
+use crate::harness::header_node::{claim::ClaimEvidence, tap::peer};
 
 /// The mirror's peer ID.
 fn mirror() -> ZakuraPeerId {
@@ -210,6 +211,11 @@ fn read_starts(check: &mut Authority, events: &[ReactorEvent]) {
     }
 }
 
+/// `findings` as their claim records' details render them.
+fn rendered(findings: Vec<AuthorityFinding>) -> Vec<String> {
+    findings.iter().map(ToString::to_string).collect()
+}
+
 /// The breaks `events` give, fed in order on the reactor's task.
 fn breaks(events: &[ReactorEvent]) -> Vec<String> {
     breaks_declaring(&[], events)
@@ -232,7 +238,7 @@ fn breaks_declaring(
     for event in &honest(events) {
         check.observe(event, true, false);
     }
-    check.drain(1)
+    rendered(check.drain(1))
 }
 
 /// The breaks `events` give with no reservation fed first, their totals
@@ -264,7 +270,7 @@ fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
         }
         check.observe(event, true, false);
     }
-    check.drain(1)
+    rendered(check.drain(1))
 }
 
 /// Storage's operation for reactor call `call`, completing `Applied`, as
@@ -317,7 +323,7 @@ fn a_page_on_a_scenario_branch_holds() {
         for event in &honest(&events) {
             check.observe(event, true, false);
         }
-        check.drain(1)
+        rendered(check.drain(1))
     };
     assert_eq!(with(&[0, 5]), Vec::<String>::new());
     let found = with(&[0, 1, 2]);
@@ -802,7 +808,7 @@ fn acceptance_reaches_only_the_applied_rounds_last_page() {
                 }
             }
         }
-        credit.take_breaks()
+        rendered(credit.take_breaks())
     };
     let judged =
         |events: Vec<ReactorEvent>, result: Option<StorageResult>| judge(events, result, true);
@@ -978,7 +984,7 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
         // The middle grant and acceptance come in a stale call's handler.
         check.observe(event, true, (2..4).contains(&at));
     }
-    assert_eq!(check.drain(1), Vec::<String>::new());
+    assert_eq!(rendered(check.drain(1)), Vec::<String>::new());
 }
 
 /// A claim whose recorded cursor isn't what its pages consumed, or that
@@ -1224,7 +1230,7 @@ fn an_open_starts_where_storage_put_its_first_locator() {
         for event in &honest(&[reserved(1, 10), open.clone()]) {
             check.observe(event, true, false);
         }
-        check.drain(1)
+        rendered(check.drain(1))
     };
     assert_eq!(with(Some(block::Height(0))), Vec::<String>::new());
     for read in [Some(block::Height(1)), None] {
@@ -1273,7 +1279,7 @@ fn a_submission_of_another_kind_breaks_at_once() {
         call: Some(1),
     };
     check.storage([&locator]);
-    let found = check.drain(1);
+    let found = rendered(check.drain(1));
     assert!(
         found
             .iter()
@@ -1332,9 +1338,9 @@ fn a_second_submission_from_one_call_breaks_at_once() {
         call: Some(1),
     };
     check.storage([&prepare(1)]);
-    assert_eq!(check.drain(1), Vec::<String>::new());
+    assert_eq!(rendered(check.drain(1)), Vec::<String>::new());
     check.storage([&prepare(2)]);
-    let found = check.drain(2);
+    let found = rendered(check.drain(2));
     assert!(
         found
             .iter()
@@ -1408,7 +1414,7 @@ fn an_apply_is_judged_with_or_without_a_handoff() {
     let mut unhanded = new_check();
     dispatch(&mut unhanded);
     unhanded.storage([&apply(source)]);
-    let found = unhanded.drain(1);
+    let found = rendered(unhanded.drain(1));
     assert!(
         matches!(&found[..], [only] if only.contains("no prepare handed the apply")),
         "{found:?}"
@@ -1417,7 +1423,7 @@ fn an_apply_is_judged_with_or_without_a_handoff() {
     let mut other_source = new_check();
     dispatch(&mut other_source);
     other_source.storage([&apply(zakura_header_chain::SourceId::from_digest([3; 32]))]);
-    let found = other_source.drain(1);
+    let found = rendered(other_source.drain(1));
     assert!(
         found.iter().any(|found| found.contains("source"))
             && found
@@ -1439,7 +1445,7 @@ fn an_apply_is_judged_with_or_without_a_handoff() {
         false,
     );
     handed.storage([&apply(source)]);
-    assert_eq!(handed.drain(1), Vec::<String>::new());
+    assert_eq!(rendered(handed.drain(1)), Vec::<String>::new());
 }
 
 /// The model's V1 page sizes are encoded V1 pages' payloads, each entry
@@ -1544,4 +1550,584 @@ fn a_frozen_authority_store_drops_its_applicability() {
         },
         AuthorityEvidence::any,
     );
+}
+
+/// A second mirror's peer ID.
+fn other_mirror() -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![3; 32]).expect("32 bytes is a valid peer ID")
+}
+
+/// `peer`'s reservation `reservation` of `headers` headers.
+fn reserved_by(peer: &ZakuraPeerId, reservation: u64, headers: usize) -> ReactorEvent {
+    let mut event = reserved(reservation, headers);
+    if let ReactorEvent::ReservationOpened { peer: by, .. } = &mut event {
+        *by = peer.clone();
+    }
+    event
+}
+
+/// [`open`], for subscription `subscription` on `peer`'s session `session`.
+fn open_on(
+    peer: &ZakuraPeerId,
+    session: u64,
+    subscription: u64,
+    target: Frontier,
+    locators: &[block::Hash],
+) -> ReactorEvent {
+    let mut event = open(target, locators);
+    if let ReactorEvent::CreditIssued {
+        peer: on,
+        session_id,
+        subscription: id,
+        update,
+        ..
+    } = &mut event
+    {
+        *on = peer.clone();
+        *session_id = session;
+        *id = subscription;
+        update.subscription_id = subscription;
+    }
+    event
+}
+
+/// Round `incarnation`'s request on subscription `subscription` of
+/// `peer`'s session `session`, bound to its `Open`'s `target` from
+/// `anchor`.
+fn request_on(
+    peer: &ZakuraPeerId,
+    session: u64,
+    subscription: u64,
+    incarnation: u64,
+    target: block::Hash,
+    anchor: block::Hash,
+) -> RequestRef {
+    let owner = HeaderSyncWorkOwner::Header(
+        HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(1),
+            branch: BranchId::new(anchor, target),
+        }
+        .bind(
+            session,
+            NonZeroU64::new(subscription).expect("a test subscription is nonzero"),
+        ),
+    );
+    RequestRef {
+        peer: peer.clone(),
+        session_id: session,
+        request_id: subscription,
+        incarnation,
+        owner,
+        target_tip_hash: target,
+    }
+}
+
+/// [`page`], staged on `request`'s subscription from its own session, in
+/// `frame`.
+fn page_on(
+    request: &RequestRef,
+    frame: Option<u64>,
+    ancestor: Frontier,
+    hashes: &[block::Hash],
+) -> ReactorEvent {
+    let mut event = page(request, ancestor, hashes);
+    if let ReactorEvent::PageStaged {
+        from_peer,
+        from_session,
+        subscription,
+        frame: tagged,
+        ..
+    } = &mut event
+    {
+        *from_peer = request.peer.clone();
+        *from_session = request.session_id;
+        *subscription = request.request_id;
+        *tagged = frame;
+    }
+    event
+}
+
+/// A staged page: its subscription, its headers and its frame.
+type CandidatePage = (Subscription, Vec<block::Hash>, u64);
+
+/// The findings one drain gives for three candidate pages, each on its own
+/// subscription, staged in one step: the mirror's honest page on session
+/// 7 subscription 1 in frame 3, its page skipping a header on session 8
+/// subscription 2 in frame 4, and the other mirror's page carrying its
+/// `Open`'s locator on session 9 subscription 3 in frame 5. Also the
+/// pages, as `(subscription, hashes, frame)`, in that order.
+pub(crate) fn two_page_breaks() -> (Vec<AuthorityFinding>, [CandidatePage; 3]) {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let target = chain[3];
+    let (mirror, other) = (mirror(), other_mirror());
+    let honest_round = request_on(&mirror, 7, 1, 1, target.hash, genesis.hash);
+    let skipping_round = request_on(&mirror, 8, 2, 2, target.hash, genesis.hash);
+    let locator_round = request_on(&other, 9, 3, 3, target.hash, genesis.hash);
+    let honest_page = vec![chain[0].hash, chain[1].hash];
+    let skipping_page = vec![chain[1].hash];
+    let locator_page = vec![chain[0].hash, chain[1].hash];
+    let events = [
+        adopted(),
+        reserved_by(&mirror, 1, 10),
+        open_on(&mirror, 7, 1, target, &[genesis.hash]),
+        reserved_by(&mirror, 2, 10),
+        open_on(&mirror, 8, 2, target, &[genesis.hash]),
+        reserved_by(&other, 3, 10),
+        open_on(&other, 9, 3, target, &[chain[1].hash, genesis.hash]),
+        started(honest_round.clone(), &[genesis.hash]),
+        started(skipping_round.clone(), &[genesis.hash]),
+        started(locator_round.clone(), &[chain[1].hash, genesis.hash]),
+        page_on(&honest_round, Some(3), genesis, &honest_page),
+        page_on(&skipping_round, Some(4), genesis, &skipping_page),
+        page_on(&locator_round, Some(5), genesis, &locator_page),
+    ];
+    let mut check = Authority::new(
+        AuthorityEvidence::new(&EvidenceStores::default()),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    read_starts(&mut check, &events);
+    for event in &honest(&events) {
+        check.observe(event, true, false);
+    }
+    (
+        check.drain(1),
+        [
+            ((mirror.clone(), 7, 1), honest_page, 3),
+            ((mirror, 8, 2), skipping_page, 4),
+            ((other, 9, 3), locator_page, 5),
+        ],
+    )
+}
+
+/// C22 (a): of three candidate pages staged in one step, the two that
+/// break the path rule each give a finding naming the path rule and its
+/// own page, by peer, session, subscription, headers and frame, and not
+/// the other's. The claim records the tap keeps for them carry that
+/// attribution into the claims store's snapshot, which the full report
+/// holds. `header_sync`'s domain tests check the property's violations.
+#[test]
+fn each_page_finding_names_its_own_page() {
+    let (found, [_, skipping, locator]) = two_page_breaks();
+    let expected = [&skipping, &locator].map(|(subscription, hashes, frame)| Attribution {
+        rule: AuthorityRule::Path,
+        subject: AuthoritySubject::page(subscription, hashes, Some(*frame)),
+    });
+    let attributions: Vec<&Attribution> = found.iter().map(|found| &found.attribution).collect();
+    assert_eq!(attributions, [&expected[0], &expected[1]], "{found:?}");
+    assert!(
+        found[0]
+            .detail
+            .contains("isn't a fixture or declared child"),
+        "{found:?}"
+    );
+    assert!(
+        found[1].detail.contains("carried its Open's locator"),
+        "{found:?}"
+    );
+    let rendered = rendered(found.clone());
+    for (line, own, theirs) in [
+        (&rendered[0], &expected[0], &expected[1]),
+        (&rendered[1], &expected[1], &expected[0]),
+    ] {
+        let lead = format!("CommitOnlyAuthorized [path] {}: ", own.subject);
+        assert!(line.starts_with(&lead), "{line}");
+        assert!(!line.contains(&theirs.subject.to_string()), "{line}");
+    }
+    assert!(
+        rendered[0].starts_with(&format!(
+            "CommitOnlyAuthorized [path] page peer {} session 8 subscription 2 headers [{}] \
+             frame 4: ",
+            peer(&mirror()),
+            crate::storage::hash(skipping.1[0]),
+        )),
+        "{}",
+        rendered[0]
+    );
+
+    let stores = EvidenceStores::default();
+    let claims = ClaimEvidence::new(&stores);
+    for finding in found {
+        claims.record(finding.record(1));
+    }
+    let snapshot = stores.snapshot();
+    let rows = snapshot
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|store| store["store"] == "claims")
+        .map(|store| store["snapshot"].clone())
+        .expect("the claims store is in the node's snapshot");
+    let peer_hex = |peer_id: &ZakuraPeerId| peer(peer_id);
+    let headers = |hashes: &[block::Hash]| -> Vec<String> {
+        hashes.iter().copied().map(crate::storage::hash).collect()
+    };
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {
+                "step": 1,
+                "claim": "CommitOnlyAuthorized",
+                "detail": rendered[0],
+                "reported": false,
+                "attribution": {
+                    "rule": "path",
+                    "subject": {
+                        "subject": "page",
+                        "peer": peer_hex(&skipping.0 .0),
+                        "session": 8,
+                        "subscription": 2,
+                        "headers": headers(&skipping.1),
+                        "frame": 4,
+                    },
+                },
+            },
+            {
+                "step": 1,
+                "claim": "CommitOnlyAuthorized",
+                "detail": rendered[1],
+                "reported": false,
+                "attribution": {
+                    "rule": "path",
+                    "subject": {
+                        "subject": "page",
+                        "peer": peer_hex(&locator.0 .0),
+                        "session": 9,
+                        "subscription": 3,
+                        "headers": headers(&locator.1),
+                        "frame": 5,
+                    },
+                },
+            },
+        ])
+    );
+}
+
+/// C22 (b): an initial `Open` granting more than its peer reserved breaks
+/// the credit rule before any page, as the `overgrant` planted case does.
+/// Its finding names that `Open`, by subscription, kind and sequence, and
+/// no page.
+#[test]
+fn an_open_credit_break_names_its_update_and_no_page() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor().hash;
+    let mut check = Authority::new(
+        AuthorityEvidence::new(&EvidenceStores::default()),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    let events = honest(&[reserved(1, 9), open(chain[3], &[genesis])]);
+    read_starts(&mut check, &events);
+    for event in &events {
+        check.observe(event, true, false);
+    }
+    let found = check.drain(1);
+    let subject = AuthoritySubject::Update {
+        peer: peer(&mirror()),
+        session: 7,
+        subscription: 1,
+        kind: UpdateKind::Open,
+        sequence: 0,
+    };
+    assert_eq!(
+        found
+            .iter()
+            .map(|found| &found.attribution)
+            .collect::<Vec<_>>(),
+        [&Attribution {
+            rule: AuthorityRule::Credit,
+            subject: subject.clone(),
+        }],
+        "{found:?}"
+    );
+    let line = found[0].to_string();
+    assert!(
+        line.starts_with(&format!(
+            "CommitOnlyAuthorized [credit] update Open sequence 0 peer {} session 7 \
+             subscription 1: ",
+            peer(&mirror())
+        )),
+        "{line}"
+    );
+    assert!(line.contains("granted 10 headers"), "{line}");
+    assert!(!line.contains("page"), "{line}");
+    let record = found[0].clone().record(1);
+    assert!(
+        !serde_json::to_string(&record.attribution)
+            .expect("an attribution serializes")
+            .contains("\"page\""),
+        "{record:?}"
+    );
+}
+
+/// C22 (c): two findings whose subjects agree on every key but one stay
+/// distinct, as findings, as rendered and as the full report serializes
+/// their attribution, for each key of a page, a
+/// round, an update, a cursor, a call, a session and an engine run. The
+/// same page staged in another frame, the real case, is one of them.
+#[test]
+fn findings_one_key_apart_stay_distinct() {
+    let page = AuthoritySubject::Page {
+        peer: peer(&mirror()),
+        session: 8,
+        subscription: 2,
+        headers: vec!["aa".to_owned(), "bb".to_owned()],
+        frame: Some(4),
+    };
+    let round = AuthoritySubject::Round {
+        incarnation: 2,
+        peer: peer(&mirror()),
+        session: 8,
+        subscription: 2,
+    };
+    let update = AuthoritySubject::Update {
+        peer: peer(&mirror()),
+        session: 8,
+        subscription: 2,
+        kind: UpdateKind::Grant,
+        sequence: 3,
+    };
+    let cursor = AuthoritySubject::Cursor {
+        peer: peer(&mirror()),
+        session: 8,
+        subscription: 2,
+        fact: CursorFact::Claim,
+        height: 5,
+        hash: "aa".to_owned(),
+    };
+    let call = AuthoritySubject::Call { call: 4, op: 9 };
+    let session = AuthoritySubject::session(&mirror(), 8, Some(1));
+    let other = peer(&other_mirror());
+    let reset = |kind: &str, target: &str, generation: u64| {
+        AuthoritySubject::Engine(EngineRunRef::Reset {
+            fact: Some(ResetFact {
+                kind: kind.to_owned(),
+                target: target.to_owned(),
+                generation,
+            }),
+        })
+    };
+    let engine = reset("invalidate", "aa", 2);
+    // Each subject, then each copy of it one key off.
+    let cases: Vec<(AuthoritySubject, Vec<AuthoritySubject>)> = vec![
+        (
+            page.clone(),
+            vec![
+                AuthoritySubject::Page {
+                    peer: other.clone(),
+                    session: 8,
+                    subscription: 2,
+                    headers: vec!["aa".to_owned(), "bb".to_owned()],
+                    frame: Some(4),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 9,
+                    subscription: 2,
+                    headers: vec!["aa".to_owned(), "bb".to_owned()],
+                    frame: Some(4),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 3,
+                    headers: vec!["aa".to_owned(), "bb".to_owned()],
+                    frame: Some(4),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    headers: vec!["aa".to_owned(), "cc".to_owned()],
+                    frame: Some(4),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    headers: vec!["bb".to_owned(), "aa".to_owned()],
+                    frame: Some(4),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    headers: vec!["aa".to_owned(), "bb".to_owned()],
+                    frame: Some(5),
+                },
+                AuthoritySubject::Page {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    headers: vec!["aa".to_owned(), "bb".to_owned()],
+                    frame: None,
+                },
+            ],
+        ),
+        (
+            round.clone(),
+            vec![
+                AuthoritySubject::round(3, &(mirror(), 8, 2)),
+                AuthoritySubject::round(2, &(other_mirror(), 8, 2)),
+                AuthoritySubject::round(2, &(mirror(), 9, 2)),
+                AuthoritySubject::round(2, &(mirror(), 8, 3)),
+            ],
+        ),
+        (
+            update.clone(),
+            vec![
+                AuthoritySubject::update(&(other_mirror(), 8, 2), UpdateKind::Grant, 3),
+                AuthoritySubject::update(&(mirror(), 9, 2), UpdateKind::Grant, 3),
+                AuthoritySubject::update(&(mirror(), 8, 3), UpdateKind::Grant, 3),
+                AuthoritySubject::update(&(mirror(), 8, 2), UpdateKind::Close, 3),
+                AuthoritySubject::update(&(mirror(), 8, 2), UpdateKind::Grant, 4),
+            ],
+        ),
+        (
+            cursor.clone(),
+            vec![
+                AuthoritySubject::Cursor {
+                    peer: other.clone(),
+                    session: 8,
+                    subscription: 2,
+                    fact: CursorFact::Claim,
+                    height: 5,
+                    hash: "aa".to_owned(),
+                },
+                AuthoritySubject::Cursor {
+                    peer: peer(&mirror()),
+                    session: 9,
+                    subscription: 2,
+                    fact: CursorFact::Claim,
+                    height: 5,
+                    hash: "aa".to_owned(),
+                },
+                AuthoritySubject::Cursor {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 3,
+                    fact: CursorFact::Claim,
+                    height: 5,
+                    hash: "aa".to_owned(),
+                },
+                AuthoritySubject::Cursor {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    fact: CursorFact::Acceptance,
+                    height: 5,
+                    hash: "aa".to_owned(),
+                },
+                AuthoritySubject::Cursor {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    fact: CursorFact::Claim,
+                    height: 6,
+                    hash: "aa".to_owned(),
+                },
+                AuthoritySubject::Cursor {
+                    peer: peer(&mirror()),
+                    session: 8,
+                    subscription: 2,
+                    fact: CursorFact::Claim,
+                    height: 5,
+                    hash: "bb".to_owned(),
+                },
+            ],
+        ),
+        (
+            call.clone(),
+            vec![
+                AuthoritySubject::Call { call: 5, op: 9 },
+                AuthoritySubject::Call { call: 4, op: 10 },
+            ],
+        ),
+        (
+            session.clone(),
+            vec![
+                AuthoritySubject::session(&other_mirror(), 8, Some(1)),
+                AuthoritySubject::session(&mirror(), 9, Some(1)),
+                AuthoritySubject::session(&mirror(), 8, Some(2)),
+                AuthoritySubject::session(&mirror(), 8, None),
+            ],
+        ),
+        (
+            engine.clone(),
+            vec![
+                reset("reconsider", "aa", 2),
+                reset("invalidate", "bb", 2),
+                reset("invalidate", "aa", 3),
+                AuthoritySubject::Engine(EngineRunRef::Reset { fact: None }),
+                AuthoritySubject::Engine(EngineRunRef::Apply { op: 2 }),
+                AuthoritySubject::Engine(EngineRunRef::Locator { op: 2 }),
+            ],
+        ),
+    ];
+    let finding = |subject: &AuthoritySubject| {
+        AuthorityFinding::new(AuthorityRule::Path, subject.clone(), "the same detail")
+    };
+    for (base, others) in &cases {
+        for other in others {
+            assert_ne!(finding(base), finding(other), "{base} and {other}");
+            assert_ne!(
+                finding(base).to_string(),
+                finding(other).to_string(),
+                "{base} and {other}"
+            );
+            let sidecar = |subject: &AuthoritySubject| {
+                serde_json::to_value(finding(subject).record(1).attribution)
+                    .expect("an attribution serializes")
+            };
+            assert_ne!(sidecar(base), sidecar(other), "{base} and {other}");
+        }
+    }
+    // One key off on the rule, with the subject and detail the same.
+    assert_ne!(
+        finding(&page).to_string(),
+        AuthorityFinding::new(AuthorityRule::Credit, page.clone(), "the same detail").to_string()
+    );
+
+    // The real case: the same skipping page staged in frame 4 and in frame
+    // 6 gives findings that agree on everything but the frame.
+    let in_frame = |frame: u64| {
+        let chain = main_chain(4);
+        let genesis = HeaderFixture::regtest().anchor();
+        let round = request_on(&mirror(), 8, 2, 2, chain[3].hash, genesis.hash);
+        let events = [
+            adopted(),
+            reserved(1, 10),
+            open_on(&mirror(), 8, 2, chain[3], &[genesis.hash]),
+            started(round.clone(), &[genesis.hash]),
+            page_on(&round, Some(frame), genesis, &[chain[1].hash]),
+        ];
+        let mut check = Authority::new(
+            AuthorityEvidence::new(&EvidenceStores::default()),
+            HeaderFixture::regtest(),
+            [0],
+            [],
+        );
+        read_starts(&mut check, &events);
+        for event in &honest(&events) {
+            check.observe(event, true, false);
+        }
+        check.drain(1)
+    };
+    let (four, six) = (in_frame(4), in_frame(6));
+    assert_eq!(four.len(), 1, "{four:?}");
+    assert_eq!(six.len(), 1, "{six:?}");
+    assert_eq!(four[0].detail, six[0].detail);
+    let AuthoritySubject::Page { frame, .. } = &four[0].attribution.subject else {
+        panic!("a path finding names its page: {four:?}");
+    };
+    assert_eq!(*frame, Some(4));
+    let mut refrated = four[0].attribution.subject.clone();
+    if let AuthoritySubject::Page { frame, .. } = &mut refrated {
+        *frame = Some(6);
+    }
+    assert_eq!(six[0].attribution.subject, refrated);
+    assert_ne!(four[0].to_string(), six[0].to_string());
 }

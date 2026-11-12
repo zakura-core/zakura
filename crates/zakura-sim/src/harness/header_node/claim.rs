@@ -12,6 +12,7 @@
 
 use zakura_network::zakura::observe::ClaimRule;
 
+use super::authority::Attribution;
 use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 use crate::RunEnd;
 
@@ -278,6 +279,9 @@ pub struct ClaimRecord {
     pub claim: Claim,
     /// What broke it, led by the rule's name.
     pub detail: String,
+    /// The rule and subject a [`Claim::CommitOnlyAuthorized`] break names,
+    /// which its `detail` renders first. `None` for every other claim.
+    pub attribution: Option<Attribution>,
 }
 
 /// One reactor's claim breaks, each with whether a property has read it,
@@ -291,18 +295,24 @@ pub struct ClaimEvidence(Registered<Claims>);
 pub(crate) struct Claims(Vec<(ClaimRecord, bool)>);
 
 impl Snapshot for Claims {
-    /// Each break's fields, in order, with whether it was reported.
+    /// Each break's fields, in order, with whether it was reported. Only
+    /// an attributed break has an `attribution`.
     fn snapshot(&self) -> serde_json::Value {
         serde_json::Value::from(
             self.0
                 .iter()
                 .map(|(record, reported)| {
-                    serde_json::json!({
+                    let mut row = serde_json::json!({
                         "step": record.step,
                         "claim": format!("{:?}", record.claim),
                         "detail": record.detail,
                         "reported": reported,
-                    })
+                    });
+                    if let Some(attribution) = &record.attribution {
+                        row["attribution"] = serde_json::to_value(attribution)
+                            .expect("an attribution holds only strings and integers");
+                    }
+                    row
                 })
                 .collect::<Vec<_>>(),
         )
@@ -408,6 +418,7 @@ mod tests {
             step: 1,
             claim: Claim::OverBudget,
             detail: "OverBudget: test".to_owned(),
+            attribution: None,
         };
         assert_freeze_drops_writes(
             ClaimEvidence::new,

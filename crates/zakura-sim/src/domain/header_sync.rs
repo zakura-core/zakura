@@ -1881,13 +1881,15 @@ mod tests {
     };
 
     use super::{
-        chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-        teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
-        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, STALE_COMPLETION_INERT,
+        chunk_budget_bound, commit_only_authorized, stale_completion_inert,
+        teardown_end_violations, teardown_returns_baseline, AuthorityView, BudgetView,
+        EndViolation, StaleView, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND,
+        CHUNK_BUDGET_CAPACITY, COMMIT_ONLY_AUTHORIZED, STALE_COMPLETION_INERT,
         TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
+            authority::AuthorityEvidence,
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
             stale::StaleEvidence,
@@ -1955,6 +1957,7 @@ mod tests {
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
         stale_calls: StaleEvidence,
+        authority: AuthorityEvidence,
     }
 
     impl Default for Probe {
@@ -1966,7 +1969,18 @@ mod tests {
                 claims: ClaimEvidence::new(&stores),
                 rounds: SettlementEvidence::new(&stores),
                 stale_calls: StaleEvidence::new(&stores),
+                authority: AuthorityEvidence::new(&stores),
             }
+        }
+    }
+
+    impl AuthorityView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn authority(&self) -> &AuthorityEvidence {
+            &self.authority
         }
     }
 
@@ -2038,6 +2052,9 @@ mod tests {
         Tainted,
         Broke(Claim),
         Breaks(&'static [Claim]),
+        /// The claim records a function gives for the step, as the tap's
+        /// drain records them.
+        Recorded(fn(u64) -> Vec<ClaimRecord>),
     }
 
     /// Records the next scripted evidence at each boundary, as a tap would.
@@ -2108,6 +2125,7 @@ mod tests {
                         step,
                         claim,
                         detail: format!("{claim:?}"),
+                        attribution: None,
                     });
                     self.probe.rounds.record(Settlement {
                         step,
@@ -2119,12 +2137,18 @@ mod tests {
                         settled: false,
                     });
                 }
+                Some(Scripted::Recorded(records)) => {
+                    for record in records(step) {
+                        self.probe.claims.record(record);
+                    }
+                }
                 Some(Scripted::Breaks(claims)) => {
                     for (at, &claim) in claims.iter().enumerate() {
                         self.probe.claims.record(ClaimRecord {
                             step,
                             claim,
                             detail: format!("{claim:?} #{at}"),
+                            attribution: None,
                         });
                     }
                 }
@@ -2154,6 +2178,11 @@ mod tests {
     /// Runs `property` over one task that yields until `script` is spent,
     /// each step's evidence as the script says.
     fn run_property(property: Property<Probe>, script: &[Scripted]) -> RunReport {
+        run_probed(property, script).0
+    }
+
+    /// [`run_property`], with the probe whose stores the run filled.
+    fn run_probed(property: Property<Probe>, script: &[Scripted]) -> (RunReport, Probe) {
         let probe = Probe::default();
         let mut sim = Sim::new(crate::RunConfig::default(), PlanInput::Bytes(Vec::new()));
         sim.add_source(Box::new(Boundaries {
@@ -2169,11 +2198,11 @@ mod tests {
         let registry = Registry::new(vec![property]).expect("one property is unique");
         let mut checker = RegistryChecker::new(
             registry,
-            Rc::new(probe),
+            Rc::new(probe.clone()),
             Assumptions::none(),
             &Sources::observed(&[Source::View]),
         );
-        sim.run(&mut checker, &mut MemorySink::default())
+        (sim.run(&mut checker, &mut MemorySink::default()), probe)
     }
 
     /// Reads within the capacity hold, an unread boundary mid-poll judges
@@ -2519,5 +2548,82 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// The claim records the tap's drain of `step` keeps for the authority
+    /// checker's two page breaks among three candidate pages.
+    fn two_page_records(step: u64) -> Vec<ClaimRecord> {
+        crate::harness::header_node::authority::tests::two_page_breaks()
+            .0
+            .into_iter()
+            .map(|finding| finding.record(step))
+            .collect()
+    }
+
+    /// C22 (a), as reported: the authority checker's two page breaks at one
+    /// step are both `header-sync/commit-only-authorized` violations, each
+    /// naming the path rule and its own page, and the node's claims store,
+    /// which the full report's snapshot holds, keeps each with its typed
+    /// attribution.
+    #[test]
+    fn commit_only_authorized_reports_each_page_it_names() {
+        let (report, probe) = run_probed(
+            commit_only_authorized(),
+            &[Scripted::Recorded(two_page_records)],
+        );
+        let records = two_page_records(1);
+        let actual: Vec<&str> = report.properties[0]
+            .violations
+            .iter()
+            .map(|violation| violation.actual.as_str())
+            .collect();
+        assert_eq!(
+            actual,
+            records
+                .iter()
+                .map(|record| record.detail.as_str())
+                .collect::<Vec<_>>()
+        );
+        for (line, session, frame) in [(actual[0], 8, 4), (actual[1], 9, 5)] {
+            assert!(
+                line.starts_with("CommitOnlyAuthorized [path] page peer ")
+                    && line.contains(&format!(" session {session} "))
+                    && line.contains(&format!(" frame {frame}: ")),
+                "{line}"
+            );
+        }
+        assert!(report.properties[0]
+            .violations
+            .iter()
+            .all(|violation| violation.property == COMMIT_ONLY_AUTHORIZED && violation.step == 1));
+        let snapshot = probe.rounds.stores().snapshot();
+        let rows = snapshot
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|store| store["store"] == "claims")
+            .map(|store| store["snapshot"].clone())
+            .expect("the claims store is in the node's snapshot");
+        let kept: Vec<serde_json::Value> = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| row["attribution"].clone())
+            .collect();
+        let expected: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                serde_json::to_value(record.attribution.as_ref().expect("an authority break"))
+                    .expect("an attribution serializes")
+            })
+            .collect();
+        assert_eq!(kept, expected);
+        assert!(
+            rows.as_array()
+                .into_iter()
+                .flatten()
+                .all(|row| row["reported"] == true),
+            "{rows}"
+        );
     }
 }

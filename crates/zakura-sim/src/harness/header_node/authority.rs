@@ -38,8 +38,9 @@
 //! fact, or the
 //! session view joined an admission's identity to its link or transport
 //! row, so a run whose wrong identity starts no round still applies. A broken
-//! rule is a claim break, which the tap hands
-//! [`Claim::CommitOnlyAuthorized`](super::claim::Claim) at its drain.
+//! rule is an [`AuthorityFinding`] naming its rule and subject, which the
+//! tap records as a [`Claim::CommitOnlyAuthorized`](super::claim::Claim)
+//! break at its drain.
 
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +51,11 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_storage::header::fixture::HeaderFixture;
+
+pub use finding::{
+    Attribution, AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, EngineRunRef,
+    ResetFact, UpdateKind,
+};
 
 use crate::observe::StorageFact;
 use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
@@ -135,7 +141,7 @@ pub(super) struct Authority {
     credit: credit::Credit,
     submission: submission::Submission,
     contents: contents::Contents,
-    breaks: Vec<String>,
+    breaks: Vec<AuthorityFinding>,
     evidence: AuthorityEvidence,
 }
 
@@ -224,11 +230,18 @@ impl Authority {
                 subscription,
                 ancestor,
                 hashes,
+                frame,
                 ..
             } => {
                 self.applies();
                 let subscription = (request.peer.clone(), request.session_id, *subscription);
-                self.path(request.incarnation, &subscription, *ancestor, hashes);
+                self.path(
+                    request.incarnation,
+                    &subscription,
+                    *ancestor,
+                    hashes,
+                    *frame,
+                );
             }
             _ => {}
         }
@@ -236,7 +249,7 @@ impl Authority {
 
     /// The breaks found since the last call. Marks the check applicable at
     /// `step` if a fact since the last call made it so.
-    pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
+    pub(super) fn drain(&mut self, step: u64) -> Vec<AuthorityFinding> {
         self.evidence.change(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
@@ -294,11 +307,16 @@ impl Authority {
         request: &zakura_network::zakura::observe::RequestRef,
         locator: &[block::Hash],
     ) {
+        let subject = AuthoritySubject::round(incarnation, subscription);
         let Some(open) = self.opens.get(subscription) else {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: round {incarnation} started on session {} subscription \
-                 {}, which the subscriber never opened",
-                subscription.1, subscription.2
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::OwnerBinding,
+                subject,
+                format!(
+                    "round {incarnation} started on session {} subscription {}, which the \
+                     subscriber never opened",
+                    subscription.1, subscription.2
+                ),
             ));
             return;
         };
@@ -334,27 +352,35 @@ impl Authority {
             ));
         }
         for detail in found {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: round {incarnation} {detail}"
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::OwnerBinding,
+                subject.clone(),
+                format!("round {incarnation} {detail}"),
             ));
         }
     }
 
     /// Judges the page round `incarnation` staged on `subscription`, which
-    /// declared `ancestor` and carried `hashes`, against the fixture and the
-    /// subscription's `Open`.
+    /// came in `frame`, declared `ancestor` and carried `hashes`, against
+    /// the fixture and the subscription's `Open`.
     fn path(
         &mut self,
         incarnation: u64,
         subscription: &Subscription,
         ancestor: Frontier,
         hashes: &[block::Hash],
+        frame: Option<u64>,
     ) {
+        let subject = AuthoritySubject::page(subscription, hashes, frame);
         let Some(open) = self.opens.get(subscription).cloned() else {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: round {incarnation} staged a page on session {} \
-                 subscription {}, which the subscriber never opened",
-                subscription.1, subscription.2
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::Path,
+                subject,
+                format!(
+                    "round {incarnation} staged a page on session {} subscription {}, which the \
+                     subscriber never opened",
+                    subscription.1, subscription.2
+                ),
             ));
             return;
         };
@@ -403,8 +429,10 @@ impl Authority {
         }
         self.staged.insert(subscription.clone(), parent);
         for detail in found {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: round {incarnation}'s page {detail}"
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::Path,
+                subject.clone(),
+                format!("round {incarnation}'s page {detail}"),
             ));
         }
     }
@@ -428,7 +456,8 @@ impl Authority {
 
 mod contents;
 mod credit;
+mod finding;
 mod submission;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

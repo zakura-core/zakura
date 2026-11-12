@@ -633,22 +633,21 @@ fn every_required_key_is_covered_once_with_its_gates() {
     });
     // A native mutation's transitional Open with only another owner, or
     // only another reason.
-    for key in [Key::Native {
+    let native = Key::Native {
         patch: "own9-join".into(),
-    }] {
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
-                *owner = "Evan's side";
-            }
-        });
-        refused(&|m| {
-            let at = covering(m, &key);
-            if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-                *reason = "another reason for the same PR";
-            }
-        });
-    }
+    };
+    refused(&|m| {
+        let at = covering(m, &native);
+        if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
+            *owner = "Evan's side";
+        }
+    });
+    refused(&|m| {
+        let at = covering(m, &native);
+        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
+            *reason = "another reason for the same PR";
+        }
+    });
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
     refused(&|m| {

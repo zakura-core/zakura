@@ -293,10 +293,13 @@ pub struct DraftEvidence {
     pub claims: Value,
 }
 
+/// Each companion's name with its verdict: `Ok` if it held, else why not.
+pub type Verdicts = Vec<(&'static str, Result<(), String>)>;
+
 /// Judges each of [`COMPANIONS`] on `evidence`, in order: `Ok` if it held,
 /// else why not. Each finds the rejected page itself, so a run with no
 /// single one fails all three.
-pub fn judge(evidence: &DraftEvidence) -> Vec<(&'static str, Result<(), String>)> {
+pub fn judge(evidence: &DraftEvidence) -> Verdicts {
     let page = rejected_page(&evidence.observations);
     let staged = page
         .as_ref()
@@ -349,9 +352,7 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
 /// recorded beside the trace, so what's judged is that run. So this must
 /// run in the build that recorded the trace, the case's own patched one,
 /// where a patched behavior replays. An error says why there's no verdict.
-pub fn judge_trace(
-    dir: &std::path::Path,
-) -> Result<Vec<(&'static str, Result<(), String>)>, String> {
+pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     use crate::harness::{header_sync::HeaderWire, Subsystem};
     let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
     if trace.meta.sim != HeaderWire::NAME {

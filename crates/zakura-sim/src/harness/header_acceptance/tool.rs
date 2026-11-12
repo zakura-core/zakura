@@ -2620,7 +2620,7 @@ mod tests {
         ] {
             let dir = recorded();
             replay_into(dir.path(), ok, &log);
-            assert_eq!(read(dir.path()).0, false, "{log}");
+            assert!(!read(dir.path()).0, "{log}");
         }
         // One stored fact changed in the replay's report, every outcome and
         // violation the same: only the stores differ.
@@ -3682,7 +3682,8 @@ mod tests {
                 "subject",
             )
         };
-        let defects: [(&str, &dyn Fn(&Path)); 5] = [
+        type Defect<'a> = (&'a str, &'a dyn Fn(&Path));
+        let defects: [Defect; 5] = [
             ("nothing", &|dir| {
                 fs::remove_dir_all(dir.join("declared")).expect("it exists");
                 fs::remove_dir_all(dir.join("history")).expect("it exists");

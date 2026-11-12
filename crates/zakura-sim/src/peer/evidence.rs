@@ -250,11 +250,11 @@ pub(crate) enum RecordBody {
 /// wire, apart from what the node did with it. They stay out of the log.
 /// Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct SentPages(Rc<RefCell<BTreeMap<(u64, u64, u64), Vec<String>>>>);
+pub struct SentPages(Rc<RefCell<BTreeMap<FrameKey, Vec<String>>>>);
 
 impl SentPages {
     /// Keeps `hashes` as the page of frame `key`.
-    pub(crate) fn record(&self, key: (u64, u64, u64), hashes: Vec<String>) {
+    pub(crate) fn record(&self, key: FrameKey, hashes: Vec<String>) {
         self.0.borrow_mut().insert(key, hashes);
     }
 

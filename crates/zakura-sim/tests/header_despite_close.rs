@@ -147,7 +147,7 @@ fn the_staging_companion_needs_the_rejected_page_staged() {
     other_hashes.hashes.push("00".repeat(32));
     for off in [other_peer, other_hashes] {
         assert!(
-            staged_page(&[off.clone()], &page, &sent).is_err(),
+            staged_page(std::slice::from_ref(&off), &page, &sent).is_err(),
             "{off:?}"
         );
     }

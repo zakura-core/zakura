@@ -34,6 +34,7 @@ use zakura_sim::{
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
     observe::{ReactorFact, StorageFact, StorageRequest},
+    property::{Assumptions, Registry, RegistryChecker},
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
@@ -399,6 +400,86 @@ fn a_tap_handed_a_second_probe_fails() {
             .collect()
     });
     assert!(detail.starts_with("ProbeReplaced"), "{detail}");
+}
+
+/// Runs `scenario` under `input` with its live phase cut after `budget`
+/// steps and the harness's own drain after it, through the storage
+/// harness's properties, and returns the report and the capacity evidence.
+fn cut_run(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    budget: u64,
+) -> (RunReport, CapacityEvidence) {
+    let config = zakura_sim::RunConfig {
+        budget,
+        ..Storage::config(scenario)
+    };
+    let mut sim = Sim::new(config, input);
+    let ports = Storage::prepare(scenario);
+    let capacity = ports.capacity.clone();
+    let storage = std::rc::Rc::new(Storage::build(&mut sim, scenario, ports));
+    let registry = Registry::new(Storage::properties()).expect("unique IDs");
+    let mut checker = RegistryChecker::new(
+        registry,
+        std::rc::Rc::clone(&storage),
+        Assumptions::none(),
+        &Storage::sources(),
+    );
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    drop((checker, storage));
+    (report, capacity)
+}
+
+/// A live phase cut at a boundary whose read found the budget's lock held
+/// with the reactor stopped mid-poll leaves that boundary to the drain. The
+/// drain resumes the reactor, a later boundary reads the budget, and
+/// `header-sync/chunk-budget-bound` holds with no harness failure, so an
+/// unread boundary at the cut concludes rather than failing the run (C19).
+#[test]
+fn a_drain_reads_past_an_unread_boundary_at_the_cut() {
+    let mut cuts = 0;
+    for input in inputs(16, 256) {
+        let ports = Storage::prepare(&witness());
+        let capacity = ports.capacity.clone();
+        let full = run_prepared::<Storage>(
+            &witness(),
+            ports,
+            input.clone(),
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let Some(budget) = (1..=full.end.steps)
+            .find(|step| capacity.boundary(*step) == Some(BoundaryRead::UnreadMidPoll))
+        else {
+            continue;
+        };
+        let (cut, capacity) = cut_run(&witness(), input, budget);
+        assert_eq!(cut.end.harness, None, "cut at {budget}: {:?}", cut.end);
+        assert_eq!(cut.end.violation, None, "cut at {budget}: {:?}", cut.end);
+        assert!(cut.end.drain.is_some(), "cut at {budget}: {:?}", cut.end);
+        assert_eq!(
+            capacity.boundary(budget),
+            Some(BoundaryRead::UnreadMidPoll),
+            "the cut run reaches the same unread boundary"
+        );
+        assert!(
+            (budget + 1..=cut.end.steps)
+                .any(|step| capacity.boundary(step) == Some(BoundaryRead::Read)),
+            "a drain step reads the budget after the cut at {budget}"
+        );
+        let outcome = cut
+            .properties
+            .iter()
+            .find(|property| property.property == CHUNK_BUDGET_BOUND)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(outcome, Some(PropertyOutcome::Held { .. })),
+            "cut at {budget}: {outcome:?}"
+        );
+        cuts += 1;
+    }
+    assert!(cuts > 0, "no input reached an unread boundary");
 }
 
 /// The capacity witness's close removes a round whose leases go back one

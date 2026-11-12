@@ -68,9 +68,8 @@ fn honest_frame_judged<V: HonestPeers>(view: &V, log: &ObservationLog) -> bool {
     let entries = log.entries();
     entries.iter().enumerate().any(|(at, entry)| {
         let connection = match &entry.obs {
-            Observation::FrameJudged { connection, .. } | Observation::Misbehavior { connection } => {
-                *connection
-            }
+            Observation::FrameJudged { connection, .. }
+            | Observation::Misbehavior { connection } => *connection,
             Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
                 *connection
             }

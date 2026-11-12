@@ -617,35 +617,38 @@ pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLo
         | Template::CadenceNeverCloses
         | Template::WorkAuthorized
         | Template::CreditConserved
-        | Template::ServingBounded => entries.iter().enumerate().any(|(at, entry)| {
-            let Observation::FrameJudged {
-                connection,
-                stream,
-                quic_stream,
-                seq,
-            } = entry.obs
-            else {
-                return false;
-            };
-            let before = &entries[..at];
-            // What came before the peer sent the frame, which `sent`
-            // checked appears exactly once.
-            let sent_before = before
-                .iter()
-                .rposition(|entry| {
-                    matches!(&entry.obs, Observation::PeerFrame {
+        | Template::ServingBounded => {
+            entries.iter().enumerate().any(|(at, entry)| {
+                let Observation::FrameJudged {
+                    connection,
+                    stream,
+                    quic_stream,
+                    seq,
+                } = entry.obs
+                else {
+                    return false;
+                };
+                let before = &entries[..at];
+                // What came before the peer sent the frame, which `sent`
+                // checked appears exactly once.
+                let sent_before = before
+                    .iter()
+                    .rposition(|entry| {
+                        matches!(&entry.obs, Observation::PeerFrame {
                         connection: c,
                         stream: s,
                         quic_stream: q,
                         seq: n,
                         ..
                     } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
+                    })
+                    .map_or(before, |sent_at| &before[..sent_at]);
+                sent(before, connection, stream, quic_stream, seq).is_ok_and(|frame| {
+                    receiver_reached(layout, &id, sent_before, connection, &frame)
                 })
-                .map_or(before, |sent_at| &before[..sent_at]);
-            sent(before, connection, stream, quic_stream, seq)
-                .is_ok_and(|frame| receiver_reached(layout, &id, sent_before, connection, &frame))
-        }) && (id.template != Template::ConformantNeverCloses
-            || punishments_follow_conformant(&id, entries)),
+            }) && (id.template != Template::ConformantNeverCloses
+                || punishments_follow_conformant(&id, entries))
+        }
     }
 }
 

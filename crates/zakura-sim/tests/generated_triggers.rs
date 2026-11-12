@@ -348,12 +348,12 @@ fn conformant_never_closes_joins_the_punished_connection() {
         &conformant,
         [first.clone(), vec![fault_closed(1)]].concat()
     ));
-    for punished in [
-        fault_closed(2),
-        Observation::Misbehavior { connection: 2 },
-    ] {
+    for punished in [fault_closed(2), Observation::Misbehavior { connection: 2 }] {
         assert!(
-            !reaches(&conformant, [first.clone(), vec![punished.clone()]].concat()),
+            !reaches(
+                &conformant,
+                [first.clone(), vec![punished.clone()]].concat()
+            ),
             "{punished:?}"
         );
         let own: Vec<Observation> = first.iter().cloned().map(on_two).collect();

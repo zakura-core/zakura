@@ -108,7 +108,7 @@ mod message;
 mod service;
 mod worker;
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

@@ -41,7 +41,7 @@ use crate::zakura::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{replay_cadence_bytes, CadenceReplaySummary};

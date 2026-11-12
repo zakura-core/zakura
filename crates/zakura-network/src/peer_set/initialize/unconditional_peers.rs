@@ -340,12 +340,28 @@ where
                             peerset_tx.send((addr, client)).await?;
                         }
                         Err(error) => {
+                            let addr_label = peer.addr.addr_label(expose_peer_addresses);
+
+                            // A peer that moves to the v2 protocol closes this
+                            // connection without a fault. Its v2 connection is in the
+                            // registry, so the next check counts it as connected.
+                            if error
+                                .downcast_ref::<peer::HandshakeError>()
+                                .is_some_and(peer::HandshakeError::is_neutral_disconnect)
+                            {
+                                debug!(
+                                    peer = %addr_label,
+                                    ?error,
+                                    "an unconditional peer closed its legacy connection neutrally"
+                                );
+                                continue;
+                            }
+
                             metrics::counter!("peer.unconditional.dial.failed.total").increment(1);
 
                             // Only the first failure since the last healthy connection
                             // is worth an operator's attention: a peer without a
                             // listener fails every dial.
-                            let addr_label = peer.addr.addr_label(expose_peer_addresses);
                             if peer.attempts <= 1 {
                                 info!(
                                     peer = %addr_label,

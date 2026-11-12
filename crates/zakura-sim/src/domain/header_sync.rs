@@ -1778,17 +1778,16 @@ where
     }
 }
 
-/// The watch property for the flooded `queue`'s violation at the run's end,
-/// naming the unread publication as its subject
-/// ([`AdoptionEvidence::unread_publication`]): a publication still unread
-/// when the run settled
-/// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
-/// stop the node (`stopping`). A correct loop with an unread publication
-/// always has its watch arm ready, so it can't settle with one. Only a
-/// shutdown, which wins the loop's biased `select!`, may leave one unread
-/// ([`EndedBy`](crate::property::EndedBy)). A harness whose view is an
-/// [`AdoptionView`] reports these from [`HasView::end_violations`], after it
-/// handed the run's end to [`AdoptionEvidence::end`].
+/// The watch property for the flooded `queue`'s violations at the run's
+/// end, one for each publication still unread when the run settled
+/// ([`AdoptionEvidence::unread_publications`]), naming it as its subject,
+/// unless the harness had started to stop the node (`stopping`). A correct
+/// loop with an unread publication always has its watch arm ready, so it
+/// can't settle with one. Only a shutdown, which wins the loop's biased
+/// `select!`, may leave one unread ([`EndedBy`](crate::property::EndedBy)).
+/// A harness whose view is an [`AdoptionView`] reports these from
+/// [`HasView::end_violations`], after it handed the run's end to
+/// [`AdoptionEvidence::end`].
 pub fn watch_end_violations(
     adoption: &AdoptionEvidence,
     queue: EventQueue,
@@ -1803,23 +1802,24 @@ pub fn watch_end_violations(
     };
     // Under a wedged loop the same publication is unread under both
     // queues' rules, so each finding names it.
-    let subject = adoption.unread_publication(queue).map(|state_version| {
-        crate::check::FindingSubject::Publication {
-            state_version: format!("{state_version:?}"),
-        }
-    });
-    vec![EndViolation {
-        subject,
-        property: PropertyId::new(property),
-        expected: "each published state is read from the committed watch before the run \
-                   settles"
-            .to_owned(),
-        actual: format!(
-            "the run settled with a published state unread and fewer than {} {queue:?} \
-             events taken since, with no shutdown begun",
-            crate::harness::header_node::adoption::WATCH_READ_EVENTS + 1
-        ),
-    }]
+    adoption
+        .unread_publications(queue)
+        .into_iter()
+        .map(|state_version| EndViolation {
+            subject: Some(crate::check::FindingSubject::Publication {
+                state_version: format!("{state_version:?}"),
+            }),
+            property: PropertyId::new(property),
+            expected: "each published state is read from the committed watch before the run \
+                       settles"
+                .to_owned(),
+            actual: format!(
+                "the run settled with state {state_version:?} published and unread, and fewer \
+                 than {} {queue:?} events taken since, with no shutdown begun",
+                crate::harness::header_node::adoption::WATCH_READ_EVENTS + 1
+            ),
+        })
+        .collect()
 }
 
 /// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state

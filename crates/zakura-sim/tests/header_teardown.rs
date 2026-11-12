@@ -10,6 +10,7 @@ use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     domain::header_sync::{CHUNK_BUDGET_BOUND, TEARDOWN_RETURNS_BASELINE},
     harness::{
@@ -41,13 +42,21 @@ const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-
 fn the_close_relink_input_holds_teardown_returns_baseline() {
     let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
     let (prefix, plan) = CLOSE_RELINK_INPUT.split_at(Storage::SCENARIO_BYTES);
-    let result = (entry.witness)(
+    let result = run_declared(
+        Storage::NAME,
+        "committed close-relink input",
         &entry.scenario(prefix),
         Plan::from_fuzz(plan),
-        TEARDOWN_RETURNS_BASELINE,
-        Expect::Holds,
-        &[],
-        &mut MemorySink::default(),
+        |scenario, plan, sink| {
+            (entry.witness)(
+                scenario,
+                plan,
+                TEARDOWN_RETURNS_BASELINE,
+                Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     );
     assert_eq!(result, Ok(()));
 }

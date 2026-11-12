@@ -69,8 +69,8 @@ pub struct ReplayReport {
     /// the recording's [`FULL_REPORT_FILE`] field, such as `report.snapshot`. Set
     /// only on a build mismatch.
     pub end_mismatch: Option<&'static str>,
-    /// The replay's own full report, as `record` writes it beside a trace.
-    /// `None` if the run sent none.
+    /// The replay's own full report, bound to the replayed trace and this
+    /// build as `record` binds its own. `None` if the run sent none.
     pub report: Option<FullReport>,
     /// The options it ran with.
     pub options: ReplayOptions,
@@ -318,6 +318,7 @@ fn replay_on<'h>(
         Err(HarnessError::Run { failure, report }) => (*report, Some(failure)),
         Err(error) => return Err(unsupported(error)),
     };
+    sink.report = sink.report.take().map(|full| full.of_trace(&trace.id));
     if let Some(kept) = kept {
         kept.records = std::mem::take(&mut sink.kept);
         kept.properties = report.properties.clone();

@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -135,14 +136,17 @@ fn witnesses() -> [(&'static str, StorageScenario); 4] {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> RunReport {
-    let report = run_prepared::<Storage>(
-        scenario,
-        Storage::prepare(scenario),
-        input,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> RunReport {
+    let report = run_prepared::<Storage>(scenario, Storage::prepare(scenario), input, sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     report
@@ -214,8 +218,16 @@ fn a_harness_commit_is_judged_as_an_engine_run() {
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
-        for input in inputs(8, 256) {
-            let report = run(&scenario, input);
+        for (index, input) in inputs(8, 256).into_iter().enumerate() {
+            // Each run is a manifest history, which the acceptance tool
+            // records from this declaration (C18).
+            let report = run_declared(
+                Storage::NAME,
+                &format!("{name} plan {index} of inputs(8, 256)"),
+                &scenario,
+                input,
+                run_into,
+            );
             assert!(
                 matches!(
                     outcome(&report, COMMIT_ONLY_AUTHORIZED),
@@ -483,7 +495,7 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
 /// same run froze them in this process, so the harness's
 /// `HasView::snapshot` reaches the sidecar. Each claim record there that
 /// carries an attribution names its rule and subject, and a fresh-process
-/// replay matches the report.
+/// replay matches the report, and refuses it once one stored fact is gone.
 #[test]
 fn a_recorded_header_run_keeps_its_stores_in_the_full_report() {
     let name = "forks-sharing-a-header";
@@ -569,5 +581,30 @@ fn a_recorded_header_run_keeps_its_stores_in_the_full_report() {
     assert!(
         replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
         "{replayed:?}"
+    );
+
+    // The same recording with one stored fact, the session view's last
+    // link, dropped from its snapshot, and nothing else changed, is refused.
+    let path = trace.join(FULL_REPORT_FILE);
+    let mut edited: FullReport =
+        serde_json::from_str(&fs::read_to_string(&path).expect("record writes the report"))
+            .expect("the report reads back");
+    let dropped = edited
+        .snapshot
+        .as_mut()
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("the node's stores are a list")
+        .iter_mut()
+        .find(|store| store["store"] == "sessions")
+        .and_then(|store| store["snapshot"]["links"].as_array_mut())
+        .expect("the session view keeps its links")
+        .pop();
+    assert!(dropped.is_some(), "the witness's sessions linked");
+    fs::write(&path, edited.to_line()).expect("the report is rewritten");
+    let refused = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("a different report.snapshot"),
+        "{refused:?}"
     );
 }

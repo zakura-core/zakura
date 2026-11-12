@@ -24,8 +24,9 @@ use zakura_header_chain::{
 };
 use zakura_network::zakura::{
     observe::{
-        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase, PortCall,
-        ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose, StorageCallKind,
+        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase,
+        HeaderWorkEnd, PortCall, ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose,
+        StorageCallKind,
     },
     spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
@@ -623,6 +624,74 @@ fn a_reactor_that_returns_is_recorded_not_failed() {
     let unwound = teardown_after(Vec::new(), true, false);
     let detail = evidence_failure(&unwound);
     assert!(detail.starts_with("ReactorGone"), "{detail}");
+}
+
+/// Runs a tapped reactor that reports `events` and then `again`, a fact
+/// the ledger already took, and requires the run to fail on the work books
+/// with `refusal`, the ledger's rule and detail. The control, the same
+/// history without `again`, fails on none of it.
+fn refused_twice(events: &[ReactorEvent], again: ReactorEvent, refusal: &str) {
+    let expected = format!("OutstandingWork: the work books don't balance: {refusal}");
+    let control = teardown_after(events.to_vec(), false, false);
+    if let Some(HarnessFailure::SourceEvidence { detail, .. }) = &control.end.harness {
+        assert_ne!(detail, &expected, "the control takes each fact once");
+    }
+    let mut repeated = events.to_vec();
+    repeated.push(again);
+    let report = teardown_after(repeated, false, false);
+    assert_eq!(evidence_failure(&report), expected);
+}
+
+/// The ledger takes each call's dispatch once (C17): a second `Dispatched`
+/// for call 1 is refused as `CallReused`.
+#[test]
+fn a_call_dispatched_twice_is_refused() {
+    let work = open_work(5);
+    refused_twice(
+        &work[..6],
+        work[5].clone(),
+        "CallReused: call 1 dispatched twice",
+    );
+}
+
+/// The ledger takes each call's end once (C17): call 1 ending a second
+/// time is refused as `CallEndedTwice`.
+#[test]
+fn a_call_ended_twice_is_refused() {
+    let ended = ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::NotSubmitted,
+    };
+    let mut events = Vec::from(open_work(6));
+    events.push(ended.clone());
+    refused_twice(&events, ended, "CallEndedTwice: call 1 ended again");
+}
+
+/// The ledger takes each call's hold of its round's headers once (C17):
+/// call 1 holding round 1's headers again is refused as `HeldTwice`.
+#[test]
+fn headers_held_twice_are_refused() {
+    let work = open_work(7);
+    refused_twice(
+        &work,
+        work[6].clone(),
+        "HeldTwice: call 1 took headers again",
+    );
+}
+
+/// The ledger takes the end of each call's hold once (C17): call 1 ending
+/// round 1's headers again is refused as `EndedTwice`.
+#[test]
+fn held_headers_ended_twice_are_refused() {
+    let ended = ReactorEvent::HeadersEnded {
+        call: 1,
+        incarnation: 1,
+        headers: 5,
+        end: HeaderWorkEnd::Stale,
+    };
+    let mut events = Vec::from(open_work(8));
+    events.push(ended.clone());
+    refused_twice(&events, ended, "EndedTwice: call 1 ended its headers again");
 }
 
 /// An announced stop still runs the teardown checks: work it leaves open

@@ -531,7 +531,7 @@ struct Named {
 /// sits.
 fn peer_written(entries: &[Entry], connection: u64, frame: Named) -> Option<usize> {
     find(entries, |obs| {
-        matches!(obs, Observation::PeerWritten { connection: c, quic_stream, seq }
+        matches!(obs, Observation::PeerWritten { connection: c, quic_stream, seq, .. }
             if (*c, *quic_stream, *seq) == (connection, frame.quic_stream, frame.seq))
     })
 }

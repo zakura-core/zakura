@@ -540,6 +540,70 @@ mod tests {
         );
     }
 
+    impl crate::harness::scripted::Script for Wakes {
+        const NAME: &'static str = "test/two-wakes";
+        /// Each wake's peer index and session, all opened at step 1.
+        type Case = Vec<(usize, u64)>;
+
+        /// Only `capacity-release-wakes`.
+        fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Wakes>>>
+        {
+            vec![capacity_release_wakes()]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// Opens the case's wakes at the boundary after step 1, as a tap
+        /// would.
+        fn observe(&self, case: &Self::Case, log: &mut ObservationLog) {
+            if log.step() == 1 {
+                for &(index, session_id) in case {
+                    self.0.push(opened(&peer_id([7; 32], index), session_id));
+                }
+            }
+        }
+
+        /// Two: the wakes open after the first, and nothing runs after the
+        /// second.
+        fn steps(_: &Self::Case) -> usize {
+            2
+        }
+    }
+
+    /// C21 through the sidecar: the two unanswered wakes one boundary
+    /// opened are two `capacity-release-wakes` violations expiring together
+    /// at quiescence, each naming its own session, in the full report
+    /// recorded beside the trace and its fresh replay.
+    #[test]
+    fn every_unanswered_wake_at_a_boundary_reaches_the_sidecar() {
+        use crate::harness::scripted::{findings, sidecar};
+        let (first, second) = (peer_id([7; 32], 0), peer_id([7; 32], 1));
+        let full = sidecar::<Wakes>(&vec![(0, 3), (1, 4)], &[]);
+        let found = findings(&full, CAPACITY_RELEASE_WAKES);
+        let violation = |expected: String| Violation {
+            property: CAPACITY_RELEASE_WAKES.to_owned(),
+            step: 2,
+            witness: vec![1, 2],
+            expected,
+            actual: "the scheduler is Quiescent after step 2 with the obligation from step 1 open"
+                .to_owned(),
+        };
+        assert_eq!(
+            found.violations,
+            [
+                violation(discharged(&first, 3)),
+                violation(discharged(&second, 4))
+            ]
+        );
+        assert!(
+            matches!(found.outcome, crate::PropertyOutcome::Violated { .. }),
+            "{found:?}"
+        );
+    }
+
     /// A wake fact kept after the node's stores froze is dropped.
     #[test]
     fn a_frozen_wake_store_drops_a_fact() {

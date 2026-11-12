@@ -11,6 +11,7 @@ use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
@@ -38,13 +39,21 @@ const STALE_PREPARE_INPUT: &[u8] = include_bytes!("fixtures/header-storage-stale
 fn the_stale_prepare_input_holds_stale_completion_inert() {
     let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
     let (prefix, plan) = STALE_PREPARE_INPUT.split_at(Storage::SCENARIO_BYTES);
-    let result = (entry.witness)(
+    let result = run_declared(
+        Storage::NAME,
+        "committed stale-prepare input",
         &entry.scenario(prefix),
         Plan::from_fuzz(plan),
-        STALE_COMPLETION_INERT,
-        Expect::Holds,
-        &[],
-        &mut MemorySink::default(),
+        |scenario, plan, sink| {
+            (entry.witness)(
+                scenario,
+                plan,
+                STALE_COMPLETION_INERT,
+                Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     );
     assert_eq!(result, Ok(()));
 }

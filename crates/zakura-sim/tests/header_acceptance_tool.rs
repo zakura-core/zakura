@@ -18,7 +18,7 @@ use zakura_sim::{
         self,
         header_acceptance::{
             contracts::RunBy,
-            evaluate::Actual,
+            evaluate::{Actual, End},
             sim_test,
             tool::{self, ReplayRun, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
             HistoryRef, RunId,
@@ -163,6 +163,140 @@ fn a_changed_stored_fact_fails_the_replay_comparison() {
     replay(dir.path());
     let (exact, _, stores_equal, _) = read(dir.path());
     assert!(!exact && !stores_equal);
+}
+
+/// Gate 1's full-report binding control: runs A and B, one mirror serving
+/// the same fork shape on two fixture branches, have the same outcomes and
+/// different stores. Each reads back as itself. With A's
+/// recording and replay reports copied beside B's trace and B's own
+/// successful replay log, B's recording reads as no run and its replay's
+/// reports don't compare, and so with only the replay's report swapped. A
+/// report that names no trace is no report of B's either.
+#[test]
+fn another_run_s_full_reports_beside_a_trace_are_refused() {
+    let plan = tempfile::tempdir().expect("a temp dir can be created");
+    let plan = plan.path().join("plan.bin");
+    std::fs::write(&plan, b"").expect("the temp dir is writable");
+    let recorded = |branch: u8| {
+        let scenario = serde_json::json!({
+            "controls": [],
+            "mirrors": [{
+                "chain": {"main": 2, "fork": {"branch": branch, "len": 3}},
+                "dialer": "mirror",
+            }],
+            "node": {"main": 0, "fork": null},
+            "policy": {"base": "success-only", "bound_ms": 5000, "holds": []},
+        })
+        .to_string();
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let (ok, log) = sim(&[
+            "record",
+            "--sim",
+            "header-sync/storage",
+            "--scenario",
+            &scenario,
+            "--plan",
+            plan.to_str().expect("the path is UTF-8"),
+            "--out",
+            dir.path().to_str().expect("the path is UTF-8"),
+        ]);
+        assert!(ok, "{log}");
+        replay(dir.path());
+        dir
+    };
+    let full = |dir: &Path| -> FullReport {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.join(FULL_REPORT_FILE)).expect("the report exists"),
+        )
+        .expect("it reads")
+    };
+    let outcomes = |report: &FullReport| -> Vec<(String, zakura_sim::PropertyOutcome)> {
+        report
+            .properties
+            .iter()
+            .map(|found| (found.property.clone(), found.outcome.clone()))
+            .collect()
+    };
+    let execution =
+        |dir: &Path| tool::read_execution(dir, history(), "header-sync/storage", RunBy::Tool).end;
+    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let a = recorded(1);
+    let b = recorded(2);
+    let (a_full, b_full) = (full(a.path()), full(b.path()));
+    assert_eq!(outcomes(&a_full), outcomes(&b_full));
+    assert_ne!(a_full.snapshot, b_full.snapshot);
+    for dir in [a.path(), b.path()] {
+        assert!(!matches!(execution(dir), End::Failed { .. }), "{dir:?}");
+        assert_eq!(read(dir), (true, true, true, true), "{dir:?}");
+    }
+
+    let copy = |from: &Path, to: &Path| std::fs::copy(from, to).map(|_| ()).expect("it copies");
+    let refused =
+        |end: End| matches!(end, End::Failed { why } if why.contains("isn't a report of"));
+    copy(
+        &a.path().join(FULL_REPORT_FILE),
+        &b.path().join(FULL_REPORT_FILE),
+    );
+    let replayed = |dir: &Path| dir.join(REPLAY_DIR).join(FULL_REPORT_FILE);
+    copy(&replayed(a.path()), &replayed(b.path()));
+    assert!(refused(execution(b.path())));
+    assert_eq!(read(b.path()), (true, false, false, true));
+
+    let b = recorded(2);
+    copy(&replayed(a.path()), &replayed(b.path()));
+    assert!(!matches!(execution(b.path()), End::Failed { .. }));
+    assert_eq!(read(b.path()), (true, false, false, true));
+
+    let b = recorded(2);
+    edit_report(&b.path().join(FULL_REPORT_FILE), |report| {
+        report.trace = None
+    });
+    assert!(refused(execution(b.path())));
+}
+
+/// The runner contract's `record` arguments for a declared history record
+/// it through the `zakura-sim` binary: `--scenario` takes the declaration's
+/// JSON text, and the recorded trace runs the declared scenario and Plan.
+/// The scenario file's path in its place, as the contract once read, is
+/// refused as not JSON.
+#[test]
+fn a_declared_history_records_through_the_contracts_arguments() {
+    use zakura_sim::{
+        harness::{header_acceptance::history, header_sync::StorageScenario},
+        PlanInput,
+    };
+    let root = tempfile::tempdir().expect("a temp dir can be created");
+    let scenario = StorageScenario::default();
+    let storage = "header-sync/storage";
+    history::declare_into(
+        root.path(),
+        storage,
+        "only",
+        &scenario,
+        &PlanInput::Bytes(vec![7, 1]),
+    )
+    .expect("the temp dir is writable");
+    let declaration = root.path().join("0");
+    let out = root.path().join("run");
+    let mut args = vec!["record".to_owned()];
+    args.extend(tool::record_args(storage, &declaration).expect("it names one Plan"));
+    args.extend(["--out".to_owned(), out.display().to_string()]);
+    let (ok, log) = sim(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok, "{log}");
+    let trace = zakura_sim::trace::TraceReader::open(&out).expect("the trace reads back");
+    let described = (harness::find(storage).expect("it's registered").meta)(
+        &serde_json::to_value(&scenario).expect("it serializes"),
+    )
+    .expect("the scenario fits");
+    assert_eq!(trace.meta.scenario, described.scenario);
+
+    let path = declaration.join(history::SCENARIO_FILE);
+    let mut by_path = args.clone();
+    by_path[4] = path.display().to_string();
+    by_path.pop();
+    by_path.push(root.path().join("by-path").display().to_string());
+    let (ok, log) = sim(&by_path.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!ok && log.contains("--scenario isn't JSON"), "{log}");
 }
 
 /// Every committed fixture of `harness`, sorted.
@@ -353,7 +487,7 @@ fn two_planted_cases_run_through_the_tool() {
         std::fs::create_dir_all(&dir).expect("the temp dir is writable");
         std::fs::write(
             dir.join(tool::TASK_FILE),
-            tool::task_binding(index, task).to_string(),
+            tool::task_binding(&run.run_id, index, task).to_string(),
         )
         .expect("the temp dir is writable");
     }
@@ -371,6 +505,7 @@ fn two_planted_cases_run_through_the_tool() {
         let Task::Case {
             harness,
             input,
+            patched: witness,
             patch,
             draft: Some(set),
             companions,
@@ -391,12 +526,20 @@ fn two_planted_cases_run_through_the_tool() {
             replay(&dir.join(out));
         };
         record("baseline", &["--witness", property, "--expect", "holds"]);
-        record("patched", &["--witness", property, "--expect", "violated"]);
+        // The patched run expects what the case's task names, as the
+        // planted runner records it.
+        let beside = witness.beside.join(",");
+        let mut patched = vec!["--witness", property, "--expect", &witness.expect];
+        if !beside.is_empty() {
+            patched.extend(["--also-violates", &beside]);
+        }
+        record("patched", &patched);
         record("draft", &["--draft", &set.join(",")]);
         let checks = [
             (
                 "provenance.json",
                 serde_json::json!({
+                    "base": run.subject,
                     "source": source,
                     "patch_sha256": digest(&repo.join(patch)),
                     "refused": null,
@@ -404,12 +547,24 @@ fn two_planted_cases_run_through_the_tool() {
             ),
             (
                 "verdict.json",
-                serde_json::json!({"property": property, "name": name, "refused": null}),
+                serde_json::json!({
+                    "property": property,
+                    "name": name,
+                    "baseline": digest(&dir.join("baseline").join("trace.jsonl")),
+                    "patched": digest(&dir.join("patched").join("trace.jsonl")),
+                    "refused": null,
+                }),
             ),
             (
                 "target.json",
                 serde_json::json!({
-                    "property": property, "name": name, "target": null, "refused": null,
+                    "property": property,
+                    "name": name,
+                    "target": null,
+                    "source": source,
+                    "input_sha256": null,
+                    "trace": null,
+                    "refused": null,
                 }),
             ),
         ];

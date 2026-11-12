@@ -296,6 +296,8 @@ pub(crate) fn write_trace<T>(
     // without its report.
     match (report, held.is_empty()) {
         (Some(report), _) => {
+            // Bound to the trace as it will be once `held` is written.
+            let report = report.of_trace(&file.id_with(&held));
             let bytes = report_bytes(&report, MAX_REPORT_BYTES);
             let written = bytes.and_then(|bytes| write_new(&out.join(FULL_REPORT_FILE), &bytes));
             if let Err(error) = written {

@@ -373,11 +373,19 @@ fn committed_required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
             Some(((property.clone(), name.clone()), harness))
         })
         .collect();
+    let harness_caught: BTreeSet<(String, String)> = planted
+        .iter()
+        .filter(|(property, name)| {
+            header_acceptance::planted_harness_caught(&repo(), property, name).unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     required_keys(&Inventories {
         registered: &registered,
         needs: &needs,
         planted: &planted,
         planted_harnesses: &planted_harnesses,
+        harness_caught: &harness_caught,
         native: &native,
         coverage_tests: &coverage,
         contracts: &contracts,
@@ -1600,16 +1608,18 @@ fn case_errors(expected: &[ExpectedResult], cases: &[(String, String)]) -> Vec<S
     let mut named: BTreeMap<(String, String), Vec<(bool, &str)>> = BTreeMap::new();
     for result in expected {
         // A duplicate native mutation's key shares its covering case's
-        // catch, which the case's own row names.
+        // catch, which the case's own row names, and so does a contract's
+        // proving catch.
         if result
             .keys
             .iter()
-            .all(|key| matches!(key, Key::Native { .. }))
+            .all(|key| matches!(key, Key::Native { .. } | Key::ContractCatch { .. }))
         {
             continue;
         }
         let (case, machine, declared) = match result.expected {
-            Expected::Caught { case, harness, .. } => (case, false, harness),
+            Expected::Caught { case, harness, .. }
+            | Expected::HarnessCaught { case, harness, .. } => (case, false, harness),
             Expected::MachineCaught { case, harness } => (case, true, harness),
             _ => continue,
         };
@@ -1687,6 +1697,7 @@ fn every_planted_case_is_named_by_one_row_of_its_kind() {
                 found: Found::AtStep,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             };
         }
     });
@@ -2291,10 +2302,11 @@ fn scripted_bypasses_never_satisfy_a_catch() {
 /// Every `#[test]` or `#[tokio::test]` function in `source`, by its full
 /// libtest name inside the file (`module::name` for one in an inline
 /// module), and whether its own attributes or an enclosing module's keep it
-/// from running: an `#[ignore]`, or a `cfg` other than the two the
-/// acceptance run's test builds turn on, `test` and `zakura_sim`. Doc
-/// comments and other attributes may sit between the test attribute and
-/// the `fn`.
+/// from running: an `#[ignore]`, or a `cfg` the acceptance run's test
+/// builds leave off. They turn on `test` and `zakura_sim`, and run on
+/// Linux, the only host whose record counts (`Containment::Subreaper`), so
+/// `unix` and `target_os = "linux"` are on too. Doc comments and other
+/// attributes may sit between the test attribute and the `fn`.
 fn test_fns(source: &str) -> BTreeMap<String, bool> {
     use proc_macro2::{Delimiter, TokenStream, TokenTree};
     /// Whether `attribute` keeps the item it's on from running in the
@@ -2319,12 +2331,18 @@ fn test_fns(source: &str) -> BTreeMap<String, bool> {
         }
     }
     /// Whether a `cfg` predicate holds in the acceptance run's test builds,
-    /// where `test` and `zakura_sim` are on and nothing else is known on:
-    /// `all`, `any` and `not` evaluate, and any other option is off.
+    /// where `test`, `zakura_sim`, `unix` and `target_os = "linux"` are on
+    /// and nothing else is known on: `all`, `any` and `not` evaluate, and
+    /// any other option is off.
     fn enabled(predicate: TokenStream) -> bool {
         let tokens: Vec<TokenTree> = predicate.into_iter().collect();
         match tokens.as_slice() {
-            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim",
+            [TokenTree::Ident(name)] => name == "test" || name == "zakura_sim" || name == "unix",
+            [TokenTree::Ident(name), TokenTree::Punct(eq), TokenTree::Literal(value)]
+                if eq.as_char() == '=' =>
+            {
+                name == "target_os" && value.to_string() == "\"linux\""
+            }
             [TokenTree::Ident(name), TokenTree::Group(args)] => {
                 let mut parts = Vec::new();
                 let mut part = Vec::new();
@@ -2488,9 +2506,77 @@ fn test_exists(test: TestRef) -> Result<(), String> {
     }
 }
 
+/// Every proving catch of `manifest`'s contracts that doesn't name a
+/// committed planted case with a row's `Caught`.
+fn catch_errors(manifest: &Manifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    for contract in &manifest.contracts {
+        for case in contract.proving_catches {
+            let patch = repo()
+                .join("qa/planted")
+                .join(case.property)
+                .join(format!("{}.patch", case.name));
+            if !patch.is_file() {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no planted case",
+                    contract.id, case.property, case.name
+                ));
+            }
+            let caught = manifest.expected.iter().any(|result| {
+                result
+                    .keys
+                    .iter()
+                    .any(|key| matches!(key, Key::Case { .. }))
+                    && matches!(
+                        result.expected,
+                        Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
+                            if c == *case
+                    )
+            });
+            if !caught {
+                errors.push(format!(
+                    "{:?}'s catch {}/{} has no row's Caught",
+                    contract.id, case.property, case.name
+                ));
+            }
+        }
+    }
+    errors
+}
+
 #[test]
 fn every_referenced_test_exists() {
     let manifest = Manifest::committed();
+    // Every proving catch names a committed case and a row's catch of it.
+    assert_eq!(catch_errors(&manifest), Vec::<String>::new());
+    assert!(manifest
+        .contracts
+        .iter()
+        .any(|contract| !contract.proving_catches.is_empty()));
+    for (case, error) in [
+        (
+            CaseRef {
+                property: "header-sync/header-fault-penalized",
+                name: "no-such-case",
+            },
+            "has no planted case",
+        ),
+        (
+            CaseRef {
+                property: "session/honest-never-punished",
+                name: "no-such-case",
+            },
+            "has no row's Caught",
+        ),
+    ] {
+        let mut named = manifest.clone();
+        named.contracts[0].proving_catches = Box::leak(Box::new([case]));
+        assert!(
+            catch_errors(&named).iter().any(|e| e.contains(error)),
+            "{case:?}: {:?}",
+            catch_errors(&named)
+        );
+    }
     let mut tests = BTreeSet::new();
     for result in &manifest.expected {
         match result.expected {
@@ -2702,6 +2788,9 @@ fn an_unnamed_replay_test() {{}}
          #[test]\n#[cfg(all(test, zakura_sim))]\nfn h() {}\n\
          #[test]\n#[cfg(all(test, windows))]\nfn i() {}\n\
          #[test]\n#[cfg(not(feature = \"slow\"))]\nfn j() {}\n\
+         #[test]\n#[cfg(target_os = \"linux\")]\nfn k() {}\n\
+         #[test]\n#[cfg(target_os = \"macos\")]\nfn l() {}\n\
+         #[test]\n#[cfg(not(unix))]\nfn n() {}\n\
          #[cfg(test)]\nmod on {\n    #[test]\n    #[cfg(zakura_sim)]\n    fn g() {}\n}\n\
          #[tokio::test(flavor = \"multi_thread\")]\nasync fn e() {}\n\
          fn not_a_test() {}\n",
@@ -2709,7 +2798,7 @@ fn an_unnamed_replay_test() {{}}
     let expected: BTreeMap<String, bool> = [
         ("a", false),
         ("m::a", false),
-        ("b", true),
+        ("b", false),
         ("c", true),
         ("d", false),
         ("e", false),
@@ -2718,6 +2807,9 @@ fn an_unnamed_replay_test() {{}}
         ("h", false),
         ("i", true),
         ("j", false),
+        ("k", false),
+        ("l", true),
+        ("n", true),
     ]
     .map(|(name, cfg)| (name.to_owned(), cfg))
     .into_iter()
@@ -2732,6 +2824,15 @@ fn an_unnamed_replay_test() {{}}
         ..xtask
     })
     .is_err());
+    // A real `#[cfg(unix)]` runner test resolves, since only a Linux run's
+    // record counts.
+    assert_eq!(
+        test_exists(TestRef {
+            test: "planted::tests::a_hung_patched_run_is_killed_and_never_caught",
+            ..xtask
+        }),
+        Ok(())
+    );
     // A real `#[tokio::test]` resolves, and an ignored test doesn't.
     assert_eq!(
         test_exists(TestRef {
@@ -2858,6 +2959,7 @@ fn the_contracts_table_has_one_row_per_required_contract() {
     assert!(!contract_errors(&doubled).is_empty());
     let mut unproved = table.clone();
     unproved[0].state = ContractState::Satisfied;
+    unproved[0].proving = &[];
     assert!(!contract_errors(&unproved).is_empty());
 }
 
@@ -2936,6 +3038,7 @@ fn every_transitional_row_names_an_open_pr() {
         harness,
         found,
         not_applicable,
+        patched_not_applicable,
         companions,
         ..
     } = caught
@@ -2957,6 +3060,7 @@ fn every_transitional_row_names_an_open_pr() {
             set: &["sim/no-task-panic"],
             found,
             not_applicable,
+            patched_not_applicable,
             companions,
         },
     });
@@ -3885,8 +3989,9 @@ const NATIVE_HISTORY: HistoryRef = HistoryRef {
 };
 /// The harness the native mutation's history runs on.
 const NATIVE_HARNESS: &str = "header-sync/storage";
-/// Why `t/b` doesn't apply on [`HISTORY`].
-const UNREACHED: &str = "unreached here";
+/// Why `t/b` doesn't apply on [`HISTORY`]: a benign reason, since a
+/// completed counted run accepts no other for a non-target property.
+const UNREACHED: &str = "never-applied";
 /// Why `t/b` never applies.
 const NEVER: &str = "never applies";
 /// `t/b`'s expected `NotApplicable` on [`HISTORY`].
@@ -3931,6 +4036,7 @@ fn satisfied(id: ContractId, test: &'static [TestRef]) -> Contract {
         owner: "test",
         statement: "test",
         proving: test,
+        proving_catches: &[],
         state: ContractState::Satisfied,
         delivery: "test",
     }
@@ -4041,6 +4147,7 @@ fn manifest() -> Manifest {
                 found: Found::AtStep,
                 companions: &["close"],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -4056,6 +4163,7 @@ fn manifest() -> Manifest {
                 found: Found::AtEnd,
                 companions: &[],
                 not_applicable: &[],
+                patched_not_applicable: None,
             },
         ),
         er(
@@ -4195,7 +4303,7 @@ fn na(reason: &str) -> Report {
 }
 
 /// A test result for `test`, which ran `ran` with `outcome`, from a binary
-/// embedding the subject's source.
+/// embedding the subject's source, in a checkout of it.
 fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
     Actual::Test {
         ran: vec![TestRan {
@@ -4205,6 +4313,7 @@ fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
             outcome,
         }],
         binary_source: Some(SOURCE.into()),
+        checkout_source: Some(SOURCE.into()),
     }
 }
 
@@ -4393,6 +4502,7 @@ fn duplicate_caught() -> Expected {
         found: Found::AtStep,
         companions: &[],
         not_applicable: &[],
+        patched_not_applicable: None,
     }
 }
 
@@ -5176,6 +5286,114 @@ fn the_evaluator_refuses_manifest_defects() {
     assert!(!evaluation.accepted());
 }
 
+/// A harness-caught case (Adam's ruling on question 7) verifies only with
+/// its baseline holding and its patched run ending at its own property's
+/// missing evidence that says its detail, violating nothing. Every other
+/// end blocks it, and a contract's proving catch may name it.
+#[test]
+fn the_evaluator_judges_a_harness_caught_case() {
+    const STUCK: CaseRef = CaseRef {
+        property: "t/a",
+        name: "stuck",
+    };
+    const DETAIL: &str = "with a boundary unread";
+    let key = Key::Case {
+        property: "t/a".into(),
+        name: "stuck".into(),
+    };
+    let caught = Expected::HarnessCaught {
+        case: STUCK,
+        harness: NODE,
+        detail: DETAIL,
+        not_applicable: &[],
+    };
+    let mut m = manifest();
+    m.expected
+        .push(er(vec![key.clone()], &[Gate::G2], caught.clone()));
+    let id = caught.id().unwrap();
+    let ended = |diagnostic: &str| {
+        let mut patched = execution(
+            RunId::case(STUCK, CaseRun::Patched),
+            NODE,
+            &[("t/a", na("harness-failed")), ("t/b", na("harness-failed"))],
+        );
+        patched.end = End::HarnessFailure {
+            diagnostic: diagnostic.into(),
+        };
+        patched
+    };
+    let with = |patched: Execution| {
+        let mut results = results();
+        results.results.push(ResultRecord {
+            expected: id.clone(),
+            commit: S.into(),
+            actual: Actual::HarnessCaught {
+                baseline: execution(
+                    RunId::case(STUCK, CaseRun::Baseline),
+                    NODE,
+                    &[("t/a", held()), ("t/b", held())],
+                ),
+                patched,
+            },
+        });
+        results
+    };
+    let missing = format!("t/a lacks evidence after step 9: the run ran dry after step 9 {DETAIL}");
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &key),
+        ObligationState::Verified
+    );
+
+    // Another property's missing evidence, another detail, another harness
+    // failure, no step, a completed run or a stop at a violation blocks it.
+    for diagnostic in [
+        format!("t/b lacks evidence after step 9: {DETAIL}"),
+        "t/a lacks evidence after step 9: a gap".to_owned(),
+        format!("t/a lacks evidence after step : {DETAIL}"),
+        format!("source 3's evidence failed: {DETAIL}"),
+    ] {
+        assert!(
+            blocked(&state(&m, &with(ended(&diagnostic)), &key)),
+            "{diagnostic}"
+        );
+    }
+    let mut completed = ended(&missing);
+    completed.end = End::Completed;
+    assert!(blocked(&state(&m, &with(completed), &key)));
+    let mut stopped = ended(&missing);
+    stopped.end = End::Violation {
+        property: "t/a".into(),
+    };
+    assert!(blocked(&state(&m, &with(stopped), &key)));
+    // A violation beside the missing evidence, or a leaked task, blocks it.
+    let mut violating = ended(&missing);
+    violating.reports.insert("t/b".into(), Report::Violated);
+    assert!(blocked(&state(&m, &with(violating), &key)));
+    let mut leaking = ended(&missing);
+    leaking.leaked = 1;
+    assert!(blocked(&state(&m, &with(leaking), &key)));
+    // A Caught's record never stands in for it.
+    let mut wrong = with(ended(&missing));
+    wrong.results.last_mut().unwrap().actual = caught_actual(STUCK, Found::AtStep);
+    assert!(blocked(&state(&m, &wrong, &key)));
+
+    // As a contract's proving catch, it decides that contract.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, STUCK);
+    m.contracts[0].proving_catches = &[STUCK];
+    m.expected.push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&m, &with(ended(&missing)), &catch_key),
+        ObligationState::Verified
+    );
+    let other = format!("t/b lacks evidence after step 9: {DETAIL}");
+    assert!(blocked(&state(&m, &with(ended(&other)), &catch_key)));
+    assert!(blocked(&state(
+        &m,
+        &with(ended(&other)),
+        &Key::passing("t/a")
+    )));
+}
+
 #[test]
 fn the_evaluator_applies_contracts_and_narrowing() {
     let holds = Key::passing("t/a");
@@ -5198,6 +5416,44 @@ fn the_evaluator_applies_contracts_and_narrowing() {
     let mut m = manifest();
     m.contracts[0].state = ContractState::Blocked { waiting_for: "E1" };
     assert!(blocked(&state(&m, &results(), &holds)));
+
+    // A proving catch decides its contract as a proving test does: C3,
+    // proved by `CASE`'s catch too, counts only while that catch's own
+    // judgment passes, and only the `Caught` of exactly that case covers
+    // its key.
+    let catch_key = contracts::contract_catch_key(ContractId::C3, CASE);
+    let caught_of = |m: &Manifest, case: CaseRef| {
+        m.expected
+            .iter()
+            .find(|r| matches!(r.expected, Expected::Caught { case: c, .. } if c == case))
+            .unwrap()
+            .expected
+            .clone()
+    };
+    let mut proved = manifest();
+    proved.contracts[0].proving_catches = &[CASE];
+    let caught = caught_of(&proved, CASE);
+    proved
+        .expected
+        .push(er(vec![catch_key.clone()], &[], caught));
+    assert_eq!(
+        state(&proved, &results(), &catch_key),
+        ObligationState::Verified
+    );
+    assert_eq!(
+        state(&proved, &results(), &holds),
+        ObligationState::Verified
+    );
+    let mut lost = results();
+    caught_runs(&mut lost, CASE).1.trigger = false;
+    assert!(blocked(&state(&proved, &lost, &catch_key)));
+    assert!(blocked(&state(&proved, &lost, &holds)));
+    let mut other = manifest();
+    other.contracts[0].proving_catches = &[CASE];
+    let late = caught_of(&other, END_CASE);
+    other.expected.push(er(vec![catch_key.clone()], &[], late));
+    assert!(blocked(&state(&other, &results(), &catch_key)));
+    assert!(blocked(&state(&other, &results(), &holds)));
 
     // A satisfied contract whose proving test failed, is missing, ran at
     // another commit, or ran another test blocks.
@@ -5380,6 +5636,25 @@ fn the_evaluator_applies_contracts_and_narrowing() {
         assert!(blocked(&state(&manifest(), &stale, &quiet)));
         let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
         assert!(blocked(&state(&manifest(), &stale, &c5_key)));
+    }
+    // Nor does C5's own test from S's binary run in a checkout that has
+    // since moved, or one never measured: only its checkout differs, and
+    // C5's bootstrap still verifies with both of S's.
+    let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
+    assert_eq!(
+        state(&manifest(), &results(), &c5_key),
+        ObligationState::Verified
+    );
+    for checkout in [None, Some("another-source".to_owned())] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t5).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &quiet)));
+        assert!(blocked(&state(&manifest(), &moved, &c5_key)));
     }
     // An unknown digest anchors nothing, even when the caller's subject,
     // the result file and every test binary all agree on it: C5's own test
@@ -5945,6 +6220,18 @@ fn the_evaluator_binds_runners_and_traces() {
     }
     assert!(blocked(&state(&manifest(), &stale, &t3_key)));
     assert!(blocked(&state(&manifest(), &stale, &Key::passing("t/a"))));
+    // So does one from S's binary that ran in another checkout, whose files
+    // it read, or in one never measured.
+    for checkout in [Some("old-source".to_owned()), None] {
+        let mut moved = results();
+        if let Actual::Test {
+            checkout_source, ..
+        } = &mut record_mut(&mut moved, &t3).actual
+        {
+            *checkout_source = checkout;
+        }
+        assert!(blocked(&state(&manifest(), &moved, &t3_key)));
+    }
     // So does one whose digest couldn't be read, for a proving test and for
     // a narrowing test, which then releases nothing.
     let mut unread = results();

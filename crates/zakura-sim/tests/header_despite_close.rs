@@ -6,17 +6,22 @@
 //! ([`companions`](zakura_sim::harness::header_acceptance::companions)).
 //! These tests judge them on the committed bad-content input unpatched,
 //! where the subscriber refuses the unlinked page and nothing stages, and
-//! move one key of each join to show it doesn't match another page.
+//! move each key of each join on its own, with Rule 25's one template, to
+//! show it doesn't match another page.
 #![cfg(zakura_sim)]
+
+mod support;
 
 use std::path::Path;
 
-use zakura_sim::{
-    harness::header_acceptance::companions::{
+use support::one_key_off::assert_one_key_off;
+use zakura_sim::harness::header_acceptance::{
+    companions::{
         fault_close, judge, path_break, rejected_page, run_draft, sent_page, staged_page,
-        DraftEvidence, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE, PATH_BREAK, STAGED,
+        DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE, PATH_BREAK,
+        STAGED,
     },
-    Observation,
+    refs::PageRef,
 };
 
 /// The committed bad-content input, the case's input.
@@ -31,14 +36,14 @@ fn evidence() -> DraftEvidence {
     run_draft(&input()).expect("the wire harness runs the committed input")
 }
 
-/// A staged page of `sent`, from `session`'s `subscription` at `frame`.
-fn staged(sent: &SentPage, session: u64, subscription: u64, frame: u64) -> StagedPage {
+/// The fact staging `page`.
+fn staged(page: &PageRef) -> StagedPage {
     StagedPage {
-        peer: sent.peer.clone(),
-        session,
-        subscription,
-        frame: Some(frame),
-        hashes: sent.hashes.clone(),
+        peer: page.subscription.peer.clone(),
+        session: page.subscription.session,
+        subscription: page.subscription.subscription,
+        frame: Some(page.frame),
+        hashes: page.headers.clone(),
     }
 }
 
@@ -52,9 +57,9 @@ fn sent(evidence: &DraftEvidence) -> SentPage {
 /// Unpatched, the node judges the unlinked page, its reader refuses it for
 /// linkage and closes its connection with a fault, so the fault-close
 /// companion holds, and nothing stages, so the other two don't: the catch
-/// needs the patch. The companion joins the page's connection and its
-/// content refusal, so the same close moved to another connection fails,
-/// and so does the same close after a refusal for another fault.
+/// needs the patch. The companion joins the page's frame and its content
+/// refusal's session, so each key of either moved on its own fails, and so
+/// does the same close after a refusal for another fault.
 #[test]
 fn the_fault_close_holds_on_the_unpatched_rejection() {
     let evidence = evidence();
@@ -71,20 +76,16 @@ fn the_fault_close_holds_on_the_unpatched_rejection() {
     assert!(verdict(PATH_BREAK).is_err());
 
     let page = rejected_page(&evidence.observations).expect("one page was rejected");
-    let moved: Vec<Observation> = evidence
-        .observations
-        .iter()
-        .cloned()
-        .map(|mut obs| {
-            if let Observation::ConnectionClosed { connection, .. } = &mut obs {
-                if *connection == page.connection {
-                    *connection += 1000;
-                }
-            }
-            obs
-        })
-        .collect();
-    assert!(fault_close(&moved, &evidence.refusals, &page).is_err());
+    let held = |refusals: &[Refusal], page: &_| {
+        fault_close(&evidence.observations, refusals, page, &evidence.peers).is_ok()
+    };
+    assert_one_key_off(&page.frame, |frame| {
+        let page = zakura_sim::harness::header_acceptance::companions::RejectedPage {
+            frame: frame.clone(),
+            ..page.clone()
+        };
+        held(&evidence.refusals, &page)
+    });
 
     let [refusal] = &evidence.refusals[..] else {
         panic!("one refusal: {:?}", evidence.refusals);
@@ -93,16 +94,25 @@ fn the_fault_close_holds_on_the_unpatched_rejection() {
         (refusal.session, refusal.reason.as_str()),
         (page.session, CONTENT_FAULT)
     );
+    // Sol P2: the same refusal with only its peer, or only its session,
+    // changed is another session's, so it doesn't hold either.
+    assert_one_key_off(&refusal.session(), |session| {
+        let moved = Refusal {
+            peer: session.peer.clone(),
+            session: session.session,
+            ..refusal.clone()
+        };
+        held(&[moved], &page)
+    });
     let mut other = evidence.refusals.clone();
     other[0].reason = "over_credit".into();
-    assert!(fault_close(&evidence.observations, &other, &page).is_err());
+    assert!(!held(&other, &page));
 }
 
-/// Unpatched, the rejected page never stages. A page staged from its
-/// session, subscription and frame, with the peer and hashes the peer sent
-/// there, would hold, and another page on the same subscription, the same
-/// frame on another session, or the same frame with only its peer or only
-/// its hashes changed, wouldn't.
+/// Unpatched, the rejected page never stages. The page staged from its
+/// frame, with the peer and hashes the peer sent there, would hold, and the
+/// same fact with any one key moved, its peer, session, subscription,
+/// frame or a header, wouldn't.
 #[test]
 fn the_staging_companion_needs_the_rejected_page_staged() {
     let evidence = evidence();
@@ -111,46 +121,9 @@ fn the_staging_companion_needs_the_rejected_page_staged() {
     assert!(!sent.hashes.is_empty(), "{sent:?}");
     assert!(evidence.staged.is_empty(), "{:?}", evidence.staged);
     assert!(staged_page(&evidence.staged, &page, &sent).is_err());
-    let own = staged(&sent, page.session, page.subscription, page.frame);
-    assert_eq!(
-        staged_page(std::slice::from_ref(&own), &page, &sent),
-        Ok(())
-    );
-    assert!(staged_page(
-        &[staged(
-            &sent,
-            page.session,
-            page.subscription,
-            page.frame + 1
-        )],
-        &page,
-        &sent
-    )
-    .is_err());
-    assert!(staged_page(
-        &[staged(
-            &sent,
-            page.session + 1,
-            page.subscription,
-            page.frame
-        )],
-        &page,
-        &sent
-    )
-    .is_err());
-    let other_peer = StagedPage {
-        peer: "00".repeat(32),
-        ..own.clone()
-    };
-    let mut other_hashes = own.clone();
-    other_hashes.hashes.reverse();
-    other_hashes.hashes.push("00".repeat(32));
-    for off in [other_peer, other_hashes] {
-        assert!(
-            staged_page(std::slice::from_ref(&off), &page, &sent).is_err(),
-            "{off:?}"
-        );
-    }
+    assert_one_key_off(&page.page(&sent), |staged_ref| {
+        staged_page(&[staged(staged_ref)], &page, &sent).is_ok()
+    });
 }
 
 /// Unpatched, `commit-only-authorized` holds, so no retained violation is

@@ -1,0 +1,18 @@
+# A release reads what the budget has left while it still holds the
+# budget's lock, so the reactor waits on itself inside the release: stopped
+# mid-poll with the lock held. `chunk-budget-bound` leaves each boundary it
+# finds that way pending, and the run goes dry with one unread, which no
+# later read can supply. The run fails as missing evidence, C19's
+# bug-only half, so the case is harness-caught: its patched run must end at
+# that missing evidence and violate nothing. The input is the fork-sharing
+# authority witness, whose first lease return is a release.
+missing_evidence = "with a boundary unread"
+# Besides peer_work.rs, which the patch changes, the reactor and the queue
+# decide when the witness's first lease returns. A change there can move
+# the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

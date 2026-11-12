@@ -571,3 +571,157 @@ fn a_frozen_publication_store_drops_a_fact() {
         PublicationEvidence::facts,
     );
 }
+
+/// Armed publication evidence and its node's claims, with no tap behind
+/// them.
+#[derive(Clone)]
+struct Boundary {
+    claims: super::super::claim::ClaimEvidence,
+    publication: PublicationEvidence,
+    ends: super::super::ends::EndEvidence,
+}
+
+impl Default for Boundary {
+    /// Empty stores in one handle of their own, the publication store
+    /// armed outside a status fixture.
+    fn default() -> Self {
+        let stores = EvidenceStores::default();
+        Boundary {
+            claims: super::super::claim::ClaimEvidence::new(&stores),
+            publication: PublicationEvidence::armed(
+                &stores,
+                Arming {
+                    armed: true,
+                    status: false,
+                },
+            ),
+            ends: super::super::ends::EndEvidence::new(&stores),
+        }
+    }
+}
+
+impl crate::domain::header_sync::PublicationView for Boundary {
+    fn claims(&self) -> &super::super::claim::ClaimEvidence {
+        &self.claims
+    }
+
+    fn publication(&self) -> &PublicationEvidence {
+        &self.publication
+    }
+
+    fn ends(&self) -> &super::super::ends::EndEvidence {
+        &self.ends
+    }
+}
+
+impl crate::property::HasView for Boundary {
+    type View = Boundary;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> Boundary {
+        self.clone()
+    }
+
+    /// The publication store's stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        Some(
+            self.publication
+                .facts()
+                .into_iter()
+                .map(|(stamp, _)| stamp)
+                .filter(|stamp| after.is_none_or(|after| *stamp > after))
+                .collect(),
+        )
+    }
+}
+
+/// The claim break [`Boundary`]'s drain finds beside its commit: the
+/// commit's skipped publication.
+const SKIPPED: &str = "StatePublicationConsistent: the engine committed state version 2 and \
+                       the port's last publication in that step was None, not it";
+
+impl crate::harness::scripted::Script for Boundary {
+    const NAME: &'static str = "test/publication-break-beside-a-commit";
+    /// Whether step 1's drain also found the commit's publication skipped.
+    type Case = bool;
+
+    /// The publication check.
+    fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Boundary>>>
+    {
+        vec![crate::domain::header_sync::state_publication_consistent()]
+    }
+
+    /// The schedule and the view.
+    fn sources() -> crate::property::Sources {
+        use crate::property::Source;
+        crate::property::Sources::observed(&[Source::Schedule, Source::View])
+    }
+
+    /// At step 1: a commit of state version 2, which nothing adopts, and,
+    /// for a break, its skipped publication, as the tap's drain keeps
+    /// them.
+    fn observe(&self, broke: &bool, log: &mut crate::ObservationLog) {
+        let step = log.step();
+        if step != 1 {
+            return;
+        }
+        self.publication.keep(PublicationFact::Committed {
+            state_version: 2,
+            at: now(),
+        });
+        self.publication.change(|store| {
+            store.applicable.get_or_insert(step);
+        });
+        if *broke {
+            self.claims.record(super::super::claim::ClaimRecord {
+                step,
+                claim: super::super::claim::Claim::StatePublicationConsistent,
+                detail: SKIPPED.to_owned(),
+                attribution: None,
+            });
+        }
+    }
+}
+
+/// Sol P2: a claim break at the boundary that commits state version 2
+/// still registers the commit's adoption obligation, so a run that never
+/// adopts it reports both failures, in the full report recorded beside the
+/// trace and its fresh replay. Without the break, the obligation's failure
+/// is the same one.
+#[test]
+fn a_claim_break_beside_an_unadopted_commit_reports_both() {
+    use crate::{
+        domain::header_sync::STATE_PUBLICATION_CONSISTENT,
+        harness::scripted::{findings, sidecar},
+    };
+    let unadopted = crate::Violation {
+        property: STATE_PUBLICATION_CONSISTENT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: "Owner(\"adoption-of-state-version-2\") discharged before quiescence".to_owned(),
+        actual: "the scheduler is Quiescent after step 1 with the obligation from step 1 open"
+            .to_owned(),
+    };
+    let skipped = crate::Violation {
+        property: STATE_PUBLICATION_CONSISTENT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: "committed states are published and adopted as recorded, and advertised as \
+                   adopted"
+            .to_owned(),
+        actual: SKIPPED.to_owned(),
+    };
+    for (broke, expected) in [
+        (true, vec![skipped.clone(), unadopted.clone()]),
+        (false, vec![unadopted.clone()]),
+    ] {
+        let full = sidecar::<Boundary>(&broke, &[]);
+        let found = findings(&full, STATE_PUBLICATION_CONSISTENT);
+        assert_eq!(found.violations, expected, "broke: {broke}");
+        assert_eq!(
+            found.outcome,
+            crate::PropertyOutcome::Violated { witness: vec![1] },
+            "broke: {broke}"
+        );
+    }
+}

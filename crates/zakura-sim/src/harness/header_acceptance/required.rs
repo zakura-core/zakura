@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
+    contracts::{
+        contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
+    },
     reasons::NaEntry,
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
     Tier, PLAN, TIERS,
@@ -44,6 +46,11 @@ pub struct Inventories<'a> {
     /// ([`planted_harness`](super::planted_harness)) apart from the rows.
     /// A case with no readable harness counts as a node case.
     pub planted_harnesses: &'a BTreeMap<(String, String), String>,
+    /// Every planted case whose `.toml` names `missing_evidence`, a
+    /// harness-caught case with no `Draft` run
+    /// ([`planted_harness_caught`](super::planted_harness_caught)), read
+    /// apart from the rows.
+    pub harness_caught: &'a BTreeSet<(String, String)>,
     /// Every directory under `qa/native-mutations/header-sync/`, retired
     /// ones included.
     pub native: &'a [String],
@@ -509,6 +516,15 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
             ],
             Vec::new(),
         ),
+        // Its patched run ends at a harness failure, so only the baseline
+        // owes a cleanup comparison.
+        Expected::HarnessCaught { case, .. } => (
+            vec![
+                RunId::case(case, CaseRun::Baseline),
+                RunId::case(case, CaseRun::Patched),
+            ],
+            vec![RunId::case(case, CaseRun::Baseline)],
+        ),
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -519,7 +535,8 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
 /// Each planted case owes its own case key, each native mutation a key,
 /// each needed source a missing-source key, each `COVERAGE` test a witness
 /// key, each `Satisfied` contract's proving test and each narrowing entry
-/// a test key, each requirement and composition check its key, and each
+/// a test key, each such contract's proving catch a catch key, each
+/// requirement and composition check its key, and each
 /// counted execution a replay and, for a history, a cleanup comparison.
 /// Each `NotApplicable` reason owes its test, and each ID an entry for every
 /// tier other than its own.
@@ -582,6 +599,9 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
                 for &test in contract.proving {
                     keys.insert(contract_test_key(id, test), BTreeSet::new());
                 }
+                for &case in contract.proving_catches {
+                    keys.insert(contract_catch_key(id, case), BTreeSet::new());
+                }
             }
         }
     }
@@ -629,9 +649,10 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
     }
     // Every planted case's baseline and patched runs owe a replay, and a
     // node case's `Draft` run does too, its baseline and Draft runs a
-    // cleanup comparison as well, from the planted inventory itself. Only
-    // whether a node case's patched run completes, so owes a cleanup too,
-    // comes from its row's `found`, below.
+    // cleanup comparison as well, from the planted inventory itself. A
+    // harness-caught case has no `Draft` run, so only its baseline owes a
+    // cleanup. Only whether a node case's patched run completes, so owes a
+    // cleanup too, comes from its row's `found`, below.
     for (property, name) in inv.planted {
         let case = |run| RunId::Case {
             property: property.clone(),
@@ -645,7 +666,17 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
         for run in [CaseRun::Baseline, CaseRun::Patched] {
             keys.insert(Key::Replay { run: case(run) }, BTreeSet::from([Gate::G1]));
         }
-        if !machine {
+        if inv
+            .harness_caught
+            .contains(&(property.clone(), name.clone()))
+        {
+            keys.insert(
+                Key::Cleanup {
+                    run: case(CaseRun::Baseline),
+                },
+                BTreeSet::from([Gate::G1]),
+            );
+        } else if !machine {
             keys.insert(
                 Key::Replay {
                     run: case(CaseRun::Draft),

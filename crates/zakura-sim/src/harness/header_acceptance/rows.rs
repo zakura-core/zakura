@@ -1184,6 +1184,7 @@ fn caught(
             found,
             companions: &[],
             not_applicable: super::not_applicable::expected(case),
+            patched_not_applicable: super::not_applicable::patched_expected(case),
         },
     )]
 }
@@ -1559,6 +1560,22 @@ fn hand_written_rows() -> Vec<Row> {
         Found::AtStep,
         G5,
         true,
+    ));
+    // C19's bug-only half (Adam's ruling on question 7): a release that
+    // re-takes the budget's lock leaves a boundary unread at a dry end.
+    let relocks = case(CHUNK, "release-relocks-budget");
+    chunk.push(result(
+        vec![Key::Case {
+            property: CHUNK.to_owned(),
+            name: relocks.name.to_owned(),
+        }],
+        G5,
+        Expected::HarnessCaught {
+            case: relocks,
+            harness: STORAGE,
+            detail: UNREAD_BOUNDARY,
+            not_applicable: super::not_applicable::expected(relocks),
+        },
     ));
     rows.push(sim_row(CHUNK, storage_harnesses, chunk));
 
@@ -2202,6 +2219,7 @@ fn hand_written_rows() -> Vec<Row> {
             found: Found::AtStep,
             companions: super::companions::COMPANIONS,
             not_applicable: super::not_applicable::expected(despite),
+            patched_not_applicable: super::not_applicable::patched_expected(despite),
         },
     ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
@@ -2209,7 +2227,8 @@ fn hand_written_rows() -> Vec<Row> {
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
     outstanding.push(mixed(OUTSTANDING));
     // The two cancellation cases' publishers linger at rest, which the end
-    // check finds.
+    // check finds after the drain. The run records that as its stopping
+    // `Violation`, so both are found at a step.
     for (index, (name, harness, set, found)) in [
         (
             "accepted-cursors-kept",
@@ -2227,13 +2246,13 @@ fn hand_written_rows() -> Vec<Row> {
             "cancellation-ignored",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "cancellation-ignored-at-capacity",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "close-kept-on-replace",
@@ -2701,6 +2720,17 @@ fn hand_written_rows() -> Vec<Row> {
             name == "late-fault-unpenalized",
         ));
     }
+    // C2's owed penalty concluding violated at the drain's end, through a
+    // node-side abandonment: the reactor's own exit drops the call holding
+    // the failed reply, and the end replay keeps it as a `DroppedFault`.
+    fault.extend(caught(
+        WIRE,
+        case(penalized, "idle-exit-drops-fault"),
+        &[PENALIZED],
+        Found::AtEnd,
+        G2,
+        false,
+    ));
     rows.push(sim_row(penalized, &[WIRE], fault));
 
     let honest = HONEST;
@@ -2851,6 +2881,10 @@ fn machine_row(property: &'static str, expected: Vec<ExpectedResult>) -> Row {
         expected,
     }
 }
+
+/// What `chunk-budget-bound`'s missing evidence says of a boundary still
+/// unread at a dry end: the registry's unread-boundary detail.
+pub const UNREAD_BOUNDARY: &str = "with a boundary unread";
 
 /// One broader claim a planted case's set may add to its own ID.
 #[derive(Clone, Copy, Debug)]
@@ -3514,6 +3548,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_refuses_manifest_defects",
     "the_evaluator_accepts_genuine_results",
     "the_evaluator_applies_contracts_and_narrowing",
+    "the_evaluator_judges_a_harness_caught_case",
     "the_evaluator_joins_on_full_identity",
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",

@@ -1743,13 +1743,23 @@ fn reactor_machine_records_and_replays_without_transport() {
     let dir = record_named("header/reactor-policy", REACTOR_INPUT);
     let trace = open(dir.path());
     let entry = harness::find("header/reactor-policy").unwrap();
-    (entry.witness)(
+    // The witness run is the manifest history `REACTOR_INPUT`, which the
+    // acceptance tool records from this declaration (C18).
+    zakura_sim::harness::header_acceptance::history::run_declared(
+        "header/reactor-policy",
+        "REACTOR_INPUT",
         &trace.meta.scenario,
         PlanInput::Bytes(Vec::new()),
-        "header/reactor-policy",
-        zakura_sim::witness::Expect::Holds,
-        &[],
-        &mut zakura_sim::NullSink,
+        |scenario, plan, sink| {
+            (entry.witness)(
+                scenario,
+                plan,
+                "header/reactor-policy",
+                zakura_sim::witness::Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     )
     .unwrap();
     assert_eq!(trace.steps.len(), REACTOR_INPUT.len().div_ceil(4));
@@ -1789,13 +1799,23 @@ fn publisher_machine_records_and_replays_without_transport() {
     let name = "header/publisher-policy";
     let dir = record_named(name, PUBLISHER_INPUT);
     let trace = open(dir.path());
-    (harness::find(name).unwrap().witness)(
+    // The witness run is the manifest history `PUBLISHER_INPUT`, which the
+    // acceptance tool records from this declaration (C18).
+    zakura_sim::harness::header_acceptance::history::run_declared(
+        name,
+        "PUBLISHER_INPUT",
         &trace.meta.scenario,
         PlanInput::Bytes(Vec::new()),
-        name,
-        zakura_sim::witness::Expect::Holds,
-        &[],
-        &mut zakura_sim::NullSink,
+        |scenario, plan, sink| {
+            (harness::find(name).unwrap().witness)(
+                scenario,
+                plan,
+                name,
+                zakura_sim::witness::Expect::Holds,
+                &[],
+                sink,
+            )
+        },
     )
     .unwrap();
     assert_eq!(trace.steps.len(), PUBLISHER_INPUT.len().div_ceil(4));

@@ -41,6 +41,12 @@ pub enum Expect {
     /// may report violations, as long as none stopped the run. A property
     /// with no trigger-history check passes on its outcome alone.
     Applicable,
+    /// The property stays `NotApplicable`, with any reason, while the run
+    /// reaches its trigger history, and the rest of the run is judged as
+    /// for [`Expect::Holds`]: no property is violated and none is left
+    /// incomplete. A row no scenario reaches, such as an `over-owed-closes`
+    /// ID, records its history's trigger this way.
+    NotApplicable,
 }
 
 impl Expect {
@@ -51,6 +57,7 @@ impl Expect {
             Expect::Violated => "violated",
             Expect::Applicable => "applicable",
             Expect::ViolatedSet => "violated-set",
+            Expect::NotApplicable => "not-applicable",
         }
     }
 }
@@ -65,10 +72,13 @@ impl FromStr for Expect {
             Expect::Violated,
             Expect::Applicable,
             Expect::ViolatedSet,
+            Expect::NotApplicable,
         ]
         .into_iter()
         .find(|expect| expect.name() == name)
-        .ok_or_else(|| format!("`{name}` isn't holds, violated, applicable or violated-set"))
+        .ok_or_else(|| {
+            format!("`{name}` isn't holds, violated, applicable, violated-set or not-applicable")
+        })
     }
 }
 
@@ -646,7 +656,8 @@ pub(crate) fn judge(
 /// [`judge`] on a run's `end` and property `reports`. Under
 /// [`Expect::Violated`], a violation of a property in `also_violates`
 /// isn't unrelated, and under [`Expect::ViolatedSet`] each of them must be
-/// violated. Under [`Expect::Holds`] and a violated expectation, another
+/// violated. Under [`Expect::Holds`], [`Expect::NotApplicable`] and a
+/// violated expectation, another
 /// property the run left with incomplete observations, a `NotApplicable`
 /// reason that isn't benign, fails the test too: the run can't show nothing
 /// else broke. The one exception is `StoppedByViolation` in a run the
@@ -701,7 +712,7 @@ fn judge_end(
     // `StoppedByViolation` says. Any unexpected stop failed above. A run
     // that went on to its end, as a `Draft` run does, leaves no such reason.
     let stopped = end.outcome == Outcome::Violation;
-    if expect == Expect::Holds || violated {
+    if matches!(expect, Expect::Holds | Expect::NotApplicable) || violated {
         let incomplete = reports
             .iter()
             .filter(|r| !expected(&r.property))
@@ -724,6 +735,10 @@ fn judge_end(
     match expect {
         Expect::Holds | Expect::Applicable => match outcome {
             PropertyOutcome::Held { applicable } if *applicable > 0 => Ok(()),
+            outcome => Err(WitnessError::Outcome(outcome.clone())),
+        },
+        Expect::NotApplicable => match outcome {
+            PropertyOutcome::NotApplicable { .. } => Ok(()),
             outcome => Err(WitnessError::Outcome(outcome.clone())),
         },
         Expect::Violated | Expect::ViolatedSet => {
@@ -850,6 +865,65 @@ mod tests {
                 },
             )
         }
+    }
+
+    /// A `NotApplicable` expectation passes only while its property stays
+    /// `NotApplicable` and nothing else is violated or left incomplete: its
+    /// property held, another property's violation, or another left
+    /// `assumptions-never-held`, fails it. The name reads back.
+    #[test]
+    fn not_applicable_needs_its_property_unapplied_and_the_rest_whole() {
+        let ended = RunEnd {
+            outcome: Outcome::Idle {
+                status: crate::IdleStatus::Quiescent,
+            },
+            steps: 5,
+            violation: None,
+            drain: None,
+            harness: None,
+            rest: None,
+        };
+        let report = |own: PropertyOutcome, other: PropertyOutcome| RunReport {
+            end: ended.clone(),
+            properties: vec![
+                PropertyReport::new("test/own", own),
+                PropertyReport::new("test/other", other),
+            ],
+            cleanup: Default::default(),
+            log: Default::default(),
+            picks: Vec::new(),
+            resolved: Default::default(),
+        };
+        let unapplied = PropertyOutcome::not_applicable(NaReason::NeverApplied);
+        let held = PropertyOutcome::Held { applicable: 1 };
+        let judged = |report: &RunReport| {
+            judge(
+                report,
+                "test/own",
+                Status::Active,
+                Expect::NotApplicable,
+                &[],
+            )
+        };
+        assert_eq!(judged(&report(unapplied.clone(), held.clone())), Ok(()));
+        assert_eq!(
+            judged(&report(held.clone(), held.clone())),
+            Err(WitnessError::Outcome(held.clone()))
+        );
+        let violated = PropertyOutcome::Violated { witness: vec![2] };
+        assert!(matches!(
+            judged(&report(unapplied.clone(), violated)),
+            Err(WitnessError::Unrelated { .. })
+        ));
+        let incomplete = PropertyOutcome::not_applicable(NaReason::AssumptionsNeverHeld);
+        assert!(matches!(
+            judged(&report(unapplied, incomplete)),
+            Err(WitnessError::UnrelatedIncomplete { .. })
+        ));
+        assert_eq!(
+            "not-applicable".parse::<Expect>(),
+            Ok(Expect::NotApplicable)
+        );
     }
 
     /// A run the property itself stopped fails `Holds` and `Applicable`

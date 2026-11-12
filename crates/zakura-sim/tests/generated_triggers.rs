@@ -372,6 +372,190 @@ fn conformant_never_closes_joins_the_punished_connection() {
     ));
 }
 
+/// The node admitting work on `connection` from the peer's `item` frame
+/// `seq` of `watch` subscription `key`.
+fn work(connection: u64, seq: u64, key: u64) -> Observation {
+    Observation::WorkAdmitted {
+        connection,
+        frame: RowAt::new(stream(), "item"),
+        seq,
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+        objects: 1,
+        bytes: 1,
+        ends: false,
+    }
+}
+
+/// The node starting to serve `connection`'s `watch` request `key`.
+fn serving(connection: u64, key: u64) -> Observation {
+    Observation::Serving {
+        connection,
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+    }
+}
+
+/// The node's `item` output on `connection` for its `watch` request `key`.
+fn output(connection: u64, key: u64) -> Observation {
+    Observation::NodeOutput {
+        connection,
+        frame: RowAt::new(stream(), "item"),
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+        payload: 8,
+        ends: false,
+    }
+}
+
+/// `receiver-work-authorized`'s trigger joins each work the node admits
+/// from its row to that work's own source frame: connection 1's judged
+/// frame doesn't reach it for work from connection 2, from another frame,
+/// from a frame the node judged only after the work, or from a frame the
+/// peer never sent. Connection 2's own judged frame does, whatever its
+/// label, since the violation is on its own trigger.
+#[test]
+fn work_authorized_joins_the_work_to_its_own_frame() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &work_id,
+        [first.clone(), vec![work(1, 0, 7)]].concat()
+    ));
+    // One key off each: the connection and the frame.
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), vec![work(2, 0, 7)]].concat()
+    ));
+    let other_row = vec![peer(1, "ended", Label::Conformant), judged(1)];
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), other_row, vec![work(1, 1, 7)]].concat()
+    ));
+    // No source frame at all, beside connection 1's.
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), vec![work(1, 5, 7)]].concat()
+    ));
+    assert!(!reaches(&work_id, vec![work(1, 0, 7)]));
+    // Judged only after the work.
+    assert!(!reaches(
+        &work_id,
+        vec![peer(0, "item", Label::Conformant), work(1, 0, 7), judged(0)]
+    ));
+    let own = vec![
+        on_two(peer(0, "item", Label::Unsolicited)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(
+        &work_id,
+        [first, own, vec![work(2, 0, 7)]].concat()
+    ));
+}
+
+/// `receiver-credit-conserved`'s trigger joins each page's work the node
+/// admits for its subscription to a judged page of that subscription on
+/// the work's own connection and key, granted credit before it. Connection
+/// 1's granted page doesn't reach it for connection 2's work, or for work
+/// of another subscription key, even with no page behind it. An ending's
+/// work, which the check doesn't count, leaves the trigger as it was.
+#[test]
+fn credit_conserved_joins_the_work_to_its_own_subscription() {
+    let credit = id(Some("watch"), Template::CreditConserved);
+    let first = vec![granted(7), peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &credit,
+        [first.clone(), vec![work(1, 0, 7)]].concat()
+    ));
+    // One key off each: the connection and the subscription.
+    assert!(!reaches(
+        &credit,
+        [first.clone(), vec![work(2, 0, 7)]].concat()
+    ));
+    assert!(!reaches(
+        &credit,
+        [first.clone(), vec![work(1, 0, 8)]].concat()
+    ));
+    let ending = match work(2, 9, 7) {
+        Observation::WorkAdmitted {
+            connection,
+            frame,
+            seq,
+            request,
+            exchange,
+            objects,
+            bytes,
+            ..
+        } => Observation::WorkAdmitted {
+            connection,
+            frame,
+            seq,
+            request,
+            exchange,
+            objects,
+            bytes,
+            ends: true,
+        },
+        _ => unreachable!(),
+    };
+    assert!(reaches(&credit, [first.clone(), vec![ending]].concat()));
+    let own_grant = Observation::CreditGranted {
+        connection: 2,
+        subscription: RowAt::new(stream(), "watch"),
+        exchange: 7,
+        objects: 4,
+        bytes: 64,
+        opens: true,
+    };
+    let own = vec![
+        own_grant,
+        on_two(peer(0, "item", Label::Conformant)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(&credit, [first, own, vec![work(2, 0, 7)]].concat()));
+}
+
+/// `receiver-serving-bounded`'s trigger joins each serving owner and output
+/// for a request of its row to a judged request with the effect's own
+/// connection and key. Connection 1's judged request doesn't reach it for
+/// serving or output on connection 2, or for another request key with no
+/// request behind it. Output for another request row, which the check
+/// doesn't count, leaves the trigger as it was.
+#[test]
+fn serving_bounded_joins_each_effect_to_its_own_request() {
+    let serving_id = id(Some("watch"), Template::ServingBounded);
+    let first = vec![peer(0, "watch", Label::Conformant), judged(0)];
+    for effect in [serving, output] {
+        assert!(reaches(
+            &serving_id,
+            [first.clone(), vec![effect(1, 7)]].concat()
+        ));
+        // One key off each: the connection and the request.
+        assert!(!reaches(
+            &serving_id,
+            [first.clone(), vec![effect(2, 7)]].concat()
+        ));
+        assert!(!reaches(
+            &serving_id,
+            [first.clone(), vec![effect(1, 8)]].concat()
+        ));
+        let own: Vec<Observation> = first.iter().cloned().map(on_two).collect();
+        assert!(reaches(
+            &serving_id,
+            [first.clone(), own, vec![effect(2, 7)]].concat()
+        ));
+    }
+    let elsewhere = Observation::NodeOutput {
+        connection: 2,
+        frame: RowAt::new(stream(), "ended"),
+        request: RowAt::new(stream(), "item"),
+        exchange: 7,
+        payload: 8,
+        ends: true,
+    };
+    assert!(reaches(&serving_id, [first, vec![elsewhere]].concat()));
+}
+
 /// The node applying the peer's grant of subscription `key` on connection
 /// 1's QUIC stream `quic`, as its regulation logs it.
 fn applied(quic: u64, key: u64) -> Observation {
@@ -414,8 +598,8 @@ fn sent(seq: u64, row: &str, label: Label) -> Observation {
 }
 
 /// `sender-within-credit` needs a page the node sent after it applied the
-/// peer's grant of that page's subscription, before it started writing. The
-/// peer's grant alone, a grant the peer only offered, the node's own
+/// peer's grant or `Open` of that page's subscription, before it started
+/// writing. The applied grant or `Open` alone, a grant the peer only offered, the node's own
 /// subscription update, a grant applied after the write started, a grant of
 /// another subscription, on another QUIC stream or on another connection,
 /// or an ending, which spends no credit, doesn't reach it. A page past its
@@ -432,6 +616,26 @@ fn sender_within_credit_needs_a_page_after_an_applied_grant() {
     ));
     assert!(!reaches(&credit, vec![grant.clone()]));
     assert!(!reaches(&credit, vec![page()]));
+    // The peer's `Open` applied with its initial credit, as its regulation
+    // logs it: alone it doesn't reach the trigger, and before a page it does.
+    let open = Observation::Transport {
+        instance: 0,
+        seq: 1,
+        node: "node".to_owned(),
+        connection: Some(1),
+        remote: "10.0.0.2:4000".to_owned(),
+        event: TransportFact::Regulated {
+            quic_stream: 4,
+            transition: TransitionFact::OpenApplied {
+                subscription: 7,
+                objects: 4,
+                bytes: 64,
+                seq: None,
+            },
+        },
+    };
+    assert!(!reaches(&credit, vec![open.clone()]));
+    assert!(reaches(&credit, vec![open, page()]));
     assert!(!reaches(
         &credit,
         vec![grant.clone(), sent(0, "watch", Label::Conformant)]

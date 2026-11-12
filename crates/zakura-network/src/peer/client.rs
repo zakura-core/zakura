@@ -41,6 +41,8 @@ pub mod tests;
 
 /// The "client" duplex half of a peer connection.
 pub struct Client {
+    /// The blocks this peer announced to us, which it does not need advertised back.
+    pub(crate) announced_blocks: super::AnnouncedBlocks,
     /// Tracks block writes for paced legacy advertisements.
     pub(crate) block_uploads: super::block_gossip::BlockUploads,
     /// Reports whether the connection can write a request as soon as it is sent.

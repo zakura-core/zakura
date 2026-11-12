@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //!     [--report <file>]
@@ -101,10 +101,10 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>] [--measure <file>]\n  \
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>] [--measure <file>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \
@@ -129,7 +129,8 @@ mod cli {
              `--scenario` and `--script` run a scripted Plan, as JSON, against it.\n\
              The trace's meta names the Plan bytes or script by digest.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
-             result to witness.json beside the trace, and exits 1 if the test fails.\n\
+             result to witness.json beside the trace, naming that trace's digest and\n\
+             this build's source, and exits 1 if the test fails.\n\
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
              test or `confirm` expects violated beside the property, as a planted bug's\n\
@@ -139,8 +140,10 @@ mod cli {
              whatever their status, as a planted case's Draft run does. The trace's\n\
              meta records them, and `replay` applies them too.\n\
              `record` writes the run's full report, every violation and the harness's\n\
-             evidence snapshot, to full-report.json beside the trace. `replay` compares its\n\
-             own with it, and `--report` writes the replay's to a file.\n\
+             evidence snapshot, to full-report.json beside the trace, naming that trace's\n\
+             digest and this build's source. `replay` compares its own with it, and\n\
+             `--report` writes the replay's, naming the replayed trace and this build's\n\
+             source, to a file.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -335,11 +338,15 @@ mod cli {
         print_trace(&trace, &out);
         write_measure(flags.measure.as_deref(), &trace, &out, started.elapsed())?;
         let error = result.as_ref().err().map(ToString::to_string);
+        // `trace` and `source` name the trace this judged and the build
+        // that judged it, so the result never counts for another run.
         let file = json!({
             "property": property,
             "expect": expect.name(),
             "also_violates": also_violates,
             "draft": draft,
+            "trace": trace.id,
+            "source": trace::BuildInfo::current().source,
             "passed": result.is_ok(),
             "error": error,
         });

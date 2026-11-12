@@ -1,0 +1,42 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 15b6d86dee..8d192d54b0 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -305,6 +305,7 @@ fn build_header_sync_reactor(
+         lifecycle: lifecycle_rx,
+         actions: actions_tx,
+         pending_port_operations: PortOperations::default(),
++        idle_exit: false,
+         locator_capacity: std::sync::Arc::new(Semaphore::new(
+             zakura_header_chain::MAX_STAGED_TARGETS_V1,
+         )),
+@@ -363,6 +364,10 @@ struct HeaderSyncReactor {
+     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
+     actions: mpsc::Sender<HeaderPortOperation>,
+     pending_port_operations: PortOperations,
++    // Mutation: set when the last session ends, after which the reactor
++    // waits out an idle grace period and returns by itself, dropping the
++    // calls still in flight.
++    idle_exit: bool,
+     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
+     locator_capacity: std::sync::Arc<Semaphore>,
+     locator_capacity_waiting: bool,
+@@ -536,6 +541,10 @@ impl HeaderSyncReactor {
+             if self.startup.shutdown.is_cancelled() {
+                 break HeaderRequestTerminal::Shutdown;
+             }
++            if self.idle_exit {
++                time::sleep(std::time::Duration::from_secs(5)).await;
++                return;
++            }
+             // Inspect watches on every turn, even when peer queues never become empty.
+             self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
+             // One item from each queue per turn prevents either queue monopolizing the loop.
+@@ -1218,6 +1227,7 @@ impl HeaderSyncReactor {
+             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
+         }
+         self.sessions.remove(peer);
++        self.idle_exit = self.sessions.is_empty();
+         observe!(
+             self,
+             ReactorEvent::SessionEnded {

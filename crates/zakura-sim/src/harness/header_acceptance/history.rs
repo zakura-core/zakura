@@ -3,18 +3,22 @@
 //! A manifest history is named by its witness test and a case within it,
 //! such as `plan 0 of inputs(16, 256)`. A witness test builds its scenario
 //! and Plan in code and may run many, so the test's name alone doesn't say
-//! which run is which. Each counted witness test calls [`declare`] with the
-//! exact scenario and Plan it's about to run. When the acceptance runner
-//! sets [`HISTORIES_VAR`], every declaration is written under that
-//! directory, so the tool can record the declared history itself with
-//! `zakura-sim record` and bind the recorded trace to it by digest. Without
-//! the variable, [`declare`] does nothing.
+//! which run is which. Each counted witness test runs each history through
+//! [`run_declared`], which declares the exact scenario and Plan and then
+//! hands those same values, with a sink, to the test's own run. When the
+//! acceptance runner sets [`HISTORIES_VAR`], every declaration is written
+//! under that directory, with [`RAN_FILE`], the steps the test's run took,
+//! so the tool can record the declared history itself with `zakura-sim
+//! record`, bind the recorded trace to it by digest, and require the
+//! recording to take the steps the test's own run took. Without the
+//! variable, [`run_declared`] only runs.
 //!
 //! The directory holds one subdirectory per declaration, numbered from 0 in
 //! the order the test made them. Each holds [`HISTORY_FILE`], a
-//! [`DeclaredHistory`], the scenario as [`SCENARIO_FILE`], and the Plan as
+//! [`DeclaredHistory`], the scenario as [`SCENARIO_FILE`], the Plan as
 //! either [`PLAN_FILE`], Plan bytes for `zakura-sim record --plan`, or
-//! [`SCRIPT_FILE`], a scripted Plan for `--script`.
+//! [`SCRIPT_FILE`], a scripted Plan for `--script`, and, once the run
+//! ended, [`RAN_FILE`].
 
 use std::{
     fs,
@@ -22,10 +26,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::PlanInput;
+use crate::{record::StepRecord, PlanInput, Record, RecordSink};
 
-/// The variable naming the directory [`declare`] writes under.
+/// The variable naming the directory [`run_declared`] writes under.
 pub const HISTORIES_VAR: &str = "ZAKURA_SIM_HISTORIES";
 /// Each declaration's identity, a [`DeclaredHistory`].
 pub const HISTORY_FILE: &str = "history.json";
@@ -35,6 +40,9 @@ pub const SCENARIO_FILE: &str = "scenario.json";
 pub const PLAN_FILE: &str = "plan.bin";
 /// A declaration's scripted Plan, as JSON.
 pub const SCRIPT_FILE: &str = "script.json";
+/// The steps the declaring test's own run took, a [`Ran`], written when
+/// that run's `end` record arrives.
+pub const RAN_FILE: &str = "ran.json";
 
 /// What one declaration's [`HISTORY_FILE`] holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,31 +58,169 @@ pub struct DeclaredHistory {
     pub case: String,
 }
 
-/// Declares that the calling witness test is about to run `plan` on
-/// `scenario` as `harness`'s history `case`, when [`HISTORIES_VAR`] names a
-/// directory. A Plan that's neither bytes nor a script names no committed
-/// input, so it can't be declared, and neither can a write that fails:
-/// either panics, which fails the test, so a run never claims a history it
-/// didn't declare.
-pub fn declare(harness: &str, case: &str, scenario: &impl Serialize, plan: &PlanInput) {
-    let Some(root) = std::env::var_os(HISTORIES_VAR).map(PathBuf::from) else {
-        return;
-    };
-    declare_into(&root, harness, case, scenario, plan).unwrap_or_else(|error| {
-        panic!("declaring history {case} under {}: {error}", root.display())
-    });
+/// What [`RAN_FILE`] holds: how many steps a run took and the digest of
+/// each step's pick, observation digest and typed machine evidence, in
+/// order. A machine step has no observation digest and its pick names only
+/// the machine and operation number, so its evidence is what tells two
+/// same-length machine runs apart. A step's input offset and draws are left
+/// out, since a full fuzz input and its split scenario and Plan bytes place
+/// the same picks at different offsets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ran {
+    /// The steps the run took.
+    pub steps: u64,
+    /// The SHA-256, in hex, of each step's `pick`, its `obs` and its
+    /// `machine` evidence as JSON, tab separated, one line per step.
+    pub digest: String,
 }
 
-/// Writes one declaration, as [`declare`] does, into the next free numbered
-/// directory under `root`, creating `root`. A directory is taken with
-/// `create_dir`, so two tests declaring at once never share one.
+impl Ran {
+    /// The [`Ran`] of `steps`, a run's step records in order.
+    pub fn of<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> Ran {
+        let mut hasher = Sha256::new();
+        let mut count = 0u64;
+        for step in steps {
+            hasher.update(step_line(step));
+            count += 1;
+        }
+        Ran {
+            steps: count,
+            digest: hex(hasher),
+        }
+    }
+}
+
+/// One step's line in a [`Ran`] digest. Machine evidence is plain structs
+/// and enums, so its JSON is the same wherever it's written.
+fn step_line(step: &StepRecord) -> String {
+    let machine = step
+        .machine
+        .as_deref()
+        .map(|machine| serde_json::to_string(machine).expect("machine evidence serializes"))
+        .unwrap_or_default();
+    format!(
+        "{}\t{}\t{machine}\n",
+        step.pick,
+        step.obs.as_deref().unwrap_or("")
+    )
+}
+
+/// `hasher`'s digest in lowercase hex.
+fn hex(hasher: Sha256) -> String {
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Runs the calling witness test's history `case` on `harness`: declares
+/// `plan` on `scenario` when [`HISTORIES_VAR`] names a directory, then calls
+/// `run` with those same two values and a sink the run must record into.
+/// The sink keeps the steps the run took and writes them as the
+/// declaration's [`RAN_FILE`] at the run's `end`, so a test that declared
+/// one history and ran another is refused by the tool, which requires its
+/// recording of the declaration to take those steps. A Plan that's neither
+/// bytes nor a script names no committed input, so it can't be declared,
+/// and neither can a write that fails, and a sink that sees a second run
+/// can't say which was declared: each panics, which fails the test, so a
+/// run never claims a history it didn't declare.
+pub fn run_declared<Sc: Serialize, R>(
+    harness: &str,
+    case: &str,
+    scenario: &Sc,
+    plan: PlanInput,
+    run: impl FnOnce(&Sc, PlanInput, &mut dyn RecordSink) -> R,
+) -> R {
+    let root = std::env::var_os(HISTORIES_VAR).map(PathBuf::from);
+    run_declared_in(root.as_deref(), harness, case, scenario, plan, run)
+}
+
+/// [`run_declared`], declaring under `root` rather than under the directory
+/// [`HISTORIES_VAR`] names, and only running when it's `None`.
+pub fn run_declared_in<Sc: Serialize, R>(
+    root: Option<&Path>,
+    harness: &str,
+    case: &str,
+    scenario: &Sc,
+    plan: PlanInput,
+    run: impl FnOnce(&Sc, PlanInput, &mut dyn RecordSink) -> R,
+) -> R {
+    let dir = root.map(|root| {
+        declare_into(root, harness, case, scenario, &plan).unwrap_or_else(|error| {
+            panic!("declaring history {case} under {}: {error}", root.display())
+        })
+    });
+    let mut sink = RanSink {
+        dir,
+        hasher: Sha256::new(),
+        steps: 0,
+        ended: false,
+    };
+    run(scenario, plan, &mut sink)
+}
+
+/// The sink [`run_declared`] hands a declared run: it keeps the run's steps
+/// and writes them to its declaration's [`RAN_FILE`] at the `end` record.
+/// With no declaration, it keeps nothing.
+struct RanSink {
+    /// The declaration's directory, or `None` when nothing is declared.
+    dir: Option<PathBuf>,
+    hasher: Sha256,
+    steps: u64,
+    ended: bool,
+}
+
+impl RecordSink for RanSink {
+    /// Folds a step into the digest, and writes [`RAN_FILE`] at the `end`.
+    fn record(&mut self, record: Record) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        match record {
+            Record::Step(step) => {
+                self.hasher.update(step_line(&step));
+                self.steps += 1;
+            }
+            Record::End(_) => {
+                assert!(
+                    !self.ended,
+                    "a declared history is one run, and {} saw a second",
+                    dir.display()
+                );
+                self.ended = true;
+                let ran = Ran {
+                    steps: self.steps,
+                    digest: hex(self.hasher.clone()),
+                };
+                fs::write(
+                    dir.join(RAN_FILE),
+                    serde_json::to_string(&ran).expect("a Ran serializes"),
+                )
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+            }
+            Record::Meta(_) | Record::Init(_) => {}
+        }
+    }
+
+    /// Steps only when there's a declaration to write them for.
+    fn wants_steps(&self) -> bool {
+        self.dir.is_some()
+    }
+}
+
+/// Writes one declaration, as [`run_declared`] does, into the next free
+/// numbered directory under `root`, creating `root`, and returns that
+/// directory. A directory is taken with `create_dir`, so two tests
+/// declaring at once never share one.
 pub fn declare_into(
     root: &Path,
     harness: &str,
     case: &str,
     scenario: &impl Serialize,
     plan: &PlanInput,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let dir = (0u64..)
         .map(|index| root.join(index.to_string()))
@@ -105,7 +251,8 @@ pub fn declare_into(
     put(
         HISTORY_FILE,
         json(serde_json::to_string(&identity))?.as_bytes(),
-    )
+    )?;
+    Ok(dir)
 }
 
 /// Every declaration under `root` with its directory, in the order they
@@ -175,5 +322,34 @@ mod tests {
         fs::write(found[1].0.join(HISTORY_FILE), "not json").unwrap();
         assert_eq!(declared(root.path()).len(), 1);
         assert!(declared(&root.path().join("missing")).is_empty());
+    }
+
+    /// Two machine runs with the same picks and step count but a different
+    /// operation have different [`Ran`]s, so one can't stand for the other.
+    #[test]
+    fn machine_operations_change_the_ran_digest() {
+        use crate::{
+            plan::By,
+            record::machine::{FixtureStep, MachineStep},
+        };
+        let step = |input: u8| StepRecord {
+            step: 1,
+            pick: "machine:fixture:1".into(),
+            key: None,
+            options: 1,
+            by: By::Forced,
+            offset: None,
+            draws: Vec::new(),
+            obs: None,
+            machine: Some(Box::new(MachineStep::Fixture(FixtureStep {
+                input: vec![input],
+                failure: None,
+            }))),
+        };
+        let first = Ran::of(&[step(0)]);
+        assert_eq!(first, Ran::of(&[step(0)]));
+        let other = Ran::of(&[step(1)]);
+        assert_eq!(first.steps, other.steps);
+        assert_ne!(first, other);
     }
 }

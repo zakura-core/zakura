@@ -70,8 +70,8 @@ use crate::{
 /// Version 42 adds `meta.plan`, the Plan bytes or script a run took its
 /// choices from when no `input.bin` did.
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.
-/// Version 44 adds a datagram's payload `digest` and `init.obs`, the
-/// digest of setup's step 0 observations.
+/// Version 44 adds the run's wire-event `order` stamp to `frame-written`,
+/// `peer-written` and `peer-received`.
 pub const FORMAT_VERSION: u32 = 44;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
@@ -346,6 +346,10 @@ pub const FULL_REPORT_FILE: &str = "full-report.json";
 /// in report order, and the harness's evidence snapshot at the run's end.
 /// The `end` record keeps only outcomes, since violations grow with the
 /// run, so this is what a later judge reads instead of rerunning.
+///
+/// A harness sends it unbound. `record`, and a replay of a trace, bind it
+/// to the trace it reports ([`FullReport::of_trace`]), so a report written
+/// beside another run's trace names a trace that isn't there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FullReport {
@@ -354,10 +358,19 @@ pub struct FullReport {
     /// What [`crate::property::HasView::snapshot`] showed after the run's
     /// end and before shutdown, or `None` for a harness that keeps none.
     pub snapshot: Option<serde_json::Value>,
+    /// The ID of the trace it reports, the SHA-256 of that `trace.jsonl`
+    /// ([`Trace::id`](crate::trace::Trace::id)), or `None` while unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+    /// The source digest of the build that ran it
+    /// ([`BuildInfo::source`](crate::trace::meta::BuildInfo::source)), or
+    /// `None` while unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl FullReport {
-    /// The full report of `properties` and `snapshot`.
+    /// The full report of `properties` and `snapshot`, unbound.
     pub fn new(properties: &[PropertyReport], snapshot: Option<serde_json::Value>) -> Self {
         FullReport {
             properties: properties
@@ -370,6 +383,18 @@ impl FullReport {
                 })
                 .collect(),
             snapshot,
+            trace: None,
+            source: None,
+        }
+    }
+
+    /// This report bound to the trace whose ID is `trace`, as run by this
+    /// build.
+    pub fn of_trace(self, trace: &str) -> Self {
+        FullReport {
+            trace: Some(trace.to_owned()),
+            source: Some(crate::trace::meta::BuildInfo::current().source),
+            ..self
         }
     }
 
@@ -1428,6 +1453,7 @@ mod tests {
                     quic_stream: 4,
                     seq: 0,
                     message_type: 1,
+                    order: 1,
                 },
             ),
             transport(22, None, TransportFact::CloseDecided { cause: None }),
@@ -1471,7 +1497,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 44, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"transport","instance":0,"seq":1,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"negotiated","local":1024,"offered":1536,"negotiated":1024}},{"obs":"transport","instance":0,"seq":2,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"handshake-refused","reason":"duplicate"}},{"obs":"transport","instance":0,"seq":3,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"registered"}},{"obs":"transport","instance":0,"seq":4,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"admitted","quic_stream":4,"kind":5,"version":9,"session_id":7,"limits":{"max_frame_bytes":1,"max_message_bytes":2,"max_open_streams":3,"max_inbound_queue_depth":4,"idle_timeout_ms":5,"prelude_timeout_ms":6,"control_timeout_ms":7,"stream_open_rate_per_second":8,"message_rate_per_second":9},"inbound_depth":4,"outbound_depth":4096}},{"obs":"session","connection":1,"peer":"peer-0","quic_stream":4,"kind":5,"version":9,"session_id":7},{"obs":"transport","instance":0,"seq":5,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"header-read","quic_stream":4,"seq":0,"message_type":3,"flags":0,"payload_len":300}},{"obs":"transport","instance":0,"seq":6,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-read","quic_stream":4,"seq":0}},{"obs":"transport","instance":0,"seq":7,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":0,"outcome":{"outcome":"reserved","objects":1,"bytes":300}}}},{"obs":"transport","instance":0,"seq":8,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":1,"outcome":{"outcome":"admitted-terminal"}}}},{"obs":"transport","instance":0,"seq":9,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":2,"outcome":{"outcome":"refused","reason":"unsolicited"}}}},{"obs":"transport","instance":0,"seq":10,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"page-claimed","seq":0,"objects":1,"bytes":300}}},{"obs":"transport","instance":0,"seq":11,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"end-claimed","subscription":2}}},{"obs":"transport","instance":0,"seq":12,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"publication-ended","subscription":3}}},{"obs":"transport","instance":0,"seq":13,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-applied","subscription":3,"objects":250,"bytes":65750,"seq":null}}},{"obs":"transport","instance":0,"seq":14,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"close-applied","subscription":3}}},{"obs":"transport","instance":0,"seq":15,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-applied","subscription":3,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":16,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-issued","subscription":2,"objects":250,"bytes":65750}}},{"obs":"transport","instance":0,"seq":17,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-retracted","subscription":2}}},{"obs":"transport","instance":0,"seq":18,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-issued","subscription":2,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":19,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"stream-refused","quic_stream":8,"kind":4,"version":2,"reason":"unknown_kind"}},{"obs":"transport","instance":0,"seq":20,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-write-started","quic_stream":4,"seq":0,"message_type":1}},{"obs":"transport","instance":0,"seq":21,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-written","quic_stream":4,"seq":0,"message_type":1}},{"obs":"transport","instance":0,"seq":22,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":null}},{"obs":"transport","instance":0,"seq":23,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":"unexpected_stream"}},{"obs":"transport","instance":0,"seq":24,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"torn-down"}},{"obs":"transport","instance":0,"seq":25,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"dial-failed","error":"QUIC handshake timed out"}},{"obs":"transport","instance":0,"seq":26,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"session-lifecycle","kind":5,"step":{"step":"generation-installed","generation":7,"attempt":1}}},{"obs":"transport","instance":0,"seq":27,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"commitment-counted","seq":3,"message_type":2}}},{"obs":"transport","instance":0,"seq":28,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"commitment-released","message_type":2}}}]"#,
+            r#"[{"obs":"transport","instance":0,"seq":1,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"negotiated","local":1024,"offered":1536,"negotiated":1024}},{"obs":"transport","instance":0,"seq":2,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"handshake-refused","reason":"duplicate"}},{"obs":"transport","instance":0,"seq":3,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"registered"}},{"obs":"transport","instance":0,"seq":4,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"admitted","quic_stream":4,"kind":5,"version":9,"session_id":7,"limits":{"max_frame_bytes":1,"max_message_bytes":2,"max_open_streams":3,"max_inbound_queue_depth":4,"idle_timeout_ms":5,"prelude_timeout_ms":6,"control_timeout_ms":7,"stream_open_rate_per_second":8,"message_rate_per_second":9},"inbound_depth":4,"outbound_depth":4096}},{"obs":"session","connection":1,"peer":"peer-0","quic_stream":4,"kind":5,"version":9,"session_id":7},{"obs":"transport","instance":0,"seq":5,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"header-read","quic_stream":4,"seq":0,"message_type":3,"flags":0,"payload_len":300}},{"obs":"transport","instance":0,"seq":6,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-read","quic_stream":4,"seq":0}},{"obs":"transport","instance":0,"seq":7,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":0,"outcome":{"outcome":"reserved","objects":1,"bytes":300}}}},{"obs":"transport","instance":0,"seq":8,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":1,"outcome":{"outcome":"admitted-terminal"}}}},{"obs":"transport","instance":0,"seq":9,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":2,"outcome":{"outcome":"refused","reason":"unsolicited"}}}},{"obs":"transport","instance":0,"seq":10,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"page-claimed","seq":0,"objects":1,"bytes":300}}},{"obs":"transport","instance":0,"seq":11,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"end-claimed","subscription":2}}},{"obs":"transport","instance":0,"seq":12,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"publication-ended","subscription":3}}},{"obs":"transport","instance":0,"seq":13,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-applied","subscription":3,"objects":250,"bytes":65750,"seq":null}}},{"obs":"transport","instance":0,"seq":14,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"close-applied","subscription":3}}},{"obs":"transport","instance":0,"seq":15,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-applied","subscription":3,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":16,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-issued","subscription":2,"objects":250,"bytes":65750}}},{"obs":"transport","instance":0,"seq":17,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-retracted","subscription":2}}},{"obs":"transport","instance":0,"seq":18,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-issued","subscription":2,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":19,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"stream-refused","quic_stream":8,"kind":4,"version":2,"reason":"unknown_kind"}},{"obs":"transport","instance":0,"seq":20,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-write-started","quic_stream":4,"seq":0,"message_type":1}},{"obs":"transport","instance":0,"seq":21,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-written","quic_stream":4,"seq":0,"message_type":1,"order":1}},{"obs":"transport","instance":0,"seq":22,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":null}},{"obs":"transport","instance":0,"seq":23,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":"unexpected_stream"}},{"obs":"transport","instance":0,"seq":24,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"torn-down"}},{"obs":"transport","instance":0,"seq":25,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"dial-failed","error":"QUIC handshake timed out"}},{"obs":"transport","instance":0,"seq":26,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"session-lifecycle","kind":5,"step":{"step":"generation-installed","generation":7,"attempt":1}}},{"obs":"transport","instance":0,"seq":27,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"commitment-counted","seq":3,"message_type":2}}},{"obs":"transport","instance":0,"seq":28,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"commitment-released","message_type":2}}}]"#,
             "{bump}"
         );
     }
@@ -1764,6 +1790,7 @@ mod tests {
                 connection: 1,
                 quic_stream: 4,
                 seq: 0,
+                order: 2,
             },
             Observation::PeerClosed {
                 connection: 1,
@@ -1779,6 +1806,7 @@ mod tests {
                     objects: 250,
                     bytes: 65_750,
                 }),
+                order: 3,
             },
             Observation::PeerReceived {
                 connection: 1,
@@ -1787,6 +1815,7 @@ mod tests {
                 message_type: 3,
                 payload: 263,
                 credit: None,
+                order: 4,
             },
             Observation::NodeFrame {
                 connection: 1,
@@ -1816,7 +1845,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 44, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"peer-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0,"row":"headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1,"payload":263},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"seq":0},{"obs":"peer-written","connection":1,"quic_stream":4,"seq":0},{"obs":"peer-closed","connection":1,"quic_stream":4},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":1,"message_type":2,"payload":139,"credit":{"objects":250,"bytes":65750}},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":2,"message_type":3,"payload":263,"credit":null},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":2,"row":"subscribe-headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"seq":3,"row":"status","rule_stream":{"kind":5,"version":9},"label":"conformant","exhausted":true}]"#,
+            r#"[{"obs":"peer-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0,"row":"headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1,"payload":263},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"seq":0},{"obs":"peer-written","connection":1,"quic_stream":4,"seq":0,"order":2},{"obs":"peer-closed","connection":1,"quic_stream":4},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":1,"message_type":2,"payload":139,"credit":{"objects":250,"bytes":65750},"order":3},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":2,"message_type":3,"payload":263,"credit":null,"order":4},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":2,"row":"subscribe-headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"seq":3,"row":"status","rule_stream":{"kind":5,"version":9},"label":"conformant","exhausted":true}]"#,
             "{bump}"
         );
     }

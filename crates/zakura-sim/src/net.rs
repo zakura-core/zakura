@@ -10,6 +10,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     rc::Rc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -25,6 +29,25 @@ use crate::{
 /// one to open the loss gate while the run holds another.
 #[derive(Clone, Debug)]
 pub struct Net(Rc<RefCell<State>>);
+
+/// The run's order of wire events, shared by everything on one [`Net`]: a
+/// transport tap stamps each frame write its endpoint finishes, and a
+/// scripted peer each frame read and write it finishes, with the next value
+/// as the event happens. Log position can't order them, since a peer's
+/// records are placed late and a read is logged when the peer's main task
+/// handles it. Taking a value is one atomic add, so it adds no scheduling
+/// point.
+#[derive(Clone, Debug, Default)]
+pub struct WireOrder(Arc<AtomicU64>);
+
+impl WireOrder {
+    /// The next stamp: 1 for the run's first event, then one more per call.
+    pub fn next(&self) -> u64 {
+        // `Relaxed` is enough: only the order of calls matters, and a run's
+        // tasks take turns on one thread.
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
 
 #[derive(Debug)]
 struct State {
@@ -42,6 +65,8 @@ struct State {
     /// Each datagram sent and not yet gone: its length, send time and
     /// payload digest.
     in_flight: BTreeMap<DatagramId, (u64, u64, Option<String>)>,
+    /// The run's wire-event stamps.
+    order: WireOrder,
 }
 
 impl Net {
@@ -76,7 +101,14 @@ impl Net {
             admitted: BTreeSet::new(),
             seen: 0,
             in_flight: BTreeMap::new(),
+            order: WireOrder::default(),
         })))
+    }
+
+    /// The run's wire-event stamps, which every clone of this network
+    /// shares.
+    pub fn order(&self) -> WireOrder {
+        self.0.borrow().order.clone()
     }
 
     /// The network, for binding endpoints on it.

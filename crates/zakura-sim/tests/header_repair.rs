@@ -32,6 +32,7 @@ use tempfile::TempDir;
 use zakura_chain::block;
 use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::header_sync::{
@@ -359,13 +360,23 @@ fn the_repair_fixtures_hold_under_every_plan() {
 fn the_committed_repair_inputs_hold_outstanding_work_bounded() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
     for ((stem, ..), input) in SEEDS.into_iter().zip(committed()) {
-        let result = (entry.witness)(
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let result = run_declared(
+            RepairHarness::NAME,
+            &format!("committed {stem} input"),
             &entry.scenario(&input[..RepairHarness::SCENARIO_BYTES]),
             plan(input),
-            OUTSTANDING_WORK_BOUNDED,
-            Expect::Holds,
-            &[],
-            &mut MemorySink::default(),
+            |scenario, plan, sink| {
+                (entry.witness)(
+                    scenario,
+                    plan,
+                    OUTSTANDING_WORK_BOUNDED,
+                    Expect::Holds,
+                    &[],
+                    sink,
+                )
+            },
         );
         assert_eq!(result, Ok(()), "committed {stem} input");
     }

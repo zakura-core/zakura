@@ -10,6 +10,8 @@ mod support;
 
 use std::{cell::Cell, fs, path::PathBuf, time::Duration};
 
+use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
+
 use support::{
     inputs,
     steer::{before, steer, Steer},
@@ -869,6 +871,35 @@ fn saved_plans_replay_their_end_records() {
                 held(HONEST_NEVER_PUNISHED);
                 assert_eq!(ports.selected_tip(), Chain::main(51).tip(&ports.fixture));
             }
+            SavedPlan::Reopen => {
+                held(HONEST_NEVER_PUNISHED);
+                let [(_, first), (_, second), ..] = header_sessions(&report)[..] else {
+                    panic!("{}: two header sessions", plan.name());
+                };
+                assert_eq!(first.0, second.0, "{}: one connection", plan.name());
+                assert_ne!(first.1, second.1, "{}: two QUIC streams", plan.name());
+            }
+            SavedPlan::OldPageAfterReopen => {
+                let [(_, first), (reopened, second), ..] = header_sessions(&report)[..] else {
+                    panic!("{}: two header sessions", plan.name());
+                };
+                assert_eq!(first.0, second.0, "{}: one connection", plan.name());
+                let late = report.log.entries()[reopened..].iter().any(|entry| {
+                    matches!(
+                        entry.obs,
+                        Observation::FrameJudged {
+                            connection,
+                            quic_stream: Some(quic_stream),
+                            ..
+                        } if (connection, quic_stream) == first
+                    )
+                });
+                assert!(
+                    late,
+                    "{}: no frame of the first session was judged after the reopen",
+                    plan.name()
+                );
+            }
         }
         assert_eq!(
             end,
@@ -877,6 +908,26 @@ fn saved_plans_replay_their_end_records() {
             plan.name()
         );
     }
+}
+
+/// Each header-sync session the node admitted in `report`, in log order:
+/// where its `Session` row is, and its connection and QUIC stream.
+fn header_sessions(report: &RunReport) -> Vec<(usize, (u64, u64))> {
+    report
+        .log
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| match entry.obs {
+            Observation::Session {
+                connection,
+                quic_stream,
+                kind,
+                ..
+            } if kind == ZAKURA_STREAM_HEADER_SYNC => Some((at, (connection, quic_stream))),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `over-credit-objects` under eager delivery holds `sim/no-livelock`.
@@ -913,7 +964,10 @@ fn regenerate_saved_plans() {
                 PlanInput::Bytes(bytes) => bytes,
                 _ => unreachable!("inputs are bytes"),
             },
-            SavedPlan::Act(_) | SavedPlan::HonestProgress => Vec::new(),
+            SavedPlan::Act(_)
+            | SavedPlan::HonestProgress
+            | SavedPlan::Reopen
+            | SavedPlan::OldPageAfterReopen => Vec::new(),
         };
         let input: Vec<u8> = plan.tag().into_iter().chain(bytes).collect();
         let (_, end, _) = replay(&input);
@@ -934,7 +988,10 @@ fn regenerate_saved_plans() {
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
-            SavedPlan::HonestSync | SavedPlan::Act(_) => String::new(),
+            SavedPlan::HonestSync
+            | SavedPlan::Act(_)
+            | SavedPlan::Reopen
+            | SavedPlan::OldPageAfterReopen => String::new(),
         };
         let sidecar = format!(
             "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\

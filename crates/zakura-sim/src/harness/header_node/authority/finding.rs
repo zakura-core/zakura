@@ -510,10 +510,9 @@ fn ledger_subject(subject: &ClaimSubject) -> AuthoritySubject {
 /// ledger's other rules.
 pub(crate) fn ledger_attribution(claim: &ClaimBreak) -> Option<Attribution> {
     let rule = ledger_rule(claim.rule)?;
-    let subject = claim
-        .subject
-        .as_ref()
-        .expect("the ledger names a subject for every rule the property reports");
+    let Some(subject) = &claim.subject else {
+        unreachable!("the ledger names a subject for every rule the property reports");
+    };
     Some(Attribution {
         rule,
         subject: ledger_subject(subject),

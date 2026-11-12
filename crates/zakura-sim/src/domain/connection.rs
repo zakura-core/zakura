@@ -141,7 +141,7 @@ where
             needs: &[Source::View, Source::Datagrams],
             status: Status::Active,
             check: check_connection_shares_bound::<S>,
-            witness: Some(TriggerHistory::View(held_past_another_share::<S>)),
+            witness: Some(TriggerHistory::View(shares_bound_triggered::<S>)),
         },
     ]
 }
@@ -654,7 +654,7 @@ where
 /// receive share there, so a gate the two shared would have let one take
 /// the other's share; or a gate's free bytes rose between two loads, so a
 /// grant returned bytes and a second return would free them twice.
-fn held_past_another_share<S>(view: &S::View, log: &ObservationLog) -> bool
+fn shares_bound_triggered<S>(view: &S::View, log: &ObservationLog) -> bool
 where
     S: HasView,
     S::View: WireView,

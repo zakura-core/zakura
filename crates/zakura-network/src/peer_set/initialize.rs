@@ -1462,14 +1462,10 @@ where
     S: Service<Request, Response = Response, Error = BoxError> + Send + Sync + 'static,
     S::Future: Send + 'static,
 {
-    // update() has timeouts, and briefly holds the address book
-    // lock, so it shouldn't hang.
-    // Try to get new peers, holding the lock for as short a time as possible.
-    let result = {
-        let result = candidates.lock().await.update().await;
-        std::mem::drop(candidates);
-        result
-    };
+    // The owned update future holds only the crawl gate while waiting for
+    // network responses. Candidate selection must remain available to dials.
+    let update = { candidates.lock().await.update() };
+    let result = update.await;
     let more_peers = match result {
         Ok(more_peers) => more_peers,
         Err(e) => {

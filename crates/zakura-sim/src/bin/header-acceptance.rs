@@ -39,7 +39,11 @@ fn main() {
 
 #[cfg(zakura_sim)]
 mod cli {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use zakura_sim::harness::header_acceptance::{
         tool::{self, RunPlan},
@@ -161,13 +165,9 @@ mod cli {
                         "--out",
                     ],
                 )?;
-                let read = |flag: &str| {
-                    fs::read_to_string(&flags[flag]).map_err(|e| format!("{}: {e}", flags[flag]))
-                };
-                let plan: RunPlan = serde_json::from_str(&read("--plan")?)
-                    .map_err(|e| format!("{}: {e}", flags["--plan"]))?;
-                let record: tool::Record = serde_json::from_str(&read("--record")?)
-                    .map_err(|e| format!("{}: {e}", flags["--record"]))?;
+                use zakura_sim::sim_acceptance::header::read_bounded_json;
+                let plan: RunPlan = read_bounded_json(Path::new(&flags["--plan"]))?;
+                let record: tool::Record = read_bounded_json(Path::new(&flags["--record"]))?;
                 let (artifacts, out) = (
                     PathBuf::from(&flags["--artifacts"]),
                     PathBuf::from(&flags["--out"]),

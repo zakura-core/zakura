@@ -11,7 +11,18 @@ use std::{
 };
 
 use super::sched::{Proof, TestRef, SCHED_IDS, SCHED_MAPPING};
-use crate::harness::header_acceptance::{tool::committed_required, Key, Manifest};
+use crate::harness::header_acceptance::{
+    tool::{committed_required, coverage_tests},
+    CaseRun, Key, Manifest, RunId,
+};
+
+/// The planted case the downstream item's production bypass is (hdr-14.6's
+/// despite-close case), whose catch's replay downstream requires.
+const DESPITE_CLOSE: (&str, &str) = ("header-sync/commit-only-authorized", "staged-despite-close");
+
+/// The harness whose coverage rows' witness keys the honest header-sync row
+/// requires.
+const SMOKE_HARNESS: &str = "header-sync/smoke";
 
 /// One expected result, which the tool produces and the evaluator judges.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,6 +128,12 @@ pub struct Derived {
     /// Every fresh-replay key hdr-14 requires, each header history's and
     /// catch's replay, for M7.2.
     pub replay_keys: Vec<Key>,
+    /// The replays downstream requires, from hdr-14's required keys: the
+    /// despite-close catch's and the first passing history's.
+    pub downstream_replays: Vec<Key>,
+    /// The `Witness` keys of [`SMOKE_HARNESS`]'s coverage rows that hdr-14
+    /// requires.
+    pub smoke_witnesses: Vec<Key>,
     /// Every `qa/suite.toml` `sim-package` row's package, each one S4.6
     /// compile command.
     pub sim_packages: Vec<String>,
@@ -334,7 +351,9 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
         row(
             "corpus/honest-header-sync",
             false,
-            vec![passing("header-sync/honest-progress")],
+            std::iter::once(passing("header-sync/honest-progress"))
+                .chain(derived.smoke_witnesses.iter().cloned().map(Expected::HeaderKey))
+                .collect(),
         ),
         row(
             "corpus/header-table-pairs",
@@ -437,7 +456,9 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                 "gate-2/end-boundary-preservation",
             ]
             .map(requirement)
-            .to_vec(),
+            .into_iter()
+            .chain(derived.downstream_replays.iter().cloned().map(Expected::HeaderKey))
+            .collect(),
         ),
     ];
     for (id, proofs) in SCHED_MAPPING {
@@ -637,10 +658,42 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
         })
         .collect();
     let required = committed_required(repo, &Manifest::committed());
-    let replay_keys = required
+    let replay_keys: Vec<Key> = required
         .keys()
         .filter(|key| matches!(key, Key::Replay { .. }))
         .cloned()
+        .collect();
+    let catch_replay = replay_keys.iter().find(|key| {
+        matches!(key, Key::Replay { run: RunId::Case { property, name, run: CaseRun::Patched } }
+            if (property.as_str(), name.as_str()) == DESPITE_CLOSE)
+    });
+    let history_replay = replay_keys.iter().find(|key| {
+        matches!(
+            key,
+            Key::Replay {
+                run: RunId::History { .. }
+            }
+        )
+    });
+    let downstream_replays = catch_replay
+        .into_iter()
+        .chain(history_replay)
+        .cloned()
+        .collect();
+    let smoke_properties: BTreeSet<String> = crate::harness::find(SMOKE_HARNESS)
+        .map(|entry| (entry.properties)().into_iter().map(|p| p.id).collect())
+        .unwrap_or_default();
+    let smoke_witnesses = coverage_tests()
+        .into_iter()
+        .filter(|(_, _, property)| smoke_properties.contains(property))
+        .map(|(file, test, _)| Key::Witness {
+            package: "zakura-sim".to_owned(),
+            file,
+            test,
+        })
+        .filter(|key| required.contains_key(key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
     let table_properties = required
         .into_keys()
@@ -662,6 +715,8 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
     );
     Ok(Derived {
         replay_keys,
+        downstream_replays,
+        smoke_witnesses,
         sim_packages: suite
             .sim_package
             .iter()
@@ -762,6 +817,27 @@ pub fn problems(rows: &[Row], derived: &Derived) -> Vec<String> {
         .collect();
     if !replays.is_subset(&held("M7.2")) || replays.is_empty() {
         problems.push("M7.2 doesn't hold every header replay key".to_owned());
+    }
+    let downstream: BTreeSet<String> = derived
+        .downstream_replays
+        .iter()
+        .map(|key| Expected::HeaderKey(key.clone()).to_string())
+        .collect();
+    if downstream.len() != 2 || !downstream.is_subset(&held("downstream")) {
+        problems.push(
+            "downstream doesn't hold the despite-close catch's replay and a passing history's"
+                .to_owned(),
+        );
+    }
+    let smoke: BTreeSet<String> = derived
+        .smoke_witnesses
+        .iter()
+        .map(|key| Expected::HeaderKey(key.clone()).to_string())
+        .collect();
+    if smoke.is_empty() || !smoke.is_subset(&held("corpus/honest-header-sync")) {
+        problems.push(
+            "the honest header-sync row doesn't hold header-sync/smoke's witness keys".to_owned(),
+        );
     }
     for (lane, targets) in [
         ("sim-release/zakura-sim", SCHED4_RELEASE_TARGETS),

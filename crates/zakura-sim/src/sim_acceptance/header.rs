@@ -38,6 +38,13 @@ pub struct Published<'a> {
 /// another run with the same subject, differs somewhere else and is
 /// refused, with the first field that differs.
 pub fn verify(repo: &Path, published: &Published<'_>) -> Result<ResultFile, String> {
+    // The one check of the run's artifacts before anything reads them, for
+    // every caller.
+    if let Some(why) = tree_refusal(published.artifacts) {
+        return Err(format!(
+            "the header run's artifacts aren't safe to read: {why}"
+        ));
+    }
     let run = RunBinding {
         run_id: published.run_id.to_owned(),
         subject: published.record.subject.clone(),
@@ -56,6 +63,16 @@ pub fn verify(repo: &Path, published: &Published<'_>) -> Result<ResultFile, Stri
             "the published header record differs from its run's artifacts at `{at}`"
         )),
     }
+}
+
+/// The JSON in the regular file at `path`, read without following a link
+/// and within [`MAX_ARTIFACT_BYTES`], so a FIFO or a link to `/dev/zero`
+/// can't hang or exhaust the reader.
+pub fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let bytes = crate::trace::read::read_bounded(path, MAX_ARTIFACT_BYTES)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .ok_or_else(|| format!("{}: missing", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The JSON path of the first place `a` and `b` differ, or `None` if

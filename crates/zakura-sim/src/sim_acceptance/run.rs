@@ -442,8 +442,12 @@ pub struct Sim7Record {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
-    /// The task's artifact directory, relative to the run directory.
-    pub artifact: String,
+    /// Where it is: a task's artifact directory, relative to the run
+    /// directory, or for a consumed header key each artifact its header
+    /// record entry links, as `header:<path>` relative to the header run's
+    /// `--out`. A header key's binaries and property outcomes are hdr-14's,
+    /// in that record, which [`Sim7Record::header_record_sha256`] pins.
+    pub artifacts: Vec<String>,
     /// The SHA-256 of each binary that produced it: the trace's recording
     /// executable, the test's binary, or each lane target's test binary.
     pub binaries: Vec<String>,
@@ -517,10 +521,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The JSON in the regular file at `path`, read without following a link
 /// and within the artifact limit, if it reads and parses.
 fn bounded_json(path: &Path) -> Option<Value> {
-    let bytes = crate::trace::read::read_bounded(path, header::MAX_ARTIFACT_BYTES)
-        .ok()
-        .flatten()?;
-    serde_json::from_slice(&bytes).ok()
+    header::read_bounded_json(path).ok()
 }
 
 /// Each registered property's outcome in the end record of the trace a
@@ -549,11 +550,62 @@ fn trace_properties(task: &Task, dir: &Path) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
-/// The binaries a task's artifacts in `dir` name, as [`Evidence::binaries`].
-fn task_binaries(task: &Task, dir: &Path) -> Vec<String> {
-    let json = |name: &str| -> Option<Value> {
-        serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
+/// What every file the runner writes for a task must name, under its
+/// `binding`, to count for that task: the task's index and its
+/// `task.json`'s SHA-256. Without it, one task's file could stand in for
+/// another's.
+struct TaskBinding {
+    /// The task's index in the plan.
+    index: usize,
+    /// The SHA-256 of the task's `task.json`.
+    task_sha256: String,
+}
+
+/// The runner-written JSON file `name` in `dir`, if its `binding` names
+/// the task `binding` describes. A file the simulator writes itself, such
+/// as `measure.json`, carries no binding and is read directly.
+fn runner_json(dir: &Path, name: &str, binding: &TaskBinding) -> Option<Value> {
+    let value: Value = serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()?;
+    let names = value.get("binding")?;
+    let same = names.get("task").and_then(Value::as_u64) == u64::try_from(binding.index).ok()
+        && names.get("task_sha256").and_then(Value::as_str) == Some(&binding.task_sha256);
+    same.then_some(value)
+}
+
+/// Why the task's fresh replay doesn't count, if it doesn't: `replay.json`
+/// must be this task's, have exited 0, and name the SHA-256 of the task's
+/// own `trace/trace.jsonl` and the run's release executable. `zakura-sim
+/// replay` exits 0 only when its run's complete end record and
+/// observations equal the recording's, so the recording's end record,
+/// judged by [`owned_run_passes`], is the replay's too.
+fn replay_refusal(dir: &Path, binding: &TaskBinding, bound: &Bound<'_>) -> Option<String> {
+    let Some(replay) = runner_json(dir, "replay.json", binding) else {
+        return Some("the task has no replay.json of its own".to_owned());
     };
+    if !exited(Some(replay.clone())) {
+        return Some("the trace didn't replay exactly in a fresh process".to_owned());
+    }
+    let trace = crate::trace::read::read_bounded(
+        &dir.join("trace").join(crate::trace::TRACE_FILE),
+        header::MAX_ARTIFACT_BYTES,
+    )
+    .ok()
+    .flatten()
+    .map(|bytes| sha256_hex(&bytes));
+    let names = replay.get("binding");
+    let field = |name: &str| names.and_then(|n| n.get(name)).and_then(Value::as_str);
+    if trace.is_none() || field("trace_sha256") != trace.as_deref() {
+        return Some("replay.json didn't replay this task's trace".to_owned());
+    }
+    if bound.release.is_none() || field("executable_sha256") != bound.release.as_deref() {
+        return Some("replay.json wasn't replayed by the run's release zakura-sim".to_owned());
+    }
+    None
+}
+
+/// The binaries a task's artifacts in `dir` name, as [`Evidence::binaries`].
+fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> {
+    let json = |name: &str| runner_json(dir, name, binding);
     match task {
         // hdr-14's runner owns `test.json`, so the xtask keeps a test
         // row's digest beside it.
@@ -613,12 +665,24 @@ pub fn record(
     if &self::plan(repo) != plan {
         problems.push("the supplied plan isn't the plan the manifest at S makes".to_owned());
     }
+    // The release executable counts only if the run kept it, at the path
+    // its digest names, with exactly those bytes.
+    let release = artifacts.parent().and_then(|run| {
+        let digest = bounded_json(&run.join("bin/index.json"))?
+            .get("release")?
+            .as_str()?
+            .to_owned();
+        let kept = crate::trace::read::read_bounded(
+            &run.join("bin").join(&digest).join("zakura-sim"),
+            header::MAX_ARTIFACT_BYTES,
+        )
+        .ok()
+        .flatten()?;
+        (sha256_hex(&kept) == digest).then_some(digest)
+    });
     let bound = Bound {
         source: subject_source,
-        release: artifacts
-            .parent()
-            .and_then(|run| bounded_json(&run.join("bin/index.json")))
-            .and_then(|index| index.get("release")?.as_str().map(str::to_owned)),
+        release,
     };
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut applicable = 0u64;
@@ -644,12 +708,13 @@ pub fn record(
             );
             continue;
         }
-        let recorded = fs::read_to_string(dir.join("task.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<Task>(&text).ok());
-        let clean = fs::read_to_string(dir.join("checkout.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        let task_text = fs::read_to_string(dir.join("task.json")).unwrap_or_default();
+        let recorded = serde_json::from_str::<Task>(&task_text).ok();
+        let binding = TaskBinding {
+            index,
+            task_sha256: sha256_hex(task_text.as_bytes()),
+        };
+        let clean = runner_json(&dir, "checkout.json", &binding)
             .and_then(|checkout| checkout.get("clean")?.as_bool())
             == Some(true);
         // A seed or witness counts only on an input the release build's own
@@ -660,7 +725,7 @@ pub fn record(
             _ => None,
         };
         let mut credited = 0u64;
-        let binaries = task_binaries(task, &dir);
+        let binaries = task_binaries(task, &dir, &binding);
         let verdict = if recorded.as_ref() != Some(task) {
             Verdict::Blocked {
                 why: "the artifact directory's task.json isn't this task".to_owned(),
@@ -681,7 +746,7 @@ pub fn record(
                 why: "the artifacts name no binary that produced this result".to_owned(),
             }
         } else {
-            judge_task(task, &dir, &bound, &mut credited)
+            judge_task(task, &dir, &binding, &bound, &mut credited)
         };
         // The suite's applicability total is the fixed corpus's.
         if matches!(task, Task::Seed { .. }) {
@@ -702,7 +767,7 @@ pub fn record(
         evidence.insert(
             task.expected().to_owned(),
             Evidence {
-                artifact: format!("{artifacts_name}/{index}"),
+                artifacts: vec![format!("{artifacts_name}/{index}")],
                 binaries,
                 applicable: credited,
                 properties: trace_properties(task, &dir),
@@ -760,10 +825,26 @@ pub fn record(
                         why: "no header record".to_owned(),
                     },
                 };
+                let links = header_record
+                    .iter()
+                    .flat_map(|record| record.verified.iter().chain(&record.excluded))
+                    .find(|entry| &entry.key == key)
+                    .map(|entry| {
+                        let base = header_record
+                            .as_ref()
+                            .map_or("", |record| record.artifacts.as_str());
+                        entry
+                            .links
+                            .artifacts
+                            .iter()
+                            .map(|path| format!("header:{base}/{path}"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 evidence.insert(
                     expected.to_string(),
                     Evidence {
-                        artifact: "header-acceptance:record.json".to_owned(),
+                        artifacts: links,
                         binaries: Vec::new(),
                         applicable: 0,
                         properties: BTreeMap::new(),
@@ -833,10 +914,17 @@ struct Bound<'a> {
 }
 
 /// One task's verdict from its artifacts in `dir`.
-fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) -> Verdict {
+fn judge_task(
+    task: &Task,
+    dir: &Path,
+    binding: &TaskBinding,
+    bound: &Bound<'_>,
+    applicable: &mut u64,
+) -> Verdict {
     let source = bound.source;
     let blocked = |why: String| Verdict::Blocked { why };
-    let json = |name: &str| -> Option<Value> {
+    let json = |name: &str| runner_json(dir, name, binding);
+    let own = |name: &str| -> Option<Value> {
         serde_json::from_str(&fs::read_to_string(dir.join(name)).ok()?).ok()
     };
     match task {
@@ -846,7 +934,9 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             test,
             ..
         } => {
-            let Some(result) = json("test.json") else {
+            // hdr-14's runner writes `test.json`; its `binary.json` beside it
+            // carries the binding.
+            let Some(result) = own("test.json") else {
                 return blocked("the test left no test.json".to_owned());
             };
             let same = result.get("package").and_then(Value::as_str) == Some(package)
@@ -876,12 +966,13 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             None => blocked("the test left no test.json".to_owned()),
         },
         Task::Lane {
+            command,
             required,
             empty,
             ignored_run,
             ..
         } => match json("lane.json") {
-            Some(lane) => match lane_bound(&lane, source) {
+            Some(lane) => match lane_bound(&lane, source, command) {
                 Some(why) => blocked(why),
                 None => lane_passed(&lane, required, empty, ignored_run),
             },
@@ -891,10 +982,8 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             if !exited(json("record.json")) {
                 return blocked("the seed's recording didn't exit 0".to_owned());
             }
-            if !exited(json("replay.json")) {
-                return blocked(
-                    "the seed's trace didn't replay exactly in a fresh process".to_owned(),
-                );
+            if let Some(why) = replay_refusal(dir, binding, bound) {
+                return blocked(why);
             }
             judge_trace(
                 &dir.join("trace"),
@@ -914,12 +1003,10 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             if !exited(json("record.json")) {
                 return blocked("the witness recording didn't exit 0".to_owned());
             }
-            if !exited(json("replay.json")) {
-                return blocked(
-                    "the witness trace didn't replay exactly in a fresh process".to_owned(),
-                );
+            if let Some(why) = replay_refusal(dir, binding, bound) {
+                return blocked(why);
             }
-            let Some(witness) = json("trace/witness.json") else {
+            let Some(witness) = own("trace/witness.json") else {
                 return blocked("the witness left no witness.json".to_owned());
             };
             let same = witness.get("property").and_then(Value::as_str) == Some(property)
@@ -936,20 +1023,45 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
                 .get("also_violates")
                 .and_then(|also| serde_json::from_value(also.clone()).ok())
                 .unwrap_or_default();
-            let run_expect = match expect.as_str() {
-                "violated" | "violated-set" => RunExpect::Violates {
+            let violates = matches!(expect.as_str(), "violated" | "violated-set");
+            let run_expect = if violates {
+                RunExpect::Violates {
                     property: property.clone(),
                     also,
-                },
-                _ => RunExpect::Passes,
+                }
+            } else {
+                RunExpect::Passes
             };
-            judge_trace(
+            let verdict = judge_trace(
                 &dir.join("trace"),
                 bound,
                 (harness, Some(input)),
                 &run_expect,
                 applicable,
-            )
+            );
+            // `witness.json` names no trace, so the claim is checked in the
+            // trace's own end record: a passing witness's property held on
+            // at least one application.
+            if verdict == Verdict::Verified && !violates {
+                let held = TraceReader::open(&dir.join("trace"))
+                    .ok()
+                    .and_then(|trace| trace.end)
+                    .is_some_and(|end| {
+                        end.properties.iter().any(|report| {
+                            &report.property == property
+                                && matches!(
+                                    report.outcome,
+                                    PropertyOutcome::Held { applicable } if applicable > 0
+                                )
+                        })
+                    });
+                if !held {
+                    return blocked(format!(
+                        "the trace doesn't show {property} held on an application"
+                    ));
+                }
+            }
+            verdict
         }
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)
@@ -963,7 +1075,7 @@ fn judge_task(task: &Task, dir: &Path, bound: &Bound<'_>, applicable: &mut u64) 
             None => blocked("the command left no command.json".to_owned()),
         },
         Task::Measure { harness, input, .. } => {
-            let Some(measure) = json("measure.json") else {
+            let Some(measure) = own("measure.json") else {
                 return blocked("the recording left no measure.json".to_owned());
             };
             if !exited(json("record.json")) {
@@ -1036,9 +1148,12 @@ struct LaneRun {
 }
 
 /// Why a lane's artifacts aren't bound to S, if they aren't: the lane must
-/// have run from this run's checkout, and every `zakura-sim` test binary,
+/// have run `command` from this run's checkout, and every `zakura-sim` test binary,
 /// which embeds the simulator's source digest, must embed S's.
-fn lane_bound(lane: &Value, source: &str) -> Option<String> {
+fn lane_bound(lane: &Value, source: &str, command: &str) -> Option<String> {
+    if lane.pointer("/binding/command").and_then(Value::as_str) != Some(command) {
+        return Some("lane.json isn't a run of this lane's command".to_owned());
+    }
     if lane.get("checkout_source").and_then(Value::as_str) != Some(source) {
         return Some("the lane didn't run from this run's checkout of S".to_owned());
     }
@@ -1087,11 +1202,14 @@ fn lane_passed(
     if let Some(target) = run.list_failures.first() {
         return blocked(format!("{target}'s binary didn't list its tests"));
     }
+    // Each atom must pass exactly once: a duplicate run is unaccounted for.
     let passed = |target: &str, name: &str| {
         run.targets.get(target).is_some_and(|tests| {
             tests
                 .iter()
-                .any(|(n, outcome)| test_name(n) == name && outcome == "ok")
+                .filter(|(n, outcome)| test_name(n) == name && outcome == "ok")
+                .count()
+                == 1
         })
     };
     for target in required {
@@ -1110,10 +1228,27 @@ fn lane_passed(
         }
     }
     for target in empty {
-        let lists = run.listed.get(target).is_some_and(|l| !l.is_empty());
+        let Some(listed) = run.listed.get(target) else {
+            return blocked(format!(
+                "expected-empty target {target} wasn't built and listed"
+            ));
+        };
         let ran = run.targets.get(target).is_some_and(|t| !t.is_empty());
-        if lists || ran {
+        if !listed.is_empty() || ran {
             return blocked(format!("{target} is expected empty but has tests"));
+        }
+    }
+    // Every test that ran is a listed atom or a `run = true` ignored test.
+    for (target, tests) in &run.targets {
+        let listed = run.listed.get(target);
+        let unaccounted = tests.iter().find(|(name, outcome)| {
+            let name = test_name(name);
+            outcome != "ignored"
+                && !listed.is_some_and(|listed| listed.iter().any(|l| l == name))
+                && !ignored_run.contains(&format!("{target}::{name}"))
+        });
+        if let Some((name, _)) = unaccounted {
+            return blocked(format!("{target}::{name} ran but wasn't listed"));
         }
     }
     for test in ignored_run {
@@ -1287,8 +1422,6 @@ fn header_record(
     subject: &str,
     subject_source: &str,
 ) -> (Option<String>, Option<Record>) {
-    let read =
-        |path: &Path| fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
     let record: Record = match bounded_json(&header.out.join("record.json"))
         .and_then(|value| serde_json::from_value(value).ok())
     {
@@ -1296,21 +1429,12 @@ fn header_record(
         None => return (Some("the header record doesn't read".to_owned()), None),
     };
     let artifacts = header.out.join(&record.artifacts);
-    // Its run's whole tree, plan and traces, is checked once before anything
-    // in it is read.
-    if let Some(why) = artifacts.parent().and_then(header::tree_refusal) {
-        return (
-            Some(format!("the header run isn't safe to read: {why}")),
-            Some(record),
-        );
-    }
     let run_dir = artifacts.parent().unwrap_or(header.out).to_owned();
     let run_id = run_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let verified = read(&run_dir.join("plan.json"))
-        .and_then(|text| serde_json::from_str::<RunPlan>(&text).map_err(|e| e.to_string()))
+    let verified = header::read_bounded_json::<RunPlan>(&run_dir.join("plan.json"))
         .and_then(|plan| {
             verify(
                 repo,
@@ -1420,6 +1544,21 @@ mod tests {
             &lane(json!({})),
             &["zakura-sim/draws::slow".to_owned()]
         )));
+        let twice = lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["a", "ok"]] } }));
+        assert!(
+            blocked(&judge(&twice, &none)),
+            "a test that ran twice blocks"
+        );
+        let extra = lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["z", "ok"]] } }));
+        assert!(
+            blocked(&judge(&extra, &none)),
+            "an unlisted test that ran blocks"
+        );
+        let unbuilt = lane(json!({ "listed": { "zakura-sim/draws": ["a"] } }));
+        assert!(
+            blocked(&judge(&unbuilt, &none)),
+            "an unlisted expected-empty target blocks"
+        );
         let ran_empty = lane(json!({ "targets": {
             "zakura-sim/draws": [["a", "ok"]], "zakura-rt/lib": [["hidden", "ok"]] } }));
         assert!(
@@ -1443,22 +1582,33 @@ mod tests {
     #[test]
     fn a_lane_needs_a_binary_for_every_target() {
         let bound = json!({
+            "binding": { "command": "cargo test" },
             "checkout_source": "s",
             "listed": { "zakura-sim/draws": ["a"] },
             "targets": { "zakura-sim/draws": [["a", "ok"]] },
             "binaries": { "zakura-sim/draws": "d" },
             "binary_sources": { "zakura-sim/draws": "s" },
         });
-        assert_eq!(lane_bound(&bound, "s"), None);
+        assert_eq!(lane_bound(&bound, "s", "cargo test"), None);
+        assert!(
+            lane_bound(&bound, "s", "cargo test --release").is_some(),
+            "another lane's run blocks"
+        );
         for field in ["binaries", "binary_sources"] {
             let mut stripped = bound.clone();
             stripped.as_object_mut().unwrap().remove(field);
-            assert!(lane_bound(&stripped, "s").is_some(), "no {field} blocks");
+            assert!(
+                lane_bound(&stripped, "s", "cargo test").is_some(),
+                "no {field} blocks"
+            );
         }
         let mut other = bound.clone();
         other["binary_sources"]["zakura-sim/draws"] = json!("not-embedded");
-        assert!(lane_bound(&other, "s").is_some());
-        assert!(lane_bound(&bound, "t").is_some(), "another checkout blocks");
+        assert!(lane_bound(&other, "s", "cargo test").is_some());
+        assert!(
+            lane_bound(&bound, "t", "cargo test").is_some(),
+            "another checkout blocks"
+        );
     }
 
     /// An artifact tree holding a link isn't read.

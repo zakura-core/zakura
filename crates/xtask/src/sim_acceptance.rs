@@ -304,6 +304,7 @@ fn run_at(
         let _ = child(&mut fill, &log, run.deadline);
     }
 
+    let release_sha256 = sha256_file(&release)?;
     let tasks = plan
         .get("tasks")
         .and_then(Value::as_array)
@@ -326,7 +327,8 @@ fn run_at(
         }
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("task.json"), serde_json::to_string_pretty(task)?)?;
+        let task_json = serde_json::to_string_pretty(task)?;
+        fs::write(dir.join("task.json"), &task_json)?;
         let (kind, fields) = task
             .as_object()
             .and_then(|object| object.iter().next())
@@ -338,6 +340,8 @@ fn run_at(
             release: &release,
             corpus: &corpus,
             source,
+            release_sha256: &release_sha256,
+            binding: json!({ "task": index, "task_sha256": sha256_hex(task_json.as_bytes()) }),
         };
         match kind.as_str() {
             "test" => {
@@ -358,9 +362,9 @@ fn run_at(
                 if let [(_, executable, _)] = &built[..] {
                     fs::write(
                         dir.join("binary.json"),
-                        serde_json::to_string_pretty(&json!({
-                            "sha256": sha256_file(executable)?,
-                        }))?,
+                        serde_json::to_string_pretty(
+                            &ctx.bound(json!({ "sha256": sha256_file(executable)? }), json!({})),
+                        )?,
                     )?;
                 }
             }
@@ -412,6 +416,11 @@ struct Ctx<'a> {
     corpus: &'a Path,
     /// S's source digest, which the checkout's own digest gave.
     source: &'a str,
+    /// The release `zakura-sim`'s SHA-256.
+    release_sha256: &'a str,
+    /// The task's index and its `task.json`'s SHA-256, which every file the
+    /// runner writes for the task carries as its `binding`.
+    binding: Value,
 }
 
 /// `field` of a task, as text.
@@ -422,23 +431,48 @@ fn field<'v>(task: &'v Value, field: &str) -> Result<&'v str, BoxError> {
 }
 
 impl Ctx<'_> {
+    /// `fields` with the task's binding, extended by `extra`, under
+    /// `binding`, so the evaluator can refuse a file written for another
+    /// task or about another trace.
+    fn bound(&self, mut fields: Value, extra: Value) -> Value {
+        let mut binding = self.binding.clone();
+        if let (Some(binding), Some(extra)) = (binding.as_object_mut(), extra.as_object()) {
+            binding.extend(extra.clone());
+        }
+        fields["binding"] = binding;
+        fields
+    }
+
     /// Runs `command` under the run's deadline with its output in
     /// `<dir>/<name>.log`, and writes `<dir>/<name>.json` with whether it
-    /// exited 0, whether it was killed, and its output.
-    fn record(&self, command: &mut Command, name: &str) -> Result<String, BoxError> {
+    /// exited 0, whether it was killed, its output, and its binding with
+    /// `extra` added.
+    fn record(&self, command: &mut Command, name: &str, extra: Value) -> Result<String, BoxError> {
         let log = self.dir.join(format!("{name}.log"));
         let ended = child(command, &log, self.run.deadline);
         stop_if_interrupted()?;
         let text = fs::read_to_string(&log).unwrap_or_default();
         fs::write(
             self.dir.join(format!("{name}.json")),
-            serde_json::to_string_pretty(&json!({
-                "exited_ok": ended.exited(),
-                "killed": ended.killed(),
-                "log": text,
-            }))?,
+            serde_json::to_string_pretty(&self.bound(
+                json!({
+                    "exited_ok": ended.exited(),
+                    "killed": ended.killed(),
+                    "log": text,
+                }),
+                extra,
+            ))?,
         )?;
         Ok(text)
+    }
+
+    /// The binding of a fresh replay of the task's `trace/`: the trace's
+    /// SHA-256 when the replay starts, and the executable that replays it.
+    fn replay_binding(&self) -> Result<Value, BoxError> {
+        Ok(json!({
+            "trace_sha256": sha256_file(&self.dir.join("trace").join("trace.jsonl"))?,
+            "executable_sha256": self.release_sha256,
+        }))
     }
 
     /// One test of the `qa/fuzz/sim` workspace's library, by its exact
@@ -469,14 +503,17 @@ impl Ctx<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         fs::write(
             self.dir.join("test.json"),
-            serde_json::to_string_pretty(&json!({
-                "checkout_source": self.source,
-                "binary": binary.first(),
-                "tests": libtest(&text),
-                "killed": ended.killed(),
-                "exited_ok": ended.exited(),
-                "log": text,
-            }))?,
+            serde_json::to_string_pretty(&self.bound(
+                json!({
+                    "checkout_source": self.source,
+                    "binary": binary.first(),
+                    "tests": libtest(&text),
+                    "killed": ended.killed(),
+                    "exited_ok": ended.exited(),
+                    "log": text,
+                }),
+                json!({}),
+            ))?,
         )?;
         Ok(())
     }
@@ -598,17 +635,20 @@ impl Ctx<'_> {
         }
         fs::write(
             self.dir.join("lane.json"),
-            serde_json::to_string_pretty(&json!({
-                "exited_ok": ended.exited() && built.exited(),
-                "killed": ended.killed() || built.killed(),
-                "targets": targets,
-                "listed": listed,
-                "binaries": binaries,
-                "binary_sources": binary_sources,
-                "checkout_source": self.source,
-                "list_failures": list_failures,
-                "log": text,
-            }))?,
+            serde_json::to_string_pretty(&self.bound(
+                json!({
+                    "exited_ok": ended.exited() && built.exited(),
+                    "killed": ended.killed() || built.killed(),
+                    "targets": targets,
+                    "listed": listed,
+                    "binaries": binaries,
+                    "binary_sources": binary_sources,
+                    "checkout_source": self.source,
+                    "list_failures": list_failures,
+                    "log": text,
+                }),
+                json!({ "command": command }),
+            ))?,
         )?;
         Ok(())
     }
@@ -617,13 +657,14 @@ impl Ctx<'_> {
     /// then replayed fresh by the same build: `trace/` and `replay.json`.
     fn seed(&self, task: &Value) -> Result<(), BoxError> {
         let mut record = self.zakura_sim(task, &[])?;
-        self.record(&mut record, "record")?;
+        self.record(&mut record, "record", json!({}))?;
         let mut replay = Command::new(self.release);
         replay
             .arg("replay")
             .arg(self.dir.join("trace"))
             .current_dir(self.root);
-        self.record(&mut replay, "replay")?;
+        let binding = self.replay_binding()?;
+        self.record(&mut replay, "replay", binding)?;
         Ok(())
     }
 
@@ -633,13 +674,14 @@ impl Ctx<'_> {
         let property = field(task, "property")?;
         let expect = field(task, "expect")?;
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
-        self.record(&mut record, "record")?;
+        self.record(&mut record, "record", json!({}))?;
         let mut replay = Command::new(self.release);
         replay
             .arg("replay")
             .arg(self.dir.join("trace"))
             .current_dir(self.root);
-        self.record(&mut replay, "replay")?;
+        let binding = self.replay_binding()?;
+        self.record(&mut replay, "replay", binding)?;
         Ok(())
     }
 
@@ -668,7 +710,7 @@ impl Ctx<'_> {
             cargo.env_remove("RUSTFLAGS");
         }
         cargo.args(&args);
-        self.record(&mut cargo, "command")?;
+        self.record(&mut cargo, "command", json!({}))?;
         // What ran, so the evaluator can tell one command's result from
         // another's.
         let file = self.dir.join("command.json");
@@ -695,10 +737,13 @@ impl Ctx<'_> {
         let text = fs::read_to_string(&log).unwrap_or_default();
         fs::write(
             self.dir.join("checkout.json"),
-            serde_json::to_string_pretty(&json!({
-                "clean": ended.exited() && text.trim().is_empty(),
-                "status": text,
-            }))?,
+            serde_json::to_string_pretty(&self.bound(
+                json!({
+                    "clean": ended.exited() && text.trim().is_empty(),
+                    "status": text,
+                }),
+                json!({}),
+            ))?,
         )?;
         Ok(())
     }
@@ -725,7 +770,7 @@ impl Ctx<'_> {
             .arg("--measure")
             .arg(self.dir.join("measure.json"))
             .current_dir(self.root);
-        self.record(&mut record, "record")?;
+        self.record(&mut record, "record", json!({}))?;
         Ok(())
     }
 }

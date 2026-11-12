@@ -345,7 +345,9 @@ pub enum Disruption {
 /// A run's recovery, shared by the control source, the storage source and
 /// the harness's view: the recovery, empty until a `Recover` step is
 /// picked, the hostile prefix before it and its cutoff, and the disruptions
-/// the scenario declares. Cloning shares them.
+/// the scenario declares. Cloning shares the recovery and the prefix. The
+/// cutoff and disruptions are fixed once the harness has prepared the
+/// evidence, so a clone carries the same ones ([`Self::with_cutoff`]).
 #[derive(Clone, Default)]
 pub struct RecoveryEvidence {
     recovery: Rc<RefCell<Option<Recovery>>>,

@@ -6,9 +6,9 @@
 # `Recover` comes there whatever its trigger. The node stays at A3, its
 # baseline at the pick, so the `recovered` pick owes A4 to A6, and the
 # obligation runs to its 30-second deadline. The harness offers a time
-# boundary just past it, so the violation comes there, and the fixture's
-# finish ends the run idle after it. Before #2355 the run ended at the
-# horizon with no `Recover`, and the property never applied.
+# boundary just past it, so the violation comes there and ends the run.
+# Before #2355 the run ended at the horizon with no `Recover`, and the
+# property never applied.
 # Besides reactor.rs, which the patch changes, the rest of header sync
 # decides whether the source is offered the target and stages its pages.
 # A change there can move the input off its staged page.

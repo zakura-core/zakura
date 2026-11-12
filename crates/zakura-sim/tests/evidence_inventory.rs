@@ -1,8 +1,8 @@
 //! The header nodes' evidence-store inventory (C14, C17), checked from the
 //! source.
 //!
-//! A static scan of the header harness's sources finds every struct field
-//! that holds shared state: a `Cell`, `RefCell`, `Mutex`, `RwLock` or
+//! A static scan of the header harness's sources finds every struct and
+//! enum variant field that holds shared state: a `Cell`, `RefCell`, `Mutex`, `RwLock` or
 //! atomic, in an `Rc` or `Arc` or not, with type aliases followed. Each is either a
 //! `Registered<T>`, which only a node's `EvidenceStores` builds, so it
 //! freezes with the run's log and reaches its snapshots, or on
@@ -717,8 +717,42 @@ struct Field {
     ty: String,
 }
 
-/// Every non-test struct field and type alias in `items`, from `file`
-/// whose source is `lines`, into `fields` and `aliases`.
+/// Each of `declared`'s fields, by name or tuple index, as `owner`'s,
+/// from `file` whose source is `lines`, into `fields`.
+fn push_fields(
+    (file, lines): (&str, &[&str]),
+    owner: &str,
+    declared: &Fields,
+    fields: &mut Vec<Field>,
+) {
+    let named: Vec<(String, &Type)> = match declared {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|field| {
+                let name = field.ident.as_ref().expect("a named field has a name");
+                (name.to_string(), &field.ty)
+            })
+            .collect(),
+        Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (index.to_string(), &field.ty))
+            .collect(),
+        Fields::Unit => Vec::new(),
+    };
+    fields.extend(named.into_iter().map(|(field, ty)| Field {
+        file: file.to_owned(),
+        owner: owner.to_owned(),
+        field,
+        ty: text(ty, lines),
+    }));
+}
+
+/// Every non-test struct field, enum variant field and type alias in
+/// `items`, from `file` whose source is `lines`, into `fields` and
+/// `aliases`. A variant's fields are owned by `Enum::Variant`.
 fn collect(
     (file, lines): (&str, &[&str]),
     items: &[Item],
@@ -728,30 +762,17 @@ fn collect(
     for item in items {
         match item {
             Item::Struct(item) if !test_only(&item.attrs) => {
-                let owner = item.ident.to_string();
-                let named: Vec<(String, &Type)> = match &item.fields {
-                    Fields::Named(named) => named
-                        .named
-                        .iter()
-                        .map(|field| {
-                            let name = field.ident.as_ref().expect("a named field has a name");
-                            (name.to_string(), &field.ty)
-                        })
-                        .collect(),
-                    Fields::Unnamed(unnamed) => unnamed
-                        .unnamed
-                        .iter()
-                        .enumerate()
-                        .map(|(index, field)| (index.to_string(), &field.ty))
-                        .collect(),
-                    Fields::Unit => Vec::new(),
-                };
-                fields.extend(named.into_iter().map(|(field, ty)| Field {
-                    file: file.to_owned(),
-                    owner: owner.clone(),
-                    field,
-                    ty: text(ty, lines),
-                }));
+                push_fields((file, lines), &item.ident.to_string(), &item.fields, fields);
+            }
+            Item::Enum(item) if !test_only(&item.attrs) => {
+                for variant in &item.variants {
+                    push_fields(
+                        (file, lines),
+                        &format!("{}::{}", item.ident, variant.ident),
+                        &variant.fields,
+                        fields,
+                    );
+                }
             }
             Item::Type(item) if !test_only(&item.attrs) => {
                 aliases
@@ -989,6 +1010,49 @@ fn the_scan_finds_atomics() {
         .find(|field| field.owner == "Stamps")
         .expect("the stamp counter is scanned");
     assert!(shared(&stamps.ty), "{stamps:?}");
+}
+
+/// An enum variant's fields, tuple or named, are scanned as a struct's
+/// are, so shared state an unlisted variant holds fails the inventory, as
+/// the control's variants show, and the scan reads the tree's real
+/// variants.
+#[test]
+fn the_scan_reads_enum_variant_fields() {
+    let source = "enum E {\n    \
+                  A(Arc<AtomicU64>),\n    \
+                  B { kept: Mutex<u8>, plain: u8 },\n    \
+                  C,\n\
+                  }\n";
+    let parsed = syn::parse_file(source).expect("the control parses");
+    let lines: Vec<&str> = source.lines().collect();
+    let (mut new, mut aliases) = (Vec::new(), BTreeMap::new());
+    collect(("new.rs", &lines), &parsed.items, &mut new, &mut aliases);
+    let found: Vec<(&str, &str, bool)> = new
+        .iter()
+        .map(|field| {
+            let flagged = shared_through(&field.ty, &aliases)
+                && !registered(&field.ty)
+                && !ALLOWED.iter().any(|(file, owner, name, _)| {
+                    (*file, *owner, *name) == ("new.rs", field.owner.as_str(), &field.field)
+                });
+            (field.owner.as_str(), field.field.as_str(), flagged)
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("E::A", "0", true),
+            ("E::B", "kept", true),
+            ("E::B", "plain", false)
+        ]
+    );
+    let (fields, _) = scan();
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.owner == "ProbeSlot::Held" && field.field == "0"),
+        "the scan reads the tap's probe slot's variant"
+    );
 }
 
 /// Whether `tests/<file>.rs` defines the test `name`.

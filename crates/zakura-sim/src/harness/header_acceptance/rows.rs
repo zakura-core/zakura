@@ -217,7 +217,7 @@ const GENERATED: [Generated; 32] = {
             "status/sender-cadence",
             EVERY,
             G34,
-            Open(SENDER_CADENCE_UNREACHED),
+            Case("pacing-floors-cut"),
         ),
         gen(
             "subscribe-headers/sender-within-live",
@@ -419,13 +419,6 @@ const LONG_PAGE_UNREACHED: &str =
      past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
      precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
      refusals drains the page at 0 ns and breaks sim/no-livelock first";
-/// Why `status/sender-cadence` has no catch: the run ends before a patched
-/// node empties the peer's bucket.
-const SENDER_CADENCE_UNREACHED: &str =
-    "the peer's Status bucket holds 602 frames and refills one every 500 ms, so breaking the rule \
-     takes over 600 Status frames from the node; with both its pacing floors cut to a millisecond, \
-     the reactor's publication interval and the cadence sender's send interval, a wire run sends \
-     about 213 before its 30,000-step budget ends";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1417,7 +1410,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
     };
     match generated.catch {
         GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 28, so the leak is
+            // Built once per case for a fixed set of 29, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
             expected.extend(caught(

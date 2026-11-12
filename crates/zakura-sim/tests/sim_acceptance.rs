@@ -672,7 +672,7 @@ mod schedule_agreement {
     fn a_site_beside_an_unrelated_difference_fails() {
         let map = HunkMap::default();
         let pick = Site {
-            at: "task:t:poll#1".to_owned(),
+            at: "task:t:poll#1=>task-exited".to_owned(),
         };
         let before = [reach(1, "task:t:poll#1", "src/a.rs:1")];
         let mut after = [reach(1, "task:t:poll#1", "src/a.rs:1")];
@@ -700,6 +700,14 @@ mod schedule_agreement {
         assert!(
             agreement(&before, &other_task, &map, &pick).is_err(),
             "a change after the site's pick that isn't the picked task's"
+        );
+        let mut wrong_op: Vec<StepView> = before.to_vec();
+        wrong_op[0]
+            .obs
+            .push(json!({ "obs": "task-waiting", "task": "t" }));
+        assert!(
+            agreement(&before, &wrong_op, &map, &pick).is_err(),
+            "the picked task's change isn't the observation the site names"
         );
         let mut other_pick: Vec<StepView> = before.to_vec();
         other_pick[0].pick = "task:u:poll#1".to_owned();

@@ -133,7 +133,8 @@ pub struct StepView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Site {
     /// A `file:line` after the patch, a `<task>:<point>` a task reached, or
-    /// a pick identity.
+    /// a pick identity with the observation of the picked task it changes,
+    /// `task:<task>:<point>=><obs>`.
     pub at: String,
 }
 
@@ -309,14 +310,22 @@ pub fn agreement(
         obs.get("site").and_then(Value::as_str) == Some(site.at.as_str())
             || reached(obs).as_deref() == Some(site.at.as_str())
     };
-    // The task a pick site picks: `task:<task>:<point>`.
-    let picked = site
+    // A pick site, `task:<task>:<point>=><obs>`, names the pick and the
+    // observation of the picked task the fix changes there.
+    let (pick_site, expected) = site
         .at
+        .split_once("=>")
+        .map_or((site.at.as_str(), None), |(pick, obs)| (pick, Some(obs)));
+    let picked = pick_site
         .strip_prefix("task:")
         .and_then(|rest| rest.rsplit_once(':'))
         .map(|(task, _)| task);
-    let of_picked =
-        |obs: &Value| picked.is_some() && obs.get("task").and_then(Value::as_str) == picked;
+    let of_picked = |obs: &Value| {
+        expected.is_some()
+            && picked.is_some()
+            && obs.get("task").and_then(Value::as_str) == picked
+            && obs.get("obs").and_then(Value::as_str) == expected
+    };
     let before_view = before.iter().find(|view| view.step == step);
     let before_obs: Vec<Value> = before_view
         .map(|view| view.obs.iter().map(|o| mapped(o, map)).collect())
@@ -335,13 +344,13 @@ pub fn agreement(
                         .and_then(|i| view.obs.get(i));
                     first.is_some_and(|obs| {
                         (names(obs) && !before_obs.contains(obs))
-                            || (view.pick == site.at && of_picked(obs))
+                            || (view.pick == pick_site && of_picked(obs))
                     })
                 }
                 // The picks differ, or the other run has no such step: the
                 // pick is the difference, and the picked task's change follows.
                 _ => {
-                    view.pick == site.at
+                    view.pick == pick_site
                         && view
                             .obs
                             .iter()

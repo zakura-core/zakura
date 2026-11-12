@@ -659,8 +659,14 @@ fn lane_task(repo: &Path, expected: &str, lane: &str) -> Option<Task> {
                 .flatten()
                 .filter_map(|entry| {
                     let path = entry.ok()?.path();
-                    (path.extension()? == "rs")
-                        .then(|| path.file_stem()?.to_str().map(str::to_owned))?
+                    // Cargo's integration targets: `tests/<name>.rs`, and
+                    // `tests/<name>/main.rs`.
+                    let target = if path.is_dir() {
+                        path.join("main.rs").is_file().then_some(path.as_path())?
+                    } else {
+                        (path.extension()? == "rs").then_some(path.as_path())?
+                    };
+                    target.file_stem()?.to_str().map(str::to_owned)
                 })
                 .collect();
             stems.sort();
@@ -1561,7 +1567,12 @@ fn run_records(dir: &Path, binding: &TaskBinding) -> Result<Vec<RunRecord>, Stri
             .and_then(|path| read(path))
             .ok_or_else(|| format!("run {stem} has no readable begin record"))?;
         let end = read(path).ok_or_else(|| format!("run {stem}'s end record doesn't read"))?;
-        for field in ["harness", "input_sha256", "phase", "binding"] {
+        // A record's id is its file's name, so a copy under another name,
+        // standing in for a run that's missing, is refused.
+        if begin.get("id").and_then(Value::as_str) != Some(stem.as_str()) {
+            return Err(format!("run {stem}'s records carry another run's id"));
+        }
+        for field in ["id", "harness", "input_sha256", "phase", "binding"] {
             if begin.get(field) != end.get(field) {
                 return Err(format!(
                     "run {stem}'s begin and end name different {field}s"
@@ -1683,6 +1694,49 @@ fn minimize_build_refusal(dir: &Path, bound: &Bound<'_>, target: &str) -> Option
     None
 }
 
+/// Why the minimization's kept bundle doesn't stand, if it doesn't: the
+/// minimized input must hash to `minimized`, its confirmation must have
+/// confirmed `property` on it, and its trace must be a run of it recorded by
+/// the simulator the report pins.
+fn minimized_bundle_refusal(
+    dir: &Path,
+    report: &Value,
+    property: &str,
+    minimized: &str,
+) -> Option<String> {
+    let root = dir.join("minimize");
+    let bundle = root.join(report.pointer("/minimized/dir")?.as_str()?);
+    let input =
+        crate::trace::read::read_bounded(&bundle.join("input.bin"), header::MAX_ARTIFACT_BYTES)
+            .ok()
+            .flatten()
+            .map(|bytes| sha256_hex(&bytes));
+    if input.as_deref() != Some(minimized) {
+        return Some("the kept minimized input isn't the one the report names".to_owned());
+    }
+    let confirmation: Option<Value> =
+        fs::read_to_string(bundle.join("confirm").join("confirmation.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+    let confirmed = confirmation.as_ref().is_some_and(|c| {
+        c.get("status").and_then(Value::as_str) == Some("confirmed")
+            && c.get("property").and_then(Value::as_str) == Some(property)
+            && c.pointer("/input/sha256").and_then(Value::as_str) == Some(minimized)
+    });
+    if !confirmed {
+        return Some("the kept minimized input's confirmation doesn't confirm it".to_owned());
+    }
+    let trace = TraceReader::open(&root.join(report.pointer("/minimized/trace")?.as_str()?)).ok();
+    let pinned = report.pointer("/build/sim_binary").and_then(Value::as_str);
+    let bound = trace.as_ref().is_some_and(|trace| {
+        trace.meta.input.as_ref().map(|i| i.sha256.as_str()) == Some(minimized)
+            && Some(trace.meta.build.binary.as_str()) == pinned
+    });
+    (!bound).then(|| {
+        "the kept trace isn't the pinned simulator's run of the minimized input".to_owned()
+    })
+}
+
 /// The minimization's verdict (Rule 11): `sim-minimize` reported a
 /// minimized candidate of the case's own input, property and harness, and
 /// for the original and the minimized input each, the fuzz target's run,
@@ -1743,6 +1797,11 @@ fn judge_minimize(
         property: property.to_owned(),
         also: Vec::new(),
     };
+    // The kept bundle: the minimized input itself, its confirmation of the
+    // property, and its trace, recorded by the pinned simulator.
+    if let Some(why) = minimized_bundle_refusal(dir, &report, property, &minimized) {
+        return blocked(why);
+    }
     // Inputs `sim-minimize` checked and rejected on the way are accounted
     // for but not judged, like the search's runs.
     let rejected: BTreeSet<String> = report

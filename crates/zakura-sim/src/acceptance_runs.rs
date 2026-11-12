@@ -98,9 +98,13 @@ pub(crate) fn begin(harness: &str) -> Option<Atom> {
             .map_or(0, |since| since.as_nanos())
     });
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{}-{start}-{n}", std::process::id());
     let atom = Atom {
-        stem: dir.join(format!("{}-{start}-{n}", std::process::id())),
+        stem: dir.join(&id),
         identity: serde_json::json!({
+            // Repeated inside, so a record copied under another run's name
+            // is refused.
+            "id": id,
             "harness": harness,
             "input_sha256": INPUT.with(|slot| slot.borrow().clone()),
             "phase": phase(),

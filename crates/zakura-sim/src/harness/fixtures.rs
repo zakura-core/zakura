@@ -103,9 +103,10 @@ pub trait Fixture: Sized + 'static {
     /// Where the fix's first observable effect is on the saved schedule
     /// (sched-4 S4.4): the planted and fixed runs of its Plan bytes agree on
     /// every step before it, and the fixed run's side of the first differing
-    /// step is here. It's a pick (`task:<task>:<point>`) when the fix
-    /// changes what follows that pick, or `<task>:<point>`, a point a task
-    /// reaches, when the fix changes which point that is or on which object.
+    /// step is here. It's a pick and the picked task's observation the fix
+    /// changes after it (`task:<task>:<point>=><obs>`), or `<task>:<point>`,
+    /// a point a task reaches, when the fix changes which point that is or
+    /// on which object.
     const AGREEMENT_SITE: &'static str;
 
     /// The fixture's shared state, as the check reads it.
@@ -387,7 +388,7 @@ impl Fixture for SnapshotReserve {
     const NAME: &'static str = "race/snapshot-reserve";
     const EXPECTED: &'static str = "no more reservations than capacity";
     /// After its release, the fixed reserver exits where the race locks again.
-    const AGREEMENT_SITE: &'static str = "task:res_a.1:release#1";
+    const AGREEMENT_SITE: &'static str = "task:res_a.1:release#1=>task-exited";
     /// The capacity left.
     type View = i64;
 
@@ -690,7 +691,7 @@ impl Fixture for AbortWithoutJoin {
     const NAME: &'static str = "race/abort-without-join";
     const EXPECTED: &'static str = "an aborted task's resource is released";
     /// After its abort, the fixed aborter waits for the join where the race yields.
-    const AGREEMENT_SITE: &'static str = "task:aborter.1:abort#1";
+    const AGREEMENT_SITE: &'static str = "task:aborter.1:abort#1=>task-waiting";
     /// True once the aborter found the resource still held.
     type View = bool;
 

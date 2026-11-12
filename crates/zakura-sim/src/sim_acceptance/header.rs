@@ -187,7 +187,16 @@ pub fn tree_refusal(dir: &Path) -> Option<String> {
         };
         if meta.is_dir() {
             match std::fs::read_dir(&path) {
-                Ok(children) => pending.extend(children.flatten().map(|entry| entry.path())),
+                // Counted while read, so a directory with too many entries
+                // is refused before they're all held.
+                Ok(children) => {
+                    for child in children.flatten() {
+                        if entries + pending.len() >= MAX_ARTIFACT_ENTRIES {
+                            return Some(format!("{} holds too many entries", dir.display()));
+                        }
+                        pending.push(child.path());
+                    }
+                }
                 Err(error) => return Some(format!("{}: {error}", path.display())),
             }
         } else if !meta.is_file() {

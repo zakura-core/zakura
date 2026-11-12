@@ -2081,7 +2081,9 @@ fn write_verdict(
 /// `scratch`, its confirmation's directory (or why it has none), is copied
 /// whole to `dir`'s [`CONFIRMATION_DIR`], and the check names its trace
 /// and the input the target ran by SHA-256, and the source the planted
-/// runner's confirmation build embeds (its report's `build.source`). A
+/// runner's confirmation `zakura-sim` embeds (its report's
+/// `build.sim_build.source`), which the runner has checked is the patched
+/// checkout's. A
 /// confirmation whose files can't be read refuses the check. A case with
 /// no target, or a refused one, names no run or input, and its `source` is
 /// left for [`case_task`].
@@ -2105,9 +2107,9 @@ fn confirmation_check(
             )
             .map_err(|error| format!("{}: {error}", path.display()))
         };
-        let source = read(&scratch.join("report.json"))?["build"]["source"]
+        let source = read(&scratch.join("report.json"))?["build"]["sim_build"]["source"]
             .as_str()
-            .ok_or("the confirmation's report names no build source")?
+            .ok_or("the confirmation's report names no simulator build source")?
             .to_owned();
         let confirm = scratch.join("original").join("confirm");
         let trace = read(&confirm.join("confirmation.json"))?["trace"]
@@ -4238,13 +4240,17 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let scratch = work.path().join("case-1/target");
         let confirm = scratch.join("original/confirm");
-        fs::create_dir_all(confirm.join("t")).unwrap();
-        fs::write(confirm.join("t/trace.jsonl"), "b").unwrap();
-        fs::write(confirm.join("confirmation.json"), r#"{"trace": "t"}"#).unwrap();
+        fs::create_dir_all(confirm.join("traces/p/t")).unwrap();
+        fs::write(confirm.join("traces/p/t/trace.jsonl"), "b").unwrap();
+        fs::write(
+            confirm.join("confirmation.json"),
+            r#"{"trace": "traces/p/t"}"#,
+        )
+        .unwrap();
         fs::write(scratch.join("original/input.bin"), "b").unwrap();
         fs::write(
             scratch.join("report.json"),
-            r#"{"build": {"source": "patched"}}"#,
+            r#"{"build": {"source": {"git": "s"}, "sim_build": {"source": "patched"}}}"#,
         )
         .unwrap();
         let check = |target: Option<&str>, refused: Option<&str>| json!({ "property": "p", "name": "n", "target": target, "refused": refused });

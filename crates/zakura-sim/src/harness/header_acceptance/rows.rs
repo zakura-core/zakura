@@ -3676,6 +3676,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
     "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
+    "identity_refs_are_defined_only_in_refs",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

@@ -6550,3 +6550,324 @@ fn the_evaluator_binds_runners_and_traces() {
     assert!(!evaluation.accepted());
     assert!(evaluation.gates.values().all(|passes| !passes));
 }
+
+/// The identity definitions outside `refs.rs` that Rule 25's scan
+/// ([`defined_refs`]) allows, as `(file, name, why)`, with the file
+/// relative to the crate. None is an identity an acceptance assertion
+/// joins on: each predates Rule 25 (adopted 2026-11-12) and keys a
+/// model's, harness's or explorer's own state as its facts name it, or
+/// names something that isn't a history's identity at all.
+const OUTSIDE_REFS: &[(&str, &str, &str)] = &[
+    (
+        "src/check.rs",
+        "FrameRef",
+        "defined beside the findings whose subject carries it; refs.rs re-exports it as Rule 25's \
+         frame ref",
+    ),
+    (
+        "src/trace/meta.rs",
+        "BlobRef",
+        "a trace meta's pointer to a stored file, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "PropertyRef",
+        "a trace meta's pointer to a registered property, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "InputRef",
+        "a trace meta's pointer to its input file, not a history identity",
+    ),
+    (
+        "src/trace/meta.rs",
+        "PlanRef",
+        "a trace meta's pointer to its Plan file, not a history identity",
+    ),
+    (
+        "src/record/machine.rs",
+        "CallRef",
+        "a machine record's storage call, compared whole by its derive",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "TestRef",
+        "the manifest's name for a test, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "HistoryRef",
+        "the manifest's name for a history, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_acceptance.rs",
+        "CaseRef",
+        "the manifest's name for a planted case, which results join whole through ExpectedId",
+    ),
+    (
+        "src/harness/header_node/authority/finding.rs",
+        "EngineRunRef",
+        "the controlled port's record of an engine run, compared whole by its derive",
+    ),
+    (
+        "src/peer/adapter.rs",
+        "StreamKey",
+        "the sender adapter's per-stream state, keyed as the transport names a stream",
+    ),
+    (
+        "src/peer/discovery/sender.rs",
+        "StreamKey",
+        "discovery's sender model's per-stream state, keyed as the transport names a stream",
+    ),
+    (
+        "src/peer/evidence.rs",
+        "FrameKey",
+        "the wire evidence's reader state, keyed as transport facts name a frame, with no stream \
+         kind or version; the pages it hands acceptance are keyed by FrameRef",
+    ),
+    (
+        "src/explore/state/crossing.rs",
+        "FrameKey",
+        "fuzz-13's crossing join over transport facts, which name no stream kind or version; it \
+         hands each crossed update out as its whole FrameRef",
+    ),
+    (
+        "src/explore/state/crossing.rs",
+        "SubscriptionKey",
+        "fuzz-13's crossing join's candidates, per subscription on a stream",
+    ),
+    (
+        "src/explore/state/collector.rs",
+        "SentFrame",
+        "the explorer's state collector's peer frames, a coverage feature's key",
+    ),
+    (
+        "src/domain/connection.rs",
+        "PeerConn",
+        "xsync's connection model, keyed as its observations name a peer's connection",
+    ),
+    (
+        "src/domain/session.rs",
+        "SessionRow",
+        "the punishment model's session rows, as its observations name them",
+    ),
+    (
+        "src/harness/header_node/authority.rs",
+        "Subscription",
+        "hdr-9's authority evidence's index of subscriptions as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/retirement.rs",
+        "Session",
+        "hdr-10's retirement evidence's index of sessions as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/stale.rs",
+        "Round",
+        "the stale-completion evidence's index of rounds as the reactor names them",
+    ),
+    (
+        "src/harness/header_node/round_life.rs",
+        "Authority",
+        "hdr-9's round-life index of authority as the reactor names it",
+    ),
+    (
+        "src/harness/header_node/round_life.rs",
+        "Subscription",
+        "hdr-9's round-life index of rounds by the reactor's subscription",
+    ),
+    (
+        "src/harness/header_node/retirement.rs",
+        "SlotKey",
+        "hdr-10's retirement report index of slots",
+    ),
+    (
+        "src/domain/block_sync.rs",
+        "RequestKey",
+        "block sync's model of its requests, outside header sync",
+    ),
+    (
+        "tests/header_node_reservations.rs",
+        "StreamKey",
+        "a reservation witness's grouping of frames by stream, not an acceptance join",
+    ),
+    (
+        "tests/header_wire.rs",
+        "SessionKey",
+        "the wire harness's admission test, which compares a Session row to its admission",
+    ),
+];
+
+/// Whether `ty` is a part of an identity, and if so whether it's a number:
+/// an unsigned integer is, and a string, peer ID, stream, hash or byte
+/// vector is a part that isn't, through a reference or an `Option`.
+/// Anything else isn't a part of an identity.
+fn identity_part(ty: &syn::Type) -> Option<bool> {
+    match ty {
+        syn::Type::Reference(reference) => identity_part(&reference.elem),
+        syn::Type::Path(path) => {
+            let last = path.path.segments.last()?;
+            let argument = || match &last.arguments {
+                syn::PathArguments::AngleBracketed(args) => match args.args.first()? {
+                    syn::GenericArgument::Type(ty) => Some(ty),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match last.ident.to_string().as_str() {
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => Some(true),
+                "Option" => identity_part(argument()?),
+                "Vec" => matches!(identity_part(argument()?), Some(true)).then_some(false),
+                "String" | "str" | "ZakuraPeerId" | "StreamId" | "Hash" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Each identity definition the Rust source `text`, the file `file`,
+/// makes, in order: a struct, enum, union, trait or type alias named
+/// `*Ref`, and a type alias for an identity tuple a join could key on,
+/// two or more [`identity_part`]s, at least one a number. It finds them at
+/// any depth, in test code and function bodies too. An associated type in
+/// an `impl` or trait isn't a definition of its own.
+fn defined_refs(text: &str, file: &str) -> Vec<String> {
+    use syn::visit::Visit;
+    /// Collects the definitions' names.
+    #[derive(Default)]
+    struct Defined(Vec<String>);
+    impl Defined {
+        /// Notes `ident` if it's named `*Ref`.
+        fn named(&mut self, ident: &syn::Ident) {
+            let name = ident.to_string();
+            if name.len() > 3 && name.ends_with("Ref") {
+                self.0.push(name);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Defined {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            self.named(&item.ident);
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            self.named(&item.ident);
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            self.named(&item.ident);
+            syn::visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            self.named(&item.ident);
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            let parts: Option<Vec<bool>> = match &*item.ty {
+                syn::Type::Tuple(tuple) if tuple.elems.len() >= 2 => {
+                    tuple.elems.iter().map(identity_part).collect()
+                }
+                _ => None,
+            };
+            match parts {
+                Some(parts) if parts.contains(&true) => self.0.push(item.ident.to_string()),
+                _ => self.named(&item.ident),
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut defined = Defined::default();
+    defined.visit_file(&parsed);
+    defined.0
+}
+
+/// Every identity definition ([`defined_refs`]) in the crate's `src` and
+/// `tests` outside `refs.rs`, as `(file, name)` with the file relative to
+/// the crate.
+fn refs_outside_refs() -> BTreeSet<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the directory reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&krate.join("src"), &mut files);
+    walk(&krate.join("tests"), &mut files);
+    let mut found = BTreeSet::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(krate)
+            .expect("under the crate")
+            .display()
+            .to_string();
+        if relative == "src/harness/header_acceptance/refs.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("a source file reads");
+        for name in defined_refs(&text, &relative) {
+            found.insert((relative.clone(), name));
+        }
+    }
+    found
+}
+
+/// Rule 25's source scan: no identity a join could key on is defined
+/// outside `refs.rs`, in the crate's `src` or `tests`, apart from the
+/// reasoned [`OUTSIDE_REFS`], which must each still be there. The control
+/// shows the scan finds a planted local `*Ref`, at the top level, in a
+/// test module and in a function body, and a tuple alias, and leaves an
+/// associated type and a one-type alias alone.
+#[test]
+fn identity_refs_are_defined_only_in_refs() {
+    let allowed: BTreeSet<(String, String)> = OUTSIDE_REFS
+        .iter()
+        .map(|(file, name, why)| {
+            assert!(!why.is_empty(), "{file} {name} has no reason");
+            ((*file).to_owned(), (*name).to_owned())
+        })
+        .collect();
+    assert_eq!(
+        allowed.len(),
+        OUTSIDE_REFS.len(),
+        "an entry is listed twice"
+    );
+    assert_eq!(refs_outside_refs(), allowed);
+
+    let planted = "struct UpdateRef { connection: u64, quic_stream: u64, seq: u64 }\n\
+                   type FrameKey = (u64, u64, u64);\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       enum SessionRef { One }\n\
+                       fn t() { struct LocalRef(u64); type Pair<'a> = (&'a str, u64); }\n\
+                   }\n\
+                   type Slot = (Vec<u8>, Option<u64>, block::Hash, ZakuraPeerId);\n\
+                   impl Subsystem for X { type View = (u64, u32); }\n\
+                   type Version = (u64);\n\
+                   type Unit = ();\n\
+                   type Names = (&'static str, String);\n\
+                   type Seed = (&'static str, Scenario, usize);\n\
+                   struct Ref;\n";
+    assert_eq!(
+        defined_refs(planted, "t.rs"),
+        [
+            "UpdateRef",
+            "FrameKey",
+            "SessionRef",
+            "LocalRef",
+            "Pair",
+            "Slot"
+        ]
+    );
+}

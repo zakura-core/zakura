@@ -23,11 +23,15 @@ only on the remote host.
 
 `routine` is the droplet timer's run (mutation plan, mut-4.6). It pins the
 checkout to `origin/main`, runs the full planted sim suite, runs the loop
-with generator lanes on what changed since the last report (every case on
-its first run), optionally runs the libFuzzer lane on the same cases, and
-diffs the new report against the last one. Each run writes under
-`<state>/runs/<UTC time>-<commit>/`, and `<state>/latest.json` names the
-last report. `--dry-run` prints the steps without running any.
+with generator lanes on what changed since the last pin (every case on its
+first run), and optionally runs the libFuzzer lane on the same cases. A
+`--changed-since` report holds only the cases it reran, so the routine
+diffs each new report against a cumulative one, `<state>/cumulative.json`
+(`cumulative-libfuzzer.json` for the libFuzzer lane): every case's latest
+result and every property finding so far. It then merges the new report
+into it. Each run writes under `<state>/runs/<UTC time>-<commit>/`, and
+`<state>/latest.json` names the last pin. `--dry-run` prints the steps
+without running any.
 """
 
 import argparse
@@ -41,6 +45,7 @@ import sys
 DIFF_FILE = "joint-diff.json"
 REPORT_FILE = "report.json"
 LATEST_FILE = "latest.json"
+CUMULATIVE_FILES = {"loop": "cumulative.json", "libfuzzer": "cumulative-libfuzzer.json"}
 ROUTINE_FILE = "routine.json"
 NEEDS_TRIAGE = ("survived", "killed-by-other-rule")
 SIM_RUSTFLAGS = "--cfg zakura_sim"
@@ -111,6 +116,29 @@ def has_news(changes):
     return any(changes[key] for key in ("newly_surviving", "newly_failing_baselines", "new_property_findings"))
 
 
+def merge(cumulative, new):
+    """Return `cumulative` with `new`'s cases in place of their earlier results, and every property finding of both.
+
+    A `--changed-since` report holds only the cases it reran, so a case
+    missing from `new` keeps its last result.
+    """
+    cases = {case_key(case): case for case in cumulative.get("cases", [])}
+    cases.update((case_key(case), case) for case in new.get("cases", []))
+    findings = {finding_key(finding): finding for finding in cumulative.get("property_findings", [])}
+    findings.update((finding_key(finding), finding) for finding in new.get("property_findings", []))
+    return {
+        "pinned": new.get("pinned"),
+        "cases": [cases[key] for key in sorted(cases, key=repr)],
+        "property_findings": [findings[key] for key in sorted(findings, key=repr)],
+    }
+
+
+def read_json(path):
+    """Return the JSON at `path`, or `{}` if it's missing."""
+    path = Path(path)
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def write_diff(previous, new_path):
     """Diff `previous` against the report at `new_path`, print the diff, write it beside the report, and return it."""
     changes = diff(previous, json.loads(Path(new_path).read_text()))
@@ -139,7 +167,7 @@ def loop_command(previous, out, generate_runs, extra):
 
 
 def read_latest(state):
-    """Return the last routine's `{"report", "pinned"}`, or None before the first report."""
+    """Return the last routine's `{"pinned"}`, or None before the first report."""
     path = Path(state) / LATEST_FILE
     return json.loads(path.read_text()) if path.exists() else None
 
@@ -211,18 +239,23 @@ def routine(args):
     ended = {}
     for step in routine_steps(checkout, run_dir, latest, args):
         ended[step["name"]] = run_step(step, run_dir)
-    record = {"pinned": pinned, "previous": latest, "steps": ended}
+    record = {"pinned": pinned, "previous": latest, "steps": ended, "news": {}}
     status = 0 if all(code == 0 for code in ended.values()) else 1
-    report = run_dir / "loop" / REPORT_FILE
-    if report.exists():
-        previous = json.loads(Path(latest["report"]).read_text()) if latest else {}
-        changes = write_diff(previous, report)
-        record["news"] = has_news(changes)
-        status = status or int(record["news"])
-        (state / LATEST_FILE).write_text(json.dumps({"report": str(report), "pinned": pinned}, indent=2) + "\n")
+    for lane, cumulative_file in CUMULATIVE_FILES.items():
+        report = run_dir / lane / REPORT_FILE
+        if not report.exists():
+            continue
+        cumulative_path = state / cumulative_file
+        cumulative = read_json(cumulative_path)
+        changes = write_diff(cumulative, report)
+        record["news"][lane] = has_news(changes)
+        status = status or int(record["news"][lane])
+        merged = merge(cumulative, json.loads(report.read_text()))
+        cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
+    if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
+        (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
     else:
-        record["news"] = False
-        print(f"the loop wrote no report; {LATEST_FILE} stays")
+        print(f"the loop failed without a report; {LATEST_FILE} stays")
     (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
     return status
 

@@ -103,7 +103,9 @@ pub(super) fn read(root: &Path) -> Result<Vec<Record>, BoxError> {
 }
 
 /// Copies each of `records` onto every lane of `cases` it names that needs
-/// triage. Returns the stale records: those that named no such lane.
+/// triage. Returns the stale records: those whose case ran and that named
+/// no such lane. A record for a case `--only` or `--changed-since` left out
+/// isn't judged.
 pub(super) fn apply<'a>(cases: &mut [CaseReport], records: &'a [Record]) -> Vec<&'a Record> {
     let mut used = vec![false; records.len()];
     let mut find = |case: &CaseReport, lane: &str| {
@@ -126,10 +128,15 @@ pub(super) fn apply<'a>(cases: &mut [CaseReport], records: &'a [Record]) -> Vec<
             })
             .collect();
     }
+    let ran = |record: &Record| {
+        cases
+            .iter()
+            .any(|case| (&case.patch, &case.property) == (&record.patch, &record.property))
+    };
     records
         .iter()
         .zip(used)
-        .filter(|(_, used)| !used)
+        .filter(|(record, used)| !used && ran(record))
         .map(|(record, _)| record)
         .collect()
 }

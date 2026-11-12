@@ -29,10 +29,14 @@ the harness's scenario families' tags, or none, picked uniformly.
 a harness whose runs take seconds.
 `--generate-mode libfuzzer` runs one campaign per seed for
 `--generate-seconds` instead, from an empty corpus and with no exclusions.
-A kill must confirm in a fresh process, and the loop shrinks its trace. The
-loop then replays the shrunk trace on the unpatched build. If the unpatched
-build violates the same ID, the lane is `baseline-fails` and the report lists
-a property finding, because the bug is in the pinned revision. One
+A kill must confirm in a fresh process, and the loop shrinks its trace
+within ten of the harness's runs, and at least two minutes. The loop then
+replays the confirmed trace, and the shrunk one if the shrink finished, on
+the unpatched build. If the unpatched build violates the same ID on the
+confirmed trace, the lane is `baseline-fails`, because the bug is in the
+pinned revision. A violation on either trace is a property finding in the
+report. The shrink keeps the ID's violation but not the mutant's part in
+it, so a violation on the shrunk trace alone leaves the kill. One
 search per harness and seed runs on the unpatched build first, and one that
 a run failure ended reruns alone. A confirmed violation there is a property
 finding in the report. Any other search that isn't clean is a generator
@@ -45,8 +49,8 @@ in `triage.toml`: the case's patch and property, the lane (`witness` or the
 generator harness), the causal-chain stage where the bug stopped
 (`generator`, `schedule`, `observation`, `property` or `unsupported`), the
 reason, and an optional tracking issue. The loop copies each record onto the
-lanes it names, lists records that name no such lane as stale, and prints how
-many lanes still need one.
+lanes it names, lists as stale each record whose case ran and that names no
+such lane, and prints how many lanes still need one.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out
 <dir>` runs the loop with generator lanes on the cases changed since the

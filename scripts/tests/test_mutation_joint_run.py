@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "mutation_joint_run.py"
 SPEC = importlib.util.spec_from_file_location("mutation_joint_run", SCRIPT)
@@ -150,7 +151,7 @@ class RoutineTests(unittest.TestCase):
 
     def test_a_later_run_covers_what_changed_since_the_last_pin(self):
         with tempfile.TemporaryDirectory() as state:
-            (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"report": "/r.json", "pinned": "a" * 40}))
+            (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--", "--jobs", "4")
         names = [step["name"] for step in plan["steps"]]
         self.assertEqual(names, ["suite", "loop", "libfuzzer"])
@@ -178,6 +179,55 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(loop.count("--generate-harness-runs"), 4)
         self.assertEqual(loop[loop.index("--cases") + 1], "qa/native-mutations")
         self.assertEqual(loop[-2:], ["--jobs", "4"])
+
+
+class CumulativeTests(unittest.TestCase):
+    def routine(self, state, reports, libfuzzer_seconds="0"):
+        """Run the routine once with each step writing `reports[name]` as its report, if it has one."""
+        def run_step(step, run_dir):
+            if step["name"] in reports:
+                out = Path(run_dir) / step["name"]
+                out.mkdir()
+                (out / joint.REPORT_FILE).write_text(json.dumps(reports[step["name"]]))
+            return 0
+
+        # Each run pins a new commit, so its run directory is new.
+        self.pins = getattr(self, "pins", 0) + 1
+        with mock.patch.object(joint, "pin", return_value=f"{self.pins:x}" * 40), \
+                mock.patch.object(joint, "run_step", side_effect=run_step), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return joint.main(["routine", "--checkout", "/c", "--state", str(state),
+                               "--libfuzzer-seconds", libfuzzer_seconds])
+
+    def test_a_partial_report_is_diffed_against_every_case_so_far(self):
+        one = case("one.patch", "survived")
+        two = case("two.patch", "survived")
+        with tempfile.TemporaryDirectory() as state:
+            self.assertEqual(self.routine(state, {"loop": {"cases": [one, two]}}), 1, "first survivors are news")
+            # A `--changed-since` report reruns only two.patch: one.patch's
+            # survival is no news, and two.patch's isn't either.
+            self.assertEqual(self.routine(state, {"loop": {"cases": [two]}}), 0)
+            merged = json.loads((Path(state) / "cumulative.json").read_text())
+            self.assertEqual([entry["patch"] for entry in merged["cases"]], ["one.patch", "two.patch"])
+            latest = json.loads((Path(state) / joint.LATEST_FILE).read_text())
+            self.assertEqual(latest["pinned"], "2" * 40)
+
+    def test_a_libfuzzer_report_has_its_own_diff(self):
+        killed = {"cases": [case("one.patch", "killed-by-named-rule")]}
+        with tempfile.TemporaryDirectory() as state:
+            self.assertEqual(self.routine(state, {"loop": killed}), 0)
+            news = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "survived")], mode="libfuzzer")]}
+            self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 1)
+            self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 0)
+            self.assertTrue((Path(state) / "cumulative-libfuzzer.json").exists())
+
+    def test_merge_keeps_every_property_finding(self):
+        merged = joint.merge(
+            {"cases": [], "property_findings": [finding(11, "a")]},
+            {"pinned": "c" * 40, "cases": [], "property_findings": [finding(23, "b"), finding(11, "a")]},
+        )
+        self.assertEqual([entry["seed"] for entry in merged["property_findings"]], [11, 23])
+        self.assertEqual(merged["pinned"], "c" * 40)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,19 @@ fn escape_command(command: &[u8; 12]) -> String {
         .collect()
 }
 
+/// Writes `count` zero bytes to `writer`.
+fn write_zeros<W: Write + ?Sized>(writer: &mut W, count: u32) -> Result<(), Error> {
+    const ZEROS: [u8; 4096] = [0; 4096];
+    // Widening u32 to usize is lossless on supported targets.
+    let mut remaining = count as usize;
+    while remaining > 0 {
+        let len = remaining.min(ZEROS.len());
+        writer.write_all(&ZEROS[..len])?;
+        remaining -= len;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BodyDecodePanic {
@@ -184,7 +197,7 @@ impl Encoder<Message> for Codec {
         let command = match item {
             Version { .. } => b"version\0\0\0\0\0",
             Verack => b"verack\0\0\0\0\0\0",
-            Ping { .. } => b"ping\0\0\0\0\0\0\0\0",
+            Ping { .. } | WarmupPing { .. } => b"ping\0\0\0\0\0\0\0\0",
             Pong { .. } => b"pong\0\0\0\0\0\0\0\0",
             Reject { .. } => b"reject\0\0\0\0\0\0",
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
@@ -281,6 +294,10 @@ impl Codec {
             Message::Verack => { /* Empty payload -- no-op */ }
             Message::Ping(nonce) => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;
+            }
+            Message::WarmupPing { nonce, padding } => {
+                writer.write_u64::<LittleEndian>(nonce.0)?;
+                write_zeros(writer, *padding)?;
             }
             Message::Pong(nonce) => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;

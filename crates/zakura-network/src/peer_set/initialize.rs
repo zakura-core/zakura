@@ -344,6 +344,10 @@ where
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
+            .with_tcp_warmup(peer::TcpWarmup::spawn(
+                config.tcp_warmup.clone(),
+                latest_chain_tip.clone(),
+            ))
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {

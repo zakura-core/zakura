@@ -43,7 +43,7 @@ use crate::{
     meta_addr::MetaAddrChange,
     peer::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
-        HandshakeError, MinimumPeerVersion, PeerError,
+        HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -102,6 +102,9 @@ where
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
+    /// Warms each new connection's send direction, if warm-up is enabled.
+    tcp_warmup: Option<TcpWarmup>,
+
     parent_span: Span,
 }
 
@@ -150,6 +153,7 @@ where
             protected_peer_ips: self.protected_peer_ips.clone(),
             inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
+            tcp_warmup: self.tcp_warmup.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -508,6 +512,7 @@ where
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
     bans: Option<BannedIps>,
+    tcp_warmup: Option<TcpWarmup>,
 }
 
 impl<S, C> Builder<S, C>
@@ -593,6 +598,7 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
             bans: self.bans,
+            tcp_warmup: self.tcp_warmup,
         }
     }
 
@@ -627,6 +633,14 @@ where
     /// If this is unset, block adverts are not checked against bans when they are written.
     pub fn with_bans(mut self, bans: BannedIps) -> Self {
         self.bans = Some(bans);
+        self
+    }
+
+    /// Warm each new connection's send direction with padded pings. Optional.
+    ///
+    /// If this is unset or `None`, connections are not warmed.
+    pub fn with_tcp_warmup(mut self, tcp_warmup: Option<TcpWarmup>) -> Self {
+        self.tcp_warmup = tcp_warmup;
         self
     }
 
@@ -681,6 +695,7 @@ where
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
             bans: self.bans.unwrap_or_default(),
+            tcp_warmup: self.tcp_warmup,
             parent_span: Span::current(),
         })
     }
@@ -709,6 +724,7 @@ where
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
             bans: None,
+            tcp_warmup: None,
         }
     }
 }
@@ -1576,6 +1592,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let bans = self.bans.clone();
+        let tcp_warmup = self.tcp_warmup.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1742,6 +1759,8 @@ where
             // Bound pending adverts; slow peers can catch up through later tip gossip.
             let (block_advert_tx, block_advert_rx) =
                 tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
+            let (warmup_tx, warmup_rx) =
+                tokio::sync::mpsc::channel(super::tcp_warmup::WARMUP_QUEUE);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1867,6 +1886,7 @@ where
                 ConnectionRequests {
                     client_rx: server_rx,
                     block_advert_rx,
+                    warmup_rx,
                     minimum_peer_version,
                     bans,
                 },
@@ -1891,6 +1911,19 @@ where
                 .instrument(connection_span.clone())
                 .boxed(),
             );
+
+            // The warm-up task ends by itself when the connection closes its warm-up channel.
+            if let (Some(tcp_warmup), Some(peer_addr)) =
+                (tcp_warmup, connected_addr.get_transient_addr())
+            {
+                tokio::spawn(
+                    tcp_warmup
+                        .run(canonical_ip(peer_addr.ip()), warmup_tx)
+                        .instrument(
+                            tracing::debug_span!(parent: connection_span.clone(), "tcp_warmup"),
+                        ),
+                );
+            }
 
             let heartbeat_task = tokio::spawn(
                 send_periodic_heartbeats_with_shutdown_handle(

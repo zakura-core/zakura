@@ -9,6 +9,7 @@ mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;
 mod priority;
+pub(crate) mod tcp_warmup;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]
@@ -39,3 +40,4 @@ pub use priority::{
     address_is_valid_for_inbound_listeners, address_is_valid_for_outbound_connections,
     PeerPreference,
 };
+pub(crate) use tcp_warmup::TcpWarmup;

@@ -99,6 +99,19 @@ p2p_stack = "default"
 peerset_initial_target_size = 100
 unconditional_peers = []
 
+# Warm each new legacy TCP connection with a few padded pings, so that its first
+# full block does not wait for TCP slow start. Needs
+# net.ipv4.tcp_slow_start_after_idle = 0.
+[network.tcp_warmup]
+chunk_timeout = "20s"
+enabled = false
+first_chunk_bytes = 16384
+ignore_slow_start_after_idle = false
+max_chunk_bytes = 2097144
+max_concurrent = 16
+peer_cooldown = "1day"
+tip_quiet = "2s"
+
 [network.zakura]
 bootstrap_peers = [
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",

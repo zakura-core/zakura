@@ -96,6 +96,7 @@ impl ConnectedClient {
             ConnectionRequests {
                 client_rx: server_rx,
                 block_advert_rx,
+                warmup_rx: tokio::sync::mpsc::channel(1).1,
                 minimum_peer_version: MinimumPeerVersion::new(NoChainTip, &Network::Mainnet),
                 bans: Default::default(),
             },

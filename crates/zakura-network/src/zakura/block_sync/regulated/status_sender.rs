@@ -25,8 +25,14 @@ const STATUS_BUCKET_CAPACITY: u32 = match RULES[0].role {
 };
 
 /// Tokens of the receiver's Status bucket that a prompt tip announcement
-/// leaves unspent: half, so the bursts after an outage that the bucket is
-/// sized for still fit, and a sender's tip announcements never exhaust it.
+/// leaves unspent: half, so a burst after a short outage still fits.
+///
+/// The sender charges its copy of the bucket when it queues a Status, and the
+/// receiver charges its bucket when the Status arrives. While frames arrive
+/// promptly the receiver's bucket never empties. A transport stall that buffers
+/// Statuses delivers them together, and one longer than about three minutes of
+/// tips every second can exceed the bucket; the receiver records that and does
+/// not treat it as a violation.
 const TIP_RESERVE_TOKENS: u32 = STATUS_BUCKET_CAPACITY / 2;
 
 /// Whether `latest` announces blocks that `previous` did not: a higher
@@ -364,10 +370,11 @@ mod tests {
     }
 
     /// Announcing a new tip every second spends at most half of the receiver's
-    /// Status bucket, then follows its refill: a receiver never sees the bucket
-    /// exhausted, and its reserve for bursts after an outage stays.
+    /// Status bucket, then follows its refill: while frames arrive promptly, a
+    /// receiver never sees the bucket exhausted, and its reserve for bursts
+    /// after an outage stays.
     #[tokio::test(start_paused = true)]
-    async fn tip_announcements_never_exhaust_the_receivers_status_bucket() {
+    async fn prompt_tip_announcements_never_exhaust_the_receivers_status_bucket() {
         use crate::zakura::regulation::{CadenceBuckets, CadenceCharge};
 
         let sender = StatusSender::new(u32::MAX, Duration::from_secs(30));
@@ -415,6 +422,52 @@ mod tests {
         assert!(
             after.abs_diff(refills) <= 2,
             "{after} announcements after the burst for {refills} refills"
+        );
+    }
+
+    /// Statuses queued during a transport stall all arrive when it ends, so the
+    /// receiver charges them together. The sender's copy of the bucket was
+    /// charged as each was queued, so it cannot see the stall.
+    ///
+    /// With a tip every second, the burst fits the receiver's bucket up to a
+    /// 165 s stall (11 early sends, then one per 15 s refill) and exceeds it
+    /// after that. At the NU7 block spacing of 25 s, a ten-minute stall exceeds
+    /// it by a few frames, which the 30 s cadence's sizing alone would have
+    /// fit. Exhaustion only records a trace on the receiver.
+    #[tokio::test(start_paused = true)]
+    async fn statuses_buffered_by_a_stall_arrive_together() {
+        use crate::zakura::regulation::{CadenceBuckets, CadenceCharge};
+
+        async fn stalled(stall_secs: u32, tip_every_secs: u32) -> (usize, usize) {
+            let sender = StatusSender::new(u32::MAX, Duration::from_secs(30));
+            let (send, mut recv) = framed_channel(8);
+            let mut buffered = 0;
+            for second in 0..=stall_secs {
+                if second % tip_every_secs == 0
+                    && sender.try_send(at(second + 1, 0), &send).unwrap() == StatusSend::Queued
+                {
+                    // The transport accepts the write, but the frame waits there.
+                    recv.recv().await.unwrap();
+                    buffered += 1;
+                }
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            let mut receiver = CadenceBuckets::new(crate::zakura::RealClock);
+            let exhausted = (0..buffered)
+                .filter(|_| receiver.charge(0, &RULES[0]) == CadenceCharge::Exhausted)
+                .count();
+            (buffered, exhausted)
+        }
+
+        let capacity = usize::try_from(STATUS_BUCKET_CAPACITY).unwrap();
+        assert_eq!(stalled(165, 1).await, (capacity, 0));
+        let (buffered, exhausted) = stalled(180, 1).await;
+        assert_eq!((buffered, exhausted), (capacity + 1, 1));
+        let (buffered, exhausted) = stalled(600, 25).await;
+        assert_eq!(exhausted, buffered - capacity);
+        assert!(
+            (1..=4).contains(&exhausted),
+            "{buffered} Statuses buffered over ten minutes of 25 s blocks"
         );
     }
 

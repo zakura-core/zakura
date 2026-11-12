@@ -319,7 +319,7 @@ pub fn crossings<'a>(observations: impl IntoIterator<Item = &'a Observation>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::StreamId;
+    use crate::observe::{StreamId, TransitionFact};
 
     /// The connection, QUIC stream and subscription every case uses.
     const C: u64 = 1;
@@ -465,13 +465,27 @@ mod tests {
         assert_eq!(crossings(&log), crossed());
     }
 
-    /// Negative 1: the node ended the subscription but wrote the ending
-    /// after the update's write returned (W > V).
+    /// Negative 1: the node ended the subscription locally before the
+    /// peer's update (its `publication-ended`), but wrote the ending only
+    /// after the update's write returned (W > V). A local end isn't a
+    /// crossing.
     #[test]
     fn an_ending_written_after_the_update_is_no_crossing() {
         let [received, node_frame] = peer_read(0, 12, SUB);
+        let ended = Observation::Transport {
+            instance: 0,
+            seq: 9,
+            node: "node".to_owned(),
+            connection: Some(C),
+            remote: "10.0.0.2:4000".to_owned(),
+            event: TransportFact::Regulated {
+                quic_stream: Q,
+                transition: TransitionFact::PublicationEnded { subscription: SUB },
+            },
+        };
         let log = [
             session(),
+            ended,
             update(1, Label::Conformant),
             peer_wrote(1, 10),
             node_wrote(0, 11),

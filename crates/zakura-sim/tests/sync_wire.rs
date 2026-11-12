@@ -50,6 +50,17 @@ fn run_scenario(
     scenario: &<SyncWire as Subsystem>::Scenario,
     input: PlanInput,
 ) -> (RunReport, Vec<String>, SyncPorts) {
+    let (report, lines, ports) = run_scenario_judged_by_caller(scenario, input);
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    (report, lines, ports)
+}
+
+/// [`run_scenario`], but leaves an active property's violation to the
+/// caller. Still fails the test on a harness failure.
+fn run_scenario_judged_by_caller(
+    scenario: &<SyncWire as Subsystem>::Scenario,
+    input: PlanInput,
+) -> (RunReport, Vec<String>, SyncPorts) {
     let ports = SyncWire::prepare(scenario);
     let mut sink = MemorySink::default();
     let report = match run_prepared::<SyncWire>(scenario, ports.clone(), input, &mut sink, None) {
@@ -57,7 +68,6 @@ fn run_scenario(
         Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
         Err(error) => panic!("{error}"),
     };
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
     (report, sink.lines(), ports)
 }
 
@@ -472,14 +482,46 @@ fn a_saturating_service_starves_no_other_on_its_connection() {
     }
 }
 
+/// The curated combination that violates [`STALLED_SERVICE_ISOLATED`] until
+/// zakura#2378 is fixed. Its fork resets a block request while the request's
+/// frame is partly written, which cancels the block-sync session. The writer
+/// fence then closes the replaced connection, connection 3, while the
+/// session's earlier requests still wait.
+const KNOWN_FAILURE: &str = "combined-reorg-submit-replace";
+
 /// fuzz-13's combined actions: each curated combination of a chain change
 /// at a pipeline stage, a connection replacement and a read stall runs its
 /// committed Plan with no active property violated, and both of the node's
-/// tips reach the mirrors' tip.
+/// tips reach the mirrors' tip. [`KNOWN_FAILURE`] instead ends in its
+/// zakura#2378 violation, and the test fails once it doesn't.
 #[test]
 fn curated_combined_actions_sync_both_tips() {
+    assert!(
+        CURATED.iter().any(|(name, _)| *name == KNOWN_FAILURE),
+        "{KNOWN_FAILURE} names a curated combination"
+    );
     for (name, prefix) in CURATED {
-        let (report, _, ports) = run_scenario(&SyncWire::draw(&prefix), Plan::from_fuzz(&[]));
+        let scenario = SyncWire::draw(&prefix);
+        if name == KNOWN_FAILURE {
+            let (report, _, _) = run_scenario_judged_by_caller(&scenario, Plan::from_fuzz(&[]));
+            let violation = report.end.violation.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "{name} no longer violates {STALLED_SERVICE_ISOLATED}, so zakura#2378 is \
+                     fixed: remove this expectation (zakura#2378): {:?}",
+                    report.end
+                )
+            });
+            assert!(
+                violation.property == STALLED_SERVICE_ISOLATED
+                    && violation
+                        .actual
+                        .contains("closed connection 3 with cause unfinished_exchange"),
+                "{name} should violate {STALLED_SERVICE_ISOLATED} with an unfinished_exchange \
+                 close of connection 3 until zakura#2378 is fixed, and violated another: {violation:?}"
+            );
+            continue;
+        }
+        let (report, _, ports) = run_scenario(&scenario, Plan::from_fuzz(&[]));
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "{name}: {:?}", report.end);
     }

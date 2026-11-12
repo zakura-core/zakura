@@ -1098,6 +1098,7 @@ fn judge(
                 found,
                 companions,
                 not_applicable,
+                patched_not_applicable,
             },
             Actual::Caught {
                 baseline,
@@ -1120,8 +1121,10 @@ fn judge(
                 not_applicable,
             )?;
             target_held(baseline, case.property)?;
-            caught_patched(manifest, patched, case, harness, set, found, not_applicable)?;
-            caught_draft(manifest, draft, case, harness, set, not_applicable)?;
+            // The patched build's completed runs go on past the break.
+            let past_break = patched_not_applicable.unwrap_or(not_applicable);
+            caught_patched(manifest, patched, case, harness, set, found, past_break)?;
+            caught_draft(manifest, draft, case, harness, set, past_break)?;
             companions_shown(companions, shown, draft)
         }
         (

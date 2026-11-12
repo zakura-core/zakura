@@ -392,8 +392,9 @@ pub struct Config {
     /// Zakura looks a DNS name up again at the start of every dial, so it follows a peer
     /// whose name moves to a new address. The exemption covers the addresses the name
     /// resolved to in the last lookup that worked, and Zakura lifts any ban on them. It
-    /// does not look a name up while that peer is connected. When a lookup fails, Zakura
-    /// dials the addresses of the last lookup that worked.
+    /// does not look a name up while that peer is connected. A name with several
+    /// addresses is dialed at one of them per attempt, in turn. When a lookup fails,
+    /// Zakura dials the addresses of the last lookup that worked.
     ///
     /// Each dialed entry gets its own connection slot, outside the outbound connection
     /// limit. Zakura still applies the inbound and per-IP connection limits to these

@@ -81,13 +81,22 @@ impl BannedIps {
         self.changes.subscribe()
     }
 
-    /// Applies a ban and notifies readers after releasing the list lock.
-    fn insert(&self, ip: IpAddr) {
+    /// Bans `ip` unless `is_exempt` returns true, and notifies readers after releasing
+    /// the list lock. Returns false when `is_exempt` stopped the ban.
+    ///
+    /// `is_exempt` runs while the list is locked. So when an address is made exempt and
+    /// its ban is then lifted with [`remove`](Self::remove), a racing ban either sees
+    /// the exemption, or lands before the removal. The address ends up without a ban
+    /// in both cases.
+    fn insert_unless(&self, ip: IpAddr, is_exempt: impl FnOnce() -> bool) -> bool {
         let changed = {
             let mut list = self
                 .inner
                 .write()
                 .expect("ban list lock should not be poisoned");
+            if is_exempt() {
+                return false;
+            }
             let changed = !list.ips.contains(&canonical_ip(ip));
             list.insert(ip);
             changed
@@ -95,6 +104,8 @@ impl BannedIps {
         if changed {
             self.changes.send_replace(());
         }
+
+        true
     }
 
     /// Lifts the ban on `ip`, if it has one, and notifies readers after releasing the
@@ -127,6 +138,12 @@ impl BannedIps {
             .expect("ban list lock should not be poisoned")
             .ips
             .contains(&ip)
+    }
+
+    /// Bans `ip`, whatever is exempt.
+    #[cfg(test)]
+    fn insert(&self, ip: IpAddr) {
+        self.insert_unless(ip, || false);
     }
 
     #[cfg(test)]
@@ -777,13 +794,21 @@ impl AddressBook {
         if let Some(updated) = updated {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
-                //
-                // The report that raised the score passed the exemption check above.
-                // A name lookup can exempt this address between that check and this
-                // ban. The dialer lifts bans after every lookup that works, so such
-                // a ban lasts until the next one.
                 let banned_ip = updated.addr.ip();
-                self.bans_by_ip.insert(banned_ip);
+
+                // A name lookup can exempt this address after the check above.
+                let is_banned = self
+                    .bans_by_ip
+                    .insert_unless(banned_ip, || self.unconditional_peers.contains(banned_ip));
+                if !is_banned {
+                    debug!(
+                        peer = %addr_label,
+                        "ignored a ban for a peer that became unconditional"
+                    );
+                    metrics::counter!("address_book.misbehavior.unconditional_ignored.total")
+                        .increment(1);
+                    return None;
+                }
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any

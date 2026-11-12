@@ -1,6 +1,6 @@
 //! Fixed test vectors for the address book.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tracing::Span;
@@ -538,6 +538,70 @@ fn unconditional_peer_misbehavior_is_ignored_at_resolved_addresses() {
     assert!(
         bans.contains(addr.ip()),
         "an address that the name left is banned like any other"
+    );
+}
+
+/// A ban that races with a new exemption is dropped.
+///
+/// A name lookup can exempt an address after the address book accepted the report that
+/// bans it, and before the ban lands. The ban then sees the exemption, so the address
+/// is not left banned until a later lookup works.
+#[test]
+fn ban_that_races_with_a_new_exemption_is_dropped() {
+    let addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let (unconditional_peers, resolved_peers) =
+        UnconditionalPeerSet::new(UnconditionalPeers::default());
+    let mut address_book =
+        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
+            .with_unconditional_peers(unconditional_peers);
+    address_book.update(gossiped_change(
+        addr,
+        PeerServices::NODE_NETWORK,
+        DateTime32::MIN,
+    ));
+    address_book.update(MetaAddr::new_reconnect(addr));
+    address_book.update(MetaAddr::new_responded(addr, None));
+    let bans = address_book.bans();
+
+    // While the test reads the ban list, the report can pass the exemption check, and
+    // then has to wait before it bans the address.
+    let ban_list = bans
+        .inner
+        .read()
+        .expect("ban list lock should not be poisoned");
+
+    let mut address_book = std::thread::scope(|scope| {
+        let report = scope.spawn(move || {
+            let updated =
+                address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
+            (address_book, updated)
+        });
+
+        // Wait until the report is waiting to ban the address, which is after its
+        // exemption check. A waiting writer keeps new readers out of the ban list.
+        let start = Instant::now();
+        while bans.inner.try_read().is_ok() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the report never waited for the ban list"
+            );
+            std::thread::yield_now();
+        }
+
+        // The name resolves to the address, and the ban list is free again.
+        resolved_peers.publish([addr.ip()]);
+        drop(ban_list);
+
+        let (address_book, updated) = report.join().expect("the report does not panic");
+        assert_eq!(updated, None);
+        address_book
+    });
+
+    assert!(!bans.contains(addr.ip()));
+    assert!(
+        address_book.get(addr).is_some(),
+        "the peer stays in the address book"
     );
 }
 

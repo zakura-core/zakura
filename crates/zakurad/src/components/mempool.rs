@@ -677,7 +677,7 @@ impl Mempool {
             _state_guard: state,
             tx_verifier,
             transaction_sender,
-            peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
+            peer_cooldowns: peer_cooldown::PeerCooldowns::new(unconditional_peers.clone()),
             misbehavior_sender,
             unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips

@@ -1,6 +1,11 @@
 //! Keeps connections open to the configured unconditional peers.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand_10::RngExt;
@@ -54,8 +59,11 @@ struct RedialState {
     /// addresses that its name resolved to at the last lookup that found any.
     addrs: Vec<PeerSocketAddr>,
 
-    /// The number of dials to this peer, which picks the next of `addrs` to dial.
-    dials: usize,
+    /// The addresses that can be dialed, in the order of their turns. The address
+    /// that was dialed goes to the back, and an address that a lookup adds waits
+    /// behind the others. So no sequence of lookup answers can keep an address that
+    /// stays in them from being dialed.
+    dial_queue: Vec<PeerSocketAddr>,
 
     /// The earliest time of the next attempt.
     next_attempt: Instant,
@@ -78,16 +86,25 @@ struct RedialState {
 }
 
 impl RedialState {
-    /// Returns whether a dial to this peer would add nothing to `connections`, because
-    /// one of its addresses is connected, see [`is_connected`].
+    /// Returns whether this peer needs no attempt, given `connections`.
+    ///
+    /// A fixed address needs none when a dial to it would add nothing, see
+    /// [`is_connected`]. A name needs none only when one of its addresses has a
+    /// connection, see [`has_connection`]. An address whose IP is merely full does not
+    /// count for a name: its other addresses can still be dialed, and its next lookup
+    /// can find an address that is not full.
     fn is_connected(
         &self,
         connections: &[(PeerSocketAddr, bool)],
         max_connections_per_ip: usize,
     ) -> bool {
-        self.addrs
-            .iter()
-            .any(|addr| is_connected(*addr, connections, max_connections_per_ip))
+        match self.target {
+            DialTarget::Addr(addr) => is_connected(addr, connections, max_connections_per_ip),
+            DialTarget::Host(..) => self
+                .addrs
+                .iter()
+                .any(|addr| has_connection(*addr, connections)),
+        }
     }
 }
 
@@ -212,30 +229,40 @@ fn dialable_addrs(
     addrs
 }
 
-/// Returns whether a dial to `addr` would add nothing to `connections`.
-///
-/// That is the case when Zakura holds an outbound connection to `addr`, an inbound
-/// connection from its IP, or `max_connections_per_ip` connections to its IP. The peer
-/// set drops any further connection to that IP.
-fn is_connected(
+/// Returns whether Zakura holds a connection to the peer at `addr`: an outbound
+/// connection to `addr`, or an inbound connection from its IP.
+fn has_connection(addr: PeerSocketAddr, connections: &[(PeerSocketAddr, bool)]) -> bool {
+    let ip = canonical_ip(addr.ip());
+
+    connections.iter().any(|(connected_addr, is_inbound)| {
+        canonical_ip(connected_addr.ip()) == ip && (*is_inbound || *connected_addr == addr)
+    })
+}
+
+/// Returns whether Zakura holds `max_connections_per_ip` connections to the IP of
+/// `addr`. The peer set drops any further connection to that IP.
+fn is_ip_full(
     addr: PeerSocketAddr,
     connections: &[(PeerSocketAddr, bool)],
     max_connections_per_ip: usize,
 ) -> bool {
     let ip = canonical_ip(addr.ip());
-    let mut connections_to_ip: usize = 0;
 
-    for (connected_addr, is_inbound) in connections {
-        if canonical_ip(connected_addr.ip()) != ip {
-            continue;
-        }
-        if *is_inbound || *connected_addr == addr {
-            return true;
-        }
-        connections_to_ip = connections_to_ip.saturating_add(1);
-    }
+    connections
+        .iter()
+        .filter(|(connected_addr, _is_inbound)| canonical_ip(connected_addr.ip()) == ip)
+        .count()
+        >= max_connections_per_ip
+}
 
-    connections_to_ip >= max_connections_per_ip
+/// Returns whether a dial to `addr` would add nothing to `connections`: the peer has a
+/// connection, see [`has_connection`], or its IP is full, see [`is_ip_full`].
+fn is_connected(
+    addr: PeerSocketAddr,
+    connections: &[(PeerSocketAddr, bool)],
+    max_connections_per_ip: usize,
+) -> bool {
+    has_connection(addr, connections) || is_ip_full(addr, connections, max_connections_per_ip)
 }
 
 /// Returns the delay before the attempt that follows `attempts` attempts without a
@@ -344,7 +371,8 @@ fn log_failed_attempt(peer: &RedialState, error: &BoxError, expose_peer_addresse
 /// resolves to are published to `resolved_peers`, which exempts them from scoring and
 /// bans, and then any ban on them is lifted from `bans`. They replace the addresses of
 /// the last lookup. When a lookup fails, Zakura dials the addresses of the last one that
-/// worked. Successive dials go through a name's addresses in turn.
+/// worked. Successive dials go through a name's addresses in turn, and skip an address
+/// whose IP is full.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -422,7 +450,7 @@ where
                 DialTarget::Host(..) => Vec::new(),
             },
             target,
-            dials: 0,
+            dial_queue: Vec::new(),
             next_attempt: start,
             attempts: 0,
             is_attempting: false,
@@ -526,22 +554,31 @@ where
 
                     let lookup_error = match lookup {
                         Ok(addrs) => {
-                            if addrs != peer.addrs {
+                            // An answer can list the same addresses in a new order.
+                            let is_changed = addrs.len() != peer.addrs.len()
+                                || addrs.iter().any(|addr| !peer.addrs.contains(addr));
+                            peer.addrs = addrs;
+
+                            if is_changed {
                                 debug!(
                                     peer = %peer.target.label(expose_peer_addresses),
-                                    addrs = addrs.len(),
+                                    addrs = peer.addrs.len(),
                                     "an unconditional peer's name resolved to new addresses"
                                 );
-                                peer.addrs = addrs;
 
-                                // Exempt the new addresses before any connection to
-                                // them can be scored.
-                                resolved_peers.publish(
-                                    peers
-                                        .iter()
-                                        .filter(|peer| matches!(peer.target, DialTarget::Host(..)))
-                                        .flat_map(|peer| peer.addrs.iter().map(|addr| addr.ip())),
-                                );
+                                let resolved_ips: Vec<IpAddr> = peers
+                                    .iter()
+                                    .filter(|peer| matches!(peer.target, DialTarget::Host(..)))
+                                    .flat_map(|peer| peer.addrs.iter().map(|addr| addr.ip()))
+                                    .collect();
+
+                                // Exempt the addresses before lifting their bans. The
+                                // address book never bans an exempt address, so they
+                                // stay unbanned, see `BannedIps::insert_unless`.
+                                resolved_peers.publish(resolved_ips.iter().copied());
+                                for ip in resolved_ips {
+                                    bans.remove(ip);
+                                }
                             }
                             None
                         }
@@ -553,18 +590,7 @@ where
                         .expect("event indexes come from the peer list, which never shrinks");
 
                     match lookup_error {
-                        None => {
-                            peer.is_lookup_failing = false;
-
-                            // Lift bans only after the addresses are exempt, so the
-                            // address book cannot ban them again in between. Doing it
-                            // on every lookup that works also clears a ban from a
-                            // report that the address book accepted just before the
-                            // address became exempt.
-                            for addr in &peer.addrs {
-                                bans.remove(addr.ip());
-                            }
-                        }
+                        None => peer.is_lookup_failing = false,
                         // A name that has never resolved has no address to dial.
                         Some(error) if peer.addrs.is_empty() => {
                             peer.is_attempting = false;
@@ -594,16 +620,38 @@ where
                         }
                     }
 
-                    if peer.is_connected(&peer_registry.connection_addrs(), max_connections_per_ip) {
+                    let connections = peer_registry.connection_addrs();
+                    if peer.is_connected(&connections, max_connections_per_ip) {
                         peer.is_attempting = false;
                         continue;
                     }
 
-                    let addr = *peer
+                    // The peer set would drop a connection to a full IP, so an address
+                    // on one loses its turn.
+                    let candidates: Vec<PeerSocketAddr> = peer
                         .addrs
-                        .get(peer.dials % peer.addrs.len())
-                        .expect("the remainder is an index into a list that is not empty");
-                    peer.dials = peer.dials.wrapping_add(1);
+                        .iter()
+                        .copied()
+                        .filter(|addr| !is_ip_full(*addr, &connections, max_connections_per_ip))
+                        .collect();
+
+                    // Keep the turns of the addresses that stay, see `dial_queue`.
+                    peer.dial_queue.retain(|addr| candidates.contains(addr));
+                    for addr in candidates {
+                        if !peer.dial_queue.contains(&addr) {
+                            peer.dial_queue.push(addr);
+                        }
+                    }
+
+                    let Some(addr) = peer.dial_queue.first().copied() else {
+                        peer.is_attempting = false;
+                        let error = "every address of the name is on an IP that already has \
+                                     max_connections_per_ip connections"
+                            .into();
+                        log_failed_attempt(peer, &error, expose_peer_addresses);
+                        continue;
+                    };
+                    peer.dial_queue.rotate_left(1);
                     events.push(start_dial(index, addr));
 
                     // Security: start outbound connections at least this far apart,

@@ -10,6 +10,7 @@
 //! M1 implementation plan.
 #![cfg(zakura_sim)]
 
+pub mod acceptance_runs;
 pub mod action;
 pub mod campaign;
 pub mod check;
@@ -33,6 +34,7 @@ pub mod record;
 pub mod seed;
 mod sender;
 pub mod sim;
+pub mod sim_acceptance;
 pub mod storage;
 pub mod stores;
 pub mod suite;

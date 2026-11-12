@@ -201,6 +201,22 @@ pub struct Lane {
     pub timeout_secs: u64,
 }
 
+impl Lane {
+    /// The integration test targets its `args` select by `--test <name>`,
+    /// in order. A lane that selects none, such as one with `--tests`, has
+    /// none here.
+    pub fn test_targets(&self) -> Vec<&str> {
+        let mut words = self.args.split_whitespace();
+        let mut targets = Vec::new();
+        while let Some(word) = words.next() {
+            if word == "--test" {
+                targets.extend(words.next());
+            }
+        }
+        targets
+    }
+}
+
 /// A fuzz package's scheduled campaign defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -353,7 +369,7 @@ impl Build {
 
     /// `cargo <subcommand> <args>` in this build: the `planted` profile
     /// goes after the subcommand.
-    fn command(self, subcommand: &str, args: &str) -> String {
+    pub fn command(self, subcommand: &str, args: &str) -> String {
         let profile = match self {
             Build::SimPlanted => " --profile planted",
             _ => "",

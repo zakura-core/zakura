@@ -106,15 +106,19 @@ impl Worker {
     ) -> R {
         let input = input.to_vec();
         let (done, result) = mpsc::sync_channel::<Ran<R>>(1);
+        // The caller's run context goes with the run to the worker thread.
+        let context = crate::acceptance_runs::current();
         let job: Job = Box::new(move || {
             let mut abandoned = false;
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                let mut collecting = feedback.as_ref().map(Feedback::start);
-                let extra = collecting.as_mut().map(|c| c as &mut dyn Checker);
-                let run = (entry.run_bytes)(&input, &mut NullSink, extra);
-                abandoned = run.leaked() > 0;
-                let classified = classify(entry, &run);
-                then(&input, &run, &classified)
+                crate::acceptance_runs::within(context, || {
+                    let mut collecting = feedback.as_ref().map(Feedback::start);
+                    let extra = collecting.as_mut().map(|c| c as &mut dyn Checker);
+                    let run = (entry.run_bytes)(&input, &mut NullSink, extra);
+                    abandoned = run.leaked() > 0;
+                    let classified = classify(entry, &run);
+                    then(&input, &run, &classified)
+                })
             }));
             let retire = abandoned || outcome.is_err();
             // The caller waits on this, so the send can't fail.

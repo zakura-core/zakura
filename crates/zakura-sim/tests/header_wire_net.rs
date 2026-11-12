@@ -150,6 +150,7 @@ fn datagrams(report: &RunReport) -> Vec<Datagram> {
                 len,
                 outcome,
                 sent_at,
+                ..
             } => Some(Datagram {
                 at,
                 id: *id,

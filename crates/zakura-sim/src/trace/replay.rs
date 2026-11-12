@@ -3,8 +3,8 @@
 //!
 //! Replay drives the same step loop as recording. The decider answers every
 //! pick and draw from the trace and checks it first, and a [`VerifySink`]
-//! compares each record the replay emits with the recorded one. Setup's step
-//! 0 observations have no digest in the trace, so replay can't check them.
+//! compares each record the replay emits with the recorded one, setup's step
+//! 0 observations included, through the digest `init` carries.
 
 use std::{
     fmt,
@@ -307,7 +307,11 @@ fn replay_on<'h>(
 
     let mut sink = VerifySink::new(trace, kept.is_some());
     let run = harness::with_draft(draft, || {
-        (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink)
+        // The replay is a run of the trace's own input.
+        let input = trace.meta.input.as_ref().map(|input| input.sha256.as_str());
+        crate::acceptance_runs::with_input_digest(input, || {
+            (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink)
+        })
     });
     let (mut report, failure) = match run {
         Ok(report) => (report, None),

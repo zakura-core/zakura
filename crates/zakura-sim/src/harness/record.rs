@@ -277,7 +277,13 @@ pub(crate) fn write_trace<T>(
         held: Vec::new(),
         report: None,
     };
-    let result = run(&meta.scenario, plan, &mut sink)?;
+    // A full input names the run's input in its acceptance records.
+    let result = match input {
+        Some(input) => {
+            crate::acceptance_runs::with_input(input, || run(&meta.scenario, plan, &mut sink))
+        }
+        None => run(&meta.scenario, plan, &mut sink),
+    }?;
     let Reported {
         mut file,
         held,

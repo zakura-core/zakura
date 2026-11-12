@@ -1008,7 +1008,7 @@ fn check_case(
     let input = case.witness.located(worktree);
     let baseline_binary = baseline;
     let baseline = record(
-        Command::new(baseline),
+        in_phase(Command::new(baseline), "baseline"),
         &harness,
         &input,
         &case.property,
@@ -1021,7 +1021,12 @@ fn check_case(
     }
     // The baseline replays fresh with its own binary too (C4), so the
     // acceptance tool reads both of the case's runs with their replays.
-    if let Some(why) = replay_misses(baseline_binary, &scratch.join("baseline"), RUN_DEADLINE)? {
+    if let Some(why) = replay_misses(
+        baseline_binary,
+        &scratch.join("baseline"),
+        RUN_DEADLINE,
+        "replay-baseline",
+    )? {
         return Ok(Verdict::BaselineFails(format!(
             "its trace doesn't replay Exact: {why}"
         )));
@@ -1098,7 +1103,7 @@ fn judge_patched(
 ) -> Result<Verdict, BoxError> {
     let trace = scratch.join("patched");
     let patched = record(
-        Command::new(zakura_sim),
+        in_phase(Command::new(zakura_sim), "patched"),
         harness,
         input,
         &case.property,
@@ -1109,7 +1114,7 @@ fn judge_patched(
     let verdict = match case.classify(&patched) {
         Verdict::Caught(None) if !case.draft_set.is_empty() => {
             let draft = record(
-                Command::new(zakura_sim),
+                in_phase(Command::new(zakura_sim), "draft"),
                 harness,
                 input,
                 &case.property,
@@ -1140,7 +1145,9 @@ fn judge_patched(
         )?,
         verdict => return Ok(verdict),
     };
-    fresh_replay(verdict, || replay_misses(zakura_sim, &trace, deadline))
+    fresh_replay(verdict, || {
+        replay_misses(zakura_sim, &trace, deadline, "replay-patched")
+    })
 }
 
 impl Case {
@@ -1280,7 +1287,7 @@ fn built_from(binary: &Path, checkout: &Path) -> Result<Result<(), String>, BoxE
 /// digest as `zakura-sim`'s build script computes it, so it was built from
 /// that source and not reused from an earlier one. A digest git couldn't
 /// compute names no source.
-pub(super) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+pub(crate) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
     if source == provenance::UNKNOWN {
         return Err("git couldn't compute the patched checkout's source digest".to_owned());
     }
@@ -1316,7 +1323,7 @@ fn campaign(
         let input = dir.join(format!("input-{index}.bin"));
         fs::write(&input, bytes)?;
         let run = record(
-            Command::new(binary),
+            in_phase(Command::new(binary), "campaign"),
             harness,
             &Located::Input(input.clone()),
             &case.property,
@@ -1346,7 +1353,7 @@ fn campaign(
 /// up to [`CAMPAIGN_INPUT_BYTES`], from a SplitMix64 stream that the
 /// property's ID seeds, so a case's campaign is the same on every run and
 /// doesn't move when other cases are added.
-fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
+pub(crate) fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
     // FNV-1a.
     let mut state = property
         .bytes()
@@ -1493,6 +1500,15 @@ impl Expect<'_> {
     }
 }
 
+/// `command` with its runs' acceptance phase set to `phase`, so sim-7's
+/// acceptance tool can tell the baseline, patched, draft, campaign and
+/// replay runs apart. It changes nothing unless the tool also names a records
+/// directory.
+fn in_phase(mut command: Command, phase: &str) -> Command {
+    command.env("ZAKURA_SIM_ACCEPTANCE_PHASE", phase);
+    command
+}
+
 /// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
 /// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
 /// `property` that expects `expect`, writing the trace to `out`, and reads
@@ -1624,11 +1640,13 @@ const REPLAY_FILE: &str = "replay.json";
 /// it did. The replay writes its full report to `<trace>/replay/`, beside
 /// `replay.json`, its child's end and output, which the acceptance tool
 /// reads as the run's fresh replay (C4, C8). A replay past `deadline` is
-/// killed and misses.
+/// killed and misses. `phase` names it to sim-7's acceptance tool
+/// ([`in_phase`]) as the replay of the baseline or of the patched run.
 fn replay_misses(
     zakura_sim: &Path,
     trace: &Path,
     deadline: Duration,
+    phase: &str,
 ) -> Result<Option<String>, BoxError> {
     let dir = trace.join(REPLAY_DIR);
     if dir.exists() {
@@ -1636,7 +1654,7 @@ fn replay_misses(
     }
     fs::create_dir_all(&dir)?;
     let log = dir.join("replay.log");
-    let mut replay = Command::new(zakura_sim);
+    let mut replay = in_phase(Command::new(zakura_sim), phase);
     replay
         .arg("replay")
         .arg(trace)
@@ -3061,19 +3079,24 @@ mod tests {
         let matched = fake("matched", "test \"$1\" = replay || exit 2");
         let missed = fake("missed", "echo 'pick 3 differs' >&2; exit 1");
         assert_eq!(
-            replay_misses(&matched, dir.path(), RUN_DEADLINE).unwrap(),
+            replay_misses(&matched, dir.path(), RUN_DEADLINE, "replay-patched").unwrap(),
             None
         );
-        let why = replay_misses(&missed, dir.path(), RUN_DEADLINE)
+        let why = replay_misses(&missed, dir.path(), RUN_DEADLINE, "replay-patched")
             .unwrap()
             .expect("a failed replay says why");
         assert!(why.contains("pick 3 differs"), "{why}");
         // A replay that hangs is killed at its deadline, and misses.
         // `wait_until_executable` runs it with no arguments.
         let hangs = fake("hangs", "[ $# -gt 0 ] || exit 0\nsleep 60");
-        let why = replay_misses(&hangs, dir.path(), Duration::from_millis(200))
-            .unwrap()
-            .expect("a hung replay misses");
+        let why = replay_misses(
+            &hangs,
+            dir.path(),
+            Duration::from_millis(200),
+            "replay-patched",
+        )
+        .unwrap()
+        .expect("a hung replay misses");
         assert!(why.contains("ran past its deadline"), "{why}");
     }
 

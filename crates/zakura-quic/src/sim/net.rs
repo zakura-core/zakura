@@ -121,6 +121,9 @@ pub enum NetEvent {
         id: DatagramId,
         /// Its length in bytes.
         len: usize,
+        /// The SHA-256 of its payload, taken at the send, while
+        /// [`SimNet::set_payload_digests`] is on.
+        digest: Option<[u8; 32]>,
     },
     /// A datagram reached its destination's receive queue.
     Delivered {
@@ -185,6 +188,9 @@ struct State {
     sockets: BTreeMap<SocketAddr, Binding>,
     next_binding: u64,
     events: Vec<NetEvent>,
+    /// Whether a send records its payload's digest. On from the start, so a
+    /// datagram sent during a run's setup is covered too.
+    payload_digests: bool,
 }
 
 impl State {
@@ -240,9 +246,14 @@ impl State {
         let earliest = now + state.model.min_delay;
         let latest = now + state.model.max_delay;
         let id = DatagramId { link, seq };
+        let digest = self.payload_digests.then(|| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+            <[u8; 32]>::try_from(digest.as_ref()).expect("a SHA-256 digest is 32 bytes")
+        });
         self.events.push(NetEvent::Sent {
             id,
             len: bytes.len(),
+            digest,
         });
         self.in_flight.insert(
             id,
@@ -273,6 +284,7 @@ impl SimNet {
         Self {
             state: Arc::new(Mutex::new(State {
                 default_model,
+                payload_digests: true,
                 ..State::default()
             })),
         }
@@ -282,6 +294,14 @@ impl SimNet {
     /// every change happens under one lock.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Makes each later send record its payload's SHA-256 in
+    /// [`NetEvent::Sent`], or stop recording it. On by default, so a send
+    /// during setup is hashed; a run that keeps no record of its steps
+    /// turns it off as its first step begins, so its steps hash nothing.
+    pub fn set_payload_digests(&self, on: bool) {
+        self.lock().payload_digests = on;
     }
 
     /// Sets `link`'s model for the rest of the run.

@@ -296,6 +296,13 @@ struct Checkout {
     fuzz_lockfile: String,
 }
 
+/// The source digest a fuzz build at `repo` records in its
+/// [`BuildIdentity::source`]: the simulator's source paths and the fuzz
+/// package, as they are now.
+pub fn fuzz_source(repo: &Path) -> String {
+    Checkout::read(repo).source
+}
+
 impl Checkout {
     /// The checkout at `repo` as it is now.
     fn read(repo: &Path) -> Checkout {

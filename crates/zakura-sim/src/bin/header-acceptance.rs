@@ -6,6 +6,8 @@
 //! header-acceptance evaluate --repo <dir> --plan <plan.json> --artifacts <dir>
 //!     --subject <commit> --subject-source <digest> --run-id <id>
 //!     --containment <subreaper|best-effort> --out <dir>
+//! header-acceptance verify --repo <dir> --plan <plan.json> --artifacts <dir>
+//!     --run-id <id> --subject-source <digest> --record <record.json> --out <dir>
 //! header-acceptance companions --trace <dir> --out <companions.json>
 //! header-acceptance record-args --declared <dir> --harness <name> --test <name>
 //!     --case <case> --out <args.json>
@@ -14,9 +16,11 @@
 //! `plan` writes the tasks xtask runs. `evaluate` reads their artifacts,
 //! writes `results.json` and `record.json` under `--out`, and prints the
 //! record's counts. It exits 0 whether or not acceptance passes, since the
-//! record says which. `companions` judges a node case's recorded `Draft`
-//! run's companions and writes a `CompanionsRun` to a new file. xtask runs
-//! it from the case's own patched build, the one that recorded the trace.
+//! record says which. `verify` rebuilds a published record from its run's
+//! plan and artifacts and exits 0 only if it's the same record (sim-7.4).
+//! `companions` judges a node case's recorded `Draft` run's companions
+//! and writes a `CompanionsRun` to a new file. xtask runs it from the
+//! case's own patched build, the one that recorded the trace.
 //! `record-args` writes, as a JSON list, the `zakura-sim record` arguments
 //! for the one history a witness test declared under `--declared` as
 //! `--case` on `--harness`, so the runner records it as the reader binds it.
@@ -44,7 +48,11 @@ fn main() {
 
 #[cfg(zakura_sim)]
 mod cli {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use zakura_sim::{
         harness::header_acceptance::{
@@ -60,6 +68,9 @@ mod cli {
                          header-acceptance evaluate --repo <dir> --plan <plan.json> \
                          --artifacts <dir> --subject <commit> --subject-source <digest> \
                          --run-id <id> --containment <subreaper|best-effort> --out <dir>\n       \
+                         header-acceptance verify --repo <dir> --plan <plan.json> \
+                         --artifacts <dir> --run-id <id> --subject-source <digest> \
+                         --record <record.json> --out <dir>\n       \
                          header-acceptance companions --trace <dir> --out <companions.json>\n       \
                          header-acceptance record-args --declared <dir> --harness <name> \
                          --test <name> --case <case> --out <args.json>";
@@ -155,6 +166,40 @@ mod cli {
                     record.stray.len(),
                     record.accepted
                 );
+                Ok(())
+            }
+            "verify" => {
+                let flags = flags(
+                    rest,
+                    &[
+                        "--repo",
+                        "--plan",
+                        "--artifacts",
+                        "--run-id",
+                        "--subject-source",
+                        "--record",
+                        "--out",
+                    ],
+                )?;
+                use zakura_sim::sim_acceptance::header::read_bounded_json;
+                let plan: RunPlan = read_bounded_json(Path::new(&flags["--plan"]))?;
+                let record: tool::Record = read_bounded_json(Path::new(&flags["--record"]))?;
+                let (artifacts, out) = (
+                    PathBuf::from(&flags["--artifacts"]),
+                    PathBuf::from(&flags["--out"]),
+                );
+                zakura_sim::sim_acceptance::header::verify(
+                    &PathBuf::from(&flags["--repo"]),
+                    &zakura_sim::sim_acceptance::header::Published {
+                        plan: &plan,
+                        artifacts: &artifacts,
+                        out: &out,
+                        run_id: &flags["--run-id"],
+                        subject_source: &flags["--subject-source"],
+                        record: &record,
+                    },
+                )?;
+                println!("subject {}: the record matches its run", record.subject);
                 Ok(())
             }
             "companions" => {

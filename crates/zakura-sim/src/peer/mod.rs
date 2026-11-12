@@ -2051,6 +2051,7 @@ mod tests {
         records.borrow_mut().push_back(written(0));
         let mut stops = crate::check::after_step(|cx: &StepCtx<'_>| {
             Some(Violation {
+                subject: None,
                 property: "test/stops".to_owned(),
                 step: cx.step,
                 witness: vec![cx.step],

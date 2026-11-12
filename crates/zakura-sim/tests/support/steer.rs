@@ -72,6 +72,7 @@ impl Checker for Steering<'_> {
         };
         self.refused = Some((cx.step, refused));
         Some(Violation {
+            subject: None,
             property: STEERED.to_owned(),
             step: cx.step,
             witness: vec![cx.step],

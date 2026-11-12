@@ -34,7 +34,7 @@ use crate::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
     },
-    sender, Observation, ObservationLog,
+    sender, FindingSubject, Observation, ObservationLog,
 };
 
 /// What a generated property claims.
@@ -1157,18 +1157,19 @@ fn check_never_closes<S: HasView>(
         let nothing_judged = judged.is_empty() && id.template == Template::ConformantNeverCloses;
         let covered = nothing_judged || judged.iter().any(|f| f.stream == id.stream && applies(f));
         if covered && judged.iter().all(|f| f.label == Label::Conformant) {
-            unjustified.push((connection, punishment));
+            let subject = FindingSubject::punishment(entries, start + at, connection);
+            unjustified.push((connection, punishment, subject));
         }
     }
     let expected = |connection| {
         format!("connection {connection}'s judged frames are all conformant, so no punishment")
     };
     let mut unjustified = unjustified.into_iter();
-    let Some((connection, punishment)) = unjustified.next() else {
+    let Some((connection, punishment, subject)) = unjustified.next() else {
         return verdict;
     };
-    for (connection, punishment) in unjustified {
-        cx.record_violation(expected(connection), punishment);
+    for (connection, punishment, subject) in unjustified {
+        cx.record_violation_about(expected(connection), punishment, subject);
     }
-    cx.violated(expected(connection), punishment)
+    cx.violated_about(expected(connection), punishment, subject)
 }

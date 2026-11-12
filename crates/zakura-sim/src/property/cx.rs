@@ -7,7 +7,10 @@ use super::{
     Pending, Property, PropertyId, Source, Subject, Verdict,
 };
 use crate::{
-    check::Violation, end::RunEnd, model::LabelledFrame, Observation, ObservationLog, StepCtx,
+    check::{FindingSubject, Violation},
+    end::RunEnd,
+    model::LabelledFrame,
+    Observation, ObservationLog, StepCtx,
 };
 
 /// A harness's read-only view of the code under test. Checks read it through
@@ -95,6 +98,8 @@ pub struct EndViolation {
     pub expected: String,
     /// What the run did.
     pub actual: String,
+    /// What it's about, if the rule names it ([`FindingSubject`]).
+    pub subject: Option<FindingSubject>,
 }
 
 /// When a view's state was captured.
@@ -352,6 +357,31 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
         self.recorded.push(violation);
     }
 
+    /// [`CheckCtx::violated`] for a finding about `subject`, which a nested
+    /// case's witness joins it by (C6).
+    pub fn violated_about(
+        &self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        subject: FindingSubject,
+    ) -> Verdict {
+        let mut violation = self.violation(expected.into(), actual.into());
+        violation.subject = Some(subject);
+        Verdict::Violated(violation)
+    }
+
+    /// [`CheckCtx::record_violation`] for a finding about `subject`.
+    pub fn record_violation_about(
+        &mut self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        subject: FindingSubject,
+    ) {
+        let mut violation = self.violation(expected.into(), actual.into());
+        violation.subject = Some(subject);
+        self.recorded.push(violation);
+    }
+
     /// Records the value `quantity` reached by this step. The property's
     /// report keeps each quantity's largest value over the run, such as the
     /// most bytes an allowance held (properties.md, Retained bytes).
@@ -382,6 +412,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// A violation at this step, with this step as its witness.
     fn violation(&self, expected: String, actual: String) -> Violation {
         Violation {
+            subject: None,
             property: self.id().to_string(),
             step: self.step.step,
             witness: vec![self.step.step],

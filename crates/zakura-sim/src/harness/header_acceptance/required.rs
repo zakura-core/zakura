@@ -168,20 +168,6 @@ pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
     "every distinct end finding at one boundary survives, which C12 and C13 \
                      deliver";
 
-/// Why `gate-3/crossing/unretained-open-then-outcome` is open until hdr-14.6.
-pub const GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME: &str =
-    "Act::UnretainedOpen then Act::OutcomeCrossing, labelled conformant with no \
-                     punishment";
-
-/// Why `gate-3/crossing/crossing-close` is open until hdr-14.6.
-pub const GATE_3_CROSSING_CROSSING_CLOSE: &str =
-    "a subscription Close that crosses the node's ending, labelled conformant \
-                     with no punishment";
-
-/// Why `gate-3/crossing/over-window-grant` is open until hdr-14.6.
-pub const GATE_3_CROSSING_OVER_WINDOW_GRANT: &str =
-    "a crossed Grant above the window, labelled bad-cursor and closed";
-
 /// Why `gate-5/bound-table` is open until hdr-9d.1.
 pub const GATE_5_BOUND_TABLE: &str =
     "each row of outstanding-work-bounded's bound table: its at-limit, \
@@ -332,29 +318,26 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/crossing-close",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_CROSSING_CLOSE,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/over-window-grant",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_OVER_WINDOW_GRANT,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+        )),
     },
     GateObligation {
         name: "gate-3/no-request-row",

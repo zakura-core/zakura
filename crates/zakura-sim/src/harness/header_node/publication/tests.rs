@@ -695,6 +695,7 @@ fn a_claim_break_beside_an_unadopted_commit_reports_both() {
         harness::scripted::{findings, sidecar},
     };
     let unadopted = crate::Violation {
+        subject: None,
         property: STATE_PUBLICATION_CONSISTENT.to_owned(),
         step: 1,
         witness: vec![1],
@@ -703,6 +704,7 @@ fn a_claim_break_beside_an_unadopted_commit_reports_both() {
             .to_owned(),
     };
     let skipped = crate::Violation {
+        subject: None,
         property: STATE_PUBLICATION_CONSISTENT.to_owned(),
         step: 1,
         witness: vec![1],

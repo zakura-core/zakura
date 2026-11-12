@@ -762,6 +762,50 @@ const C13_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C22's proving tests: the authority checker naming each finding's rule
+/// and subject, two page breaks at one step and the `overgrant` case's
+/// credit break on its `Open` with no page, each as reported and through a
+/// recorded run's sidecar, and a real header run's sidecar keeping every
+/// claim's attribution.
+const C22_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_page_finding_names_its_own_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::an_open_credit_break_names_its_update_and_no_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_finding_joins_on_its_full_identity",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::findings_one_key_apart_stay_distinct",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_ledger_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_the_overgrant_update_and_no_page",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "tests/header_authority.rs",
+        "a_recorded_header_run_keeps_its_stores_in_the_full_report",
+    ),
+];
+
 /// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
 const fn planted_test(test: &'static str) -> TestRef {
     TestRef {
@@ -985,8 +1029,9 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, and C13 by hf-1 to hf-3. Every other row's deliveries landed,
-/// and its state names the proving test still missing.
+/// stores, C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every
+/// other row's deliveries landed, and its state names the proving test
+/// still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1174,12 +1219,12 @@ pub fn contract_table() -> Vec<Contract> {
             "a two-finding report and sidecar test for every header check, those hdr-9, \
              hdr-10 and hdr-12 added after hf-8 included",
         ),
-        waiting(
+        satisfied(
             C22,
             "Adam's harness",
             "Each commit-only-authorized finding names its rule kind and its actual subject.",
+            C22_PROVING,
             "hf-9, and E4 for its proving test",
-            "the overgrant credit break at report level, and both cases through the sidecar",
         ),
     ]
 }

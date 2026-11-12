@@ -31,6 +31,9 @@ mod indexed;
 mod selection_tests;
 
 #[cfg(test)]
+mod selection_variants;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

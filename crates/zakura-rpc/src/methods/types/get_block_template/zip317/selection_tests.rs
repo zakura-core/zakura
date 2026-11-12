@@ -31,6 +31,7 @@ use super::{
         parents, priority, IndexedSelector, Pool, Priority, MAX_PACKING_SCAN_ENTRIES,
         PACKING_THRESHOLD_BYTES, SELECTION_STOP_BYTES,
     },
+    selection_variants::{Misfit, Score, VariantSelector},
     *,
 };
 use crate::methods::types::get_block_template::{
@@ -39,18 +40,29 @@ use crate::methods::types::get_block_template::{
 
 const SAMPLES: usize = 12;
 
+/// Signature (72 bytes) and compressed public key (33 bytes) pushes.
+const P2PKH_UNLOCK_SCRIPT_BYTES: usize = 107;
+
+/// Chain inputs and outputs of the rotating transparent transaction shapes:
+/// payments, a consolidation, and a payout.
+const TRANSPARENT_SHAPES: [(usize, usize); 6] = [(1, 2), (2, 2), (1, 1), (5, 1), (1, 20), (3, 2)];
+
+/// Rotating fee multiples of the conventional fee for transparent fixtures.
+const TRANSPARENT_FEE_MULTIPLES: [u64; 5] = [1, 1, 2, 1, 3];
+
 fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTemplateLimits {
     let coinbase =
         TransactionTemplate::coinbase_resource_usage(network, height, miner, None).unwrap();
     BlockTemplateLimits::initial(network, height, coinbase)
 }
 
-/// Selected transactions, the number of entries packing visited, and the
-/// time packing took.
+/// Selected transactions, the number of entries packing visited, the time
+/// packing took, and how many best packages did not fit.
 struct Selection {
     txs: Vec<SelectedMempoolTx>,
     packing_scanned: usize,
     packing_elapsed: Duration,
+    misfits: usize,
 }
 
 /// Runs the primary passes, then packing if `pack` is set.
@@ -73,6 +85,7 @@ fn run(
         txs: selector.selected().to_vec(),
         packing_scanned,
         packing_elapsed,
+        misfits: 0,
     }
 }
 
@@ -105,6 +118,37 @@ impl Factory {
         spent: Vec<OutPoint>,
         outputs: usize,
     ) -> VerifiedUnminedTx {
+        self.build(actions, fee_multiple, spent, 0, outputs)
+    }
+
+    /// A transparent transaction spending `chain_inputs` fresh chain outputs
+    /// and the mempool outputs in `spent`, each with a P2PKH-sized unlock
+    /// script, paying to `outputs` P2PKH outputs.
+    fn transparent(
+        &mut self,
+        chain_inputs: usize,
+        spent: Vec<OutPoint>,
+        outputs: usize,
+        fee_multiple: u64,
+    ) -> VerifiedUnminedTx {
+        let mut inputs = spent;
+        for _ in 0..chain_inputs {
+            self.serial += 1;
+            let mut hash = [0xcc; 32];
+            hash[..8].copy_from_slice(&self.serial.to_le_bytes());
+            inputs.push(OutPoint::from_usize(transaction::Hash(hash), 0));
+        }
+        self.build(0, fee_multiple, inputs, P2PKH_UNLOCK_SCRIPT_BYTES, outputs)
+    }
+
+    fn build(
+        &mut self,
+        actions: usize,
+        fee_multiple: u64,
+        spent: Vec<OutPoint>,
+        unlock_script_bytes: usize,
+        outputs: usize,
+    ) -> VerifiedUnminedTx {
         if actions == 0 {
             self.serial += 1;
         }
@@ -130,7 +174,7 @@ impl Factory {
                 .into_iter()
                 .map(|outpoint| Input::PrevOut {
                     outpoint,
-                    unlock_script: Script::new(&[]),
+                    unlock_script: Script::new(&vec![0; unlock_script_bytes]),
                     sequence: u32::MAX,
                 })
                 .collect(),
@@ -186,9 +230,19 @@ impl Fixture {
         let mut deps = TransactionDependencies::default();
         let mut pool = Pool::new();
         let mut cost = 0;
+        let ids: std::collections::HashSet<_> = txs
+            .iter()
+            .map(|tx| tx.transaction.id().mined_id())
+            .collect();
         for tx in txs {
             let id = tx.transaction.id().mined_id();
-            deps.add(id, tx.transaction.transaction().spent_outpoints().collect());
+            let spent_mempool_outputs = tx
+                .transaction
+                .transaction()
+                .spent_outpoints()
+                .filter(|outpoint| ids.contains(&outpoint.hash))
+                .collect();
+            deps.add(id, spent_mempool_outputs);
             cost += tx.cost();
             pool.insert(id, tx);
         }
@@ -208,7 +262,7 @@ impl Fixture {
         let mut factory = Factory::new();
         let mut txs = Vec::new();
         let mut cost = 0;
-        if matches!(kind, "mixed" | "mixed_packages") {
+        if matches!(kind, "mixed" | "mixed_packages" | "mixed_transparent") {
             for _ in 0..32 {
                 let tx = factory.tx(64, 10, Vec::new(), 1);
                 if cost + tx.cost() > cost_limit / 4 {
@@ -221,7 +275,7 @@ impl Fixture {
         let mut previous = None;
         let mut position = 0;
         loop {
-            let chained = matches!(kind, "packages" | "mixed_packages")
+            let chained = matches!(kind, "packages" | "mixed_packages" | "mixed_transparent")
                 && position % 6 != 0
                 && position % 6 < 3;
             let spent = if chained {
@@ -229,12 +283,26 @@ impl Fixture {
             } else {
                 Vec::new()
             };
-            let tx = factory.tx(
-                1,
-                if chained && position % 6 == 2 { 4 } else { 1 },
-                spent,
-                1,
-            );
+            let tx = if matches!(kind, "transparent" | "mixed_transparent") {
+                // Payments, consolidations and payouts, with a spread of
+                // fee rates. A chained child also spends its parent's output,
+                // and the last child of each chain pays to bump the package.
+                let (chain_inputs, outputs) =
+                    TRANSPARENT_SHAPES[position % TRANSPARENT_SHAPES.len()];
+                let fee_multiple = if chained && position % 6 == 2 {
+                    4
+                } else {
+                    TRANSPARENT_FEE_MULTIPLES[position % TRANSPARENT_FEE_MULTIPLES.len()]
+                };
+                factory.transparent(chain_inputs, spent, outputs, fee_multiple)
+            } else {
+                factory.tx(
+                    1,
+                    if chained && position % 6 == 2 { 4 } else { 1 },
+                    spent,
+                    1,
+                )
+            };
             if cost + tx.cost() > cost_limit {
                 break;
             }
@@ -257,9 +325,44 @@ impl Fixture {
     }
 }
 
-/// Selects with the production entry point's limits, with or without packing.
+/// A selector configuration compared by the benchmark.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    /// Production main pass, without packing.
+    Indexed,
+    /// Production selector: main pass and bounded packing.
+    IndexedPack,
+    /// Skip packages that do not fit, ranked by ZIP-401 cost.
+    SkipZip401,
+    /// Skip packages that do not fit, ranked by serialized size.
+    SkipSize,
+    /// Skip packages that do not fit, ranked by sigop-adjusted size.
+    SkipSigopAdjusted,
+}
+
+impl Mode {
+    const ALL: [Self; 5] = [
+        Self::Indexed,
+        Self::IndexedPack,
+        Self::SkipZip401,
+        Self::SkipSize,
+        Self::SkipSigopAdjusted,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::IndexedPack => "indexed_pack",
+            Self::SkipZip401 => "skip_zip401",
+            Self::SkipSize => "skip_size",
+            Self::SkipSigopAdjusted => "skip_sigop_adjusted",
+        }
+    }
+}
+
+/// Selects with the production entry point's limits.
 fn select(
-    pack: bool,
+    mode: Mode,
     txs: Vec<VerifiedUnminedTx>,
     deps: TransactionDependencies,
     network: &Network,
@@ -267,7 +370,30 @@ fn select(
     miner: &MinerParams,
 ) -> Selection {
     let limits = limits(network, height, miner);
-    run(txs, deps, limits, pack)
+    let score = match mode {
+        Mode::Indexed => return run(txs, deps, limits, false),
+        Mode::IndexedPack => return run(txs, deps, limits, true),
+        Mode::SkipZip401 => Score::Zip401Cost,
+        Mode::SkipSize => Score::Size,
+        Mode::SkipSigopAdjusted => Score::SigopAdjustedSize,
+    };
+    variant(txs, deps, limits, score, Misfit::Skip)
+}
+
+fn variant(
+    txs: Vec<VerifiedUnminedTx>,
+    deps: TransactionDependencies,
+    limits: BlockTemplateLimits,
+    score: Score,
+    misfit: Misfit,
+) -> Selection {
+    let selection = VariantSelector::new(txs, deps, limits, score, misfit).select();
+    Selection {
+        txs: selection.txs,
+        packing_scanned: 0,
+        packing_elapsed: Duration::ZERO,
+        misfits: selection.misfits,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -278,6 +404,8 @@ struct Stats {
     remaining: usize,
     scanned: usize,
     packing_ns: u64,
+    misfits: usize,
+    sigops_left: u32,
 }
 fn validate(
     selection: &Selection,
@@ -308,6 +436,8 @@ fn validate(
         remaining: limits.remaining_bytes,
         scanned: selection.packing_scanned,
         packing_ns: selection.packing_elapsed.as_nanos().try_into().unwrap(),
+        misfits: selection.misfits,
+        sigops_left: limits.remaining_sigops,
     }
 }
 
@@ -342,7 +472,7 @@ fn indexed_rescores_surviving_children_after_parent_selection() {
     let independent_id = independent.transaction.id().mined_id();
     let fixture = Fixture::from_transactions(vec![parent, child_a, child_b, independent]);
     let (txs, deps) = fixture.snapshot();
-    let selection = select(false, txs, deps, &network, height, &miner);
+    let selection = select(Mode::Indexed, txs, deps, &network, height, &miner);
     validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(selection.txs[0].1.transaction.id().mined_id(), parent_id);
     assert_eq!(
@@ -359,11 +489,11 @@ fn indexed_packing_preserves_priority_prefix_and_fills_the_gap() {
     txs.extend((0..40).map(|_| factory.tx(1, 1, Vec::new(), 1)));
     let fixture = Fixture::from_transactions(txs);
     let (txs, deps) = fixture.snapshot();
-    let plain = select(false, txs, deps, &network, height, &miner);
+    let plain = select(Mode::Indexed, txs, deps, &network, height, &miner);
     let plain_stats = validate(&plain, &fixture, &network, height, &miner);
     assert!(plain_stats.remaining > PACKING_THRESHOLD_BYTES);
     let (txs, deps) = fixture.snapshot();
-    let packed = select(true, txs, deps, &network, height, &miner);
+    let packed = select(Mode::IndexedPack, txs, deps, &network, height, &miner);
     let packed_stats = validate(&packed, &fixture, &network, height, &miner);
     assert!(packed.txs.starts_with(&plain.txs));
     assert!(packed_stats.remaining < plain_stats.remaining);
@@ -493,7 +623,7 @@ fn indexed_selection_is_repeatable_and_orders_package_parents_by_txid() {
     let runs: Vec<_> = (0..8)
         .map(|_| {
             let (txs, deps) = fixture.snapshot();
-            let selection = select(true, txs, deps, &network, height, &miner);
+            let selection = select(Mode::IndexedPack, txs, deps, &network, height, &miner);
             validate(&selection, &fixture, &network, height, &miner);
             ids(&selection)
         })
@@ -531,7 +661,7 @@ fn indexed_skips_candidates_with_unavailable_ancestors() {
 
     // The orphan comes first, as its baseline score would rank it.
     let selection = select(
-        true,
+        Mode::IndexedPack,
         vec![orphan, available],
         deps,
         &network,
@@ -539,6 +669,42 @@ fn indexed_skips_candidates_with_unavailable_ancestors() {
         &miner,
     );
     assert_eq!(ids(&selection), [available_id]);
+}
+
+/// The variant selector with the production score and misfit rule selects
+/// exactly what the production main pass selects, so benchmark differences
+/// come from the variant settings alone. Every variant's output is valid.
+#[test]
+fn selection_variants_match_production_and_respect_limits() {
+    let (network, height, miner, _) = context();
+    for kind in [
+        "uniform",
+        "mixed",
+        "packages",
+        "mixed_packages",
+        "transparent",
+        "mixed_transparent",
+    ] {
+        // Large enough that every fixture overfills a block.
+        let fixture = Fixture::full(kind, 12_000_000);
+        let (txs, deps) = fixture.snapshot();
+        let production = select(Mode::Indexed, txs, deps, &network, height, &miner);
+        let (txs, deps) = fixture.snapshot();
+        let mirrored = variant(
+            txs,
+            deps,
+            limits(&network, height, &miner),
+            Score::Zip401Cost,
+            Misfit::Stop,
+        );
+        assert_eq!(ids(&production), ids(&mirrored), "{kind}");
+
+        for mode in Mode::ALL {
+            let (txs, deps) = fixture.snapshot();
+            let selection = select(mode, txs, deps, &network, height, &miner);
+            validate(&selection, &fixture, &network, height, &miner);
+        }
+    }
 }
 
 /// The env gate keeps all-ignored CI runs from executing this performance job.
@@ -551,31 +717,47 @@ fn benchmark_full_mempool_gbt_selection() {
     };
     let cost_limit: u64 = cost_limit.parse().unwrap();
     let (network, height, miner, chain) = context();
-    for kind in ["uniform", "mixed", "packages", "mixed_packages"] {
+    let fixtures = std::env::var("ZAKURA_GBT_BENCH_FIXTURES").ok();
+    let kinds = [
+        "uniform",
+        "mixed",
+        "packages",
+        "mixed_packages",
+        "transparent",
+        "mixed_transparent",
+    ];
+    for kind in kinds.into_iter().filter(|kind| {
+        fixtures
+            .as_deref()
+            .is_none_or(|fixtures| fixtures.split(',').any(|fixture| fixture == *kind))
+    }) {
         let fixture = Fixture::full(kind, cost_limit);
         for phase in ["selection", "template_json"] {
-            // (name, pack): the main pass alone, then with packing, so the
-            // difference shows what packing costs.
-            let modes = [("indexed", false), ("indexed_pack", true)];
-            // Alternate which mode runs first, balancing warm-cache effects
-            // when one mode immediately follows the other.
-            let orders = [[0, 1], [1, 0]];
-            let mut results: [Vec<(Duration, Stats)>; 2] = Default::default();
+            let modes = Mode::ALL;
+            let mut results: [Vec<(Duration, Stats)>; Mode::ALL.len()] = Default::default();
             // Sample 0 warms caches and is discarded.
             for sample in 0..=SAMPLES {
-                for index in orders[sample % orders.len()] {
-                    let (_, pack) = modes[index];
+                // Rotate and alternate the mode order, balancing position
+                // and warm-cache effects between modes.
+                let mut order: Vec<_> = (0..modes.len())
+                    .map(|index| (index + sample) % modes.len())
+                    .collect();
+                if sample % 2 == 1 {
+                    order.reverse();
+                }
+                for index in order {
+                    let mode = modes[index];
                     let mut elapsed = Duration::ZERO;
                     let selection = if phase == "selection" {
                         let (txs, deps) = fixture.snapshot();
                         let start = Instant::now();
-                        let result = black_box(select(pack, txs, deps, &network, height, &miner));
+                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
                         elapsed += start.elapsed();
                         result
                     } else {
                         let start = Instant::now();
                         let (txs, deps) = fixture.snapshot();
-                        let result = black_box(select(pack, txs, deps, &network, height, &miner));
+                        let result = black_box(select(mode, txs, deps, &network, height, &miner));
                         elapsed += start.elapsed();
                         result
                     };
@@ -607,7 +789,8 @@ fn benchmark_full_mempool_gbt_selection() {
                 }
             }
 
-            for ((mode, _), mut result) in modes.into_iter().zip(results) {
+            for (mode, mut result) in modes.into_iter().zip(results) {
+                let mode = mode.name();
                 result.sort_by_key(|(elapsed, _)| *elapsed);
                 let median =
                     (result[SAMPLES / 2 - 1].0.as_nanos() + result[SAMPLES / 2].0.as_nanos()) / 2;
@@ -627,7 +810,9 @@ fn benchmark_full_mempool_gbt_selection() {
                 let (remaining_min, remaining_max) =
                     values(|s| u64::try_from(s.remaining).unwrap());
                 let (scanned_min, scanned_max) = values(|s| u64::try_from(s.scanned).unwrap());
-                println!("gbt fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={mode} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} scanned_min={scanned_min} scanned_max={scanned_max} packing_ns={packing_ns}",
+                let (_, misfits) = values(|s| u64::try_from(s.misfits).unwrap());
+                let (sigops_left, _) = values(|s| u64::from(s.sigops_left));
+                println!("gbt fixture={kind} cost_limit={cost_limit} pool_cost={} pool_txs={} phase={phase} mode={mode} median_ns={median} min_ns={} max_ns={} selected_min={selected_min} selected_max={selected_max} bytes_min={bytes_min} bytes_max={bytes_max} fees_min={fees_min} fees_max={fees_max} remaining_min={remaining_min} remaining_max={remaining_max} scanned_min={scanned_min} scanned_max={scanned_max} packing_ns={packing_ns} misfits={misfits} sigops_left={sigops_left}",
                     fixture.cost, fixture.pool.len(), result[0].0.as_nanos(), result[SAMPLES-1].0.as_nanos());
             }
         }

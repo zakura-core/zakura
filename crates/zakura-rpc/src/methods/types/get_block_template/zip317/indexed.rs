@@ -78,7 +78,7 @@ pub(super) fn parents<'a>(
 /// Mempool admission bounds each dependency group to a few transactions, so
 /// the quadratic ordering step is cheap. Ready members are taken in TXID
 /// order so the result does not depend on hash iteration order.
-fn package(
+pub(super) fn package(
     id: transaction::Hash,
     pool: &Pool,
     selected: &HashMap<transaction::Hash, usize>,

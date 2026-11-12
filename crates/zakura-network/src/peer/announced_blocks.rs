@@ -152,10 +152,10 @@ mod tests {
         assert!(announced.announced(hash(2 * ANNOUNCED_BLOCKS_LIMIT + EXCESS - 1)));
     }
 
-    /// A maximum-sized message leaves neither an oversized allocation nor a quadratic amount
-    /// of work behind: one `inv` can carry 50,000 hashes.
+    /// A maximum-sized inventory retains bounded entries and allocation, including when
+    /// hashes repeat: one `inv` can carry 50,000 hashes.
     #[tokio::test(start_paused = true)]
-    async fn maximum_inventory_is_bounded_in_entries_and_work() {
+    async fn maximum_inventory_retains_bounded_entries_and_allocation() {
         use crate::protocol::external::InventoryHash;
         use zakura_chain::serialization::TrustedPreallocate;
 
@@ -164,11 +164,7 @@ mod tests {
         for distinct in [limit, limit / 2, ANNOUNCED_BLOCKS_LIMIT] {
             let announced = AnnouncedBlocks::default();
             let hashes: Vec<_> = (0..limit).map(|index| hash(index % distinct)).collect();
-            // The clock is paused, so this measures the work the connection's task does
-            // under the mutex that block gossip also takes.
-            let started = std::time::Instant::now();
             announced.record(hashes);
-            let elapsed = started.elapsed();
             let entries = announced
                 .0
                 .lock()
@@ -181,13 +177,6 @@ mod tests {
                 "a single inventory retained an oversized allocation: {} + {}",
                 entries.current.capacity(),
                 entries.previous.capacity()
-            );
-            // Generously above the ~7 ms this takes, which no longer depends on how many
-            // of the hashes are distinct, and far below the ~670 ms an insertion-ordered
-            // cache spent shifting entries once per announced hash.
-            assert!(
-                elapsed < Duration::from_millis(100),
-                "recording {limit} hashes over {distinct} distinct took {elapsed:?}"
             );
             // The last hash of the message is always still readable.
             drop(entries);

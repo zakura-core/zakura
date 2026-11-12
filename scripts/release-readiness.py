@@ -191,22 +191,12 @@ def minimum_release(
 def release_patch_waiver(
     base: Version, target: Version, entries: dict[str, list[str]]
 ) -> str | None:
-    """Apply release-owner exceptions to the node version only."""
+    """Apply the approved node-only exception for the stable v1.8.6 release."""
     if base == parse_version("1.8.5") and target == parse_version("1.8.6"):
         return (
             "The release owner approved v1.8.6 as a patch, including the documented "
             "removal of historical treestate commands from default builds and unused "
             "Sprout library types. Library crates retain independent SemVer bumps."
-        )
-    if (
-        base == parse_version("1.8.6")
-        and target == parse_version("1.8.7")
-        and not (MINOR_CATEGORIES - PATCH_WAIVABLE_CATEGORIES).intersection(entries)
-    ):
-        return (
-            "The release owner approved v1.8.7 as a patch despite the Added and "
-            "Changed changelog categories. Library crates retain independent "
-            "SemVer bumps."
         )
     return patch_waiver_reason(entries)
 
@@ -319,10 +309,7 @@ class SelfTests(unittest.TestCase):
         self.assertEqual((level, str(minimum)), ("patch", "1.8.6"))
 
     def test_patch_exception_does_not_apply_to_other_releases(self) -> None:
-        for base, target in (
-            ("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"),
-            ("1.8.6", "1.8.7-rc0"), ("1.8.6", "1.8.8"), ("1.8.7", "1.8.8"),
-        ):
+        for base, target in (("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"), ("1.8.6", "1.8.7")):
             with self.subTest(base=base, target=target):
                 with self.assertRaisesRegex(ReadinessError, "minor floor"):
                     minimum_release(
@@ -331,29 +318,11 @@ class SelfTests(unittest.TestCase):
                     )
 
     def test_patch_exception_preserves_network_upgrade_floor(self) -> None:
-        for base, target in (("1.8.5", "1.8.6"), ("1.8.6", "1.8.7")):
-            with self.subTest(base=base, target=target):
-                with self.assertRaisesRegex(ReadinessError, "major floor"):
-                    minimum_release(
-                        parse_version(base), parse_version(target),
-                        {"Added": ["- Added the Mainnet Network Upgrade."]},
-                    )
-
-    def test_approved_patch_allows_added_and_changed_entries(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.8.6"), parse_version("1.8.7"),
-            {"Added": ["- Added an RPC."], "Changed": ["- Changed a limit."]},
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.8.7"))
-
-    def test_added_and_changed_exception_does_not_allow_removals_or_deprecations(self) -> None:
-        for category in ("Removed", "Deprecated"):
-            with self.subTest(category=category):
-                with self.assertRaisesRegex(ReadinessError, "minor floor"):
-                    minimum_release(
-                        parse_version("1.8.6"), parse_version("1.8.7"),
-                        {category: ["- Changed a public command."]},
-                    )
+        with self.assertRaisesRegex(ReadinessError, "major floor"):
+            minimum_release(
+                parse_version("1.8.5"), parse_version("1.8.6"),
+                {"Added": ["- Added the Mainnet Network Upgrade."]},
+            )
 
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

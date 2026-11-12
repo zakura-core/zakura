@@ -1,5 +1,6 @@
 //! The acceptance tool's integration (hdr-14.7b): gate 1's A/A and A/B/A
-//! comparison and its replay store control.
+//! comparison and its replay store control, and the tool's whole path over
+//! two planted cases, from recording through evaluation.
 //!
 //! Recordings and replays here go through the `zakura-sim` binary, as the
 //! acceptance runner makes them, and land at the paths `tool`'s artifact
@@ -268,4 +269,279 @@ fn each_history_is_the_same_alone_and_after_another() {
             .is_err_and(|why| why.contains("B resolves to A")),
         "{same:?}"
     );
+}
+
+/// The SHA-256 of `path`'s bytes in hex, as the tool names a trace.
+fn digest(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(std::fs::read(path).expect("the file exists"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The `zakura-sim record` arguments that run `input` on `harness`, from
+/// the repository `repo`.
+fn input_args(repo: &Path, input: &tool::CaseInput) -> Vec<String> {
+    let path = |file: &str| repo.join(file).display().to_string();
+    match input {
+        tool::CaseInput::Fuzz { input } => vec!["--input".into(), path(input)],
+        tool::CaseInput::Typed { scenario, plan } => vec![
+            "--scenario".into(),
+            std::fs::read_to_string(repo.join(scenario)).expect("the scenario is readable"),
+            "--plan".into(),
+            path(plan),
+        ],
+        tool::CaseInput::Scripted { scenario, script } => vec![
+            "--scenario".into(),
+            std::fs::read_to_string(repo.join(scenario)).expect("the scenario is readable"),
+            "--script".into(),
+            path(script),
+        ],
+    }
+}
+
+/// The two planted cases the whole-path test runs: the despite-close case
+/// on `header-sync/wire`, with its three companions, and a stale-completion
+/// case on `header-sync/storage`, with none. Their patches differ.
+const TWO_CASES: [(&str, &str); 2] = [
+    ("header-sync/commit-only-authorized", "staged-despite-close"),
+    ("header-sync/stale-completion-inert", "stale-charge"),
+];
+
+/// The tool's whole path over two planted cases, from recording through
+/// evaluation, with every artifact made as the runner's contract gives it,
+/// through the `zakura-sim` and `header-acceptance` binaries. Each case
+/// gets its baseline, patched and `Draft` runs, each replayed fresh, its
+/// provenance, verdict and target checks, and its companions. The tool
+/// reads each run from its own case's directory with its own trace, binds
+/// it to that case's committed input, reads the `Draft` run's override as
+/// the case's set and its companions on that trace, and gives each run's
+/// replay exact with its reports and stores equal.
+///
+/// Rebuilding each case's patch is the runner's (xtask's `rebuild_case`),
+/// which this test can't do, so every run here comes from this build: the
+/// patched runs don't violate, and each `Draft` run is refused as not from
+/// its case's own binary. So both cases block, which the record shows,
+/// each with its links in its own directory only.
+#[test]
+fn two_planted_cases_run_through_the_tool() {
+    use zakura_sim::harness::header_acceptance::{
+        companions::COMPANIONS,
+        evaluate::End,
+        tool::{RunBinding, Task},
+        Expected, Manifest,
+    };
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = Manifest::committed();
+    let plan = tool::plan(&manifest, &repo).expect("the committed manifest plans");
+    let source = zakura_sim::trace::BuildInfo::current().source;
+    let run = RunBinding {
+        run_id: "two-cases".into(),
+        subject: "s".into(),
+        subject_source: source.clone(),
+        containment: tool::Containment::Subreaper,
+    };
+    let artifacts = tempfile::tempdir().expect("a temp dir can be created");
+    std::fs::write(
+        artifacts.path().join(tool::RUN_FILE),
+        serde_json::to_string(&run).expect("it serializes"),
+    )
+    .expect("the temp dir is writable");
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let dir = artifacts.path().join(index.to_string());
+        std::fs::create_dir_all(&dir).expect("the temp dir is writable");
+        std::fs::write(
+            dir.join(tool::TASK_FILE),
+            tool::task_binding(index, task).to_string(),
+        )
+        .expect("the temp dir is writable");
+    }
+    let path = |dir: &Path| dir.to_str().expect("the path is UTF-8").to_owned();
+    let mut indices = Vec::new();
+    for (property, name) in TWO_CASES {
+        let (index, task) = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, task)| {
+                matches!(task, Task::Case { property: p, name: n, .. } if p == property && n == name)
+            })
+            .expect("each case has a task");
+        let Task::Case {
+            harness,
+            input,
+            patch,
+            draft: Some(set),
+            companions,
+            ..
+        } = task
+        else {
+            panic!("{property}/{name} is a node case");
+        };
+        indices.push(index);
+        let dir = artifacts.path().join(index.to_string());
+        let record = |out: &str, extra: &[&str]| {
+            let mut args: Vec<String> = vec!["record".into(), "--sim".into(), harness.clone()];
+            args.extend(input_args(&repo, input));
+            args.extend(["--out".into(), path(&dir.join(out))]);
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            sim(&args);
+            replay(&dir.join(out));
+        };
+        record("baseline", &["--witness", property, "--expect", "holds"]);
+        record("patched", &["--witness", property, "--expect", "violated"]);
+        record("draft", &["--draft", &set.join(",")]);
+        let checks = [
+            (
+                "provenance.json",
+                serde_json::json!({
+                    "source": source,
+                    "patch_sha256": digest(&repo.join(patch)),
+                    "refused": null,
+                }),
+            ),
+            (
+                "verdict.json",
+                serde_json::json!({"property": property, "name": name, "refused": null}),
+            ),
+            (
+                "target.json",
+                serde_json::json!({
+                    "property": property, "name": name, "target": null, "refused": null,
+                }),
+            ),
+        ];
+        for (file, check) in checks {
+            std::fs::write(dir.join(file), check.to_string()).expect("the temp dir is writable");
+        }
+        if !companions.is_empty() {
+            let out = Command::new(env!("CARGO_BIN_EXE_header-acceptance"))
+                .args([
+                    "companions",
+                    "--trace",
+                    &path(&dir.join("draft")),
+                    "--out",
+                    &path(&dir.join("draft").join(tool::COMPANIONS_FILE)),
+                ])
+                .output()
+                .expect("the binary runs");
+            assert!(out.status.success(), "{out:?}");
+        }
+    }
+
+    let (results, record) = tool::evaluate_artifacts(&repo, &plan, artifacts.path(), &run);
+    let mut traces = std::collections::BTreeSet::new();
+    for (&index, (property, name)) in indices.iter().zip(TWO_CASES) {
+        let dir = artifacts.path().join(index.to_string());
+        let Task::Case {
+            expected,
+            draft: Some(set),
+            companions: declared,
+            ..
+        } = &plan.tasks[index]
+        else {
+            unreachable!("found as a node case");
+        };
+        let caught = results
+            .results
+            .iter()
+            .find(|result| &result.expected == expected)
+            .expect("each case gives a result");
+        let Actual::Caught {
+            baseline,
+            patched,
+            draft,
+            companions,
+        } = &caught.actual
+        else {
+            panic!("{name} is read as a Caught: {:?}", caught.actual);
+        };
+        for (execution, run) in [
+            (baseline, "baseline"),
+            (patched, "patched"),
+            (draft, "draft"),
+        ] {
+            assert_eq!(execution.trace, digest(&dir.join(run).join("trace.jsonl")));
+            assert!(!execution.reports.is_empty(), "{name}/{run}");
+        }
+        // One build records the same input to the same trace, so the
+        // patched run, which this test can't rebuild, is the baseline's.
+        // The Draft run's override makes its own.
+        assert_eq!(patched.trace, baseline.trace, "{name}");
+        for (execution, run) in [(baseline, "baseline"), (draft, "draft")] {
+            assert!(traces.insert(execution.trace.clone()), "{name}/{run}");
+        }
+        assert_eq!(baseline.end, End::Completed, "{name}: {baseline:?}");
+        assert_eq!(baseline.meta.run_by, RunBy::Planted);
+        assert!(baseline.trigger, "{name}");
+        assert_eq!(draft.meta.run_by, RunBy::Tool);
+        assert_eq!(&draft.meta.draft_override, set);
+        assert!(
+            matches!(&draft.end, End::Failed { why } if why.contains("patched checkout")),
+            "{name}: {:?}",
+            draft.end
+        );
+        let names: Vec<&str> = companions.iter().map(|c| c.name.as_str()).collect();
+        let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
+        assert_eq!(names, declared, "{name}");
+        if !declared.is_empty() {
+            assert_eq!(names, COMPANIONS);
+        }
+        assert!(companions
+            .iter()
+            .all(|c| c.trace == draft.trace && c.run == draft.run));
+        // Each of the case's counted runs replayed fresh and exactly, with
+        // its reports and stores equal.
+        for role in ["patched", "draft"] {
+            let replayed = manifest
+                .expected
+                .iter()
+                .find_map(|result| match &result.expected {
+                    Expected::Replays {
+                        run:
+                            run @ RunId::Case {
+                                property: p,
+                                name: n,
+                                run: r,
+                            },
+                    } if p == property
+                        && n == name
+                        && serde_json::to_value(r).ok() == Some(Value::from(role)) =>
+                    {
+                        result.expected.id().map(|id| (id, run.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("the manifest replays each counted run");
+            let replay = results
+                .results
+                .iter()
+                .find(|result| result.expected == replayed.0)
+                .expect("each replay gives a result");
+            assert_eq!(
+                flags(replay.actual.clone()),
+                (true, true, true, true),
+                "{name}/{role}"
+            );
+            let Actual::Replay { of, run, .. } = &replay.actual else {
+                unreachable!("read as a replay");
+            };
+            assert_eq!(*run, replayed.1);
+            assert_eq!(*of, digest(&dir.join(role).join("trace.jsonl")));
+        }
+        // The record blocks the case, linking only its own directory.
+        let entry = record
+            .blocked
+            .iter()
+            .find(|entry| entry.links.result.as_ref() == Some(expected))
+            .expect("the case is blocked");
+        assert!(entry
+            .links
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.starts_with(&format!("{index}/"))));
+    }
+    assert!(!record.accepted);
 }

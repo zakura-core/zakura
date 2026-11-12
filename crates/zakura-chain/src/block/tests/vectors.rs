@@ -29,6 +29,24 @@ use crate::{
 use super::generate; // TODO: this should be rewritten as strategies
 
 #[test]
+fn indexed_transaction_borrows_the_original_and_checks_bounds() {
+    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+        .zcash_deserialize_into()
+        .expect("the historical block vector deserializes");
+    assert!(block.transactions.len() > 1);
+    for (index, expected) in block.transactions.iter().enumerate() {
+        let owners = Arc::strong_count(expected);
+        let actual = block.transaction_at(index).expect("the index is in bounds");
+        assert!(std::ptr::eq(actual, expected.as_ref()));
+        assert_eq!(Arc::strong_count(expected), owners);
+    }
+    assert!(block.transaction_at(block.transactions.len()).is_none());
+    assert!(block.transaction_at(usize::MAX).is_none());
+    block.transactions.clear();
+    assert!(block.transaction_at(0).is_none());
+}
+
+#[test]
 fn blockheaderhash_debug() {
     let _init_guard = zakura_test::init();
 

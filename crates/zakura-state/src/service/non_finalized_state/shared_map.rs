@@ -10,7 +10,7 @@ use std::{
 mod tests;
 
 // Bound snapshot cloning to 256 Arc increments. Writes copy only touched partitions.
-const PARTITIONS: usize = 256;
+pub(super) const PARTITIONS: usize = 256;
 
 /// A partitioned hash map with independent snapshots.
 ///
@@ -60,6 +60,16 @@ impl<K: Eq + Hash, V> SharedMap<K, V> {
         self.len
     }
 
+    /// Returns how many partitions `self` and `other` share without a copy.
+    #[cfg(test)]
+    pub(crate) fn shared_partitions(&self, other: &Self) -> usize {
+        self.partitions
+            .iter()
+            .zip(&other.partitions)
+            .filter(|(mine, theirs)| Arc::ptr_eq(mine, theirs))
+            .count()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
@@ -80,6 +90,26 @@ impl<K: Eq + Hash + Clone, V: Clone> SharedMap<K, V> {
             self.len += 1;
         }
         previous
+    }
+
+    /// Removes the entries in partition `partition` that `keep` rejects.
+    ///
+    /// Copies a shared partition only if it has an entry to remove.
+    pub(crate) fn retain_partition(
+        &mut self,
+        partition: usize,
+        mut keep: impl FnMut(&K, &V) -> bool,
+    ) {
+        if self.partitions[partition]
+            .iter()
+            .all(|(key, value)| keep(key, value))
+        {
+            return;
+        }
+        let entries = Arc::make_mut(&mut self.partitions[partition]);
+        let before = entries.len();
+        entries.retain(|key, value| keep(key, value));
+        self.len -= before - entries.len();
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {

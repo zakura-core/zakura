@@ -433,7 +433,7 @@ where
     C: AsRef<Chain>,
 {
     match chain {
-        Some(chain) if chain.as_ref().spent_utxos.contains_key(&outpoint) => None,
+        Some(chain) if chain.as_ref().spent_utxo(&outpoint).is_some() => None,
         chain => utxo(chain, db, outpoint),
     }
 }

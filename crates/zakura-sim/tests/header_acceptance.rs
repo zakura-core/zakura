@@ -1808,10 +1808,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "late-fault-unpenalized",
         NativePin::Move("header-sync/header-fault-penalized", "hdr-14.4"),
     ),
-    (
-        "misstored-page",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
-    ),
+    ("misstored-page", NativePin::Retired),
     (
         "own9-join",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
@@ -1845,10 +1842,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "short-cooldown",
         NativePin::Move("header-sync/header-fault-penalized", "hdr-14.4"),
     ),
-    (
-        "short-payload",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
-    ),
+    ("short-payload", NativePin::Retired),
     (
         "shutdown-kept-queue",
         NativePin::Move("header-sync/teardown-returns-baseline", "hdr-14.4"),
@@ -1857,18 +1851,12 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "skewed-remaining",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1b"),
     ),
-    (
-        "skipped-retention",
-        NativePin::Move("header-sync/outstanding-work-bounded", "hdr-9d.1"),
-    ),
+    ("skipped-retention", NativePin::Retired),
     (
         "skipped-staging",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
     ),
-    (
-        "stale-locator-round",
-        NativePin::Move("header-sync/reset-invalidates-work", "hdr-9a.2"),
-    ),
+    ("stale-locator-round", NativePin::Retired),
     (
         "stale-status-cache",
         NativePin::Move("header-sync/state-publication-consistent", "hdr-12b"),

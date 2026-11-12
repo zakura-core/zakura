@@ -1739,7 +1739,19 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "owner-swap",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "projection-to-side-tip",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "reordered-payload",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1757,7 +1769,19 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "skewed-remaining",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "skipped-sequence",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "skipped-staging",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1776,6 +1800,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "submitted-source-changed",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "swapped-payload",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1987,6 +2017,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "reuse-skipped",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "secondary-reservation",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,
@@ -2946,9 +2982,23 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "late-fault-unpenalized",
         },
     },
-    to_move("misstored-page", COMMIT, "hdr-9c.1a"),
+    NativeMutation {
+        patch: "misstored-page",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case commit-only-authorized/stored-order, which \
+                     reverses the same page one call down, in WorkPolicy::stage_page, and on the \
+                     forks-sharing-a-header input first fails with the same UnstagedPage at step \
+                     709",
+        },
+    },
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
-    to_move("owner-swap", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "owner-swap",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "owner-swap",
+        },
+    },
     NativeMutation {
         patch: "raw-budget-lease",
         class: NativeClass::Integrity {
@@ -2972,8 +3022,20 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
                      stays a zakura-network unit test",
         },
     },
-    to_move("reordered-payload", COMMIT, "hdr-9c.2a"),
-    to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
+    NativeMutation {
+        patch: "reordered-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "reordered-payload",
+        },
+    },
+    NativeMutation {
+        patch: "secondary-reservation",
+        class: NativeClass::Moved {
+            property: OUTSTANDING,
+            case: "secondary-reservation",
+        },
+    },
     NativeMutation {
         patch: "session-view",
         class: NativeClass::Moved {
@@ -2988,7 +3050,15 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "short-cooldown",
         },
     },
-    to_move("short-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "short-payload",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case \
+                     commit-only-authorized/dropped-payload-header, which plants the same \
+                     entries.pop() in WorkPolicy::begin_prepare and on the forks-sharing-a-header \
+                     input first fails with the same WrongPayload at step 738",
+        },
+    },
     NativeMutation {
         patch: "shutdown-kept-queue",
         class: NativeClass::Moved {
@@ -2996,14 +3066,38 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "shutdown-kept-queue",
         },
     },
-    to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
-    to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
-    to_move("skipped-staging", COMMIT, "hdr-9c.1a"),
-    to_move(
-        "stale-locator-round",
-        "header-sync/reset-invalidates-work",
-        "hdr-9a.2",
-    ),
+    NativeMutation {
+        patch: "skewed-remaining",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skewed-remaining",
+        },
+    },
+    NativeMutation {
+        patch: "skipped-retention",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case outstanding-work-bounded/retention-skipped, \
+                     which dispatches a prepare without retaining its headers in the same \
+                     dispatch path, and on the forks-sharing-a-header input first fails with the \
+                     same held call that holds no headers at step 738",
+        },
+    },
+    NativeMutation {
+        patch: "skipped-staging",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skipped-staging",
+        },
+    },
+    NativeMutation {
+        patch: "stale-locator-round",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case reset-invalidates-work/awaiting-kept, whose \
+                     adoption also keeps the awaiting target, and on the \
+                     header-reset-held-locator input first fails with the same \
+                     ResetInvalidatesWork at step 207",
+        },
+    },
     NativeMutation {
         patch: "stale-status-cache",
         class: NativeClass::Moved {
@@ -3011,7 +3105,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "stale-status-cache",
         },
     },
-    to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "swapped-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "swapped-payload",
+        },
+    },
     NativeMutation {
         patch: "unreleased-retirement",
         class: NativeClass::Moved {

@@ -15,12 +15,13 @@ use zakura_quic::NodeId;
 use super::protocol::{
     network_id_from_code, summary_tag_service, validate_known_summary_payload,
     validate_record_body_bounds, DiscoveryMessage, GetPeers, GetServices, ServiceSummaryEnvelope,
-    Services, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, MAX_DIRECT_ADDRS_PER_RECORD,
-    MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-    MAX_GET_PEERS_WANTED_SERVICES, MAX_GET_SERVICES_WANTED, MAX_NODE_RECORD_BODY_BYTES,
-    MAX_NODE_RECORD_BYTES, MAX_SERVICES_PER_RECORD, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
-    MAX_SERVICE_SUMMARY_BYTES, MAX_ZAKURA_SERVICE_ID_BYTES, MSG_DISCOVERY_GET_PEERS,
-    MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
+    Services, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord, ZakuraNodeRecordBody,
+    ZakuraServiceId, MAX_DIRECT_ADDRS_PER_RECORD, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
+    MAX_DISCOVERY_RECORDS_PER_RESPONSE, MAX_GET_PEERS_WANTED_SERVICES, MAX_GET_SERVICES_WANTED,
+    MAX_NODE_RECORD_BODY_BYTES, MAX_NODE_RECORD_BYTES, MAX_SERVICES_PER_RECORD,
+    MAX_SERVICE_SUMMARIES_PER_RESPONSE, MAX_SERVICE_SUMMARY_BYTES, MAX_ZAKURA_SERVICE_ID_BYTES,
+    MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO, MSG_DISCOVERY_PEERS,
+    MSG_DISCOVERY_SERVICES,
 };
 use crate::zakura::{
     regulation::ResponseCap,
@@ -745,4 +746,141 @@ fn read_envelope(reader: &mut BoundedReader<'_>) -> Result<ServiceSummaryEnvelop
     };
     check_envelope(&envelope)?;
     Ok(envelope)
+}
+
+/// The header of an encoded discovery book file: a tag and a format version.
+const PERSISTED_BOOK_MAGIC: &[u8; 8] = b"ZKDBOOK\x01";
+
+/// Encodes at most `max_entries` discovery book entries for the local book
+/// file. Each record keeps its wire encoding, so a loaded record carries the
+/// exact bytes its signature covers.
+pub(crate) fn encode_persisted_entries(
+    entries: &[ZakuraDiscoveryPersistedEntry],
+    max_entries: usize,
+) -> Result<Vec<u8>, WireError> {
+    let max_entries = max_entries.min(usize::from(u16::MAX));
+    if entries.len() > max_entries {
+        return Err(WireError::CountOutOfRange {
+            // Widening usize to u64 is lossless on supported targets.
+            count: entries.len() as u64,
+            min: 0,
+            max: max_entries,
+        });
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(PERSISTED_BOOK_MAGIC);
+    write_count(entries.len(), &mut out);
+    for entry in entries {
+        write_record(&entry.record, &mut out)?;
+        match entry.source {
+            Some(source) => {
+                out.push(1);
+                out.extend_from_slice(source.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out.push(u8::from(entry.is_static));
+        out.extend_from_slice(&entry.last_seen.to_le_bytes());
+        write_optional_u64(entry.last_dial_attempt, &mut out);
+        write_optional_u64(entry.last_success, &mut out);
+        for addrs in [&entry.confirmed_addrs, &entry.dialed_addrs] {
+            write_list(addrs, MAX_DIRECT_ADDRS_PER_RECORD, &mut out, |addr, out| {
+                write_socket_addr(addr, out);
+                Ok(())
+            })?;
+        }
+        out.extend_from_slice(&entry.failure_count.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Decodes a local discovery book file holding at most `max_entries` entries.
+///
+/// Decoding checks only the encoding. The caller re-imports every entry
+/// through the book, which verifies each record before it can be dialed.
+pub(crate) fn decode_persisted_entries(
+    bytes: &[u8],
+    max_entries: usize,
+) -> Result<Vec<ZakuraDiscoveryPersistedEntry>, WireError> {
+    let mut reader = BoundedReader::new(bytes);
+    if reader.array::<8>("discovery book header")? != *PERSISTED_BOOK_MAGIC {
+        return Err(WireError::OutOfRange("discovery book header"));
+    }
+    read_list(
+        &mut reader,
+        max_entries,
+        NODE_RECORD_MIN_BYTES,
+        "discovery book entry count",
+        read_persisted_entry,
+    )
+    .and_then(|entries| {
+        if reader.remaining() == 0 {
+            Ok(entries)
+        } else {
+            Err(WireError::TrailingBytes)
+        }
+    })
+}
+
+fn read_persisted_entry(
+    reader: &mut BoundedReader<'_>,
+) -> Result<ZakuraDiscoveryPersistedEntry, WireError> {
+    let record = read_record(reader)?;
+    let source = match reader.array::<1>("entry source flag")? {
+        [0] => None,
+        [1] => Some(read_node_id(reader, "entry source")?),
+        _ => return Err(WireError::OutOfRange("entry source flag")),
+    };
+    let is_static = match reader.array::<1>("entry static flag")? {
+        [0] => false,
+        [1] => true,
+        _ => return Err(WireError::OutOfRange("entry static flag")),
+    };
+    let last_seen = read_u64(reader, "entry last seen")?;
+    let last_dial_attempt = read_optional_u64(reader, "entry last dial attempt")?;
+    let last_success = read_optional_u64(reader, "entry last success")?;
+    let mut read_addrs = |what| {
+        read_list(
+            reader,
+            MAX_DIRECT_ADDRS_PER_RECORD,
+            SOCKET_ADDR_V4_BYTES,
+            what,
+            read_socket_addr,
+        )
+    };
+    let confirmed_addrs = read_addrs("entry confirmed address count")?;
+    let dialed_addrs = read_addrs("entry dialed address count")?;
+    let failure_count = read_u32(reader, "entry failure count")?;
+    Ok(ZakuraDiscoveryPersistedEntry {
+        record,
+        source,
+        is_static,
+        last_seen,
+        last_dial_attempt,
+        last_success,
+        confirmed_addrs,
+        dialed_addrs,
+        failure_count,
+    })
+}
+
+fn write_optional_u64(value: Option<u64>, out: &mut Vec<u8>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn read_optional_u64(
+    reader: &mut BoundedReader<'_>,
+    item: &'static str,
+) -> Result<Option<u64>, WireError> {
+    match reader.array::<1>(item)? {
+        [0] => Ok(None),
+        [1] => Ok(Some(read_u64(reader, item)?)),
+        _ => Err(WireError::OutOfRange(item)),
+    }
 }

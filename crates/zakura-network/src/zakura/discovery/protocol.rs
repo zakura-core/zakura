@@ -6838,6 +6838,118 @@ mod tests {
         );
     }
 
+    /// A book saved to its file reloads with its dial history, and the reload
+    /// still re-verifies every record.
+    #[test]
+    fn discovery_book_file_round_trip_restores_dial_history() {
+        use super::super::book_file::DiscoveryBookFile;
+
+        let mut book = ZakuraDiscoveryBook::default();
+        let record = signed_record_with(1, service(9), test_addr(9));
+        let node_id = record.body.node_id;
+        import_confirmed_record(&mut book, record.clone()).unwrap();
+        book.mark_dial_success(&node_id, Some(test_addr(9)), NOW);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        assert!(file.load().is_empty(), "a missing file loads as empty");
+        file.store(book.persisted_entries()).unwrap();
+
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
+        assert_eq!(outcome.added, 1);
+        let entry = reloaded.get(&node_id).expect("the saved peer reloads");
+        assert_eq!(entry.record(), &record);
+        assert_eq!(entry.last_success(), Some(NOW));
+        assert_eq!(entry.dialed_addrs(), &[test_addr(9)]);
+
+        // A record altered on disk fails its signature check on reload.
+        let mut tampered = book.persisted_entries();
+        tampered[0].record.body.sequence += 1;
+        file.store(tampered).unwrap();
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
+        assert_eq!((outcome.added, outcome.rejected), (0, 1));
+    }
+
+    /// The file keeps the most recently successful peers, stores static peers as
+    /// ordinary peers, and a run with nothing to save keeps the previous file.
+    #[test]
+    fn discovery_book_file_keeps_useful_entries_and_the_previous_file() {
+        use super::super::book_file::{DiscoveryBookFile, MAX_PERSISTED_DISCOVERY_ENTRIES};
+
+        let entry =
+            |index: u8, last_success: Option<u64>, is_static: bool| ZakuraDiscoveryPersistedEntry {
+                record: signed_record_with(1, service(1), test_addr(index)),
+                source: None,
+                is_static,
+                last_seen: NOW,
+                last_dial_attempt: None,
+                last_success,
+                confirmed_addrs: Vec::new(),
+                dialed_addrs: Vec::new(),
+                failure_count: 0,
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+
+        let mut entries: Vec<_> = (0..MAX_PERSISTED_DISCOVERY_ENTRIES)
+            .map(|_| entry(1, None, false))
+            .collect();
+        let recent = entry(2, Some(NOW), false);
+        let bootstrap = entry(3, Some(NOW + 1), true);
+        entries.push(recent.clone());
+        entries.push(bootstrap.clone());
+        file.store(entries).unwrap();
+
+        let saved = file.load();
+        assert_eq!(saved.len(), MAX_PERSISTED_DISCOVERY_ENTRIES);
+        assert_eq!(
+            saved[0],
+            ZakuraDiscoveryPersistedEntry {
+                is_static: false,
+                ..bootstrap
+            },
+            "the most recent success is kept first, as an ordinary entry"
+        );
+        assert_eq!(saved[1], recent);
+
+        file.store(Vec::new()).unwrap();
+        assert_eq!(
+            file.load().len(),
+            MAX_PERSISTED_DISCOVERY_ENTRIES,
+            "a run with nothing to save keeps the previous file"
+        );
+
+        std::fs::write(dir.path().join("book"), b"not a discovery book").unwrap();
+        assert!(file.load().is_empty(), "an undecodable file loads as empty");
+    }
+
+    /// Decoding a book file enforces its entry cap and rejects trailing bytes.
+    #[test]
+    fn discovery_book_file_decoding_is_bounded() {
+        use super::super::wire::{decode_persisted_entries, encode_persisted_entries};
+
+        let mut book = ZakuraDiscoveryBook::default();
+        for index in 1..=2 {
+            import_confirmed_record(
+                &mut book,
+                signed_record_with(1, service(1), test_addr(index)),
+            )
+            .unwrap();
+        }
+        let entries = book.persisted_entries();
+        assert!(encode_persisted_entries(&entries, 1).is_err());
+
+        let bytes = encode_persisted_entries(&entries, 2).unwrap();
+        assert_eq!(decode_persisted_entries(&bytes, 2).unwrap(), entries);
+        assert!(decode_persisted_entries(&bytes, 1).is_err());
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_persisted_entries(&trailing, 2).is_err());
+    }
+
     #[test]
     fn self_record_includes_local_node_addresses_services_and_verifies() {
         let secret = secret_key();

@@ -103,10 +103,9 @@ unconditional_peers = []
 # full block does not wait for TCP slow start. Needs
 # net.ipv4.tcp_slow_start_after_idle = 0.
 [network.tcp_warmup]
-chunk_timeout = "20s"
+chunk_timeout = "5s"
 enabled = false
-first_chunk_bytes = 16384
-ignore_slow_start_after_idle = false
+first_chunk_bytes = 14000
 max_chunk_bytes = 2097144
 max_concurrent = 16
 peer_cooldown = "1day"

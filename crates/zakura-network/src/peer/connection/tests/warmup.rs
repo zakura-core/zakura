@@ -1,15 +1,13 @@
 //! Connection tests for warm-up pings.
 
-use std::time::Duration;
-
 use futures::{channel::oneshot, SinkExt, StreamExt};
+use indexmap::IndexSet;
 use tracing::Span;
 
 use zakura_chain::block;
 use zakura_test::mock_service::PanicAssertion;
 
 use crate::{
-    constants::REQUEST_TIMEOUT,
     peer::{tcp_warmup::WarmupChunk, ClientRequest},
     protocol::external::{InventoryHash, Message},
     types::Nonce,
@@ -18,11 +16,8 @@ use crate::{
 
 use super::new_test_connection;
 
-/// Returns a warm-up ping and the receiver for its pong time.
-fn warmup_chunk(
-    nonce: Nonce,
-    padding: u32,
-) -> (WarmupChunk, tokio::sync::oneshot::Receiver<Duration>) {
+/// Returns a warm-up ping and the receiver that fires on its pong.
+fn warmup_chunk(nonce: Nonce, padding: u32) -> (WarmupChunk, tokio::sync::oneshot::Receiver<()>) {
     let (pong, pong_rx) = tokio::sync::oneshot::channel();
     (
         WarmupChunk {
@@ -66,7 +61,7 @@ async fn warmup_pong_is_delivered_while_a_heartbeat_is_pending() {
     warmup_tx.send(chunk).await.unwrap();
     assert_eq!(
         outbound.next().await,
-        Some(Message::WarmupPing {
+        Some(Message::PaddedPing {
             nonce: warmup_nonce,
             padding: 100
         })
@@ -116,18 +111,18 @@ async fn block_advert_is_written_before_a_queued_warmup_ping() {
     );
     assert!(matches!(
         outbound.next().await,
-        Some(Message::WarmupPing { padding: 1000, .. })
+        Some(Message::PaddedPing { padding: 1000, .. })
     ));
 
     drop(peer_tx);
     connection.await.unwrap();
 }
 
-/// A warm-up ping whose pong never arrives leaves the connection open and usable.
+/// A warm-up pong that arrives while a block request awaits its response reaches the warm-up,
+/// and the block request still waits for its block.
 #[tokio::test]
-async fn unanswered_warmup_ping_does_not_fail_the_connection() {
+async fn warmup_pong_is_delivered_while_a_block_request_is_pending() {
     let _init_guard = zakura_test::init();
-    tokio::time::pause();
 
     let (mut peer_tx, peer_rx) = futures::channel::mpsc::channel(1);
     let (mut connection, mut client_tx, _inbound, mut outbound, error_slot) =
@@ -136,32 +131,38 @@ async fn unanswered_warmup_ping_does_not_fail_the_connection() {
     connection.warmup_rx = warmup_rx;
     let connection = tokio::spawn(connection.run(peer_rx));
 
-    let (chunk, warmup_pong) = warmup_chunk(Nonce(4), 10);
-    warmup_tx.send(chunk).await.unwrap();
-    assert!(matches!(
-        outbound.next().await,
-        Some(Message::WarmupPing { .. })
-    ));
-    // The warm-up task gives up and closes its channel.
-    drop(warmup_pong);
-    drop(warmup_tx);
-    tokio::time::advance(REQUEST_TIMEOUT * 2).await;
-    assert!(error_slot.try_get_error().is_none());
-
-    let (heartbeat_tx, heartbeat_rx) = oneshot::channel();
+    let hash = block::Hash([9; 32]);
+    let (block_tx, mut block_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
-            request: Request::Ping(Nonce(5)),
-            tx: heartbeat_tx,
+            request: Request::BlocksByHash(IndexSet::from([hash])),
+            tx: block_tx,
             inv_collector: None,
             transient_addr: None,
             span: Span::none(),
         })
         .await
         .unwrap();
-    assert_eq!(outbound.next().await, Some(Message::Ping(Nonce(5))));
-    peer_tx.send(Ok(Message::Pong(Nonce(5)))).await.unwrap();
-    assert!(matches!(heartbeat_rx.await.unwrap(), Ok(Response::Pong(_))));
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![InventoryHash::Block(hash)]))
+    );
+
+    let warmup_nonce = Nonce(4);
+    let (chunk, warmup_pong) = warmup_chunk(warmup_nonce, 10);
+    warmup_tx.send(chunk).await.unwrap();
+    assert!(matches!(
+        outbound.next().await,
+        Some(Message::PaddedPing { .. })
+    ));
+
+    peer_tx.send(Ok(Message::Pong(warmup_nonce))).await.unwrap();
+    warmup_pong.await.expect("the warm-up pong is delivered");
+    assert!(
+        block_rx.try_recv().unwrap().is_none(),
+        "the block request still awaits its block"
+    );
+    assert!(error_slot.try_get_error().is_none());
 
     drop(peer_tx);
     connection.await.unwrap();

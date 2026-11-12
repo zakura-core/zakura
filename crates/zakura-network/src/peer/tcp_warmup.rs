@@ -46,8 +46,8 @@ pub(crate) struct WarmupChunk {
     pub nonce: Nonce,
     /// The zero bytes after the nonce.
     pub padding: u32,
-    /// Receives the time from the start of the ping's write to its `pong`.
-    pub pong: oneshot::Sender<Duration>,
+    /// Fires when the peer's `pong` arrives.
+    pub pong: oneshot::Sender<()>,
 }
 
 /// The queue size of a connection's warm-up channel. The driver waits for each `pong`, so it
@@ -72,7 +72,7 @@ struct Inner {
 
 impl TcpWarmup {
     /// Returns a coordinator that follows `latest_chain_tip`, or `None` if warm-up is disabled
-    /// or the kernel setting would undo it.
+    /// or the kernel would undo it.
     ///
     /// Must be called from within a Tokio runtime, because it spawns the tip watcher.
     pub fn spawn<C>(config: TcpWarmupConfig, latest_chain_tip: C) -> Option<Self>
@@ -85,7 +85,7 @@ impl TcpWarmup {
         let slow_start_after_idle = std::fs::read_to_string(SLOW_START_AFTER_IDLE_PATH)
             .ok()
             .map(|value| value.trim().to_string());
-        if slow_start_after_idle.as_deref() != Some("0") && !config.ignore_slow_start_after_idle {
+        if slow_start_after_idle.as_deref() != Some("0") {
             warn!(
                 ?slow_start_after_idle,
                 "TCP warm-up is disabled: set net.ipv4.tcp_slow_start_after_idle = 0, \
@@ -117,6 +117,9 @@ impl TcpWarmup {
     ///
     /// Returns when the warm-up completes or stops. It stops if a `pong` takes longer than the
     /// chunk timeout, or if the connection closes, and it never closes the connection itself.
+    /// The chunk timeout is less than half the connection's send timeout, and each ping is at
+    /// most twice the size of the last one that the peer answered in time, so writing the next
+    /// ping never takes long enough to fail the connection.
     pub(crate) async fn run(self, peer_ip: IpAddr, link: mpsc::Sender<WarmupChunk>) {
         let Some(mut claim) = self.claim(peer_ip) else {
             metrics::counter!("peer.tcp_warmup.skipped", "reason" => "cooldown").increment(1);
@@ -149,6 +152,7 @@ impl TcpWarmup {
                 padding,
                 pong: pong_tx,
             };
+            let sent_at = Instant::now();
             if link.send(chunk).await.is_err() {
                 return abort("closed", &rtts);
             }
@@ -157,7 +161,8 @@ impl TcpWarmup {
             }
 
             match tokio::time::timeout(config.chunk_timeout, pong_rx).await {
-                Ok(Ok(rtt)) => {
+                Ok(Ok(())) => {
+                    let rtt = sent_at.elapsed();
                     metrics::counter!("peer.tcp_warmup.bytes_sent").increment(padding.into());
                     metrics::histogram!(
                         "peer.tcp_warmup.chunk_rtt_seconds",

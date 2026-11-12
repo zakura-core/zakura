@@ -19,10 +19,10 @@ use zakura_chain::{
     serialization::Duration32,
 };
 
-/// The largest padding a warm-up `ping` can carry: the protocol message limit minus the
-/// 8-byte nonce. Peers disconnect on a larger message.
+/// The largest padding a `ping` can carry: the protocol message limit minus the 8-byte nonce.
+/// Peers disconnect on a larger message.
 // The message limit is 2 MiB, so the cast to u32 is lossless.
-pub const MAX_WARMUP_PING_PADDING: u32 =
+pub const MAX_PING_PADDING: u32 =
     (zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN - 8) as u32;
 
 /// A multiplier used to calculate the inbound connection limit for the peer set,

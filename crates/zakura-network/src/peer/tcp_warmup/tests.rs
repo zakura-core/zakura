@@ -29,7 +29,7 @@ async fn answer_all(mut link: mpsc::Receiver<WarmupChunk>) -> Vec<u32> {
     let mut paddings = Vec::new();
     while let Some(chunk) = link.recv().await {
         paddings.push(chunk.padding);
-        let _ = chunk.pong.send(Duration::from_millis(1));
+        let _ = chunk.pong.send(());
     }
     paddings
 }
@@ -42,18 +42,17 @@ fn default_schedule_doubles_to_the_message_limit() {
         schedule,
         [
             0,
-            16 << 10,
-            32 << 10,
-            64 << 10,
-            128 << 10,
-            256 << 10,
-            512 << 10,
-            1024 << 10,
-            crate::constants::MAX_WARMUP_PING_PADDING,
+            14_000,
+            28_000,
+            56_000,
+            112_000,
+            224_000,
+            448_000,
+            896_000,
+            1_792_000,
+            crate::constants::MAX_PING_PADDING,
         ]
     );
-    let total: u64 = schedule.iter().copied().map(u64::from).sum();
-    assert_eq!(total, (2048 << 10) - 16 * 1024 + 2_097_144);
 }
 
 #[test]
@@ -74,12 +73,12 @@ fn schedule_with_equal_first_and_max_sends_one_padded_ping() {
 }
 
 #[test]
-fn validation_rejects_chunks_over_the_message_limit() {
+fn validation_rejects_settings_that_peers_or_connections_cannot_take() {
     assert!(TcpWarmupConfig::default().validate().is_ok());
 
     for config in [
         TcpWarmupConfig {
-            max_chunk_bytes: crate::constants::MAX_WARMUP_PING_PADDING + 1,
+            max_chunk_bytes: crate::constants::MAX_PING_PADDING + 1,
             ..TcpWarmupConfig::default()
         },
         TcpWarmupConfig {
@@ -97,6 +96,10 @@ fn validation_rejects_chunks_over_the_message_limit() {
         },
         TcpWarmupConfig {
             chunk_timeout: Duration::ZERO,
+            ..TcpWarmupConfig::default()
+        },
+        TcpWarmupConfig {
+            chunk_timeout: crate::constants::REQUEST_TIMEOUT / 2,
             ..TcpWarmupConfig::default()
         },
     ] {
@@ -223,7 +226,7 @@ async fn padded_pings_wait_for_a_quiet_tip() {
         .recv()
         .await
         .expect("the probe does not wait for the tip");
-    let _ = probe.pong.send(Duration::ZERO);
+    let _ = probe.pong.send(());
 
     // A tip change half-way through the quiet time restarts it.
     tokio::time::advance(config.tip_quiet / 2).await;

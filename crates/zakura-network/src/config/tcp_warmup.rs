@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::MAX_WARMUP_PING_PADDING;
+use crate::constants::{MAX_PING_PADDING, REQUEST_TIMEOUT};
 
 /// Settings for warming the send direction of new legacy TCP connections.
 ///
@@ -23,6 +23,11 @@ pub struct TcpWarmupConfig {
     pub enabled: bool,
 
     /// The padding bytes in the first padded ping.
+    ///
+    /// The default fits the first ping, with its header and nonce, in a new connection's
+    /// initial window of 10 segments (about 14,000 bytes). Each padded ping then fits the
+    /// window that the previous one doubled, so each takes one round trip. A larger first ping
+    /// spills past the window, and every step takes two round trips.
     pub first_chunk_bytes: u32,
 
     /// The padding bytes in the last padded ping. Doubling stops at this size.
@@ -46,33 +51,31 @@ pub struct TcpWarmupConfig {
 
     /// How long a connection waits for each `pong` before it stops warming. A timeout never
     /// closes the connection.
+    ///
+    /// It must be less than half of [`REQUEST_TIMEOUT`], the time a connection allows for each
+    /// write. Each ping is twice the size of the last one, so a peer that answered the last
+    /// one within this time takes at most about twice this time to accept the next one.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub chunk_timeout: Duration,
-
-    /// Warm connections even when `net.ipv4.tcp_slow_start_after_idle` is not 0.
-    ///
-    /// The kernel then shrinks the window again after each idle period, so this is useful only
-    /// for experiments.
-    pub ignore_slow_start_after_idle: bool,
 }
 
 impl Default for TcpWarmupConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            first_chunk_bytes: 16 * 1024,
-            max_chunk_bytes: MAX_WARMUP_PING_PADDING,
+            first_chunk_bytes: 14_000,
+            max_chunk_bytes: MAX_PING_PADDING,
             max_concurrent: 16,
             peer_cooldown: Duration::from_secs(24 * 60 * 60),
             tip_quiet: Duration::from_secs(2),
-            chunk_timeout: Duration::from_secs(20),
-            ignore_slow_start_after_idle: false,
+            chunk_timeout: Duration::from_secs(5),
         }
     }
 }
 
 impl TcpWarmupConfig {
-    /// Checks that the settings describe a warm-up that peers accept.
+    /// Checks that the settings describe a warm-up that peers accept and that never fails a
+    /// connection.
     pub fn validate(&self) -> Result<(), String> {
         if self.first_chunk_bytes == 0 {
             return Err("network.tcp_warmup.first_chunk_bytes must be greater than 0".into());
@@ -82,17 +85,21 @@ impl TcpWarmupConfig {
                 "network.tcp_warmup.first_chunk_bytes must not exceed max_chunk_bytes".into(),
             );
         }
-        if self.max_chunk_bytes > MAX_WARMUP_PING_PADDING {
+        if self.max_chunk_bytes > MAX_PING_PADDING {
             return Err(format!(
-                "network.tcp_warmup.max_chunk_bytes must be at most {MAX_WARMUP_PING_PADDING}, \
+                "network.tcp_warmup.max_chunk_bytes must be at most {MAX_PING_PADDING}, \
                  because peers disconnect on larger messages"
             ));
         }
         if self.max_concurrent == 0 {
             return Err("network.tcp_warmup.max_concurrent must be greater than 0".into());
         }
-        if self.chunk_timeout.is_zero() {
-            return Err("network.tcp_warmup.chunk_timeout must be greater than 0".into());
+        if self.chunk_timeout.is_zero() || self.chunk_timeout * 2 >= REQUEST_TIMEOUT {
+            return Err(format!(
+                "network.tcp_warmup.chunk_timeout must be greater than 0 and less than {:?}, \
+                 so that writing the next ping never times out the connection",
+                REQUEST_TIMEOUT / 2
+            ));
         }
         Ok(())
     }

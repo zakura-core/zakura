@@ -71,11 +71,10 @@ pub enum Message {
     /// A `ping` message whose body carries `padding` zero bytes after its nonce.
     ///
     /// It encodes as the `ping` command. Receivers ignore a ping body's trailing bytes and
-    /// answer with an ordinary `pong`, so the padding grows our TCP congestion window on a new
-    /// connection before it carries a full block. Peers' pings always decode as
-    /// [`Self::Ping`], so this variant is only ever sent.
+    /// answer with an ordinary `pong`. The decoder drops those bytes, so a received padded ping
+    /// is a [`Self::Ping`], and this variant is only ever sent.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    WarmupPing {
+    PaddedPing {
         /// A nonce unique to this ping, echoed by the peer's `pong`.
         nonce: Nonce,
         /// The number of zero bytes after the nonce.
@@ -454,7 +453,7 @@ impl fmt::Display for Message {
             Message::Verack => "verack".to_string(),
 
             Message::Ping(_) => "ping".to_string(),
-            Message::WarmupPing { padding, .. } => format!("ping {{ padding: {padding} }}"),
+            Message::PaddedPing { padding, .. } => format!("ping {{ padding: {padding} }}"),
             Message::Pong(_) => "pong".to_string(),
 
             Message::Reject {
@@ -513,7 +512,7 @@ impl Message {
         match self {
             Message::Version(_) => "version",
             Message::Verack => "verack",
-            Message::Ping(_) | Message::WarmupPing { .. } => "ping",
+            Message::Ping(_) | Message::PaddedPing { .. } => "ping",
             Message::Pong(_) => "pong",
             Message::Reject { .. } => "reject",
             Message::P2pV2Upgrade(_) => "p2pv2up",

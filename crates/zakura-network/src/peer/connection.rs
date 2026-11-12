@@ -609,8 +609,7 @@ pub(crate) struct ConnectionRequests<C> {
 #[derive(Debug)]
 struct PendingWarmup {
     nonce: Nonce,
-    write_started_at: Instant,
-    pong: tokio::sync::oneshot::Sender<Duration>,
+    pong: tokio::sync::oneshot::Sender<()>,
 }
 
 /// The channels, services, and associated state for a peer connection.
@@ -1289,19 +1288,12 @@ where
             return;
         }
 
-        let write_started_at = Instant::now();
         match self
             .peer_tx
-            .send(Message::WarmupPing { nonce, padding })
+            .send(Message::PaddedPing { nonce, padding })
             .await
         {
-            Ok(()) => {
-                self.pending_warmup = Some(PendingWarmup {
-                    nonce,
-                    write_started_at,
-                    pong,
-                })
-            }
+            Ok(()) => self.pending_warmup = Some(PendingWarmup { nonce, pong }),
             Err(error) => self.fail_with(error).await,
         }
     }
@@ -1534,7 +1526,7 @@ where
                 Consumed
             }
             // The decoder returns padded pings as `Ping`, so peers never send this variant.
-            Message::WarmupPing { .. } => Unused,
+            Message::PaddedPing { .. } => Unused,
             // These messages shouldn't be sent outside of a handshake.
             Message::Version { .. } => {
                 self.fail_with(PeerError::DuplicateHandshake).await;
@@ -1565,7 +1557,7 @@ where
                     .pending_warmup
                     .take_if(|pending| pending.nonce == nonce)
                 {
-                    let _ = pending.pong.send(pending.write_started_at.elapsed());
+                    let _ = pending.pong.send(());
                     Consumed
                 } else {
                     debug!(%msg, "got pong message unsolicited or from canceled request");

@@ -872,10 +872,10 @@ fn warmup_ping_encodes_as_padded_ping() {
     codec.reconfigure_full_body_len();
     let nonce = Nonce(0x0123_4567_89ab_cdef);
 
-    for padding in [0, 1, 16 * 1024, crate::constants::MAX_WARMUP_PING_PADDING] {
+    for padding in [0, 1, 16 * 1024, crate::constants::MAX_PING_PADDING] {
         let mut bytes = BytesMut::new();
         codec
-            .encode(Message::WarmupPing { nonce, padding }, &mut bytes)
+            .encode(Message::PaddedPing { nonce, padding }, &mut bytes)
             .expect("a warm-up ping within the message limit encodes");
 
         assert_eq!(&bytes[4..16], b"ping\0\0\0\0\0\0\0\0");
@@ -893,9 +893,9 @@ fn warmup_ping_encodes_as_padded_ping() {
     let mut bytes = BytesMut::new();
     codec
         .encode(
-            Message::WarmupPing {
+            Message::PaddedPing {
                 nonce,
-                padding: crate::constants::MAX_WARMUP_PING_PADDING + 1,
+                padding: crate::constants::MAX_PING_PADDING + 1,
             },
             &mut bytes,
         )

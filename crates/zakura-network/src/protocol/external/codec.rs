@@ -197,7 +197,7 @@ impl Encoder<Message> for Codec {
         let command = match item {
             Version { .. } => b"version\0\0\0\0\0",
             Verack => b"verack\0\0\0\0\0\0",
-            Ping { .. } | WarmupPing { .. } => b"ping\0\0\0\0\0\0\0\0",
+            Ping { .. } | PaddedPing { .. } => b"ping\0\0\0\0\0\0\0\0",
             Pong { .. } => b"pong\0\0\0\0\0\0\0\0",
             Reject { .. } => b"reject\0\0\0\0\0\0",
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
@@ -295,7 +295,7 @@ impl Codec {
             Message::Ping(nonce) => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;
             }
-            Message::WarmupPing { nonce, padding } => {
+            Message::PaddedPing { nonce, padding } => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;
                 write_zeros(writer, *padding)?;
             }

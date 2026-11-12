@@ -1822,7 +1822,9 @@ impl HasView for HeaderWire {
 impl Subsystem for HeaderWire {
     const NAME: &'static str = "header-sync/wire";
     // 3: scenario tag 0xFE 0x10 picks the lower-locator saved Plan.
-    const GENERATOR: u32 = 3;
+    // 4: tags 0xFE 0x11 to 0x13 pick fuzz-13's reopen, old page and
+    // crossing saved Plans.
+    const GENERATOR: u32 = 4;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = WirePorts;
@@ -2035,6 +2037,7 @@ impl Subsystem for HeaderWire {
                 listening,
                 chain: ports.chains[index].clone(),
                 records: ports.records.clone(),
+                order: net.order(),
                 closed: ports.closed.clone(),
                 taken: 0,
             };

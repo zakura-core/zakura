@@ -103,13 +103,13 @@ fn state_features_have_distinct_indices_inside_their_blocks() {
     }
 }
 
-/// [`FEEDBACK_VERSION`] 3's layout: one pinned index per block, and every
+/// [`FEEDBACK_VERSION`] 4's layout: one pinned index per block, and every
 /// vocabulary's size. A change here changes what a corpus means, so it
 /// bumps the version.
 #[test]
 fn the_layout_is_pinned_to_its_version() {
     use zakura_sim::explore::state::*;
-    assert_eq!(FEEDBACK_VERSION, 3);
+    assert_eq!(FEEDBACK_VERSION, 4);
     let pinned = [
         (
             StateFeature::HeaderRetired {
@@ -209,6 +209,7 @@ fn the_layout_is_pinned_to_its_version() {
             StateFeature::Transition(Transition::RefusedUnlisted),
             20480 + 2048 + 17,
         ),
+        (StateFeature::ConformantCrossing, 20480 + 3072),
         (
             StateFeature::Hold {
                 op: Operation::ReadRange,
@@ -293,7 +294,7 @@ fn the_layout_is_pinned_to_its_version() {
             18, 2, 3, 7, 8, 3, 3, 2, 2, 2
         ]
     );
-    assert_eq!(StateFeature::all().len(), 2_688);
+    assert_eq!(StateFeature::all().len(), 2_689);
     // Swapping two values inside a vocabulary keeps every size above, and
     // can keep every pinned index, but moves both values' indices. The
     // digest of every feature's index pins the whole mapping.
@@ -306,7 +307,7 @@ fn the_layout_is_pinned_to_its_version() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        digest, "089432c52072c3294eb11a3f5fad07bd13496e6746856a1c430540482e1a64b1",
+        digest, "62dda724b9a4bc56960d601ac0bb3a9baff241866c1b52fd4dede0ef73b65df6",
         "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
     );
 }
@@ -602,6 +603,10 @@ fn witnesses() -> Vec<Witness> {
     for (stem, _) in support::storage_witnesses::witness_seeds() {
         all.push(drawn("header-sync/storage", &stem, seed(&stem)));
     }
+    // fuzz-13's saved Plans, each run from its committed seed.
+    for stem in FUZZ_13_SEEDS {
+        all.push(drawn("header-sync/wire", stem, seed(stem)));
+    }
     // Competing mirrors under more plans, which also reach a reorg.
     for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
         all.push(explicit::<HeaderStorage>(
@@ -612,6 +617,13 @@ fn witnesses() -> Vec<Witness> {
     }
     all
 }
+
+/// fuzz-13's committed `header-sync/wire` seeds.
+const FUZZ_13_SEEDS: [&str; 3] = [
+    "header-wire-reopen",
+    "header-wire-old-page-after-reopen",
+    "header-wire-outcome-crossing",
+];
 
 /// The no-hold passing control: [`StorageScenario::grow`] under a Plan whose
 /// run leaves an operation pending through its drain, and prepares one chain
@@ -780,6 +792,15 @@ fn every_collected_state_has_a_witness() {
         (
             "header-storage-w-stop-storage",
             &["external acknowledgement"][..],
+        ),
+        ("header-wire-reopen", &["stream replacement"][..]),
+        (
+            "header-wire-old-page-after-reopen",
+            &["old-session traffic delivered"][..],
+        ),
+        (
+            "header-wire-outcome-crossing",
+            &["conformant crossed updates"][..],
         ),
     ];
     for (name, rows) in own {

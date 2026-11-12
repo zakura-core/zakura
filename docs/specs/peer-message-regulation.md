@@ -188,7 +188,8 @@ Cadence MUST run before expensive verification, sampling, or handler work. Stale
 unchanged messages MUST count toward cadence.
 
 - The sender MUST obey the declared minimum interval, including across configurable refreshes.
-  It MAY send one initial message where the message rules permit it.
+  It MAY send one initial message where the message rules permit it, and earlier messages only
+  where a message rule says so, as block-sync `Status` does for a new tip.
 - Receiver capacity MUST tolerate the allowed initial send, jitter, coalescing, and buffered
   arrivals after transport stalls or intentional read pauses.
 - A sender rate below half the receiver refill rate does not by itself prove burst tolerance.
@@ -810,13 +811,23 @@ there.
   - refill = 1 message / 15 seconds
   - on_empty = record and forward (exhaustion is not a violation)
 
-The sender MUST send at most one `Status` every 30 seconds, including range corrections. It MAY
-send one immediate `Status` when the connection opens. The handler MUST retain bounded latest-status
-state and SHOULD suppress redundant candidate-selection work without requiring a separate relevance
-snapshot.
+The sender MUST send at most one `Status` every 30 seconds, including range corrections, with one
+exception. A `Status` that announces a new tip, meaning a higher `servable_high`, MAY follow the
+previous `Status` after one second. A different `tip_hash` at the same height is not a new tip:
+receivers do not act on it, so it keeps the 30-second interval. It MAY do so only
+while the sender's own copy of the receiver's bucket, charged one token for every `Status` it
+queues, holds more than half the capacity. Range corrections, such as a pruned low end or a lower
+tip, keep the 30-second interval. It MAY send one immediate `Status` when the connection opens. The
+handler MUST retain bounded latest-status state and SHOULD suppress redundant candidate-selection
+work without requiring a separate relevance snapshot.
 
-The receiver capacity allows 20 messages buffered over the maximum ten-minute transport outage,
-plus the initial message and one message of jitter. The sender interval remains 30 seconds.
+The receiver capacity allows 20 messages buffered over the maximum ten-minute transport outage at
+the 30-second interval, plus the initial message and one message of jitter. Early tip sends leave
+at least 11 tokens in the sender's copy, so at most 11 go out back to back one second apart, and
+later ones follow the 15-second refill. The sender spends tokens when it queues a `Status`, not
+when the receiver reads it, so a transport stall that buffers early sends can still deliver more
+than the capacity at once. The receiver records that exhaustion and does not treat it as a
+violation.
 
 #### `GetBlocks` — Request, discriminator 2
 

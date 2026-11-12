@@ -412,6 +412,9 @@ pub enum Observation {
         /// The frame's position among the peer's writes on the stream, from
         /// 0.
         seq: u64,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as `write_all`
+        /// returned.
+        order: u64,
     },
     /// A scripted peer closed its connection with `Conn::close`, so its
     /// close is on its way and nothing it sends on the connection follows
@@ -465,6 +468,10 @@ pub enum Observation {
         payload: u64,
         /// The credit an update adds, for an `Open` or `Grant`.
         credit: Option<PeerCredit>,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as the peer's
+        /// reader finished reading the frame, which can be well before the
+        /// peer's main task records it.
+        order: u64,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -2072,6 +2079,9 @@ pub enum TransportFact {
         seq: u64,
         /// The frame's message type.
         message_type: u16,
+        /// The run's [`crate::net::WireOrder`] stamp, taken when the tap's
+        /// observer heard of the write, before it buffered the event.
+        order: u64,
     },
     /// The node decided to close the connection: its first recorded close
     /// cause, or `None` for a cancellation with no cause recorded first.

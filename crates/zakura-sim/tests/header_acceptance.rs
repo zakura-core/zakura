@@ -4823,6 +4823,20 @@ fn the_evaluator_accepts_genuine_results() {
         held(),
         Report::Violated
     )));
+    // The same Draft run with no trigger, as a failed witness leaves it,
+    // blocks however its reports read.
+    let mut file = results();
+    let (baseline, patched, draft, _) = caught_runs(&mut file, END_CASE);
+    baseline.reports.insert("t/b".into(), held());
+    patched.end = End::Violation {
+        property: "t/a".into(),
+    };
+    patched.actions = Actions::Prefix;
+    patched.reports.insert("t/b".into(), held());
+    draft.reports.insert("t/b".into(), Report::Violated);
+    draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
+    draft.trigger = false;
+    assert!(blocked(&state(&later, &file, &late)));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on

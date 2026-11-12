@@ -1740,7 +1740,7 @@ impl CaseChecks<'_> {
     /// The case's `Draft` run, as `run`, which the tool records itself with
     /// the case's rebuilt binary (C9): it must have run the committed input,
     /// with a witness file judging the case's property as the task's
-    /// `draft_witness` expects ([`witness_judges`]), from the binary the
+    /// `draft_witness` expects ([`witness_judges`]) that passed, from the binary the
     /// provenance check measured, which must have passed, and be its
     /// baseline's counterfactual ([`counterfactual_refusal`]). Its override
     /// is read from its meta, and the evaluator judges its set
@@ -1763,6 +1763,14 @@ impl CaseChecks<'_> {
                     "its witness file doesn't judge {} as {:?} expects",
                     self.property, self.draft_witness
                 ),
+            );
+        } else if !execution.trigger {
+            // A run with no scripted acts is complete whatever its witness
+            // found, so only the witness's own verdict shows its trigger.
+            execution.actions = Actions::Incomplete;
+            fail(
+                &mut execution,
+                format!("its witness of {} didn't pass", self.property),
             );
         }
         let rebuild = self.rebuild();
@@ -4945,6 +4953,66 @@ mod tests {
             same_run_input(&baseline, &moved).is_ok()
         });
         assert!(keys >= 3, "{keys}");
+    }
+
+    /// A `Draft` run counts only with a passing witness. A machine run has
+    /// no scripted acts, so its actions are complete whatever its witness
+    /// says, like a held node case such as `page-past-credit`'s: the
+    /// witness's own `passed` is all that tells the two apart. The same
+    /// bound witness judging the case's property as its task expects, with
+    /// `passed: false`, fails the run and shows no trigger.
+    #[test]
+    fn a_failed_draft_witness_fails_its_run() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let case = case_dir("s", "patched");
+        let draft_dir = case.path().join("draft");
+        record_into(&draft_dir, "patched");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let expected = PatchedWitness {
+            expect: "violated".into(),
+            beside: Vec::new(),
+        };
+        let checks = CaseChecks {
+            repo: &repo,
+            dir: case.path(),
+            property: MACHINE,
+            harness: MACHINE,
+            input: &input,
+            subject_source: "s",
+            draft_witness: Some(&expected),
+            subject: "s",
+            patch: TEST_PATCH,
+        };
+        let draft_run = |passed: bool| {
+            write_witness(
+                &draft_dir,
+                serde_json::json!({
+                    "property": MACHINE,
+                    "expect": "violated",
+                    "also_violates": [],
+                    "passed": passed,
+                    "error": (!passed).then_some("the property held"),
+                }),
+            );
+            checks.draft(RunId::Case {
+                property: MACHINE.into(),
+                name: "a".into(),
+                run: CaseRun::Draft,
+            })
+        };
+        let caught = draft_run(true);
+        assert_eq!(caught.end, End::Completed);
+        assert!(caught.trigger);
+        assert_eq!(caught.actions, Actions::Complete);
+        let failed = draft_run(false);
+        assert!(!failed.trigger);
+        assert!(
+            matches!(&failed.end, End::Failed { why } if why.contains("didn't pass")),
+            "{:?}",
+            failed.end
+        );
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task

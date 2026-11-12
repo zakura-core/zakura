@@ -1726,7 +1726,8 @@ fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), Strin
 }
 
 /// A `Caught`'s `Draft` run, the one Draft-set judge: a completed counted
-/// run with the set as its override, judged as a counterfactual of the
+/// run with the set as its override and its trigger history, a passing
+/// witness of the case's property, judged as a counterfactual of the
 /// case's `baseline` on one input (Adam, 2026-11-12). The set passes only
 /// if all of these hold:
 ///
@@ -1759,6 +1760,9 @@ fn caught_draft(
 ) -> Result<(), String> {
     same_run(manifest, run, &RunId::case(case, CaseRun::Draft), harness)?;
     completed(run)?;
+    if !run.trigger {
+        return Err("its Draft run lost the trigger history".into());
+    }
     inventory(manifest, run, harness)?;
     if let Some(member) = violated(baseline).find(|id| set.contains(id)) {
         return Err(format!(

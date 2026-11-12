@@ -316,6 +316,35 @@ pub const MIN_HELD_SEAT_CONNECTION_AGE: Duration = Duration::from_secs(10 * 60);
 /// peers. Limits below this divisor hold no seats.
 pub const INBOUND_SEAT_HOLD_LIMIT_DIVISOR: usize = 10;
 
+/// How long an outbound connection must stay open for Zakura to dial its peer again soon
+/// after it closes.
+///
+/// This matches [`MIN_HELD_SEAT_CONNECTION_AGE`], so a node redials the same connections
+/// that its peers hold seats for.
+pub const MIN_REDIALED_CONNECTION_AGE: Duration = MIN_HELD_SEAT_CONNECTION_AGE;
+
+/// After a long-lived outbound connection closes, Zakura dials its peer again this long after
+/// the close, at each time in turn until one dial succeeds. Implemented by
+/// `peer_set::initialize::crawl_and_dial`.
+///
+/// A peer that restarts reopens its listener with every inbound seat empty, and on Mainnet
+/// other nodes take those seats within two to three minutes. On the Mainnet fleet, a restart
+/// reopened the listener about 10 to 50 seconds after the node was asked to stop.
+///
+/// The first redial waits longer than [`CONCURRENT_ADDRESS_CHANGE_PERIOD`], so the address
+/// book records it as a new attempt.
+///
+/// ## Security
+///
+/// See `peer_set::initialize::dropped_peer_redials` for why these redials can skip
+/// [`MIN_PEER_RECONNECTION_DELAY`].
+pub const DROPPED_PEER_REDIAL_DELAYS: [Duration; 4] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
 /// The minimum time between successive calls to
 /// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
 ///
@@ -585,6 +614,31 @@ mod tests {
         assert!(
             INBOUND_SEAT_HOLD_LIMIT_DIVISOR > 1,
             "held seats must leave most of the inbound limit to connected peers"
+        );
+    }
+
+    /// Make sure redials of a dropped peer are recorded, ordered, and overlap the seat hold.
+    #[test]
+    fn ensure_dropped_peer_redials_are_consistent() {
+        let _init_guard = zakura_test::init();
+
+        assert!(
+            DROPPED_PEER_REDIAL_DELAYS[0] > CONCURRENT_ADDRESS_CHANGE_PERIOD,
+            "the address book ignores an attempt that is too close to the failure before it"
+        );
+        assert!(
+            DROPPED_PEER_REDIAL_DELAYS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "redials must be in time order"
+        );
+        assert!(
+            DROPPED_PEER_REDIAL_DELAYS[0] < INBOUND_SEAT_HOLD_DURATION,
+            "a connection that drops without a restart must be redialed while its seat is held"
+        );
+        assert_eq!(
+            MIN_REDIALED_CONNECTION_AGE, MIN_HELD_SEAT_CONNECTION_AGE,
+            "a node must redial the connections that its peers hold seats for"
         );
     }
 

@@ -38,9 +38,10 @@ use crate::{
     address_book_updater::AddressBookUpdater,
     config::CacheDir,
     constants, init,
-    meta_addr::{MetaAddr, PeerAddrState},
+    meta_addr::{MetaAddr, MetaAddrChange, PeerAddrState},
     peer::{self, ClientTestHarness, ConnectedAddr, HandshakeRequest, OutboundConnectorRequest},
     peer_cache_updater::update_peer_cache_once,
+    peer_registry::PeerRegistry,
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
@@ -2130,6 +2131,502 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     );
 }
 
+/// Returns the peer address that the redial tests connect to.
+fn redial_test_peer() -> PeerSocketAddr {
+    "127.0.0.9:8233"
+        .parse()
+        .expect("hard-coded test address is valid")
+}
+
+/// Options for [`spawn_redial_crawler`].
+#[derive(Default)]
+struct RedialCrawlerOptions {
+    /// Fail every dial.
+    fail_dials: bool,
+
+    /// The ban list that the crawler checks.
+    bans: BannedIps,
+
+    /// The active connections that the crawler checks.
+    peer_registry: PeerRegistry,
+
+    /// Open outbound connections to other peers, which count against the outbound limit.
+    other_connections: usize,
+}
+
+/// A crawler whose address book is empty, so every dial it makes is a redial, with one open
+/// connection to each redialed peer.
+struct RedialCrawler {
+    /// The open connections to the redialed peers.
+    connections: Vec<ConnectionTracker>,
+
+    /// The open connections to other peers.
+    other_connections: Vec<ConnectionTracker>,
+
+    /// The address and start time of each dial.
+    dials_rx: tokio::sync::mpsc::UnboundedReceiver<(PeerSocketAddr, tokio::time::Instant)>,
+
+    /// The connections that successful dials opened.
+    opened_rx: tokio::sync::mpsc::UnboundedReceiver<ConnectionTracker>,
+
+    /// The changes that the crawler sent to the address book.
+    address_book_updates_rx: tokio::sync::mpsc::Receiver<MetaAddrChange>,
+
+    /// The peers that the crawler sent to the peer set.
+    peerset_rx: mpsc::Receiver<DiscoveredPeer>,
+
+    crawl_task_handle: JoinHandle<Result<(), BoxError>>,
+}
+
+impl RedialCrawler {
+    /// Closes the connections to the redialed peers after they have been open for
+    /// `open_for`, and returns when they closed.
+    async fn close_after(&mut self, open_for: Duration) -> tokio::time::Instant {
+        tokio::time::advance(open_for).await;
+        let closed_at = tokio::time::Instant::now();
+        self.connections.clear();
+
+        closed_at
+    }
+
+    /// Runs the crawler until `until`, and returns the address of each dial, and how long
+    /// after `closed_at` it started.
+    async fn dials_until(
+        &mut self,
+        closed_at: tokio::time::Instant,
+        until: tokio::time::Instant,
+    ) -> Vec<(PeerSocketAddr, Duration)> {
+        let mut dials = Vec::new();
+
+        loop {
+            // Let the crawler and its dial tasks run at this time.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            while let Ok((addr, dialed_at)) = self.dials_rx.try_recv() {
+                dials.push((addr, dialed_at.saturating_duration_since(closed_at)));
+            }
+
+            if tokio::time::Instant::now() >= until {
+                return dials;
+            }
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Like [`Self::dials_until`], for a crawler with one redialed peer.
+    async fn redial_times_until(
+        &mut self,
+        closed_at: tokio::time::Instant,
+        until: tokio::time::Instant,
+    ) -> Vec<Duration> {
+        self.dials_until(closed_at, until)
+            .await
+            .into_iter()
+            .map(|(addr, dialed_after)| {
+                assert_eq!(addr, redial_test_peer(), "only the dropped peer is dialed");
+                dialed_after
+            })
+            .collect()
+    }
+}
+
+impl Drop for RedialCrawler {
+    fn drop(&mut self) {
+        self.crawl_task_handle.abort();
+    }
+}
+
+/// Spawns a [`RedialCrawler`] with an open connection to each of `peers`, and `options`.
+async fn spawn_redial_crawler(
+    peers: &[PeerSocketAddr],
+    options: RedialCrawlerOptions,
+) -> RedialCrawler {
+    let config = Config {
+        peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
+        // A periodic crawl never runs during these tests.
+        crawl_new_peer_interval: Duration::from_secs(60 * 60),
+        ..test_defaults()
+    };
+
+    let address_book = Arc::new(std::sync::Mutex::new(AddressBook::new(
+        config.listen_addr,
+        &config.network,
+        config.max_connections_per_ip,
+        tracing::Span::none(),
+    )));
+    let no_peer_addresses = service_fn(|request| async move {
+        assert!(
+            matches!(request, Request::Peers),
+            "crawler should only request peer addresses"
+        );
+        Err::<Response, BoxError>("redial test crawls return no addresses".into())
+    });
+    let candidates = CandidateSet::new(address_book, no_peer_addresses);
+
+    let (dials_tx, dials_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (opened_tx, opened_rx) = tokio::sync::mpsc::unbounded_channel();
+    let fail_dials = options.fail_dials;
+    let outbound_connector = service_fn(move |request: OutboundConnectorRequest| {
+        let dials_tx = dials_tx.clone();
+        let opened_tx = opened_tx.clone();
+
+        async move {
+            let OutboundConnectorRequest {
+                addr,
+                mut connection_tracker,
+            } = request;
+
+            dials_tx
+                .send((addr, tokio::time::Instant::now()))
+                .expect("redial test dial observer remains open");
+
+            if fail_dials {
+                return Err::<_, BoxError>("redial test dial failure".into());
+            }
+
+            // A handshake that succeeds marks its connection open.
+            connection_tracker.mark_open();
+            let _ = opened_tx.send(connection_tracker);
+
+            let (fake_client, _harness) = ClientTestHarness::build().finish();
+            Ok((addr, fake_client))
+        }
+    });
+
+    let mut active_outbound_connections = ActiveConnectionCounter::new_counter_with(
+        config.peerset_outbound_connection_limit(),
+        "Redial Test Outbound Connections",
+    );
+    let connections = peers
+        .iter()
+        .map(|peer| {
+            let mut connection = active_outbound_connections.track_connection_from(*peer);
+            connection.mark_open();
+            connection
+        })
+        .collect();
+    let other_connections = (0..options.other_connections)
+        .map(|_| {
+            let mut connection = active_outbound_connections.track_connection();
+            connection.mark_open();
+            connection
+        })
+        .collect();
+
+    let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(8);
+    let (demand_tx, demand_rx) = mpsc::channel::<MorePeers>(8);
+    let (address_book_updater, address_book_updates_rx) = tokio::sync::mpsc::channel(32);
+
+    let crawl_task_handle = tokio::spawn(crawl_and_dial(
+        config,
+        demand_tx,
+        demand_rx,
+        candidates,
+        tower::util::BoxCloneService::new(outbound_connector),
+        peerset_tx,
+        active_outbound_connections,
+        address_book_updater,
+        options.bans,
+        options.peer_registry,
+        Arc::new(AtomicBool::new(false)),
+    ));
+
+    RedialCrawler {
+        connections,
+        other_connections,
+        dials_rx,
+        opened_rx,
+        address_book_updates_rx,
+        peerset_rx,
+        crawl_task_handle,
+    }
+}
+
+/// Asserts that a redial started at `delay` after the close, within one test clock step.
+fn assert_redial_time(dial: Duration, delay: Duration) {
+    assert!(
+        dial >= delay && dial < delay + Duration::from_secs(1),
+        "redial started {dial:?} after the close, expected {delay:?}"
+    );
+}
+
+/// The time after a close by which every redial has had its chance.
+const AFTER_EVERY_REDIAL: Duration = Duration::from_secs(5 * 60);
+
+/// Test the crawler dials a long-lived outbound peer again at the first redial time after its
+/// connection closes, records the attempt first, and stops once it reconnects. The new
+/// connection is redialed in turn when it closes.
+#[tokio::test(start_paused = true)]
+async fn crawler_redials_a_long_lived_peer_after_its_connection_closes() {
+    let _init_guard = zakura_test::init();
+
+    let mut crawler =
+        spawn_redial_crawler(&[redial_test_peer()], RedialCrawlerOptions::default()).await;
+
+    let closed_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    let dials = crawler
+        .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)
+        .await;
+
+    assert_eq!(dials.len(), 1, "a successful redial is the last: {dials:?}");
+    assert_redial_time(dials[0], constants::DROPPED_PEER_REDIAL_DELAYS[0]);
+
+    assert_eq!(
+        crawler.address_book_updates_rx.try_recv().ok(),
+        Some(MetaAddr::new_reconnect(redial_test_peer())),
+        "the redial records its attempt in the address book"
+    );
+    assert!(
+        crawler.peerset_rx.try_recv().is_ok(),
+        "the reconnected peer joins the peer set"
+    );
+
+    // The connection that the redial opened is long-lived too.
+    crawler.connections.push(
+        crawler
+            .opened_rx
+            .try_recv()
+            .expect("the successful redial opened a connection"),
+    );
+    let closed_again_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    let dials = crawler
+        .redial_times_until(closed_again_at, closed_again_at + AFTER_EVERY_REDIAL)
+        .await;
+
+    assert_eq!(dials.len(), 1, "the new connection is redialed: {dials:?}");
+    assert_redial_time(dials[0], constants::DROPPED_PEER_REDIAL_DELAYS[0]);
+}
+
+/// Test the crawler dials a dropped peer that refuses every redial at each redial time, and
+/// then no more.
+#[tokio::test(start_paused = true)]
+async fn crawler_stops_redialing_after_the_last_redial_time() {
+    let _init_guard = zakura_test::init();
+
+    let mut crawler = spawn_redial_crawler(
+        &[redial_test_peer()],
+        RedialCrawlerOptions {
+            fail_dials: true,
+            ..RedialCrawlerOptions::default()
+        },
+    )
+    .await;
+
+    let closed_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    let dials = crawler
+        .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)
+        .await;
+
+    assert_eq!(
+        dials.len(),
+        constants::DROPPED_PEER_REDIAL_DELAYS.len(),
+        "each redial time gets one dial: {dials:?}"
+    );
+    for (dial, delay) in dials.into_iter().zip(constants::DROPPED_PEER_REDIAL_DELAYS) {
+        assert_redial_time(dial, delay);
+    }
+
+    let mut updates = Vec::new();
+    while let Ok(update) = crawler.address_book_updates_rx.try_recv() {
+        updates.push(update);
+    }
+    let attempt_then_failure = [
+        MetaAddr::new_reconnect(redial_test_peer()),
+        MetaAddr::new_errored(redial_test_peer(), None),
+    ];
+    assert_eq!(
+        updates,
+        attempt_then_failure.repeat(constants::DROPPED_PEER_REDIAL_DELAYS.len()),
+        "each redial records its attempt, then its failure"
+    );
+}
+
+/// Test the crawler spaces out redials that are due at the same time, like startup dials.
+#[tokio::test(start_paused = true)]
+async fn crawler_spaces_out_redials_that_are_due_together() {
+    let _init_guard = zakura_test::init();
+
+    let peers: Vec<PeerSocketAddr> = (1..=3)
+        .map(|last_octet| {
+            format!("127.0.1.{last_octet}:8233")
+                .parse()
+                .expect("test peer address is valid")
+        })
+        .collect();
+    let mut crawler = spawn_redial_crawler(&peers, RedialCrawlerOptions::default()).await;
+
+    let closed_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    let first_redial = closed_at + constants::DROPPED_PEER_REDIAL_DELAYS[0];
+    let mut dials = crawler.dials_until(closed_at, first_redial).await;
+    assert_eq!(
+        dials.len(),
+        1,
+        "only one redial starts at the redial time: {dials:?}"
+    );
+
+    dials.extend(
+        crawler
+            .dials_until(closed_at, first_redial + Duration::from_secs(1))
+            .await,
+    );
+    let mut dialed: Vec<_> = dials.into_iter().map(|(addr, _)| addr).collect();
+    dialed.sort_by_key(|addr| addr.remove_socket_addr_privacy());
+    assert_eq!(dialed, peers, "each dropped peer is redialed once");
+}
+
+/// Test the crawler waits for room under the outbound connection limit, and redials at the
+/// next redial time once there is room.
+#[tokio::test(start_paused = true)]
+async fn crawler_redials_only_under_the_outbound_connection_limit() {
+    let _init_guard = zakura_test::init();
+
+    // With the redialed peer's connection closed, the node is at its limit.
+    let mut crawler = spawn_redial_crawler(
+        &[redial_test_peer()],
+        RedialCrawlerOptions {
+            other_connections: CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS,
+            ..RedialCrawlerOptions::default()
+        },
+    )
+    .await;
+
+    let closed_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    let first_redial = closed_at + constants::DROPPED_PEER_REDIAL_DELAYS[0];
+    let dials = crawler
+        .redial_times_until(closed_at, first_redial + Duration::from_secs(1))
+        .await;
+    assert_eq!(dials, vec![], "a node at its limit does not redial");
+
+    crawler.other_connections.pop();
+    let second_redial = closed_at + constants::DROPPED_PEER_REDIAL_DELAYS[1];
+    let dials = crawler
+        .redial_times_until(closed_at, second_redial + Duration::from_secs(1))
+        .await;
+    assert_eq!(dials.len(), 1, "a node with room redials: {dials:?}");
+    assert_redial_time(dials[0], constants::DROPPED_PEER_REDIAL_DELAYS[1]);
+}
+
+/// Returns the redials of a crawler with `options` whose connection to the redialed peer
+/// closes after `open_for`.
+async fn redials_after(options: RedialCrawlerOptions, open_for: Duration) -> Vec<Duration> {
+    let mut crawler = spawn_redial_crawler(&[redial_test_peer()], options).await;
+
+    let closed_at = crawler.close_after(open_for).await;
+    crawler
+        .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)
+        .await
+}
+
+/// Test the crawler does not redial a peer whose connection was short, a banned peer, or a
+/// peer that is connected again.
+#[tokio::test(start_paused = true)]
+async fn crawler_does_not_redial_short_banned_or_connected_peers() {
+    let _init_guard = zakura_test::init();
+
+    let short = constants::MIN_REDIALED_CONNECTION_AGE - Duration::from_secs(1);
+    assert_eq!(
+        redials_after(RedialCrawlerOptions::default(), short).await,
+        vec![],
+        "a short connection is not redialed"
+    );
+
+    let bans = BannedIps::with_banned_ip(redial_test_peer().ip());
+    let options = RedialCrawlerOptions {
+        bans,
+        ..RedialCrawlerOptions::default()
+    };
+    assert_eq!(
+        redials_after(options, constants::MIN_REDIALED_CONNECTION_AGE).await,
+        vec![],
+        "a banned peer is not redialed"
+    );
+
+    // The peer connected back to this node, so a redial would be a duplicate.
+    let peer_registry = PeerRegistry::default();
+    let (_inbound_connection, _) = peer_registry.register_legacy(crate::ConnectedPeer {
+        addr: SocketAddr::new(redial_test_peer().ip(), 45_678).into(),
+        user_agent: Arc::from("/Zakura:test/"),
+        version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        start_height: zakura_chain::block::Height(0),
+        is_inbound: true,
+        rtt: None,
+        ping_sent_at: None,
+    });
+    let options = RedialCrawlerOptions {
+        peer_registry,
+        ..RedialCrawlerOptions::default()
+    };
+    assert_eq!(
+        redials_after(options, constants::MIN_REDIALED_CONNECTION_AGE).await,
+        vec![],
+        "a peer that is connected again is not redialed"
+    );
+}
+
+/// Test a startup dial's connection reports its peer's address when it closes, so the crawler
+/// can redial it.
+#[tokio::test]
+async fn add_initial_peers_connections_report_their_address_when_they_close() {
+    let _init_guard = zakura_test::init();
+
+    let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outbound_connector = service_fn(move |request: OutboundConnectorRequest| {
+        let opened_tx = opened_tx.clone();
+
+        async move {
+            let OutboundConnectorRequest {
+                addr,
+                mut connection_tracker,
+            } = request;
+
+            connection_tracker.mark_open();
+            opened_tx
+                .send((addr, connection_tracker))
+                .expect("startup dial observer remains open");
+
+            let (fake_client, _harness) = ClientTestHarness::build().finish();
+            Ok((addr, fake_client))
+        }
+    });
+
+    let (initial_peers_task_handle, _peerset_rx, address_book_updater_task_handle) =
+        spawn_add_initial_peers(1, outbound_connector).await;
+    let mut active_outbound_connections =
+        tokio::time::timeout(CRAWLER_TEST_TIMEOUT, initial_peers_task_handle)
+            .await
+            .expect("startup dials should finish before the timeout")
+            .expect("startup dial task should not panic")
+            .expect("startup dials should not fail");
+
+    let (addr, connection) = opened_rx
+        .try_recv()
+        .expect("the startup dial opened a connection");
+    drop(connection);
+
+    assert_eq!(active_outbound_connections.update_count(), 0);
+    let closed: Vec<_> = active_outbound_connections
+        .take_closed_connections()
+        .into_iter()
+        .map(|closed| closed.addr)
+        .collect();
+    assert_eq!(closed, vec![addr]);
+
+    address_book_updater_task_handle.abort();
+}
+
 /// Test the listener with a multi-peer inbound limit, and a handshaker that always errors.
 #[tokio::test]
 async fn listener_peer_limit_many_handshake_error() {
@@ -2964,6 +3461,8 @@ async fn spawn_replenishment_crawler_with(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        BannedIps::default(),
+        PeerRegistry::default(),
         Arc::new(AtomicBool::new(
             options.force_failed_dial_demand_restore_full,
         )),
@@ -3195,6 +3694,8 @@ async fn spawn_boxed_crawler_with_peer_limit(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        BannedIps::default(),
+        PeerRegistry::default(),
         Arc::new(AtomicBool::new(false)),
     );
     let crawl_task_handle = tokio::spawn(crawl_fut);

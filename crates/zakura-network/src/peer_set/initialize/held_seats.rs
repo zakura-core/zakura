@@ -77,13 +77,13 @@ impl HeldSeats {
         if closed.open_for < self.min_connection_age
             || release_time <= now
             || self.release_times.len() >= self.max_held
-            || self.release_times.contains_key(&closed.ip)
-            || bans.contains(closed.ip)
+            || self.release_times.contains_key(&closed.addr.ip())
+            || bans.contains(closed.addr.ip())
         {
             return false;
         }
 
-        self.release_times.insert(closed.ip, release_time);
+        self.release_times.insert(closed.addr.ip(), release_time);
 
         true
     }

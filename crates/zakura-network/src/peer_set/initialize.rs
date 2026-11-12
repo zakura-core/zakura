@@ -26,7 +26,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, Instant},
+    time::{sleep, sleep_until, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -63,6 +63,7 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+mod dropped_peer_redials;
 mod held_seats;
 mod recent_by_ip;
 
@@ -342,7 +343,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
-            .with_peer_registry(peer_registry)
+            .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
@@ -423,7 +424,7 @@ where
             constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
             listen_handshaker,
             peerset_tx.clone(),
-            bans,
+            bans.clone(),
             block_gossip_peer_ips,
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
@@ -486,6 +487,8 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
+            bans,
+            peer_registry,
             Arc::new(AtomicBool::new(false)),
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
@@ -632,7 +635,7 @@ where
         .into_iter()
         .enumerate()
         .map(|(i, addr)| {
-            let connection_tracker = active_outbound_connections.track_connection();
+            let connection_tracker = active_outbound_connections.track_connection_from(addr);
             let req = OutboundConnectorRequest {
                 addr,
                 connection_tracker,
@@ -976,7 +979,7 @@ where
                 }
 
                 // The tracker reports when this connection closes, so its seat can be held.
-                active_inbound_connections.track_connection_from(addr.ip())
+                active_inbound_connections.track_connection_from(addr)
             };
             debug!(
                 inbound_connections = ?active_total_inbound_connections,
@@ -1128,6 +1131,15 @@ enum CrawlerAction {
     DemandCrawlFinished,
     /// Clear a finished TimerCrawl.
     TimerCrawlFinished,
+    /// An outbound connection opened or closed, so a long-lived one may need redials.
+    OutboundConnectionsChanged,
+    /// Redial the dropped peers whose next redial is due.
+    RedialsDue,
+    /// Clear a finished redial of `addr`, which reconnected if `connected` is set.
+    RedialFinished {
+        addr: PeerSocketAddr,
+        connected: bool,
+    },
 }
 
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 80;
@@ -1186,6 +1198,11 @@ fn outbound_peer_replenishment_demand(
 ///
 /// Uses `active_outbound_connections` to limit the number of active outbound connections
 /// across both the initial peers and crawler. The limit is based on `config`.
+///
+/// When an outbound connection that was open for [`constants::MIN_REDIALED_CONNECTION_AGE`]
+/// closes, dials its peer again at the times in [`constants::DROPPED_PEER_REDIAL_DELAYS`],
+/// until a dial succeeds, unless `bans` holds the peer or `peer_registry` shows it connected.
+/// See [`dropped_peer_redials`] for why.
 #[allow(clippy::too_many_arguments)]
 #[instrument(
     skip(
@@ -1197,6 +1214,8 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        bans,
+        peer_registry,
         force_failed_dial_demand_restore_full,
     ),
     fields(
@@ -1212,6 +1231,8 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    bans: BannedIps,
+    peer_registry: PeerRegistry,
     // When true, failed dials report a full demand channel so tests can cover
     // unrestored-demand credit gating without racing the crawler select loop.
     force_failed_dial_demand_restore_full: Arc<AtomicBool>,
@@ -1263,6 +1284,11 @@ where
     // periodic crawl refreshes any remaining deficit.
     let remaining_replenishment_demand = AtomicUsize::new(0);
 
+    // Each redial replaces the connection that closed, so pending redials are bounded by the
+    // outbound connection limit.
+    let mut dropped_peer_redials =
+        dropped_peer_redials::DroppedPeerRedials::new(config.peerset_outbound_connection_limit());
+
     // # Concurrency
     //
     // To avoid hangs and starvation, the crawler must spawn a separate task for each crawl
@@ -1275,6 +1301,17 @@ where
                 .expect("the pool always contains an unresolved future") as f64,
         );
 
+        // Schedule redials of the long-lived outbound peers whose connections have closed.
+        let now = Instant::now();
+        for closed_connection in active_outbound_connections.take_closed_connections() {
+            if dropped_peer_redials.schedule(closed_connection, now) {
+                metrics::counter!("peer.outbound.redials.scheduled").increment(1);
+            }
+        }
+        // Pending redials never exceed the outbound connection limit, so the cast is exact.
+        metrics::gauge!("peer.outbound.redials.pending").set(dropped_peer_redials.len() as f64);
+        let next_redial = dropped_peer_redials.next_due();
+
         let crawler_action = tokio::select! {
             biased;
             // Check for completed handshakes first, because the rest of the app needs them.
@@ -1282,6 +1319,11 @@ where
             next_handshake_res = handshakes.next() => next_handshake_res.expect(
                 "handshakes never terminates, because it contains a future that never resolves"
             ),
+            // Learn about closed connections promptly, so their first redial is on time.
+            () = active_outbound_connections.changed() => Ok(OutboundConnectionsChanged),
+            _ = sleep_until(next_redial.unwrap_or_else(Instant::now)), if next_redial.is_some() => {
+                Ok(RedialsDue)
+            }
             // The timer is rate-limited
             next_timer = crawl_timer.next() => Ok(next_timer.expect("timers never terminate")),
             // External demand is potentially unlimited, so it goes after the
@@ -1479,6 +1521,68 @@ where
                 );
             }
 
+            Ok(OutboundConnectionsChanged) => {
+                // The next iteration schedules redials for the connections that closed.
+            }
+            Ok(RedialsDue) => {
+                let now = Instant::now();
+                for (index, addr) in dropped_peer_redials.take_due(now).into_iter().enumerate() {
+                    // The peer is back, or must not be dialed.
+                    if bans.contains(addr.ip()) || peer_registry.is_connected_to(addr.ip()) {
+                        dropped_peer_redials.stop(addr);
+                        continue;
+                    }
+
+                    let outbound_connections = active_outbound_connections.update_count();
+                    if outbound_connections >= config.peerset_outbound_connection_limit() {
+                        dropped_peer_redials.failed(addr);
+                        continue;
+                    }
+
+                    metrics::counter!("peer.outbound.redials.attempted").increment(1);
+                    let outbound_connection_tracker =
+                        active_outbound_connections.track_connection();
+                    let outbound_connector = outbound_connector.clone();
+                    let peerset_tx = peerset_tx.clone();
+                    let address_book_updater = address_book_updater.clone();
+                    let expose_peer_addresses = config.expose_peer_addresses;
+                    // Space out redials that are due together, like the startup dials.
+                    let delay = constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+                        .saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
+
+                    let redial_handle = tokio::spawn(erased(
+                        async move {
+                            sleep(delay).await;
+
+                            let connected = redial(
+                                addr,
+                                outbound_connector,
+                                outbound_connection_tracker,
+                                outbound_connections,
+                                peerset_tx,
+                                address_book_updater,
+                                expose_peer_addresses,
+                            )
+                            .await?;
+
+                            Ok(RedialFinished { addr, connected })
+                        }
+                        .in_current_span(),
+                    ))
+                    .wait_for_panics();
+
+                    handshakes.push(redial_handle);
+                }
+            }
+            Ok(RedialFinished { addr, connected }) => {
+                if connected {
+                    metrics::counter!("peer.outbound.redials.reconnected").increment(1);
+                    dropped_peer_redials.stop(addr);
+                } else {
+                    dropped_peer_redials.failed(addr);
+                }
+            }
+
             // Fatal errors and shutdowns
             Err(error) => {
                 info!(?error, "crawler task exiting due to an error");
@@ -1592,15 +1696,122 @@ fn try_restore_demand_after_failed_dial(
 ), fields(peer = %candidate.addr.addr_label(expose_peer_addresses)))]
 async fn dial<C>(
     candidate: MetaAddr,
-    mut outbound_connector: C,
+    outbound_connector: C,
     outbound_connection_tracker: ConnectionTracker,
     outbound_connections: usize,
-    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
     force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<DialOutcome, BoxError>
+where
+    C: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    C::Future: Send + 'static,
+{
+    debug!(
+        peer = %candidate.addr.addr_label(expose_peer_addresses),
+        "attempting outbound connection in response to demand"
+    );
+
+    if connect_outbound(
+        candidate.addr,
+        outbound_connector,
+        outbound_connection_tracker,
+        outbound_connections,
+        peerset_tx,
+        address_book_updater,
+        expose_peer_addresses,
+    )
+    .await?
+    {
+        return Ok(DialOutcome::Connected);
+    }
+
+    // The demand signal that was taken out of the queue to attempt to connect to the
+    // failed candidate never turned into a connection, so add it back when possible.
+    //
+    // # Security
+    //
+    // Handshake failures are rate-limited by peer attempt timeouts.
+    let demand_restored = try_restore_demand_after_failed_dial(
+        &mut demand_tx,
+        &force_failed_dial_demand_restore_full,
+    )?;
+
+    Ok(DialOutcome::Failed { demand_restored })
+}
+
+/// Dials `addr` again after a long-lived connection to it closed, see [`dropped_peer_redials`].
+///
+/// First records the attempt in the address book, as [`CandidateSet::next`] does for the
+/// peers it returns. Returns whether the connection succeeded.
+#[instrument(skip_all, fields(peer = %addr.addr_label(expose_peer_addresses)))]
+async fn redial<C>(
+    addr: PeerSocketAddr,
+    outbound_connector: C,
+    outbound_connection_tracker: ConnectionTracker,
+    outbound_connections: usize,
+    peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    expose_peer_addresses: bool,
+) -> Result<bool, BoxError>
+where
+    C: Service<
+            OutboundConnectorRequest,
+            Response = (PeerSocketAddr, peer::Client),
+            Error = BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    C::Future: Send + 'static,
+{
+    // Ignore send errors on Zakura shutdown.
+    let _ = address_book_updater
+        .send(MetaAddr::new_reconnect(addr))
+        .await;
+
+    let connected = connect_outbound(
+        addr,
+        outbound_connector,
+        outbound_connection_tracker,
+        outbound_connections,
+        peerset_tx,
+        address_book_updater,
+        expose_peer_addresses,
+    )
+    .await?;
+
+    if connected {
+        info!(
+            peer = %addr.addr_label(expose_peer_addresses),
+            "reconnected to an outbound peer whose long-lived connection closed"
+        );
+    }
+
+    Ok(connected)
+}
+
+/// Connects to `addr` using `outbound_connector`, counting the connection with
+/// `outbound_connection_tracker`.
+///
+/// On success, sends the peer to `peerset_tx`. On failure, marks the peer as failed in the
+/// address book, unless it disconnected neutrally. Returns whether the connection succeeded.
+async fn connect_outbound<C>(
+    addr: PeerSocketAddr,
+    mut outbound_connector: C,
+    mut outbound_connection_tracker: ConnectionTracker,
+    outbound_connections: usize,
+    mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    expose_peer_addresses: bool,
+) -> Result<bool, BoxError>
 where
     C: Service<
             OutboundConnectorRequest,
@@ -1621,14 +1832,16 @@ where
     // - functions that return immediately, or
     // - functions that have a reasonable timeout
 
-    let addr_label = candidate.addr.addr_label(expose_peer_addresses);
-    debug!(peer = %addr_label, "attempting outbound connection in response to demand");
+    let addr_label = addr.addr_label(expose_peer_addresses);
+
+    // A long-lived connection to `addr` is redialed when it closes.
+    outbound_connection_tracker.set_peer_addr(addr);
 
     // the connector is always ready, so this can't hang
     let outbound_connector = outbound_connector.ready().await?;
 
     let req = OutboundConnectorRequest {
-        addr: candidate.addr,
+        addr,
         connection_tracker: outbound_connection_tracker,
     };
 
@@ -1642,7 +1855,7 @@ where
             // The connection limit makes sure this send doesn't block.
             peerset_tx.send((address, client)).await?;
 
-            Ok(DialOutcome::Connected)
+            Ok(true)
         }
         // The connection was never opened, or it failed the handshake and was dropped.
         Err(error) => {
@@ -1659,26 +1872,10 @@ where
             }
 
             if !neutral_disconnect {
-                report_failed(
-                    address_book_updater.clone(),
-                    candidate,
-                    expose_peer_addresses,
-                )
-                .await;
+                report_failed(address_book_updater, addr, expose_peer_addresses).await;
             }
 
-            // The demand signal that was taken out of the queue to attempt to connect to the
-            // failed candidate never turned into a connection, so add it back when possible.
-            //
-            // # Security
-            //
-            // Handshake failures are rate-limited by peer attempt timeouts.
-            let demand_restored = try_restore_demand_after_failed_dial(
-                &mut demand_tx,
-                &force_failed_dial_demand_restore_full,
-            )?;
-
-            Ok(DialOutcome::Failed { demand_restored })
+            Ok(false)
         }
     }
 }
@@ -1686,15 +1883,15 @@ where
 /// Mark `addr` as a failed peer to `address_book_updater`.
 #[instrument(
     skip(address_book_updater, addr, expose_peer_addresses),
-    fields(peer = %addr.addr.addr_label(expose_peer_addresses))
+    fields(peer = %addr.addr_label(expose_peer_addresses))
 )]
 async fn report_failed(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    addr: MetaAddr,
+    addr: PeerSocketAddr,
     expose_peer_addresses: bool,
 ) {
     // The connection info is the same as what's already in the address book.
-    let addr = MetaAddr::new_errored(addr.addr, None);
+    let addr = MetaAddr::new_errored(addr, None);
 
     // Ignore send errors on Zebra shutdown.
     let _ = address_book_updater.send(addr).await;

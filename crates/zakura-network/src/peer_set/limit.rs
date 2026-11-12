@@ -3,9 +3,11 @@
 //! These types can be used to count any kind of active resource.
 //! But they are currently used to track the number of open connections.
 
-use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use tokio::{sync::mpsc, time::Instant};
+
+use crate::PeerSocketAddr;
 
 #[cfg(test)]
 mod tests;
@@ -18,16 +20,16 @@ mod tests;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ConnectionStatus {
     Opened,
-    /// Carries a report if the tracker came from
-    /// [`ActiveConnectionCounter::track_connection_from`] and the connection had opened.
+    /// Carries a report if the tracker has a peer address and the connection had opened.
     Closed(Option<ClosedConnection>),
 }
 
 /// An open connection that has closed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClosedConnection {
-    /// The peer's IP address.
-    pub ip: IpAddr,
+    /// The peer's address: the dialed address for an outbound connection, and the remote
+    /// address for an inbound one.
+    pub addr: PeerSocketAddr,
 
     /// How long the connection was open, from [`ConnectionTracker::mark_open`] until it closed.
     pub open_for: Duration,
@@ -111,18 +113,32 @@ impl ActiveConnectionCounter {
         ConnectionTracker::new(self, None)
     }
 
-    /// Like [`Self::track_connection`], for a connection with the peer at `ip`.
+    /// Like [`Self::track_connection`], for a connection with the peer at `addr`.
     ///
     /// If the connection opens, the tracker also sends a [`ClosedConnection`] when it is
     /// dropped. The caller must collect them with [`Self::take_closed_connections`].
-    pub fn track_connection_from(&mut self, ip: IpAddr) -> ConnectionTracker {
-        ConnectionTracker::new(self, Some(ip))
+    pub fn track_connection_from(&mut self, addr: PeerSocketAddr) -> ConnectionTracker {
+        ConnectionTracker::new(self, Some(addr))
     }
 
     /// Returns the reports of the connections that [`Self::update_count`] has seen close
     /// since the last call.
     pub fn take_closed_connections(&mut self) -> Vec<ClosedConnection> {
         std::mem::take(&mut self.closed_connections)
+    }
+
+    /// Waits until a tracked connection opens or closes, then updates the count like
+    /// [`Self::update_count`].
+    ///
+    /// Cancel safe: a notification is either applied or left in the channel.
+    pub async fn changed(&mut self) {
+        // The channel never closes, because this counter holds a sender.
+        if let Some(status) = self.status_notification_rx.recv().await {
+            let previous_connections = self.count;
+            self.apply(status, previous_connections);
+        }
+
+        self.update_count();
     }
 
     /// Check for closed connection notifications, and return the current connection count.
@@ -133,32 +149,7 @@ impl ActiveConnectionCounter {
         // - TryRecvError::Empty means that there are no pending close notifications
         // - TryRecvError::Closed is unreachable, because we hold a sender
         while let Ok(status) = self.status_notification_rx.try_recv() {
-            match status {
-                ConnectionStatus::Opened => {
-                    self.reserved_count -= 1;
-                    self.count += 1;
-
-                    debug!(
-                        open_connections = ?self.count,
-                        ?previous_connections,
-                        limit = ?self.limit,
-                        label = ?self.label,
-                        "a peer connection was opened",
-                    );
-                }
-                ConnectionStatus::Closed(closed_connection) => {
-                    self.count -= 1;
-                    self.closed_connections.extend(closed_connection);
-
-                    debug!(
-                        open_connections = ?self.count,
-                        ?previous_connections,
-                        limit = ?self.limit,
-                        label = ?self.label,
-                        "a peer connection was closed",
-                    );
-                }
-            }
+            self.apply(status, previous_connections);
         }
 
         trace!(
@@ -170,6 +161,36 @@ impl ActiveConnectionCounter {
         );
 
         self.count + self.reserved_count
+    }
+
+    /// Applies one open or close notification to the counts.
+    fn apply(&mut self, status: ConnectionStatus, previous_connections: usize) {
+        match status {
+            ConnectionStatus::Opened => {
+                self.reserved_count -= 1;
+                self.count += 1;
+
+                debug!(
+                    open_connections = ?self.count,
+                    ?previous_connections,
+                    limit = ?self.limit,
+                    label = ?self.label,
+                    "a peer connection was opened",
+                );
+            }
+            ConnectionStatus::Closed(closed_connection) => {
+                self.count -= 1;
+                self.closed_connections.extend(closed_connection);
+
+                debug!(
+                    open_connections = ?self.count,
+                    ?previous_connections,
+                    limit = ?self.limit,
+                    label = ?self.label,
+                    "a peer connection was closed",
+                );
+            }
+        }
     }
 }
 
@@ -189,8 +210,8 @@ pub struct ConnectionTracker {
     /// The label for this connection counter, typically its type.
     label: Arc<str>,
 
-    /// The peer's IP address, if this tracker reports the connection when it closes.
-    report_ip: Option<IpAddr>,
+    /// The peer's address, if this tracker reports the connection when it closes.
+    report_addr: Option<PeerSocketAddr>,
 
     /// When the connection was marked open, if it has been.
     opened_at: Option<Instant>,
@@ -215,13 +236,21 @@ impl ConnectionTracker {
         }
     }
 
+    /// Makes this tracker report `addr` when its connection closes, like a tracker from
+    /// [`ActiveConnectionCounter::track_connection_from`].
+    ///
+    /// For a tracker that is created before its peer is chosen.
+    pub fn set_peer_addr(&mut self, addr: PeerSocketAddr) {
+        self.report_addr = Some(addr);
+    }
+
     /// Create and return a new active connection tracker, and add 1 to `counter`.
     /// All connection trackers share a label with their connection counter.
     ///
     /// When the returned tracker is dropped, `counter` will be notified, and decreased by 1.
-    /// If `report_ip` is set and the connection opened, the notification carries a
+    /// If `report_addr` is set and the connection opened, the notification carries a
     /// [`ClosedConnection`].
-    fn new(counter: &mut ActiveConnectionCounter, report_ip: Option<IpAddr>) -> Self {
+    fn new(counter: &mut ActiveConnectionCounter, report_addr: Option<PeerSocketAddr>) -> Self {
         counter.reserved_count += 1;
 
         debug!(
@@ -235,7 +264,7 @@ impl ConnectionTracker {
             status_notification_tx: counter.status_notification_tx.clone(),
             has_marked_open: false,
             label: counter.label.clone(),
-            report_ip,
+            report_addr,
             opened_at: None,
         }
     }
@@ -262,15 +291,18 @@ impl Drop for ConnectionTracker {
         // Read the report first: only a connection that opened before this drop has one.
         // It travels in the close notification, so the counter never sees one without
         // the other.
-        let closed_connection = self.report_ip.zip(self.opened_at).map(|(ip, opened_at)| {
-            let closed_at = Instant::now();
+        let closed_connection = self
+            .report_addr
+            .zip(self.opened_at)
+            .map(|(addr, opened_at)| {
+                let closed_at = Instant::now();
 
-            ClosedConnection {
-                ip,
-                open_for: closed_at.saturating_duration_since(opened_at),
-                closed_at,
-            }
-        });
+                ClosedConnection {
+                    addr,
+                    open_for: closed_at.saturating_duration_since(opened_at),
+                    closed_at,
+                }
+            });
         self.mark_open();
         let _ = self
             .status_notification_tx

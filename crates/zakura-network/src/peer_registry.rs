@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -10,7 +11,7 @@ use zakura_chain::block;
 
 use crate::{
     peer::ConnectionInfo,
-    protocol::external::types::Version,
+    protocol::external::{canonical_ip, types::Version},
     zakura::{ZakuraConnId, ZakuraPeerId},
     PeerSocketAddr,
 };
@@ -88,6 +89,19 @@ impl PeerRegistry {
                 .then(left.user_agent.cmp(&right.user_agent))
         });
         connected_peers
+    }
+
+    /// Returns whether any active connection, legacy or native, in either direction, is with
+    /// a peer at `ip`.
+    pub(crate) fn is_connected_to(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+
+        self.inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .values()
+            .any(|connected_peer| canonical_ip(connected_peer.addr.ip()) == ip)
     }
 
     /// Register one legacy connection until the returned guard drops.

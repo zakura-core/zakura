@@ -1,6 +1,9 @@
 //! Fixed test vectors for held inbound seats.
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use tokio::time::Instant;
 
@@ -23,9 +26,11 @@ fn ip(last_octet: u8) -> IpAddr {
 }
 
 /// Returns a connection from `ip` that closed at `closed_at` after being open for `open_for`.
+///
+/// The port is an inbound peer's source port, so holds must ignore it.
 fn closed(ip: IpAddr, open_for: Duration, closed_at: Instant) -> ClosedConnection {
     ClosedConnection {
-        ip,
+        addr: SocketAddr::new(ip, 45_678).into(),
         open_for,
         closed_at,
     }

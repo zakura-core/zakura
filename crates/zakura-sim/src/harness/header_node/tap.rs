@@ -103,7 +103,7 @@ use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture}
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    authority::{ledger_attribution, Authority, AuthorityEvidence},
+    authority::{ledger_record, Authority, AuthorityEvidence},
     capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
@@ -366,13 +366,7 @@ impl TapState {
             (mem::take(&mut work.claims), work.books.take())
         };
         for broken in claims {
-            let attribution = ledger_attribution(&broken);
-            self.claims.record(ClaimRecord {
-                step,
-                claim: Claim::of(broken.rule),
-                detail: broken.detail,
-                attribution,
-            });
+            self.claims.record(ledger_record(step, broken));
         }
         if let Some(rule) = books {
             self.claims.record(ClaimRecord {

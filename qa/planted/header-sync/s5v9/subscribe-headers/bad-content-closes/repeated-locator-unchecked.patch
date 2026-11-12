@@ -1,0 +1,20 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/wire.rs b/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
+index b8c47d9755..ca7ecbfa17 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/wire.rs
+@@ -616,14 +616,7 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
+                 let Some(first) = locators.first() else {
+                     return Err(WireError::OutOfRange("locator count"));
+                 };
+-                // At most 13 locators, so the pairwise check stays small.
+-                if locators
+-                    .iter()
+-                    .enumerate()
+-                    .any(|(index, hash)| locators[..index].contains(hash))
+-                {
+-                    return Err(WireError::OutOfRange("locator hashes"));
+-                }
++                // Mutation: a repeated locator is no longer refused.
+                 let cursor = update.acknowledged;
+                 if cursor.hash != *first || cursor.headers != 0 || cursor.bytes != 0 {
+                     return Err(WireError::OutOfRange("open cursor"));

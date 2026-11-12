@@ -714,6 +714,38 @@ const C18_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
+const fn planted_test(test: &'static str) -> TestRef {
+    TestRef {
+        package: "xtask",
+        file: "src/planted.rs",
+        test,
+    }
+}
+
+/// C4's proving tests: the planted runner's classification of baseline and
+/// patched runs, its fresh replay of every catch, typed and fuzz-input, a
+/// deadline killing a hung baseline, patched or campaign run, and its
+/// set-aware judgment of a nested case. The fresh-replay and hang tests are
+/// `cfg(unix)`, which the acceptance host, Linux, builds.
+const C4_PROVING: &[TestRef] = &[
+    planted_test("planted::tests::planted_passes_only_on_its_own_id"),
+    planted_test("planted::tests::witness_flags_carry_the_co_violations"),
+    planted_test("planted::tests::listed_co_violations_are_expected"),
+    planted_test("planted::tests::planted_requires_the_trigger_history"),
+    planted_test("planted::tests::planted_requires_passing_baseline"),
+    planted_test("planted::tests::planted_patch_must_apply"),
+    planted_test("planted::tests::a_patch_may_not_change_the_witness"),
+    planted_test("planted::tests::campaign_failures_name_their_input"),
+    planted_test("planted::tests::every_catch_needs_its_fresh_replay"),
+    planted_test("planted::tests::the_runner_replays_every_caught_case"),
+    planted_test("planted::tests::a_replay_miss_reads_the_exit_status"),
+    planted_test("planted::tests::a_hung_patched_run_is_killed_and_never_caught"),
+    planted_test("planted::tests::a_hung_baseline_or_campaign_run_is_killed_and_never_passes"),
+    planted_test("planted::tests::a_nested_case_needs_exactly_its_set"),
+    planted_test("planted::tests::a_typed_case_watches_and_runs_its_files"),
+];
+
 /// C17's proving tests: the freeze comparison's controls, a store whose
 /// freeze is skipped and a cleanup-time append to the log each failing it,
 /// the header witnesses keeping their stores and log through cleanup,
@@ -903,8 +935,8 @@ const fn satisfied(
 }
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
-/// E10, C18 by E10 with hdr-14.7b's binding, and C14 and C17 by hf-6's
+/// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
+/// to E10, C18 by E10 with hdr-14.7b's binding, and C14 and C17 by hf-6's
 /// stores. Every other row's deliveries landed, and its state names the
 /// proving test still missing.
 pub fn contract_table() -> Vec<Contract> {
@@ -938,15 +970,13 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        waiting(
+        satisfied(
             C4,
             "Evan (xt/planted.rs)",
             "The planted runner classifies baseline and patched runs, replays every catch \
              fresh, puts a deadline on every run and judges nested cases by their set.",
+            C4_PROVING,
             "E6",
-            "runner tests the acceptance build runs: the fresh-replay and hung-run tests are \
-             cfg(unix), which the static check counts as gated, and no test hangs a baseline \
-             or campaign run",
         ),
         waiting(
             C5,

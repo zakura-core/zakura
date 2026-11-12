@@ -7,6 +7,8 @@
 //!     --subject <commit> --subject-source <digest> --run-id <id>
 //!     --containment <subreaper|best-effort> --out <dir>
 //! header-acceptance companions --trace <dir> --out <companions.json>
+//! header-acceptance record-args --declared <dir> --harness <name> --test <name>
+//!     --case <case> --out <args.json>
 //! ```
 //!
 //! `plan` writes the tasks xtask runs. `evaluate` reads their artifacts,
@@ -15,6 +17,9 @@
 //! record says which. `companions` judges a node case's recorded `Draft`
 //! run's companions and writes a `CompanionsRun` to a new file. xtask runs
 //! it from the case's own patched build, the one that recorded the trace.
+//! `record-args` writes, as a JSON list, the `zakura-sim record` arguments
+//! for the one history a witness test declared under `--declared` as
+//! `--case` on `--harness`, so the runner records it as the reader binds it.
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 
@@ -55,7 +60,9 @@ mod cli {
                          header-acceptance evaluate --repo <dir> --plan <plan.json> \
                          --artifacts <dir> --subject <commit> --subject-source <digest> \
                          --run-id <id> --containment <subreaper|best-effort> --out <dir>\n       \
-                         header-acceptance companions --trace <dir> --out <companions.json>";
+                         header-acceptance companions --trace <dir> --out <companions.json>\n       \
+                         header-acceptance record-args --declared <dir> --harness <name> \
+                         --test <name> --case <case> --out <args.json>";
 
     /// Reads `--flag value` pairs, refusing an unknown or repeated flag.
     fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
@@ -189,6 +196,21 @@ mod cli {
                     run.companions.iter().filter(|c| c.held).count(),
                     run.companions.len()
                 );
+                Ok(())
+            }
+            "record-args" => {
+                let flags = flags(
+                    rest,
+                    &["--declared", "--harness", "--test", "--case", "--out"],
+                )?;
+                let args = tool::declared_record_args(
+                    &PathBuf::from(&flags["--declared"]),
+                    &flags["--harness"],
+                    &flags["--test"],
+                    &flags["--case"],
+                )?;
+                let json = serde_json::to_string(&args).map_err(|e| e.to_string())?;
+                fs::write(&flags["--out"], json).map_err(|e| format!("{}: {e}", flags["--out"]))?;
                 Ok(())
             }
             _ => Err(USAGE.to_owned()),

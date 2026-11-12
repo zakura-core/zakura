@@ -1,0 +1,19 @@
+# `reserved-flags-skipped`'s patch, on an input whose adversary sends two
+# `Status` frames with a reserved flag set. Its patched `Draft` run gives
+# two distinct findings of `header-sync/s5v9/status/reserved-flags-closes`
+# at one boundary, the run's quiescence, one per skipped frame, which is
+# C21's proof for the generated receiver checks. The input is scripted
+# because no Plan bytes reach it: steering defers the second act until the
+# peer has flushed the first frame, and the second packet's delivery until
+# the node's stream reader has judged the first, so the two frames open
+# their obligations at two steps. Without that, both ride one packet and
+# open at one step, and the two findings read the same.
+# Besides handler.rs, which the patch changes, the transport and header
+# sync decide when the peer sends each frame and when the node reads it. A
+# change there can move the script off its two frames.
+checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-status-reserved-flags-twice.json"
+script = "crates/zakura-sim/tests/fixtures/header-wire-planted-status-reserved-flags-twice.script.json"

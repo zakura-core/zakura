@@ -111,6 +111,12 @@ pub enum Actual {
         /// The history on the restored checkout.
         restored: Execution,
     },
+    /// A retired native mutation's witness test, unpatched, patched and
+    /// restored, as the tool judged its three runs (`tool::unit_refusal`).
+    UnitCaught {
+        /// Why its runs aren't the mutation caught, or `None` if they are.
+        refused: Option<String>,
+    },
     /// A fresh-process replay of one execution.
     Replay {
         /// The replayed execution.
@@ -989,7 +995,10 @@ fn owned_runs(expected: &Expected) -> Vec<RunId> {
                 .map(|run| RunId::native(patch, run))
                 .to_vec()
         }
-        Expected::Replays { .. } | Expected::Passes { .. } | Expected::Open { .. } => Vec::new(),
+        Expected::UnitCaught { .. }
+        | Expected::Replays { .. }
+        | Expected::Passes { .. }
+        | Expected::Open { .. } => Vec::new(),
     }
 }
 
@@ -1011,7 +1020,7 @@ fn executions(actual: &Actual) -> Vec<&Execution> {
             restored,
             ..
         } => vec![unpatched, patched, restored],
-        Actual::Replay { .. } | Actual::Test { .. } => Vec::new(),
+        Actual::UnitCaught { .. } | Actual::Replay { .. } | Actual::Test { .. } => Vec::new(),
     }
 }
 
@@ -1027,7 +1036,7 @@ fn expected_harness(manifest: &Manifest, expected: &Expected) -> Option<String> 
         | Expected::MachineCaught { harness, .. }
         | Expected::HarnessCaught { harness, .. } => Some((*harness).to_owned()),
         Expected::Replays { run } => replayed_harness(manifest, run),
-        Expected::Passes { .. } | Expected::Open { .. } => None,
+        Expected::UnitCaught { .. } | Expected::Passes { .. } | Expected::Open { .. } => None,
     }
 }
 
@@ -1370,6 +1379,10 @@ fn judge(
             }
         }
         (Expected::Passes { test }, actual) => judge_test(actual, test),
+        (Expected::UnitCaught { .. }, Actual::UnitCaught { refused }) => match refused {
+            None => Ok(()),
+            Some(why) => Err(why.clone()),
+        },
         (expected, actual) => Err(format!(
             "a {:?} result can't satisfy a {:?}",
             kind_of(actual),
@@ -1452,6 +1465,7 @@ fn kind_of(actual: &Actual) -> &'static str {
         Actual::MachineCaught { .. } => "machine-caught",
         Actual::HarnessCaught { .. } => "harness-caught",
         Actual::IntegrityCaught { .. } => "integrity-caught",
+        Actual::UnitCaught { .. } => "unit-caught",
         Actual::Replay { .. } => "replay",
         Actual::Test { .. } => "test",
     }

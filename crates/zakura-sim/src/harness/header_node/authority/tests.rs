@@ -149,27 +149,31 @@ fn page(request: &RequestRef, ancestor: Frontier, hashes: &[block::Hash]) -> Rea
 
 /// `events` with each credit fact's primitive totals filled in as an
 /// honest primitive counts them: every update's credit and every claimed
-/// page's, per subscription.
+/// page's, per subscription, by peer, session and ID.
 fn honest(events: &[ReactorEvent]) -> Vec<ReactorEvent> {
-    let mut counted: std::collections::HashMap<(u64, u64), CreditTotals> = Default::default();
+    let mut counted: std::collections::HashMap<Subscription, CreditTotals> = Default::default();
     events
         .iter()
         .cloned()
         .map(|mut event| {
             match &mut event {
                 ReactorEvent::CreditIssued {
+                    peer,
                     session_id,
                     subscription,
                     update,
                     totals,
                     ..
                 } => {
-                    let count = counted.entry((*session_id, *subscription)).or_default();
+                    let count = counted
+                        .entry((peer.clone(), *session_id, *subscription))
+                        .or_default();
                     count.granted_headers += u64::from(update.added_credit.objects);
                     count.granted_bytes += u64::from(update.added_credit.bytes);
                     *totals = *count;
                 }
                 ReactorEvent::CursorClaimed {
+                    peer,
                     session_id,
                     subscription,
                     page_headers,
@@ -177,23 +181,31 @@ fn honest(events: &[ReactorEvent]) -> Vec<ReactorEvent> {
                     totals,
                     ..
                 } => {
-                    let count = counted.entry((*session_id, *subscription)).or_default();
+                    let count = counted
+                        .entry((peer.clone(), *session_id, *subscription))
+                        .or_default();
                     count.consumed_headers += *page_headers;
                     count.consumed_bytes += *page_bytes;
                     *totals = *count;
                 }
                 ReactorEvent::CloseBuilt {
+                    peer,
                     session_id,
                     subscription,
                     totals,
                     ..
                 }
                 | ReactorEvent::CursorsAccepted {
+                    peer,
                     session_id,
                     subscription,
                     totals,
                     ..
-                } => *totals = *counted.entry((*session_id, *subscription)).or_default(),
+                } => {
+                    *totals = *counted
+                        .entry((peer.clone(), *session_id, *subscription))
+                        .or_default();
+                }
                 _ => {}
             }
             event
@@ -1878,6 +1890,311 @@ fn an_open_credit_break_names_its_update_and_no_page() {
             .expect("an attribution serializes")
             .contains("\"page\""),
         "{record:?}"
+    );
+}
+
+/// The findings `events` give, their totals filled in honestly, fed in
+/// order on the reactor's task to a check of the main branch.
+fn findings(events: &[ReactorEvent]) -> Vec<AuthorityFinding> {
+    let mut check = Authority::new(
+        AuthorityEvidence::new(&EvidenceStores::default()),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    read_starts(&mut check, events);
+    for event in &honest(events) {
+        check.observe(event, true, false);
+    }
+    check.drain(1)
+}
+
+/// Each of `found`'s attributions, in order.
+fn attributions(found: &[AuthorityFinding]) -> Vec<Attribution> {
+    found
+        .iter()
+        .map(|found| found.attribution.clone())
+        .collect()
+}
+
+/// `rule` broken by `subject`.
+fn blamed(rule: AuthorityRule, subject: AuthoritySubject) -> Attribution {
+    Attribution { rule, subject }
+}
+
+/// The mirror's session 7 subscription 1, and copies of it one key off:
+/// another peer and another session that share its subscription number,
+/// and another subscription on its session.
+fn one_key_off() -> (Subscription, [Subscription; 3]) {
+    (
+        (mirror(), 7, 1),
+        [(other_mirror(), 7, 1), (mirror(), 8, 1), (mirror(), 7, 2)],
+    )
+}
+
+/// C22 (c), the producer join: the checker judges each round and page
+/// against its own subscription's `Open` and names it whole. Inputs pair
+/// a subscription with one a key off, by peer, session or subscription,
+/// two of which share its subscription number, and pages, rounds, updates
+/// and calls a key off within one subscription. Each case breaks exactly
+/// one of the pair, and only that one is named, with every key, so a join
+/// on an incomplete identity misses it or blames the other.
+#[test]
+fn each_finding_joins_on_its_full_identity() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let (base, others) = one_key_off();
+    let (peer_id, session, subscription) = &base;
+
+    for other in &others {
+        let (other_peer, other_session, other_subscription) = other;
+        // Rounds: the other's Open targets another header, so its round,
+        // bound to this one's target, is the one bound off its Open.
+        let kept = request_on(
+            peer_id,
+            *session,
+            *subscription,
+            1,
+            chain[3].hash,
+            genesis.hash,
+        );
+        let off = request_on(
+            other_peer,
+            *other_session,
+            *other_subscription,
+            2,
+            chain[3].hash,
+            genesis.hash,
+        );
+        let found = findings(&[
+            adopted(),
+            reserved_by(peer_id, 1, 10),
+            open_on(peer_id, *session, *subscription, chain[3], &[genesis.hash]),
+            reserved_by(other_peer, 2, 10),
+            open_on(
+                other_peer,
+                *other_session,
+                *other_subscription,
+                chain[2],
+                &[genesis.hash],
+            ),
+            started(kept, &[genesis.hash]),
+            started(off.clone(), &[genesis.hash]),
+        ]);
+        assert_eq!(
+            attributions(&found),
+            [blamed(
+                AuthorityRule::OwnerBinding,
+                AuthoritySubject::round(2, other)
+            )],
+            "{other:?}: {found:?}"
+        );
+
+        // Pages: the same headers in the same frame, which carry the
+        // other's Open's locator and not this one's.
+        let kept = request_on(
+            peer_id,
+            *session,
+            *subscription,
+            1,
+            chain[3].hash,
+            genesis.hash,
+        );
+        let off = request_on(
+            other_peer,
+            *other_session,
+            *other_subscription,
+            2,
+            chain[3].hash,
+            genesis.hash,
+        );
+        let headers = [chain[0].hash, chain[1].hash];
+        let found = findings(&[
+            adopted(),
+            reserved_by(peer_id, 1, 10),
+            open_on(peer_id, *session, *subscription, chain[3], &[genesis.hash]),
+            reserved_by(other_peer, 2, 10),
+            open_on(
+                other_peer,
+                *other_session,
+                *other_subscription,
+                chain[3],
+                &[chain[1].hash, genesis.hash],
+            ),
+            started(kept.clone(), &[genesis.hash]),
+            started(off.clone(), &[chain[1].hash, genesis.hash]),
+            page_on(&kept, Some(3), genesis, &headers),
+            page_on(&off, Some(3), genesis, &headers),
+        ]);
+        assert_eq!(
+            attributions(&found),
+            [blamed(
+                AuthorityRule::Path,
+                AuthoritySubject::page(other, &headers, Some(3))
+            )],
+            "{other:?}: {found:?}"
+        );
+    }
+
+    // Headers: two pages of one round, untagged, the second skipping a
+    // header.
+    let round = request_on(
+        peer_id,
+        *session,
+        *subscription,
+        1,
+        chain[3].hash,
+        genesis.hash,
+    );
+    let found = findings(&[
+        adopted(),
+        reserved_by(peer_id, 1, 10),
+        open_on(peer_id, *session, *subscription, chain[3], &[genesis.hash]),
+        started(round.clone(), &[genesis.hash]),
+        page_on(&round, None, genesis, &[chain[0].hash]),
+        page_on(&round, None, chain[0], &[chain[2].hash]),
+    ]);
+    assert_eq!(
+        attributions(&found),
+        [blamed(
+            AuthorityRule::Path,
+            AuthoritySubject::page(&base, &[chain[2].hash], None)
+        )],
+        "{found:?}"
+    );
+
+    // Round incarnation: two rounds of one subscription, the second bound
+    // to another target than its Open's.
+    let found = findings(&[
+        adopted(),
+        reserved_by(peer_id, 1, 10),
+        open_on(peer_id, *session, *subscription, chain[3], &[genesis.hash]),
+        started(
+            request_on(
+                peer_id,
+                *session,
+                *subscription,
+                1,
+                chain[3].hash,
+                genesis.hash,
+            ),
+            &[genesis.hash],
+        ),
+        started(
+            request_on(
+                peer_id,
+                *session,
+                *subscription,
+                2,
+                chain[2].hash,
+                genesis.hash,
+            ),
+            &[genesis.hash],
+        ),
+    ]);
+    assert_eq!(
+        attributions(&found),
+        [blamed(
+            AuthorityRule::OwnerBinding,
+            AuthoritySubject::round(2, &base)
+        )],
+        "{found:?}"
+    );
+
+    // Update sequence: two grants of one subscription, the second a byte
+    // past its headers' pages.
+    let page = u32::try_from(credit::smallest_page(AuxSchema::None)).expect("small");
+    let start = Frontier::new(block::Height(0), genesis.hash);
+    let found = findings(&[
+        reserved(1, 10),
+        open(chain[3], &[genesis.hash]),
+        reserved(2, 2),
+        grant(2, 2 * page, 1, start, chain[3].hash),
+        reserved(3, 2),
+        grant(2, 2 * page + 1, 2, start, chain[3].hash),
+    ]);
+    assert_eq!(
+        attributions(&found),
+        [blamed(
+            AuthorityRule::Credit,
+            AuthoritySubject::update(&base, UpdateKind::Grant, 2)
+        )],
+        "{found:?}"
+    );
+
+    // Call: two prepares dispatched alike, the second reaching storage as
+    // a locator read, and then the first reaching it again.
+    use zakura_network::zakura::observe::PortCall;
+    let round = request(1, chain[1].hash, genesis.hash);
+    let source = SourceId::from_digest([2; 32]);
+    let mut check = Authority::new(
+        AuthorityEvidence::new(&EvidenceStores::default()),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    for call in [1, 2] {
+        check.observe(
+            &ReactorEvent::Dispatched {
+                call,
+                op: PortCall::Prepare {
+                    peer: mirror(),
+                    source,
+                    owner: round.owner,
+                    common_ancestor: genesis,
+                    target: chain[1],
+                    hashes: vec![chain[0].hash, chain[1].hash],
+                },
+            },
+            true,
+            false,
+        );
+    }
+    let prepare = |id, call| crate::observe::StorageFact::Submitted {
+        id,
+        request: crate::observe::StorageRequest::PrepareHeaderTarget {
+            owner: crate::storage::work_owner(round.owner),
+            source: crate::storage::hex(&source.digest()),
+            common_ancestor: crate::storage::point(genesis),
+            target: crate::storage::point(chain[1]),
+            headers: 2,
+            work: None,
+            first: None,
+            hashes: vec![
+                crate::storage::hash(chain[0].hash),
+                crate::storage::hash(chain[1].hash),
+            ],
+        },
+        digest: String::new(),
+        call: Some(call),
+    };
+    let locator = crate::observe::StorageFact::Submitted {
+        id: 11,
+        request: crate::observe::StorageRequest::ContinuationLocator,
+        digest: String::new(),
+        call: Some(2),
+    };
+    check.storage([&prepare(10, 1), &locator]);
+    let found = check.drain(1);
+    assert!(
+        !found.is_empty()
+            && attributions(&found).iter().all(|found| *found
+                == blamed(
+                    AuthorityRule::Submission,
+                    AuthoritySubject::Call { call: 2, op: 11 }
+                )),
+        "{found:?}"
+    );
+    check.storage([&prepare(12, 1)]);
+    let found = check.drain(2);
+    assert!(
+        !found.is_empty()
+            && attributions(&found).iter().all(|found| *found
+                == blamed(
+                    AuthorityRule::Submission,
+                    AuthoritySubject::Call { call: 1, op: 12 }
+                )),
+        "{found:?}"
     );
 }
 

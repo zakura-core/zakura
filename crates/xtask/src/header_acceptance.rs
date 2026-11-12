@@ -152,7 +152,7 @@ fn options(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Optio
 /// planted runner sets and the profiles as committed. Cargo config files
 /// outside the repository, such as `~/.cargo/config.toml`, are the
 /// operator's. It runs first, before any thread or child.
-fn clean_build_env() {
+pub(crate) fn clean_build_env() {
     let names: Vec<OsString> = env::vars_os()
         .map(|(name, _)| name)
         .filter(|name| {
@@ -506,7 +506,7 @@ fn subject_of(repo_root: &Path, options: &Options) -> Result<Subject, BoxError> 
 
 /// A `cargo` command in `dir` with the simulator's flags and `target` as
 /// its target directory, and uncolored output, which the runner parses.
-fn cargo(dir: &Path, target: &Path) -> Command {
+pub(crate) fn cargo(dir: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
@@ -776,7 +776,7 @@ fn verdict_line<'a>(log: &'a str, property: &str, name: &str) -> Option<&'a str>
 /// `targets`, and writes `test.json`: whether the child exited 0, since the
 /// reader counts an `ok` only if it did, and whether the test binary embeds
 /// `source`.
-fn run_test(
+pub(crate) fn run_test(
     dir_root: &Path,
     options: &Options,
     source: Option<&str>,
@@ -1106,7 +1106,7 @@ fn test_executable(messages: &str, target: &TestTarget) -> Result<PathBuf, Strin
 }
 
 /// The tests libtest reported in `log`, as `(name, ok|FAILED|ignored)`.
-fn libtest(log: &str) -> Vec<(String, String)> {
+pub(crate) fn libtest(log: &str) -> Vec<(String, String)> {
     let mut tests = Vec::new();
     for line in log.lines() {
         let line = line.trim();

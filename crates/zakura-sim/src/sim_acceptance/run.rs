@@ -525,9 +525,15 @@ fn exactly_one_passed(result: &Value, test: &str) -> Verdict {
 }
 
 /// A lane passes when its command exited 0, every required target ran at
-/// least one test, and no test of any target failed (Rule 11).
+/// least one test that passed, no test of any target failed, and no test a
+/// target's binary lists (`--list`, less its ignored ones) went unrun
+/// (Rule 11).
 fn lane_passed(lane: &Value, required: &[String]) -> Verdict {
     let exited = lane.get("exited_ok").and_then(Value::as_bool) == Some(true);
+    let unrun: Vec<String> = lane
+        .get("unrun")
+        .and_then(|u| serde_json::from_value(u.clone()).ok())
+        .unwrap_or_default();
     let targets: BTreeMap<String, Vec<(String, String)>> = lane
         .get("targets")
         .and_then(|t| serde_json::from_value(t.clone()).ok())
@@ -537,8 +543,15 @@ fn lane_passed(lane: &Value, required: &[String]) -> Verdict {
             why: "the lane's command failed".to_owned(),
         };
     }
+    if let Some(test) = unrun.first() {
+        return Verdict::Blocked {
+            why: format!("{test} is listed but didn't run and pass"),
+        };
+    }
     for target in required {
-        let ran = targets.get(target).map(Vec::len).unwrap_or(0);
+        let ran = targets.get(target).map_or(0, |tests| {
+            tests.iter().filter(|(_, outcome)| outcome == "ok").count()
+        });
         if ran == 0 {
             return Verdict::Blocked {
                 why: format!("required target {target} ran no test"),
@@ -546,7 +559,7 @@ fn lane_passed(lane: &Value, required: &[String]) -> Verdict {
         }
     }
     for (target, tests) in &targets {
-        if let Some((name, outcome)) = tests.iter().find(|(_, outcome)| outcome != "ok") {
+        if let Some((name, outcome)) = tests.iter().find(|(_, outcome)| outcome == "FAILED") {
             return Verdict::Blocked {
                 why: format!("{target}: {name} {outcome}"),
             };
@@ -758,6 +771,15 @@ mod tests {
         let exited =
             json!({ "exited_ok": false, "targets": { "zakura-sim/draws": [["a", "ok"]] } });
         assert!(blocked(&lane_passed(&exited, &required)));
+        let ignored = json!({ "exited_ok": true, "targets": {
+            "zakura-sim/draws": [["a", "ok"], ["regenerate", "ignored"]] } });
+        assert_eq!(lane_passed(&ignored, &required), Verdict::Verified);
+        let skipped_one = json!({ "exited_ok": true, "unrun": ["zakura-sim/draws::b"],
+            "targets": { "zakura-sim/draws": [["a", "ok"]] } });
+        assert!(
+            blocked(&lane_passed(&skipped_one, &required)),
+            "a --skip of one listed test blocks"
+        );
     }
 
     /// `cargo tree` passes only on exit 0, with the zakurad root, and no

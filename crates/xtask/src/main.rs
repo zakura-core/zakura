@@ -15,6 +15,7 @@ mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
+mod sim_acceptance;
 mod sim_feedback;
 mod sim_minimize;
 
@@ -155,6 +156,7 @@ fn try_main() -> Result<(), BoxError> {
             )
         }
         Some("header-acceptance") => header_acceptance::run(&repo_root()?, args),
+        Some("sim-acceptance") => sim_acceptance::run(&repo_root()?, args),
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
@@ -399,6 +401,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
     )?;
     writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
+    writeln!(
+        output,
+        "  cargo xtask sim-acceptance --subject <S> --header-out <dir> --out <dir> [--deadline-secs <n>]"
+    )?;
     writeln!(
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"

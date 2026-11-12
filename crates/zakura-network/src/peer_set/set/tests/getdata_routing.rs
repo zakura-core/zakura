@@ -465,10 +465,10 @@ async fn pruned_routing_prefers_idle_pruned_over_busy_archive() {
     assert_eq!(archive.written_now().await, None);
 }
 
-/// A peer that advertises no services, such as an older Zakura pruned node, makes no full-history
-/// claim, so it does not outrank a peer with the pruned hint.
+/// A peer that advertises no services, such as an older Zakura pruned node, lacks the pruned hint,
+/// so it is treated as an archive candidate and outranks a peer with the hint.
 #[tokio::test(start_paused = true)]
-async fn pruned_routing_does_not_favour_peers_without_node_network() {
+async fn pruned_routing_treats_peers_without_services_as_archive() {
     let _init_guard = zakura_test::init();
     const SELECTIONS: usize = 200;
 
@@ -495,10 +495,10 @@ async fn pruned_routing_does_not_favour_peers_without_node_network() {
         .filter(|_| set.select_archive_or_pruned_peer(&candidates) == Some(no_services.addr))
         .count();
 
-    // Equal ranks and equal fresh loads leave the choice to the random sample order.
-    assert!(
-        (1..SELECTIONS).contains(&no_services_selections),
-        "the peer without services took {no_services_selections} of {SELECTIONS} selections",
+    // With two candidates both are sampled every time, so the higher rank always wins.
+    assert_eq!(
+        no_services_selections, SELECTIONS,
+        "the peer without services must win every selection against a pruned peer",
     );
 }
 

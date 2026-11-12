@@ -86,15 +86,17 @@ impl LoadTrackedClient {
         self.connection_info.remote.version
     }
 
-    /// Returns true if the peer's handshake claims full block history: it advertises
-    /// [`PeerServices::NODE_NETWORK`] without the [`PeerServices::NODE_PRUNED`] hint.
+    /// Returns true if the peer may have full block history: its handshake lacks the
+    /// [`PeerServices::NODE_PRUNED`] hint.
     ///
-    /// The claim is self-reported. Older Zakura pruned nodes advertise no services at all, so a
-    /// peer without `NODE_NETWORK` makes no claim even though it lacks the pruned hint.
+    /// Any other service bits are ignored, so peers that advertise no services, such as older
+    /// Zakura pruned nodes, are treated as archive candidates too. The hint is self-reported.
     pub(crate) fn claims_full_block_history(&self) -> bool {
-        let services = self.connection_info.remote.services;
-        services.contains(PeerServices::NODE_NETWORK)
-            && !services.contains(PeerServices::NODE_PRUNED)
+        !self
+            .connection_info
+            .remote
+            .services
+            .contains(PeerServices::NODE_PRUNED)
     }
 
     /// Returns true if the connection would write a request sent now, rather than leave it queued

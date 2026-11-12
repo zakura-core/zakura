@@ -71,7 +71,8 @@
 //!   build it ran, which must be the provenance check's, and, with a
 //!   target, the SHA-256 of the committed input it ran (`input_sha256`) and
 //!   of its own patched run's trace (`trace`), copied whole to
-//!   [`CONFIRMATION_DIR`], whose meta must name that source and input.
+//!   [`CONFIRMATION_DIR`], whose meta must name that source and input and
+//!   the case's `harness`, the one the target maps to.
 //!   A node case's task names `draft`, its set: then `<i>/draft` is
 //!   recorded by the case's own rebuilt binary with `zakura-sim record
 //!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
@@ -1773,18 +1774,18 @@ fn credit_sources(
 
 /// Why the planted runner didn't credit case `name` of `property` in `dir`:
 /// it didn't report it caught, or it wasn't confirmed through `target`,
-/// the fuzz target its harness maps to, if any, or either check is
+/// the fuzz target its `harness` maps to, if any, or either check is
 /// missing, names another case or another target, or judged runs other
 /// than this attempt's ([`verdict_refusal`], [`target_refusal`]).
 fn case_refusal(
     repo: &Path,
     dir: &Path,
     (property, name): (&str, &str),
-    target: Option<&str>,
+    (harness, target): (&str, Option<&str>),
     input: &CaseInput,
 ) -> Option<String> {
     verdict_refusal(dir, property, name)
-        .or_else(|| target_refusal(repo, dir, (property, name), target, input))
+        .or_else(|| target_refusal(repo, dir, (property, name), (harness, target), input))
 }
 
 /// Why `dir`'s [`VERDICT_FILE`] isn't the planted runner's catch of case
@@ -1814,12 +1815,13 @@ fn verdict_refusal(dir: &Path, property: &str, name: &str) -> Option<String> {
 /// or target, or ran a build other than the one the case's provenance check
 /// measured. With a target, it must also name the case's committed `input`
 /// and its own run in [`CONFIRMATION_DIR`] ([`judged_refusal`]), which must
-/// have run that input. Without one, it names no input or run.
+/// have run that input on `harness`, the harness `target` maps to. Without
+/// one, it names no input or run.
 fn target_refusal(
     repo: &Path,
     dir: &Path,
     (property, name): (&str, &str),
-    target: Option<&str>,
+    (harness, target): (&str, Option<&str>),
     input: &CaseInput,
 ) -> Option<String> {
     let artifact = read_json::<Value>(&dir.join(TARGET_FILE));
@@ -1875,6 +1877,18 @@ fn target_refusal(
             "its target confirmation isn't its run {trace}'s: {why}"
         ));
     }
+    // A run of another harness on the same build and input confirms
+    // nothing through this target.
+    match crate::trace::TraceReader::open(&run) {
+        Ok(trace) if trace.meta.sim != harness => {
+            return Some(format!(
+                "its target confirmation's trace ran {}, not {harness}",
+                trace.meta.sim
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Some(format!("{}: {error}", run.display())),
+    }
     input_refusal(repo, input, &run)
 }
 
@@ -1896,7 +1910,7 @@ fn mapped_case_refusal(
             repo,
             dir,
             case,
-            target_of(targets, harness).as_deref(),
+            (harness, target_of(targets, harness).as_deref()),
             input,
         ),
         Err(why) => Some(format!("the fuzz-target mapping can't be read: {why}")),
@@ -3774,7 +3788,13 @@ mod tests {
                     }
                 }
             }
-            case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input)
+            case_refusal(
+                &repo,
+                case.path(),
+                ("p", "a"),
+                (MACHINE, Some("fuzz_a")),
+                &input,
+            )
         };
         assert_eq!(read(Some(&mine), Some(&confirmed)), None);
         // Confirmed through no target, or another one, while the harness
@@ -3819,17 +3839,25 @@ mod tests {
         let (verdict, untargeted) = case_checks(case.path(), None);
         write_checks(case.path(), &verdict, &untargeted);
         assert_eq!(
-            case_refusal(&repo, case.path(), ("p", "a"), None, &input),
+            case_refusal(&repo, case.path(), ("p", "a"), (MACHINE, None), &input),
             None
         );
-        assert!(case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input).is_some());
+        assert!(case_refusal(
+            &repo,
+            case.path(),
+            ("p", "a"),
+            (MACHINE, Some("fuzz_a")),
+            &input
+        )
+        .is_some());
     }
 
     /// Sol P2: an older attempt's checks for the same case never count
     /// beside this attempt's runs. A verdict that judged an older baseline
     /// or patched trace is refused, and so is a target confirmation that
     /// ran an older patched build, another input, or names a run other
-    /// than the one beside it, even when that run and its check agree.
+    /// than the one beside it, even when that run and its check agree, or
+    /// one of another harness than its target maps to.
     #[test]
     fn an_older_attempt_s_case_checks_are_refused() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3842,7 +3870,13 @@ mod tests {
         let (old_verdict, old_target) = case_checks(older.path(), Some("fuzz_a"));
         let refusal = |verdict: &VerdictCheck, target: &TargetCheck| {
             write_checks(current.path(), verdict, target);
-            case_refusal(&repo, current.path(), ("p", "a"), Some("fuzz_a"), &input)
+            case_refusal(
+                &repo,
+                current.path(),
+                ("p", "a"),
+                (MACHINE, Some("fuzz_a")),
+                &input,
+            )
         };
         assert_eq!(refusal(&mine, &confirmed), None);
         let substitutes = [
@@ -3896,6 +3930,20 @@ mod tests {
         for (substitute, verdict, target) in substitutes {
             assert!(refusal(&verdict, &target).is_some(), "{substitute}");
         }
+        // A run of another harness on the same build and input, which the
+        // confirmation names: only the trace's harness is off the one the
+        // target maps to.
+        let on_another_harness = TargetCheck {
+            trace: Some({
+                rewrite(&current.path().join(CONFIRMATION_DIR), |lines| {
+                    lines[0]["meta"]["sim"] = Value::String(NODE.to_owned());
+                });
+                digest(&current.path().join(CONFIRMATION_DIR).join("trace.jsonl"))
+            }),
+            ..confirmed.clone()
+        };
+        let why = refusal(&mine, &on_another_harness).expect("another harness's run is refused");
+        assert!(why.contains(&format!("ran {NODE}, not {MACHINE}")), "{why}");
         // The older attempt's confirmation run copied in with its own check,
         // which agree with each other, still isn't from the measured build.
         fs::remove_dir_all(current.path().join(CONFIRMATION_DIR)).expect("it exists");
@@ -3946,7 +3994,13 @@ mod tests {
                 (End::Completed, End::Completed)
             );
             assert_eq!(
-                case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input),
+                case_refusal(
+                    &repo,
+                    case.path(),
+                    ("p", "a"),
+                    (MACHINE, Some("fuzz_a")),
+                    &input
+                ),
                 None
             );
             rebuild_refusal(&repo, patch, "s", case.path())

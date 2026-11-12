@@ -1500,7 +1500,7 @@ impl IpSlots {
         registered.saturating_add(handshaking)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, all(debug_assertions, not(zakura_sim))))]
     fn registered_total(&self) -> usize {
         self.counts().registered.values().sum()
     }
@@ -1651,7 +1651,13 @@ impl ZakuraSupervisorState {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Checks that the per-IP registered totals match the active peer
+    /// registrations with known IPs, in debug builds.
+    ///
+    /// Simulator builds skip it. Its `IpSlots` lock is a scheduler point
+    /// there, so a debug-only lock would give debug and release builds
+    /// different schedules for the same seed.
+    #[cfg(all(debug_assertions, not(zakura_sim)))]
     fn debug_assert_accounting(&self) {
         debug_assert_eq!(
             self.ip_slots.registered_total(),
@@ -1663,7 +1669,7 @@ impl ZakuraSupervisorState {
         );
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(any(not(debug_assertions), zakura_sim))]
     fn debug_assert_accounting(&self) {}
 }
 

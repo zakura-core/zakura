@@ -562,6 +562,11 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             Expected::MachineCaught { case, harness } => {
                 tasks.push(case_task(repo, case, harness, true, id)?);
             }
+            // A harness-caught case has no Draft run: its patched run can't
+            // complete.
+            Expected::HarnessCaught { case, harness, .. } => {
+                tasks.push(case_task(repo, case, harness, false, id)?);
+            }
             Expected::IntegrityCaught {
                 patch,
                 history,
@@ -1408,6 +1413,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 subject_source,
             )),
             Task::Case {
+                expected,
                 property,
                 name,
                 harness,
@@ -1417,7 +1423,6 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 patch,
                 draft,
                 companions,
-                ..
             } => {
                 let case = |run| RunId::Case {
                     property: property.clone(),
@@ -1457,6 +1462,9 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 }
                 match (machine, draft) {
                     (true, _) => Actual::MachineCaught { baseline, patched },
+                    (false, None) if matches!(expected, ExpectedId::HarnessCaught(_)) => {
+                        Actual::HarnessCaught { baseline, patched }
+                    }
                     (false, Some(_)) => {
                         let draft = checks.draft(case(CaseRun::Draft));
                         let companions = companions_of(&dir, &draft, companions);
@@ -2457,11 +2465,19 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
             Some(((property.clone(), name.clone()), harness))
         })
         .collect();
+    let harness_caught: BTreeSet<(String, String)> = planted
+        .iter()
+        .filter(|(property, name)| {
+            super::planted_harness_caught(repo, property, name).unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     required_keys(&Inventories {
         registered: &registered,
         needs: &needs,
         planted: &planted,
         planted_harnesses: &planted_harnesses,
+        harness_caught: &harness_caught,
         native: &native,
         coverage_tests: &coverage,
         contracts: &super::contract_table(),
@@ -4829,6 +4845,18 @@ mod tests {
             );
             assert_eq!(found.result.as_ref(), Some(expected));
             match task {
+                // A harness-caught case has no Draft run to link.
+                Task::Case {
+                    machine: false,
+                    draft: None,
+                    ..
+                } => {
+                    assert!(matches!(expected, ExpectedId::HarnessCaught(_)));
+                    assert!(found
+                        .artifacts
+                        .contains(&format!("{index}/patched/trace.jsonl")));
+                    assert!(!found.artifacts.iter().any(|a| a.contains("/draft/")));
+                }
                 Task::Case { machine: false, .. } => {
                     node = true;
                     for artifact in [

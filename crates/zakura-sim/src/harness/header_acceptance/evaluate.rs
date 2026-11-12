@@ -22,8 +22,8 @@
 //! comes from the manifest's expected execution, never from what a result
 //! claims about itself.
 //!
-//! The tests that decide a contract's or an entry's state depend only on
-//! C5, the binary's provenance: letting them depend on the contracts they
+//! The tests and proving catches that decide a contract's or an entry's
+//! state depend only on C5, the binary's provenance: letting them depend on the contracts they
 //! decide would make the graph cyclic, so a contract could never be
 //! satisfied and an entry could never release. C5's own proving tests can't
 //! depend on C5, so each must have run from a binary that embeds the
@@ -36,7 +36,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    contracts::{contract_test_key, ContractId, ContractState, Narrowing, NarrowingTest, RunBy},
+    contracts::{
+        contract_catch_key, contract_test_key, ContractId, ContractState, Narrowing, NarrowingTest,
+        RunBy,
+    },
     Approval, CaseRun, Expected, ExpectedId, ExpectedNa, ExpectedResult, Found, Gate, Key,
     Manifest, ResultCtx, RunId, TestRef, GATES,
 };
@@ -89,6 +92,13 @@ pub enum Actual {
         /// The unpatched baseline.
         baseline: Execution,
         /// The patched run.
+        patched: Execution,
+    },
+    /// A harness-caught planted case's two runs.
+    HarnessCaught {
+        /// The unpatched baseline.
+        baseline: Execution,
+        /// The patched run, which ends at its harness failure.
         patched: Execution,
     },
     /// A native integrity mutation's three runs, each naming the history
@@ -505,10 +515,15 @@ pub fn evaluate(
             .iter()
             .filter(|contract| contract.id == id)
             .flat_map(|contract| {
-                contract
+                let tests = contract
                     .proving
                     .iter()
-                    .map(move |&t| contract_test_key(id, t))
+                    .map(move |&t| contract_test_key(id, t));
+                let catches = contract
+                    .proving_catches
+                    .iter()
+                    .map(move |&case| contract_catch_key(id, case));
+                tests.chain(catches)
             })
             .collect()
     };
@@ -594,7 +609,9 @@ pub fn evaluate(
             let passes = stray.is_empty()
                 && required.iter().all(|(key, gates)| match key {
                     Key::Composition { .. } => keys[key] == ObligationState::Verified,
-                    Key::ContractTest { .. } | Key::NarrowingTest { .. } => {
+                    Key::ContractTest { .. }
+                    | Key::ContractCatch { .. }
+                    | Key::NarrowingTest { .. } => {
                         !matches!(keys[key], ObligationState::Blocked { .. })
                     }
                     _ if gates.contains(&gate) => {
@@ -627,7 +644,10 @@ fn recorded(reason: &str, approval: Approval) -> bool {
 
 /// Whether `key` decides a contract's or a narrowing entry's state.
 fn decides_a_contract(key: &Key) -> bool {
-    matches!(key, Key::ContractTest { .. } | Key::NarrowingTest { .. })
+    matches!(
+        key,
+        Key::ContractTest { .. } | Key::ContractCatch { .. } | Key::NarrowingTest { .. }
+    )
 }
 
 impl<'a> Evidence<'a> {
@@ -729,22 +749,28 @@ impl<'a> Evidence<'a> {
                     return Standing::Blocked(format!("{id:?} is satisfied with no proving test"));
                 }
                 let mut excluded = None;
-                for &test in contract.proving {
-                    match keys.get(&contract_test_key(id, test)) {
+                let tests = contract
+                    .proving
+                    .iter()
+                    .map(|&test| (contract_test_key(id, test), format!("test {}", test.test)));
+                let catches = contract.proving_catches.iter().map(|&case| {
+                    (
+                        contract_catch_key(id, case),
+                        format!("catch {}/{}", case.property, case.name),
+                    )
+                });
+                for (key, what) in tests.chain(catches) {
+                    match keys.get(&key) {
                         Some(ObligationState::Verified) => {}
                         Some(ObligationState::Excluded { why }) => {
                             excluded = excluded.or(Some(why.clone()));
                         }
                         Some(ObligationState::Blocked { why }) => {
-                            return Standing::Blocked(format!(
-                                "{id:?}'s proving test {}: {why}",
-                                test.test
-                            ))
+                            return Standing::Blocked(format!("{id:?}'s proving {what}: {why}"))
                         }
                         None => {
                             return Standing::Blocked(format!(
-                                "{id:?}'s proving test {} has no state",
-                                test.test
+                                "{id:?}'s proving {what} has no state"
                             ))
                         }
                     }
@@ -759,9 +785,10 @@ impl<'a> Evidence<'a> {
     }
 
     /// The state of a key that decides a contract or a narrowing entry:
-    /// its test passed at the subject commit, with C5's standing applied
-    /// when `c5` is given, and for `bootstrap`, from a binary embedding the
-    /// subject's source digest.
+    /// its test passed at the subject commit, or its proving catch's result
+    /// at the subject commit passed its own judgment, with C5's standing
+    /// applied when `c5` is given, and for `bootstrap`, from a binary
+    /// embedding the subject's source digest. A catch never bootstraps C5.
     fn deciding_state(
         &self,
         result: &ExpectedResult,
@@ -770,11 +797,24 @@ impl<'a> Evidence<'a> {
     ) -> ObligationState {
         let own = match result.expected {
             Expected::Passes { test } => self.test_passed(test, bootstrap),
+            // A proving catch is its case's own judgment, which reads no
+            // contract.
+            Expected::Caught { .. } | Expected::HarnessCaught { .. } if !bootstrap => {
+                let id = result.expected.id().expect("a catch has an identity");
+                self.one_result(&id).and_then(|record| {
+                    judge(
+                        self.manifest,
+                        &self.traces,
+                        &result.expected,
+                        &record.actual,
+                    )
+                })
+            }
             Expected::Open { until, .. } => Err(match until {
                 Some(until) => format!("transitional until {until}"),
                 None => "an Open decides nothing".to_owned(),
             }),
-            _ => Err("a contract or entry is decided only by a test".to_owned()),
+            _ => Err("a contract or entry is decided only by a test or a catch".to_owned()),
         };
         // A blocked C5 blocks. A test that's missing or failed blocks too,
         // even under an excluded C5, so only a passing one is excluded by it.
@@ -939,9 +979,11 @@ fn owned_runs(expected: &Expected) -> Vec<RunId> {
         Expected::Caught { case, .. } => [CaseRun::Baseline, CaseRun::Patched, CaseRun::Draft]
             .map(|run| RunId::case(case, run))
             .to_vec(),
-        Expected::MachineCaught { case, .. } => [CaseRun::Baseline, CaseRun::Patched]
-            .map(|run| RunId::case(case, run))
-            .to_vec(),
+        Expected::MachineCaught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            [CaseRun::Baseline, CaseRun::Patched]
+                .map(|run| RunId::case(case, run))
+                .to_vec()
+        }
         Expected::IntegrityCaught { patch, .. } => {
             [CaseRun::Unpatched, CaseRun::Patched, CaseRun::Restored]
                 .map(|run| RunId::native(patch, run))
@@ -961,7 +1003,8 @@ fn executions(actual: &Actual) -> Vec<&Execution> {
             draft,
             ..
         } => vec![baseline, patched, draft],
-        Actual::MachineCaught { baseline, patched } => vec![baseline, patched],
+        Actual::MachineCaught { baseline, patched }
+        | Actual::HarnessCaught { baseline, patched } => vec![baseline, patched],
         Actual::IntegrityCaught {
             unpatched,
             patched,
@@ -980,9 +1023,9 @@ fn expected_harness(manifest: &Manifest, expected: &Expected) -> Option<String> 
         Expected::Holds { history, .. }
         | Expected::StaysNotApplicable { history, .. }
         | Expected::IntegrityCaught { history, .. } => Some(history.harness.to_owned()),
-        Expected::Caught { harness, .. } | Expected::MachineCaught { harness, .. } => {
-            Some((*harness).to_owned())
-        }
+        Expected::Caught { harness, .. }
+        | Expected::MachineCaught { harness, .. }
+        | Expected::HarnessCaught { harness, .. } => Some((*harness).to_owned()),
         Expected::Replays { run } => replayed_harness(manifest, run),
         Expected::Passes { .. } | Expected::Open { .. } => None,
     }
@@ -1000,6 +1043,7 @@ fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
                 .find_map(|result| match result.expected {
                     Expected::Caught { case, harness, .. }
                     | Expected::MachineCaught { case, harness }
+                    | Expected::HarnessCaught { case, harness, .. }
                         if case.property == property && case.name == name =>
                     {
                         Some(harness.to_owned())
@@ -1193,6 +1237,43 @@ fn judge(
             exactly_violated(patched, &[case.property])
         }
         (
+            Expected::HarnessCaught {
+                case,
+                harness,
+                detail,
+                not_applicable,
+            },
+            Actual::HarnessCaught { baseline, patched },
+        ) => {
+            if manifest.machines.contains(&harness) {
+                return Err(format!("{harness} is a machine, which runs no drain"));
+            }
+            whole_report(
+                manifest,
+                baseline,
+                &RunId::case(case, CaseRun::Baseline),
+                harness,
+                case.property,
+                not_applicable,
+            )?;
+            target_held(baseline, case.property)?;
+            same_run(
+                manifest,
+                patched,
+                &RunId::case(case, CaseRun::Patched),
+                harness,
+            )?;
+            inventory(manifest, patched, harness)?;
+            if patched.leaked != 0 {
+                return Err(format!("its patched run leaked {} tasks", patched.leaked));
+            }
+            missing_evidence(&patched.end, case.property, detail)?;
+            match violated(patched).next() {
+                Some(property) => Err(format!("its patched run violated {property}")),
+                None => Ok(()),
+            }
+        }
+        (
             Expected::IntegrityCaught {
                 patch,
                 history,
@@ -1369,6 +1450,7 @@ fn kind_of(actual: &Actual) -> &'static str {
         Actual::Run(_) => "run",
         Actual::Caught { .. } => "caught",
         Actual::MachineCaught { .. } => "machine-caught",
+        Actual::HarnessCaught { .. } => "harness-caught",
         Actual::IntegrityCaught { .. } => "integrity-caught",
         Actual::Replay { .. } => "replay",
         Actual::Test { .. } => "test",
@@ -1594,6 +1676,30 @@ fn caught_patched(
         (found, end) => return Err(format!("found {found:?}, its patched run ended {end:?}")),
     }
     exactly_violated(run, set)
+}
+
+/// Checks `end` is a harness failure of `property`'s missing evidence,
+/// `<property> lacks evidence after step <n>: <its detail>` as
+/// `HarnessFailure::MissingEvidence` writes it, whose detail says `detail`.
+fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), String> {
+    let End::HarnessFailure { diagnostic } = end else {
+        return Err(format!(
+            "its patched run ended {end:?}, not at a harness failure"
+        ));
+    };
+    let shown = diagnostic
+        .strip_prefix(property)
+        .and_then(|rest| rest.strip_prefix(" lacks evidence after step "))
+        .and_then(|rest| rest.split_once(": "))
+        .filter(|(step, _)| !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, shown)| shown);
+    match shown {
+        Some(shown) if shown.contains(detail) => Ok(()),
+        _ => Err(format!(
+            "its patched run's harness failure {diagnostic:?} isn't {property}'s missing \
+             evidence saying {detail:?}"
+        )),
+    }
 }
 
 /// A `Caught`'s `Draft` run: a completed counted run with the set as its

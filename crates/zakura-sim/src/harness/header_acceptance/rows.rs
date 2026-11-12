@@ -161,6 +161,10 @@ const TOOL_TESTS: &str = "tests/header_acceptance_tool.rs";
 /// per-row content tests carry the fault close a content rejection owes.
 const TABLE_TESTS: &str = "tests/header_wire_table.rs";
 
+/// The file of gate 3's crossing histories on `header-sync/wire`, each a
+/// `subscribe-headers` update that crosses the node's ending.
+const CROSSING_TESTS: &str = "tests/header_wire_crossing.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
 /// names its passing history, the gates it serves, and its catch.
 struct Generated {
@@ -2066,6 +2070,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "own9-join",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "owner-swap",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -3197,31 +3207,31 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/crossing-close",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_CROSSING_CLOSE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "a_crossing_close_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/over-window-grant",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_OVER_WINDOW_GRANT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+            ),
         },
     },
     GateRequirement {
@@ -3374,18 +3384,6 @@ const PROBE_ACCOUNTING: HistoryRef = HistoryRef {
     case: "plan 0 of inputs(16, 256)",
 };
 
-/// A [`NativeClass::ToMove`].
-const fn to_move(
-    patch: &'static str,
-    property: &'static str,
-    until: &'static str,
-) -> NativeMutation {
-    NativeMutation {
-        patch,
-        class: NativeClass::ToMove { property, until },
-    }
-}
-
 /// Every native mutation on `main`, classified. The ledger rules each one
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
@@ -3441,7 +3439,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "stored-order",
         },
     },
-    to_move("own9-join", COMMIT, "hdr-9c.1a"),
+    NativeMutation {
+        patch: "own9-join",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "own9-join",
+        },
+    },
     NativeMutation {
         patch: "owner-swap",
         class: NativeClass::Moved {

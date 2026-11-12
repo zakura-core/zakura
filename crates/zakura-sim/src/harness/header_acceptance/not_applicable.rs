@@ -146,6 +146,27 @@ const HONEST_SYNC: &[&str] = &[
     "header-sync/s5v9/subscribe-headers/sender-within-credit",
 ];
 
+/// The IDs a run in which an honest peer's header stream reopens on one
+/// connection applies, beside its target: both subscriptions' work and
+/// updates, the node's page and ending, and the honest peer unpunished.
+const HONEST_REOPEN: &[&str] = &[
+    "sim/no-task-panic",
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/s5v9/conformant-never-closes",
+    "header-sync/s5v9/status/sender-cadence",
+    "header-sync/storage-operation-ids",
+    "header-sync/teardown-returns-baseline",
+    "header-sync/reset-invalidates-work",
+    "header-sync/stale-completion-inert",
+    "header-sync/stale-chain-effect-inert",
+    "header-sync/s5v9/subscribe-headers/sender-within-live",
+    "header-sync/s5v9/subscribe-headers/sender-within-credit",
+    "header-sync/s5v9/headers/sender-answers-open",
+    "header-sync/s5v9/headers-outcome/sender-ends-once",
+    "session/honest-never-punished",
+];
+
 /// What an adversary's scenario doesn't declare: no peer is honest, and
 /// the node isn't expected to progress.
 const ADVERSARY: &[&str] = &[
@@ -280,6 +301,12 @@ const CASES: &[CaseNa] = &[
         "off-path-page",
         PAGE_JUDGED,
         ADVERSARY,
+    ),
+    wire(
+        "header-sync/commit-only-authorized",
+        "own9-join",
+        HONEST_REOPEN,
+        SERVING,
     ),
     wire(
         "header-sync/commit-only-authorized",

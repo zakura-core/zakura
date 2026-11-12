@@ -1160,8 +1160,8 @@ fn regenerate_saved_plans() {
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        // The progress fixture, honest sync, the three refused-page acts and
-        // the acts whose `<label>-closes` ID a planted case catches on them
+        // The progress fixture, honest sync, the reopen, the three refused-page
+        // acts and the acts whose `<label>-closes` ID a planted case catches on them
         // are planted cases' inputs, which `cargo xtask planted` records as
         // witnesses expecting a hold.
         let holds = |property: &str| {
@@ -1182,6 +1182,8 @@ fn regenerate_saved_plans() {
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),
+            // `commit-only-authorized/own9-join` reopens on it.
+            SavedPlan::Reopen => holds(COMMIT_ONLY_AUTHORIZED),
             SavedPlan::HonestSync => {
                 holds(HONEST_NEVER_PUNISHED)
                     + &holds("header-sync/s5v9/subscribe-headers/sender-within-live")
@@ -1194,7 +1196,7 @@ fn regenerate_saved_plans() {
                 };
                 holds(&judging(act.label(), row))
             }
-            SavedPlan::Act(_) | SavedPlan::Reopen | SavedPlan::OldPageAfterReopen => String::new(),
+            SavedPlan::Act(_) | SavedPlan::OldPageAfterReopen => String::new(),
         };
         let sidecar = format!(
             "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\

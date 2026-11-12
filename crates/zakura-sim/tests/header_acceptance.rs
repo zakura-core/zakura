@@ -639,22 +639,16 @@ fn every_required_key_is_covered_once_with_its_gates() {
             test.test = "another_test";
         }
     });
-    // A native mutation's transitional Open with only another owner, or
-    // only another reason.
-    let native = Key::Native {
-        patch: "own9-join".into(),
-    };
+    // No native mutation is still to move, so none takes a transitional
+    // Open, even the one a move to a listed PR would write.
     refused(&|m| {
-        let at = covering(m, &native);
-        if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
-            *owner = "Evan's side";
-        }
-    });
-    refused(&|m| {
-        let at = covering(m, &native);
-        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-            *reason = "another reason for the same PR";
-        }
+        let at = covering(
+            m,
+            &Key::Native {
+                patch: "raw-budget-lease".into(),
+            },
+        );
+        m.expected[at].expected = rows::native_open("hdr-14.7b");
     });
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
@@ -843,17 +837,6 @@ fn every_required_key_is_covered_once_with_its_gates() {
                 "wire_fails_without_each_source",
             ),
         };
-    });
-    refused(&|m| {
-        let at = covering(
-            m,
-            &Key::Native {
-                patch: "own9-join".into(),
-            },
-        );
-        if let Expected::Open { until, .. } = &mut m.expected[at].expected {
-            *until = Some("hdr-14.6");
-        }
     });
     // The retired mutation's catch of another failure than its pinned
     // witness's, or any Open, such as a ToMove's, isn't its own.
@@ -2160,54 +2143,60 @@ fn every_native_mutation_is_classified() {
         assert_eq!(native_pin_errors(&changed).len(), 1, "{class:?}");
     }
     // A mutation whose directory and classification are both removed is
-    // refused, since the inventory still names it.
+    // refused, since the inventory still names it: here the moved
+    // `own9-join`, whose directory is gone.
+    assert!(!native_dirs().iter().any(|dir| dir == "own9-join"));
     let dropped: Vec<rows::NativeMutation> = NATIVE_MUTATIONS
         .iter()
         .filter(|m| m.patch != "own9-join")
         .copied()
         .collect();
-    let fewer: Vec<String> = native_dirs()
-        .into_iter()
-        .filter(|dir| dir != "own9-join")
-        .collect();
-    assert!(!native_errors(&dropped, &fewer, &cases, &manifest.expected).is_empty());
+    assert!(!native_errors(&dropped, &native_dirs(), &cases, &manifest.expected).is_empty());
     // A move's record outlives its directory: once moved, its planted case
-    // must exist under its property and a catch must name it.
+    // must exist under its property and a catch must name it. The
+    // committed move holds. Without its planted case, without the Caught
+    // naming it, onto an existing, caught case of another name, or under
+    // another property, it's refused.
+    let own9 = (
+        "header-sync/commit-only-authorized".to_owned(),
+        "own9-join".to_owned(),
+    );
+    assert!(cases.contains(&own9));
+    let without_case: Vec<(String, String)> =
+        cases.iter().filter(|c| **c != own9).cloned().collect();
+    let unnamed: Vec<ExpectedResult> = manifest
+        .expected
+        .iter()
+        .filter(|r| {
+            !matches!(r.expected, Expected::Caught { case, .. }
+                if case.property == own9.0 && case.name == own9.1)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(unnamed.len() + 1, manifest.expected.len());
     let mut moved = NATIVE_MUTATIONS.to_vec();
     let at = moved.iter().position(|m| m.patch == "own9-join").unwrap();
-    let dirs: Vec<String> = native_dirs()
-        .into_iter()
-        .filter(|dir| dir != "own9-join")
-        .collect();
-    // Moved, it needs a planted case of its own name under its property,
-    // named by a Caught. An existing, caught case of another name doesn't
-    // stand in for it.
-    let mut with_case = cases.clone();
-    with_case.push((
-        "header-sync/commit-only-authorized".into(),
-        "own9-join".into(),
-    ));
-    let mut named = manifest.expected.clone();
-    let caught = named
-        .iter()
-        .find(|r| {
-            matches!(r.expected, Expected::Caught { case, .. }
-            if case.property == "header-sync/commit-only-authorized")
-        })
-        .unwrap()
-        .clone();
-    let mut own = caught;
-    if let Expected::Caught { case, .. } = &mut own.expected {
-        case.name = "own9-join";
-    }
-    named.push(own);
     for (property, case, cases, expected, ok) in [
         (
             "header-sync/commit-only-authorized",
             "own9-join",
-            &with_case,
-            &named,
+            &cases,
+            &manifest.expected,
             true,
+        ),
+        (
+            "header-sync/commit-only-authorized",
+            "own9-join",
+            &without_case,
+            &manifest.expected,
+            false,
+        ),
+        (
+            "header-sync/commit-only-authorized",
+            "own9-join",
+            &cases,
+            &unnamed,
+            false,
         ),
         (
             "header-sync/commit-only-authorized",
@@ -2217,22 +2206,15 @@ fn every_native_mutation_is_classified() {
             false,
         ),
         (
-            "header-sync/commit-only-authorized",
+            "header-sync/teardown-returns-baseline",
             "own9-join",
             &cases,
             &manifest.expected,
             false,
         ),
-        (
-            "header-sync/teardown-returns-baseline",
-            "own9-join",
-            &with_case,
-            &named,
-            false,
-        ),
     ] {
         moved[at].class = NativeClass::Moved { property, case };
-        let errors = native_errors(&moved, &dirs, cases, expected);
+        let errors = native_errors(&moved, &native_dirs(), cases, expected);
         assert_eq!(errors.is_empty(), ok, "{property}/{case}: {errors:?}");
     }
 }
@@ -3011,7 +2993,6 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 const OPEN_PRS: &[&str] = &[
     "hdr-14.4",
     "hdr-14.5",
-    "hdr-14.6",
     "hdr-14.7b",
     "hdr-14.8",
     "hf-1",
@@ -3171,6 +3152,30 @@ fn the_gate_requirements_match_their_obligations() {
         name: "gate-3/crossing/crossing-close".into(),
     };
     assert!(!crossing.covers(&standing.expected, NARROWING));
+    // Each crossing requirement is its own history's test. Another
+    // history's test doesn't satisfy it, nor does its old transitional
+    // Open: a conformant crossing isn't the over-window Grant's close.
+    for (name, own) in CROSSINGS {
+        let key = Key::Requirement {
+            name: format!("gate-3/crossing/{name}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{name}"
+        );
+        for (other, test) in CROSSINGS {
+            if other != name {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{name}");
+            }
+        }
+        let transitional = Expected::Open {
+            reason: "a crossed update, labelled and judged",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{name}");
+    }
     // Each row's bad-content requirement is that row's fault-close test,
     // since a content rejection owes the close. Another row's test doesn't
     // satisfy it, nor does its old transitional Open, nor the
@@ -3254,6 +3259,31 @@ const BAD_CONTENT_CLOSES: [(&str, TestRef); 4] = [
         sim_test(
             "tests/header_wire_table.rs",
             "headers_outcome_bad_content_closes_with_a_fault",
+        ),
+    ),
+];
+
+/// Each gate-3 crossing history's test, by requirement name.
+const CROSSINGS: [(&str, TestRef); 3] = [
+    (
+        "unretained-open-then-outcome",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "crossing-close",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "over-window-grant",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
         ),
     ),
 ];

@@ -49,7 +49,7 @@ use super::{
         chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
-        fault::{self, FaultCheck, FaultEvidence},
+        fault::{FaultCheck, FaultEvidence},
         fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
@@ -87,7 +87,7 @@ use crate::{
         header_sync_progress::{bounded_adversary_progress, recovery_deadline},
         session::{honest_never_punished, HonestPeers},
     },
-    observe::StorageFact,
+    observe::{ReactorFact, StorageFact},
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
@@ -1584,6 +1584,11 @@ pub struct WireScenario {
     pub peers: Vec<PeerSpec>,
     /// How the run completes the node's storage operations.
     pub policy: Policy,
+    /// The run's step budget in place of [`wire_config`]'s, for a history
+    /// the default budget can't reach. `None`, and absent from the JSON,
+    /// leaves the budget to [`Harness::config`](crate::Harness::config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
 }
 
 impl WireScenario {
@@ -1607,6 +1612,7 @@ impl Default for WireScenario {
             node: Chain::default(),
             peers: vec![PeerSpec::dialing()],
             policy: Policy::converging(),
+            budget: None,
         }
     }
 }
@@ -1826,8 +1832,9 @@ impl Subsystem for HeaderWire {
     type Scenario = WireScenario;
     type Prepared = WirePorts;
 
-    /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// [`wire_config`], with the scenario's own budget if it names one, or
+    /// else twice its budget for a scenario with status bursts or an
+    /// over-credit objects page. Emptying a `Status` bucket
     /// takes about 600 frames, and the node about 40 steps to read each. The
     /// node must read the whole 45 KB page before it can count objects, so
     /// with every datagram delivered at once, that run spends up to about
@@ -1841,10 +1848,10 @@ impl Subsystem for HeaderWire {
         });
         let config = wire_config();
         RunConfig {
-            budget: if burst {
-                2 * config.budget
-            } else {
-                config.budget
+            budget: match (scenario.budget, burst) {
+                (Some(budget), _) => budget,
+                (None, true) => 2 * config.budget,
+                (None, false) => config.budget,
             },
             ..config
         }
@@ -2674,17 +2681,32 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
 }
 
 /// [`DIRECT_DISPATCH`]'s trigger: a reactor dispatched a storage call,
-/// either to the node's port, whose header storage logs its submission, or
-/// to its action channel, which sets the dispatch guard's flag. So the rule
-/// had a call to judge.
+/// either to the node's port, whose header storage logs a submission tagged
+/// with a call the reactor's tap logged dispatching, or to its action
+/// channel, which sets the dispatch guard's flag. So the rule had a call to
+/// judge. The publisher's submissions carry no reactor call, so serving
+/// headers alone meets nothing here.
 fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
-    view.direct_dispatch_broken
-        || log.entries().iter().any(|entry| {
-            matches!(
-                operation_fact(HEADER_SERVICE, &entry.obs),
-                Some(StorageFact::Submitted { .. })
-            )
+    if view.direct_dispatch_broken {
+        return true;
+    }
+    let dispatched: BTreeSet<u64> = log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Dispatched { call, .. },
+                ..
+            } => Some(*call),
+            _ => None,
         })
+        .collect();
+    log.entries().iter().any(|entry| {
+        matches!(
+            operation_fact(HEADER_SERVICE, &entry.obs),
+            Some(StorageFact::Submitted { call: Some(call), .. }) if dispatched.contains(call)
+        )
+    })
 }
 
 /// [`HEADER_FAULT_PENALIZED`], active.
@@ -2703,12 +2725,16 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
     }
 }
 
-/// [`HEADER_FAULT_PENALIZED`]'s trigger: the reactor took the reply of a
-/// failed prepare or apply that owes a penalty ([`fault::owed`]), so the
-/// rule had something to judge. A log whose evidence can't be read owes
-/// nothing here, and the check itself reports why.
+/// [`HEADER_FAULT_PENALIZED`]'s trigger: a failed prepare or apply that
+/// owes a penalty delivered its reply to the reactor, which took it, left
+/// it untaken, or dropped it without the harness stopping the node
+/// ([`FaultEvidence::delivered`]), so the rule had something to judge. A
+/// log whose evidence can't be read owes nothing here, and the check itself
+/// reports why.
 fn penalty_owed(view: &StorageView, log: &ObservationLog) -> bool {
-    fault::owed(log.entries(), view.faults.attributions()).is_ok_and(|owed| !owed.is_empty())
+    view.faults
+        .delivered(log.entries())
+        .is_ok_and(|delivered| !delivered.is_empty())
 }
 
 /// What [`HEADER_FAULT_PENALIZED`] expects, as its violations report it.
@@ -2837,6 +2863,28 @@ mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
 
+    /// A wire scenario's own budget replaces the harness's, burst or not,
+    /// and an unset one is left out of the JSON, so every committed
+    /// scenario's digest stays.
+    #[test]
+    fn a_wire_scenario_budget_replaces_the_harness_budget() {
+        let mut scenario = WireScenario::default();
+        assert_eq!(HeaderWire::config(&scenario).budget, wire_config().budget);
+        let json = serde_json::to_value(&scenario).unwrap();
+        assert!(json.get("budget").is_none(), "{json}");
+        scenario.budget = Some(120_000);
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.peers[0].script.push(PeerAction::Act {
+            act: Act::StatusBurst,
+        });
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.budget = None;
+        assert_eq!(
+            HeaderWire::config(&scenario).budget,
+            2 * wire_config().budget
+        );
+    }
+
     /// The fork fixture's window constants restate production's, and its
     /// header cap leaves more than a refill batch of window.
     #[test]
@@ -2938,6 +2986,18 @@ mod tests {
         id: u64,
         taken: bool,
     ) {
+        log_failure(log, attributions, id, true, taken);
+    }
+
+    /// [`log_fault`], with its reply reaching the reactor only if
+    /// `delivered`.
+    fn log_failure(
+        log: &mut ObservationLog,
+        attributions: &crate::storage::FaultAttributions,
+        id: u64,
+        delivered: bool,
+        taken: bool,
+    ) {
         use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
         let point = |height| StoragePoint {
@@ -2983,7 +3043,7 @@ mod tests {
                 id,
                 outcome: "engine".to_owned(),
                 result: failed,
-                delivered: true,
+                delivered,
                 generation: 0,
                 state: String::new(),
             },
@@ -3082,6 +3142,68 @@ mod tests {
             &actual,
             &["UntakenFault: operation 4 ", "UntakenFault: operation 7 "],
         );
+    }
+
+    /// Logs the reactor's teardown dropping call `call`, with any reply it
+    /// held.
+    fn log_dropped(log: &mut ObservationLog, call: u64) {
+        log.push(Observation::Reactor {
+            instance: 0,
+            seq: 0,
+            storage_seq: 0,
+            node: "node".to_owned(),
+            event: ReactorFact::CallEnded {
+                call,
+                end: "dropped".to_owned(),
+                op: Some(call),
+            },
+        });
+    }
+
+    /// Whether [`HEADER_FAULT_PENALIZED`]'s trigger holds over what
+    /// `history` logs, in a settled run the harness stopped if `stopped`.
+    fn penalty_triggered(
+        stopped: bool,
+        history: impl FnOnce(&mut ObservationLog, &crate::storage::FaultAttributions),
+    ) -> bool {
+        use crate::harness::header_node::fault::tests::{evidence_ending, shutdown};
+
+        let ends = if stopped {
+            vec![shutdown()]
+        } else {
+            Vec::new()
+        };
+        let faults = evidence_ending(&[], &ends);
+        let mut log = ObservationLog::default();
+        history(&mut log, faults.attributions());
+        penalty_owed(&FaultsOnly(faults).view(), &log)
+    }
+
+    /// [`HEADER_FAULT_PENALIZED`]'s trigger holds for every header-peer
+    /// fault whose reply reached the reactor, since the property judges
+    /// each: one it took, one it left untaken, and one its teardown dropped
+    /// without the harness stopping the node. A drop the harness's stop
+    /// explains and a reply that never reached the reactor leave nothing to
+    /// judge.
+    #[test]
+    fn every_delivered_fault_meets_the_penalty_trigger() {
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, true);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(true, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(false, |log, blamed| {
+            log_failure(log, blamed, 1, false, false);
+        }));
     }
 
     /// A harness whose view holds only a recovery and the adoption and end
@@ -3271,6 +3393,136 @@ mod tests {
             .map(|found| found.actual)
             .collect();
         starts_with_each(&ended, &["UntakenFault: operation 3 "]);
+    }
+
+    /// An empty header scope.
+    fn scope() -> crate::observe::WorkScope {
+        crate::observe::WorkScope {
+            header_generation: 1,
+            branch: crate::observe::StorageBranch {
+                anchor: String::new(),
+                target: String::new(),
+            },
+        }
+    }
+
+    /// Logs `fact` on the node's header storage.
+    fn log_storage(log: &mut ObservationLog, fact: StorageFact) {
+        log.push(Observation::Storage {
+            service: HEADER_SERVICE.to_owned(),
+            instance: 0,
+            seq: 0,
+            txn: 0,
+            fact,
+        });
+    }
+
+    /// Logs the node's publisher serving a peer that subscribed from an
+    /// earlier height of the node's own chain: it acquires a header path
+    /// and reads a page of it, as operations 1 and 2, which no reactor
+    /// call submitted.
+    fn log_publisher(log: &mut ObservationLog) {
+        let requests = [
+            StorageRequest::AcquireHeaderPath {
+                peer: "aa".to_owned(),
+                session_id: 3,
+                scope: scope(),
+                target: "bb".to_owned(),
+                locators: vec!["cc".to_owned()],
+            },
+            StorageRequest::ReadHeaderPath {
+                lease: None,
+                scope: scope(),
+                after: "cc".to_owned(),
+                max_headers: 10,
+            },
+        ];
+        for (id, request) in (1..).zip(requests) {
+            log_storage(
+                log,
+                StorageFact::Submitted {
+                    id,
+                    request,
+                    digest: String::new(),
+                    call: None,
+                },
+            );
+        }
+    }
+
+    /// Logs the node's reactor dispatching locator call `call`.
+    fn log_dispatched(log: &mut ObservationLog, call: u64) {
+        log.push(Observation::Reactor {
+            instance: 0,
+            seq: 0,
+            storage_seq: 0,
+            node: "node".to_owned(),
+            event: crate::observe::ReactorFact::Dispatched {
+                call,
+                port: crate::observe::ReactorCall::Locator {
+                    peer: "aa".to_owned(),
+                    session_id: 3,
+                    target: "bb".to_owned(),
+                    scope: scope(),
+                },
+            },
+        });
+    }
+
+    /// An empty view whose dispatch guard's flag is `broken`.
+    fn dispatch_view(broken: bool) -> StorageView {
+        let faults = settled_faults(crate::storage::FaultAttributions::new(
+            &EvidenceStores::default(),
+        ));
+        StorageView {
+            direct_dispatch_broken: broken,
+            ..FaultsOnly(faults).view()
+        }
+    }
+
+    /// Serving headers alone dispatches nothing: an honest peer on the
+    /// node's chain subscribing from an earlier height makes the publisher
+    /// submit storage operations with no reactor call, which leave
+    /// [`DIRECT_DISPATCH`]'s trigger unmet.
+    #[test]
+    fn a_publisher_only_history_dispatched_no_storage_call() {
+        let mut log = ObservationLog::default();
+        log_publisher(&mut log);
+        assert!(!storage_call_dispatched(&dispatch_view(false), &log));
+    }
+
+    /// [`DIRECT_DISPATCH`]'s trigger needs the reactor's own dispatch: a
+    /// submission tagged with a call the reactor dispatched, or the
+    /// dispatch guard's flag. A submission tagged with a call the reactor
+    /// never logged dispatching isn't one.
+    #[test]
+    fn only_a_reactor_dispatch_meets_the_direct_dispatch_trigger() {
+        let reactor_submitted = |log: &mut ObservationLog| {
+            log_storage(
+                log,
+                StorageFact::Submitted {
+                    id: 3,
+                    request: StorageRequest::ContinuationLocator,
+                    digest: String::new(),
+                    call: Some(1),
+                },
+            );
+        };
+        let mut matched = ObservationLog::default();
+        log_publisher(&mut matched);
+        reactor_submitted(&mut matched);
+        log_dispatched(&mut matched, 1);
+        assert!(storage_call_dispatched(&dispatch_view(false), &matched));
+
+        let mut unmatched = ObservationLog::default();
+        log_publisher(&mut unmatched);
+        log_dispatched(&mut unmatched, 2);
+        reactor_submitted(&mut unmatched);
+        assert!(!storage_call_dispatched(&dispatch_view(false), &unmatched));
+
+        let mut flagged = ObservationLog::default();
+        log_publisher(&mut flagged);
+        assert!(storage_call_dispatched(&dispatch_view(true), &flagged));
     }
 
     /// A harness with no view, for checks that read only the log.

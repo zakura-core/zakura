@@ -169,8 +169,8 @@ struct Generated {
 enum GeneratedCatch {
     /// The case's name. Its set is the ID alone, and it's found at a step.
     Case(&'static str),
-    /// The `Open`'s reason, pending Adam's approval.
-    Open(&'static str),
+    /// The `Open`'s reason and its approval.
+    Open(&'static str, Approval),
 }
 
 /// The honest witness, and the check that the witnesses list every ID.
@@ -217,13 +217,13 @@ const GENERATED: [Generated; 32] = {
             "status/sender-cadence",
             EVERY,
             G34,
-            Open(SENDER_CADENCE_UNREACHED),
+            Case("pacing-floors-cut"),
         ),
         gen(
             "subscribe-headers/sender-within-live",
             EVERY,
             G3,
-            Open(SENDER_LIVE_UNREACHED),
+            Case("open-repeated"),
         ),
         gen(
             "subscribe-headers/sender-within-credit",
@@ -343,7 +343,7 @@ const GENERATED: [Generated; 32] = {
             "headers/long-payload-closes",
             HEADERS,
             G2,
-            Open(LONG_PAGE_UNREACHED),
+            Open(LONG_PAGE_UNREACHED, HDR_14_5_RULING),
         ),
         gen(
             "headers/unsolicited-closes",
@@ -355,9 +355,14 @@ const GENERATED: [Generated; 32] = {
             "headers/bad-content-closes",
             HEADERS,
             G2,
-            Open(BAD_PAGE_UNREACHED),
+            Case("unlinked-page-dropped"),
         ),
-        gen("headers/over-owed-closes", HEADERS, G23, Open(NOT_OWED)),
+        gen(
+            "headers/over-owed-closes",
+            HEADERS,
+            G23,
+            Open(NOT_OWED, Approval::Pending),
+        ),
         gen(
             "headers-outcome/reserved-flags-closes",
             OUTCOME,
@@ -392,7 +397,7 @@ const GENERATED: [Generated; 32] = {
             "headers-outcome/over-owed-closes",
             OUTCOME,
             G23,
-            Open(NOT_OWED),
+            Open(NOT_OWED, Approval::Pending),
         ),
     ]
 };
@@ -412,32 +417,19 @@ const fn gen(
     }
 }
 
+/// Adam's hdr-14.5 ruling on the generated IDs' open catches.
+const HDR_14_5_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.5 ruling",
+};
+
 /// Why `headers/long-payload-closes` has no catch: no patch to one path
 /// breaks it alone.
 const LONG_PAGE_UNREACHED: &str =
-    "the node grants a subscription less byte credit than the headers row's maximum, so a page \
-     past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
-     precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
-     refusals drains the page at 0 ns and breaks sim/no-livelock first";
-/// Why `headers/bad-content-closes` has no catch: its patch breaks a
-/// broader ID that `NESTS` doesn't list over it.
-const BAD_PAGE_UNREACHED: &str =
-    "each page content rule the adversary breaks, linkage and lower locator, puts headers the \
-     node didn't ask for on the page, so a patch that admits one has the node stage them and breaks \
-     header-sync/commit-only-authorized at that step, which NESTS doesn't list over this ID";
-/// Why `status/sender-cadence` has no catch: the run ends before a patched
-/// node empties the peer's bucket.
-const SENDER_CADENCE_UNREACHED: &str =
-    "the peer's Status bucket holds 602 frames and refills one every 500 ms, so breaking the rule \
-     takes over 600 Status frames from the node; with both its pacing floors cut to a millisecond, \
-     the reactor's publication interval and the cadence sender's send interval, a wire run sends \
-     about 213 before its 30,000-step budget ends";
-/// Why `subscribe-headers/sender-within-live` has no catch: the node's
-/// subscriber can't hold the subscriptions the rule's label needs.
-const SENDER_LIVE_UNREACHED: &str =
-    "the peer's models label a node Open over-live only beside two subscriptions the node holds \
-     on that peer, and the node's v9 subscriber state holds at most one live subscription per \
-     session, so no patch to one path makes the node send it";
+    "on the simulator's Regtest headers the node grants a subscription at most 4,000 smallest \
+     pages of byte credit, about 1 MiB, which is less than the headers row's 2 MiB maximum, so a \
+     page past that maximum is past its credit too, as the act's two labels say, and the \
+     subscriber's precheck refuses it before the frame filter's cap does; a patch that has the \
+     reader skip both refusals drains the page at 0 ns and breaks sim/no-livelock first";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1276,9 +1268,15 @@ pub struct StandingExclusion {
 }
 
 /// The approved standing exclusions of passing, catch and missing-source
-/// keys. None is approved on `main`: the two `over-owed-closes` catch
-/// exclusions still await approval, so they block.
-pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[];
+/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling.
+/// The two `over-owed-closes` catch exclusions still await approval, so
+/// they block.
+pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[StandingExclusion {
+    key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
+    owner: "hdr-14",
+    reason: LONG_PAGE_UNREACHED,
+    approval: HDR_14_5_RULING,
+}];
 
 /// Whether `exclusions` grants `key` exactly the standing `Open` `expected`.
 pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: &Expected) -> bool {
@@ -1399,8 +1397,8 @@ fn generated_ids() -> &'static [&'static str] {
 }
 
 /// A generated ID's row: its passing history, or its approval-pending
-/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or an
-/// approval-pending `Open`.
+/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or its
+/// `Open` under the approval its entry names.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
         let results = vec![result(
@@ -1429,7 +1427,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
     };
     match generated.catch {
         GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 26, so the leak is
+            // Built once per case for a fixed set of 29, so the leak is
             // bounded.
             let set: &'static [&'static str] = Box::leak(Box::new([property]));
             expected.extend(caught(
@@ -1441,13 +1439,13 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
                 true,
             ));
         }
-        GeneratedCatch::Open(reason) => expected.push(result(
+        GeneratedCatch::Open(reason, approval) => expected.push(result(
             vec![Key::catch(property)],
             generated.gates,
             Expected::Open {
                 reason,
                 owner: "hdr-14",
-                approval: Approval::Pending,
+                approval,
                 until: None,
             },
         )),
@@ -1647,6 +1645,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "skipped-retirement",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-locator-round",
             STORAGE,
             &[RESET] as &'static [&'static str],
             Found::AtStep,
@@ -3138,6 +3142,16 @@ pub enum NativeClass {
         /// Why.
         reason: &'static str,
     },
+    /// It's a duplicate of the existing planted case `case` under
+    /// `property`, an approved retirement. Its directory stays, so its key
+    /// stays required on gate 6, and that key shares the case's `Caught`:
+    /// it verifies only once that case is caught.
+    Duplicate {
+        /// The covering case's property.
+        property: &'static str,
+        /// The covering case.
+        case: &'static str,
+    },
 }
 
 /// One native mutation's classification.
@@ -3218,13 +3232,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "late-fault-unpenalized",
         },
     },
+    // Duplicates of a planted case: the same mutation one call apart,
+    // first failing with the same finding at the same step.
     NativeMutation {
         patch: "misstored-page",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case commit-only-authorized/stored-order, which \
-                     reverses the same page one call down, in WorkPolicy::stage_page, and on the \
-                     forks-sharing-a-header input first fails with the same UnstagedPage at step \
-                     709",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "stored-order",
         },
     },
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
@@ -3288,11 +3302,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "short-payload",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case \
-                     commit-only-authorized/dropped-payload-header, which plants the same \
-                     entries.pop() in WorkPolicy::begin_prepare and on the forks-sharing-a-header \
-                     input first fails with the same WrongPayload at step 738",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "dropped-payload-header",
         },
     },
     NativeMutation {
@@ -3311,11 +3323,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "skipped-retention",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case outstanding-work-bounded/retention-skipped, \
-                     which dispatches a prepare without retaining its headers in the same \
-                     dispatch path, and on the forks-sharing-a-header input first fails with the \
-                     same held call that holds no headers at step 738",
+        class: NativeClass::Duplicate {
+            property: OUTSTANDING,
+            case: "retention-skipped",
         },
     },
     NativeMutation {
@@ -3327,11 +3337,9 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     NativeMutation {
         patch: "stale-locator-round",
-        class: NativeClass::Retired {
-            reason: "a duplicate of the planted case reset-invalidates-work/awaiting-kept, whose \
-                     adoption also keeps the awaiting target, and on the \
-                     header-reset-held-locator input first fails with the same \
-                     ResetInvalidatesWork at step 207",
+        class: NativeClass::Moved {
+            property: RESET,
+            case: "stale-locator-round",
         },
     },
     NativeMutation {
@@ -3365,9 +3373,12 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
-/// or a transitional `Open` until the PR that moves it. A retired one has
-/// no key.
-pub fn native_results() -> Vec<ExpectedResult> {
+/// a transitional `Open` until the PR that moves it or, for a retired one,
+/// until its witness runs, or, for a duplicate, the `Caught` among
+/// `expected` of the planted case covering it, on gate 6. A moved one has
+/// no key, and nor has a duplicate whose case no `Caught` names, so its key
+/// blocks.
+pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
     NATIVE_MUTATIONS
         .iter()
         .filter_map(|mutation| {
@@ -3387,6 +3398,14 @@ pub fn native_results() -> Vec<ExpectedResult> {
                     not_applicable,
                 },
                 NativeClass::Retired { .. } => retired_open(),
+                NativeClass::Duplicate { property, case } => expected
+                    .iter()
+                    .find(|result| {
+                        matches!(result.expected, Expected::Caught { case: c, .. }
+                            if c.property == property && c.name == case)
+                    })?
+                    .expected
+                    .clone(),
                 NativeClass::Moved { .. } => return None,
             };
             Some(result(key, &[Gate::G6], expected))

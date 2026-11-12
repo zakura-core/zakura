@@ -280,6 +280,7 @@ fn conformant_peers_survive_loss_and_reordering() {
             honest(PeerSpec::listening(), 120, None),
         ],
         policy: Policy::converging(),
+        budget: None,
     };
     let (mut lost, mut out_of_order) = (0, 0);
     for plan in inputs(64, 16_384) {
@@ -338,6 +339,7 @@ fn a_lost_initial_is_retransmitted() {
         node: Chain::main(PRELOAD),
         peers: vec![honest(PeerSpec::dialing(), 120, None)],
         policy: Policy::converging(),
+        budget: None,
     };
     let to_node = link(peer, NODE_ADDR);
     let first = format!("drop:{to_node}:0");
@@ -429,6 +431,7 @@ fn a_handshake_timeout_is_neutral() {
             honest(PeerSpec::listening(), 120, None),
         ],
         policy: Policy::converging(),
+        budget: None,
     };
     let to_peer = link(NODE_ADDR, listener);
     let prefix = format!("drop:{to_peer}:");

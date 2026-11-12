@@ -11,3 +11,7 @@ source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 [[witness]]
 property = "header-sync/commit-only-authorized"
 expect = "holds"
+
+[[witness]]
+property = "header-sync/s5v9/headers/bad-content-closes"
+expect = "holds"

@@ -1,0 +1,14 @@
+# The session queues each `Open` a second time behind itself, so the node
+# opens a subscription on a peer that still holds its first one live,
+# which the peer's models label `OverLive`. v9's `max_live` is one, so the
+# second `Open` alone breaks the rule, while the subscriber state still
+# records one subscription. Its input is the saved honest-sync Plan, whose
+# honest peer serves the node its whole chain and leaves the node's first
+# subscription open, so
+# `header-sync/s5v9/subscribe-headers/sender-within-live` is the only ID
+# it breaks.
+# Besides service.rs, which the patch changes, the rest of these decide
+# when the node subscribes and how its updates reach the wire. A change
+# there can move the input off its `Open`.
+input = "crates/zakura-sim/tests/fixtures/header-wire-honest-sync.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

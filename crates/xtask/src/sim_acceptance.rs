@@ -1092,6 +1092,19 @@ impl Ctx<'_> {
             .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &runs)
             .current_dir(&src);
         self.record(&mut minimize, "minimize", json!({}))?;
+        // The minimized trace's recording executable, the patched build, is
+        // kept by its digest beside the others, so the archive replays it.
+        if let Ok(bytes) = fs::read(self.dir.join("minimize").join("bin").join("zakura-sim")) {
+            let kept_dir = self.run.out.join("bin").join(sha256_hex(&bytes));
+            fs::create_dir_all(&kept_dir)?;
+            let kept = kept_dir.join("zakura-sim");
+            fs::write(&kept, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&kept, fs::Permissions::from_mode(0o755))?;
+            }
+        }
         Ok(())
     }
 

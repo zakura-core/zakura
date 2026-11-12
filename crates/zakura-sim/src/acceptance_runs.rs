@@ -99,6 +99,20 @@ pub fn with_input<T>(input: &[u8], f: impl FnOnce() -> T) -> T {
     within(context, f)
 }
 
+/// Runs `f` with the input whose SHA-256 is `sha256` as the input of the
+/// runs it makes, for a replay, which knows its input by its trace's digest
+/// rather than its bytes.
+pub fn with_input_digest<T>(sha256: Option<&str>, f: impl FnOnce() -> T) -> T {
+    if dir().is_none() {
+        return f();
+    }
+    let context = Context {
+        input: sha256.map(str::to_owned),
+        ..current()
+    };
+    within(context, f)
+}
+
 /// Runs `f` with `role` as the role of the runs it makes.
 pub fn with_role<T>(role: &str, f: impl FnOnce() -> T) -> T {
     if dir().is_none() {

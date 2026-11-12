@@ -1881,9 +1881,10 @@ fn judge_minimize(
                 run.stem
             ));
         }
-        // A run that names its input must be of the input its phase confirms.
-        if run.input.as_deref().is_some_and(|named| named != sha) {
-            return blocked(format!("run {} is of another input than {sha}", run.stem));
+        // Every confirmation run names its input, and it's the one its
+        // phase confirms.
+        if run.input.as_deref() != Some(sha) {
+            return blocked(format!("run {} isn't named a run of input {sha}", run.stem));
         }
         if run.harness != harness {
             return blocked(format!("run {} isn't a run of {harness}", run.stem));

@@ -307,7 +307,11 @@ fn replay_on<'h>(
 
     let mut sink = VerifySink::new(trace, kept.is_some());
     let run = harness::with_draft(draft, || {
-        (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink)
+        // The replay is a run of the trace's own input.
+        let input = trace.meta.input.as_ref().map(|input| input.sha256.as_str());
+        crate::acceptance_runs::with_input_digest(input, || {
+            (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink)
+        })
     });
     let (mut report, failure) = match run {
         Ok(report) => (report, None),

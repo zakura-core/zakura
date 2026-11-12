@@ -299,18 +299,21 @@ pub fn confirm(
     let out = out.to_path_buf();
     let also_violates = also_violates.to_vec();
     // Each run inside a confirmation carries its role: the input run here,
-    // then the witness rerun, the recording and its replay.
-    crate::acceptance_runs::with_role("input", || {
-        Worker::new().explore(entry, input, move |input, run, classified| {
-            judge(
-                entry,
-                input,
-                (&id, &also_violates),
-                run,
-                classified,
-                &out,
-                confirmation,
-            )
+    // then the witness rerun, the recording and its replay. The input stays
+    // with all of them, the callback's included.
+    crate::acceptance_runs::with_input(input, || {
+        crate::acceptance_runs::with_role("input", || {
+            Worker::new().explore(entry, input, move |input, run, classified| {
+                judge(
+                    entry,
+                    input,
+                    (&id, &also_violates),
+                    run,
+                    classified,
+                    &out,
+                    confirmation,
+                )
+            })
         })
     })
 }

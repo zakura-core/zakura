@@ -17,15 +17,13 @@
 //! found at the end, go on past the break, so they can apply other IDs, or
 //! never reach some the baseline applies. Where a case's recorded runs
 //! there do, [`PATCHED`] names how, and [`patched_expected`] spells out
-//! their own list. Four cases' `Draft` runs don't fit any list, and keep
+//! their own list. Three cases' `Draft` runs don't fit any list, and keep
 //! their baselines' lists: on `outcome-window-unchecked`'s,
 //! `headers-outcome/unsolicited-closes` stops the run; on
-//! `page-past-credit`'s, `sim/no-livelock` does; on `open-repeated`'s,
+//! `page-past-credit`'s, `sim/no-livelock` does; and on `open-repeated`'s,
 //! `conformant-never-closes` does, with `session/honest-never-punished`
-//! broken too; and `exhausted-cadence-throttled`'s ends at a harness
-//! failure, a status burst on the connection the patch closed.
-//! [`super::rows::NESTS`] allows none of those sets, so each stays blocked
-//! until its owner decides.
+//! broken too. [`super::rows::NESTS`] allows none of those sets, so each
+//! stays blocked until its owner decides.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 

@@ -14,6 +14,7 @@ use crate::record::DrawRecord;
 struct Hunk {
     old_start: u64,
     old_len: u64,
+    new_start: u64,
     new_len: u64,
 }
 
@@ -42,6 +43,30 @@ impl HunkMap {
             }
         }
         Ok(map)
+    }
+
+    /// The map of the patch reversed: lines after it to lines before it,
+    /// for comparing a patched run against the code the patch was made
+    /// from.
+    pub fn inverse(&self) -> Self {
+        HunkMap {
+            files: self
+                .files
+                .iter()
+                .map(|(file, hunks)| {
+                    let reversed = hunks
+                        .iter()
+                        .map(|hunk| Hunk {
+                            old_start: hunk.new_start,
+                            old_len: hunk.new_len,
+                            new_start: hunk.old_start,
+                            new_len: hunk.old_len,
+                        })
+                        .collect();
+                    (file.clone(), reversed)
+                })
+                .collect(),
+        }
     }
 
     /// Where `line` of `file` before the patch is after it: shifted by the
@@ -78,10 +103,11 @@ fn parse_hunk(rest: &str) -> Option<Hunk> {
         Some((start.parse().ok()?, len.parse().ok()?))
     };
     let (old_start, old_len) = range(parts.next()?, '-')?;
-    let (_, new_len) = range(parts.next()?, '+')?;
+    let (new_start, new_len) = range(parts.next()?, '+')?;
     Some(Hunk {
         old_start,
         old_len,
+        new_start,
         new_len,
     })
 }
@@ -239,5 +265,24 @@ pub fn agreement(
             "the runs first differ at step {step}, which isn't at the declared site {}",
             site.at
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HunkMap;
+
+    /// The inverse map takes a line after the patch back to its line
+    /// before it, and a line inside a hunk to nothing, either way.
+    #[test]
+    fn the_inverse_map_undoes_the_patch() {
+        let patch = "+++ b/peer.rs\n@@ -86,18 +86,9 @@\n";
+        let map = HunkMap::parse(patch).unwrap();
+        let back = map.inverse();
+        assert_eq!(map.map("peer.rs", 120), Some(111));
+        assert_eq!(back.map("peer.rs", 111), Some(120));
+        assert_eq!(back.map("peer.rs", 85), Some(85));
+        assert_eq!(map.map("peer.rs", 97), None);
+        assert_eq!(back.map("peer.rs", 90), None);
     }
 }

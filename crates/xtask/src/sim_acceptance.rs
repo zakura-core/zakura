@@ -513,6 +513,7 @@ fn run_at(
             // A saved race schedule runs as a seed witness does.
             "seed-witness" | "race-schedule" => ctx.seed_witness(fields)?,
             "agreement" => ctx.agreement(fields)?,
+            "planted" => ctx.planted(fields)?,
             "command" => ctx.command(fields)?,
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
@@ -621,10 +622,22 @@ impl Ctx<'_> {
     /// with `--observe` if `observe`, which writes the full observation log
     /// beside the trace.
     fn replay_at(&self, trace: &str, name: &str, observe: bool) -> Result<(), BoxError> {
+        self.replay_with((self.release, self.release_sha256), trace, name, observe)
+    }
+
+    /// [`Ctx::replay_at`] by `executable`, with its SHA-256, which must be
+    /// the build that recorded the trace.
+    fn replay_with(
+        &self,
+        (executable, executable_sha256): (&Path, &str),
+        trace: &str,
+        name: &str,
+        observe: bool,
+    ) -> Result<(), BoxError> {
         let Ok(trace_sha256) = sha256_file(&self.dir.join(trace).join("trace.jsonl")) else {
             return Ok(());
         };
-        let mut replay = Command::new(self.release);
+        let mut replay = Command::new(executable);
         replay
             .arg("replay")
             .arg(self.dir.join(trace))
@@ -637,7 +650,7 @@ impl Ctx<'_> {
             name,
             json!({
                 "trace_sha256": trace_sha256,
-                "executable_sha256": self.release_sha256,
+                "executable_sha256": executable_sha256,
             }),
         )?;
         Ok(())
@@ -837,6 +850,107 @@ impl Ctx<'_> {
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
         self.record(&mut record, "record", json!({}))?;
         self.replay()
+    }
+
+    /// The discovery planted case: `cargo xtask planted <property>` for its
+    /// verdict, then S's checkout with the case's patch applied, in a
+    /// worktree under `<run>/planted/<task>/` with its own target
+    /// directory, whose release `zakura-sim` is kept as
+    /// `<run>/bin/<sha256>/zakura-sim` and named in `patched.json`. The
+    /// case's committed input is recorded by S's release build as a
+    /// `holds` witness into `baseline/` and by the patched build as a
+    /// `violated` witness into `patched/`, and each is replayed fresh with
+    /// `--observe` by the build that recorded it. A step that fails leaves
+    /// its files missing, so the task blocks.
+    fn planted(&self, task: &Value) -> Result<(), BoxError> {
+        let property = field(task, "property")?;
+        let harness = field(task, "harness")?;
+        let input = self.root.join(field(task, "input")?);
+        let cargo_path = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut verdict = Command::new(&cargo_path);
+        verdict
+            .args(["xtask", "planted", property])
+            .env_remove("RUSTFLAGS")
+            .current_dir(self.root);
+        self.record(&mut verdict, "planted", json!({}))?;
+        let index = self
+            .binding
+            .get("task")
+            .and_then(Value::as_u64)
+            .ok_or("a task's binding names its index")?;
+        let work = self.run.out.join("planted").join(index.to_string());
+        let src = work.join("src");
+        add_worktree(self.root, self.run, &src, "HEAD")?;
+        let mut apply = Command::new("git");
+        apply
+            .arg("apply")
+            .arg(self.root.join(field(task, "patch")?))
+            .current_dir(&src);
+        self.record(&mut apply, "apply", json!({}))?;
+        let applied = fs::read_to_string(self.dir.join("apply.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|apply| apply.get("exited_ok")?.as_bool())
+            == Some(true);
+        if !applied {
+            return Ok(());
+        }
+        let mut build = cargo(&src, &work.join("target"));
+        build.args([
+            "build",
+            "--locked",
+            "--release",
+            "-p",
+            "zakura-sim",
+            "--bin",
+            "zakura-sim",
+        ]);
+        self.record(&mut build, "build-patched", json!({}))?;
+        let Ok(bytes) = fs::read(work.join("target/release/zakura-sim")) else {
+            return Ok(());
+        };
+        let patched_sha256 = sha256_hex(&bytes);
+        let kept_dir = self.run.out.join("bin").join(&patched_sha256);
+        fs::create_dir_all(&kept_dir)?;
+        let kept = kept_dir.join("zakura-sim");
+        fs::write(&kept, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&kept, fs::Permissions::from_mode(0o755))?;
+        }
+        fs::write(
+            self.dir.join("patched.json"),
+            serde_json::to_string_pretty(
+                &self.bound(json!({ "sha256": patched_sha256 }), json!({})),
+            )?,
+        )?;
+        for (side, executable, executable_sha256, expect) in [
+            ("baseline", self.release, self.release_sha256, "holds"),
+            (
+                "patched",
+                kept.as_path(),
+                patched_sha256.as_str(),
+                "violated",
+            ),
+        ] {
+            let mut record = Command::new(executable);
+            record
+                .args(["record", "--sim", harness, "--input"])
+                .arg(&input)
+                .arg("--out")
+                .arg(self.dir.join(side))
+                .args(["--witness", property, "--expect", expect])
+                .current_dir(self.root);
+            self.record(&mut record, &format!("record-{side}"), json!({}))?;
+            self.replay_with(
+                (executable, executable_sha256),
+                side,
+                &format!("replay-{side}"),
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     /// One race fixture's agreement pair: its saved schedule recorded as its

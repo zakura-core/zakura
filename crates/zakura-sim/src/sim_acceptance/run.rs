@@ -18,7 +18,9 @@ use super::{
     evaluate::{evaluate, header_refusal, Evaluation, HeaderRecordFacts, RowSpec, Verdict},
     header::{self, consumed_cleanup, verify, Published},
     judge::{owned_run_passes, Registered, RunExpect},
-    manifest::{derive, problems, rows, Expected, LANES, RACE_SCHEDULES},
+    manifest::{
+        derive, problems, rows, Expected, DISCOVERY_CASE, DISCOVERY_SITE, LANES, RACE_SCHEDULES,
+    },
 };
 use crate::{
     check::PropertyOutcome,
@@ -133,6 +135,28 @@ pub enum Task {
         /// The fixture's declared site, [`crate::harness::fixtures::Fixture::AGREEMENT_SITE`].
         site: String,
     },
+    /// The discovery planted case (S4.7): `cargo xtask planted` for its
+    /// verdict (`planted.json`), then S with the case's patch applied, built
+    /// in its own directory and kept by SHA-256 (`patched.json`), and the
+    /// case's committed input recorded by S's release build as a `holds`
+    /// witness (`baseline/`) and by the patched build as a `violated`
+    /// witness (`patched/`), each replayed fresh with `--observe` by the
+    /// build that recorded it. The discovery agreement pair is judged from
+    /// these runs.
+    Planted {
+        /// The expected result it produces.
+        expected: String,
+        /// The planted property.
+        property: String,
+        /// The case's harness.
+        harness: String,
+        /// The committed input, relative to the repository's root.
+        input: String,
+        /// Its SHA-256.
+        input_sha256: String,
+        /// The case's patch, relative to the repository's root.
+        patch: String,
+    },
     /// One S4.6 command, which writes `command.json`.
     Command {
         /// The expected result it produces.
@@ -170,6 +194,7 @@ impl Task {
             | Task::SeedWitness { expected, .. }
             | Task::RaceSchedule { expected, .. }
             | Task::Agreement { expected, .. }
+            | Task::Planted { expected, .. }
             | Task::Command { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
@@ -430,14 +455,17 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                         },
                     })
                 }
-                // Judged from the header record and from seed tasks.
+                // Judged from the header record, from seed tasks, and the
+                // discovery pair from the planted case's runs.
                 Expected::HeaderKey(_) | Expected::EndRecord { .. } => None,
-                // The planted runner's verdict alone isn't evidence (Rule 11):
-                // it blocks until each of its runs is kept and judged.
-                // The discovery pair needs the planted case's patched build,
-                // which the tool doesn't run yet.
+                Expected::Agreement(name) if name == DISCOVERY_CASE.0 => None,
                 Expected::Agreement(name) if race_pairs.contains_key(name) => {
                     race_pairs.get(name).cloned()
+                }
+                // The planted runner's verdict alone isn't evidence (Rule 11),
+                // so its baseline and patched runs are recorded and judged.
+                Expected::Planted(property) if *property == DISCOVERY_CASE.0 => {
+                    planted_task(repo, &id)
                 }
                 Expected::Planted(_)
                 | Expected::Target(_)
@@ -466,6 +494,28 @@ pub fn plan(repo: &Path) -> Sim7Plan {
         }
     }
     plan
+}
+
+/// The discovery planted case's task, from its `.toml` at `repo`: its
+/// committed input and the harness that input's sidecar names.
+fn planted_task(repo: &Path, expected: &str) -> Option<Task> {
+    let (property, case) = DISCOVERY_CASE;
+    let dir = format!("qa/planted/{property}");
+    let toml: toml::Value =
+        toml::from_str(&fs::read_to_string(repo.join(format!("{dir}/{case}.toml"))).ok()?).ok()?;
+    let input = toml.get("input")?.as_str()?.to_owned();
+    let sidecar: toml::Value = toml::from_str(
+        &fs::read_to_string(repo.join(Path::new(&input).with_extension("toml"))).ok()?,
+    )
+    .ok()?;
+    Some(Task::Planted {
+        expected: expected.to_owned(),
+        property: property.to_owned(),
+        harness: sidecar.get("harness")?.as_str()?.to_owned(),
+        input_sha256: crate::seed::sha256(&fs::read(repo.join(&input)).ok()?),
+        input,
+        patch: format!("{dir}/{case}.patch"),
+    })
 }
 
 /// `lane`'s task, its command from `qa/suite.toml` at `repo` and its
@@ -825,7 +875,7 @@ fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> 
             .map(|trace| trace.meta.build.binary)
             .into_iter()
             .collect(),
-        Task::Agreement { .. } => ["base", "fixed"]
+        Task::Agreement { .. } | Task::Planted { .. } => ["base", "fixed", "baseline", "patched"]
             .iter()
             .filter_map(|side| {
                 TraceReader::open(&dir.join(side))
@@ -946,6 +996,19 @@ pub fn record(
             Task::SeedWitness { harness, input, .. } => {
                 seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, harness, None, input)
             }
+            Task::Planted {
+                harness,
+                input,
+                input_sha256,
+                ..
+            } => seed_inventory_refusal(
+                artifacts,
+                SEED_INVENTORY,
+                &bound,
+                harness,
+                Some(input),
+                input_sha256,
+            ),
             Task::RaceSchedule { harness, input, .. }
             | Task::Agreement {
                 harness,
@@ -1044,6 +1107,38 @@ pub fn record(
             }
         }
     }
+    // The discovery pair: from the planted case's runs, once they passed.
+    let discovery = Expected::Agreement(DISCOVERY_CASE.0.to_owned()).to_string();
+    let planted = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| matches!(task, Task::Planted { .. }));
+    let pair = match planted {
+        Some((index, task @ Task::Planted { patch, .. })) => {
+            if verdicts.get(task.expected()) == Some(&Verdict::Verified) {
+                if let Some(planted_evidence) = evidence.get(task.expected()).cloned() {
+                    evidence.insert(
+                        discovery.clone(),
+                        Evidence {
+                            applicable: 0,
+                            properties: BTreeMap::new(),
+                            ..planted_evidence
+                        },
+                    );
+                }
+                discovery_agreement(repo, &artifacts.join(index.to_string()), patch)
+            } else {
+                Verdict::Blocked {
+                    why: "the discovery planted case's runs didn't pass".to_owned(),
+                }
+            }
+        }
+        _ => Verdict::Blocked {
+            why: "no planted task ran the discovery case".to_owned(),
+        },
+    };
+    verdicts.insert(discovery, pair);
     let (refusal, header_record) = header_record(repo, header, subject, subject_source);
     for row in &rows {
         for expected in &row.expected {
@@ -1141,6 +1236,125 @@ struct Bound<'a> {
     /// The SHA-256 of the release `zakura-sim` the run kept, which every
     /// seed, witness and measured trace must have been recorded by.
     release: Option<String>,
+}
+
+/// The patched build's SHA-256 for the planted task in `dir`, if the run
+/// kept that executable with exactly those bytes under `<run>/bin/<sha>/`.
+fn kept_patched(dir: &Path, binding: &TaskBinding) -> Option<String> {
+    let sha = runner_json(dir, "patched.json", binding)?
+        .get("sha256")?
+        .as_str()?
+        .to_owned();
+    let run = dir.parent()?.parent()?;
+    let kept = crate::trace::read::read_bounded(
+        &run.join("bin").join(&sha).join("zakura-sim"),
+        header::MAX_ARTIFACT_BYTES,
+    )
+    .ok()
+    .flatten()?;
+    (sha256_hex(&kept) == sha).then_some(sha)
+}
+
+/// The planted task's verdict: `cargo xtask planted` passed, the baseline
+/// run on S's release build holds, and the run on the kept patched build,
+/// from the same commit, violates the property, each replayed exactly by
+/// its own build and passed through [`owned_run_passes`].
+fn judge_planted(
+    dir: &Path,
+    binding: &TaskBinding,
+    bound: &Bound<'_>,
+    harness: &str,
+    input: &str,
+    applicable: &mut u64,
+) -> Verdict {
+    let blocked = |why: String| Verdict::Blocked { why };
+    if !exited(runner_json(dir, "planted.json", binding)) {
+        return blocked("`cargo xtask planted` didn't pass".to_owned());
+    }
+    let Some(patched_sha) = kept_patched(dir, binding) else {
+        return blocked("the run didn't keep the patched build it recorded with".to_owned());
+    };
+    let Ok(patched) = TraceReader::open(&dir.join("patched")) else {
+        return blocked("the patched run left no trace".to_owned());
+    };
+    // The patched build embeds its own source, S plus the patch, so its
+    // trace is bound to that build and to S's commit rather than S's digest.
+    let patched_bound = Bound {
+        source: &patched.meta.build.source,
+        release: Some(patched_sha),
+    };
+    let baseline_git = TraceReader::open(&dir.join("baseline"))
+        .ok()
+        .map(|trace| trace.meta.build.git);
+    if baseline_git.as_deref() != Some(patched.meta.build.git.as_str())
+        || patched.meta.build.source == bound.source
+    {
+        return blocked("the patched build isn't S's commit with the patch applied".to_owned());
+    }
+    for (side, recorder) in [("baseline", bound), ("patched", &patched_bound)] {
+        if !exited(runner_json(dir, &format!("record-{side}.json"), binding)) {
+            return blocked(format!("the {side} run's witness recording didn't exit 0"));
+        }
+        if let Some(why) = replay_refusal(
+            dir,
+            (side, &format!("replay-{side}.json")),
+            binding,
+            recorder,
+        ) {
+            return blocked(why);
+        }
+    }
+    let property = DISCOVERY_CASE.0.to_owned();
+    let baseline = judge_trace(
+        &dir.join("baseline"),
+        bound,
+        (harness, Some(input)),
+        &RunExpect::Passes,
+        applicable,
+    );
+    if baseline != Verdict::Verified {
+        return baseline;
+    }
+    judge_trace(
+        &dir.join("patched"),
+        &patched_bound,
+        (harness, Some(input)),
+        &RunExpect::Violates {
+            property,
+            also: Vec::new(),
+        },
+        applicable,
+    )
+}
+
+/// The discovery agreement pair's verdict, from the planted task's runs in
+/// `dir` once they passed: the patched run, its lines mapped back across
+/// the patch, and the baseline run on S agree on every step before their
+/// first difference, which must be at [`DISCOVERY_SITE`] on S's side.
+fn discovery_agreement(repo: &Path, dir: &Path, patch: &str) -> Verdict {
+    let blocked = |why: String| Verdict::Blocked { why };
+    let map = match fs::read_to_string(repo.join(patch))
+        .map_err(|error| error.to_string())
+        .and_then(|text| super::agreement::HunkMap::parse(&text))
+    {
+        Ok(map) => map.inverse(),
+        Err(why) => return blocked(format!("{patch}: {why}")),
+    };
+    let views = |side: &str| super::agreement::step_views(&dir.join(side));
+    match (views("patched"), views("baseline")) {
+        (Ok(patched), Ok(baseline)) => match super::agreement::agreement(
+            &patched,
+            &baseline,
+            &map,
+            &super::agreement::Site {
+                at: DISCOVERY_SITE.to_owned(),
+            },
+        ) {
+            Ok(_) => Verdict::Verified,
+            Err(why) => blocked(why),
+        },
+        (Err(why), _) | (_, Err(why)) => blocked(why),
+    }
 }
 
 /// One task's verdict from its artifacts in `dir`.
@@ -1379,6 +1593,11 @@ fn judge_task(
                 (Err(why), _) | (_, Err(why)) => blocked(why),
             }
         }
+        Task::Planted {
+            harness,
+            input_sha256,
+            ..
+        } => judge_planted(dir, binding, bound, harness, input_sha256, applicable),
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)
                 if command.get("args") != Some(&serde_json::json!(args))

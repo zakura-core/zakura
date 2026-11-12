@@ -19,6 +19,19 @@ use crate::harness::header_acceptance::{
 /// sched-4's saved race schedules, outside the seed loader's directory.
 pub const RACE_SCHEDULES: &str = "crates/zakura-sim/tests/fixtures/race-schedules";
 
+/// The discovery lost-wakeup case (S4.7): the planted property and the
+/// case's name, whose `.toml` and `.patch` sit under
+/// `qa/planted/<property>/`.
+pub const DISCOVERY_CASE: (&str, &str) = ("discovery/wait-complete-wakes", "lost-wakeup");
+
+/// Where the fix's first observable effect is on the discovery case's
+/// committed input (S4.7): the source task creating its `Notified` before
+/// it checks for completion (`discovery/peer.rs`'s `wait_complete`), which
+/// the planted patch moves after the check. The patched and fixed runs
+/// agree on every step before it. It's declared here, not beside the fix,
+/// because the fix is production code.
+pub const DISCOVERY_SITE: &str = "discovery_admission.1/discovery_source.1:notified#1";
+
 /// The planted case the downstream item's production bypass is (hdr-14.6's
 /// despite-close case), whose catch's replay downstream requires.
 const DESPITE_CLOSE: (&str, &str) = ("header-sync/commit-only-authorized", "staged-despite-close");

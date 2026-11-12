@@ -6,24 +6,25 @@
 //! `commit-only-authorized` owns several claim kinds, so its `Caught` alone
 //! could come from another one. Its row names three companions, each judged
 //! on the case's own `Draft` run, and each joined to the rejected page by
-//! its full identity, since Rule 25 isn't adopted:
+//! its full identity, a Rule 25 ref ([`super::refs`]):
 //!
 //! - [`FAULT_CLOSE`]: the node closed the rejected frame's connection with a
 //!   cause in [`FAULT_CAUSES`](crate::model::FAULT_CAUSES), after it judged
-//!   that frame, and the session's reader refused a frame for the page's
-//!   content fault, [`CONTENT_FAULT`]. It joins on the connection, and on
-//!   the peer and the session, so a close for another fault, or another
-//!   peer's refusal, doesn't count.
-//! - [`STAGED`]: exactly one `PageStaged` came from that frame. It joins on
-//!   the session the frame's connection and QUIC stream carry, the
-//!   subscription the frame names, and the frame's position among the
-//!   stream's reads, and it carries the frame's peer and the hashes the peer
-//!   sent. Subscription IDs are per session, so the subscription alone
-//!   doesn't name a page.
+//!   that frame ([`FrameRef`]), and the session's reader refused a frame for
+//!   the page's content fault, [`CONTENT_FAULT`] ([`SessionRef`]: the peer
+//!   and the session), so a close for another fault, or another peer's
+//!   refusal, doesn't count.
+//! - [`STAGED`]: exactly one `PageStaged` came from that frame, as the
+//!   session's reader names it ([`ReadRef`]: the session the frame's
+//!   connection and QUIC stream carry, and the frame's position among the
+//!   stream's reads), and it's the page the peer sent ([`PageRef`]: the
+//!   frame's peer, session and subscription, the frame and the hashes the
+//!   peer sent). Subscription IDs are per session, so the subscription
+//!   alone doesn't name a page.
 //! - [`PATH_BREAK`]: the retained `commit-only-authorized` violation is a
-//!   `path` break whose subject is that page: its peer, session,
-//!   subscription, frame and header hashes, which C22 adds to each page
-//!   finding.
+//!   `path` break whose subject is that page, its [`PageRef`], which C22
+//!   adds to each page finding, and it's the violation the property
+//!   reported for that record ([`FindingRef`]).
 //!
 //! The rejected page is found from the run's own log: the one `headers`
 //! frame the peer's models labelled `BadContent` that the node judged
@@ -35,7 +36,11 @@
 use serde_json::Value;
 use zakura_network::zakura::observe::ReactorEvent;
 
-use super::CaseRef;
+use super::{
+    binding::{self, Expect, Field},
+    refs::{joined, FindingRef, FrameRef, PageRef, ReadRef, SessionRef, SubscriptionRef},
+    CaseRef,
+};
 use crate::{
     harness::header_node::authority::{Attribution, AuthorityRule, AuthoritySubject},
     model::{is_fault_cause, Label},
@@ -78,6 +83,14 @@ pub struct Refusal {
 }
 
 impl Refusal {
+    /// The session whose reader refused it.
+    pub fn session(&self) -> SessionRef {
+        SessionRef {
+            peer: self.peer.clone(),
+            session: self.session,
+        }
+    }
+
     /// The refusal `event` reports, if it's a `FrameRefused`.
     pub fn of(event: &ReactorEvent) -> Option<Refusal> {
         let ReactorEvent::FrameRefused {
@@ -99,19 +112,39 @@ impl Refusal {
 /// The rejected page's frame, as the run's log names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedPage {
-    /// The connection it came on.
-    pub connection: u64,
-    /// Its QUIC stream.
-    pub quic_stream: u64,
-    /// Its position among the peer's frames on the stream, which is its
-    /// position among the stream's reads.
-    pub frame: u64,
+    /// The frame: its connection, stream, direction and its position among
+    /// the peer's frames on the stream, which is its position among the
+    /// stream's reads.
+    pub frame: FrameRef,
     /// The node's session for that connection and stream.
     pub session: u64,
     /// The subscription it names.
     pub subscription: u64,
     /// The peer its connection's `Session` row names, by harness name.
     pub peer: String,
+}
+
+impl RejectedPage {
+    /// The frame as the session's reader names it.
+    pub fn read(&self) -> ReadRef {
+        ReadRef {
+            session: self.session,
+            frame: self.frame.seq,
+        }
+    }
+
+    /// The page the peer sent in this frame, `sent`, on its subscription.
+    pub fn page(&self, sent: &SentPage) -> PageRef {
+        PageRef {
+            subscription: SubscriptionRef {
+                peer: sent.peer.clone(),
+                session: self.session,
+                subscription: self.subscription,
+            },
+            frame: self.frame.seq,
+            headers: sent.hashes.clone(),
+        }
+    }
 }
 
 /// What the peer sent as the rejected page, from the frame's evidence: its
@@ -141,6 +174,28 @@ pub struct StagedPage {
 }
 
 impl StagedPage {
+    /// The frame it came from, as its session's reader names it, if a
+    /// reader tagged it.
+    pub fn read(&self) -> Option<ReadRef> {
+        Some(ReadRef {
+            session: self.session,
+            frame: self.frame?,
+        })
+    }
+
+    /// The page it staged, if a reader tagged its frame.
+    pub fn page(&self) -> Option<PageRef> {
+        Some(PageRef {
+            subscription: SubscriptionRef {
+                peer: self.peer.clone(),
+                session: self.session,
+                subscription: self.subscription,
+            },
+            frame: self.frame?,
+            headers: self.hashes.clone(),
+        })
+    }
+
     /// The staged page `event` reports, if it's a `PageStaged`.
     pub fn of(event: &ReactorEvent) -> Option<StagedPage> {
         let ReactorEvent::PageStaged {
@@ -164,64 +219,95 @@ impl StagedPage {
     }
 }
 
+/// The frame `obs` says the node judged, if it's a `FrameJudged` on a QUIC
+/// stream: a frame the peer sent.
+fn judged_frame(obs: &Observation) -> Option<FrameRef> {
+    match obs {
+        Observation::FrameJudged {
+            connection,
+            stream,
+            quic_stream: Some(quic_stream),
+            seq,
+        } => Some(FrameRef {
+            connection: *connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream: *quic_stream,
+            inbound: true,
+            seq: *seq,
+        }),
+        _ => None,
+    }
+}
+
 /// The rejected page in `observations`: the one `headers` frame the peer's
 /// models labelled `BadContent` and the node judged, with the session its
 /// connection and QUIC stream carry. An error says why there's no single
 /// one.
 pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, String> {
-    let judged = |connection: u64, stream: u64, frame: u64| {
-        observations.iter().any(|obs| {
-            matches!(obs, Observation::FrameJudged { connection: c, quic_stream: Some(s), seq, .. }
-                if (*c, *s, *seq) == (connection, stream, frame))
-        })
-    };
-    let frames: Vec<(u64, u64, u64, Option<u64>)> = observations
+    let judged = |frame: &FrameRef| !joined(observations, judged_frame, frame).is_empty();
+    let frames: Vec<(FrameRef, Option<u64>)> = observations
         .iter()
         .filter_map(|obs| match obs {
             Observation::PeerFrame {
                 connection,
+                stream,
                 quic_stream: Some(quic_stream),
                 seq,
                 row: Some(row),
                 label: Label::BadContent,
                 exchange,
                 ..
-            } if row == "headers" => Some((*connection, *quic_stream, *seq, *exchange)),
+            } if row == "headers" => Some((
+                FrameRef {
+                    connection: *connection,
+                    kind: stream.kind,
+                    version: stream.version,
+                    quic_stream: *quic_stream,
+                    inbound: true,
+                    seq: *seq,
+                },
+                *exchange,
+            )),
             _ => None,
         })
-        .filter(|(connection, stream, frame, _)| judged(*connection, *stream, *frame))
+        .filter(|(frame, _)| judged(frame))
         .collect();
-    let [(connection, quic_stream, frame, exchange)] = frames[..] else {
+    let [(frame, exchange)] = &frames[..] else {
         return Err(format!(
             "{} judged bad-content pages, not one: {frames:?}",
             frames.len()
         ));
     };
-    let subscription =
-        exchange.ok_or_else(|| format!("the rejected page {frame} names no subscription"))?;
+    let subscription = exchange
+        .ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
+    // The session row names the stream its session reads.
     let sessions: Vec<(u64, &str)> = observations
         .iter()
         .filter_map(|obs| match obs {
             Observation::Session {
-                connection: c,
-                quic_stream: s,
-                kind: 5,
-                version: 9,
+                connection,
+                quic_stream,
+                kind,
+                version,
                 session_id,
                 peer,
-            } if (*c, *s) == (connection, quic_stream) => Some((*session_id, peer.as_str())),
+            } if (*connection, *quic_stream, *kind, *version)
+                == (frame.connection, frame.quic_stream, frame.kind, frame.version) =>
+            {
+                Some((*session_id, peer.as_str()))
+            }
             _ => None,
         })
         .collect();
     let [(session, peer)] = sessions[..] else {
         return Err(format!(
-            "connection {connection} stream {quic_stream} carries sessions {sessions:?}, not one"
+            "connection {} stream {} carries sessions {sessions:?}, not one",
+            frame.connection, frame.quic_stream
         ));
     };
     Ok(RejectedPage {
-        connection,
-        quic_stream,
-        frame,
+        frame: frame.clone(),
         session,
         subscription,
         peer: peer.to_owned(),
@@ -247,98 +333,86 @@ pub fn sent_page(
 ) -> Result<SentPage, String> {
     let peer = page_peer(page, peers)?;
     let hashes = sent
-        .page(page.connection, page.quic_stream, page.frame)
+        .page(page.frame.connection, page.frame.quic_stream, page.frame.seq)
         .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
     Ok(SentPage { peer, hashes })
 }
 
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
 /// after it judged `page`'s frame, with a fault cause, and `refusals` hold
-/// exactly one of `page`'s peer ([`page_peer`], from `peers`) and session,
-/// for [`CONTENT_FAULT`]. A reader ends its session at its first refusal,
-/// so that one is the close's.
+/// exactly one of `page`'s session ([`page_peer`], from `peers`, and its
+/// session), for [`CONTENT_FAULT`]. A reader ends its session at its first
+/// refusal, so that one is the close's.
 pub fn fault_close(
     observations: &[Observation],
     refusals: &[Refusal],
     page: &RejectedPage,
     peers: &[(String, String)],
 ) -> Result<(), String> {
-    let peer = page_peer(page, peers)?;
+    let session = SessionRef {
+        peer: page_peer(page, peers)?,
+        session: page.session,
+    };
     let judged = observations
         .iter()
-        .position(|obs| {
-            matches!(obs, Observation::FrameJudged { connection, quic_stream: Some(s), seq, .. }
-                if (*connection, *s, *seq) == (page.connection, page.quic_stream, page.frame))
-        })
+        .position(|obs| judged_frame(obs).as_ref() == Some(&page.frame))
         .ok_or_else(|| format!("the node never judged {page:?}"))?;
+    // A close names only its connection, which is the whole of its
+    // identity.
+    let connection = page.frame.connection;
     let close = observations
         .iter()
         .enumerate()
         .find_map(|(at, obs)| match obs {
-            Observation::ConnectionClosed { connection, cause }
-                if *connection == page.connection =>
-            {
+            Observation::ConnectionClosed { connection: c, cause } if *c == connection => {
                 Some((at, cause))
             }
             _ => None,
         });
     match close {
-        None => Err(format!("connection {} never closed", page.connection)),
+        None => Err(format!("connection {connection} never closed")),
         Some((at, cause)) if at < judged => Err(format!(
-            "connection {} closed with {cause} before the node judged frame {}",
-            page.connection, page.frame
+            "connection {connection} closed with {cause} before the node judged frame {}",
+            page.frame.seq
         )),
         Some((_, cause)) if !is_fault_cause(cause) => Err(format!(
-            "connection {} closed with {cause}, not a fault cause",
-            page.connection
+            "connection {connection} closed with {cause}, not a fault cause"
         )),
         Some(_) => {
-            let of_session: Vec<&Refusal> = refusals
-                .iter()
-                .filter(|refusal| refusal.peer == peer && refusal.session == page.session)
-                .collect();
+            let of_session = joined(refusals, |refusal| Some(refusal.session()), &session);
             match of_session[..] {
                 [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
                 _ => Err(format!(
-                    "peer {peer}'s session {} reader refused {of_session:?}, not one frame for \
-                     {CONTENT_FAULT}",
-                    page.session
+                    "{session:?}'s reader refused {of_session:?}, not one frame for \
+                     {CONTENT_FAULT}"
                 )),
             }
         }
     }
 }
 
-/// [`STAGED`]: exactly one of `staged` came from `page`'s frame, on its
-/// session and subscription, and it carries `sent`'s peer and its headers,
-/// which aren't none.
+/// [`STAGED`]: exactly one of `staged` came from `page`'s frame, as its
+/// session's reader names it ([`ReadRef`]), and it's the page the peer
+/// sent there, `sent`, on `page`'s subscription ([`PageRef`]), with headers.
 pub fn staged_page(
     staged: &[StagedPage],
     page: &RejectedPage,
     sent: &SentPage,
 ) -> Result<(), String> {
-    let from: Vec<&StagedPage> = staged
-        .iter()
-        .filter(|fact| {
-            fact.session == page.session
-                && fact.subscription == page.subscription
-                && fact.frame == Some(page.frame)
-        })
-        .collect();
+    let want = page.page(sent);
+    let from = joined(staged, StagedPage::read, &page.read());
     match from[..] {
         [fact] if fact.hashes.is_empty() => {
             Err(format!("the rejected page staged no header: {fact:?}"))
         }
-        [fact] if fact.peer != sent.peer || fact.hashes != sent.hashes => Err(format!(
-            "the page staged from the rejected frame is {fact:?}, not the peer's {sent:?}"
+        [fact] if fact.page().as_ref() != Some(&want) => Err(format!(
+            "the page staged from the rejected frame is {fact:?}, not the peer's {want:?}"
         )),
         [_] => Ok(()),
         _ => Err(format!(
-            "{} pages staged from session {} subscription {} frame {}, not one",
+            "{} pages staged from {:?}, not one",
             from.len(),
-            page.session,
-            page.subscription,
-            page.frame
+            page.read()
         )),
     }
 }
@@ -348,8 +422,8 @@ pub fn staged_page(
 /// store's snapshot, whose attribution is a `path` break of `page` as the
 /// peer sent it, `sent`. A violation is a record's when it's at the
 /// record's step and its `actual` is the record's detail, which is how the
-/// property reports a break, so the same detail retained at another
-/// boundary doesn't stand in for a break dropped at its own.
+/// property reports a break ([`FindingRef`]), so the same detail retained
+/// at another boundary doesn't stand in for a break dropped at its own.
 pub fn path_break(
     properties: &[PropertyReport],
     claims: &Value,
@@ -363,27 +437,37 @@ pub fn path_break(
     if !matches!(report.outcome, PropertyOutcome::Violated { .. }) {
         return Err(format!("{COMMIT} is {:?}", report.outcome));
     }
+    let subject = page.page(sent);
     let expected = serde_json::to_value(Attribution {
         rule: AuthorityRule::Path,
         subject: AuthoritySubject::Page {
-            peer: sent.peer.clone(),
-            session: page.session,
-            subscription: page.subscription,
-            headers: sent.hashes.clone(),
-            frame: Some(page.frame),
+            peer: subject.subscription.peer,
+            session: subject.subscription.session,
+            subscription: subject.subscription.subscription,
+            headers: subject.headers,
+            frame: Some(subject.frame),
         },
     })
     .map_err(|error| format!("the expected attribution doesn't serialize: {error}"))?;
     let records = claims
         .as_array()
         .ok_or("the claim store's snapshot isn't a list")?;
+    let reported = |violation: &crate::Violation| {
+        Some(FindingRef {
+            step: violation.step,
+            detail: violation.actual.clone(),
+        })
+    };
     let found = records.iter().any(|record| {
+        let finding = record["step"].as_u64().zip(record["detail"].as_str());
         record["claim"] == "CommitOnlyAuthorized"
             && record["attribution"] == expected
-            && record["detail"].as_str().is_some_and(|detail| {
-                report.violations.iter().any(|violation| {
-                    record["step"].as_u64() == Some(violation.step) && violation.actual == detail
-                })
+            && finding.is_some_and(|(step, detail)| {
+                let finding = FindingRef {
+                    step,
+                    detail: detail.to_owned(),
+                };
+                !joined(&report.violations, reported, &finding).is_empty()
             })
     });
     if found {
@@ -481,27 +565,20 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
 /// Judges each of [`COMPANIONS`] on the case's recorded `Draft` run in
 /// `dir` (C9), as [`judge`] does. The trace must be `header-sync/wire`'s
 /// with `commit-only-authorized` as its whole `Draft` override. It's rerun
-/// here following the trace's own picks and draws, and the rerun's full
-/// report, every violation and the stores' snapshot, must equal the one
+/// here following the trace's own picks and draws ([`binding::TRACE_META`]),
+/// and the rerun's full report, every violation and the stores' snapshot,
+/// must equal the one
 /// recorded beside the trace, so what's judged is that run. So this must
 /// run in the build that recorded the trace, the case's own patched one,
 /// where a patched behavior replays. An error says why there's no verdict.
 pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     use crate::harness::{header_sync::HeaderWire, Subsystem};
     let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
-    if trace.meta.sim != HeaderWire::NAME {
-        return Err(format!(
-            "the trace ran {}, not {}",
-            trace.meta.sim,
-            HeaderWire::NAME
-        ));
-    }
-    if trace.meta.draft != [COMMIT] {
-        return Err(format!(
-            "the trace's Draft override is {:?}, not [{COMMIT}]",
-            trace.meta.draft
-        ));
-    }
+    let expect = Expect::new()
+        .with(Field::Harness, HeaderWire::NAME)
+        .with(Field::Draft, [COMMIT]);
+    let meta = serde_json::to_value(&trace.meta).map_err(|error| error.to_string())?;
+    binding::check(&binding::TRACE_META, &meta, &expect)?;
     let script = crate::plan::TraceScript::new(&trace, false).map_err(|error| error.to_string())?;
     let (evidence, rerun) = draft_run(&trace.meta.scenario, crate::PlanInput::Trace(script))?;
     // Bound as `record` bound the recorded one, so it's equal only to a
@@ -597,7 +674,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{observe::StreamId, Violation};
+    use crate::{
+        harness::header_acceptance::refs::one_key_off::assert_one_key_off, observe::StreamId,
+        Violation,
+    };
 
     /// The header-sync stream.
     const STREAM: StreamId = StreamId {
@@ -757,12 +837,12 @@ mod tests {
         assert!(judge_trace(plain.path()).is_err());
     }
 
-    /// The fault-close companion joins the rejected frame's connection and
-    /// its content refusal: a fault close there after the session's reader
-    /// refused a frame for linkage holds, and the same close of another
-    /// connection, a close there with a cause that isn't a fault, or a close
-    /// after a refusal for another fault, of another session or of another
-    /// peer, or none, doesn't.
+    /// The fault-close companion joins the rejected frame and its content
+    /// refusal: a fault close there after the session's reader refused a
+    /// frame for linkage holds. Each key of the frame or of the refusing
+    /// session moved on its own fails (Rule 25's template), and so do the
+    /// same close of another connection, a close there with a cause that
+    /// isn't a fault, a close after a refusal for another fault, or none.
     #[test]
     fn the_fault_close_joins_the_rejected_frames_connection() {
         let linkage = refused(CONTENT_FAULT);
@@ -774,9 +854,14 @@ mod tests {
         assert_eq!(
             page,
             RejectedPage {
-                connection: 1,
-                quic_stream: 4,
-                frame: 3,
+                frame: FrameRef {
+                    connection: 1,
+                    kind: 5,
+                    version: 9,
+                    quic_stream: 4,
+                    inbound: true,
+                    seq: 3,
+                },
                 session: 11,
                 subscription: 7,
                 peer: "peer-0".into(),
@@ -784,19 +869,26 @@ mod tests {
         );
         let closed = log(1, 1, "service_protocol_reject");
         assert_eq!(fault_close(&closed, &linkage, &page), Ok(()));
+        assert_one_key_off(&page.frame, |frame| {
+            let page = RejectedPage {
+                frame: frame.clone(),
+                ..page.clone()
+            };
+            fault_close(&closed, &linkage, &page).is_ok()
+        });
+        assert_one_key_off(&linkage[0].session(), |session| {
+            let refusals = [Refusal {
+                peer: session.peer.clone(),
+                session: session.session,
+                reason: CONTENT_FAULT.into(),
+            }];
+            fault_close(&closed, &refusals, &page).is_ok()
+        });
         assert!(fault_close(&log(1, 2, "service_protocol_reject"), &linkage, &page).is_err());
         assert!(fault_close(&log(1, 1, "service_local_shutdown"), &linkage, &page).is_err());
         // Another fault's refusal closes the same connection.
         assert!(fault_close(&closed, &refused("over_credit"), &page).is_err());
         assert!(fault_close(&closed, &[], &page).is_err());
-        // The linkage refusal of another session isn't this page's.
-        let mut other = linkage.clone();
-        other[0].session = 12;
-        assert!(fault_close(&closed, &other, &page).is_err());
-        // Nor is another peer's, on the same session for the same fault.
-        let mut other = linkage.clone();
-        other[0].peer = "cd".into();
-        assert!(fault_close(&closed, &other, &page).is_err());
         // A page whose peer no harness name resolves has no refusal.
         assert!(super::fault_close(&closed, &linkage, &page, &[]).is_err());
     }
@@ -809,18 +901,29 @@ mod tests {
         }
     }
 
-    /// `sent` with only its peer moved, then with only its hashes moved.
-    fn one_key_off() -> [SentPage; 2] {
-        [
-            SentPage {
-                peer: "cd".into(),
-                ..sent()
-            },
-            SentPage {
-                hashes: vec!["01".into(), "03".into()],
-                ..sent()
-            },
-        ]
+    /// The rejected page `page` names, from `peer-0`'s frame 3 on connection
+    /// 1, and what its peer sent there.
+    fn page_of(page: &PageRef) -> (RejectedPage, SentPage) {
+        let mut rejected = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        rejected.frame.seq = page.frame;
+        rejected.session = page.subscription.session;
+        rejected.subscription = page.subscription.subscription;
+        let sent = SentPage {
+            peer: page.subscription.peer.clone(),
+            hashes: page.headers.clone(),
+        };
+        (rejected, sent)
+    }
+
+    /// The fact staging `page`.
+    fn staged_from(page: &PageRef) -> StagedPage {
+        StagedPage {
+            peer: page.subscription.peer.clone(),
+            session: page.subscription.session,
+            subscription: page.subscription.subscription,
+            frame: Some(page.frame),
+            hashes: page.headers.clone(),
+        }
     }
 
     /// The rejected page's peer and hashes come from its frame's evidence:
@@ -836,54 +939,56 @@ mod tests {
         assert!(sent_page(&page, &[], &pages).is_err());
     }
 
-    /// The staging companion joins the page's session, subscription and
-    /// frame, and the peer and hashes the peer sent: the page staged from
-    /// that frame holds, and another page on the same subscription, the
-    /// same page on another session, or the same frame with only its peer
-    /// or only its hashes changed, doesn't.
+    /// The staging companion joins the page staged from the rejected frame:
+    /// that page holds, and the same fact with any one key of its page
+    /// moved, its peer, session, subscription, frame or a header, doesn't
+    /// (Rule 25's template). A frame that staged nothing, or two pages,
+    /// doesn't either.
     #[test]
     fn the_staged_page_joins_the_rejected_frame() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
-        assert_eq!(staged_page(&[staged(11, 3)], &page, &sent()), Ok(()));
-        assert!(staged_page(&[staged(11, 5)], &page, &sent()).is_err());
-        assert!(staged_page(&[staged(12, 3)], &page, &sent()).is_err());
+        let own = staged(11, 3);
+        assert_eq!(staged_page(&[own.clone()], &page, &sent()), Ok(()));
+        let keys = assert_one_key_off(&own.page().expect("it names its frame"), |staged| {
+            staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
+        });
+        assert_eq!(keys, 6);
         assert!(staged_page(&[], &page, &sent()).is_err());
-        for off in one_key_off() {
-            assert!(
-                staged_page(&[staged(11, 3)], &page, &off).is_err(),
-                "{off:?}"
-            );
-        }
+        let mut twice = own.clone();
+        twice.subscription += 1;
+        assert!(staged_page(&[own, twice], &page, &sent()).is_err());
     }
 
     /// The path-break companion requires the retained violation to be a
-    /// `path` break of exactly the page the peer sent: another rule,
-    /// another frame, another peer, other hashes or an unretained break
-    /// doesn't count, and nor does a violation with the break's detail at
-    /// another step, or one at its step with another detail.
+    /// `path` break of exactly the page the peer sent, and the violation
+    /// the property reported for that record: any one key of the page or
+    /// of the finding moved on its own fails (Rule 25's template), and so
+    /// do another rule, an unretained break, and a violation at the
+    /// record's step whose detail holds the record's as a prefix.
     #[test]
     fn the_path_break_names_the_sent_page() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let (store, properties) = claims("path", 3);
         assert_eq!(path_break(&properties, &store, &page, &sent()), Ok(()));
-        for off in one_key_off() {
-            assert!(
-                path_break(&properties, &store, &page, &off).is_err(),
-                "{off:?}"
-            );
-        }
+        assert_one_key_off(&page.page(&sent()), |subject| {
+            let (page, sent) = page_of(subject);
+            path_break(&properties, &store, &page, &sent).is_ok()
+        });
+        let violation = &properties[0].violations[0];
+        let finding = FindingRef {
+            step: violation.step,
+            detail: violation.actual.clone(),
+        };
+        assert_one_key_off(&finding, |finding| {
+            let mut properties = properties.clone();
+            properties[0].violations[0].step = finding.step;
+            properties[0].violations[0].actual = finding.detail.clone();
+            path_break(&properties, &store, &page, &sent()).is_ok()
+        });
         let (store, properties) = claims("credit", 3);
-        assert!(path_break(&properties, &store, &page, &sent()).is_err());
-        let (store, properties) = claims("path", 4);
         assert!(path_break(&properties, &store, &page, &sent()).is_err());
         let (store, mut properties) = claims("path", 3);
         properties[0].violations.clear();
-        assert!(path_break(&properties, &store, &page, &sent()).is_err());
-        // The break found at step 9 was dropped from the report, which
-        // keeps a violation with the same detail from step 8: only the
-        // step differs.
-        let (store, mut properties) = claims("path", 3);
-        properties[0].violations[0].step = 8;
         assert!(path_break(&properties, &store, &page, &sent()).is_err());
         // The same step with another break's detail, which holds the
         // record's as a prefix.

@@ -4,8 +4,8 @@
 //! companions, the action judge's control steps, finding attribution and
 //! trigger evidence) names what it joins by a [`Ref`]: the full identity
 //! the evidence carries for it, never a hand-picked part. That's, for a
-//! frame, its connection, QUIC stream, direction and sequence
-//! ([`FrameRef`]); for a subscription event, its peer, session and
+//! frame, its connection, stream, direction and sequence ([`FrameRef`],
+//! and [`ReadRef`] as its session's reader names it); for a subscription event, its peer, session and
 //! subscription ([`SubscriptionRef`], and [`PageRef`] for a page staged on
 //! one); and for work, its full owner ([`WorkRef`]). A finding is named by
 //! its step ([`FindingRef`]), within a run every artifact names by its
@@ -41,6 +41,10 @@ pub fn joined<'a, T: 'a, R: Ref>(
 pub struct FrameRef {
     /// Its connection.
     pub connection: u64,
+    /// Its stream's kind.
+    pub kind: u16,
+    /// Its stream's version.
+    pub version: u16,
     /// Its QUIC stream.
     pub quic_stream: u64,
     /// Whether the peer sent it to the node, rather than the node to it.
@@ -49,6 +53,18 @@ pub struct FrameRef {
     pub seq: u64,
 }
 impl Ref for FrameRef {}
+
+/// One frame as its session's reader names it: the session, and the
+/// frame's position among the stream's reads. A session is one connection
+/// and QUIC stream, so this names the frame on the reader's side.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadRef {
+    /// The session.
+    pub session: u64,
+    /// The frame's position among its stream's reads.
+    pub frame: u64,
+}
+impl Ref for ReadRef {}
 
 /// One session of one peer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,10 +188,12 @@ mod tests {
         assert_eq!(assert_one_key_off(&page, joins), 6);
         let frame = FrameRef {
             connection: 1,
+            kind: 5,
+            version: 9,
             quic_stream: 4,
             inbound: true,
             seq: 3,
         };
-        assert_eq!(assert_one_key_off(&frame, |want| *want == frame), 4);
+        assert_eq!(assert_one_key_off(&frame, |want| *want == frame), 6);
     }
 }

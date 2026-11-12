@@ -192,6 +192,7 @@ pub use crate::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
         SharedPeerError,
     },
+    peer_cache_updater::update_peer_cache_once,
     peer_registry::ConnectedPeer,
     peer_set::init_with_zakura,
     protocol::{

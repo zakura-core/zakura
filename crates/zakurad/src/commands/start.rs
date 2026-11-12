@@ -78,6 +78,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use eyre::{eyre, Report};
@@ -196,6 +197,31 @@ fn check_tcp_slow_start_after_idle() {
          Hint: set `net.ipv4.tcp_slow_start_after_idle=0` via sysctl. \
          See https://zebra.zfnd.org/user/troubleshooting.html#linux-tcp-tuning-for-block-propagation"
     );
+}
+
+/// How long shutdown waits for the final legacy peer cache write.
+const PEER_CACHE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Writes the current address book to the legacy peer cache, so the next start
+/// dials the peers this run found. Failures are logged and otherwise ignored,
+/// because the cache is optional and shutdown must not wait on the disk.
+async fn save_peer_cache_on_shutdown(
+    config: &zakura_network::Config,
+    address_book: &Arc<std::sync::Mutex<zakura_network::AddressBook>>,
+) {
+    match tokio::time::timeout(
+        PEER_CACHE_SHUTDOWN_TIMEOUT,
+        zakura_network::update_peer_cache_once(config, address_book),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(?error, "could not save the peer cache on shutdown"),
+        Err(_) => warn!(
+            timeout = ?PEER_CACHE_SHUTDOWN_TIMEOUT,
+            "saving the peer cache on shutdown timed out"
+        ),
+    }
 }
 
 fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
@@ -607,6 +633,12 @@ impl StartCmd {
             None => None,
         };
         let mut block_sync_fatal_events = None;
+
+        // Shutdown saves the legacy peer cache, so the next start can dial the peers
+        // this run found instead of a cache up to one update interval old.
+        if config.network.legacy_p2p() {
+            shutdown_cleanup_required.cancel();
+        }
 
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint
@@ -1264,6 +1296,9 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
+        if config.network.legacy_p2p() {
+            save_peer_cache_on_shutdown(&config.network, &address_book).await;
+        }
         if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
             zakura_endpoint_shutdown_task
                 .await
@@ -1498,6 +1533,46 @@ mod tests {
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
     use zakura_state::{PruningConfig, StorageMode};
+
+    /// Shutdown writes the peers this run knows to the peer cache, so the next
+    /// start does not depend on the periodic cache update having run.
+    #[tokio::test]
+    async fn shutdown_saves_the_current_peers_to_the_peer_cache() {
+        let _init_guard = zakura_test::init();
+        let cache_dir = tempfile::tempdir().expect("test creates a temporary cache directory");
+        let config = zakura_network::Config {
+            cache_dir: zakura_network::CacheDir::custom_path(cache_dir.path()),
+            ..zakura_network::Config::default()
+        };
+        let mut address_book = zakura_network::AddressBook::new(
+            "0.0.0.0:0".parse().expect("valid listener address"),
+            &config.network,
+            config.max_connections_per_ip,
+            tracing::Span::none(),
+        );
+        let peer = "203.0.113.7:8233".parse().expect("valid peer address");
+        address_book.update(
+            zakura_network::types::MetaAddr::new_gossiped_meta_addr(
+                peer,
+                PeerServices::NODE_NETWORK,
+                zakura_chain::serialization::DateTime32::now(),
+            )
+            .new_gossiped_change()
+            .expect("a recently gossiped peer creates an address book change"),
+        );
+        let address_book = std::sync::Arc::new(std::sync::Mutex::new(address_book));
+
+        super::save_peer_cache_on_shutdown(&config, &address_book).await;
+
+        let cached = config
+            .load_peer_cache()
+            .await
+            .expect("the saved peer cache is readable");
+        assert!(
+            cached.contains(&peer),
+            "the known peer is cached: {cached:?}"
+        );
+    }
 
     #[tokio::test]
     async fn shutdown_cannot_mask_a_ready_writer_failure() {

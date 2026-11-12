@@ -957,7 +957,7 @@ fn regenerate_saved_plans() {
             }
             SavedPlan::Act(
                 Act::BadContent {
-                    rule: ContentRule::Linkage | ContentRule::LowerLocator,
+                    rule: ContentRule::LowerLocator,
                 }
                 | Act::OverCreditObjects,
             ) => holds(COMMIT_ONLY_AUTHORIZED),

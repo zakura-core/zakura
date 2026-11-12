@@ -3109,8 +3109,8 @@ mod tests {
     /// The planted runner's runs pass as it writes them: one baseline and
     /// its replay that hold, one patched run and its replay that violate,
     /// and each listed campaign input once. A replay of the wrong outcome,
-    /// a missing or doubled one, an old-style `replay`, or an unlisted
-    /// campaign input blocks.
+    /// a missing or doubled one, an old-style `replay`, a case run of
+    /// another input, or an unlisted or repeated campaign input blocks.
     #[test]
     fn the_planted_runs_are_judged_by_phase() {
         use super::{planted_judged, PlantedRun};
@@ -3155,6 +3155,15 @@ mod tests {
         let mut unlisted = written();
         unlisted[4] = run("campaign", "c2", true);
         assert!(planted_judged(&unlisted, "case", &campaign).is_some());
+        let mut held_patched = written();
+        held_patched[3] = run("replay-patched", "case", true);
+        assert!(planted_judged(&held_patched, "case", &campaign).is_some());
+        let mut other_input = written();
+        other_input[0] = run("baseline", "c1", true);
+        assert!(planted_judged(&other_input, "case", &campaign).is_some());
+        let mut campaign_twice = written();
+        campaign_twice.push(run("campaign", "c1", true));
+        assert!(planted_judged(&campaign_twice, "case", &campaign).is_some());
     }
 
     /// An artifact tree holding a link isn't read.

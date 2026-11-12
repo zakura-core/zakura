@@ -21,7 +21,8 @@ use crate::{
 /// reverse.
 ///
 /// Every entry is exempt from scoring and bans. An entry that names one address is also
-/// dialed, see [`dial_addrs`](Self::dial_addrs). A range has no single address to dial.
+/// dialed, see [`dial_addrs`](Self::dial_addrs). A range of several addresses has no
+/// single address to dial.
 ///
 /// The list is cheap to clone, so every component that needs it can hold a copy.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,8 +91,8 @@ impl UnconditionalPeers {
     /// Returns the addresses Zakura dials to stay connected to its unconditional peers.
     ///
     /// Every entry that names one address is dialed, on `default_port` unless the entry
-    /// gives its own port. A range is never dialed. Addresses are canonical, in config
-    /// order, with duplicates removed.
+    /// gives its own port. A range of several addresses is never dialed. Addresses are
+    /// canonical, in config order, with duplicates removed.
     pub fn dial_addrs(&self, default_port: u16) -> Vec<PeerSocketAddr> {
         let mut dial_addrs = Vec::with_capacity(self.dial_limit());
 

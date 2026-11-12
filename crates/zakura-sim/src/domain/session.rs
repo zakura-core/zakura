@@ -58,16 +58,23 @@ where
     }
 }
 
-/// [`HONEST_NEVER_PUNISHED`]'s trigger: the node judged a frame on the
-/// connection of a peer the scenario marks `HonestPeer`, so it had a frame
-/// it could have punished that peer for. The connection's peer is found
-/// as the check finds a punished one's, from its latest transport row
-/// before the judgement.
+/// [`HONEST_NEVER_PUNISHED`]'s trigger: on the connection of a peer the
+/// scenario marks `HonestPeer`, the node judged a frame, so it had a frame
+/// it could have punished that peer for, or it punished the peer, as the
+/// check counts a punishment, even before judging anything. The
+/// connection's peer is found as the check finds a punished one's, from its
+/// latest transport row before the event.
 fn honest_frame_judged<V: HonestPeers>(view: &V, log: &ObservationLog) -> bool {
     let entries = log.entries();
     entries.iter().enumerate().any(|(at, entry)| {
-        let Observation::FrameJudged { connection, .. } = entry.obs else {
-            return false;
+        let connection = match &entry.obs {
+            Observation::FrameJudged { connection, .. } | Observation::Misbehavior { connection } => {
+                *connection
+            }
+            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+                *connection
+            }
+            _ => return false,
         };
         remote_of(&entries[..at], connection)
             .and_then(peer_at)

@@ -907,6 +907,116 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
     );
 }
 
+/// A scripted history as a harness, with peer 0 marked `HonestPeer`, so a
+/// witness test judges `session/honest-never-punished`, whose trigger reads
+/// the view, on it.
+struct HonestScript;
+
+/// [`HonestScript`]'s histories.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+enum Punished {
+    /// The node reports a `Misbehavior` against honest peer 0's connection
+    /// before it judges any frame there.
+    BeforeJudging,
+    /// The node fault-closes honest peer 0's connection before it judges any
+    /// frame there.
+    ClosedBeforeJudging,
+    /// The node judges peer 0's conformant frame, and punishes no one.
+    Judged,
+}
+
+impl Punished {
+    /// The history, one batch per step.
+    fn script(self) -> Vec<Vec<Observation>> {
+        match self {
+            Punished::BeforeJudging => vec![
+                vec![registered()],
+                vec![Observation::Misbehavior { connection: 1 }],
+            ],
+            Punished::ClosedBeforeJudging => {
+                vec![vec![registered()], vec![closed("ordered_read_rejected")]]
+            }
+            Punished::Judged => {
+                let [frame, judged] = labelled(Label::Conformant);
+                vec![vec![registered()], vec![frame], vec![judged]]
+            }
+        }
+    }
+}
+
+impl HasView for HonestScript {
+    type View = MarkedView;
+
+    /// Peer 0, the one honest peer.
+    fn view(&self) -> MarkedView {
+        MarkedView([0].into())
+    }
+}
+
+impl Subsystem for HonestScript {
+    const NAME: &'static str = "test/honest-script";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Punished;
+    type Prepared = ();
+
+    fn config(_: &Punished) -> zakura_sim::RunConfig {
+        support::config(1, 1_000)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Punished) {}
+
+    fn build(sim: &mut zakura_sim::Sim, history: &Punished, (): ()) -> Self {
+        support::script::feed(sim, history.script());
+        HonestScript
+    }
+
+    fn sources() -> zakura_sim::property::Sources {
+        let mut observed = OBSERVED.to_vec();
+        observed.push(Source::View);
+        zakura_sim::property::Sources::observed(&observed)
+    }
+
+    fn assumptions(_: &Punished) -> Assumptions<Self> {
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::json!({ "peers": ["peer-0"] }),
+        }])
+    }
+
+    fn properties() -> Vec<Property<Self>> {
+        vec![honest_never_punished()]
+    }
+
+    fn draw(_: &[u8]) -> Punished {
+        Punished::Judged
+    }
+}
+
+/// The witness judge counts a punishment of an honest peer before the node
+/// judged any frame on its connection as `session/honest-never-punished`'s
+/// trigger history, so that catch isn't lost: a `Misbehavior` and a fault
+/// close, each before any `FrameJudged`. A judged frame with no punishment
+/// still reaches it on a holding history.
+#[test]
+fn a_punishment_before_any_judgement_reaches_the_honest_trigger() {
+    let judged = |history, expect| {
+        zakura_sim::witness::witness::<HonestScript>(
+            zakura_sim::witness::WitnessScenario {
+                scenario: history,
+                input: Plan::from_fuzz(&[1; 64]),
+            },
+            HONEST_NEVER_PUNISHED,
+            expect,
+        )
+    };
+    for history in [Punished::BeforeJudging, Punished::ClosedBeforeJudging] {
+        assert_eq!(judged(history, Expect::Violated), Ok(()), "{history:?}");
+    }
+    assert_eq!(judged(Punished::Judged, Expect::Holds), Ok(()));
+}
+
 /// The committed Plan bytes every typed planted input below runs under:
 /// none, so each step takes its first action by identity, as the default
 /// Plan does.

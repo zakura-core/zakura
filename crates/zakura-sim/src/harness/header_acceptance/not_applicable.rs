@@ -140,7 +140,6 @@ const HONEST_SYNC: &[&str] = &[
     "header-sync/storage-operation-ids",
     "header-sync/teardown-returns-baseline",
     "header-sync/reset-invalidates-work",
-    "header-sync/stale-completion-inert",
     "header-sync/stale-chain-effect-inert",
     "header-sync/s5v9/subscribe-headers/sender-within-live",
     "header-sync/s5v9/subscribe-headers/sender-within-credit",
@@ -1267,15 +1266,13 @@ const PATCHED: &[PatchedNa] = &[
         ],
         other: &[],
     },
-    // The same patch, on the honest-sync input.
+    // The same patch, on the honest-sync input, whose baseline never
+    // reaches a stale completion either.
     PatchedNa {
         property: "session/honest-never-punished",
         name: "target-page-refused",
         applies: &["header-sync/peer-retirement-progress"],
-        never: &[
-            "header-sync/stale-completion-inert",
-            "header-sync/stale-chain-effect-inert",
-        ],
+        never: &["header-sync/stale-chain-effect-inert"],
         other: &[],
     },
     // Past the misnamed page, no outcome ends a page the peer took.

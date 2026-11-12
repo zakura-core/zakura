@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::Serialize;
-use support::storage_witnesses;
+use support::{handshake_seeds, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -70,6 +70,12 @@ fn committed_seeds_validate() {
 fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
+    }
+    if let Some(curated) = handshake_seeds::handshake_seeds()
+        .into_iter()
+        .find(|curated| curated.stem == stem)
+    {
+        return value(curated.scenario);
     }
     if stem == "handshake-partial-session" {
         use zakura_sim::{
@@ -173,6 +179,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
+        }),
         "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![128, 1, 128],
         }),
@@ -199,20 +208,6 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
                     peer
                 })
                 .collect();
-            value(scenario)
-        }
-        "handshake-capability-before" => {
-            let mut scenario = zakura_sim::harness::handshake_wire::Scenario {
-                capability_flip: Some(
-                    zakura_sim::harness::handshake_wire::CapabilityFlip::BeforeRegistration,
-                ),
-                ..Default::default()
-            };
-            scenario.peers[0].handshake =
-                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
-                    dial_delay_ms: 1,
-                    ..Default::default()
-                });
             value(scenario)
         }
         "handshake-slow-control" => {

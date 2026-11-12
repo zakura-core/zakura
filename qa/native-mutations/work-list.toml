@@ -426,11 +426,6 @@ code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/
 witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
-property = "handshake/hello/conformant-never-refused"
-code = ["crates/zakura-network/src/zakura/handshake.rs"]
-witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
-
-[[entry.instance]]
 property = "handshake/ack/bad-magic-refused"
 code = ["crates/zakura-network/src/zakura/handshake.rs"]
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
@@ -491,16 +486,6 @@ code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/
 witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
 
 [[entry.instance]]
-property = "handshake/ack/conformant-never-refused"
-code = ["crates/zakura-network/src/zakura/handshake.rs"]
-witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
-
-[[entry.instance]]
-property = "handshake/prelude/conformant-never-refused"
-code = ["crates/zakura-network/src/zakura/handler.rs"]
-witness = { test = "every_family_draws_a_conformant_control_exchange", test_target = "handshake" }
-
-[[entry.instance]]
 property = "handshake/prelude/bad-magic-resets"
 code = ["crates/zakura-network/src/zakura/handler.rs"]
 witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
@@ -543,7 +528,7 @@ witness = { test = "prelude_guards_apply_each_declared_consequence", test_target
 [[entry.instance]]
 property = "handshake/hello/conformant-never-refused"
 code = ["crates/zakura-network/src/zakura/handshake.rs"]
-witness = { test = "conformant_ack_is_accepted", test_target = "handshake" }
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
 
 [[entry.instance]]
 property = "handshake/ack/conformant-never-refused"
@@ -587,7 +572,7 @@ id = "handshake-release"
 kind = "shared-definition"
 claim = "A refused handshake returns every claim, permit, address charge and QUIC slot within shutdown drain."
 check = ["crates/zakura-sim/src/table/handshake.rs"]
-shared = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs"]
+shared = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/driver/connection.rs"]
 
 [[entry.instance]]
 property = "handshake/hello/refusal-releases-slot"
@@ -662,9 +647,9 @@ witness = { test = "honest_peer_never_punished", test_target = "header_wire_witn
 [[entry]]
 id = "handshake-quic"
 kind = "shared-definition"
-claim = "QUIC enforces source limits, Retry, TLS deadlines, bounded closing state, supported ALPNs, and the dialed identity."
+claim = "QUIC enforces source limits, Retry, TLS deadlines, supported ALPNs, and the dialed identity."
 check = ["crates/zakura-sim/src/table/handshake.rs"]
-shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/driver/connection.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
 
 [[entry.instance]]
 property = "handshake/quic/pending-per-address-bounded"
@@ -690,11 +675,6 @@ witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_targe
 property = "handshake/quic/identity-required"
 code = []
 witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }
-
-[[entry.instance]]
-property = "handshake/hello/refusal-releases-slot"
-code = []
-witness = { test = "slow_link_refusal_releases_the_quic_slot", test_target = "handshake" }
 
 [[entry]]
 id = "handshake-deadline"

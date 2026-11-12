@@ -1248,8 +1248,8 @@
     "fault_class": "boundary-accounting"
   },
   {
-    "patch": "handshake-quic/no-closing-deadline/no-closing-deadline.patch",
-    "entry": "handshake-quic",
+    "patch": "handshake-release/no-closing-deadline/no-closing-deadline.patch",
+    "entry": "handshake-release",
     "property": "handshake/hello/refusal-releases-slot",
     "witness": {
       "test": "slow_link_refusal_releases_the_quic_slot",

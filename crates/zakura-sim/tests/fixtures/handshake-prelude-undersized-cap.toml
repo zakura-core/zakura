@@ -1,0 +1,9 @@
+harness = "handshake/wire"
+generator = 11
+sha256 = "ad91a21da1c5b10e3ad91eda4ec573b0213a0b02f81ac44af4ce4edec5cda8f6"
+scenario_sha256 = "7e7691b01b5d53185222a91a46d0c83a18ce8e093c12a24927c136b89c421d6f"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/prelude/undersized-cap-closes"
+expect = "holds"

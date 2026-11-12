@@ -1,0 +1,13 @@
+harness = "handshake/wire"
+generator = 11
+sha256 = "bc7b85f7b2aec8a47b7db8c4f80d497f04467d1dad66714def8b7843c843aa3e"
+scenario_sha256 = "af7b1fd516aa095b0bac0365abad71ceb0a952988379c25e49224b2e4c0e8a6c"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/hello/nonzero-native-transcript-refused"
+expect = "holds"
+
+[[witness]]
+property = "handshake/hello/refusal-releases-slot"
+expect = "holds"

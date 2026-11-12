@@ -585,8 +585,33 @@ fn a_bad_nonce_echo_is_refused() {
     }]);
     for plan in plans() {
         let (events, sessions) = read(&run(&scenario, plan));
+        // The ack fails validation, and the handshake releases its claims
+        // without reaching registration.
+        let stages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.fact {
+                TransportFact::Handshake {
+                    stage, validation, ..
+                } => Some((stage.as_str(), validation.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            [
+                ("ack", Some("bad-nonce-echo")),
+                ("pending-released", None),
+                ("connection-released", None),
+            ]
+        );
         let seen: Vec<_> = events
             .iter()
+            .filter(|event| {
+                !matches!(
+                    event.fact,
+                    TransportFact::Handshake { .. } | TransportFact::HandshakeCapabilities { .. }
+                )
+            })
             .map(|event| (event.connection, event.remote.clone(), event.fact.clone()))
             .collect();
         // The node's dial then fails with the same error.

@@ -52,7 +52,7 @@ use zakura_network::zakura::{
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
-pub(crate) use finding::ledger_attribution;
+pub(crate) use finding::{ledger_attribution, ledger_record};
 use finding::{spell_frontier, spell_hash, spell_hashes};
 pub use finding::{
     Attribution, AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, EngineRunRef,

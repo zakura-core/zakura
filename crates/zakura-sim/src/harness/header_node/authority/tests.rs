@@ -20,7 +20,7 @@ use zakura_network::zakura::{
 use super::*;
 use crate::domain::header_sync::AUTHORITY_CLAIMS;
 use crate::harness::header_node::{
-    claim::{Claim, ClaimEvidence},
+    claim::{Claim, ClaimEvidence, ClaimRecord},
     tap::peer,
 };
 
@@ -2712,4 +2712,62 @@ fn a_ledger_handoff_claim_names_both_calls() {
             },
         }
     );
+}
+
+/// One page from the mirror's session 9 staged on its session 7 round, a
+/// `ForeignPage` break, folded through a fresh ledger: by `peer`, in
+/// `frame`.
+fn foreign_page_claim(peer_id: &ZakuraPeerId, frame: u64) -> ClaimBreak {
+    let chain = main_chain(1);
+    let genesis = HeaderFixture::regtest().anchor();
+    let (round, mut events) = ledger_round();
+    let mut page = page_on(&round, Some(frame), genesis, &[chain[0].hash]);
+    if let ReactorEvent::PageStaged {
+        from_peer,
+        from_session,
+        reserved_left,
+        ..
+    } = &mut page
+    {
+        *from_peer = peer_id.clone();
+        *from_session = 9;
+        *reserved_left = 9;
+    }
+    events.push(page);
+    let mut ledger = HeaderWorkLedger::default();
+    for event in &events {
+        if let Err(rule) = ledger.observe(event) {
+            panic!("the ledger refused {event:?}: {rule}");
+        }
+    }
+    let mut claims = ledger.take_claims();
+    assert_eq!(claims.len(), 1, "{claims:?}");
+    claims.remove(0)
+}
+
+/// The claim records the tap's drain of `step` keeps for three
+/// `ForeignPage` breaks: the mirror's page in frame 4, the same page from
+/// the other mirror, and the mirror's page in frame 5. Each is one key off
+/// the first, and the ledger's own words for all three are the same.
+///
+/// The ledger's maps draw their hashing seed from a run, so the breaks are
+/// folded on this thread's first call, which must come outside one.
+pub(crate) fn foreign_page_records(step: u64) -> Vec<ClaimRecord> {
+    thread_local! {
+        static CLAIMS: std::cell::RefCell<Option<Vec<ClaimBreak>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CLAIMS.with(|claims| {
+        claims
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                [(mirror(), 4), (other_mirror(), 4), (mirror(), 5)]
+                    .iter()
+                    .map(|(peer_id, frame)| foreign_page_claim(peer_id, *frame))
+                    .collect()
+            })
+            .iter()
+            .map(|claim| ledger_record(step, claim.clone()))
+            .collect()
+    })
 }

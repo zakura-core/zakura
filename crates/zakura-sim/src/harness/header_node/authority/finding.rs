@@ -519,6 +519,34 @@ pub(crate) fn ledger_attribution(claim: &ClaimBreak) -> Option<Attribution> {
     })
 }
 
+/// The claim record the drain of `step` keeps for `claim`, a work-ledger
+/// break. For a rule `header-sync/commit-only-authorized` reports, its
+/// detail keeps the claim's name as its lead, then names the authority
+/// rule and the subject as [`AuthorityFinding`] renders them, then the
+/// ledger's own words, and it carries the attribution
+/// ([`ledger_attribution`]). Any other rule's record is the ledger's
+/// detail alone.
+pub(crate) fn ledger_record(step: u64, claim: ClaimBreak) -> ClaimRecord {
+    let attribution = ledger_attribution(&claim);
+    let detail = match &attribution {
+        Some(Attribution { rule, subject }) => {
+            let lead = format!("{:?}", claim.rule);
+            let words = claim
+                .detail
+                .strip_prefix(&format!("{lead}: "))
+                .unwrap_or(&claim.detail);
+            format!("{lead} [{}] {subject}: {words}", rule.name())
+        }
+        None => claim.detail,
+    };
+    ClaimRecord {
+        step,
+        claim: Claim::of(claim.rule),
+        detail,
+        attribution,
+    }
+}
+
 /// What a `CommitOnlyAuthorized` claim record names, for the full report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Attribution {

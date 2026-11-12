@@ -45,7 +45,12 @@
 //!   <property> --expect <expect>` when the task names `expect`, and its
 //!   fresh replay.
 //! * `case`: the planted runner's `baseline` and `patched` recorded runs,
-//!   copied whole, with the fresh replays it made of them (C4), and
+//!   copied whole, with the fresh replays it made of them (C4). The
+//!   baseline is recorded with `--witness <property> --expect holds`, and
+//!   the patched run with the task's `patched` witness, `--expect
+//!   <expect>` and, if its `beside` isn't empty, `--also-violates <beside,
+//!   comma-separated>`: `violated` beside the case's `also_violates`, or
+//!   `violated-set` with a nested case's exact `set`. With the runs come
 //!   [`VERDICT_FILE`], [`TARGET_FILE`] and [`PROVENANCE_FILE`] as before.
 //!   A node case's task names `draft`, its set: then `<i>/draft` is
 //!   recorded by the case's own rebuilt binary with `zakura-sim record
@@ -265,6 +270,8 @@ pub enum Task {
         machine: bool,
         /// What the case runs: its committed input or its typed scenario.
         input: CaseInput,
+        /// What its patched runs' witness expects, as its `.toml` names it.
+        patched: PatchedWitness,
         /// The patch, relative to the repository root.
         patch: String,
         /// A node case's set, its `Draft` run's override (C9). `None` for a
@@ -334,6 +341,61 @@ pub enum CaseInput {
         /// The scripted Plan, as JSON.
         script: String,
     },
+}
+
+/// What a planted case's patched witness expects, as its `.toml` names it
+/// and the planted runner passes it to `zakura-sim record`: the case's
+/// property `violated` beside its `also_violates`, or, for a nested case
+/// that names a `set`, `violated-set` with exactly that set (C6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchedWitness {
+    /// `--expect`'s value: `violated` or `violated-set`.
+    pub expect: String,
+    /// `--also-violates`'s list, in the case file's order: its
+    /// `also_violates` under `violated`, its `set` under `violated-set`.
+    pub beside: Vec<String>,
+}
+
+/// What a planted case's `.toml` says its patched witness expects
+/// ([`PatchedWitness`]). A case naming both `set` and `also_violates`, or
+/// either as anything but a list of IDs, is refused, as the planted runner
+/// refuses it.
+fn patched_witness(repo: &Path, case: CaseRef) -> Result<PatchedWitness, String> {
+    let file = repo
+        .join("qa/planted")
+        .join(case.property)
+        .join(format!("{}.toml", case.name));
+    let text = fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
+    let ids = |key: &str| -> Result<Vec<String>, String> {
+        let Some(value) = table.get(key) else {
+            return Ok(Vec::new());
+        };
+        value
+            .as_array()
+            .and_then(|ids| {
+                ids.iter()
+                    .map(|id| id.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<String>>>()
+            })
+            .ok_or_else(|| format!("{}: `{key}` isn't a list of IDs", file.display()))
+    };
+    match (ids("set")?, ids("also_violates")?) {
+        (set, also) if !set.is_empty() && !also.is_empty() => Err(format!(
+            "{}: a case names either `set` or `also_violates`, not both",
+            file.display()
+        )),
+        (set, _) if !set.is_empty() => Ok(PatchedWitness {
+            expect: "violated-set".to_owned(),
+            beside: set,
+        }),
+        (_, also) => Ok(PatchedWitness {
+            expect: "violated".to_owned(),
+            beside: also,
+        }),
+    }
 }
 
 impl CaseInput {
@@ -564,6 +626,7 @@ fn case_task(
         harness: harness.to_owned(),
         machine,
         input: case_input(repo, case)?,
+        patched: patched_witness(repo, case)?,
         patch: format!("qa/planted/{}/{}.patch", case.property, case.name),
         draft: None,
         companions: Vec::new(),
@@ -1190,6 +1253,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 harness,
                 machine,
                 input,
+                patched: witness,
                 patch,
                 draft,
                 companions,
@@ -1210,8 +1274,14 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 };
                 // The planted runner runs a case's baseline and patched
                 // runs (C4), and xtask copies its traces here.
-                let mut baseline = checks.planted(case(CaseRun::Baseline), "baseline", "holds");
-                let mut patched = checks.planted(case(CaseRun::Patched), "patched", "violated");
+                let mut baseline =
+                    checks.planted(case(CaseRun::Baseline), "baseline", "holds", &[]);
+                let mut patched = checks.planted(
+                    case(CaseRun::Patched),
+                    "patched",
+                    &witness.expect,
+                    &witness.beside,
+                );
                 credit_sources(&dir, subject_source, &mut baseline, &mut patched);
                 if let Some(why) = patch_refusal(repo, patch, &dir) {
                     fail(&mut patched, why);
@@ -1350,19 +1420,20 @@ struct CaseChecks<'a> {
 impl CaseChecks<'_> {
     /// The planted runner's run `name` of the case, as `run`: it must have
     /// run the case's committed input (C18), and its witness file must judge
-    /// the case's property expecting `expect`.
-    fn planted(&self, run: RunId, name: &str, expect: &str) -> Execution {
+    /// the case's property expecting `expect` beside exactly `beside`
+    /// ([`witness_judges`]).
+    fn planted(&self, run: RunId, name: &str, expect: &str, beside: &[String]) -> Execution {
         let dir = self.dir.join(name);
         let mut execution = execution(&dir, run, self.harness, RunBy::Planted);
         if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
             fail(&mut execution, why);
         }
-        if !witness_judges(&dir, self.property, expect) {
+        if !witness_judges(&dir, self.property, expect, beside) {
             execution.trigger = false;
             fail(
                 &mut execution,
                 format!(
-                    "its witness file doesn't judge {} expecting {expect}",
+                    "its witness file doesn't judge {} expecting {expect} beside {beside:?}",
                     self.property
                 ),
             );
@@ -1446,7 +1517,7 @@ fn history_execution(
     let recording = dir.join("run");
     let mut execution = execution(&recording, run, harness, RunBy::Tool);
     match witness {
-        (property, Some(expect)) if !witness_judges(&recording, property, expect) => {
+        (property, Some(expect)) if !witness_judges(&recording, property, expect, &[]) => {
             execution.trigger = false;
             fail(
                 &mut execution,
@@ -1871,12 +1942,19 @@ fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<Str
 }
 
 /// Whether `dir`'s `witness.json` judges `property` expecting `expect`
-/// (`holds` or `violated`). A witness file for another property or role
-/// isn't this run's trigger evidence.
-fn witness_judges(dir: &Path, property: &str, expect: &str) -> bool {
+/// (`holds`, `not-applicable`, `violated` or `violated-set`) with exactly
+/// `beside` as its `also_violates`, in order. A witness file for another
+/// property, role or set isn't this run's trigger evidence.
+fn witness_judges(dir: &Path, property: &str, expect: &str, beside: &[String]) -> bool {
     read_json::<Value>(&dir.join("witness.json")).is_some_and(|witness| {
+        let also: Option<Vec<&str>> = witness
+            .get("also_violates")
+            .map_or(Some(Vec::new()), |also| {
+                also.as_array()?.iter().map(Value::as_str).collect()
+            });
         witness.get("property").and_then(Value::as_str) == Some(property)
             && witness.get("expect").and_then(Value::as_str) == Some(expect)
+            && also.is_some_and(|also| also.iter().copied().eq(beside.iter().map(String::as_str)))
     })
 }
 
@@ -3249,15 +3327,138 @@ mod tests {
             .expect("the temp dir is writable");
         };
         witness(MACHINE, "violated");
-        assert!(witness_judges(dir.path(), MACHINE, "violated"));
-        assert!(!witness_judges(dir.path(), MACHINE, "holds"));
+        assert!(witness_judges(dir.path(), MACHINE, "violated", &[]));
+        assert!(!witness_judges(dir.path(), MACHINE, "holds", &[]));
         assert!(!witness_judges(
             dir.path(),
             "header/publisher-policy",
-            "violated"
+            "violated",
+            &[]
+        ));
+        // A co-violation the case doesn't list isn't its witness.
+        assert!(!witness_judges(
+            dir.path(),
+            MACHINE,
+            "violated",
+            &["p/b".to_owned()]
         ));
         fs::remove_file(dir.path().join("witness.json")).expect("the file exists");
-        assert!(!witness_judges(dir.path(), MACHINE, "violated"));
+        assert!(!witness_judges(dir.path(), MACHINE, "violated", &[]));
+    }
+
+    /// A planted case's patched witness is the one the planted runner
+    /// records: the nested `target-page-refused` case names a `set`, so
+    /// its task expects `violated-set` with exactly that set, and a case
+    /// naming `also_violates` expects `violated` beside it. A patched run
+    /// of the nested case whose witness judges its set is read with its
+    /// trigger. The same witness under `violated`, with a member missing or
+    /// with another one added, isn't its witness, and fails the run.
+    #[test]
+    fn a_nested_case_s_patched_witness_judges_its_exact_set() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let task = |property: &str, name: &str| {
+            plan.tasks
+                .iter()
+                .find(|task| {
+                    matches!(task, Task::Case { property: p, name: n, .. }
+                        if p == property && n == name)
+                })
+                .unwrap_or_else(|| panic!("{property}/{name} has a task"))
+        };
+        let flood = task("header-sync/watch-observed-under-flood", "wedged-run-loop");
+        let Task::Case { patched, .. } = flood else {
+            unreachable!("found as a case");
+        };
+        assert_eq!(
+            patched,
+            &PatchedWitness {
+                expect: "violated".into(),
+                beside: vec!["header-sync/watch-observed-under-lifecycle-flood".into()],
+            }
+        );
+        let Task::Case {
+            property,
+            harness,
+            input,
+            patched,
+            ..
+        } = task("session/honest-never-punished", "target-page-refused")
+        else {
+            unreachable!("found as a case");
+        };
+        let set = vec!["header-sync/s5v9/conformant-never-closes".to_owned()];
+        assert_eq!(
+            patched,
+            &PatchedWitness {
+                expect: "violated-set".into(),
+                beside: set.clone(),
+            }
+        );
+        let CaseInput::Fuzz { input: file } = input else {
+            panic!("the nested case runs a committed fuzz input");
+        };
+        let case = tempfile::tempdir().expect("a temp dir can be created");
+        let dir = case.path().join("patched");
+        let bytes = fs::read(repo.join(file)).expect("the committed input is readable");
+        let entry = crate::harness::find(harness).expect("the case's harness is registered");
+        crate::harness::record(entry, crate::harness::RecordInput::Input(&bytes), &dir)
+            .expect("the case's harness records its committed input");
+        let checks = CaseChecks {
+            repo: &repo,
+            dir: case.path(),
+            property,
+            harness,
+            input,
+            subject_source: "s",
+        };
+        let read = |expect: &str, beside: &[String]| {
+            fs::write(
+                dir.join("witness.json"),
+                serde_json::json!({
+                    "property": property,
+                    "expect": expect,
+                    "also_violates": beside,
+                    "draft": [],
+                    "passed": true,
+                    "error": null,
+                })
+                .to_string(),
+            )
+            .expect("the temp dir is writable");
+            checks.planted(
+                RunId::Case {
+                    property: property.clone(),
+                    name: "target-page-refused".into(),
+                    run: CaseRun::Patched,
+                },
+                "patched",
+                &patched.expect,
+                &patched.beside,
+            )
+        };
+        let caught = read("violated-set", &set);
+        assert!(caught.trigger);
+        assert!(
+            !matches!(caught.end, End::Failed { .. }),
+            "{:?}",
+            caught.end
+        );
+        let mut wider = set.clone();
+        wider.push("header-sync/honest-progress".into());
+        for (expect, beside) in [
+            ("violated", set.clone()),
+            ("violated-set", Vec::new()),
+            ("violated-set", wider),
+        ] {
+            let refused = read(expect, &beside);
+            assert!(!refused.trigger, "{expect} {beside:?}");
+            assert!(
+                matches!(&refused.end, End::Failed { why } if why.contains("witness file")),
+                "{expect} {beside:?}: {:?}",
+                refused.end
+            );
+        }
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task
@@ -4445,6 +4646,10 @@ mod tests {
             harness: MACHINE.into(),
             machine: !draft,
             input,
+            patched: PatchedWitness {
+                expect: "violated".into(),
+                beside: Vec::new(),
+            },
             patch: format!("qa/planted/p/{name}.patch"),
             draft: draft.then(|| vec!["p".to_owned()]),
             companions: Vec::new(),

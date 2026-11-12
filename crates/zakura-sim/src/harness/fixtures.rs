@@ -100,6 +100,14 @@ pub trait Fixture: Sized + 'static {
     /// What the property expects, for the violation's text.
     const EXPECTED: &'static str;
 
+    /// Where the fix's first observable effect is on the saved schedule
+    /// (sched-4 S4.4): the planted and fixed runs of its Plan bytes agree on
+    /// every step before it, and the fixed run's side of the first differing
+    /// step is here. It's a pick (`task:<task>:<point>`) when the fix
+    /// changes what follows that pick, or `<task>:<point>`, a point a task
+    /// reaches, when the fix changes which point that is or on which object.
+    const AGREEMENT_SITE: &'static str;
+
     /// The fixture's shared state, as the check reads it.
     type View;
 
@@ -320,6 +328,8 @@ pub struct LostUpdate {
 impl Fixture for LostUpdate {
     const NAME: &'static str = "race/lost-update";
     const EXPECTED: &'static str = "both increments land";
+    /// The fixed incrementer reads and writes in one `rmw` where the race loads.
+    const AGREEMENT_SITE: &'static str = "inc_a.1:rmw#1";
     /// The counter, and how many incrementers finished.
     type View = (u64, u32);
 
@@ -376,6 +386,8 @@ pub struct SnapshotReserve {
 impl Fixture for SnapshotReserve {
     const NAME: &'static str = "race/snapshot-reserve";
     const EXPECTED: &'static str = "no more reservations than capacity";
+    /// After its release, the fixed reserver exits where the race locks again.
+    const AGREEMENT_SITE: &'static str = "task:res_a.1:release#1";
     /// The capacity left.
     type View = i64;
 
@@ -441,6 +453,8 @@ pub struct MissedNotify {
 impl Fixture for MissedNotify {
     const NAME: &'static str = "race/missed-notify";
     const EXPECTED: &'static str = "the waiter wakes on the notification";
+    /// The fixed waiter registers for the notification before it loads.
+    const AGREEMENT_SITE: &'static str = "waiter.1:notified#1";
     /// True once the waiter timed out.
     type View = bool;
 
@@ -526,6 +540,8 @@ pub struct TimerCancel {
 impl Fixture for TimerCancel {
     const NAME: &'static str = "race/timer-cancel";
     const EXPECTED: &'static str = "no timeout after the cancel";
+    /// The timer reaches the fixed `select`, which checks the cancel first.
+    const AGREEMENT_SITE: &'static str = "timer.1:select#1";
     /// True once the timer chose its timeout after the cancel.
     type View = bool;
 
@@ -606,6 +622,8 @@ pub struct AbBa;
 impl Fixture for AbBa {
     const NAME: &'static str = "race/ab-ba";
     const EXPECTED: &'static str = "no lock cycle";
+    /// `ba` takes the shared `first.lock()` on the other lock object.
+    const AGREEMENT_SITE: &'static str = "ba.1:lock#1";
     /// Nothing. The scheduler's status shows the deadlock.
     type View = ();
 
@@ -670,6 +688,8 @@ impl Drop for Resource {
 impl Fixture for AbortWithoutJoin {
     const NAME: &'static str = "race/abort-without-join";
     const EXPECTED: &'static str = "an aborted task's resource is released";
+    /// After its abort, the fixed aborter waits for the join where the race yields.
+    const AGREEMENT_SITE: &'static str = "task:aborter.1:abort#1";
     /// True once the aborter found the resource still held.
     type View = bool;
 
@@ -757,6 +777,18 @@ impl Which {
         Which::AbBa,
         Which::AbortWithoutJoin,
     ];
+
+    /// The fixture's [`Fixture::AGREEMENT_SITE`].
+    pub fn agreement_site(self) -> &'static str {
+        match self {
+            Which::LostUpdate => LostUpdate::AGREEMENT_SITE,
+            Which::SnapshotReserve => SnapshotReserve::AGREEMENT_SITE,
+            Which::MissedNotify => MissedNotify::AGREEMENT_SITE,
+            Which::TimerCancel => TimerCancel::AGREEMENT_SITE,
+            Which::AbBa => AbBa::AGREEMENT_SITE,
+            Which::AbortWithoutJoin => AbortWithoutJoin::AGREEMENT_SITE,
+        }
+    }
 
     /// The fixture's property ID, which is also its own harness's name.
     pub fn property(self) -> &'static str {

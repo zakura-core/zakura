@@ -102,11 +102,65 @@ pub struct StepView {
 
 /// Where a fix's first observable effect must be: the first differing
 /// step's after-patch side must hold an observation whose `site` is
-/// `site`, or a pick that is `site`.
+/// `site`, an observation of a task reaching a point, `<task>:<at>`, that
+/// is `site`, or a pick that is `site`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Site {
-    /// A `file:line` after the patch, or a pick identity.
+    /// A `file:line` after the patch, a `<task>:<point>` a task reached, or
+    /// a pick identity.
     pub at: String,
+}
+
+/// `<task>:<at>` for an observation of a task reaching a point.
+fn reached(obs: &Value) -> Option<String> {
+    let task = obs.get("task")?.as_str()?;
+    let at = obs.get("at")?.as_str()?;
+    Some(format!("{task}:{at}"))
+}
+
+/// The step views of the trace in `dir`, from its steps and the
+/// `--observe` log a fresh replay wrote beside it, one line per step from
+/// 0 for setup. The log must have exactly one line per step.
+pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
+    let trace = crate::trace::TraceReader::open(dir)
+        .map_err(|error| format!("{}: {error}", dir.display()))?;
+    let log = crate::sim_acceptance::header::read_bounded_text(
+        &dir.join(crate::trace::OBSERVATIONS_FILE),
+    )?;
+    let lines: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
+        .collect::<Result<_, _>>()?;
+    if lines.len() != trace.steps.len() + 1 {
+        return Err(format!(
+            "{}: the observation log has {} lines for {} steps",
+            dir.display(),
+            lines.len(),
+            trace.steps.len()
+        ));
+    }
+    let obs = |n: usize| -> Vec<Value> {
+        lines[n]
+            .get("obs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut views = vec![StepView {
+        step: 0,
+        pick: String::new(),
+        draws: trace.init.map(|init| init.draws).unwrap_or_default(),
+        obs: obs(0),
+    }];
+    for (n, step) in trace.steps.into_iter().enumerate() {
+        views.push(StepView {
+            step: step.step,
+            pick: step.pick,
+            draws: step.draws,
+            obs: obs(n + 1),
+        });
+    }
+    Ok(views)
 }
 
 /// `obs` with every `site` that names a `file:line` mapped across `map`,
@@ -173,10 +227,10 @@ pub fn agreement(
         .find(|view| view.step == step)
         .is_some_and(|view| {
             view.pick == site.at
-                || view
-                    .obs
-                    .iter()
-                    .any(|obs| obs.get("site").and_then(Value::as_str) == Some(site.at.as_str()))
+                || view.obs.iter().any(|obs| {
+                    obs.get("site").and_then(Value::as_str) == Some(site.at.as_str())
+                        || reached(obs).as_deref() == Some(site.at.as_str())
+                })
         });
     if at_site {
         Ok(step)

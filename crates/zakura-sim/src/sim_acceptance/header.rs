@@ -75,6 +75,15 @@ pub fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<
     serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// The text of the regular file at `path`, read as
+/// [`read_bounded_json`] reads.
+pub fn read_bounded_text(path: &Path) -> Result<String, String> {
+    let bytes = crate::trace::read::read_bounded(path, MAX_ARTIFACT_BYTES)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .ok_or_else(|| format!("{}: missing", path.display()))?;
+    String::from_utf8(bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// The JSON path of the first place `a` and `b` differ, or `None` if
 /// they're equal. Objects compare by key in order, arrays by index.
 pub fn first_difference(a: &Value, b: &Value) -> Option<String> {

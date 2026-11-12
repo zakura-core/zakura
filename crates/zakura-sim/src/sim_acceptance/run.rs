@@ -112,6 +112,27 @@ pub enum Task {
         /// The expectation, as the sidecar spells it.
         expect: String,
     },
+    /// One race fixture's schedule-agreement pair (S4.4): its saved
+    /// schedule recorded as its violation's witness into `base/`, and the
+    /// same Plan bytes on the fix as a `holds` witness into `fixed/`, each
+    /// replayed fresh with `--observe` (`replay-base.json`,
+    /// `replay-fixed.json`).
+    Agreement {
+        /// The expected result it produces.
+        expected: String,
+        /// The race fixture's harness, which is also its property.
+        harness: String,
+        /// The saved schedule's full input's SHA-256, its corpus file name.
+        base_input: String,
+        /// The schedule's Plan bytes, after its scenario prefix, in hex.
+        plan: String,
+        /// Their SHA-256, which the fixed trace's meta must name.
+        plan_sha256: String,
+        /// The fixed scenario, as JSON.
+        fixed_scenario: String,
+        /// The fixture's declared site, [`crate::harness::fixtures::Fixture::AGREEMENT_SITE`].
+        site: String,
+    },
     /// One S4.6 command, which writes `command.json`.
     Command {
         /// The expected result it produces.
@@ -148,6 +169,7 @@ impl Task {
             | Task::Seed { expected, .. }
             | Task::SeedWitness { expected, .. }
             | Task::RaceSchedule { expected, .. }
+            | Task::Agreement { expected, .. }
             | Task::Command { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
@@ -271,6 +293,40 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                     .collect()
             })
             .unwrap_or_default();
+    // Each race fixture's agreement pair: its saved schedule's Plan bytes,
+    // and the fixed scenario they also run on.
+    let race_pairs: BTreeMap<String, Task> = crate::seed::load(&[repo.join(RACE_SCHEDULES)], None)
+        .map(|report| {
+            report
+                .admitted
+                .iter()
+                .filter_map(|seed| {
+                    use crate::harness::fixtures::{Scenario, Variant, Which};
+                    let harness = seed.sidecar.harness.clone();
+                    let which = Which::ALL.into_iter().find(|w| w.property() == harness)?;
+                    let entry = crate::harness::find(&harness).ok()?;
+                    let plan = seed.input.get(entry.scenario_bytes..)?;
+                    let fixed = serde_json::to_string(&Scenario {
+                        variant: Variant::Fixed,
+                        workers: 2,
+                    })
+                    .ok()?;
+                    Some((
+                        harness.clone(),
+                        Task::Agreement {
+                            expected: Expected::Agreement(harness.clone()).to_string(),
+                            harness,
+                            base_input: seed.input_sha256(),
+                            plan: plan.iter().map(|byte| format!("{byte:02x}")).collect(),
+                            plan_sha256: crate::seed::sha256(plan),
+                            fixed_scenario: fixed,
+                            site: which.agreement_site().to_owned(),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut plan = Sim7Plan {
         problems: problems(&rows(&derived), &derived),
         ..Sim7Plan::default()
@@ -378,6 +434,11 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                 Expected::HeaderKey(_) | Expected::EndRecord { .. } => None,
                 // The planted runner's verdict alone isn't evidence (Rule 11):
                 // it blocks until each of its runs is kept and judged.
+                // The discovery pair needs the planted case's patched build,
+                // which the tool doesn't run yet.
+                Expected::Agreement(name) if race_pairs.contains_key(name) => {
+                    race_pairs.get(name).cloned()
+                }
                 Expected::Planted(_)
                 | Expected::Target(_)
                 | Expected::Minimize(_)
@@ -690,21 +751,27 @@ fn runner_json(dir: &Path, name: &str, binding: &TaskBinding) -> Option<Value> {
     same.then_some(value)
 }
 
-/// Why the task's fresh replay doesn't count, if it doesn't: `replay.json`
-/// must be this task's, have exited 0, and name the SHA-256 of the task's
-/// own `trace/trace.jsonl` and the run's release executable. `zakura-sim
+/// Why the task's fresh replay of its trace in `trace` doesn't count, if it
+/// doesn't: `replay`, such as `replay.json`, must be this task's, have
+/// exited 0, and name the SHA-256 of the task's own `<trace>/trace.jsonl`
+/// and the run's release executable. `zakura-sim
 /// replay` exits 0 only when its run's complete end record and
 /// observations equal the recording's, so the recording's end record,
 /// judged by [`owned_run_passes`], is the replay's too.
-fn replay_refusal(dir: &Path, binding: &TaskBinding, bound: &Bound<'_>) -> Option<String> {
-    let Some(replay) = runner_json(dir, "replay.json", binding) else {
-        return Some("the task has no replay.json of its own".to_owned());
+fn replay_refusal(
+    dir: &Path,
+    (trace_dir, replay_file): (&str, &str),
+    binding: &TaskBinding,
+    bound: &Bound<'_>,
+) -> Option<String> {
+    let Some(replay) = runner_json(dir, replay_file, binding) else {
+        return Some(format!("the task has no {replay_file} of its own"));
     };
     if !exited(Some(replay.clone())) {
         return Some("the trace didn't replay exactly in a fresh process".to_owned());
     }
     let trace = crate::trace::read::read_bounded(
-        &dir.join("trace").join(crate::trace::TRACE_FILE),
+        &dir.join(trace_dir).join(crate::trace::TRACE_FILE),
         header::MAX_ARTIFACT_BYTES,
     )
     .ok()
@@ -713,10 +780,12 @@ fn replay_refusal(dir: &Path, binding: &TaskBinding, bound: &Bound<'_>) -> Optio
     let names = replay.get("binding");
     let field = |name: &str| names.and_then(|n| n.get(name)).and_then(Value::as_str);
     if trace.is_none() || field("trace_sha256") != trace.as_deref() {
-        return Some("replay.json didn't replay this task's trace".to_owned());
+        return Some(format!("{replay_file} didn't replay this task's trace"));
     }
     if bound.release.is_none() || field("executable_sha256") != bound.release.as_deref() {
-        return Some("replay.json wasn't replayed by the run's release zakura-sim".to_owned());
+        return Some(format!(
+            "{replay_file} wasn't replayed by the run's release zakura-sim"
+        ));
     }
     None
 }
@@ -755,6 +824,14 @@ fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> 
             .ok()
             .map(|trace| trace.meta.build.binary)
             .into_iter()
+            .collect(),
+        Task::Agreement { .. } => ["base", "fixed"]
+            .iter()
+            .filter_map(|side| {
+                TraceReader::open(&dir.join(side))
+                    .ok()
+                    .map(|trace| trace.meta.build.binary)
+            })
             .collect(),
         Task::Command { .. } => Vec::new(),
     }
@@ -869,9 +946,12 @@ pub fn record(
             Task::SeedWitness { harness, input, .. } => {
                 seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, harness, None, input)
             }
-            Task::RaceSchedule { harness, input, .. } => {
-                seed_inventory_refusal(artifacts, RACE_INVENTORY, &bound, harness, None, input)
-            }
+            Task::RaceSchedule { harness, input, .. }
+            | Task::Agreement {
+                harness,
+                base_input: input,
+                ..
+            } => seed_inventory_refusal(artifacts, RACE_INVENTORY, &bound, harness, None, input),
             _ => None,
         };
         let mut credited = 0u64;
@@ -1140,7 +1220,7 @@ fn judge_task(
             if !exited(json("record.json")) {
                 return blocked("the seed's recording didn't exit 0".to_owned());
             }
-            if let Some(why) = replay_refusal(dir, binding, bound) {
+            if let Some(why) = replay_refusal(dir, ("trace", "replay.json"), binding, bound) {
                 return blocked(why);
             }
             judge_trace(
@@ -1168,7 +1248,7 @@ fn judge_task(
             if !exited(json("record.json")) {
                 return blocked("the witness recording didn't exit 0".to_owned());
             }
-            if let Some(why) = replay_refusal(dir, binding, bound) {
+            if let Some(why) = replay_refusal(dir, ("trace", "replay.json"), binding, bound) {
                 return blocked(why);
             }
             let Some(witness) = own("trace/witness.json") else {
@@ -1227,6 +1307,77 @@ fn judge_task(
                 }
             }
             verdict
+        }
+        Task::Agreement {
+            harness,
+            base_input,
+            plan_sha256,
+            fixed_scenario,
+            site,
+            ..
+        } => {
+            for side in ["base", "fixed"] {
+                if !exited(json(&format!("record-{side}.json"))) {
+                    return blocked(format!("the {side} run's witness recording didn't exit 0"));
+                }
+                if let Some(why) =
+                    replay_refusal(dir, (side, &format!("replay-{side}.json")), binding, bound)
+                {
+                    return blocked(why);
+                }
+            }
+            // Each run passes through the one judge: the planted race must
+            // violate its property, and the fix must hold.
+            let base = judge_trace(
+                &dir.join("base"),
+                bound,
+                (harness, Some(base_input)),
+                &RunExpect::Violates {
+                    property: harness.clone(),
+                    also: Vec::new(),
+                },
+                applicable,
+            );
+            if base != Verdict::Verified {
+                return base;
+            }
+            let fixed = judge_trace(
+                &dir.join("fixed"),
+                bound,
+                (harness, None),
+                &RunExpect::Passes,
+                applicable,
+            );
+            if fixed != Verdict::Verified {
+                return fixed;
+            }
+            // The fixed run is the same Plan bytes on the fixed scenario.
+            let same_plan = TraceReader::open(&dir.join("fixed"))
+                .ok()
+                .is_some_and(|trace| {
+                    trace.meta.plan.as_ref().map(|plan| plan.sha256.as_str())
+                        == Some(plan_sha256.as_str())
+                        && serde_json::from_str::<Value>(fixed_scenario).ok()
+                            == Some(trace.meta.scenario.clone())
+                });
+            if !same_plan {
+                return blocked(
+                    "the fixed run isn't the saved schedule's Plan bytes on the fix".to_owned(),
+                );
+            }
+            let views = |side: &str| super::agreement::step_views(&dir.join(side));
+            match (views("base"), views("fixed")) {
+                (Ok(base), Ok(fixed)) => match super::agreement::agreement(
+                    &base,
+                    &fixed,
+                    &super::agreement::HunkMap::default(),
+                    &super::agreement::Site { at: site.clone() },
+                ) {
+                    Ok(_) => Verdict::Verified,
+                    Err(why) => blocked(why),
+                },
+                (Err(why), _) | (_, Err(why)) => blocked(why),
+            }
         }
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)

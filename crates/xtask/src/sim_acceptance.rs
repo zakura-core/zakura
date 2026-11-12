@@ -490,6 +490,7 @@ fn run_at(
             "seed" => ctx.seed(fields)?,
             // A saved race schedule runs as a seed witness does.
             "seed-witness" | "race-schedule" => ctx.seed_witness(fields)?,
+            "agreement" => ctx.agreement(fields)?,
             "command" => ctx.command(fields)?,
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
@@ -590,18 +591,27 @@ impl Ctx<'_> {
     /// gets no replay, so its task blocks on the missing `replay.json`
     /// rather than ending the run.
     fn replay(&self) -> Result<(), BoxError> {
-        let trace = self.dir.join("trace").join("trace.jsonl");
-        let Ok(trace_sha256) = sha256_file(&trace) else {
+        self.replay_at("trace", "replay", false)
+    }
+
+    /// [`Ctx::replay`] of the trace in `<dir>/<trace>`, into `<name>.json`,
+    /// with `--observe` if `observe`, which writes the full observation log
+    /// beside the trace.
+    fn replay_at(&self, trace: &str, name: &str, observe: bool) -> Result<(), BoxError> {
+        let Ok(trace_sha256) = sha256_file(&self.dir.join(trace).join("trace.jsonl")) else {
             return Ok(());
         };
         let mut replay = Command::new(self.release);
         replay
             .arg("replay")
-            .arg(self.dir.join("trace"))
+            .arg(self.dir.join(trace))
             .current_dir(self.root);
+        if observe {
+            replay.arg("--observe");
+        }
         self.record(
             &mut replay,
-            "replay",
+            name,
             json!({
                 "trace_sha256": trace_sha256,
                 "executable_sha256": self.release_sha256,
@@ -804,6 +814,44 @@ impl Ctx<'_> {
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
         self.record(&mut record, "record", json!({}))?;
         self.replay()
+    }
+
+    /// One race fixture's agreement pair: its saved schedule recorded as its
+    /// violation's witness into `base/`, the same Plan bytes on the fixed
+    /// scenario as a `holds` witness into `fixed/`, and each replayed fresh
+    /// with `--observe`.
+    fn agreement(&self, task: &Value) -> Result<(), BoxError> {
+        let harness = field(task, "harness")?;
+        let mut base = Command::new(self.release);
+        base.args(["record", "--sim", harness, "--input"])
+            .arg(self.corpus.join(field(task, "base_input")?))
+            .arg("--out")
+            .arg(self.dir.join("base"))
+            .args(["--witness", harness, "--expect", "violated"])
+            .current_dir(self.root);
+        self.record(&mut base, "record-base", json!({}))?;
+        self.replay_at("base", "replay-base", true)?;
+        let plan = field(task, "plan")?;
+        let bytes = (0..plan.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(plan.get(i..i + 2).unwrap_or("zz"), 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| "the task's plan isn't hex")?;
+        let plan_file = self.dir.join("plan.bin");
+        fs::write(&plan_file, bytes)?;
+        let mut fixed = Command::new(self.release);
+        fixed
+            .args(["record", "--sim", harness, "--scenario"])
+            .arg(field(task, "fixed_scenario")?)
+            .arg("--plan")
+            .arg(&plan_file)
+            .arg("--out")
+            .arg(self.dir.join("fixed"))
+            .args(["--witness", harness, "--expect", "holds"])
+            .current_dir(self.root);
+        self.record(&mut fixed, "record-fixed", json!({}))?;
+        self.replay_at("fixed", "replay-fixed", true)?;
+        Ok(())
     }
 
     /// `zakura-sim record` of the task's harness on its seed's full input,

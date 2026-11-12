@@ -2795,7 +2795,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let flags = "header-sync/s5v9/status/reserved-flags-closes";
+    let panic = "sim/no-task-panic";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -2816,17 +2816,17 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: flags.into(),
-            name: "reserved-flags".into(),
+            property: panic.into(),
+            name: "task-panic".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: flags,
-                name: "reserved-flags",
+                property: panic,
+                name: "task-panic",
             },
             harness,
-            set: &["header-sync/s5v9/status/reserved-flags-closes"],
+            set: &["sim/no-task-panic"],
             found,
             not_applicable,
             companions,

@@ -855,6 +855,35 @@ const C2_CATCHES: &[CaseRef] = &[CaseRef {
     name: "idle-exit-drops-fault",
 }];
 
+/// `commit-only-authorized/later-ancestor`: its patched `Draft` run, through
+/// the real reactor tap, gives two `path` findings at one boundary, on the
+/// one page it stages under the wrong ancestor, each in the recorded full
+/// report.
+const LATER_ANCESTOR: CaseRef = CaseRef {
+    property: "header-sync/commit-only-authorized",
+    name: "later-ancestor",
+};
+
+/// C21's proving catches: [`LATER_ANCESTOR`], the real-tap two-finding
+/// history the claim-reading tests can't give, since `ClaimRun` and the
+/// scripted claim cases insert their claim records themselves (Adam's
+/// ruling on question 8).
+const C21_CATCHES: &[CaseRef] = &[LATER_ANCESTOR];
+
+/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]'s
+/// two findings at one boundary, and `overgrant`, whose patched `Draft`
+/// run's first finding is its initial `Open`'s credit break, naming the
+/// update and no page. Both come through the real reactor tap, where the
+/// sidecar test's `ClaimRun` inserts its claim records itself and the real
+/// header run finds no authority break.
+const C22_CATCHES: &[CaseRef] = &[
+    LATER_ANCESTOR,
+    CaseRef {
+        property: "header-sync/commit-only-authorized",
+        name: "overgrant",
+    },
+];
+
 /// C15's proving tests: the release-wake fixtures' runs equal the runs
 /// without the release up to their measured boundary and then settle, on
 /// the committed inputs and on every plan, and two planted wake bypasses'
@@ -1154,9 +1183,10 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
 /// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3 and C15 by hf-5. Every other row's
-/// deliveries landed, and its state names what's still missing: C4's, C21's
-/// and C22's proving tests pass, but don't yet prove them.
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5 and C22 by hf-9 with its
+/// planted catches. Every other row's deliveries landed, and its state
+/// names what's still missing: C4's and C21's proving tests pass, but don't
+/// yet prove them.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1342,30 +1372,33 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        proved_short(
-            C21,
-            "Adam's harness",
-            "Every header check keeps every finding at a boundary, not just its first.",
-            C21_PROVING,
-            "hf-8",
-            "a two-finding history through the real reactor tap, with both findings in the \
-             recorded full report and its fresh replay, since `ClaimRun` and the scripted \
-             claim cases insert their claim records themselves; and sidecar coverage for the \
-             generated `header-sync/s5v9` receiver and sender checks and \
-             `session/honest-never-punished`, which `wire_properties` registers and which can \
-             each find several failures at one boundary",
-        ),
-        proved_short(
-            C22,
-            "Adam's harness",
-            "Each commit-only-authorized finding names its rule kind and its actual subject.",
-            C22_PROVING,
-            "hf-9, and E4 for its proving test",
-            "the two-page and initial-Open overgrant cases through the real reactor tap, with \
-             each finding and its full attribution in the report and the sidecar. The \
-             sidecar test's `ClaimRun` inserts its claim records itself, and the real header \
-             run finds no authority break",
-        ),
+        Contract {
+            proving_catches: C21_CATCHES,
+            ..proved_short(
+                C21,
+                "Adam's harness",
+                "Every header check keeps every finding at a boundary, not just its first.",
+                C21_PROVING,
+                "hf-8",
+                "a planted case whose patched Draft run gives two findings at one boundary, \
+                 as C21_CATCHES' does for commit-only-authorized, for the generated \
+                 `header-sync/s5v9` receiver and sender checks and for \
+                 `session/honest-never-punished`, which `wire_properties` registers and which \
+                 can each find several failures at one boundary. No planted case's run does \
+                 that yet",
+            )
+        },
+        Contract {
+            proving_catches: C22_CATCHES,
+            ..satisfied(
+                C22,
+                "Adam's harness",
+                "Each commit-only-authorized finding names its rule kind and its actual \
+                 subject.",
+                C22_PROVING,
+                "hf-9, and E4 for its proving test",
+            )
+        },
     ]
 }
 

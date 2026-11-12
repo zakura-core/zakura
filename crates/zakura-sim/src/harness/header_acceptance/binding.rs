@@ -360,7 +360,10 @@ pub fn check(kind: &Kind, artifact: &Value, expect: &Expect) -> Result<(), Strin
             .as_object()
             .ok_or_else(|| format!("{} isn't an object", kind.name))?;
         if let Some(other) = held.keys().find(|key| !carried.contains(&key.as_str())) {
-            return Err(format!("{} holds {other}, which it doesn't carry", kind.name));
+            return Err(format!(
+                "{} holds {other}, which it doesn't carry",
+                kind.name
+            ));
         }
     }
     for &(field, pointer) in kind.carries {
@@ -509,7 +512,8 @@ mod tests {
     /// and no other line does.
     #[test]
     fn a_replay_log_claims_the_traces_it_matched() {
-        let log = "replayed trace ab: idle after 3 steps; every pick, draw and observation matched\n\
+        let log =
+            "replayed trace ab: idle after 3 steps; every pick, draw and observation matched\n\
                    replayed trace cd b: idle; 1 records differed\n\
                    replayed trace ef with --prefix: idle; everything matched, but a";
         assert_eq!(replay_claims(log), [json!({ "trace": "ab" })]);

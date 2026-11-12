@@ -440,9 +440,9 @@ impl Selected {
         if !self.dispatched(&dispatch) {
             return Err(format!("no call dispatched {dispatch:?}"));
         }
-        let ended = self
-            .ended(&Paired { call, op })
-            .ok_or(format!("call {call} never ended paired with operation {op}"))?;
+        let ended = self.ended(&Paired { call, op }).ok_or(format!(
+            "call {call} never ended paired with operation {op}"
+        ))?;
         if !self.ended_stale(&StaleCall { call, apply: false }) {
             return Err(format!(
                 "prepare call {call} didn't end stale: {:?}",

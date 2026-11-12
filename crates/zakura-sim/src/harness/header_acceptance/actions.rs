@@ -363,18 +363,20 @@ fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
     }
     facts
         .iter()
-        .map(|fact| match (fact.action.as_str(), fact.relink(), fact.closes()) {
-            ("Shutdown", ..) => fact.connection.is_none(),
-            (_, Some(link), _) => {
-                current.insert(link.peer.clone(), Some(link.clone()));
-                opened.contains(&link)
-            }
-            (_, _, Some(link)) => {
-                let was = current.insert(link.peer.clone(), None).flatten();
-                was.as_ref() == Some(&link) && opened.contains(&link) && closed.contains(&link)
-            }
-            _ => false,
-        })
+        .map(
+            |fact| match (fact.action.as_str(), fact.relink(), fact.closes()) {
+                ("Shutdown", ..) => fact.connection.is_none(),
+                (_, Some(link), _) => {
+                    current.insert(link.peer.clone(), Some(link.clone()));
+                    opened.contains(&link)
+                }
+                (_, _, Some(link)) => {
+                    let was = current.insert(link.peer.clone(), None).flatten();
+                    was.as_ref() == Some(&link) && opened.contains(&link) && closed.contains(&link)
+                }
+                _ => false,
+            },
+        )
         .collect()
 }
 

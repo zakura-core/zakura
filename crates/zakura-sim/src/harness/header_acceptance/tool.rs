@@ -1251,7 +1251,8 @@ fn integrity_execution(
             ) if fails_with(failure, diagnostic) => Ok(()),
             (_, other) => Err(format!("its recorded history ended {other:?}")),
         };
-        let expect = Expect::new().with_read(Field::Source, checkout, "its checkout wasn't measured");
+        let expect =
+            Expect::new().with_read(Field::Source, checkout, "its checkout wasn't measured");
         let from_checkout = binding::check_trace(&history, &expect).map_err(|why| {
             format!("its recorded history isn't from the checkout its test ran in: {why}")
         });
@@ -1764,14 +1765,21 @@ fn verdict_refusal(dir: &Path, property: &str, name: &str) -> Option<String> {
     let expect = Expect::new()
         .with(Field::Property, property)
         .with(Field::Case, name)
-        .with_read(Field::BaselineTrace, trace("baseline"), "the case has no baseline trace")
-        .with_read(Field::PatchedTrace, trace("patched"), "the case has no patched trace");
-    let check = binding::read(&binding::VERDICT, &dir.join(VERDICT_FILE), &expect).and_then(
-        |artifact| {
+        .with_read(
+            Field::BaselineTrace,
+            trace("baseline"),
+            "the case has no baseline trace",
+        )
+        .with_read(
+            Field::PatchedTrace,
+            trace("patched"),
+            "the case has no patched trace",
+        );
+    let check =
+        binding::read(&binding::VERDICT, &dir.join(VERDICT_FILE), &expect).and_then(|artifact| {
             serde_json::from_value::<VerdictCheck>(artifact)
                 .map_err(|error| format!("its planted verdict: {error}"))
-        },
-    );
+        });
     match check {
         Ok(check) => check.refused,
         Err(why) => Some(why),
@@ -1807,9 +1815,9 @@ fn target_refusal(
         None => Ok(Expect::new()
             .with(Field::Trace, Value::Null)
             .with(Field::InputSha256, Value::Null)),
-        Some((_, ran)) => Expect::of_trace(&run).map(|expect| {
-            expect.with(Field::InputSha256, ran.sha256.clone())
-        }),
+        Some((_, ran)) => {
+            Expect::of_trace(&run).map(|expect| expect.with(Field::InputSha256, ran.sha256.clone()))
+        }
     }
     .map(|expect| {
         expect
@@ -1973,7 +1981,11 @@ fn patched_build_refusal(
     });
     let build = match build {
         Ok(build) => build,
-        Err(why) => return Some(format!("its patched checkout isn't S plus {patch_file}: {why}")),
+        Err(why) => {
+            return Some(format!(
+                "its patched checkout isn't S plus {patch_file}: {why}"
+            ))
+        }
     };
     let measured = Some(build.source.as_str());
     let test = read_json::<TestRun>(&dir.join(TEST_FILE));

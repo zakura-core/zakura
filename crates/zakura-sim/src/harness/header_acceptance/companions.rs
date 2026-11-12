@@ -279,8 +279,8 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
             frames.len()
         ));
     };
-    let subscription = exchange
-        .ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
+    let subscription =
+        exchange.ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
     // The session row names the stream its session reads.
     let sessions: Vec<(u64, &str)> = observations
         .iter()
@@ -293,7 +293,12 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
                 session_id,
                 peer,
             } if (*connection, *quic_stream, *kind, *version)
-                == (frame.connection, frame.quic_stream, frame.kind, frame.version) =>
+                == (
+                    frame.connection,
+                    frame.quic_stream,
+                    frame.kind,
+                    frame.version,
+                ) =>
             {
                 Some((*session_id, peer.as_str()))
             }
@@ -333,7 +338,11 @@ pub fn sent_page(
 ) -> Result<SentPage, String> {
     let peer = page_peer(page, peers)?;
     let hashes = sent
-        .page(page.frame.connection, page.frame.quic_stream, page.frame.seq)
+        .page(
+            page.frame.connection,
+            page.frame.quic_stream,
+            page.frame.seq,
+        )
         .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
     Ok(SentPage { peer, hashes })
 }
@@ -364,9 +373,10 @@ pub fn fault_close(
         .iter()
         .enumerate()
         .find_map(|(at, obs)| match obs {
-            Observation::ConnectionClosed { connection: c, cause } if *c == connection => {
-                Some((at, cause))
-            }
+            Observation::ConnectionClosed {
+                connection: c,
+                cause,
+            } if *c == connection => Some((at, cause)),
             _ => None,
         });
     match close {
@@ -948,7 +958,10 @@ mod tests {
     fn the_staged_page_joins_the_rejected_frame() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let own = staged(11, 3);
-        assert_eq!(staged_page(&[own.clone()], &page, &sent()), Ok(()));
+        assert_eq!(
+            staged_page(std::slice::from_ref(&own), &page, &sent()),
+            Ok(())
+        );
         let keys = assert_one_key_off(&own.page().expect("it names its frame"), |staged| {
             staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
         });

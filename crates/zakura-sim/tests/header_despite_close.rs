@@ -54,7 +54,8 @@ fn sent(evidence: &DraftEvidence) -> SentPage {
 /// companion holds, and nothing stages, so the other two don't: the catch
 /// needs the patch. The companion joins the page's connection and its
 /// content refusal, so the same close moved to another connection fails,
-/// and so does the same close after a refusal for another fault.
+/// and so does the same close after a refusal for another fault or by
+/// another peer.
 #[test]
 fn the_fault_close_holds_on_the_unpatched_rejection() {
     let evidence = evidence();
@@ -84,7 +85,7 @@ fn the_fault_close_holds_on_the_unpatched_rejection() {
             obs
         })
         .collect();
-    assert!(fault_close(&moved, &evidence.refusals, &page).is_err());
+    assert!(fault_close(&moved, &evidence.refusals, &page, &evidence.peers).is_err());
 
     let [refusal] = &evidence.refusals[..] else {
         panic!("one refusal: {:?}", evidence.refusals);
@@ -95,7 +96,19 @@ fn the_fault_close_holds_on_the_unpatched_rejection() {
     );
     let mut other = evidence.refusals.clone();
     other[0].reason = "over_credit".into();
-    assert!(fault_close(&evidence.observations, &other, &page).is_err());
+    assert!(fault_close(&evidence.observations, &other, &page, &evidence.peers).is_err());
+
+    // Sol P2: the same refusal with only its peer changed is another
+    // peer's, so it doesn't hold either.
+    let peer = format!("{}00", refusal.peer);
+    let mut evidence = evidence;
+    evidence.refusals[0].peer = peer;
+    let verdicts = judge(&evidence);
+    let fault = verdicts
+        .iter()
+        .find(|(name, _)| *name == FAULT_CLOSE)
+        .map(|(_, verdict)| verdict);
+    assert!(matches!(fault, Some(Err(_))), "{verdicts:?}");
 }
 
 /// Unpatched, the rejected page never stages. A page staged from its

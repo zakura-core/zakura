@@ -1137,7 +1137,12 @@ where
             Request::FindBlocks { .. } | Request::FindHeaders { .. }
         );
 
-        let prefer_archive = matches!(&req, Request::FindBlocks { .. });
+        let prefer_archive = matches!(
+            &req,
+            Request::FindBlocks { .. }
+                | Request::BlocksByHash(_)
+                | Request::BlocksByHashFrom { .. }
+        );
         if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request, prefer_archive) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),

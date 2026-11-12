@@ -221,6 +221,38 @@ async fn pruned_routing_falls_back_without_an_archive() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pruned_routing_batch_prefers_archive_and_falls_back() {
+    let _init_guard = zakura_test::init();
+    for archive_present in [true, false] {
+        let mut peers = StoragePeers::new().await;
+        if !archive_present {
+            peers
+                .set
+                .call(Request::DisconnectPeer(peers.archive.addr))
+                .await
+                .unwrap();
+            peers.set.ready().await.unwrap();
+        }
+        let hashes = [BLOCK_HASH, block::Hash([0x88; 32])];
+        let _response = peers
+            .set
+            .call(Request::BlocksByHash(hashes.into_iter().collect()));
+        let selected = if archive_present {
+            &mut peers.archive
+        } else {
+            &mut peers.pruned
+        };
+        let Message::GetData(inventory) = StoragePeers::next_message(selected).await else {
+            panic!("a batch block request writes getdata");
+        };
+        assert_eq!(
+            inventory.into_iter().collect::<HashSet<_>>(),
+            hashes.into_iter().map(Into::into).collect()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn pruned_routing_preserves_advertiser_and_known_source_priority() {
     let _init_guard = zakura_test::init();
     for advertised in [false, true] {
@@ -313,6 +345,45 @@ async fn pruned_routing_findblocks_prefers_archive_and_falls_back() {
         StoragePeers::next_message(&mut peers.pruned).await,
         Message::GetBlocks { .. }
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_pruned_notfound_retries_archive_without_disconnect() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    peers
+        .inventory
+        .send(InventoryStatus::new_available(
+            BLOCK_HASH.into(),
+            peers.pruned.addr,
+        ))
+        .unwrap();
+    let response = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request());
+    StoragePeers::next_message(&mut peers.pruned).await;
+    peers
+        .pruned
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+    assert!(response.await.is_err());
+    let _retry = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request());
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![BLOCK_HASH.into()])
+    );
+    assert!(peers.set.ready_services.contains_key(&peers.pruned.addr));
+    assert_eq!(peers.pruned.written_now().await, None);
 }
 
 #[tokio::test(start_paused = true)]

@@ -172,6 +172,42 @@ pub enum ClaimRule {
     WrongSource,
 }
 
+/// What a [`ClaimBreak`] is about, as the event that broke it names it:
+/// a subject holds only what that event and the ledger's records give, so
+/// a break about a call or a handoff never names a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimSubject {
+    /// A staged page, as it arrived.
+    Page {
+        /// The peer it arrived from.
+        peer: ZakuraPeerId,
+        /// The session it arrived on.
+        session_id: u64,
+        /// The subscription it belongs to.
+        subscription: u64,
+        /// Its position among its stream's reads, if a reader tagged it.
+        frame: Option<u64>,
+        /// Its header hashes, in order.
+        hashes: Vec<block::Hash>,
+    },
+    /// A storage call's hold of a round's headers.
+    Hold {
+        /// The reactor's call number.
+        call: u64,
+        /// The round the event names the call taking or ending.
+        incarnation: u64,
+    },
+    /// A prepare handing a round's headers to an apply.
+    Handoff {
+        /// The prepare's call number.
+        prepare: u64,
+        /// The apply's call number.
+        apply: u64,
+        /// The round handed over.
+        incarnation: u64,
+    },
+}
+
 /// One break of a [`ClaimRule`], with its detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimBreak {
@@ -179,6 +215,10 @@ pub struct ClaimBreak {
     pub rule: ClaimRule,
     /// What broke it, led by the rule's name.
     pub detail: String,
+    /// The page, hold or handoff that broke it, for a rule about one of
+    /// those, or `None` for an accounting rule about a reservation, a lease
+    /// or a round's release.
+    pub subject: Option<ClaimSubject>,
 }
 
 /// Folds one reactor's events. See the module doc.
@@ -258,7 +298,16 @@ struct Round {
 }
 
 /// One staged page's headers, as `PageStaged` reports them.
+#[derive(Clone, Copy)]
 struct StagedHeaders<'a> {
+    /// The peer the page arrived from.
+    peer: &'a ZakuraPeerId,
+    /// The session it arrived on.
+    session_id: u64,
+    /// The subscription it belongs to.
+    subscription: u64,
+    /// Its position among its stream's reads, if a reader tagged it.
+    frame: Option<u64>,
     /// How many headers the page carried.
     headers: usize,
     /// What its reservation kept.
@@ -271,6 +320,19 @@ struct StagedHeaders<'a> {
     stored: &'a [block::Hash],
     /// How many headers the round held after the page.
     staged_total: usize,
+}
+
+impl StagedHeaders<'_> {
+    /// The page as a claim about it names it.
+    fn subject(&self) -> ClaimSubject {
+        ClaimSubject::Page {
+            peer: self.peer.clone(),
+            session_id: self.session_id,
+            subscription: self.subscription,
+            frame: self.frame,
+            hashes: self.hashes.to_vec(),
+        }
+    }
 }
 
 /// What a prepare sends: the target it names, the hashes of the headers it
@@ -344,6 +406,7 @@ impl HeaderWorkLedger {
                 if open {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::OpenOwnership,
+                        subject: None,
                         detail: format!(
                             "OpenOwnership: call {call} was handled with its headers still held"
                         ),
@@ -381,6 +444,7 @@ impl HeaderWorkLedger {
                     let claim = match reason {
                         HeaderRequestTerminal::SnapshotObsolete => ClaimBreak {
                             rule: ClaimRule::UnreleasedObsoleteRound,
+                            subject: None,
                             detail: format!(
                                 "UnreleasedObsoleteRound: obsolete round {} retired while the \
                                  queue still holds it",
@@ -391,6 +455,7 @@ impl HeaderWorkLedger {
                         | HeaderRequestTerminal::SessionReplaced
                         | HeaderRequestTerminal::TimedOut => ClaimBreak {
                             rule: ClaimRule::UnreleasedDepartedRound,
+                            subject: None,
                             detail: format!(
                                 "UnreleasedDepartedRound: round {} retired {} while the queue \
                                  still holds it",
@@ -400,6 +465,7 @@ impl HeaderWorkLedger {
                         },
                         _ => ClaimBreak {
                             rule: ClaimRule::UnreleasedRound,
+                            subject: None,
                             detail: format!(
                                 "UnreleasedRound: round {} retired as {reason:?} while the queue \
                                  still holds it",
@@ -447,20 +513,33 @@ impl HeaderWorkLedger {
                 request,
                 reservation,
                 subscription,
+                frame,
                 headers,
                 reserved_left,
                 ancestor,
                 hashes,
                 stored,
                 staged_total,
-                ..
             } => {
+                let page = StagedHeaders {
+                    peer: from_peer,
+                    session_id: *from_session,
+                    subscription: *subscription,
+                    frame: *frame,
+                    headers: *headers,
+                    reserved_left: *reserved_left,
+                    hashes,
+                    ancestor: *ancestor,
+                    stored,
+                    staged_total: *staged_total,
+                };
                 if from_peer != &request.peer
                     || *from_session != request.session_id
                     || *subscription != request.request_id
                 {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::ForeignPage,
+                        subject: Some(page.subject()),
                         detail: format!(
                             "ForeignPage: a page from session {from_session}, subscription \
                              {subscription} was staged on round {}, which session {} requested \
@@ -469,18 +548,7 @@ impl HeaderWorkLedger {
                         ),
                     });
                 }
-                self.stage(
-                    *reservation,
-                    request,
-                    StagedHeaders {
-                        headers: *headers,
-                        reserved_left: *reserved_left,
-                        hashes,
-                        ancestor: *ancestor,
-                        stored,
-                        staged_total: *staged_total,
-                    },
-                )?;
+                self.stage(*reservation, request, page)?;
             }
             ReactorEvent::LeaseReturned {
                 peer,
@@ -524,6 +592,7 @@ impl HeaderWorkLedger {
                 {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::LeakedReservation,
+                        subject: None,
                         detail: format!(
                             "LeakedReservation: the queue released round {incarnation} with \
                              its peer still holding reservation {reservation}"
@@ -533,6 +602,7 @@ impl HeaderWorkLedger {
                 if *queue_owned != 0 {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::LeakedLease,
+                        subject: None,
                         detail: format!(
                             "LeakedLease: the queue released round {incarnation} still holding \
                              leases of {queue_owned} headers for its peer"
@@ -582,6 +652,10 @@ impl HeaderWorkLedger {
                     let foreign = first;
                     found.push(ClaimBreak {
                         rule: ClaimRule::ForeignLease,
+                        subject: Some(ClaimSubject::Hold {
+                            call: *call,
+                            incarnation: *incarnation,
+                        }),
                         detail: format!(
                             "ForeignLease: call {call} holds round {incarnation} with a lease \
                              staged for round {foreign}"
@@ -626,6 +700,10 @@ impl HeaderWorkLedger {
                     other => {
                         found.push(ClaimBreak {
                             rule: ClaimRule::WrongCall,
+                            subject: Some(ClaimSubject::Hold {
+                                call: *call,
+                                incarnation: *incarnation,
+                            }),
                             detail: format!(
                                 "WrongCall: call {call} holds headers but asks for {other:?}"
                             ),
@@ -639,6 +717,10 @@ impl HeaderWorkLedger {
                     self.taint_round(*incarnation, false, true);
                     found.push(ClaimBreak {
                         rule: ClaimRule::WrongCall,
+                        subject: Some(ClaimSubject::Hold {
+                            call: *call,
+                            incarnation: *incarnation,
+                        }),
                         detail: format!(
                             "WrongCall: call {call} names {kind:?} for another peer or kind"
                         ),
@@ -650,6 +732,10 @@ impl HeaderWorkLedger {
                     }
                     found.push(ClaimBreak {
                         rule: ClaimRule::WrongRound,
+                        subject: Some(ClaimSubject::Hold {
+                            call: *call,
+                            incarnation: *incarnation,
+                        }),
                         detail: format!(
                             "WrongRound: call {call} holds round {incarnation}, but its peer's \
                              current round is {current:?}"
@@ -703,6 +789,10 @@ impl HeaderWorkLedger {
                     (held.incarnation != *incarnation || held.headers != *headers).then(|| {
                         ClaimBreak {
                             rule: ClaimRule::WrongRound,
+                            subject: Some(ClaimSubject::Hold {
+                                call: *call,
+                                incarnation: *incarnation,
+                            }),
                             detail: format!(
                                 "WrongRound: call {call} held round {} with {} headers, and ended \
                              round {incarnation} with {headers}",
@@ -769,6 +859,11 @@ impl HeaderWorkLedger {
                 {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::BadHandoff,
+                        subject: Some(ClaimSubject::Handoff {
+                            prepare: call,
+                            apply,
+                            incarnation,
+                        }),
                         detail: format!(
                             "BadHandoff: call {call} handed its headers to call {apply}, which \
                              is an apply for other work"
@@ -889,6 +984,7 @@ impl HeaderWorkLedger {
         {
             self.claims.push(ClaimBreak {
                 rule: ClaimRule::OverBudget,
+                subject: None,
                 detail: format!(
                     "OverBudget: reservation {reservation} holds {headers} headers with \
                      {claimed} already claimed of {HEADER_CHUNK_BUDGET_CAPACITY_V1}"
@@ -978,6 +1074,7 @@ impl HeaderWorkLedger {
             ancestor,
             stored,
             staged_total,
+            ..
         } = page;
         let current = self.rounds.get(&request.peer) == Some(&request.incarnation);
         if !current
@@ -1007,6 +1104,7 @@ impl HeaderWorkLedger {
             && (headers == 0 || headers > unstaged || reserved_left != unstaged - headers))
             .then(|| ClaimBreak {
                 rule: ClaimRule::OverReservation,
+                subject: Some(page.subject()),
                 detail: format!(
                     "OverReservation: a page of {headers} headers spent reservation \
                      {reservation}, which held {unstaged} and reports {reserved_left} left"
@@ -1038,6 +1136,7 @@ impl HeaderWorkLedger {
             );
             self.claims.push(ClaimBreak {
                 rule: ClaimRule::UnstagedPage,
+                subject: Some(page.subject()),
                 detail,
             });
             self.taint_round(request.incarnation, true, false);
@@ -1060,7 +1159,11 @@ impl HeaderWorkLedger {
         headers: usize,
         payload: Option<Payload>,
     ) -> Vec<ClaimBreak> {
-        let claim = |rule, detail| ClaimBreak { rule, detail };
+        let claim = |rule, detail| ClaimBreak {
+            rule,
+            detail,
+            subject: Some(ClaimSubject::Hold { call, incarnation }),
+        };
         let taint = self.taint_of(incarnation);
         let Some(round) = self
             .started
@@ -1157,6 +1260,7 @@ impl HeaderWorkLedger {
         if let Some(detail) = self.unreturned(incarnation, when) {
             self.claims.push(ClaimBreak {
                 rule: ClaimRule::LeakedLease,
+                subject: None,
                 detail,
             });
         }
@@ -1377,6 +1481,7 @@ impl HeaderWorkLedger {
             if record.held.as_ref().is_some_and(|held| !held.ended) {
                 claims.push(ClaimBreak {
                     rule: ClaimRule::OpenOwnership,
+                    subject: None,
                     detail: format!("OpenOwnership: call {call} never ended its headers"),
                 });
             }
@@ -1384,6 +1489,7 @@ impl HeaderWorkLedger {
         for reservation in self.reservations.keys() {
             claims.push(ClaimBreak {
                 rule: ClaimRule::OpenReservation,
+                subject: None,
                 detail: format!("OpenReservation: reservation {reservation} never ended"),
             });
         }
@@ -1391,6 +1497,7 @@ impl HeaderWorkLedger {
             if !self.tainted_rounds.contains_key(incarnation) && round.returned != round.staged {
                 claims.push(ClaimBreak {
                     rule: ClaimRule::LeakedLease,
+                    subject: None,
                     detail: format!(
                         "LeakedLease: teardown finished with {} of round {incarnation}'s {} \
                          staged headers unreturned",
@@ -1668,8 +1775,26 @@ mod tests {
         assert!(error.starts_with(rule), "{error}");
     }
 
+    /// The rules whose breaks name a page, a call's hold or a handoff.
+    /// Every other rule's break names nothing.
+    const SUBJECTED: [ClaimRule; 12] = [
+        ClaimRule::ForeignPage,
+        ClaimRule::UnstagedPage,
+        ClaimRule::OverReservation,
+        ClaimRule::WrongOwner,
+        ClaimRule::WrongPayload,
+        ClaimRule::BadHandoff,
+        ClaimRule::WrongRound,
+        ClaimRule::WrongCall,
+        ClaimRule::ForeignLease,
+        ClaimRule::HeldUnowned,
+        ClaimRule::UnstagedHeaders,
+        ClaimRule::WrongSource,
+    ];
+
     /// Folds `events`, which the ledger accepts, and requires its first
-    /// claim break to be `rule`'s.
+    /// claim break to be `rule`'s, and every break to name a subject
+    /// exactly when its rule is [`SUBJECTED`].
     fn claimed_as(events: Vec<ReactorEvent>, rule: ClaimRule) -> HeaderWorkLedger {
         let mut ledger = fold(events).expect("a claim break doesn't refuse the history");
         let claims = ledger.take_claims();
@@ -1678,7 +1803,39 @@ mod tests {
             Some(rule),
             "{claims:?}"
         );
+        for claim in &claims {
+            assert_eq!(
+                claim.subject.is_some(),
+                SUBJECTED.contains(&claim.rule),
+                "{claim:?}"
+            );
+        }
         ledger
+    }
+
+    /// [`claimed_as`], requiring the first break to name `subject` too.
+    fn claimed_about(events: Vec<ReactorEvent>, rule: ClaimRule, subject: ClaimSubject) {
+        let mut ledger = fold(events).expect("a claim break doesn't refuse the history");
+        let claims = ledger.take_claims();
+        assert_eq!(
+            claims
+                .first()
+                .map(|claim| (claim.rule, claim.subject.clone())),
+            Some((rule, Some(subject))),
+            "{claims:?}"
+        );
+    }
+
+    /// The page `peer(byte)` sent on `session_id`'s subscription 1 with
+    /// `headers` copies of `TIP`, as a claim names it.
+    fn page_subject(byte: u8, session_id: u64, frame: Option<u64>, headers: usize) -> ClaimSubject {
+        ClaimSubject::Page {
+            peer: peer(byte),
+            session_id,
+            subscription: 1,
+            frame,
+            hashes: vec![TIP; headers],
+        }
     }
 
     #[test]
@@ -1720,7 +1877,7 @@ mod tests {
     /// #1845: a capture naming a retired round is a claim break.
     #[test]
     fn a_capture_must_name_its_peers_current_round() {
-        claimed_as(
+        claimed_about(
             after(
                 &[(1, 1), (2, 2)],
                 vec![
@@ -1729,6 +1886,10 @@ mod tests {
                 ],
             ),
             ClaimRule::WrongRound,
+            ClaimSubject::Hold {
+                call: 1,
+                incarnation: 2,
+            },
         );
     }
 
@@ -1750,7 +1911,15 @@ mod tests {
         let mut other_peer = base;
         other_peer.push(dispatched(2, apply(2)));
         other_peer.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
-        claimed_as(other_peer, ClaimRule::BadHandoff);
+        claimed_about(
+            other_peer,
+            ClaimRule::BadHandoff,
+            ClaimSubject::Handoff {
+                prepare: 1,
+                apply: 2,
+                incarnation: 1,
+            },
+        );
     }
 
     /// A handoff must reach an open apply, which takes the same round and
@@ -2021,7 +2190,7 @@ mod tests {
             request: request(1, 1),
             reservation: 1,
             subscription: 1,
-            frame: None,
+            frame: Some(4),
             headers: 2,
             reserved_left: 3,
             ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
@@ -2029,10 +2198,19 @@ mod tests {
             stored: vec![TIP; 2],
             staged_total: 2,
         });
-        claimed_as(foreign, ClaimRule::ForeignPage);
+        // The page as it arrived, on the foreign session, not the round's.
+        claimed_about(
+            foreign,
+            ClaimRule::ForeignPage,
+            page_subject(1, 2, Some(4), 2),
+        );
         let mut over = base.clone();
         over.push(staged(1, 1, 1, 6, 0, 6));
-        claimed_as(over, ClaimRule::OverReservation);
+        claimed_about(
+            over,
+            ClaimRule::OverReservation,
+            page_subject(1, 1, None, 6),
+        );
         let mut miscounted = base.clone();
         miscounted.push(staged(1, 1, 1, 2, 2, 2));
         claimed_as(miscounted, ClaimRule::OverReservation);
@@ -2072,7 +2250,14 @@ mod tests {
             headers: 3,
             leases: Vec::new(),
         });
-        claimed_as(swapped, ClaimRule::WrongOwner);
+        claimed_about(
+            swapped,
+            ClaimRule::WrongOwner,
+            ClaimSubject::Hold {
+                call: 1,
+                incarnation: 1,
+            },
+        );
         let mut unowned = base;
         unowned.push(dispatched(1, apply(1)));
         unowned.push(ReactorEvent::HeadersHeld {
@@ -2513,7 +2698,14 @@ mod tests {
         };
         let mut short = base.clone();
         short.extend([dispatched(1, prepare_of(1, owner(), 2)), hold.clone()]);
-        claimed_as(short, ClaimRule::WrongPayload);
+        claimed_about(
+            short,
+            ClaimRule::WrongPayload,
+            ClaimSubject::Hold {
+                call: 1,
+                incarnation: 1,
+            },
+        );
         let mut elsewhere = base.clone();
         elsewhere.extend([
             dispatched(
@@ -2720,7 +2912,11 @@ mod tests {
             stored: vec![TIP, block::Hash([8; 32])],
             staged_total: 2,
         });
-        claimed_as(misstored, ClaimRule::UnstagedPage);
+        claimed_about(
+            misstored,
+            ClaimRule::UnstagedPage,
+            page_subject(1, 1, None, 2),
+        );
         let mut rewritten = base.clone();
         rewritten.extend([
             staged(1, 1, 1, 2, 3, 2),
@@ -2753,7 +2949,14 @@ mod tests {
                 leases: vec![1, 2],
             },
         ]);
-        claimed_as(foreign, ClaimRule::ForeignLease);
+        claimed_about(
+            foreign,
+            ClaimRule::ForeignLease,
+            ClaimSubject::Hold {
+                call: 1,
+                incarnation: 1,
+            },
+        );
         // A claimed foreign lease leaves both rounds' settlement unjudged,
         // so neither a release, an early return nor a leak follows it.
         let mut ledger = fold(after(

@@ -146,12 +146,31 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
 /// The file of `header-sync/wire`'s generated witnesses.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
+/// The file of the despite-close case's companion tests.
+const DESPITE_CLOSE_TESTS: &str = "tests/header_despite_close.rs";
+
+/// The file of `header-sync/wire`'s receiver-direction table checks, whose
+/// per-row content tests carry the fault close a content rejection owes.
+const TABLE_TESTS: &str = "tests/header_wire_table.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
-/// names its passing history, and the gates it serves.
+/// names its passing history, the gates it serves, and its catch.
 struct Generated {
     suffix: &'static str,
     witness: &'static str,
     gates: &'static [Gate],
+    catch: GeneratedCatch,
+}
+
+/// How a generated ID's catch is settled (decision 1): by its planted case
+/// under `qa/planted/header-sync/s5v9/`, or by an `Open` saying why no
+/// production patch breaks the ID alone.
+#[derive(Clone, Copy)]
+enum GeneratedCatch {
+    /// The case's name. Its set is the ID alone, and it's found at a step.
+    Case(&'static str),
+    /// The `Open`'s reason, pending Adam's approval.
+    Open(&'static str),
 }
 
 /// The honest witness, and the check that the witnesses list every ID.
@@ -185,49 +204,240 @@ const G1: &[Gate] = &[Gate::G1];
 const NONE: &[Gate] = &[];
 
 /// Header sync's 32 generated IDs on `main`.
-const GENERATED: [Generated; 32] = [
-    gen("conformant-never-closes", EVERY, G2),
-    gen("status/sender-cadence", EVERY, G34),
-    gen("subscribe-headers/sender-within-live", EVERY, G3),
-    gen("subscribe-headers/sender-within-credit", EVERY, G3),
-    gen("headers/sender-answers-open", EVERY, G3),
-    gen("headers-outcome/sender-ends-once", EVERY, G3),
-    gen("undeclared-type-closes", STATUS, G2),
-    gen("status/reserved-flags-closes", STATUS, G2),
-    gen("status/short-payload-closes", STATUS, G2),
-    gen("status/long-payload-closes", STATUS, G2),
-    gen("status/bad-content-closes", STATUS, G2),
-    gen("status/cadence-never-closes", STATUS, G24),
-    gen("subscribe-headers/reserved-flags-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/short-payload-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/long-payload-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/over-live-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/over-credit-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/after-close-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/bad-cursor-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/bad-content-closes", SUBSCRIBE, G2),
-    gen("headers/reserved-flags-closes", HEADERS, G2),
-    gen("headers/short-payload-closes", HEADERS, G2),
-    gen("headers/long-payload-closes", HEADERS, G2),
-    gen("headers/unsolicited-closes", HEADERS, G2),
-    gen("headers/bad-content-closes", HEADERS, G2),
-    gen("headers/over-owed-closes", HEADERS, G23),
-    gen("headers-outcome/reserved-flags-closes", OUTCOME, G2),
-    gen("headers-outcome/short-payload-closes", OUTCOME, G2),
-    gen("headers-outcome/long-payload-closes", OUTCOME, G2),
-    gen("headers-outcome/unsolicited-closes", OUTCOME, G2),
-    gen("headers-outcome/bad-content-closes", OUTCOME, G2),
-    gen("headers-outcome/over-owed-closes", OUTCOME, G23),
-];
+const GENERATED: [Generated; 32] = {
+    use GeneratedCatch::{Case, Open};
+    [
+        gen(
+            "conformant-never-closes",
+            EVERY,
+            G2,
+            Case("target-page-refused"),
+        ),
+        gen(
+            "status/sender-cadence",
+            EVERY,
+            G34,
+            Open(SENDER_CADENCE_UNREACHED),
+        ),
+        gen(
+            "subscribe-headers/sender-within-live",
+            EVERY,
+            G3,
+            Open(SENDER_LIVE_UNREACHED),
+        ),
+        gen(
+            "subscribe-headers/sender-within-credit",
+            EVERY,
+            G3,
+            Case("page-past-credit"),
+        ),
+        gen(
+            "headers/sender-answers-open",
+            EVERY,
+            G3,
+            Case("page-misnamed"),
+        ),
+        gen(
+            "headers-outcome/sender-ends-once",
+            EVERY,
+            G3,
+            Case("outcome-misnamed"),
+        ),
+        gen(
+            "undeclared-type-closes",
+            STATUS,
+            G2,
+            Case("undeclared-type-skipped"),
+        ),
+        gen(
+            "status/reserved-flags-closes",
+            STATUS,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "status/short-payload-closes",
+            STATUS,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "status/long-payload-closes",
+            STATUS,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "status/bad-content-closes",
+            STATUS,
+            G2,
+            Case("work-anchor-unchecked"),
+        ),
+        gen(
+            "status/cadence-never-closes",
+            STATUS,
+            G24,
+            Case("exhausted-cadence-throttled"),
+        ),
+        gen(
+            "subscribe-headers/reserved-flags-closes",
+            SUBSCRIBE,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "subscribe-headers/short-payload-closes",
+            SUBSCRIBE,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "subscribe-headers/long-payload-closes",
+            SUBSCRIBE,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "subscribe-headers/over-live-closes",
+            SUBSCRIBE,
+            G23,
+            Case("no-slot-dropped"),
+        ),
+        gen(
+            "subscribe-headers/over-credit-closes",
+            SUBSCRIBE,
+            G23,
+            Case("above-reservation-skipped"),
+        ),
+        gen(
+            "subscribe-headers/after-close-closes",
+            SUBSCRIBE,
+            G23,
+            Case("after-close-dropped"),
+        ),
+        gen(
+            "subscribe-headers/bad-cursor-closes",
+            SUBSCRIBE,
+            G23,
+            Case("unknown-acknowledgement-dropped"),
+        ),
+        gen(
+            "subscribe-headers/bad-content-closes",
+            SUBSCRIBE,
+            G2,
+            Case("repeated-locator-unchecked"),
+        ),
+        gen(
+            "headers/reserved-flags-closes",
+            HEADERS,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "headers/short-payload-closes",
+            HEADERS,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "headers/long-payload-closes",
+            HEADERS,
+            G2,
+            Open(LONG_PAGE_UNREACHED),
+        ),
+        gen(
+            "headers/unsolicited-closes",
+            HEADERS,
+            G2,
+            Case("unsolicited-skipped"),
+        ),
+        gen(
+            "headers/bad-content-closes",
+            HEADERS,
+            G2,
+            Open(BAD_PAGE_UNREACHED),
+        ),
+        gen("headers/over-owed-closes", HEADERS, G23, Open(NOT_OWED)),
+        gen(
+            "headers-outcome/reserved-flags-closes",
+            OUTCOME,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "headers-outcome/short-payload-closes",
+            OUTCOME,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "headers-outcome/long-payload-closes",
+            OUTCOME,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "headers-outcome/unsolicited-closes",
+            OUTCOME,
+            G2,
+            Case("unsolicited-skipped"),
+        ),
+        gen(
+            "headers-outcome/bad-content-closes",
+            OUTCOME,
+            G2,
+            Case("outcome-window-unchecked"),
+        ),
+        gen(
+            "headers-outcome/over-owed-closes",
+            OUTCOME,
+            G23,
+            Open(NOT_OWED),
+        ),
+    ]
+};
 
 /// A [`Generated`] entry.
-const fn gen(suffix: &'static str, witness: &'static str, gates: &'static [Gate]) -> Generated {
+const fn gen(
+    suffix: &'static str,
+    witness: &'static str,
+    gates: &'static [Gate],
+    catch: GeneratedCatch,
+) -> Generated {
     Generated {
         suffix,
         witness,
         gates,
+        catch,
     }
 }
+
+/// Why `headers/long-payload-closes` has no catch: no patch to one path
+/// breaks it alone.
+const LONG_PAGE_UNREACHED: &str =
+    "the node grants a subscription less byte credit than the headers row's maximum, so a page \
+     past that maximum is past its credit too, as the act's two labels say, and the subscriber's \
+     precheck refuses it before the frame filter's cap does; a patch that has the reader skip both \
+     refusals drains the page at 0 ns and breaks sim/no-livelock first";
+/// Why `headers/bad-content-closes` has no catch: its patch breaks a
+/// broader ID that `NESTS` doesn't list over it.
+const BAD_PAGE_UNREACHED: &str =
+    "each page content rule the adversary breaks, linkage and lower locator, puts headers the \
+     node didn't ask for on the page, so a patch that admits one has the node stage them and breaks \
+     header-sync/commit-only-authorized at that step, which NESTS doesn't list over this ID";
+/// Why `status/sender-cadence` has no catch: the run ends before a patched
+/// node empties the peer's bucket.
+const SENDER_CADENCE_UNREACHED: &str =
+    "the peer's Status bucket holds 602 frames and refills one every 500 ms, so breaking the rule \
+     takes over 600 Status frames from the node; with both its pacing floors cut to a millisecond, \
+     the reactor's publication interval and the cadence sender's send interval, a wire run sends \
+     about 213 before its 30,000-step budget ends";
+/// Why `subscribe-headers/sender-within-live` has no catch: the node's
+/// subscriber can't hold the subscriptions the rule's label needs.
+const SENDER_LIVE_UNREACHED: &str =
+    "the peer's models label a node Open over-live only beside two subscriptions the node holds \
+     on that peer, and the node's v9 subscriber state holds at most one live subscription per \
+     session, so no patch to one path makes the node send it";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -1104,9 +1314,6 @@ const OPERATION_IDS_UNREACHED: &str =
      storage operations and logs their submissions and completions, so only storage-fake code \
      can break the rule and no production patch can";
 
-/// Why a reachable generated ID's catch is still owed.
-const GENERATED_CATCH: &str =
-    "one planted case per reachable generated ID, from about six production patches (decision 1)";
 /// Why `header-fault-penalized`'s counted history is still owed.
 const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
                                  COVERAGE test runs test/header-wire-watched";
@@ -1120,18 +1327,11 @@ const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harnes
 
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. Every reachable generated ID's catch is hdr-14.5's, and
-/// the sim-wide IDs' catches and the two test-only witnesses' passing
-/// histories are hdr-14.4's. [`Key::covers`] takes a
+/// plan's PR table. The sim-wide IDs' catches and the two test-only
+/// witnesses' passing histories are hdr-14.4's. [`Key::covers`] takes a
 /// transitional `Open` on such a key only if it's exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
-        Key::Catch { property }
-            if property.starts_with("header-sync/s5v9/")
-                && !property.ends_with("over-owed-closes") =>
-        {
-            (GENERATED_CATCH, "hdr-14.5")
-        }
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
         }
@@ -1199,7 +1399,8 @@ fn generated_ids() -> &'static [&'static str] {
 }
 
 /// A generated ID's row: its passing history, or its approval-pending
-/// `StaysNotApplicable`, and a transitional catch until hdr-14.5.
+/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or an
+/// approval-pending `Open`.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
         let results = vec![result(
@@ -1226,19 +1427,30 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
         };
         holds(property, generated.gates, history)
     };
-    if !generated.suffix.ends_with("over-owed-closes") {
-        expected.push(owed(Key::catch(property), generated.gates));
-    } else {
-        expected.push(result(
+    match generated.catch {
+        GeneratedCatch::Case(name) => {
+            // Built once per case for a fixed set of 26, so the leak is
+            // bounded.
+            let set: &'static [&'static str] = Box::leak(Box::new([property]));
+            expected.extend(caught(
+                WIRE,
+                case(property, name),
+                set,
+                Found::AtStep,
+                generated.gates,
+                true,
+            ));
+        }
+        GeneratedCatch::Open(reason) => expected.push(result(
             vec![Key::catch(property)],
             generated.gates,
             Expected::Open {
-                reason: NOT_OWED,
+                reason,
                 owner: "hdr-14",
                 approval: Approval::Pending,
                 until: None,
             },
-        ));
+        )),
     }
     Row {
         property,
@@ -1637,6 +1849,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "foreign-leases",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "forwarded-length",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -1901,6 +2119,24 @@ fn hand_written_rows() -> Vec<Row> {
             index == 0,
         ));
     }
+    // Gap 6: a page staged despite its connection's fault close, judged on
+    // the case's Draft run by its three companions (`companions`).
+    let despite = super::companions::DESPITE_CLOSE;
+    commit.push(result(
+        vec![Key::Case {
+            property: despite.property.to_owned(),
+            name: despite.name.to_owned(),
+        }],
+        G23,
+        Expected::Caught {
+            case: despite,
+            harness: WIRE,
+            set: &[COMMIT],
+            found: Found::AtStep,
+            companions: super::companions::COMPANIONS,
+            not_applicable: &[],
+        },
+    ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
@@ -2659,71 +2895,65 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-2/despite-close/caught",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CAUGHT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_path_break_needs_a_retained_violation",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/close-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_fault_close_holds_on_the_unpatched_rejection",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/staging-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_staging_companion_needs_the_rejected_page_staged",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/status",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "status_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "subscribe_headers_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "headers_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "headers_outcome_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
@@ -2967,7 +3197,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "dropped-owner-check",
         },
     },
-    to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "foreign-leases",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "foreign-leases",
+        },
+    },
     NativeMutation {
         patch: "forgotten-locator-permit",
         class: NativeClass::Moved {

@@ -30,7 +30,7 @@ use zakura_network::zakura::{
         Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage,
         Status, SubscribeHeaders,
     },
-    AuxSchema, Credit, HeaderEntry,
+    AuxSchema, Credit, HeaderEntry, MessageRole,
 };
 use zakura_rt::time::Instant;
 
@@ -95,6 +95,14 @@ impl Row {
             .iter()
             .find(|rule| rule.name == self.name())
             .expect("header sync has every row")
+    }
+
+    /// The credit window of the row's subscription role.
+    fn window(self) -> Credit {
+        let MessageRole::Subscription { credit, .. } = self.rule().role else {
+            panic!("{} isn't a subscription row", self.name());
+        };
+        credit
     }
 
     /// Whether the row answers a subscription the node opened.
@@ -259,6 +267,22 @@ pub enum Act {
     /// after it, once the node has ended the subscription and before the
     /// ending arrives: conformant.
     OutcomeCrossing,
+    /// A `Close` for the [`Act::UnretainedOpen`], sent at the crossing point
+    /// as [`Act::OutcomeCrossing`]'s `Grant` is: conformant, since a `Close`
+    /// may cross the node's ending.
+    CrossingClose,
+    /// A `Grant` adding `objects` and `bytes` of credit to the
+    /// [`Act::UnretainedOpen`], sent at the crossing point as
+    /// [`Act::OutcomeCrossing`]'s is. It's conformant while the `Open`'s
+    /// credit plus the added credit fits the row's window, and `BadCursor`
+    /// above it. The credit must be one the encoder takes: at least a
+    /// grant's minimum, and within the update credit cap.
+    CrossingGrant {
+        /// The objects added.
+        objects: u32,
+        /// The bytes added.
+        bytes: u32,
+    },
     /// A `Grant` acknowledging the last page's cursor with one `field`
     /// changed, so it names no cursor of the subscription's history.
     BadCursor {
@@ -296,6 +320,8 @@ impl Act {
             Act::AfterClose => "after-close",
             Act::UnretainedOpen => "unretained-open",
             Act::OutcomeCrossing => "outcome-crossing",
+            Act::CrossingClose => "crossing-close",
+            Act::CrossingGrant { .. } => "crossing-grant",
             Act::BadCursor { .. } => "bad-cursor",
             Act::StatusBurst => "status-burst",
             Act::BadContent { .. } => "bad-content",
@@ -323,7 +349,23 @@ impl Act {
             | Act::SecondOpen
             | Act::UnretainedOpen
             | Act::OutcomeCrossing
+            | Act::CrossingClose
             | Act::StatusBurst => Labels::NONE,
+            Act::CrossingGrant { objects, bytes } => {
+                let window = Row::SubscribeHeaders.window();
+                // Nothing of the `Open`'s credit was spent or acknowledged,
+                // so the window holds all of it and the added credit.
+                let above = |open: u32, added: u32, limit: u32| {
+                    u64::from(open) + u64::from(added) > u64::from(limit)
+                };
+                if above(ONE_PAGE.objects, objects, window.objects)
+                    || above(ONE_PAGE.bytes, bytes, window.bytes)
+                {
+                    of(Label::BadCursor)
+                } else {
+                    Labels::NONE
+                }
+            }
             Act::Unsolicited { .. } | Act::ExtraEnding | Act::ExtraEndingAhead => {
                 of(Label::Unsolicited)
             }
@@ -351,6 +393,8 @@ impl Act {
             | Act::AfterClose
             | Act::UnretainedOpen
             | Act::OutcomeCrossing
+            | Act::CrossingClose
+            | Act::CrossingGrant { .. }
             | Act::BadCursor { .. } => Row::SubscribeHeaders,
             Act::ExtraEnding | Act::ExtraEndingAhead => Row::HeadersOutcome,
             Act::BadContent { rule } => rule.row(),
@@ -511,7 +555,7 @@ impl Adversary {
             | Act::MinPayload {
                 row: Row::SubscribeHeaders,
             } => own.is_some_and(|sub| sub.paged_at.is_some()),
-            Act::OutcomeCrossing => {
+            Act::OutcomeCrossing | Act::CrossingClose | Act::CrossingGrant { .. } => {
                 return self
                     .crossing
                     .filter(|crossing| !crossing.ended)
@@ -621,18 +665,16 @@ impl Adversary {
                 }
                 Crafted::of(message)
             }
-            Act::OutcomeCrossing => {
-                let crossing = self.crossing.ok_or("no Open to cross")?;
-                Crafted::of(RegtestMessage::SubscribeHeaders(SubscribeHeaders {
-                    operation: Operation::Grant,
-                    subscription_id: crossing.key,
-                    update_sequence: 1,
-                    initial_target_tip_hash: UNRETAINED,
-                    acknowledged: crossing.start,
-                    locator_hashes: Vec::new(),
-                    added_credit: ONE_PAGE,
-                    tree_aux_schema: AuxSchema::None,
-                }))
+            Act::OutcomeCrossing => Crafted::of(self.crossing_update(Operation::Grant, ONE_PAGE)?),
+            Act::CrossingClose => {
+                let none = Credit {
+                    objects: 0,
+                    bytes: 0,
+                };
+                Crafted::of(self.crossing_update(Operation::Close, none)?)
+            }
+            Act::CrossingGrant { objects, bytes } => {
+                Crafted::of(self.crossing_update(Operation::Grant, Credit { objects, bytes })?)
             }
             Act::BadCursor { field } => {
                 let mut message = honest.update(Some(ONE_PAGE));
@@ -695,6 +737,26 @@ impl Adversary {
             }
             _ => {}
         }
+    }
+
+    /// The first update after the [`Act::UnretainedOpen`]: `operation`,
+    /// adding `added`, acknowledging the `Open`'s start cursor.
+    fn crossing_update(
+        &self,
+        operation: Operation,
+        added: Credit,
+    ) -> Result<RegtestMessage, String> {
+        let crossing = self.crossing.ok_or("no Open to cross")?;
+        Ok(RegtestMessage::SubscribeHeaders(SubscribeHeaders {
+            operation,
+            subscription_id: crossing.key,
+            update_sequence: 1,
+            initial_target_tip_hash: UNRETAINED,
+            acknowledged: crossing.start,
+            locator_hashes: Vec::new(),
+            added_credit: added,
+            tree_aux_schema: AuxSchema::None,
+        }))
     }
 
     /// A fresh key for an `Open`.
@@ -1139,28 +1201,108 @@ mod tests {
         assert_eq!(Act::ExtraEnding.label(), Label::Unsolicited);
     }
 
-    /// An act whose precondition no longer holds is skipped: it sends
-    /// nothing and doesn't fail the run.
-    #[test]
-    fn an_expired_act_is_skipped() {
+    /// A peer holding five headers, with no subscription of its own, and
+    /// an adversary that announces and serves.
+    fn peer() -> (Honest, Adversary) {
         let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
         let spec = crate::peer::HonestSpec {
             chain: 5,
             subscribe: None,
         };
         let chain = std::sync::Arc::new(crate::peer::HonestChain::new(&fixture, 5));
-        let mut honest = Honest::with(spec, chain, true, true);
-        let mut adversary = Adversary::new(AdversarySpec {
+        let honest = Honest::with(spec, chain, true, true);
+        let adversary = Adversary::new(AdversarySpec {
             announce: true,
             serve: true,
             withhold: false,
         });
+        (honest, adversary)
+    }
+
+    /// An act whose precondition no longer holds is skipped: it sends
+    /// nothing and doesn't fail the run.
+    #[test]
+    fn an_expired_act_is_skipped() {
+        let (mut honest, mut adversary) = peer();
         for act in [Act::AfterClose, Act::SecondOpen, Act::OverLive] {
             assert!(adversary.wake(act, &honest).is_none(), "{act:?}");
             assert!(
                 matches!(adversary.act(act, &mut honest), Ok(None)),
                 "{act:?}"
             );
+        }
+    }
+
+    /// Each crossing act waits for an unretained `Open`, then sends the
+    /// update it names for that `Open`'s subscription: the first after the
+    /// `Open`, acknowledging its start cursor, with the act's operation and
+    /// credit, and labelled as the act says. A `Close` and a `Grant` within
+    /// the window are conformant, and a `Grant` that fills the window on
+    /// top of the `Open`'s page is `BadCursor`.
+    #[test]
+    fn each_crossing_act_sends_its_update() {
+        let window = Row::SubscribeHeaders.window();
+        let none = Credit {
+            objects: 0,
+            bytes: 0,
+        };
+        let cases = [
+            (
+                Act::CrossingClose,
+                Operation::Close,
+                none,
+                Label::Conformant,
+            ),
+            (
+                Act::CrossingGrant {
+                    objects: 2,
+                    bytes: 600,
+                },
+                Operation::Grant,
+                Credit {
+                    objects: 2,
+                    bytes: 600,
+                },
+                Label::Conformant,
+            ),
+            (
+                Act::CrossingGrant {
+                    objects: window.objects,
+                    bytes: window.bytes,
+                },
+                Operation::Grant,
+                window,
+                Label::BadCursor,
+            ),
+        ];
+        for (act, operation, added, label) in cases {
+            let (mut honest, mut adversary) = peer();
+            honest.node_status = Some(honest.chain.status.clone());
+            assert!(adversary.wake(act, &honest).is_none(), "{act:?}");
+            adversary
+                .act(Act::UnretainedOpen, &mut honest)
+                .expect("the unretained Open is labelled conformant")
+                .expect("the node announced and nothing subscribed");
+            let crossing = adversary.crossing.expect("the Open is the crossing's");
+            assert!(adversary.wake(act, &honest).is_some(), "{act:?}");
+            let sent = adversary
+                .act(act, &mut honest)
+                .unwrap_or_else(|error| panic!("{act:?}: {error}"))
+                .unwrap_or_else(|| panic!("{act:?} has an Open to cross"));
+            let intended = RegtestMessage::SubscribeHeaders(SubscribeHeaders {
+                operation,
+                subscription_id: crossing.key,
+                update_sequence: 1,
+                initial_target_tip_hash: UNRETAINED,
+                acknowledged: crossing.start,
+                locator_hashes: Vec::new(),
+                added_credit: added,
+                tree_aux_schema: AuxSchema::None,
+            });
+            assert_eq!(act.label(), label, "{act:?}");
+            assert_eq!(sent.len(), 1, "{act:?}");
+            assert_eq!(sent[0].bytes, Crafted::of(intended).bytes(), "{act:?}");
+            assert_eq!(sent[0].conformant(), label == Label::Conformant, "{act:?}");
         }
     }
 }

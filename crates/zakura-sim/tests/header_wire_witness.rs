@@ -906,3 +906,172 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
         report.end
     );
 }
+
+/// The committed Plan bytes every typed planted input below runs under:
+/// none, so each step takes its first action by identity, as the default
+/// Plan does.
+const DEFAULT_PLAN: &str = "header-wire-default.plan";
+
+/// The committed scenarios of the generated IDs' typed planted cases
+/// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
+/// focused scenario ([`act_scenario`]) for each act no saved Plan takes, an
+/// adversary serving the node its chain and the held subscription, both
+/// with no act, and the node serving an honest subscriber. The saved Plans' inputs serve the other cases.
+fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
+    let act = |name, act| (name, act_scenario(act));
+    let mut held = act_scenario(Act::MinPayload {
+        row: Row::SubscribeHeaders,
+    });
+    held.peers[0].script.clear();
+    let mut serving = act_scenario(Act::ExtraEnding);
+    serving.peers[0].script.clear();
+    vec![
+        act(
+            "status-bad-content",
+            Act::BadContent {
+                rule: ContentRule::StatusAnchor,
+            },
+        ),
+        act("status-burst", Act::StatusBurst),
+        act(
+            "subscribe-headers-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::SubscribeHeaders,
+                bit: 0,
+            },
+        ),
+        act(
+            "subscribe-headers-short-payload",
+            Act::ShortPayload {
+                row: Row::SubscribeHeaders,
+            },
+        ),
+        act(
+            "subscribe-headers-long-payload",
+            Act::LongPayload {
+                row: Row::SubscribeHeaders,
+            },
+        ),
+        act(
+            "subscribe-headers-bad-content",
+            Act::BadContent {
+                rule: ContentRule::OpenLocators,
+            },
+        ),
+        act(
+            "headers-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::Headers,
+                bit: 0,
+            },
+        ),
+        act(
+            "headers-short-payload",
+            Act::ShortPayload { row: Row::Headers },
+        ),
+        act(
+            "headers-outcome-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::HeadersOutcome,
+                bit: 0,
+            },
+        ),
+        act(
+            "headers-outcome-short-payload",
+            Act::ShortPayload {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-long-payload",
+            Act::LongPayload {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-unsolicited",
+            Act::Unsolicited {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-bad-content",
+            Act::BadContent {
+                rule: ContentRule::OutcomeWindow,
+            },
+        ),
+        ("serving-adversary", serving),
+        ("held-subscription", held),
+        ("served-subscription", served_subscription()),
+    ]
+}
+
+/// The node at 120 serving an honest peer at 50, which dials it and
+/// subscribes from genesis with its grants sent at once. The node never
+/// subscribes, so every frame of its subscription rows is its publisher's.
+fn served_subscription() -> WireScenario {
+    WireScenario {
+        node: Chain::main(120),
+        peers: vec![honest(
+            PeerSpec::dialing(),
+            PRELOAD,
+            Some(SubscribeSpec {
+                start: 0,
+                open: CreditSpec {
+                    objects: 250,
+                    bytes: 65_750,
+                },
+                grants: GrantPolicy::Immediate,
+            }),
+        )],
+        policy: Policy::converging(),
+        ..WireScenario::default()
+    }
+}
+
+/// The committed fixture file `name`.
+fn fixture_file(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// `scenario` as its committed JSON.
+fn scenario_json(scenario: &WireScenario) -> String {
+    serde_json::to_string_pretty(scenario).expect("scenarios serialize") + "\n"
+}
+
+/// The committed typed planted inputs are what their builders give, and
+/// their Plan bytes are empty.
+///
+/// This fails if a builder or the scenario format changes; after a
+/// deliberate change, run `regenerate_planted_scenarios`.
+#[test]
+fn planted_scenarios_match_their_builders() {
+    let read = |name: &str| {
+        std::fs::read_to_string(fixture_file(name))
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    for (name, scenario) in planted_scenarios() {
+        let file = format!("header-wire-planted-{name}.json");
+        assert_eq!(
+            read(&file),
+            scenario_json(&scenario),
+            "run `regenerate_planted_scenarios`"
+        );
+    }
+    assert_eq!(read(DEFAULT_PLAN), "");
+}
+
+/// Rewrites the typed planted inputs and their empty Plan bytes. Run it
+/// with `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
+/// header_wire_witness -- --ignored regenerate_planted_scenarios`.
+#[test]
+#[ignore = "rewrites the committed planted scenarios"]
+fn regenerate_planted_scenarios() {
+    for (name, scenario) in planted_scenarios() {
+        let file = fixture_file(&format!("header-wire-planted-{name}.json"));
+        std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
+    }
+    std::fs::write(fixture_file(DEFAULT_PLAN), "").expect("the fixture directory exists");
+}

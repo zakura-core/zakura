@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index c847aa6cfc..a1a43fc73a 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -553,6 +553,10 @@ impl Publisher {
+     /// runs out, so a burst of updates lets other peers progress.
+     pub(crate) async fn apply(&self, update: &SubscribeHeaders) -> Result<Applied, PublisherFault> {
+         let applied = lock(&self.shared).apply(update);
++        // Mutation: an update after Close is dropped, not refused.
++        if let Err(PublisherFault::Subscription(SubscriptionFault::AfterClose)) = applied {
++            return Ok(Applied::Crossed);
++        }
+         if applied == Ok(Applied::Live) {
+             self.wake.notify_one();
+         }

@@ -103,7 +103,7 @@ use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture}
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    authority::{Authority, AuthorityEvidence},
+    authority::{ledger_record, Authority, AuthorityEvidence},
     capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
@@ -366,12 +366,7 @@ impl TapState {
             (mem::take(&mut work.claims), work.books.take())
         };
         for broken in claims {
-            self.claims.record(ClaimRecord {
-                step,
-                claim: Claim::of(broken.rule),
-                detail: broken.detail,
-                attribution: None,
-            });
+            self.claims.record(ledger_record(step, broken));
         }
         if let Some(rule) = books {
             self.claims.record(ClaimRecord {
@@ -1901,7 +1896,7 @@ impl ReactorTap {
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
-pub(super) fn peer(peer: &ZakuraPeerId) -> String {
+pub(crate) fn peer(peer: &ZakuraPeerId) -> String {
     hex(&peer.digest())
 }
 

@@ -675,7 +675,7 @@ fn fork_choice_applied<V: ForkView>(view: &V, _: &ObservationLog) -> bool {
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
-const AUTHORITY_CLAIMS: [Claim; 13] = [
+pub(crate) const AUTHORITY_CLAIMS: [Claim; 13] = [
     Claim::CommitOnlyAuthorized,
     Claim::ForeignPage,
     Claim::UnstagedPage,
@@ -2558,6 +2558,68 @@ mod tests {
             .into_iter()
             .map(|finding| finding.record(step))
             .collect()
+    }
+
+    /// C22, a work-ledger claim as reported: three `ForeignPage` breaks
+    /// one key apart, by arrival peer or frame, whose ledger words are the
+    /// same, give three violations that each lead with the claim, name the
+    /// provenance rule and their own whole page, and match the claims
+    /// store's attribution for them.
+    #[test]
+    fn commit_only_authorized_reports_each_ledger_page_it_names() {
+        use crate::harness::header_node::authority::tests::foreign_page_records;
+        // Folds the ledger's breaks outside the run.
+        let records = foreign_page_records(1);
+        let (report, probe) = run_probed(
+            commit_only_authorized(),
+            &[Scripted::Recorded(foreign_page_records)],
+        );
+        let actual: Vec<&str> = report.properties[0]
+            .violations
+            .iter()
+            .map(|violation| violation.actual.as_str())
+            .collect();
+        assert_eq!(actual.len(), 3, "{actual:?}: {:?}", report.end);
+        for (index, line) in actual.iter().enumerate() {
+            let subject = &records[index]
+                .attribution
+                .as_ref()
+                .expect("a ledger page break is attributed")
+                .subject;
+            assert!(
+                line.starts_with(&format!("ForeignPage [provenance] {subject}: ")),
+                "{line}"
+            );
+            for other in actual.iter().skip(index + 1) {
+                assert_ne!(line, other);
+            }
+        }
+        let snapshot = probe.rounds.stores().snapshot();
+        let rows = snapshot
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|store| store["store"] == "claims")
+            .map(|store| store["snapshot"].clone())
+            .expect("the claims store is in the node's snapshot");
+        let kept: Vec<(serde_json::Value, serde_json::Value)> = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| (row["detail"].clone(), row["attribution"].clone()))
+            .collect();
+        let expected: Vec<(serde_json::Value, serde_json::Value)> = actual
+            .iter()
+            .zip(&records)
+            .map(|(line, record)| {
+                (
+                    serde_json::Value::from(*line),
+                    serde_json::to_value(record.attribution.as_ref().expect("attributed"))
+                        .expect("an attribution serializes"),
+                )
+            })
+            .collect();
+        assert_eq!(kept, expected);
     }
 
     /// C22 (a), as reported: the authority checker's two page breaks at one

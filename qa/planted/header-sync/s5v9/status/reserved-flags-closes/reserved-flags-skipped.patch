@@ -1,0 +1,31 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index d58ffec1c8..3c6683a3ed 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -6472,8 +6472,24 @@ where
+         usize::try_from(max_frame_bytes).expect("u32 frame cap fits usize on supported targets");
+     // The stream's message table can only tighten the negotiated cap. Check it
+     // before allocating the payload.
+-    let max_frame_bytes = filter
+-        .check_header(message_type, flags, payload_len, max_frame_bytes)
++    let max_frame_bytes = match filter.check_header(message_type, flags, payload_len, max_frame_bytes) {
++        // Mutation: a frame with reserved flags is skipped, not refused.
++        Err(FrameRejection::ReservedFlags) => {
++            let mut skipped = vec![0; payload_len];
++            read_frame_payload(recv, &mut skipped, read_timeout).await?;
++            let cap = u32::try_from(max_frame_bytes).expect("the cap is at most the u32 one");
++            return Box::pin(read_frame_under(
++                recv,
++                cap,
++                filter,
++                read_timeout,
++                first_byte_timeout,
++                admit,
++            ))
++            .await;
++        }
++        checked => checked,
++    }
+         .map_err(|rejection| {
+             metrics::counter!("zakura.p2p.frame.rejected", "reason" => rejection.label())
+                 .increment(1);

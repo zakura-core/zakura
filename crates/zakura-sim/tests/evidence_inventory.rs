@@ -1,9 +1,9 @@
 //! The header nodes' evidence-store inventory (C14, C17), checked from the
 //! source.
 //!
-//! A static scan of the header harness's sources finds every struct field
-//! that holds shared state: a `Cell`, `RefCell`, `Mutex` or `RwLock`, in an
-//! `Rc` or `Arc` or not, with type aliases followed. Each is either a
+//! A static scan of the header harness's sources finds every struct and
+//! enum variant field that holds shared state: a `Cell`, `RefCell`, `Mutex`, `RwLock` or
+//! atomic, in an `Rc` or `Arc` or not, with type aliases followed. Each is either a
 //! `Registered<T>`, which only a node's `EvidenceStores` builds, so it
 //! freezes with the run's log and reaches its snapshots, or on
 //! [`ALLOWED`], a live resource or harness mechanism that isn't evidence,
@@ -288,8 +288,9 @@ const REGISTERED: &[Store] = &[
             "each_recorded_end_is_its_links_cancellation",
         ),
     ),
-    // A second handle on `Effects::ended`, which the fork-choice check
-    // reads for the mirrors' link ends, so the same producer test.
+    // A second, non-owning handle on `Effects::ended`, which the
+    // fork-choice check reads for the mirrors' link ends, so the same
+    // producer test.
     store(
         "src/harness/header_node/fork_choice.rs",
         "LinkEnds",
@@ -396,6 +397,54 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
         "TapState",
         "retirement",
         "the departed-work check, whose facts go to the retirement store",
+    ),
+    // The tap's flags, each a live state or a guard, whose facts go to the
+    // stores or fail the run.
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "refused",
+        "an event recorded outside the run, which fails the run",
+    ),
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "port_gone",
+        "the node's port dropped mid-run, which the tap's health fails the run on",
+    ),
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "unwound",
+        "whether the reactor panicked, which the tap's health fails the run on",
+    ),
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "shutdown",
+        "whether the harness began stopping the reactor, which each drain copies into the \
+         settlement store's row",
+    ),
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "exited",
+        "a guard that records the reactor's own exit in the ends store once",
+    ),
+    (
+        "src/harness/header_node/tap.rs",
+        "TapState",
+        "settled",
+        "whether the stopped reactor's teardown is done, which each drain copies into the \
+         settlement store's row",
+    ),
+    // The node's stamp counter.
+    (
+        "src/harness/header_node/stamp.rs",
+        "Stamps",
+        "0",
+        "the next fact stamp, which a registered store takes under its own lock as it keeps a \
+         fact, so the stamps are in its snapshot and a frozen store takes none",
     ),
     // The fault property's own state.
     (
@@ -548,6 +597,18 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/peer/mod.rs",
+        "Forward",
+        "live",
+        "a scripted peer's live connection count, which gates its next accept, not a fact",
+    ),
+    (
+        "src/peer/mod.rs",
+        "Live",
+        "0",
+        "one live connection's share of its peer's count, not a fact",
+    ),
+    (
+        "src/peer/mod.rs",
         "PeerControl",
         "records",
         "C11: the peers' records, owed a peer-evidence checkpoint",
@@ -656,8 +717,42 @@ struct Field {
     ty: String,
 }
 
-/// Every non-test struct field and type alias in `items`, from `file`
-/// whose source is `lines`, into `fields` and `aliases`.
+/// Each of `declared`'s fields, by name or tuple index, as `owner`'s,
+/// from `file` whose source is `lines`, into `fields`.
+fn push_fields(
+    (file, lines): (&str, &[&str]),
+    owner: &str,
+    declared: &Fields,
+    fields: &mut Vec<Field>,
+) {
+    let named: Vec<(String, &Type)> = match declared {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|field| {
+                let name = field.ident.as_ref().expect("a named field has a name");
+                (name.to_string(), &field.ty)
+            })
+            .collect(),
+        Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (index.to_string(), &field.ty))
+            .collect(),
+        Fields::Unit => Vec::new(),
+    };
+    fields.extend(named.into_iter().map(|(field, ty)| Field {
+        file: file.to_owned(),
+        owner: owner.to_owned(),
+        field,
+        ty: text(ty, lines),
+    }));
+}
+
+/// Every non-test struct field, enum variant field and type alias in
+/// `items`, from `file` whose source is `lines`, into `fields` and
+/// `aliases`. A variant's fields are owned by `Enum::Variant`.
 fn collect(
     (file, lines): (&str, &[&str]),
     items: &[Item],
@@ -667,30 +762,17 @@ fn collect(
     for item in items {
         match item {
             Item::Struct(item) if !test_only(&item.attrs) => {
-                let owner = item.ident.to_string();
-                let named: Vec<(String, &Type)> = match &item.fields {
-                    Fields::Named(named) => named
-                        .named
-                        .iter()
-                        .map(|field| {
-                            let name = field.ident.as_ref().expect("a named field has a name");
-                            (name.to_string(), &field.ty)
-                        })
-                        .collect(),
-                    Fields::Unnamed(unnamed) => unnamed
-                        .unnamed
-                        .iter()
-                        .enumerate()
-                        .map(|(index, field)| (index.to_string(), &field.ty))
-                        .collect(),
-                    Fields::Unit => Vec::new(),
-                };
-                fields.extend(named.into_iter().map(|(field, ty)| Field {
-                    file: file.to_owned(),
-                    owner: owner.clone(),
-                    field,
-                    ty: text(ty, lines),
-                }));
+                push_fields((file, lines), &item.ident.to_string(), &item.fields, fields);
+            }
+            Item::Enum(item) if !test_only(&item.attrs) => {
+                for variant in &item.variants {
+                    push_fields(
+                        (file, lines),
+                        &format!("{}::{}", item.ident, variant.ident),
+                        &variant.fields,
+                        fields,
+                    );
+                }
             }
             Item::Type(item) if !test_only(&item.attrs) => {
                 aliases
@@ -727,11 +809,25 @@ fn names(ty: &str, word: &str) -> bool {
     })
 }
 
-/// Whether `ty` holds shared state directly.
+/// Whether `ty` names an atomic, such as `AtomicU64` or
+/// `zakura_rt::sync::atomic::AtomicBool`: an identifier `Atomic` followed
+/// by its kind, on any path.
+fn names_atomic(ty: &str) -> bool {
+    ty.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|ident| {
+            ident
+                .strip_prefix("Atomic")
+                .and_then(|kind| kind.chars().next())
+                .is_some_and(|c| c.is_ascii_uppercase())
+        })
+}
+
+/// Whether `ty` holds shared state directly: a cell, a lock or an atomic.
 fn shared(ty: &str) -> bool {
     ["Cell", "RefCell", "Mutex", "RwLock"]
         .iter()
         .any(|word| names_generic(ty, word))
+        || names_atomic(ty)
 }
 
 /// Whether `ty`, with every alias in `aliases` it names followed, holds
@@ -752,9 +848,15 @@ fn shared_through(ty: &str, aliases: &BTreeMap<String, Vec<String>>) -> bool {
     false
 }
 
-/// Whether `ty` is a registered store's cell.
+/// Whether `ty` is a registered store's cell, or a non-owning handle on
+/// one, which a store holds to read another of its node's stores.
 fn registered(ty: &str) -> bool {
-    ty.starts_with("Registered<") || ty.starts_with("crate::stores::Registered<")
+    ["Registered<", "WeakRegistered<"].iter().any(|cell| {
+        ty.starts_with(cell)
+            || ty
+                .strip_prefix("crate::stores::")
+                .is_some_and(|ty| ty.starts_with(cell))
+    })
 }
 
 /// Every field the scan reads, and every alias, from the crate's sources.
@@ -864,6 +966,93 @@ fn the_scan_follows_aliases() {
     assert_eq!(new[0].ty, "Kept");
     assert!(!registered(&new[0].ty));
     assert!(shared_through(&new[0].ty, &new_aliases));
+}
+
+/// An atomic field, on any of its paths and through an alias, is shared
+/// state the scan finds, so an unlisted one fails the inventory, as the
+/// control's fields show. A type merely named like one isn't.
+#[test]
+fn the_scan_finds_atomics() {
+    let source = "type Count = std::sync::atomic::AtomicUsize;\n\
+                  struct New {\n    \
+                  counter: Arc<AtomicU64>,\n    \
+                  flag: zakura_rt::sync::atomic::AtomicBool,\n    \
+                  count: Count,\n    \
+                  plain: Atomicity,\n\
+                  }\n";
+    let parsed = syn::parse_file(source).expect("the control parses");
+    let lines: Vec<&str> = source.lines().collect();
+    let (mut new, mut aliases) = (Vec::new(), BTreeMap::new());
+    collect(("new.rs", &lines), &parsed.items, &mut new, &mut aliases);
+    let found: Vec<(&str, bool)> = new
+        .iter()
+        .map(|field| {
+            let flagged = shared_through(&field.ty, &aliases)
+                && !registered(&field.ty)
+                && !ALLOWED.iter().any(|(file, owner, name, _)| {
+                    (*file, *owner, *name) == ("new.rs", "New", &field.field)
+                });
+            (field.field.as_str(), flagged)
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("counter", true),
+            ("flag", true),
+            ("count", true),
+            ("plain", false)
+        ]
+    );
+    let (fields, _) = scan();
+    let stamps = fields
+        .iter()
+        .find(|field| field.owner == "Stamps")
+        .expect("the stamp counter is scanned");
+    assert!(shared(&stamps.ty), "{stamps:?}");
+}
+
+/// An enum variant's fields, tuple or named, are scanned as a struct's
+/// are, so shared state an unlisted variant holds fails the inventory, as
+/// the control's variants show, and the scan reads the tree's real
+/// variants.
+#[test]
+fn the_scan_reads_enum_variant_fields() {
+    let source = "enum E {\n    \
+                  A(Arc<AtomicU64>),\n    \
+                  B { kept: Mutex<u8>, plain: u8 },\n    \
+                  C,\n\
+                  }\n";
+    let parsed = syn::parse_file(source).expect("the control parses");
+    let lines: Vec<&str> = source.lines().collect();
+    let (mut new, mut aliases) = (Vec::new(), BTreeMap::new());
+    collect(("new.rs", &lines), &parsed.items, &mut new, &mut aliases);
+    let found: Vec<(&str, &str, bool)> = new
+        .iter()
+        .map(|field| {
+            let flagged = shared_through(&field.ty, &aliases)
+                && !registered(&field.ty)
+                && !ALLOWED.iter().any(|(file, owner, name, _)| {
+                    (*file, *owner, *name) == ("new.rs", field.owner.as_str(), &field.field)
+                });
+            (field.owner.as_str(), field.field.as_str(), flagged)
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("E::A", "0", true),
+            ("E::B", "kept", true),
+            ("E::B", "plain", false)
+        ]
+    );
+    let (fields, _) = scan();
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.owner == "ProbeSlot::Held" && field.field == "0"),
+        "the scan reads the tap's probe slot's variant"
+    );
 }
 
 /// Whether `tests/<file>.rs` defines the test `name`.

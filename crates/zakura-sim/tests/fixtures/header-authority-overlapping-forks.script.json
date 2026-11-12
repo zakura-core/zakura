@@ -1,0 +1,2143 @@
+{
+  "choices": [
+    {
+      "draw": "0x0"
+    },
+    {
+      "pick": "task:control.1:poll#1"
+    },
+    {
+      "pick": "task:dispatch-guard.1:poll#1"
+    },
+    {
+      "pick": "task:control.1:recv#1"
+    },
+    {
+      "pick": "task:dispatch-guard.1:recv#1"
+    },
+    {
+      "pick": "task:dispatch-guard.2:poll#1"
+    },
+    {
+      "pick": "task:dispatch-guard.3:poll#1"
+    },
+    {
+      "pick": "task:dispatch-guard.2:recv#1"
+    },
+    {
+      "pick": "task:dispatch-guard.3:recv#1"
+    },
+    {
+      "pick": "task:header-node.1:poll#1"
+    },
+    {
+      "pick": "task:header-node.2:poll#1"
+    },
+    {
+      "pick": "task:header-node.3:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:recv#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:recv#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:recv#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:recv#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:poll#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:poll#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:watch#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:lock#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:release#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:release#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:watch#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:release#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:release#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:notified#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:notified#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:select#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:recv#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:recv#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.2:watch#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:poll#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:poll#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:watch#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:lock#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:release#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:release#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:watch#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:release#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:release#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:notified#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:notified#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:select#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:recv#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:recv#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.4:watch#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:poll#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:poll#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:load#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:send#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:send#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:select#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:sleep#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:sleep#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:poll#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#12"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:cancelled#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:load#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:send#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#14"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:send#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:select#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#15"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:sleep#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:sleep#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#16"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#17"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#10"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:select#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:lock#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:acquire#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#11"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#12"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#6"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:select#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#13"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:recv#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:sleep#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#7"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#8"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:send#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:acquire#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:lock#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:lock#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:lock#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:release#6"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:acquire#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:recv#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#14"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#15"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#9"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#10"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:select#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:cancelled#6"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:sleep#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#11"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:recv#12"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#17"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:watch#18"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:poll#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:recv#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:select#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:send#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:lock#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:release#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:release#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:lock#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:release#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:lock#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:release#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:acquire#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:acquire#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:recv#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#12"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:sleep#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:recv#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#14"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.3:watch#15"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:poll#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.2:select#5"
+    },
+    {
+      "pick": "storage:header:1:engine"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:poll#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#10"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#20"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#21"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#22"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#22"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#23"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#20"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#23"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#24"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#10"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#11"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#9"
+    },
+    {
+      "pick": "storage:header:2:engine"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:notify#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:sleep#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#21"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#22"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:recv#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:poll#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#10"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#10"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#25"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#24"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#26"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#25"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#27"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#26"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#27"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:notified#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#28"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#29"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#28"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:recv#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#30"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#29"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#31"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#30"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#31"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:spawn#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:poll#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#32"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:lock#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#32"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:lock#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#33"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:release#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#33"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:release#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#34"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:lock#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:lock#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:release#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#13"
+    },
+    {
+      "pick": "task:header_sync_publisher.1/header_sync_page_job.1:release#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#14"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:poll#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#34"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#35"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:lock#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#35"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:lock#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#36"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#37"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#23"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#36"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#38"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:lock#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#13"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#14"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#13"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:release#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#24"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:notify#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#25"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:select#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#12"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:cancelled#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#13"
+    },
+    {
+      "pick": "task:header_sync_pipe.3:recv#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:poll#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#14"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#26"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:sleep#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#14"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#15"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:send#1"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#27"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:acquire#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#28"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#9"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:poll#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:send#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#10"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#13"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#14"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#13"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#15"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:notified#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:notified#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:cancelled#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:recv#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:recv#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:poll#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#6"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:spawn#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:poll#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:lock#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:lock#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:release#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:release#2"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#9"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:lock#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#10"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:lock#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:release#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.3/header_sync_page_job.1:release#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:poll#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#9"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#10"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:send#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#7"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:cancelled#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:send#1"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:recv#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:acquire#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:poll#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:send#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#37"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#39"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#12"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:store#1"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#15"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#12"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#15"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#14"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#38"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:lock#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#40"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:release#15"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#39"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:notified#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#40"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:select#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#41"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:cancelled#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#16"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:recv#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#17"
+    },
+    {
+      "pick": "task:header_sync_publisher.3:watch#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#18"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:poll#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#42"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#41"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#43"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#42"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#44"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#15"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#29"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#30"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:lock#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#17"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:release#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#8"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:notify#2"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:cancelled#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:select#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#31"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:cancelled#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:sleep#6"
+    },
+    {
+      "pick": "task:header_sync_pipe.1:recv#5"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:poll#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#18"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:recv#19"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#3"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#32"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:watch#33"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:poll#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#7"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#14"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:lock#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#15"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:lock#3"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#17"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#9"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#8"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#10"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:cancelled#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:lock#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:recv#4"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:lock#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:send#3"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#11"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#16"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:release#12"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#18"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#7"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#17"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#19"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:send#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#8"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:select#8"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#18"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:cancelled#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#20"
+    },
+    {
+      "pick": "task:header_sync_pipe.4:recv#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:lock#19"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:poll#4"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:release#21"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:select#9"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:notified#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#6"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:select#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#43"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:cancelled#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#45"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:recv#5"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:store#2"
+    },
+    {
+      "pick": "task:header_sync_publisher.1:watch#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#7"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:poll#4"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:load#8"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:select#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#19"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#17"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#6"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#44"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#7"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#46"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#14"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#45"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#15"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#46"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#8"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#47"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#9"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#20"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#10"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#21"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#11"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:send#22"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#16"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#48"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#17"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#47"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#12"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#49"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:lock#13"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:lock#48"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#18"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:release#50"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#19"
+    },
+    {
+      "pick": "task:header_sync_reactor.1:acquire#18"
+    },
+    {
+      "pick": "task:header_sync_pipe.2:release#20"
+    }
+  ]
+}

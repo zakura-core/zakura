@@ -35,7 +35,7 @@ use zakura_sim::{
         header_sync::{HeaderWire, StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
         run_prepared, HarnessError, Subsystem, WITNESS_FILE,
     },
-    model::Label,
+    model::{is_fault_cause, Label},
     observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
     peer::{honest::HonestChain, PeerAction},
     property::HasView,
@@ -208,9 +208,43 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
     shape
 }
 
+/// The causes the node closed each connection that carried a `BadContent`
+/// page with, in log order, by that connection.
+fn bad_page_closes(report: &RunReport) -> Vec<(u64, Vec<String>)> {
+    let entries = report.log.entries();
+    let mut connections: Vec<u64> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::PeerFrame {
+                connection, label, ..
+            } if *label == Label::BadContent => Some(*connection),
+            _ => None,
+        })
+        .collect();
+    connections.dedup();
+    connections
+        .into_iter()
+        .map(|connection| {
+            let causes = entries
+                .iter()
+                .filter_map(|entry| match &entry.obs {
+                    Observation::ConnectionClosed {
+                        connection: closed,
+                        cause,
+                    } if *closed == connection => Some(cause.clone()),
+                    _ => None,
+                })
+                .collect();
+            (connection, causes)
+        })
+        .collect()
+}
+
 /// The node prepares the invalid tip, penalizes the peer and closes it. The
 /// close isn't one `conformant-never-closes` flags, since the page was judged
-/// at its preparation.
+/// at its preparation. The fault's session is still current, so its close
+/// is owed, and it closes the page's connection with a fault cause, as a
+/// subscriber's content rejection does.
 #[test]
 fn an_invalid_page_is_judged_at_prepare_and_penalized() {
     for (index, plan) in plans().into_iter().enumerate() {
@@ -222,6 +256,14 @@ fn an_invalid_page_is_judged_at_prepare_and_penalized() {
                 .iter()
                 .all(|(origin, current)| origin == current),
             "plan {index}: the session that sent the page was still current: {shape:?}"
+        );
+        let closes = bad_page_closes(&report);
+        assert!(
+            !closes.is_empty()
+                && closes
+                    .iter()
+                    .all(|(_, causes)| causes.first().is_some_and(|cause| is_fault_cause(cause))),
+            "plan {index}: the page's connection closed with a fault cause: {closes:?}"
         );
     }
 }

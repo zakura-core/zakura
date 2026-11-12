@@ -4,18 +4,25 @@ use std::num::NonZeroU64;
 
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
-    BranchId, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority, StateVersion,
+    BranchId, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId, StateVersion,
     VerifiedGeneration,
 };
 use zakura_network::zakura::{
-    observe::{CreditTotals, RequestRef, ReservationEnd, ReservationPurpose},
+    observe::{
+        ClaimBreak, ClaimRule, ClaimSubject, CreditTotals, HeaderWorkEnd, HeaderWorkLedger,
+        PortCall, RequestRef, ReservationEnd, ReservationPurpose, StorageCallKind,
+    },
     v9::{Cursor, Headers, Operation, RegtestMessage, SubscribeHeaders},
     wire_codec::encode_frame,
     AuxSchema, Credit, HeaderEntry,
 };
 
 use super::*;
-use crate::harness::header_node::{claim::ClaimEvidence, tap::peer};
+use crate::domain::header_sync::AUTHORITY_CLAIMS;
+use crate::harness::header_node::{
+    claim::{Claim, ClaimEvidence},
+    tap::peer,
+};
 
 /// The mirror's peer ID.
 fn mirror() -> ZakuraPeerId {
@@ -2141,4 +2148,251 @@ fn findings_one_key_apart_stay_distinct() {
     }
     assert_eq!(six[0].attribution.subject, refrated);
     assert_ne!(four[0].to_string(), six[0].to_string());
+}
+
+/// Folds `events` into a fresh work ledger, which must accept them, and
+/// returns its claim breaks with the attribution the tap keeps for each.
+fn ledger_claims(events: &[ReactorEvent]) -> Vec<(ClaimRule, Option<Attribution>)> {
+    let mut ledger = HeaderWorkLedger::default();
+    for event in events {
+        if let Err(rule) = ledger.observe(event) {
+            panic!("the ledger refused {event:?}: {rule}");
+        }
+    }
+    ledger
+        .take_claims()
+        .iter()
+        .map(|claim| (claim.rule, ledger_attribution(claim)))
+        .collect()
+}
+
+/// The attribution `claims` hold for `rule`'s first break, after checking
+/// every break is attributed exactly when `commit-only-authorized`
+/// reports its rule.
+fn attributed(claims: &[(ClaimRule, Option<Attribution>)], rule: ClaimRule) -> Attribution {
+    for (found, attribution) in claims {
+        assert_eq!(
+            attribution.is_some(),
+            AUTHORITY_CLAIMS.contains(&Claim::of(*found)),
+            "{claims:?}"
+        );
+    }
+    claims
+        .iter()
+        .find(|(found, _)| *found == rule)
+        .and_then(|(_, attribution)| attribution.clone())
+        .unwrap_or_else(|| panic!("no attributed {rule:?} in {claims:?}"))
+}
+
+/// The mirror's round 1 on session 7 subscription 1, toward the main
+/// chain's fourth header, bound to its reservation 1 of 10 headers and
+/// started, with the events that do it.
+fn ledger_round() -> (RequestRef, Vec<ReactorEvent>) {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request_on(&mirror(), 7, 1, 1, chain[3].hash, genesis.hash);
+    let events = vec![
+        reserved(1, 10),
+        ReactorEvent::ReservationBound {
+            reservation: 1,
+            request: round.clone(),
+            max_headers: 10,
+        },
+        started(round.clone(), &[genesis.hash]),
+    ];
+    (round, events)
+}
+
+/// `round`'s prepare of `hashes` toward the last of them.
+fn ledger_prepare(round: &RequestRef, hashes: &[block::Hash]) -> PortCall {
+    let genesis = HeaderFixture::regtest().anchor();
+    PortCall::Prepare {
+        peer: round.peer.clone(),
+        source: SourceId::from_digest(round.peer.digest()),
+        owner: round.owner,
+        common_ancestor: genesis,
+        target: Frontier::new(
+            block::Height(u32::try_from(hashes.len()).expect("a test page is short")),
+            *hashes.last().expect("a test prepare sends headers"),
+        ),
+        hashes: hashes.to_vec(),
+    }
+}
+
+/// Every work-ledger rule `commit-only-authorized` reports maps to its
+/// authority rule, and none of the ledger's other rules is attributed,
+/// even with a subject.
+#[test]
+fn each_ledger_rule_the_property_reports_has_its_authority_rule() {
+    use AuthorityRule::{Credit, OwnerBinding, Path, Provenance, Submission};
+    let reported = [
+        (ClaimRule::ForeignPage, Provenance),
+        (ClaimRule::WrongSource, Provenance),
+        (ClaimRule::UnstagedPage, Path),
+        (ClaimRule::OverReservation, Credit),
+        (ClaimRule::WrongOwner, OwnerBinding),
+        (ClaimRule::WrongRound, OwnerBinding),
+        (ClaimRule::ForeignLease, OwnerBinding),
+        (ClaimRule::HeldUnowned, OwnerBinding),
+        (ClaimRule::UnstagedHeaders, OwnerBinding),
+        (ClaimRule::WrongPayload, Submission),
+        (ClaimRule::WrongCall, Submission),
+        (ClaimRule::BadHandoff, Submission),
+    ];
+    let others = [
+        ClaimRule::OverBudget,
+        ClaimRule::LeakedReservation,
+        ClaimRule::LeakedLease,
+        ClaimRule::OpenOwnership,
+        ClaimRule::OpenReservation,
+        ClaimRule::UnreleasedObsoleteRound,
+        ClaimRule::UnreleasedRound,
+        ClaimRule::UnreleasedDepartedRound,
+    ];
+    let claim = |rule| ClaimBreak {
+        rule,
+        detail: String::new(),
+        subject: Some(ClaimSubject::Hold {
+            call: 1,
+            incarnation: 2,
+        }),
+    };
+    for (rule, authority) in reported {
+        assert!(AUTHORITY_CLAIMS.contains(&Claim::of(rule)), "{rule:?}");
+        assert_eq!(
+            ledger_attribution(&claim(rule)),
+            Some(Attribution {
+                rule: authority,
+                subject: AuthoritySubject::Hold { call: 1, round: 2 },
+            }),
+            "{rule:?}"
+        );
+    }
+    for rule in others {
+        assert!(!AUTHORITY_CLAIMS.contains(&Claim::of(rule)), "{rule:?}");
+        assert_eq!(ledger_attribution(&claim(rule)), None, "{rule:?}");
+    }
+    assert_eq!(
+        reported.len() + 1,
+        AUTHORITY_CLAIMS.len(),
+        "every ledger rule the property reports, beside its own"
+    );
+}
+
+/// A ledger claim about a page names the page as it arrived, by peer,
+/// session, subscription, headers and frame: a page from another session
+/// than its round's, and one that overspent its reservation.
+#[test]
+fn a_ledger_page_claim_names_its_page() {
+    let chain = main_chain(11);
+    let genesis = HeaderFixture::regtest().anchor();
+    let (round, mut foreign) = ledger_round();
+    let mut page = page_on(&round, Some(4), genesis, &[chain[0].hash]);
+    if let ReactorEvent::PageStaged { from_session, .. } = &mut page {
+        *from_session = 9;
+    }
+    foreign.push(page);
+    assert_eq!(
+        attributed(&ledger_claims(&foreign), ClaimRule::ForeignPage),
+        Attribution {
+            rule: AuthorityRule::Provenance,
+            subject: AuthoritySubject::page(&(mirror(), 9, 1), &[chain[0].hash], Some(4)),
+        }
+    );
+    let (round, mut over) = ledger_round();
+    let hashes: Vec<block::Hash> = chain.iter().map(|header| header.hash).collect();
+    over.push(page_on(&round, Some(5), genesis, &hashes));
+    assert_eq!(
+        attributed(&ledger_claims(&over), ClaimRule::OverReservation),
+        Attribution {
+            rule: AuthorityRule::Credit,
+            subject: AuthoritySubject::page(&(mirror(), 7, 1), &hashes, Some(5)),
+        }
+    );
+}
+
+/// A ledger claim about a call's hold names the call and its round, and
+/// no page: a prepare holding a round that staged nothing.
+#[test]
+fn a_ledger_hold_claim_names_its_call_and_round() {
+    let chain = main_chain(1);
+    let (round, mut events) = ledger_round();
+    events.extend([
+        ReactorEvent::Dispatched {
+            call: 3,
+            op: ledger_prepare(&round, &[chain[0].hash]),
+        },
+        ReactorEvent::HeadersHeld {
+            call: 3,
+            kind: StorageCallKind::Prepare,
+            peer: mirror(),
+            incarnation: 1,
+            headers: 1,
+            leases: Vec::new(),
+        },
+    ]);
+    let attribution = attributed(&ledger_claims(&events), ClaimRule::UnstagedHeaders);
+    assert_eq!(
+        attribution,
+        Attribution {
+            rule: AuthorityRule::OwnerBinding,
+            subject: AuthoritySubject::Hold { call: 3, round: 1 },
+        }
+    );
+    assert!(
+        !serde_json::to_string(&attribution)
+            .expect("an attribution serializes")
+            .contains("\"page\""),
+        "{attribution:?}"
+    );
+}
+
+/// A ledger claim about a handoff names the prepare, the apply and the
+/// round: a prepare handing its staged page to another peer's apply.
+#[test]
+fn a_ledger_handoff_claim_names_both_calls() {
+    let chain = main_chain(1);
+    let genesis = HeaderFixture::regtest().anchor();
+    let (round, mut events) = ledger_round();
+    events.extend([
+        page_on(&round, None, genesis, &[chain[0].hash]),
+        ReactorEvent::Dispatched {
+            call: 1,
+            op: ledger_prepare(&round, &[chain[0].hash]),
+        },
+        ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer: mirror(),
+            incarnation: 1,
+            headers: 1,
+            leases: Vec::new(),
+        },
+        ReactorEvent::Dispatched {
+            call: 2,
+            op: PortCall::Apply {
+                peer: other_mirror(),
+                source: SourceId::from_digest(other_mirror().digest()),
+                owner: round.owner,
+                target_tip_hash: chain[0].hash,
+            },
+        },
+        ReactorEvent::HeadersEnded {
+            call: 1,
+            incarnation: 1,
+            headers: 1,
+            end: HeaderWorkEnd::HandedToApply { apply: 2 },
+        },
+    ]);
+    assert_eq!(
+        attributed(&ledger_claims(&events), ClaimRule::BadHandoff),
+        Attribution {
+            rule: AuthorityRule::Submission,
+            subject: AuthoritySubject::Handoff {
+                prepare: 1,
+                apply: 2,
+                round: 1,
+            },
+        }
+    );
 }

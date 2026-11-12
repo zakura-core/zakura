@@ -1114,7 +1114,7 @@ fn judge_patched(
     let verdict = match case.classify(&patched) {
         Verdict::Caught(None) if !case.draft_set.is_empty() => {
             let draft = record(
-                Command::new(zakura_sim),
+                in_phase(Command::new(zakura_sim), "draft"),
                 harness,
                 input,
                 &case.property,
@@ -1501,8 +1501,8 @@ impl Expect<'_> {
 }
 
 /// `command` with its runs' acceptance phase set to `phase`, so sim-7's
-/// acceptance tool can tell the baseline, patched, campaign and replay runs
-/// apart. It changes nothing unless the tool also names a records
+/// acceptance tool can tell the baseline, patched, draft, campaign and
+/// replay runs apart. It changes nothing unless the tool also names a records
 /// directory.
 fn in_phase(mut command: Command, phase: &str) -> Command {
     command.env("ZAKURA_SIM_ACCEPTANCE_PHASE", phase);

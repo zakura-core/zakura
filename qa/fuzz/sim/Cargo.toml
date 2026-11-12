@@ -38,6 +38,9 @@ serde_json = "1"
 zakura-scheduler = { path = "../../../crates/zakura-scheduler" }
 zakura-sim = { path = "../../../crates/zakura-sim" }
 
+[dev-dependencies]
+zakura-rt = { path = "../../../crates/zakura-rt" }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(zakura_sim)"] }
 

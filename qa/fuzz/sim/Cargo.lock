@@ -2150,6 +2150,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "serde_json",
+ "zakura-rt",
  "zakura-scheduler",
  "zakura-sim",
 ]

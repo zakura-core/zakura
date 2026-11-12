@@ -822,3 +822,77 @@ fn the_manifest_doesnt_depend_on_the_executable() {
     }
     assert!(manifests[0] == manifests[1], "the two manifests differ");
 }
+
+/// The test targets sched-4's certification rows map that the release lane
+/// runs (sim-7.2). `race_schedules` joins when sched-4's S4.4 to S4.6 land.
+const SCHED4_RELEASE_TARGETS: &[&str] = &[
+    "draws",
+    "race_fixtures",
+    "discovery",
+    "witness",
+    "cli",
+    "replay_exact",
+    "idle",
+    "time",
+];
+
+/// The sched-4 test targets the ASan lane runs (sim-7.2).
+const SCHED4_ASAN_TARGETS: &[&str] = &["draws", "race_fixtures", "discovery", "witness", "cli"];
+
+/// The committed lane `id`.
+fn lane(suite: &SuiteFile, id: &str) -> zakura_sim::suite::Lane {
+    suite
+        .lane
+        .iter()
+        .find(|lane| lane.id == id)
+        .unwrap_or_else(|| panic!("qa/suite.toml has lane {id}"))
+        .clone()
+}
+
+/// The sched-4 targets of `lane` that it doesn't select, or that aren't
+/// test targets of `zakura-sim`.
+fn missing_sched4_targets(lane: &zakura_sim::suite::Lane, targets: &[&str]) -> Vec<String> {
+    let tests = seed::repo_root().join("crates/zakura-sim/tests");
+    let selected = lane.test_targets();
+    targets
+        .iter()
+        .filter(|target| {
+            !selected.contains(target) || !tests.join(format!("{target}.rs")).is_file()
+        })
+        .map(|target| (*target).to_owned())
+        .collect()
+}
+
+#[test]
+fn the_zakura_sim_lanes_run_every_sched4_target() {
+    let suite = committed();
+    for (id, targets) in [
+        ("sim-release/zakura-sim", SCHED4_RELEASE_TARGETS),
+        ("sim-asan/zakura-sim", SCHED4_ASAN_TARGETS),
+    ] {
+        let lane = lane(&suite, id);
+        assert_eq!(
+            missing_sched4_targets(&lane, targets),
+            Vec::<String>::new(),
+            "{id}"
+        );
+        assert!(
+            lane.args.contains("--lib"),
+            "{id} runs the library's unit tests"
+        );
+        assert!(
+            !lane.args.contains("--ignored") && !lane.args.contains("--include-ignored"),
+            "{id} runs no ignored test, so never a generator such as `regenerate_saved_plans`"
+        );
+    }
+}
+
+#[test]
+fn a_lane_without_a_sched4_target_fails() {
+    let mut lane = lane(&committed(), "sim-release/zakura-sim");
+    lane.args = lane.args.replace(" --test witness", "");
+    assert_eq!(
+        missing_sched4_targets(&lane, SCHED4_RELEASE_TARGETS),
+        ["witness"]
+    );
+}

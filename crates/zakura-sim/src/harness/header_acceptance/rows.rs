@@ -172,6 +172,10 @@ struct Generated {
 enum GeneratedCatch {
     /// The case's name. Its set is the ID alone, and it's found at a step.
     Case(&'static str),
+    /// [`Case`](GeneratedCatch::Case)'s case, and a second case of the ID,
+    /// caught the same way, that isn't its catch but proves something
+    /// beside it, such as a contract's.
+    Cases(&'static str, &'static str),
     /// The `Open`'s reason and its approval.
     Open(&'static str, Approval),
 }
@@ -208,7 +212,7 @@ const NONE: &[Gate] = &[];
 
 /// Header sync's 32 generated IDs on `main`.
 const GENERATED: [Generated; 32] = {
-    use GeneratedCatch::{Case, Open};
+    use GeneratedCatch::{Case, Cases, Open};
     [
         gen(
             "conformant-never-closes",
@@ -256,7 +260,8 @@ const GENERATED: [Generated; 32] = {
             "status/reserved-flags-closes",
             STATUS,
             G2,
-            Case("reserved-flags-skipped"),
+            // The second is C21's proof for the generated receiver checks.
+            Cases("reserved-flags-skipped", "two-reserved-flags-skipped"),
         ),
         gen(
             "status/short-payload-closes",
@@ -1459,7 +1464,8 @@ fn generated_ids() -> &'static [&'static str] {
 
 /// A generated ID's row: its passing history, or its approval-pending
 /// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or its
-/// `Open` under the approval its entry names.
+/// `Open` under the approval its entry names. A second case's `Caught`
+/// covers that case's key alone.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
         let results = vec![result(
@@ -1486,19 +1492,24 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
         };
         holds(property, generated.gates, history)
     };
+    let caught_by = |name, primary| {
+        // Built once per case for a fixed set of 30, so the leak is
+        // bounded.
+        let set: &'static [&'static str] = Box::leak(Box::new([property]));
+        caught(
+            WIRE,
+            case(property, name),
+            set,
+            Found::AtStep,
+            generated.gates,
+            primary,
+        )
+    };
     match generated.catch {
-        GeneratedCatch::Case(name) => {
-            // Built once per case for a fixed set of 29, so the leak is
-            // bounded.
-            let set: &'static [&'static str] = Box::leak(Box::new([property]));
-            expected.extend(caught(
-                WIRE,
-                case(property, name),
-                set,
-                Found::AtStep,
-                generated.gates,
-                true,
-            ));
+        GeneratedCatch::Case(name) => expected.extend(caught_by(name, true)),
+        GeneratedCatch::Cases(name, second) => {
+            expected.extend(caught_by(name, true));
+            expected.extend(caught_by(second, false));
         }
         GeneratedCatch::Open(reason, approval) => expected.push(result(
             vec![Key::catch(property)],

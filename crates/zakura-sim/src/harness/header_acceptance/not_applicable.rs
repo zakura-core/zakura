@@ -545,6 +545,12 @@ const CASES: &[CaseNa] = &[
         ADVERSARY,
     ),
     generated(
+        "status/reserved-flags-closes",
+        "two-reserved-flags-skipped",
+        FRAME,
+        ADVERSARY,
+    ),
+    generated(
         "status/short-payload-closes",
         "short-payload-skipped",
         FRAME,

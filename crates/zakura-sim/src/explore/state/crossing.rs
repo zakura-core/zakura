@@ -119,9 +119,11 @@ struct Candidates {
 }
 
 /// The incremental crossing join. Feed it every observation of a run, in
-/// log order, through [`CrossingJoin::observe`]. It holds one entry per
-/// header-sync stream, per ending-typed node frame on one, and per peer
-/// update, and starts empty for each run.
+/// log order, through [`CrossingJoin::observe`]. It keeps what the module
+/// doc lists, each for the run: header-sync streams, ending-typed node
+/// frames, update-typed reads, and peer frames whose `PeerFrame` names the
+/// update's row, which include over-credit pages. It starts empty for each
+/// run.
 #[derive(Debug, Default)]
 pub struct CrossingJoin {
     /// The header-sync streams the node admitted, by connection and QUIC
@@ -578,20 +580,24 @@ mod tests {
         assert_eq!(crossings(&log), Vec::new());
     }
 
-    /// Negative 3: the update was written inside the bracket but never
-    /// judged.
+    /// Negative 3: the update was written inside the bracket and read with
+    /// the update's type, but never judged. Its judgment is the only
+    /// missing fact: the same history with it crosses.
     #[test]
     fn an_unjudged_update_is_no_crossing() {
         let [received, node_frame] = peer_read(0, 12, SUB);
-        let log = [
+        let log = vec![
             session(),
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             received,
             node_frame,
         ];
         assert_eq!(crossings(&log), Vec::new());
+        let judged_too: Vec<Observation> = log.into_iter().chain([judged(1)]).collect();
+        assert_eq!(crossings(&judged_too), crossed());
     }
 
     /// Negative 4: the peer's reader read the ending (R = 11) before the

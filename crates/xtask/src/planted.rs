@@ -1356,7 +1356,9 @@ impl Expect<'_> {
 /// With a `deadline` and its interrupt flag, the command's output goes to
 /// `<out>.log`. A run past the deadline, or one that a signal killed, is
 /// [`Run::Killed`], whatever files it already wrote. A set flag kills the
-/// run and stops the pilot.
+/// run and stops the pilot. A run whose witness passed but that didn't
+/// exit 0 didn't finish either, so it's [`Run::Failed`]. A failed witness
+/// exits nonzero anyway, and keeps its reason.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -1376,8 +1378,11 @@ fn record(
         .arg(out)
         .args(["--witness", property])
         .args(expect.args());
-    let ended = match deadline {
-        None => format!("exited with {}", zakura_sim.status()?),
+    let (ended, exited_ok) = match deadline {
+        None => {
+            let status = zakura_sim.status()?;
+            (format!("exited with {status}"), status.success())
+        }
         Some((deadline, interrupt)) => {
             let log = out.with_extension("log");
             let end = sim_minimize::run_child(&mut zakura_sim, &log, Some(deadline), interrupt)?;
@@ -1389,7 +1394,7 @@ fn record(
                 sim_minimize::ChildEnd::TimedOut | sim_minimize::ChildEnd::Signaled(_) => {
                     return Ok(Run::Killed(format!("`zakura-sim record` {ended}")))
                 }
-                sim_minimize::ChildEnd::Exited(_) => ended,
+                sim_minimize::ChildEnd::Exited(code) => (ended, code == 0),
             }
         }
     };
@@ -1398,6 +1403,11 @@ fn record(
         return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
     };
     let witness: WitnessFile = serde_json::from_str(&witness)?;
+    if witness.passed && !exited_ok {
+        return Ok(Run::Failed(format!(
+            "`zakura-sim record` {ended} after writing a passing witness result"
+        )));
+    }
     let trace = match fs::read_to_string(out.join("trace.jsonl")) {
         Ok(trace) => trace,
         Err(error) => {
@@ -2657,6 +2667,106 @@ mod tests {
         );
     }
 
+    /// C4: a recording that writes a whole trace and a passing witness and
+    /// then exits nonzero, as a panic after its witness would, didn't
+    /// finish. Its patched run is never a catch and its baseline never
+    /// passes, with a deadline or without. The same recording exiting 0 is
+    /// a catch and a passing baseline, and a failing witness that exits 1,
+    /// as `zakura-sim record`'s does, keeps its reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_recording_that_exits_nonzero_never_counts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // `record` writes `end` and `witness` under `--out` and exits
+        // `code`. `replay` matches.
+        let fake = |name: &str, end: &str, witness: &str, code: u8| {
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ $# -gt 0 ] || exit 0\n\
+                 [ \"$1\" = replay ] && exit 0\n\
+                 out=; prev=\n\
+                 for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+                 mkdir -p \"$out\"\n\
+                 printf '%s\\n' '{end}' > \"$out/trace.jsonl\"\n\
+                 printf '%s\\n' '{witness}' > \"$out/witness.json\"\n\
+                 exit {code}\n"
+            );
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
+            path
+        };
+        let passed = r#"{"passed":true,"error":null}"#;
+        let violated = end(Some(ID), &[(ID, VIOLATED)]);
+        let held = end(None, &[(ID, HELD)]);
+        let case = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Input("a.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: Vec::new(),
+            target: None,
+        };
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        let input = case.witness.located(dir.path());
+        let patched = |binary: &Path| {
+            judge_patched(
+                binary,
+                "header-sync/storage",
+                &input,
+                &case,
+                &scratch,
+                RUN_DEADLINE,
+            )
+            .expect("the fake binary runs")
+        };
+        let baseline = |binary: &Path, deadline| {
+            record(
+                Command::new(binary),
+                "header-sync/storage",
+                &input,
+                ID,
+                Expect::Holds,
+                &scratch.join("baseline"),
+                deadline,
+            )
+            .expect("the fake binary runs")
+        };
+        let deadline = Some((RUN_DEADLINE, &NEVER_INTERRUPTED));
+
+        let panics = fake("caught-then-panics", &violated, passed, 101);
+        assert!(
+            matches!(patched(&panics), Verdict::Failed(_)),
+            "{:?}",
+            patched(&panics)
+        );
+        let panics = fake("holds-then-panics", &held, passed, 101);
+        for deadline in [deadline, None] {
+            let run = baseline(&panics, deadline);
+            assert!(
+                matches!(&run, Run::Failed(why) if why.contains("passing witness")),
+                "{run:?}"
+            );
+            assert!(baseline_failure(ID, &run).is_some());
+        }
+
+        let caught = fake("caught", &violated, passed, 0);
+        assert!(matches!(patched(&caught), Verdict::Caught(_)));
+        let holds = fake("holds", &held, passed, 0);
+        assert_eq!(baseline_failure(ID, &baseline(&holds, deadline)), None);
+
+        let failed = fake("fails", &held, r#"{"passed":false,"error":"boom"}"#, 1);
+        let run = baseline(&failed, deadline);
+        assert!(
+            matches!(&run, Run::Ended { witness: Some(why), .. } if why == "boom"),
+            "{run:?}"
+        );
+    }
+
     /// [`replay_misses`] reads the replay's exit status: a `zakura-sim`
     /// that exits 0 matched, and one that exits 1 says why it didn't.
     #[cfg(unix)]
@@ -2740,6 +2850,64 @@ mod tests {
         )
         .expect("the fake binary starts");
         assert!(matches!(verdict, Verdict::Failed(_)), "{verdict:?}");
+    }
+
+    /// C4: a baseline and a campaign run have deadlines too. A baseline
+    /// recording that hangs is killed at its deadline, ends `Killed`, and
+    /// fails the case's baseline. A campaign whose first run hangs ends
+    /// there as a failed campaign, never a catch.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_baseline_or_campaign_run_is_killed_and_never_passes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let hangs = dir.path().join("hangs");
+        // `wait_until_executable` runs it with no arguments.
+        fs::write(&hangs, "#!/bin/sh\n[ $# -gt 0 ] || exit 0\nsleep 60\n").unwrap();
+        fs::set_permissions(&hangs, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&hangs);
+        let case = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Input("a.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: Vec::new(),
+            target: None,
+        };
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let baseline = record(
+            Command::new(&hangs),
+            "header-sync/storage",
+            &case.witness.located(dir.path()),
+            ID,
+            Expect::Holds,
+            &scratch.join("baseline"),
+            Some((deadline, &NEVER_INTERRUPTED)),
+        )
+        .expect("the fake binary starts");
+        assert!(matches!(baseline, Run::Killed(_)), "{baseline:?}");
+        assert!(
+            baseline_failure(ID, &baseline).is_some(),
+            "a killed baseline fails the case"
+        );
+        let verdict = campaign(
+            &hangs,
+            "header-sync/storage",
+            &case,
+            &scratch.join("campaign"),
+            deadline,
+        )
+        .expect("the fake binary starts");
+        assert!(
+            matches!(&verdict, Verdict::CampaignFails { verdict, .. }
+                if matches!(**verdict, Verdict::Failed(_))),
+            "{verdict:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     /// C4: a nested case's exact set. Its committed input is a catch only

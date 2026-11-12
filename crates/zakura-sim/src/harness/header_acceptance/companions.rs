@@ -487,6 +487,9 @@ pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     }
     let script = crate::plan::TraceScript::new(&trace, false).map_err(|error| error.to_string())?;
     let (evidence, rerun) = draft_run(&trace.meta.scenario, crate::PlanInput::Trace(script))?;
+    // Bound as `record` bound the recorded one, so it's equal only to a
+    // report of this trace by this build.
+    let rerun = rerun.map(|report| report.of_trace(&trace.id));
     let recorded = std::fs::read_to_string(dir.join(crate::record::FULL_REPORT_FILE))
         .map_err(|error| format!("its full report: {error}"))
         .and_then(|text| {

@@ -64,9 +64,11 @@ pub enum Effect {
     /// fact for `peer` with `action` (`Close`, `Relink` or `Shutdown`) in
     /// the node's `ends` store as it acts, which names the step's position
     /// in the control script as its cause. A flood or churn step relinks.
-    /// The fact's connection must be one the `sessions` store shows opened
-    /// to `peer` (a shutdown names none), and no two relinks name one
-    /// connection, since each opens a new link.
+    /// The fact's connection must be the link it acted on, as the
+    /// `sessions` store shows it: a relink's one opened to `peer`, a
+    /// close's the peer's link current at it, whose closure the store
+    /// shows (a shutdown names none). No two relinks name one connection,
+    /// since each opens a new link.
     Environment {
         /// The peer the fact names.
         peer: String,
@@ -289,9 +291,10 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
     found
 }
 
-/// Every link the full report's `sessions` store shows opened, as its peer
-/// and connection, read from its `LinkOpened` facts.
-fn opened_links(report: &FullReport) -> Vec<(String, u64)> {
+/// Every link the full report's `sessions` store shows with `fact`, which
+/// is `LinkOpened` or `LinkClosed`, as its peer and connection, in the
+/// store's order.
+fn session_links(report: &FullReport, fact: &str) -> Vec<(String, u64)> {
     let Some(facts) = snapshot(report, "sessions")
         .and_then(|sessions| sessions.get("facts"))
         .and_then(Value::as_str)
@@ -299,12 +302,51 @@ fn opened_links(report: &FullReport) -> Vec<(String, u64)> {
         return Vec::new();
     };
     facts
-        .split("LinkOpened { peer: \"")
+        .split(&format!("{fact} {{ peer: \""))
         .skip(1)
         .filter_map(|fact| {
             let (peer, rest) = fact.split_once('"')?;
             let (_, id) = rest.split_once("connection: ")?;
             Some((peer.to_owned(), leading_number(id)?))
+        })
+        .collect()
+}
+
+/// Whether each of `facts`, in stamp order, names the link it acted on,
+/// as `report`'s `sessions` store shows it. A relink names a link opened to
+/// its peer, which becomes the peer's current one. A close names its peer's
+/// current link, whose closure the store shows, and leaves it with none.
+/// A peer's first link is its first opened one that no relink opened. A
+/// shutdown names no link.
+fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
+    let opened = session_links(report, "LinkOpened");
+    let closed = session_links(report, "LinkClosed");
+    let relinked = |peer: &str, id: u64| {
+        facts
+            .iter()
+            .any(|fact| fact.action == "Relink" && fact.peer == peer && fact.connection == Some(id))
+    };
+    let mut current = std::collections::BTreeMap::new();
+    for (peer, id) in &opened {
+        if !current.contains_key(peer) && !relinked(peer, *id) {
+            current.insert(peer.clone(), Some(*id));
+        }
+    }
+    facts
+        .iter()
+        .map(|fact| match (fact.action.as_str(), fact.connection) {
+            ("Shutdown", None) => true,
+            ("Relink", Some(id)) => {
+                let link = (fact.peer.clone(), id);
+                current.insert(fact.peer.clone(), Some(id));
+                opened.contains(&link)
+            }
+            ("Close", Some(id)) => {
+                let link = (fact.peer.clone(), id);
+                let was = current.insert(fact.peer.clone(), None).flatten();
+                was == Some(id) && opened.contains(&link) && closed.contains(&link)
+            }
+            _ => false,
         })
         .collect()
 }
@@ -360,7 +402,7 @@ pub fn judge(
         return Actions::Incomplete;
     }
     let facts = environment_facts(report);
-    let links = opened_links(report);
+    let named = names_its_link(&facts, report);
     // Each relink opens a new link, so two naming one connection can't
     // both be the connection their step made.
     let mut relinked = std::collections::BTreeSet::new();
@@ -371,12 +413,6 @@ pub fn judge(
     {
         return Actions::Incomplete;
     }
-    // A fact names its connection's link, and a shutdown none.
-    let linked = |fact: &Fact| match (fact.action.as_str(), fact.connection) {
-        ("Shutdown", None) => true,
-        ("Close" | "Relink", Some(id)) => links.iter().any(|(p, c)| *p == fact.peer && *c == id),
-        _ => false,
-    };
     // Each in-turn step's effect, its first fact, follows the one before.
     let mut turn = 0;
     let mut shown: Vec<bool> = declared
@@ -389,12 +425,13 @@ pub fn judge(
                 action,
                 in_turn,
             } => {
-                let own = facts.iter().find(|fact| {
-                    fact.control.is_some()
+                let own = facts.iter().zip(&named).find_map(|(fact, named)| {
+                    (fact.control.is_some()
                         && fact.control == declared.control
                         && fact.peer == *peer
                         && fact.action == *action
-                        && linked(fact)
+                        && *named)
+                        .then_some(fact)
                 });
                 match own {
                     Some(fact) if *in_turn && fact.stamp <= turn => false,
@@ -424,5 +461,103 @@ pub fn judge(
         Actions::Complete
     } else {
         Actions::Incomplete
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A two-mirror storage history that closes `mirror-0`, relinks it and
+    /// closes it again, recorded with no Plan bytes: its trace and full
+    /// report, and its declared actions.
+    fn close_relink_close() -> (Trace, FullReport, Vec<Declared>) {
+        let scenario = json!({
+            "controls": [
+                {"action": "close", "peer": "mirror-0", "when": null},
+                {"action": "relink", "peer": "mirror-0", "when": {"closed": "mirror-0"}},
+                {"action": "close", "peer": "mirror-0",
+                 "when": {"count": [2, {"linked": "mirror-0"}]}},
+            ],
+            "mirrors": [
+                {"chain": {"fork": null, "main": 5}, "dialer": "mirror"},
+                {"chain": {"fork": {"branch": 1, "len": 4}, "main": 3}, "dialer": "node"},
+            ],
+            "node": {"fork": null, "main": 2},
+            "policy": {"base": "success-only", "bound_ms": 5000, "holds": []},
+        });
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let entry = crate::harness::find("header-sync/storage").expect("it's registered");
+        let trace = crate::harness::record(
+            entry,
+            crate::harness::RecordInput::Plan {
+                scenario: &scenario,
+                plan: &[],
+            },
+            dir.path(),
+        )
+        .expect("the history records");
+        let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
+            .expect("record writes the full report");
+        let report = serde_json::from_str(&text).expect("the full report reads back");
+        let declared = declared("header-sync/storage", &trace.meta.scenario).expect("it declares");
+        (trace, report, declared)
+    }
+
+    /// `report` with `from` replaced by `to` in its `store` snapshot's
+    /// text, where `field` is `None` for a store whose snapshot is the
+    /// text, or the field that holds it.
+    fn edited(
+        report: &FullReport,
+        store: &str,
+        field: Option<&str>,
+        from: &str,
+        to: &str,
+    ) -> FullReport {
+        let mut report = report.clone();
+        let stores = report
+            .snapshot
+            .as_mut()
+            .and_then(Value::as_array_mut)
+            .expect("a node run keeps its stores");
+        let store = stores
+            .iter_mut()
+            .find(|found| found["store"] == store)
+            .expect("the store is there");
+        let text = match field {
+            Some(field) => &mut store["snapshot"][field],
+            None => &mut store["snapshot"],
+        };
+        let before = text.as_str().expect("the snapshot is text").to_owned();
+        assert!(before.contains(from), "{before}");
+        *text = Value::String(before.replace(from, to));
+        report
+    }
+
+    /// A `Close`, `Relink`, `Close` history is complete when each close
+    /// names the connection current at it, which its link's closure shows.
+    /// Its final close naming connection 1, which the first close already
+    /// closed, with every cause and stamp the same, leaves it incomplete,
+    /// and so does that close's connection showing no closure.
+    #[test]
+    fn a_close_joins_its_peer_s_current_connection() {
+        let (trace, report, declared) = close_relink_close();
+        let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
+        assert_eq!(judged(&report), Actions::Complete);
+
+        let last = "(6, Environment { peer: \"mirror-0\", connection: Some(3), action: Close })";
+        let stale = last.replace("Some(3)", "Some(1)");
+        assert_eq!(
+            judged(&edited(&report, "ends", None, last, &stale)),
+            Actions::Incomplete
+        );
+
+        let closed = "LinkClosed { peer: \"mirror-0\", connection: 3 }, ";
+        assert_eq!(
+            judged(&edited(&report, "sessions", Some("facts"), closed, "")),
+            Actions::Incomplete
+        );
     }
 }

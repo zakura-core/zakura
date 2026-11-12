@@ -28,14 +28,16 @@
 //! names what it judged: `trace`, the SHA-256 of that `trace.jsonl`,
 //! `source`, the source digest its build embeds, and `draft`, the run's
 //! `Draft` override, beside its `property`, `expect`, `also_violates`,
-//! `passed` and `error`. A witness file whose `trace`, `source` or `draft`
-//! isn't the trace's beside it is no witness of that run. Its *fresh
-//! replay*, where the contract asks for one, is the directory
-//! [`REPLAY_DIR`] inside it, written by a separate
+//! `passed` and `error`. The full report names its `trace` and `source`
+//! the same way. A witness file or full report whose `trace`, `source` or
+//! `draft` isn't the trace's beside it is no witness or report of that run
+//! ([`judged_refusal`]). Its *fresh replay*, where the contract asks for
+//! one, is the directory [`REPLAY_DIR`] inside it, written by a separate
 //! `zakura-sim replay <run> --report <run>/replay/full-report.json` with the
 //! same binary that recorded the run: the replay's own `full-report.json`,
-//! and [`REPLAY_FILE`], a [`ReplayRun`] holding how that child ended and
-//! its output.
+//! which names the replayed trace and that binary's source as the
+//! recording's does, and [`REPLAY_FILE`], a [`ReplayRun`] holding how that
+//! child ended and its output.
 //!
 //! * `test`: [`TEST_FILE`], a [`TestRun`] of the exact-name filter.
 //! * `history`: the witness test run as for `test`, with
@@ -77,7 +79,9 @@
 //!
 //! Every recorded run's report and store snapshot come from its
 //! `full-report.json`, never from the trace's `end` record, which keeps no
-//! violation and no store, and the two must agree on every outcome.
+//! violation and no store, and the two must agree on every outcome. That
+//! holds for an `integrity` run's `history` recording too, which owes no
+//! fresh replay.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -799,9 +803,10 @@ struct Judged {
 /// `dir`'s, by digest, its judging build isn't the one `dir`'s trace
 /// records, or it names a `Draft` override other than the trace's. Every
 /// artifact the tool credits to a recorded run, its witness file
-/// ([`bound_witness`]) and a `Draft` run's companions ([`companions_of`]),
-/// is checked here, so one written beside another run never counts for
-/// this one.
+/// ([`bound_witness`]), a `Draft` run's companions ([`companions_of`]) and
+/// its recording's and fresh replay's full reports ([`bound_report`]), is
+/// checked here, so one written beside another run never counts for this
+/// one.
 fn judged_refusal(dir: &Path, artifact: &Value) -> Option<String> {
     let Ok(judged) = serde_json::from_value::<Judged>(artifact.clone()) else {
         return Some("it names no trace it judged".to_owned());
@@ -876,24 +881,35 @@ fn trace_source(dir: &Path) -> Option<String> {
     (!source.is_empty() && source != "unknown").then(|| source.to_owned())
 }
 
-/// The full report (C8) in `dir`'s [`FULL_REPORT_FILE`], read as the
-/// trace reader reads its files: a regular file within
-/// [`MAX_REPORT_BYTES`](crate::trace::MAX_REPORT_BYTES).
-fn full_report(dir: &Path) -> Result<FullReport, String> {
-    let path = dir.join(FULL_REPORT_FILE);
-    match crate::trace::read::read_bounded(&path, crate::trace::MAX_REPORT_BYTES) {
-        Ok(Some(bytes)) => {
-            serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
-        }
-        Ok(None) => Err(format!("{}: missing", path.display())),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+/// The full report (C8) in `at`'s [`FULL_REPORT_FILE`], read as the trace
+/// reader reads its files (a regular file within
+/// [`MAX_REPORT_BYTES`](crate::trace::MAX_REPORT_BYTES)), if it reports the
+/// recorded run in `dir` ([`judged_refusal`]). `at` is `dir` for the
+/// recording's own report and its [`REPLAY_DIR`] for its fresh replay's.
+fn bound_report(dir: &Path, at: &Path) -> Result<FullReport, String> {
+    let path = at.join(FULL_REPORT_FILE);
+    let value: Value = match crate::trace::read::read_bounded(&path, crate::trace::MAX_REPORT_BYTES)
+    {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?,
+        Ok(None) => return Err(format!("{}: missing", path.display())),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if let Some(why) = judged_refusal(dir, &value) {
+        return Err(format!(
+            "{}: it isn't a report of {}'s trace: {why}",
+            path.display(),
+            dir.display()
+        ));
     }
+    serde_json::from_value(value).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The recorded run in `dir`: its trace, which the simulator's own reader
 /// checks whole (its versions, every line's shape and order, its step
 /// numbers and that its last line is a written `end`), and its full
-/// report, whose outcomes must be the `end` record's, property by property.
+/// report, which must report that trace ([`bound_report`]) and whose
+/// outcomes must be the `end` record's, property by property.
 fn recorded(dir: &Path) -> Result<(Trace, FullReport), String> {
     let trace = crate::trace::TraceReader::open(dir)
         .map_err(|error| format!("{}: {error}", dir.display()))?;
@@ -901,7 +917,7 @@ fn recorded(dir: &Path) -> Result<(Trace, FullReport), String> {
         .end
         .as_ref()
         .ok_or_else(|| format!("{}: no end record", dir.display()))?;
-    let report = full_report(dir)?;
+    let report = bound_report(dir, dir)?;
     let ended: Vec<(&str, &PropertyOutcome)> = end
         .properties
         .iter()
@@ -1020,7 +1036,8 @@ pub fn read_execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> E
 /// The fresh replay (C3, C8) of the recorded run `run` in `dir`, from its
 /// [`REPLAY_DIR`]: it's exact only if its child exited 0, wasn't killed
 /// and said it replayed this trace with every pick, draw and observation
-/// matched. Its full report is compared with the recording's, outcomes and
+/// matched. Its full report, which must report `dir`'s trace
+/// ([`bound_report`]), is compared with the recording's, outcomes and
 /// violations apart from the store snapshot, so a changed stored fact fails
 /// it even when every report is the same. Its meta is the recording's: the
 /// replay reruns the meta's harness with its `Draft` override.
@@ -1052,7 +1069,7 @@ fn replay_actual(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
     });
     let (reports_equal, stores_equal) = match (
         recorded.as_ref().map(|(_, report)| report),
-        full_report(&replay),
+        bound_report(dir, &replay),
     ) {
         (Some(original), Ok(replayed)) => (
             original.properties == replayed.properties,
@@ -2864,7 +2881,10 @@ mod tests {
         fields
     }
 
-    /// Rewrites `dir`'s trace through `edit` on its parsed lines.
+    /// Rewrites `dir`'s trace through `edit` on its parsed lines, and
+    /// rebinds its full report, if it has one, to the rewritten trace as
+    /// `zakura-sim record` binds it: that trace's digest and the source its
+    /// meta records.
     fn rewrite(dir: &Path, edit: impl FnOnce(&mut Vec<Value>)) {
         let path = dir.join("trace.jsonl");
         let text = fs::read_to_string(&path).expect("the trace is readable");
@@ -2875,6 +2895,15 @@ mod tests {
         edit(&mut lines);
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         fs::write(&path, text).expect("the temp dir is writable");
+        let report = dir.join(FULL_REPORT_FILE);
+        let Ok(text) = fs::read_to_string(&report) else {
+            return;
+        };
+        let mut full: FullReport = serde_json::from_str(&text).expect("the report reads");
+        let trace = crate::trace::TraceReader::open_prefix(dir).expect("the trace reads");
+        full.trace = Some(trace.id);
+        full.source = Some(trace.meta.build.source);
+        fs::write(&report, full.to_line()).expect("the temp dir is writable");
     }
 
     /// [`record_into`] a fresh directory, built from `s`.
@@ -2899,11 +2928,10 @@ mod tests {
         let violation = End::Violation {
             property: "t/a".into(),
         };
-        let machine = crate::trace::TraceReader::open(recorded().path()).expect("it reads");
-        let machine_report = full_report(recorded().path()).unwrap_or_else(|_| FullReport {
-            properties: Vec::new(),
-            snapshot: None,
-        });
+        let machine_dir = recorded();
+        let machine = crate::trace::TraceReader::open(machine_dir.path()).expect("it reads");
+        let machine_report = bound_report(machine_dir.path(), machine_dir.path())
+            .unwrap_or_else(|_| FullReport::new(&[], None));
         let judged =
             |trace: &Trace, report: &FullReport, end: &End| actions(trace, report, end, false);
         assert_eq!(
@@ -2920,7 +2948,8 @@ mod tests {
         );
 
         let trace = crate::trace::TraceReader::open(storage_recording()).expect("it reads");
-        let report = full_report(storage_recording()).expect("the recording has its report");
+        let report = bound_report(storage_recording(), storage_recording())
+            .expect("the recording has its report");
         assert_eq!(judged(&trace, &report, &End::Completed), Actions::Complete);
         assert_eq!(judged(&trace, &report, &violation), Actions::Prefix);
         assert_eq!(judged(&trace, &report, &End::Killed), Actions::Incomplete);
@@ -2994,7 +3023,8 @@ mod tests {
     #[test]
     fn each_control_effect_joins_its_own_step() {
         let trace = crate::trace::TraceReader::open(storage_recording()).expect("it reads");
-        let report = full_report(storage_recording()).expect("the recording has its report");
+        let report = bound_report(storage_recording(), storage_recording())
+            .expect("the recording has its report");
         let judged =
             |trace: &Trace, report: &FullReport| actions(trace, report, &End::Completed, false);
         assert_eq!(judged(&trace, &report), Actions::Complete);
@@ -3141,7 +3171,7 @@ mod tests {
     fn an_execution_s_reports_come_from_its_full_report() {
         let dir = recorded();
         let path = dir.path().join(FULL_REPORT_FILE);
-        let mut report = full_report(dir.path()).expect("record wrote it");
+        let mut report = bound_report(dir.path(), dir.path()).expect("record wrote it");
         let run = execution(dir.path(), history_run(), MACHINE, RunBy::Tool);
         assert_eq!(run.end, End::Completed, "{run:?}");
         assert_eq!(run.meta.draft_override, Vec::<String>::new());
@@ -3169,14 +3199,14 @@ mod tests {
             .expect("the trace replays");
         let replay = dir.join(REPLAY_DIR);
         fs::create_dir_all(&replay).expect("the temp dir is writable");
-        fs::write(
-            replay.join(FULL_REPORT_FILE),
-            replayed
-                .report
-                .expect("a replay sends its report")
-                .to_line(),
-        )
-        .expect("the temp dir is writable");
+        // As the recording's own build, whose source the trace records,
+        // binds its replay's report.
+        let report = FullReport {
+            source: Some(trace.meta.build.source.clone()),
+            ..replayed.report.expect("a replay sends its report")
+        };
+        fs::write(replay.join(FULL_REPORT_FILE), report.to_line())
+            .expect("the temp dir is writable");
         let ran = ReplayRun {
             exited_ok,
             killed: false,

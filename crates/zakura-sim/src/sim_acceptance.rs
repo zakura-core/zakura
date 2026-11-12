@@ -5,5 +5,6 @@
 pub mod evaluate;
 pub mod header;
 pub mod judge;
+pub mod sched;
 
 pub use judge::{owned_run_passes, Blocked, CleanupMeaning, Registered, RunExpect, CLEANUP};

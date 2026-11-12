@@ -530,3 +530,58 @@ mod evaluator {
         ));
     }
 }
+
+mod sched_mapping {
+    use zakura_sim::{
+        seed,
+        sim_acceptance::sched::{Proof, TestRef, SCHED_IDS, SCHED_MAPPING},
+        suite::{SuiteFile, SUITE_FILE},
+    };
+
+    /// Whether `test` names a test function in its package's test file.
+    fn exists(test: &TestRef) -> bool {
+        let file = seed::repo_root()
+            .join("crates")
+            .join(test.package)
+            .join("tests")
+            .join(format!("{}.rs", test.file));
+        std::fs::read_to_string(file).is_ok_and(|text| text.contains(&format!("fn {}(", test.name)))
+    }
+
+    /// The mapping covers exactly the specs' IDs, once each, in order.
+    #[test]
+    fn every_sched_id_has_one_mapping_row() {
+        let mapped: Vec<&str> = SCHED_MAPPING.iter().map(|(id, _)| *id).collect();
+        assert_eq!(mapped, SCHED_IDS);
+        assert!(SCHED_MAPPING.iter().all(|(_, proofs)| !proofs.is_empty()));
+    }
+
+    /// Every proof names a real test or a committed lane.
+    #[test]
+    fn every_sched_proof_exists() {
+        let text = std::fs::read_to_string(seed::repo_root().join(SUITE_FILE)).unwrap();
+        let suite: SuiteFile = toml::from_str(&text).unwrap();
+        for (id, proofs) in SCHED_MAPPING {
+            for proof in *proofs {
+                match proof {
+                    Proof::Test(test) => assert!(exists(test), "{id}: {test:?}"),
+                    Proof::Lane(lane) => {
+                        assert!(
+                            suite.lane.iter().any(|l| l.id == *lane),
+                            "{id}: lane {lane}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_misspelled_test_doesnt_exist() {
+        assert!(!exists(&TestRef {
+            package: "zakura-scheduler",
+            file: "fixtures",
+            name: "no_such_test",
+        }));
+    }
+}

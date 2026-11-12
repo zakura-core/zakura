@@ -19,6 +19,7 @@ use zakura_chain::{
     block::{self, CHAIN_HISTORY_ACTIVATION_RESERVED},
     ironwood,
     primitives::Halo2Proof,
+    sapling,
     serialization::{DateTime32, ZcashSerialize},
     transaction::{LockTime, Transaction},
     transparent::{Input, OutPoint, Output, Script},
@@ -86,12 +87,17 @@ fn ids(selection: &Selection) -> Vec<transaction::Hash> {
 
 struct Factory {
     action: ironwood::Action,
+    sapling_output: sapling::Output,
     serial: u64,
 }
 impl Factory {
     fn new() -> Self {
         Self {
             action: any::<ironwood::Action>()
+                .new_tree(&mut TestRunner::deterministic())
+                .unwrap()
+                .current(),
+            sapling_output: any::<sapling::Output>()
                 .new_tree(&mut TestRunner::deterministic())
                 .unwrap()
                 .current(),
@@ -105,7 +111,19 @@ impl Factory {
         spent: Vec<OutPoint>,
         outputs: usize,
     ) -> VerifiedUnminedTx {
-        self.build(actions, fee_multiple, spent, 0, outputs)
+        self.build(actions, 0, fee_multiple, spent, 0, outputs)
+    }
+
+    /// A transaction with `sapling_outputs` Sapling outputs that spends the
+    /// mempool outputs in `spent` and pays to `outputs` P2PKH outputs.
+    fn sapling(
+        &mut self,
+        sapling_outputs: usize,
+        fee_multiple: u64,
+        spent: Vec<OutPoint>,
+        outputs: usize,
+    ) -> VerifiedUnminedTx {
+        self.build(0, sapling_outputs, fee_multiple, spent, 0, outputs)
     }
 
     /// A transparent transaction spending `chain_inputs` fresh chain outputs
@@ -125,12 +143,20 @@ impl Factory {
             hash[..8].copy_from_slice(&self.serial.to_le_bytes());
             inputs.push(OutPoint::from_usize(transaction::Hash(hash), 0));
         }
-        self.build(0, fee_multiple, inputs, P2PKH_UNLOCK_SCRIPT_BYTES, outputs)
+        self.build(
+            0,
+            0,
+            fee_multiple,
+            inputs,
+            P2PKH_UNLOCK_SCRIPT_BYTES,
+            outputs,
+        )
     }
 
     fn build(
         &mut self,
         actions: usize,
+        sapling_outputs: usize,
         fee_multiple: u64,
         spent: Vec<OutPoint>,
         unlock_script_bytes: usize,
@@ -176,7 +202,17 @@ impl Factory {
                     )
                 })
                 .collect(),
-            sapling_shielded_data: None,
+            sapling_shielded_data: (sapling_outputs > 0).then(|| {
+                Box::new(sapling::ShieldedData {
+                    value_balance: Amount::zero(),
+                    transfers: sapling::TransferData::JustOutputs {
+                        outputs: vec![self.sapling_output.clone(); sapling_outputs]
+                            .try_into()
+                            .unwrap(),
+                    },
+                    binding_sig: [0; 64].into(),
+                })
+            }),
             orchard_shielded_data: None,
             ironwood_shielded_data: (actions > 0).then(|| ironwood::ShieldedData {
                 flags: ironwood::Flags::ENABLE_SPENDS,
@@ -584,14 +620,37 @@ fn indexed_gives_up_after_consecutive_misfits_at_any_fill_level() {
 /// so is the parent on its own. The child waits for a later block.
 #[test]
 fn indexed_selects_around_a_package_that_can_never_fit() {
-    let (network, height, miner, _) = context_at(NetworkUpgrade::Nu7);
-    let mut factory = Factory::new();
     // 170 Ironwood actions each: within the ZIP 218 limit of 330 alone, but
     // 340 together.
-    let parent = factory.tx(170, 1, Vec::new(), 1);
+    assert_selects_around_a_package_that_can_never_fit(|factory, fee_multiple, spent| {
+        factory.tx(170, fee_multiple, spent, 1)
+    });
+    // 166 Sapling outputs each: within the ZIP 218 limit of 300 I/O alone, but
+    // 332 together.
+    assert_selects_around_a_package_that_can_never_fit(|factory, fee_multiple, spent| {
+        factory.sapling(166, fee_multiple, spent, 1)
+    });
+}
+
+/// Checks [`indexed_selects_around_a_package_that_can_never_fit`] for a
+/// parent and child built by `shielded`, which takes a fee multiple and the
+/// mempool outputs to spend.
+fn assert_selects_around_a_package_that_can_never_fit(
+    shielded: impl Fn(&mut Factory, u64, Vec<OutPoint>) -> VerifiedUnminedTx,
+) {
+    let (network, height, miner, _) = context_at(NetworkUpgrade::Nu7);
+    let mut factory = Factory::new();
+    let parent = shielded(&mut factory, 1, Vec::new());
     let parent_id = parent.transaction.id().mined_id();
-    let child = factory.tx(170, 50, vec![OutPoint::from_usize(parent_id, 0)], 1);
+    let child = shielded(&mut factory, 50, vec![OutPoint::from_usize(parent_id, 0)]);
     let child_id = child.transaction.id().mined_id();
+    for tx in [&parent, &child] {
+        assert!(limits(&network, height, &miner).try_add(tx));
+    }
+    let mut both = limits(&network, height, &miner);
+    assert!(both.try_add(&parent));
+    assert!(!both.try_add(&child));
+
     // More transparent transactions than the old packing pass scanned, ranked
     // between the package and the parent.
     let cover: Vec<_> = (0..150)
@@ -604,6 +663,11 @@ fn indexed_selects_around_a_package_that_can_never_fit() {
     let mut txs = vec![parent, child];
     txs.extend(cover);
     let fixture = Fixture::from_transactions(txs);
+
+    // The mempool ranks the package first, then the cover, then the parent.
+    let order: Vec<_> = fixture.index.iter().map(|priority| priority.id).collect();
+    assert_eq!(order.first(), Some(&child_id));
+    assert_eq!(order.last(), Some(&parent_id));
 
     let (txs, deps) = fixture.snapshot();
     let selection = run(txs, deps, limits(&network, height, &miner));

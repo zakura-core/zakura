@@ -7,6 +7,7 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod acceptance;
 mod header_acceptance;
 mod header_conformance;
 mod header_fuzz;

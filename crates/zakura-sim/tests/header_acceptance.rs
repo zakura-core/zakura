@@ -6884,3 +6884,284 @@ fn identity_refs_are_defined_only_in_refs() {
         ]
     );
 }
+
+/// The acceptance tool's source directory, relative to the crate.
+const ACCEPTANCE_SRC: &str = "src/harness/header_acceptance";
+
+/// The reads under [`ACCEPTANCE_SRC`] outside `binding.rs` that read no
+/// run artifact, as `(file, function, why)`. Every other read there must
+/// go through `binding.rs`, the one place an artifact is bound to what its
+/// reader expects (Rule 25).
+const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
+    (
+        "tool.rs",
+        "patched_witness",
+        "a planted case's committed `.toml` at S",
+    ),
+    (
+        "tool.rs",
+        "case_input",
+        "a planted case's committed `.toml` at S",
+    ),
+    (
+        "tool.rs",
+        "native_patch",
+        "the committed native mutation's directory at S",
+    ),
+    (
+        "tool.rs",
+        "fuzz_targets",
+        "the committed fuzz-target mapping at S",
+    ),
+    ("tool.rs", "committed_input", "a committed fuzz input at S"),
+    (
+        "tool.rs",
+        "walk",
+        "the committed planted-case tree at S, which `planted_cases_in` walks",
+    ),
+    (
+        "tool.rs",
+        "native_dirs",
+        "the committed native-mutation tree at S",
+    ),
+    (
+        "tool.rs",
+        "record_args",
+        "the runner's recorder arguments for a declaration, which judge nothing: the \
+         recording they make is bound to the same declaration's files by \
+         `binding::scenario_expect` and `binding::RAN`",
+    ),
+    (
+        "history.rs",
+        "declared",
+        "which declaration a witness test made is which, by its own history file; the one \
+         counted is then bound to its recording by its scenario, Plan and steps",
+    ),
+    (
+        "companions.rs",
+        "judge_trace",
+        "the companions judge, run by the case's own build on the Draft run it's handed: it \
+         writes `companions.json`, which the reader binds (`binding::COMPANIONS`)",
+    ),
+];
+
+/// Every read in the Rust source `text` outside test code, as the name of
+/// the function it's in, in order: a call of `fs::read`,
+/// `fs::read_to_string`, `fs::read_dir`, `File::open`, `read_bounded`,
+/// `TraceReader::open` or `open_prefix`, `serde_json::from_reader` or a
+/// `read_json` helper, however its path is spelled, other than the binding
+/// module's own (`binding::read_bounded`), and a method call of
+/// `read_dir`, `read_to_string` or `read_to_end`. A `use` that imports one
+/// of those names, or renames one, would hide a call, so it fails the scan.
+fn artifact_reads(text: &str, file: &str) -> Vec<String> {
+    use syn::visit::Visit;
+    /// The last segment of each read path, with the segment before it if
+    /// that names its owner.
+    const READS: &[(&str, &str)] = &[
+        ("fs", "read"),
+        ("fs", "read_to_string"),
+        ("fs", "read_dir"),
+        ("File", "open"),
+        ("", "read_bounded"),
+        ("TraceReader", "open"),
+        ("TraceReader", "open_prefix"),
+        ("serde_json", "from_reader"),
+        ("", "read_json"),
+    ];
+    /// Whether `names`, a path's segments, call one of [`READS`] other than
+    /// through `binding`.
+    fn reads(names: &[String]) -> bool {
+        if matches!(names, [.., module, _] if module == "binding") {
+            return false;
+        }
+        READS.iter().any(|(owner, last)| match names {
+            [.., before, at] => at == last && (owner.is_empty() || before == owner),
+            [at] => at == last && owner.is_empty(),
+            [] => false,
+        })
+    }
+    /// Collects the reads, by enclosing function.
+    struct Reads<'a> {
+        file: &'a str,
+        within: Vec<String>,
+        found: Vec<String>,
+    }
+    /// Whether `attrs` mark test-only code: `#[test]`, or `#[cfg(test)]`.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
+        })
+    }
+    /// Fails on a `use` tree importing a read by name.
+    fn check_use(tree: &syn::UseTree, path: &mut Vec<String>, file: &str) {
+        match tree {
+            syn::UseTree::Path(at) => {
+                path.push(at.ident.to_string());
+                check_use(&at.tree, path, file);
+                path.pop();
+            }
+            syn::UseTree::Name(syn::UseName { ident: name })
+            | syn::UseTree::Rename(syn::UseRename { ident: name, .. })
+                if {
+                    let mut names = path.clone();
+                    names.push(name.to_string());
+                    reads(&names)
+                } =>
+            {
+                panic!("{file}: a `use` imports a read by name, which the scan can't see")
+            }
+            syn::UseTree::Rename(rename)
+                if READS
+                    .iter()
+                    .any(|(owner, _)| !owner.is_empty() && rename.ident == owner) =>
+            {
+                panic!("{file}: a `use` renames a read's owner, which the scan can't see")
+            }
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .for_each(|tree| check_use(tree, path, file)),
+            _ => {}
+        }
+    }
+    impl Reads<'_> {
+        /// Notes a read at `path` inside the current function.
+        fn path(&mut self, path: &syn::Path) {
+            let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if reads(&names) {
+                self.note();
+            }
+        }
+
+        /// Notes a read inside the current function.
+        fn note(&mut self) {
+            let within = self.within.last().cloned().unwrap_or_default();
+            self.found.push(within);
+        }
+    }
+    impl<'ast> Visit<'ast> for Reads<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            check_use(&item.tree, &mut Vec::new(), self.file);
+        }
+
+        fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+            self.path(&expr.path);
+            syn::visit::visit_expr_path(self, expr);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if ["read_dir", "read_to_string", "read_to_end"]
+                .iter()
+                .any(|name| call.method == name)
+            {
+                self.note();
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut reads = Reads {
+        file,
+        within: Vec::new(),
+        found: Vec::new(),
+    };
+    reads.visit_file(&parsed);
+    reads.found
+}
+
+/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read of a run
+/// artifact goes through `binding.rs`, so no reader binds an artifact
+/// itself or reads one unbound. Each read anywhere else in the directory
+/// is one [`NON_ARTIFACT_READS`] lists, with why it reads no artifact, and
+/// each listed read is still there. A planted bypass, however its read is
+/// spelled, fails the scan.
+#[test]
+fn every_artifact_read_goes_through_binding() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ACCEPTANCE_SRC);
+    let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut texts = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("the acceptance source reads") {
+        let path = entry.expect("an entry reads").path();
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a UTF-8 file name")
+            .to_owned();
+        if path.extension().is_none_or(|ext| ext != "rs") || file == "binding.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a source file reads");
+        for within in artifact_reads(&text, &file) {
+            found.insert((file.clone(), within));
+        }
+        texts.insert(file, text);
+    }
+    let allowed: BTreeSet<(String, String)> = NON_ARTIFACT_READS
+        .iter()
+        .map(|(file, within, _)| ((*file).to_owned(), (*within).to_owned()))
+        .collect();
+    let unbound: Vec<&(String, String)> = found.difference(&allowed).collect();
+    assert!(
+        unbound.is_empty(),
+        "reads outside binding.rs that NON_ARTIFACT_READS doesn't list: {unbound:?}"
+    );
+    let stale: Vec<&(String, String)> = allowed.difference(&found).collect();
+    assert!(stale.is_empty(), "listed reads that are gone: {stale:?}");
+
+    let tool = &texts["tool.rs"];
+    for bypass in [
+        "fn planted(dir: &Path) { let _ = std::fs::read_to_string(dir.join(\"replay.json\")); }",
+        "fn planted(dir: &Path) { let _ = fs::read(dir); }",
+        "fn planted(dir: &Path) { let _ = read_json::<Value>(dir); }",
+        "fn planted(dir: &Path) { let _ = crate::trace::TraceReader::open(dir); }",
+        "struct P; impl P { fn planted(dir: &Path) { let _ = std::fs::File::open(dir); } }",
+        "fn planted(dir: &Path) { let _ = dir.read_dir(); }",
+    ] {
+        let planted = format!("{tool}\n{bypass}\n");
+        assert!(
+            artifact_reads(&planted, "tool.rs").contains(&"planted".to_owned()),
+            "{bypass}"
+        );
+    }
+    let in_test =
+        format!("{tool}\n#[cfg(test)]\nfn planted() {{ let _ = std::fs::read(\"x\"); }}\n");
+    assert!(!artifact_reads(&in_test, "tool.rs").contains(&"planted".to_owned()));
+    for hidden in [
+        "use std::fs::read_to_string;",
+        "use std::fs::{read as slurp};",
+        "use std::fs as files;",
+    ] {
+        let planted = format!("{tool}\n{hidden}\n");
+        assert!(
+            std::panic::catch_unwind(|| artifact_reads(&planted, "tool.rs")).is_err(),
+            "{hidden}"
+        );
+    }
+}

@@ -3677,6 +3677,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
     "identity_refs_are_defined_only_in_refs",
+    "every_artifact_read_goes_through_binding",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

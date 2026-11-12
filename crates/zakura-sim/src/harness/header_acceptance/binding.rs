@@ -35,7 +35,7 @@ pub enum Field {
     /// The source digest of the build that wrote or judged it. Both sides
     /// must be [`known`].
     Source,
-    /// The commit a checkout was made from.
+    /// The commit a checkout was made from, or a run's subject commit S.
     Base,
     /// The SHA-256 of the patch a checkout applied.
     PatchSha256,
@@ -306,6 +306,19 @@ pub const PROVENANCE: Kind = Kind {
     closed: false,
 };
 
+/// An artifacts directory's `run.json` ([`RunBinding`](super::tool::RunBinding)):
+/// the run's ID, its subject commit and that commit's source.
+pub const RUN: Kind = Kind {
+    name: "run.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::Base, "/subject"),
+        (Field::Source, "/subject_source"),
+    ],
+    required: &[Field::RunId, Field::Base, Field::Source],
+    closed: false,
+};
+
 /// A task directory's `task.json` ([`task_binding`](super::tool::task_binding)).
 pub const TASK: Kind = Kind {
     name: "task.json",
@@ -387,8 +400,7 @@ impl Expect {
     /// `Draft` override, read by the simulator's own trace reader, which
     /// checks the trace whole.
     pub fn of_trace(dir: &Path) -> Result<Expect, String> {
-        let trace = crate::trace::TraceReader::open(dir)
-            .map_err(|error| format!("{}: {error}", dir.display()))?;
+        let trace = open_trace(dir)?;
         Ok(Expect::new()
             .with(Field::Trace, &trace.id)
             .with(Field::Source, &trace.meta.build.source)
@@ -470,6 +482,80 @@ pub fn check(kind: &Kind, artifact: &Value, expect: &Expect) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+/// The recorded trace in `dir`, read whole by the simulator's own reader,
+/// which checks its versions, every line's shape and order, its step
+/// numbers and its `end`. It's what every other artifact of the run binds
+/// to: its digest is the [`Field::Trace`] they name, and its meta the
+/// build, harness and override ([`Expect::of_trace`], [`TRACE_META`]).
+pub fn open_trace(dir: &Path) -> Result<crate::trace::Trace, String> {
+    crate::trace::TraceReader::open(dir).map_err(|error| format!("{}: {error}", dir.display()))
+}
+
+/// The SHA-256 of `path`'s bytes in hex, if it can be read: how an
+/// artifact names a trace, and how a reader names the committed patch or
+/// input it expects one to have run.
+pub fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// The JSON artifact of `kind` at `path`, read as the trace reader reads
+/// its files (a regular file within `max` bytes), if it's bound to what
+/// `expect` names ([`check`]), or why not.
+pub fn read_bounded(kind: &Kind, path: &Path, max: u64, expect: &Expect) -> Result<Value, String> {
+    let artifact: Value = match crate::trace::read::read_bounded(path, max) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?,
+        Ok(None) => return Err(format!("{}: missing", path.display())),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    check(kind, &artifact, expect)?;
+    Ok(artifact)
+}
+
+/// What a trace that ran `harness` on the scenario in `scenario_file`
+/// under the Plan in `plan_file`, Plan bytes or a script as `script` says,
+/// must carry in its meta ([`TRACE_META`]): that harness, the scenario as
+/// the harness describes it, no fuzz input, and the file's Plan, Plan
+/// bytes by their own digest and a script by the Plan it parses to
+/// ([`PlanRef::script`](crate::trace::meta::PlanRef::script)), so a script
+/// binds however it's formatted. The files are a committed case's or a
+/// witness test's declaration. Any that can't be read refuses it.
+pub fn scenario_expect(
+    harness: &str,
+    scenario_file: &Path,
+    plan_file: &Path,
+    script: bool,
+) -> Result<Expect, String> {
+    use crate::trace::meta::PlanRef;
+    let text = std::fs::read_to_string(scenario_file)
+        .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+    let scenario: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+    let entry = crate::harness::find(harness).map_err(|error| error.to_string())?;
+    let described = (entry.meta)(&scenario).map_err(|error| error.to_string())?;
+    let bytes =
+        std::fs::read(plan_file).map_err(|error| format!("{}: {error}", plan_file.display()))?;
+    let plan = if script {
+        let plan: crate::Plan = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{} isn't a Plan: {error}", plan_file.display()))?;
+        PlanRef::script(&plan)
+    } else {
+        PlanRef::bytes(&bytes)
+    };
+    Ok(Expect::new()
+        .with(Field::Harness, harness)
+        .with(Field::Scenario, &described.scenario)
+        .with(Field::InputSha256, Value::Null)
+        .with(Field::Plan, &plan))
 }
 
 /// The JSON artifact of `kind` at `path`, if it's readable and bound to

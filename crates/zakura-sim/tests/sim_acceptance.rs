@@ -397,3 +397,136 @@ fn a_record_differs_from_another_run_at_a_named_path() {
         Some("blocked")
     );
 }
+
+mod evaluator {
+    use std::collections::BTreeMap;
+
+    use zakura_sim::sim_acceptance::evaluate::{
+        evaluate, header_refusal, judge_row, HeaderRecordFacts, RowSpec, Verdict,
+    };
+
+    fn row(id: &str, results: &[&str], never_excluded: bool) -> RowSpec {
+        RowSpec {
+            id: id.to_owned(),
+            results: results.iter().map(|r| (*r).to_owned()).collect(),
+            never_excluded,
+        }
+    }
+
+    fn excluded() -> Verdict {
+        Verdict::Excluded {
+            approval: "Adam, 2026-11-11".to_owned(),
+        }
+    }
+
+    fn blocked() -> Verdict {
+        Verdict::Blocked {
+            why: "failed".to_owned(),
+        }
+    }
+
+    fn verdicts(pairs: &[(&str, Verdict)]) -> BTreeMap<String, Verdict> {
+        pairs
+            .iter()
+            .map(|(id, v)| ((*id).to_owned(), v.clone()))
+            .collect()
+    }
+
+    /// A row with one excluded and one blocked result is blocked.
+    #[test]
+    fn a_row_takes_its_worst_result() {
+        let v = verdicts(&[
+            ("a", excluded()),
+            ("b", blocked()),
+            ("c", Verdict::Verified),
+        ]);
+        assert_eq!(
+            judge_row(&row("M7.2", &["a", "b"], false), &v).verdict,
+            blocked()
+        );
+        assert_eq!(
+            judge_row(&row("M7.2", &["a", "c"], false), &v).verdict,
+            excluded()
+        );
+        assert_eq!(
+            judge_row(&row("M7.2", &["c"], false), &v).verdict,
+            Verdict::Verified
+        );
+    }
+
+    #[test]
+    fn a_missing_result_and_an_empty_row_block() {
+        let v = verdicts(&[("a", Verdict::Verified)]);
+        assert!(matches!(
+            judge_row(&row("M7.1", &["a", "gone"], false), &v).verdict,
+            Verdict::Blocked { .. }
+        ));
+        assert!(matches!(
+            judge_row(&row("M7.1", &[], false), &v).verdict,
+            Verdict::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn an_exclusion_blocks_a_row_that_cant_be_excluded() {
+        let v = verdicts(&[("a", excluded())]);
+        assert!(matches!(
+            judge_row(&row("S4.4", &["a"], true), &v).verdict,
+            Verdict::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn acceptance_needs_no_block_and_a_positive_applicable_count() {
+        let rows = [row("M7.1", &["a"], false), row("M7.2", &["b"], false)];
+        let all = verdicts(&[("a", Verdict::Verified), ("b", Verdict::Verified)]);
+        let done = evaluate(&rows, &all, 5);
+        assert!(done.accepted && done.fully_accepted);
+        let nothing_applied = evaluate(&rows, &all, 0);
+        assert!(
+            !nothing_applied.accepted,
+            "a suite where nothing applied isn't accepted"
+        );
+        let some_excluded = evaluate(
+            &rows,
+            &verdicts(&[("a", Verdict::Verified), ("b", excluded())]),
+            5,
+        );
+        assert!(some_excluded.accepted && !some_excluded.fully_accepted);
+        let one_blocked = evaluate(
+            &rows,
+            &verdicts(&[("a", Verdict::Verified), ("b", blocked())]),
+            5,
+        );
+        assert!(!one_blocked.accepted);
+    }
+
+    fn facts() -> HeaderRecordFacts {
+        HeaderRecordFacts {
+            subject: "S".to_owned(),
+            subreaper: true,
+            accepted: true,
+            stray: Vec::new(),
+            verified: Ok(()),
+        }
+    }
+
+    /// The header record counts only at S, contained, accepted, with no
+    /// stray and bound to its run.
+    #[test]
+    fn the_header_record_is_refused_unless_every_fact_holds() {
+        assert_eq!(header_refusal(&facts(), "S"), None);
+        assert!(header_refusal(&facts(), "T").is_some());
+        let refused = |change: fn(&mut HeaderRecordFacts)| {
+            let mut f = facts();
+            change(&mut f);
+            header_refusal(&f, "S").is_some()
+        };
+        assert!(refused(|f| f.subreaper = false));
+        assert!(refused(|f| f.accepted = false));
+        assert!(refused(|f| f.stray.push("a timed-out child".to_owned())));
+        assert!(refused(
+            |f| f.verified = Err("differs at `verified.0`".to_owned())
+        ));
+    }
+}

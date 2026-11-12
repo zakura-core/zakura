@@ -2,6 +2,7 @@
 //! the manifest and evaluator `cargo xtask sim-acceptance` runs (the sim-7
 //! implementation plan, sim-7.4).
 
+pub mod evaluate;
 pub mod header;
 pub mod judge;
 

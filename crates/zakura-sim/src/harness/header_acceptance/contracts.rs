@@ -834,6 +834,26 @@ const C22_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C15's proving tests: the release-wake fixtures' runs equal the runs
+/// without the release up to their measured boundary and then settle, on
+/// the committed inputs and on every plan, and two planted wake bypasses'
+/// patched `Draft` runs, one on each fixture, settle too, with the release
+/// picked after the bypassed wake's violation.
+const C15_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_fixtures_settle_after_their_measured_boundary_and_not_before",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_wake_fixtures_hold_under_every_plan",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "a_bypassed_wake_s_patched_draft_run_settles",
+    ),
+];
+
 /// C21's proving tests: for each `header-sync` check the header node
 /// harnesses register that can find two failures at one boundary, two
 /// distinct ones there surviving into the run's report and the full report
@@ -1043,25 +1063,6 @@ const C17_PROVING: &[TestRef] = &[
     sim_test("tests/header_pairing.rs", "held_headers_ended_twice_are_refused"),
 ];
 
-/// A contract that waits for `delivery`, with no proving test yet.
-const fn blocked(
-    id: ContractId,
-    owner: &'static str,
-    statement: &'static str,
-    delivery: &'static str,
-) -> Contract {
-    Contract {
-        id,
-        owner,
-        statement,
-        proving: &[],
-        state: ContractState::Blocked {
-            waiting_for: delivery,
-        },
-        delivery,
-    }
-}
-
 /// A contract whose delivery landed but whose proving tests don't yet cover
 /// it, waiting for `missing`.
 const fn waiting(
@@ -1104,9 +1105,9 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C4, C5, C7, C8, C9 and C12 by
 /// E1 to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, and C21 and C22 by hf-8 and hf-9 with E4's
-/// sidecar. Every other row's deliveries landed, and its state names the
-/// proving test still missing.
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C21 and C22 by hf-8 and
+/// hf-9 with E4's sidecar. Every other row's deliveries landed, and its
+/// state names the proving test still missing.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1233,16 +1234,13 @@ pub fn contract_table() -> Vec<Contract> {
             C14_PROVING,
             "hf-6's store inventory",
         ),
-        // hf-5 (#2197) made the unpatched fixtures settle, which
-        // `the_fixtures_settle_after_their_measured_boundary_and_not_before`
-        // shows. No test yet shows a bypassed wake's patched run settling,
-        // the half a Draft run needs, so C15 stays blocked.
-        blocked(
+        satisfied(
             C15,
             "Adam's harness",
             "Release-wake fixtures release their remaining hold after the measured boundary, \
              including when a bypass stops the wake, so a Draft run can finish.",
-            "a test that a bypassed wake's patched run settles (hf-5's remaining half)",
+            C15_PROVING,
+            "hf-5",
         ),
         Contract {
             id: C16,

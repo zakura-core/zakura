@@ -1,15 +1,19 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/peer.rs b/crates/zakura-network/src/zakura/header_sync/peer.rs
-index 730bf23d81..3a446bc8cd 100644
+index 730bf23d81..66f7d85952 100644
 --- a/crates/zakura-network/src/zakura/header_sync/peer.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/peer.rs
-@@ -68,6 +68,12 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
+@@ -68,6 +68,16 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                          result.map_err(|error| SinkReject::local(error.to_string()))?;
                      }
                  }
-+                // Mutation: the page went to the reactor, and only now does
-+                // the reader raise its deferred fault and close.
++                // Mutation: the page went to the reactor, and once it has had
++                // time to stage it the reader raises its deferred fault and
++                // closes.
 +                let deferred = session.subscriber().take_deferred();
 +                if let Some(fault) = deferred {
++                    for _ in 0..64 {
++                        zakura_rt::task::yield_now().await;
++                    }
 +                    return Err(violation(&handle, &session, fault.label(), fault));
 +                }
              }

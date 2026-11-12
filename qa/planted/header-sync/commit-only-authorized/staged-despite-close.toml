@@ -1,6 +1,8 @@
 # The subscriber keeps its linkage fault for the unlinked page, so the
-# reader still closes the connection with it, but admits the page first and
-# forwards it to the reactor, so it stages despite the close (hdr-14 gap 6).
+# reader still closes the connection with it, but admits the page first,
+# forwards it to the reactor and yields before raising the fault, so the
+# page stages despite the close (hdr-14 gap 6). Closing right after the
+# forward lets the session's teardown drop the page unstaged.
 # The input is the saved bad-content Plan, whose act is that page. The
 # case's row also judges its Draft run's three companions: the fault close
 # of the page's connection, the page's PageStaged, and the catch as that

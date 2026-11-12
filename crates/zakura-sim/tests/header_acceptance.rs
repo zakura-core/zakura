@@ -6939,19 +6939,6 @@ const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
         "the committed native-mutation tree at S",
     ),
     (
-        "tool.rs",
-        "record_args",
-        "the runner's recorder arguments for a declaration, which judge nothing: the \
-         recording they make is bound to the same declaration's files by \
-         `binding::scenario_expect` and `binding::RAN`",
-    ),
-    (
-        "history.rs",
-        "declared",
-        "which declaration a witness test made is which, by its own history file; the one \
-         counted is then bound to its recording by its scenario, Plan and steps",
-    ),
-    (
         "companions.rs",
         "judge_trace",
         "the companions judge, run by the case's own build on the Draft run it's handed: it \

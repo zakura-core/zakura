@@ -29,8 +29,8 @@ use zakura_state::GetBlockTemplateChainInfo;
 
 use super::{
     indexed::{
-        parents, priority, IndexedSelector, Pool, Priority, MAX_CONSECUTIVE_MISFITS,
-        NEARLY_FULL_BYTES, SELECTION_STOP_BYTES,
+        parents, priority, IndexedSelector, Pool, Priority, MAX_PACKING_SCAN_ENTRIES,
+        PACKING_THRESHOLD_BYTES, SELECTION_STOP_BYTES,
     },
     selection_variants::{weighted_random, Misfit, Score, VariantSelector},
     *,
@@ -57,23 +57,40 @@ fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTempla
     BlockTemplateLimits::initial(network, height, coinbase)
 }
 
-/// Selected transactions, and how many best packages did not fit when the
-/// selector reports it.
+/// Selected transactions, the number of entries packing visited, and how
+/// many best packages did not fit when the selector reports it.
 struct Selection {
     txs: Vec<SelectedMempoolTx>,
+    packing_scanned: usize,
     misfits: usize,
 }
 
-/// Runs the production selector.
+/// Runs the production main pass, then packing if `pack` is set.
 fn run(
     txs: Vec<VerifiedUnminedTx>,
     deps: TransactionDependencies,
     limits: BlockTemplateLimits,
+    pack: bool,
 ) -> Selection {
+    let mut selector = IndexedSelector::new(txs, deps, limits);
+    selector.select_primary();
+    let packing_scanned = if pack { selector.pack() } else { 0 };
     Selection {
-        txs: IndexedSelector::new(txs, deps, limits).select(),
+        txs: selector.selected().to_vec(),
+        packing_scanned,
         misfits: 0,
     }
+}
+
+/// Runs the production main pass without packing.
+fn plain(
+    txs: Vec<VerifiedUnminedTx>,
+    deps: TransactionDependencies,
+    network: &Network,
+    height: Height,
+    miner: &MinerParams,
+) -> Selection {
+    run(txs, deps, limits(network, height, miner), false)
 }
 
 fn ids(selection: &Selection) -> Vec<transaction::Hash> {
@@ -317,11 +334,11 @@ impl Fixture {
 enum Mode {
     /// Weighted-random selection, as on main before the indexed selector.
     Random,
-    /// The indexed selector before skip-and-continue: stop at the first
-    /// package that does not fit, then pack from the next 100 entries.
-    StopThenPack,
-    /// The production selector.
+    /// The production selector: stop at the first package that does not
+    /// fit, then pack from the next 100 entries.
     Production,
+    /// Skip-and-continue ranked by ZIP-401 cost, like production.
+    Skip,
     /// Skip-and-continue ranked by sigop-adjusted size.
     SigopAdjusted,
     /// Skip-and-continue ranked by the largest share of any block limit.
@@ -331,8 +348,8 @@ enum Mode {
 impl Mode {
     const ALL: [Self; 5] = [
         Self::Random,
-        Self::StopThenPack,
         Self::Production,
+        Self::Skip,
         Self::SigopAdjusted,
         Self::ResourceAdjusted,
     ];
@@ -340,8 +357,8 @@ impl Mode {
     fn name(self) -> &'static str {
         match self {
             Self::Random => "random",
-            Self::StopThenPack => "stop_then_pack",
             Self::Production => "production",
+            Self::Skip => "skip",
             Self::SigopAdjusted => "sigop_adjusted",
             Self::ResourceAdjusted => "resource_adjusted",
         }
@@ -358,19 +375,20 @@ fn select(
     miner: &MinerParams,
 ) -> Selection {
     let limits = limits(network, height, miner);
-    let (score, misfit) = match mode {
+    let score = match mode {
         Mode::Random => {
             return Selection {
                 txs: weighted_random(txs, &deps, limits, &mut rand_10::rng()),
+                packing_scanned: 0,
                 misfits: 0,
             }
         }
-        Mode::Production => return run(txs, deps, limits),
-        Mode::StopThenPack => (Score::Zip401Cost, Misfit::StopThenPack),
-        Mode::SigopAdjusted => (Score::SigopAdjustedSize, Misfit::Skip),
-        Mode::ResourceAdjusted => (Score::ResourceAdjustedSize, Misfit::Skip),
+        Mode::Production => return run(txs, deps, limits, true),
+        Mode::Skip => Score::Zip401Cost,
+        Mode::SigopAdjusted => Score::SigopAdjustedSize,
+        Mode::ResourceAdjusted => Score::ResourceAdjustedSize,
     };
-    variant(txs, deps, limits, score, misfit)
+    variant(txs, deps, limits, score, Misfit::Skip)
 }
 
 fn variant(
@@ -383,6 +401,7 @@ fn variant(
     let selection = VariantSelector::new(txs, deps, limits, score, misfit).select();
     Selection {
         txs: selection.txs,
+        packing_scanned: 0,
         misfits: selection.misfits,
     }
 }
@@ -404,6 +423,7 @@ fn validate(
     height: Height,
     miner: &MinerParams,
 ) -> Stats {
+    assert!(selection.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
     let mut limits = limits(network, height, miner);
     let mut selected = std::collections::HashSet::new();
     let mut bytes = 0;
@@ -473,7 +493,7 @@ fn indexed_rescores_surviving_children_after_parent_selection() {
     let independent_id = independent.transaction.id().mined_id();
     let fixture = Fixture::from_transactions(vec![parent, child_a, child_b, independent]);
     let (txs, deps) = fixture.snapshot();
-    let selection = select(Mode::Production, txs, deps, &network, height, &miner);
+    let selection = plain(txs, deps, &network, height, &miner);
     validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(selection.txs[0].1.transaction.id().mined_id(), parent_id);
     assert_eq!(
@@ -483,76 +503,63 @@ fn indexed_rescores_surviving_children_after_parent_selection() {
 }
 
 #[test]
-fn indexed_skips_packages_that_do_not_fit_beyond_any_scan_bound() {
+fn indexed_packing_preserves_priority_prefix_and_fills_the_gap() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
-    // More large, high-priority transactions than the old packing scan
-    // visited, ahead of one small transaction that fits.
-    let mut txs: Vec<_> = (0..110)
+    let mut txs: Vec<_> = (0..12).map(|_| factory.tx(64, 10, Vec::new(), 1)).collect();
+    txs.extend((0..40).map(|_| factory.tx(1, 1, Vec::new(), 1)));
+    let fixture = Fixture::from_transactions(txs);
+    let (txs, deps) = fixture.snapshot();
+    let plain = plain(txs, deps, &network, height, &miner);
+    let plain_stats = validate(&plain, &fixture, &network, height, &miner);
+    assert!(plain_stats.remaining > PACKING_THRESHOLD_BYTES);
+    let (txs, deps) = fixture.snapshot();
+    let packed = select(Mode::Production, txs, deps, &network, height, &miner);
+    let packed_stats = validate(&packed, &fixture, &network, height, &miner);
+    assert!(packed.txs.starts_with(&plain.txs));
+    assert!(packed_stats.remaining < plain_stats.remaining);
+    assert!(packed.packing_scanned <= MAX_PACKING_SCAN_ENTRIES);
+}
+
+#[test]
+fn indexed_packing_stops_after_one_hundred_entries() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let mut txs: Vec<_> = (0..=MAX_PACKING_SCAN_ENTRIES)
         .map(|_| factory.tx(64, 10, Vec::new(), 1))
         .collect();
     let small = factory.tx(1, 1, Vec::new(), 1);
-    let small_size = small.transaction.size();
     let small_id = small.transaction.id().mined_id();
-    assert!(txs[0].transaction.size() > small_size + SELECTION_STOP_BYTES);
     txs.push(small);
     let fixture = Fixture::from_transactions(txs);
-    let limits_for_gap = || {
+    let run = |mut txs: Vec<VerifiedUnminedTx>, deps, remove_first| {
+        if remove_first {
+            txs.remove(0);
+        }
         let mut limits = limits(&network, height, &miner);
-        limits.remaining_bytes = small_size + SELECTION_STOP_BYTES + 1;
-        limits
+        limits.remaining_bytes = PACKING_THRESHOLD_BYTES + 1;
+        run(txs, deps, limits, true)
     };
 
+    // The small transaction follows 100 oversized entries after the blocked
+    // priority candidate. It must not be visited as entry 101.
     let (txs, deps) = fixture.snapshot();
-    let selection = run(txs, deps, limits_for_gap());
-    validate(&selection, &fixture, &network, height, &miner);
-    assert_eq!(ids(&selection), [small_id]);
+    let bounded = run(txs, deps, false);
+    assert_eq!(bounded.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert!(bounded.txs.is_empty());
 
-    // The previous selector stopped at the first large transaction and had
-    // too little space left to pack.
+    // Removing one oversized transaction puts the fitting candidate exactly at
+    // the scan boundary, proving entry 100 is still considered.
     let (txs, deps) = fixture.snapshot();
-    let stopped = variant(
-        txs,
-        deps,
-        limits_for_gap(),
-        Score::Zip401Cost,
-        Misfit::StopThenPack,
-    );
-    assert!(stopped.txs.is_empty());
+    let boundary = run(txs, deps, true);
+    validate(&boundary, &fixture, &network, height, &miner);
+    assert_eq!(boundary.packing_scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert_eq!(boundary.txs.len(), 1);
+    assert_eq!(boundary.txs[0].1.transaction.id().mined_id(), small_id);
 }
 
 #[test]
-fn indexed_gives_up_after_consecutive_misfits_once_nearly_full() {
-    let (network, height, miner, _) = context();
-    let mut factory = Factory::new();
-    let small = factory.tx(0, 1, Vec::new(), 1);
-    let small_size = small.transaction.size();
-    let small_id = small.transaction.id().mined_id();
-    let large: Vec<_> = (0..MAX_CONSECUTIVE_MISFITS)
-        .map(|_| factory.tx(1, 10, Vec::new(), 1))
-        .collect();
-    let remaining = SELECTION_STOP_BYTES + small_size;
-    assert!(remaining <= NEARLY_FULL_BYTES);
-    assert!(large.iter().all(|tx| tx.transaction.size() > remaining));
-
-    let run_with = |large: &[VerifiedUnminedTx]| {
-        let mut txs = large.to_vec();
-        txs.push(small.clone());
-        let fixture = Fixture::from_transactions(txs);
-        let (txs, deps) = fixture.snapshot();
-        let mut limits = limits(&network, height, &miner);
-        limits.remaining_bytes = remaining;
-        ids(&run(txs, deps, limits))
-    };
-
-    // The small transaction ranks after every large one. It is reached after
-    // one fewer than the bound, and not after the full bound.
-    assert_eq!(run_with(&large[1..]), [small_id]);
-    assert!(run_with(&large).is_empty());
-}
-
-#[test]
-fn indexed_stops_at_three_kilobytes() {
+fn indexed_primary_stops_at_three_kilobytes() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let first = factory.tx(0, 10, Vec::new(), 1);
@@ -561,22 +568,27 @@ fn indexed_stops_at_three_kilobytes() {
     let tail = factory.tx(0, 1, Vec::new(), 2);
     assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
     let fixture = Fixture::from_transactions(vec![first, tail]);
-    for remaining in [SELECTION_STOP_BYTES - 1, SELECTION_STOP_BYTES] {
+    for pack in [false, true] {
+        for remaining in [SELECTION_STOP_BYTES - 1, SELECTION_STOP_BYTES] {
+            let (txs, deps) = fixture.snapshot();
+            let mut limits = limits(&network, height, &miner);
+            limits.remaining_bytes = remaining;
+            let selection = run(txs, deps, limits, pack);
+            assert!(selection.txs.is_empty());
+            assert_eq!(selection.packing_scanned, 0);
+        }
         let (txs, deps) = fixture.snapshot();
         let mut limits = limits(&network, height, &miner);
-        limits.remaining_bytes = remaining;
-        assert!(run(txs, deps, limits).txs.is_empty());
+        limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
+        let selection = run(txs, deps, limits, pack);
+        validate(&selection, &fixture, &network, height, &miner);
+        assert_eq!(selection.txs.len(), 1);
+        assert_eq!(selection.txs[0].1.transaction.id().mined_id(), first_id);
     }
-    let (txs, deps) = fixture.snapshot();
-    let mut limits = limits(&network, height, &miner);
-    limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
-    let selection = run(txs, deps, limits);
-    validate(&selection, &fixture, &network, height, &miner);
-    assert_eq!(ids(&selection), [first_id]);
 }
 
 #[test]
-fn indexed_stops_at_three_kilobytes_after_skipping() {
+fn indexed_packing_stops_at_three_kilobytes() {
     let (network, height, miner, _) = context();
     let mut factory = Factory::new();
     let mut txs = vec![factory.tx(64, 10, Vec::new(), 1)];
@@ -586,7 +598,7 @@ fn indexed_stops_at_three_kilobytes_after_skipping() {
         .map(|tx| tx.transaction.size())
         .sum::<usize>()
         + SELECTION_STOP_BYTES;
-    assert!(txs[0].transaction.size() > remaining);
+    assert!(remaining > PACKING_THRESHOLD_BYTES);
     let tail = factory.tx(0, 1, Vec::new(), 1);
     let tail_id = tail.transaction.id().mined_id();
     assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
@@ -595,13 +607,15 @@ fn indexed_stops_at_three_kilobytes_after_skipping() {
     let (txs, deps) = fixture.snapshot();
     let mut limits = limits(&network, height, &miner);
     limits.remaining_bytes = remaining;
-    // The large transaction is skipped, the eight mid-priority ones fill the
-    // template to exactly the stop threshold, and the tail is never reached.
-    let selection = run(txs, deps, limits);
+    let selection = run(txs, deps, limits, true);
     let stats = validate(&selection, &fixture, &network, height, &miner);
     assert_eq!(remaining - stats.bytes, SELECTION_STOP_BYTES);
+    assert_eq!(selection.packing_scanned, 8);
     assert_eq!(selection.txs.len(), 8);
-    assert!(!ids(&selection).contains(&tail_id));
+    assert!(selection
+        .txs
+        .iter()
+        .all(|(_, tx)| tx.transaction.id().mined_id() != tail_id));
 }
 
 #[test]
@@ -703,7 +717,7 @@ fn selection_variants_match_production_and_respect_limits() {
                 deps,
                 limits(&network, height, &miner),
                 Score::Zip401Cost,
-                Misfit::Skip,
+                Misfit::StopThenPack,
             );
             assert_eq!(ids(&production), ids(&mirrored), "{era} {kind}");
 
@@ -717,6 +731,7 @@ fn selection_variants_match_production_and_respect_limits() {
                             limits(&network, height, &miner),
                             &mut StdRng::seed_from_u64(317),
                         ),
+                        packing_scanned: 0,
                         misfits: 0,
                     }
                 } else {

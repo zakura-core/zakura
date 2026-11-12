@@ -23,17 +23,19 @@ use zakura_node_services::mempool::TransactionDependencies;
 
 use super::{
     indexed::{
-        package, parents, Pool, MAX_CONSECUTIVE_MISFITS, NEARLY_FULL_BYTES, SELECTION_STOP_BYTES,
+        package, parents, Pool, MAX_PACKING_SCAN_ENTRIES, PACKING_THRESHOLD_BYTES,
+        SELECTION_STOP_BYTES,
     },
     BlockTemplateLimits, SelectedMempoolTx,
 };
 
-/// The previous production selector packed only when more than this many
-/// bytes were left after the main pass.
-const PACKING_THRESHOLD_BYTES: usize = 50_000;
+/// Once the template is within this many bytes of full, [`Misfit::Skip`]
+/// gives up after [`MAX_CONSECUTIVE_MISFITS`] packages in a row do not fit.
+const NEARLY_FULL_BYTES: usize = 50_000;
 
-/// The previous production selector packed from at most this many entries.
-const MAX_PACKING_SCAN_ENTRIES: usize = 100;
+/// Consecutive misfits [`Misfit::Skip`] tolerates in a nearly full template.
+/// Matches Bitcoin Core's `MAX_CONSECUTIVE_FAILURES`.
+const MAX_CONSECUTIVE_MISFITS: usize = 1_000;
 
 /// What a package's fee is divided by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,10 +54,11 @@ pub(super) enum Score {
 /// What the main pass does when the best package does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Misfit {
-    /// End the main pass, then pack from the next entries. The selector
-    /// before skip-and-continue.
+    /// End the main pass, then pack from the next entries, like the
+    /// production selector.
     StopThenPack,
-    /// Skip the package with the production stop rule.
+    /// Skip the package and keep going, until the template is nearly full
+    /// and [`MAX_CONSECUTIVE_MISFITS`] packages in a row did not fit.
     Skip,
 }
 
@@ -273,7 +276,7 @@ impl VariantSelector {
         }
     }
 
-    /// The previous production packing pass.
+    /// Mirrors the production packing pass.
     fn pack(&mut self) {
         if self.limits.remaining_bytes <= PACKING_THRESHOLD_BYTES {
             return;

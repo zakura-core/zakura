@@ -497,13 +497,30 @@ impl Ctx<'_> {
         Ok(text)
     }
 
-    /// The binding of a fresh replay of the task's `trace/`: the trace's
-    /// SHA-256 when the replay starts, and the executable that replays it.
-    fn replay_binding(&self) -> Result<Value, BoxError> {
-        Ok(json!({
-            "trace_sha256": sha256_file(&self.dir.join("trace").join("trace.jsonl"))?,
-            "executable_sha256": self.release_sha256,
-        }))
+    /// Replays the task's `trace/` fresh with the release build into
+    /// `replay.json`, bound to the trace's SHA-256 when the replay starts and
+    /// to the executable that replays it. A recording that left no trace
+    /// gets no replay, so its task blocks on the missing `replay.json`
+    /// rather than ending the run.
+    fn replay(&self) -> Result<(), BoxError> {
+        let trace = self.dir.join("trace").join("trace.jsonl");
+        let Ok(trace_sha256) = sha256_file(&trace) else {
+            return Ok(());
+        };
+        let mut replay = Command::new(self.release);
+        replay
+            .arg("replay")
+            .arg(self.dir.join("trace"))
+            .current_dir(self.root);
+        self.record(
+            &mut replay,
+            "replay",
+            json!({
+                "trace_sha256": trace_sha256,
+                "executable_sha256": self.release_sha256,
+            }),
+        )?;
+        Ok(())
     }
 
     /// One test of the `qa/fuzz/sim` workspace's library, by its exact
@@ -689,14 +706,7 @@ impl Ctx<'_> {
     fn seed(&self, task: &Value) -> Result<(), BoxError> {
         let mut record = self.zakura_sim(task, &[])?;
         self.record(&mut record, "record", json!({}))?;
-        let mut replay = Command::new(self.release);
-        replay
-            .arg("replay")
-            .arg(self.dir.join("trace"))
-            .current_dir(self.root);
-        let binding = self.replay_binding()?;
-        self.record(&mut replay, "replay", binding)?;
-        Ok(())
+        self.replay()
     }
 
     /// One seed witness, recorded with `--witness`: `trace/` with its
@@ -706,14 +716,7 @@ impl Ctx<'_> {
         let expect = field(task, "expect")?;
         let mut record = self.zakura_sim(task, &["--witness", property, "--expect", expect])?;
         self.record(&mut record, "record", json!({}))?;
-        let mut replay = Command::new(self.release);
-        replay
-            .arg("replay")
-            .arg(self.dir.join("trace"))
-            .current_dir(self.root);
-        let binding = self.replay_binding()?;
-        self.record(&mut replay, "replay", binding)?;
-        Ok(())
+        self.replay()
     }
 
     /// `zakura-sim record` of the task's harness on its seed's full input,
@@ -801,6 +804,12 @@ impl Ctx<'_> {
             .arg("--measure")
             .arg(self.dir.join("measure.json"))
             .current_dir(self.root);
+        // A race fixture's run on its saved schedule fails by design, so it
+        // records as that violation's witness, which exits 0 only if it
+        // happened.
+        if let Some(property) = task.get("violates").and_then(Value::as_str) {
+            record.args(["--witness", property, "--expect", "violated"]);
+        }
         self.record(&mut record, "record", json!({}))?;
         Ok(())
     }

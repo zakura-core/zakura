@@ -127,9 +127,14 @@ pub enum Task {
         expected: String,
         /// The harness.
         harness: String,
-        /// The full input's SHA-256 in the run's corpus, the harness's first
-        /// committed seed, or `None` for empty input when it has none.
+        /// The full input's SHA-256 in the run's corpus: the harness's
+        /// first committed seed, else its saved race schedule, or `None` for
+        /// empty input when it has neither.
         input: Option<String>,
+        /// The property the measured run must violate, for a race fixture
+        /// measured on its saved schedule, which fails by design. Any other
+        /// measured run must pass.
+        violates: Option<String>,
     },
 }
 
@@ -338,14 +343,37 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                     file: "tests/sim_acceptance.rs".to_owned(),
                     test: path.clone(),
                 }),
-                Expected::Measure(harness) => Some(Task::Measure {
-                    expected: id.clone(),
-                    harness: (*harness).to_owned(),
-                    input: seed_inputs
+                Expected::Measure(harness) => {
+                    let seed = seed_inputs
                         .values()
                         .find(|(seed_harness, _)| seed_harness == harness)
-                        .map(|(_, input)| input.clone()),
-                }),
+                        .map(|(_, input)| input.clone());
+                    // A race fixture has no passing seed: its measured run is
+                    // its saved schedule, with its declared violation.
+                    let race = race_schedules
+                        .values()
+                        .find(|(race_harness, ..)| race_harness == harness);
+                    Some(match (seed, race) {
+                        (Some(input), _) => Task::Measure {
+                            expected: id.clone(),
+                            harness: (*harness).to_owned(),
+                            input: Some(input),
+                            violates: None,
+                        },
+                        (None, Some((_, input, property, _))) => Task::Measure {
+                            expected: id.clone(),
+                            harness: (*harness).to_owned(),
+                            input: Some(input.clone()),
+                            violates: Some(property.clone()),
+                        },
+                        (None, None) => Task::Measure {
+                            expected: id.clone(),
+                            harness: (*harness).to_owned(),
+                            input: None,
+                            violates: None,
+                        },
+                    })
+                }
                 // Judged from the header record and from seed tasks.
                 Expected::HeaderKey(_) | Expected::EndRecord { .. } => None,
                 // The planted runner's verdict alone isn't evidence (Rule 11):
@@ -491,8 +519,8 @@ pub struct Sim7Record {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
-    /// Where it is: a task's artifact directory, relative to the run
-    /// directory, or for a consumed header key each artifact its header
+    /// Where it is: a task's artifact directory, relative to the archive
+    /// root (the published record's directory), or for a consumed header key each artifact its header
     /// record entry links, as `header:<path>` relative to the header run's
     /// `--out`. A header key's binaries and property outcomes are hdr-14's,
     /// in that record, which [`Sim7Record::header_record_sha256`] pins.
@@ -539,12 +567,14 @@ pub const RACE_INVENTORY: &str = "race-schedules";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Why the release seed inventory under `inventory` doesn't admit `file`
-/// with full input `input`, or `None` if it does. With no `file`, any admitted seed with
-/// that input counts. The inventory must also have exited 0.
+/// with full input `input` for `harness`, or `None` if it does. With no
+/// `file`, any admitted seed of `harness` with that input counts, since
+/// race fixtures can share bytes. The inventory must also have exited 0.
 fn seed_inventory_refusal(
     artifacts: &Path,
     inventory: &str,
     bound: &Bound<'_>,
+    harness: &str,
     file: Option<&str>,
     input: &str,
 ) -> Option<String> {
@@ -584,6 +614,7 @@ fn seed_inventory_refusal(
         .filter(|row| row.get("status").and_then(Value::as_str) == Some("admitted"))
         .any(|row| {
             row.get("input_sha256").and_then(Value::as_str) == Some(input)
+                && row.pointer("/sidecar/harness").and_then(Value::as_str) == Some(harness)
                 && file.is_none_or(|file| row.get("file").and_then(Value::as_str) == Some(file))
         });
     (!admitted).then(|| format!("the release seed inventory doesn't admit input {input}"))
@@ -784,6 +815,15 @@ pub fn record(
         .parent()
         .and_then(Path::file_name)
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    // Evidence links are relative to the archive root, the published
+    // record's directory, which holds `<runs>/<run>/<artifacts>` as the
+    // shared runner lays it out.
+    let runs_name = artifacts
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let archive_artifacts = format!("{runs_name}/{run_name}/{artifacts_name}");
     // Every file below is read only once the whole tree is safe to read.
     let unsafe_tree = header::tree_refusal(artifacts);
     // The task that changed the subject checkout, which every later task's
@@ -813,14 +853,24 @@ pub fn record(
         // A seed or witness counts only on an input the release build's own
         // inventory admitted.
         let refusal = match task {
-            Task::Seed { file, input, .. } => {
-                seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, Some(file), input)
+            Task::Seed {
+                file,
+                harness,
+                input,
+                ..
+            } => seed_inventory_refusal(
+                artifacts,
+                SEED_INVENTORY,
+                &bound,
+                harness,
+                Some(file),
+                input,
+            ),
+            Task::SeedWitness { harness, input, .. } => {
+                seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, harness, None, input)
             }
-            Task::SeedWitness { input, .. } => {
-                seed_inventory_refusal(artifacts, SEED_INVENTORY, &bound, None, input)
-            }
-            Task::RaceSchedule { input, .. } => {
-                seed_inventory_refusal(artifacts, RACE_INVENTORY, &bound, None, input)
+            Task::RaceSchedule { harness, input, .. } => {
+                seed_inventory_refusal(artifacts, RACE_INVENTORY, &bound, harness, None, input)
             }
             _ => None,
         };
@@ -867,7 +917,7 @@ pub fn record(
         evidence.insert(
             task.expected().to_owned(),
             Evidence {
-                artifacts: vec![format!("{artifacts_name}/{index}")],
+                artifacts: vec![format!("{archive_artifacts}/{index}")],
                 binaries,
                 applicable: credited,
                 properties: trace_properties(task, &dir),
@@ -1189,7 +1239,12 @@ fn judge_task(
             Some(command) => command_passed(&command, args),
             None => blocked("the command left no command.json".to_owned()),
         },
-        Task::Measure { harness, input, .. } => {
+        Task::Measure {
+            harness,
+            input,
+            violates,
+            ..
+        } => {
             let Some(measure) = own("measure.json") else {
                 return blocked("the recording left no measure.json".to_owned());
             };
@@ -1216,7 +1271,12 @@ fn judge_task(
                 &trace,
                 bound,
                 (harness, Some(input.as_deref().unwrap_or(EMPTY_SHA256))),
-                &RunExpect::Passes,
+                &violates
+                    .as_ref()
+                    .map_or(RunExpect::Passes, |property| RunExpect::Violates {
+                        property: property.clone(),
+                        also: Vec::new(),
+                    }),
                 applicable,
             )
         }

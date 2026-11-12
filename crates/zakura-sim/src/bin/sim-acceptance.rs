@@ -102,11 +102,9 @@ mod cli {
                         "--out",
                     ],
                 )?;
-                let plan: Sim7Plan = serde_json::from_str(
-                    &fs::read_to_string(&flags["--plan"])
-                        .map_err(|e| format!("{}: {e}", flags["--plan"]))?,
-                )
-                .map_err(|e| format!("{}: {e}", flags["--plan"]))?;
+                let plan: Sim7Plan = zakura_sim::sim_acceptance::header::read_bounded_json(
+                    &PathBuf::from(&flags["--plan"]),
+                )?;
                 let header_out = PathBuf::from(&flags["--header-out"]);
                 let record = record(
                     &PathBuf::from(&flags["--repo"]),

@@ -136,7 +136,9 @@ fn read_honest_status(view: &StorageView, log: &ObservationLog) -> bool {
 /// `SnapshotAdopted` of that height discharges ([`adopted_successor`]).
 /// The progress fixture's chains are one branch of one fixture, so that
 /// height names the honest peer's tip, the header the `Status` advertises.
-/// Every other step is `NotApplicable`.
+/// Every other step is `NotApplicable`. Only that one step opens anything,
+/// and it opens one obligation, so the check finds at most one failure in a
+/// run, its expiry, and C21's two-finding tests leave it out.
 fn check_honest_progress<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let read_now = cx.observations().any(|obs| {
         matches!(
@@ -266,7 +268,12 @@ pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<
 /// Otherwise it opens one obligation, which the first later
 /// `SnapshotAdopted` that meets it discharges ([`recovery_answer`]). Both
 /// read [`RecoveryEvidence::progress`], as the liveness harness's finish
-/// and deadline sources do. Every other step is `NotApplicable`.
+/// and deadline sources do. Every other step is `NotApplicable`. The
+/// scenario grammar admits no control step after a `Recover`, so a run
+/// holds one recovery, which either ends unreached or records one
+/// `recovered` pick. So the check finds at most one failure in a run, that
+/// pick's violation or its one obligation's expiry, and C21's two-finding
+/// tests leave it out.
 ///
 /// [`RecoveryObjective`]: crate::harness::header_node::recovery::RecoveryObjective
 /// [`RecoveryEvidence::progress`]: crate::harness::header_node::recovery::RecoveryEvidence::progress

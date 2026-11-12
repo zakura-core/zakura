@@ -4649,6 +4649,63 @@ mod tests {
         }
     }
 
+    /// C5, for a standalone witness history: its run counts only when the
+    /// binary that recorded its trace and the one its witness test ran in
+    /// both embed the subject's source digest. A trace recorded by a binary
+    /// built from other source, or one embedding the `unknown` marker, a
+    /// witness test from a stale binary or one that embeds no digest, each
+    /// fail the run, naming why. An unknown digest matches nothing, not
+    /// even an unknown subject's.
+    #[test]
+    fn a_history_from_a_stale_binary_is_refused() {
+        let read = |subject: &str, trace: Option<&str>, binary: Option<&str>| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            history_task_dir(dir.path(), None);
+            if let Some(source) = trace {
+                rewrite(&dir.path().join("run"), |lines| {
+                    lines[0]["meta"]["build"]["source"] = Value::String(source.to_owned());
+                });
+            }
+            if let Some(source) = binary {
+                let path = dir.path().join(TEST_FILE);
+                let mut ran: TestRun =
+                    serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                        .expect("it reads back");
+                ran.binary_source = Some(source.to_owned());
+                fs::write(&path, serde_json::to_string(&ran).expect("it serializes"))
+                    .expect("the temp dir is writable");
+            }
+            history_execution(
+                dir.path(),
+                history_run(),
+                NODE,
+                ("p/a", None),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                subject,
+            )
+            .end
+        };
+        let fresh = read("s", None, None);
+        assert!(!matches!(fresh, End::Failed { .. }), "{fresh:?}");
+        let refused = |end: End, why: &str| {
+            assert!(
+                matches!(&end, End::Failed { why: found } if found.contains(why)),
+                "{why}: {end:?}"
+            );
+        };
+        let stale_trace = "its trace's build source isn't the subject's";
+        let stale_test = "its witness test zakura-sim/tests/header_node.rs::test didn't pass at S";
+        refused(read("s", Some("stale"), None), stale_trace);
+        refused(read("s", Some("unknown"), None), stale_trace);
+        refused(read("s", None, Some("stale")), stale_test);
+        refused(read("s", None, Some(NOT_EMBEDDED)), stale_test);
+        // Unknown on both sides, the subject's and every binary's.
+        refused(
+            read("unknown", Some("unknown"), Some("unknown")),
+            stale_trace,
+        );
+    }
+
     /// A counted witness test's declarations must be exactly the counted
     /// histories the committed inventory names for it. The storage
     /// witness's 32 plans declared once each pass. One missing, one extra,

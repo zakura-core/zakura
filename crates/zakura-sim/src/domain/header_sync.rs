@@ -613,8 +613,9 @@ where
 /// run left. A break the step's drain found violates at once. In the fork
 /// fixture, a step after which no task can run, whose drain found every
 /// other settled-point condition, is a settled point, and the engine's tip
-/// there must be a heaviest mirror tip ([`settled`]). It applies once a
-/// drain judged a record, until a drain found a run corrupt.
+/// there must be a heaviest mirror tip ([`settled`]). A step can break
+/// both, and each is its own violation there. It applies once a drain
+/// judged a record, until a drain found a run corrupt.
 ///
 /// [`settled`]: crate::harness::header_node::fork_choice::settled
 fn check_expected_chain_selected<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -624,32 +625,38 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let expected = "the engine selects a max-work eligible tip, scored with its work";
-    let mut breaks = view
+    let selects = "the engine selects a max-work eligible tip, scored with its work";
+    let mut breaks: Vec<(&str, String)> = view
         .claims()
         .at(step, &[Claim::ExpectedChainSelected])
-        .into_iter();
-    if let Some(first) = breaks.next() {
-        for other in breaks {
-            cx.record_violation(expected, other.detail);
-        }
-        return cx.violated(expected, first.detail);
-    }
+        .into_iter()
+        .map(|record| (selects, record.detail))
+        .collect();
     // A corrupt engine state is `commit-only-authorized`'s, and nothing
     // after it is judged here, so no later step counts as passed.
-    if view.fork_choice().tainted_by(step) {
-        return Verdict::NotApplicable;
-    }
+    let tainted = view.fork_choice().tainted_by(step);
     // A settled point needs no task able to run after the step, which only
     // the scheduler's status says.
-    let at_rest = crate::at_rest(cx.status);
-    if let (true, Some(verdict)) = (at_rest, view.fork_choice().settled_at(step)) {
-        if let Some(detail) = verdict {
-            return cx.violated(
-                "a settled node in the fork fixture is on the heaviest mirror chain",
-                detail,
-            );
+    let settled = (!tainted && crate::at_rest(cx.status))
+        .then(|| view.fork_choice().settled_at(step))
+        .flatten();
+    if let Some(Some(detail)) = &settled {
+        breaks.push((
+            "a settled node in the fork fixture is on the heaviest mirror chain",
+            detail.clone(),
+        ));
+    }
+    let mut breaks = breaks.into_iter();
+    if let Some((expected, actual)) = breaks.next() {
+        for (expected, actual) in breaks {
+            cx.record_violation(expected, actual);
         }
+        return cx.violated(expected, actual);
+    }
+    if tainted {
+        return Verdict::NotApplicable;
+    }
+    if settled.is_some() {
         return Verdict::Holds;
     }
     if view.fork_choice().applicable_by(step) {
@@ -1735,8 +1742,8 @@ where
 }
 
 /// Checks the watch rule for `queue` over the view's adoption evidence
-/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
-/// published. A publication still waiting for its read or its third event
+/// ([`AdoptionEvidence::watch_read`]), each publication it broke its own
+/// violation. It applies once a state is published. A publication still waiting for its read or its third event
 /// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
 /// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
@@ -1751,11 +1758,18 @@ where
             cx.pending(Pending::WatchOpen);
             Verdict::Holds
         }
-        WatchRead::Broken(why) => cx.violated(
-            "each published state is read from the committed watch before a third event \
-             from the flooded queue",
-            why,
-        ),
+        WatchRead::Broken(breaks) => {
+            let expected = "each published state is read from the committed watch before a \
+                            third event from the flooded queue";
+            let mut breaks = breaks.into_iter();
+            let first = breaks
+                .next()
+                .expect("watch_read returns Broken only with a break");
+            for other in breaks {
+                cx.record_violation(expected, other);
+            }
+            cx.violated(expected, first)
+        }
     }
 }
 
@@ -1881,17 +1895,27 @@ mod tests {
     };
 
     use super::{
-        chunk_budget_bound, commit_only_authorized, stale_completion_inert,
-        teardown_end_violations, teardown_returns_baseline, AuthorityView, BudgetView,
-        EndViolation, StaleView, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND,
-        CHUNK_BUDGET_CAPACITY, COMMIT_ONLY_AUTHORIZED, STALE_COMPLETION_INERT,
+        chunk_budget_bound, commit_only_authorized, outstanding_work_bounded,
+        peer_retirement_progress, reset_invalidates_work, stale_chain_effect_inert,
+        stale_completion_inert, state_publication_consistent, teardown_end_violations,
+        teardown_returns_baseline, AuthorityView, BudgetView, ChainView, EndViolation,
+        OutstandingView, PublicationView, ResetView, RetirementView, StaleView, TeardownView,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, COMMIT_ONLY_AUTHORIZED,
+        OUTSTANDING_WORK_BOUNDED, PEER_RETIREMENT_PROGRESS, RESET_INVALIDATES_WORK,
+        STALE_CHAIN_EFFECT_INERT, STALE_COMPLETION_INERT, STATE_PUBLICATION_CONSISTENT,
         TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
             authority::AuthorityEvidence,
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
+            chain_effect::ChainEffectEvidence,
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+            ends::EndEvidence,
+            outstanding::OutstandingEvidence,
+            publication::PublicationEvidence,
+            retirement::RetirementEvidence,
+            round_life::RoundLifeEvidence,
             stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
@@ -1958,6 +1982,12 @@ mod tests {
         rounds: SettlementEvidence,
         stale_calls: StaleEvidence,
         authority: AuthorityEvidence,
+        round_life: RoundLifeEvidence,
+        outstanding: OutstandingEvidence,
+        chain_effect: ChainEffectEvidence,
+        publication: PublicationEvidence,
+        ends: EndEvidence,
+        retirement: RetirementEvidence,
     }
 
     impl Default for Probe {
@@ -1970,7 +2000,71 @@ mod tests {
                 rounds: SettlementEvidence::new(&stores),
                 stale_calls: StaleEvidence::new(&stores),
                 authority: AuthorityEvidence::new(&stores),
+                round_life: RoundLifeEvidence::new(&stores),
+                outstanding: OutstandingEvidence::new(&stores),
+                chain_effect: ChainEffectEvidence::new(&stores),
+                publication: PublicationEvidence::new(&stores),
+                ends: EndEvidence::new(&stores),
+                retirement: RetirementEvidence::new(&stores),
             }
+        }
+    }
+
+    impl ResetView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn round_life(&self) -> &RoundLifeEvidence {
+            &self.round_life
+        }
+    }
+
+    impl OutstandingView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn outstanding(&self) -> &OutstandingEvidence {
+            &self.outstanding
+        }
+    }
+
+    impl ChainView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn chain_effect(&self) -> &ChainEffectEvidence {
+            &self.chain_effect
+        }
+    }
+
+    impl PublicationView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn publication(&self) -> &PublicationEvidence {
+            &self.publication
+        }
+
+        fn ends(&self) -> &EndEvidence {
+            &self.ends
+        }
+    }
+
+    impl RetirementView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn ends(&self) -> &EndEvidence {
+            &self.ends
+        }
+
+        fn retirement(&self) -> &RetirementEvidence {
+            &self.retirement
         }
     }
 
@@ -2030,6 +2124,11 @@ mod tests {
         /// [`teardown_end_violations`].
         fn end_violations(&self, _: &ObservationLog) -> Vec<EndViolation> {
             teardown_end_violations(&self.rounds)
+        }
+
+        /// The probe's stores, as a node harness reports its own.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            Some(self.rounds.stores().report_snapshot())
         }
     }
 
@@ -2920,6 +3019,218 @@ mod tests {
                     .expect("the trace replays");
             assert!(replayed.verified(), "{case:?}: {replayed:?}");
             assert_eq!(replayed.report.as_ref(), Some(&full), "{case:?}");
+        }
+    }
+
+    /// One of C21's claim-reading header checks, each with two distinct
+    /// failures the tap's drain keeps at one boundary.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum TwoFindings {
+        /// An `OverBudget` reservation beside a probe read over capacity.
+        Budget,
+        /// A round's leaked reservation beside a teardown's held locator
+        /// permits.
+        Teardown,
+        /// Two stale completions' forbidden effects.
+        Stale,
+        /// A reset the work didn't follow beside an obsolete round retired
+        /// before its release.
+        Reset,
+        /// Two containers over their bounds.
+        Outstanding,
+        /// Two stale applies that changed the engine.
+        Chain,
+        /// Two adoptions no engine record holds.
+        Publication,
+        /// A departed session's slot beside its unreleased round.
+        Retirement,
+    }
+
+    impl TwoFindings {
+        /// Every case, one per check.
+        const ALL: [TwoFindings; 8] = [
+            TwoFindings::Budget,
+            TwoFindings::Teardown,
+            TwoFindings::Stale,
+            TwoFindings::Reset,
+            TwoFindings::Outstanding,
+            TwoFindings::Chain,
+            TwoFindings::Publication,
+            TwoFindings::Retirement,
+        ];
+
+        /// The check it breaks.
+        fn property(self) -> &'static str {
+            match self {
+                TwoFindings::Budget => CHUNK_BUDGET_BOUND,
+                TwoFindings::Teardown => TEARDOWN_RETURNS_BASELINE,
+                TwoFindings::Stale => STALE_COMPLETION_INERT,
+                TwoFindings::Reset => RESET_INVALIDATES_WORK,
+                TwoFindings::Outstanding => OUTSTANDING_WORK_BOUNDED,
+                TwoFindings::Chain => STALE_CHAIN_EFFECT_INERT,
+                TwoFindings::Publication => STATE_PUBLICATION_CONSISTENT,
+                TwoFindings::Retirement => PEER_RETIREMENT_PROGRESS,
+            }
+        }
+
+        /// The claim breaks the boundary's drain keeps. The budget case's
+        /// second finding is the probe's over-capacity read instead.
+        fn claims(self) -> &'static [Claim] {
+            match self {
+                TwoFindings::Budget => &[Claim::OverBudget],
+                TwoFindings::Teardown => &[Claim::LeakedReservation, Claim::TeardownLocatorPermits],
+                TwoFindings::Stale => &[Claim::StaleCompletionEffect, Claim::StaleCompletionEffect],
+                TwoFindings::Reset => {
+                    &[Claim::ResetInvalidatesWork, Claim::UnreleasedObsoleteRound]
+                }
+                TwoFindings::Outstanding => &[Claim::OutstandingWork, Claim::OutstandingWork],
+                TwoFindings::Chain => &[Claim::StaleChainEffect, Claim::StaleChainEffect],
+                TwoFindings::Publication => &[
+                    Claim::StatePublicationConsistent,
+                    Claim::StatePublicationConsistent,
+                ],
+                TwoFindings::Retirement => &[
+                    Claim::PeerRetirementProgress,
+                    Claim::UnreleasedDepartedRound,
+                ],
+            }
+        }
+
+        /// The claim records the case's drain keeps at `step`, each worded
+        /// apart.
+        fn records(self, step: u64) -> Vec<ClaimRecord> {
+            self.claims()
+                .iter()
+                .enumerate()
+                .map(|(index, &claim)| ClaimRecord {
+                    step,
+                    claim,
+                    detail: format!("{claim:?}: the boundary's finding {index}"),
+                    attribution: None,
+                })
+                .collect()
+        }
+
+        /// The two findings the check reports, in order.
+        fn findings(self) -> Vec<String> {
+            let mut findings: Vec<String> = self
+                .records(1)
+                .into_iter()
+                .map(|record| record.detail)
+                .collect();
+            if self == TwoFindings::Budget {
+                findings.push(format!(
+                    "the probe reads {} reserved and 0 owned",
+                    CHUNK_BUDGET_CAPACITY + 1
+                ));
+            }
+            findings
+        }
+    }
+
+    impl crate::harness::scripted::Script for Probe {
+        const NAME: &'static str = "test/two-claim-findings";
+        type Case = TwoFindings;
+
+        /// Every claim-reading check a case breaks.
+        fn properties() -> Vec<Property<crate::harness::scripted::ScriptRun<Probe>>> {
+            vec![
+                chunk_budget_bound(),
+                teardown_returns_baseline(),
+                stale_completion_inert(),
+                reset_invalidates_work(),
+                outstanding_work_bounded(),
+                stale_chain_effect_inert(),
+                state_publication_consistent(),
+                peer_retirement_progress(),
+            ]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// The case's claim breaks at step 1, as the tap's drain records
+        /// them, and for the budget case a probe read over capacity there.
+        fn observe(&self, case: &TwoFindings, log: &mut ObservationLog) {
+            let step = log.step();
+            if step != 1 {
+                return;
+            }
+            for record in case.records(step) {
+                self.claims.record(record);
+            }
+            if *case == TwoFindings::Budget {
+                self.capacity.record(CapacityReading {
+                    step,
+                    reserved: CHUNK_BUDGET_CAPACITY + 1,
+                    owned: 0,
+                    locator_permits: 0,
+                    compared: false,
+                    teardown: false,
+                });
+            }
+        }
+    }
+
+    /// C21 through the sidecar, for each claim-reading header check: two
+    /// distinct failures at step 1 are two violations there, both in the
+    /// full report recorded beside the trace and its fresh replay, and the
+    /// claims store in the report's snapshot keeps both breaks. No other
+    /// check reports one.
+    #[test]
+    fn each_claim_check_keeps_two_findings_at_a_boundary_in_the_sidecar() {
+        use crate::harness::scripted::{findings, sidecar};
+        for case in TwoFindings::ALL {
+            let full = sidecar::<Probe>(&case, &[]);
+            let found = findings(&full, case.property());
+            let actual: Vec<(u64, &str, &str)> = found
+                .violations
+                .iter()
+                .map(|violation| {
+                    (
+                        violation.step,
+                        violation.property.as_str(),
+                        violation.actual.as_str(),
+                    )
+                })
+                .collect();
+            let wanted = case.findings();
+            let expected: Vec<(u64, &str, &str)> = wanted
+                .iter()
+                .map(|actual| (1, case.property(), actual.as_str()))
+                .collect();
+            assert_eq!(actual, expected, "{case:?}");
+            assert_eq!(found.violations.len(), 2, "{case:?}");
+            assert_eq!(found.end_found, 0, "{case:?}: both at their step");
+            assert_eq!(
+                found.outcome,
+                PropertyOutcome::Violated { witness: vec![1] },
+                "{case:?}"
+            );
+            for other in &full.properties {
+                if other.property != case.property() {
+                    assert!(other.violations.is_empty(), "{case:?}: {other:?}");
+                }
+            }
+            let rows = full
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.as_array())
+                .and_then(|stores| stores.iter().find(|store| store["store"] == "claims"))
+                .and_then(|store| store["snapshot"].as_array().cloned())
+                .expect("the claims store is in the report's snapshot");
+            let kept: Vec<&str> = rows
+                .iter()
+                .filter_map(|row| row["detail"].as_str())
+                .collect();
+            let recorded: Vec<String> = case
+                .records(1)
+                .into_iter()
+                .map(|record| record.detail)
+                .collect();
+            assert_eq!(kept, recorded, "{case:?}");
         }
     }
 }

@@ -506,6 +506,58 @@ const STALE_PREPARE: HistoryRef = HistoryRef {
     case: "committed stale-prepare input",
 };
 
+/// The mixed resource witness's test (gate 5), which runs its committed
+/// fixture once.
+const MIXED_TEST: TestRef = sim_test(
+    "tests/header_mixed_resources.rs",
+    "the_mixed_fixture_holds_every_resource_rule",
+);
+
+/// Gate 5's mixed resource witness: the one storage history where close and
+/// relink churn, a reset, a reply hold, a held prepare, a `Shutdown` and a
+/// `StopStorage` run together. It's counted once per resource rule in
+/// [`MIXED_TARGETS`], each with its own whole-report pass, and its test's
+/// own pass is `gate-5/mixed-witness`, which also requires the control
+/// picks in order and the node settled at its reactor's exit. Like every
+/// `Holds`, these count only in the frozen-head run's record, which runs on
+/// `main` once hdr-14 has merged.
+const MIXED_RESOURCES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: MIXED_TEST,
+    case: "header-resources-mixed",
+};
+
+/// The four `Sim` resource rules [`MIXED_RESOURCES`] judges.
+const MIXED_TARGETS: [&str; 4] = [CHUNK, TEARDOWN, STALE, OUTSTANDING];
+
+/// What stays `NotApplicable` on [`MIXED_RESOURCES`], each with the reason
+/// its report carries: no storage scenario declares a livelock assumption
+/// or a recovery. Every other ID the storage harness registers must hold.
+const MIXED_NA: &[ExpectedNa] = &[
+    ExpectedNa {
+        property: SIM_WIDE[1],
+        reason: "undeclared",
+    },
+    ExpectedNa {
+        property: RECOVERY_ID,
+        reason: "undeclared",
+    },
+];
+
+/// `property`'s `Holds` on [`MIXED_RESOURCES`]. It takes its key, the
+/// history's pass for `property`, from [`attach_history_passes`].
+fn mixed(property: &'static str) -> ExpectedResult {
+    result(
+        Vec::new(),
+        G5,
+        Expected::Holds {
+            property,
+            history: MIXED_RESOURCES,
+            not_applicable: MIXED_NA,
+        },
+    )
+}
+
 /// Each reset witness's name, as its witness test prefixes its executions.
 const RESET_CASES: [&str; 10] = [
     "held-locator ",
@@ -988,16 +1040,20 @@ fn plan_cases(prefix: &'static str, inputs: &'static str, count: usize) -> Vec<&
 /// from the tests. Each owes its replay, its cleanup comparison and, on a
 /// node harness, its expected `NotApplicable` list, whether or not a row's
 /// `Holds` names it. Tests that run several, such as the honest-peer
-/// witness's five, list each.
+/// witness's five, list each. A history [`history_targets`] counts for
+/// several targets is listed once.
 pub fn counted_histories() -> Vec<HistoryRef> {
+    let mut seen = std::collections::BTreeSet::new();
     history_targets()
         .into_iter()
         .map(|(history, _)| history)
+        .filter(|history| seen.insert(*history))
         .collect()
 }
 
 /// Every counted history with the property its whole-report pass judges as
-/// its target: the ID the witness test runs it for.
+/// its target: the ID the witness test runs it for. The mixed resource
+/// witness is run for each of its four rules, so it's listed once per rule.
 pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
     let mut histories = vec![(BOTH_WAYS, generated_ids()[0])];
     for (generated, id) in GENERATED.iter().zip(generated_ids()) {
@@ -1082,6 +1138,7 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             RECOVERY_ID,
         ));
     }
+    histories.extend(MIXED_TARGETS.map(|target| (MIXED_RESOURCES, target)));
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
@@ -1491,6 +1548,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(sim_row(DIRECT_DISPATCH, storage_harnesses, direct));
 
     let mut chunk = holds(CHUNK, G5, CLOSE_RELINK_CAPACITY);
+    chunk.push(mixed(CHUNK));
     chunk.extend(caught(
         STORAGE,
         case(CHUNK, "uncapped-secondary-reservation"),
@@ -1502,6 +1560,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(sim_row(CHUNK, storage_harnesses, chunk));
 
     let mut teardown = holds(TEARDOWN, G5, CLOSE_RELINK_TEARDOWN);
+    teardown.push(mixed(TEARDOWN));
     // `forgotten-completion`'s leak shows only at the end, as an end finding.
     for (index, (name, found)) in [
         ("forgotten-completion", Found::AtEnd),
@@ -1531,6 +1590,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(sim_row(TEARDOWN, storage_harnesses, teardown));
 
     let mut stale = holds(STALE, G5, STALE_PREPARE);
+    stale.push(mixed(STALE));
     for (index, name) in [
         "stale-charge",
         "stale-credit",
@@ -2144,6 +2204,7 @@ fn hand_written_rows() -> Vec<Row> {
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
+    outstanding.push(mixed(OUTSTANDING));
     // The two cancellation cases' publishers linger at rest, which the end
     // check finds.
     for (index, (name, harness, set, found)) in [
@@ -3082,12 +3143,7 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-5/mixed-witness",
         gates: G5,
-        expected: Expected::Open {
-            reason: obligation::GATE_5_MIXED_WITNESS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.8"),
-        },
+        expected: Expected::Passes { test: MIXED_TEST },
     },
 ];
 

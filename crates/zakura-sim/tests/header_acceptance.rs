@@ -1421,6 +1421,25 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             Some("header-sync/stale-completion-inert"),
             owned(&["committed stale-prepare input"]),
         ),
+    ];
+    // Gate 5's mixed resource witness, run for each of the four resource
+    // rules.
+    let mut groups = groups;
+    for target in [
+        "header-sync/chunk-budget-bound",
+        "header-sync/teardown-returns-baseline",
+        "header-sync/stale-completion-inert",
+        "header-sync/outstanding-work-bounded",
+    ] {
+        groups.push((
+            STORAGE,
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+            Some(target),
+            owned(&["header-resources-mixed"]),
+        ));
+    }
+    groups.extend([
         (
             "header-sync/release-wake",
             "tests/header_release_wake.rs",
@@ -1463,7 +1482,7 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             Some("header/publisher-policy"),
             owned(&["PUBLISHER_INPUT"]),
         ),
-    ];
+    ]);
     // Built once per call for a fixed test table, so the leaks are bounded.
     let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
     groups
@@ -1509,6 +1528,11 @@ fn every_history_names_its_case() {
     // the inventory must name every execution of every counted witness,
     // by its full identity.
     let targets: BTreeSet<(HistoryRef, &str)> = rows::history_targets().into_iter().collect();
+    assert_eq!(
+        targets.len(),
+        rows::history_targets().len(),
+        "each history once per target"
+    );
     assert_eq!(targets, pinned_histories());
     // A history differing from a pinned one only in its witness's file, in
     // its harness, or in the property it's run for, isn't that history.

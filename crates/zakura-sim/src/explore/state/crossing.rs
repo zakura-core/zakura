@@ -45,7 +45,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
 
-use crate::{model::Label, observe::TransportFact, Observation};
+use crate::{
+    check::FrameRef,
+    model::Label,
+    observe::{StreamId, TransportFact},
+    Observation,
+};
 
 /// The row of a node frame that ends a subscription.
 const ENDING_ROW: &str = "headers-outcome";
@@ -71,14 +76,12 @@ type SubscriptionKey = (u64, u64, u64);
 
 /// One crossed update: the update's identity and the label the peer's
 /// model gave it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Crossed {
-    /// The connection.
-    pub connection: u64,
-    /// The QUIC stream both frames travelled on.
-    pub quic_stream: u64,
-    /// The update's position among the peer's frames on the stream.
-    pub seq: u64,
+    /// The update, as its `PeerFrame` names it: its connection, its
+    /// stream's kind and version, the QUIC stream both frames travelled
+    /// on, and its position among the peer's frames there.
+    pub update: FrameRef,
     /// The subscription both frames name.
     pub subscription: u64,
     /// The update's label, from its `PeerFrame`.
@@ -99,6 +102,8 @@ struct Ending {
 /// What the join knows of one peer update.
 #[derive(Clone, Copy, Debug)]
 struct Update {
+    /// The stream its `PeerFrame` names.
+    stream: StreamId,
     /// The subscription it names.
     subscription: u64,
     /// Its label.
@@ -217,6 +222,7 @@ impl CrossingJoin {
             }
             Observation::PeerFrame {
                 connection,
+                stream,
                 quic_stream: Some(quic_stream),
                 seq,
                 ref row,
@@ -231,6 +237,7 @@ impl CrossingJoin {
                 self.updates.insert(
                     key,
                     Update {
+                        stream,
                         subscription,
                         label,
                         written: None,
@@ -337,9 +344,14 @@ impl CrossingJoin {
         }
         let (connection, quic_stream, seq) = update;
         Some(Crossed {
-            connection,
-            quic_stream,
-            seq,
+            update: FrameRef {
+                connection,
+                kind: up.stream.kind,
+                version: up.stream.version,
+                quic_stream,
+                inbound: true,
+                seq,
+            },
             subscription: up.subscription,
             label: up.label,
         })
@@ -498,9 +510,14 @@ mod tests {
     /// The crossing of update 1, labelled conformant.
     fn crossed() -> Vec<Crossed> {
         vec![Crossed {
-            connection: C,
-            quic_stream: Q,
-            seq: 1,
+            update: FrameRef {
+                connection: C,
+                kind: STREAM.kind,
+                version: STREAM.version,
+                quic_stream: Q,
+                inbound: true,
+                seq: 1,
+            },
             subscription: SUB,
             label: Label::Conformant,
         }]
@@ -695,7 +712,7 @@ mod tests {
             read_header(1, UPDATE_TYPE),
             judged(1),
         ];
-        let [crossing] = crossings(&log)[..] else {
+        let [crossing] = &crossings(&log)[..] else {
             panic!("one crossing");
         };
         assert_eq!(crossing.label, Label::BadCursor);

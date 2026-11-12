@@ -5,7 +5,9 @@
 //! trigger evidence) names what it joins by a [`Ref`]: the full identity
 //! the evidence carries for it, never a hand-picked part. That's, for a
 //! frame, its connection, stream, direction and sequence ([`FrameRef`],
-//! and [`ReadRef`] as its session's reader names it); for a subscription event, its peer, session and
+//! and [`ReadRef`] as its session's reader names it); for the stream a
+//! session reads, its connection, kind, version and QUIC stream
+//! ([`StreamRef`]); for a subscription event, its peer, session and
 //! subscription ([`SubscriptionRef`], and [`PageRef`] for a page staged on
 //! one); for work, its full owner ([`WorkRef`]); and for a finding, its
 //! subject ([`FindingSubject`](crate::check::FindingSubject)), such as the
@@ -42,6 +44,34 @@ pub fn joined<'a, T: 'a, R: Ref>(
 /// One transport frame, defined beside the findings that name it.
 pub use crate::check::FrameRef;
 impl Ref for FrameRef {}
+
+/// One QUIC stream of one connection, of one stream kind and version: what
+/// a `Session` row says its session reads, and what a frame travels on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The QUIC stream.
+    pub quic_stream: u64,
+}
+impl Ref for StreamRef {}
+
+impl From<&FrameRef> for StreamRef {
+    /// The stream `frame` travels on: every key of its ref but its
+    /// direction and sequence.
+    fn from(frame: &FrameRef) -> Self {
+        StreamRef {
+            connection: frame.connection,
+            kind: frame.kind,
+            version: frame.version,
+            quic_stream: frame.quic_stream,
+        }
+    }
+}
 
 /// One frame as its session's reader names it: the session, and the
 /// frame's position among the stream's reads. A session is one connection

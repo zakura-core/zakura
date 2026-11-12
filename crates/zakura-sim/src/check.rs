@@ -96,7 +96,7 @@ impl FindingSubject {
 
 /// One transport frame: its connection, its stream's kind and version, its
 /// QUIC stream, its direction and its sequence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrameRef {
     /// Its connection.

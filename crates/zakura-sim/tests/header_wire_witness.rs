@@ -1060,8 +1060,8 @@ const DEFAULT_PLAN: &str = "header-wire-default.plan";
 
 /// The committed scenarios of the generated IDs' typed planted cases
 /// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
-/// focused scenario ([`act_scenario`]) for each act no saved Plan takes, an
-/// adversary serving the node its chain and the held subscription, both
+/// focused scenario ([`act_scenario`]) for each act no saved Plan takes,
+/// the status bursts' cut at the 20th, an adversary serving the node its chain and the held subscription, both
 /// with no act, the node serving an honest subscriber, and two reserved
 /// flags `Status` frames over fixed 0 ms links, the two-finding case's.
 /// The saved Plans' inputs serve the other cases.
@@ -1073,6 +1073,11 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     held.peers[0].script.clear();
     let mut serving = act_scenario(Act::ExtraEnding);
     serving.peers[0].script.clear();
+    // The 20th burst's frame is the first to find the `Status` bucket
+    // empty, so `exhausted-cadence-throttled`'s script ends there, leaving
+    // its patched close no burst to try on the closed connection.
+    let mut burst = act_scenario(Act::StatusBurst);
+    burst.peers[0].script.truncate(20);
     vec![
         act(
             "status-bad-content",
@@ -1080,7 +1085,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
                 rule: ContentRule::StatusAnchor,
             },
         ),
-        act("status-burst", Act::StatusBurst),
+        ("status-burst", burst),
         act(
             "subscribe-headers-reserved-flags",
             Act::ReservedFlags {

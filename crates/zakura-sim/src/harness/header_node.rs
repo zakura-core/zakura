@@ -966,6 +966,9 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
+    /// The position in the control script of the step being carried out,
+    /// while one is, which each environment fact it records names.
+    acting: Cell<Option<usize>>,
     /// The mirror whose pages the harness holds back, if any.
     delayed_page: Option<DelayedPage>,
 }
@@ -1111,8 +1114,8 @@ pub const CHURN_RELINKS: u32 = 8;
 /// it, so a relink that returns after the pick closes its own link and
 /// stops. The pick sets [`Topology::stopping`] before the sweep runs, so a
 /// link the check passes is already in the sweep's copy.
-async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
-    let Some(index) = start.recv().await else {
+async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<(usize, usize)>) {
+    let Some((index, position)) = start.recv().await else {
         return;
     };
     drop(start);
@@ -1120,8 +1123,12 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
         if topology.stopping() {
             return;
         }
-        let (link, _far) = topology.open(index, 0, true);
-        topology.close(&link);
+        // Each relink and close is the churn step's own.
+        let _far = topology.acting_as(Some(position), || {
+            let (link, far) = topology.open(index, 0, true);
+            topology.close(&link);
+            far
+        });
         if topology.stopping() {
             return;
         }
@@ -1145,6 +1152,7 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
+            acting: Cell::new(None),
             delayed_page: None,
         }
     }
@@ -1214,11 +1222,23 @@ impl Topology {
     }
 
     /// Records in the node under test's tap that the harness's `action` on
-    /// `peer` ends `connection`, as [`ends`] describes.
+    /// `peer` ends `connection`, as [`ends`] describes, naming the control
+    /// step being carried out, if one is ([`Topology::acting_as`]).
     fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
         if let Some(tap) = &self.tap {
-            tap.environment(peer, connection, action);
+            tap.environment(peer, connection, action, self.acting.get());
         }
+    }
+
+    /// Runs `act` as the execution of the control script's step at
+    /// `position`, so every environment fact it records names that step,
+    /// or none for `None`. `act` must not wait, or another task's facts
+    /// could take its step.
+    fn acting_as<R>(&self, position: Option<usize>, act: impl FnOnce() -> R) -> R {
+        let outer = self.acting.replace(position);
+        let done = act();
+        self.acting.set(outer);
+        done
     }
 
     /// Closes `link` as the harness's own action, which the node under
@@ -1724,7 +1744,9 @@ pub struct Control {
     next: usize,
     /// Set once a `Shutdown` step was picked.
     shut_down: bool,
-    to_task: mpsc::Sender<ControlStep>,
+    /// Each queued step, with its position in the script, or `None` for a
+    /// recovery's relink, which no script step names.
+    to_task: mpsc::Sender<(Option<usize>, ControlStep)>,
     /// How many queued steps the task hasn't carried out yet.
     queued: Rc<Cell<usize>>,
     /// The node under test's port, for the steps the step loop carries out.
@@ -1747,17 +1769,18 @@ impl Control {
         script: Vec<ControlStep>,
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
-        let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
+        let (to_task, mut steps) =
+            mpsc::channel::<(Option<usize>, ControlStep)>(script.len().max(1));
         let task_topology = topology.clone();
         let queued = Rc::new(Cell::new(0));
         let task_queued = queued.clone();
         // One task per churn step, so each churned mirror competes for
         // steps on its own. The control task starts them in script order.
-        let mut to_churn: VecDeque<mpsc::Sender<usize>> = script
+        let mut to_churn: VecDeque<mpsc::Sender<(usize, usize)>> = script
             .iter()
             .filter(|step| step.action == ControlAction::Churn)
             .map(|_| {
-                let (start, started) = mpsc::channel::<usize>(1);
+                let (start, started) = mpsc::channel::<(usize, usize)>(1);
                 sim.scheduler()
                     .spawn_root("churn", churn(topology.clone(), started));
                 start
@@ -1768,30 +1791,35 @@ impl Control {
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
             let topology = task_topology;
-            while let Some(step) = steps.recv().await {
+            while let Some((position, step)) = steps.recv().await {
                 let link = || {
                     topology
                         .link_to(&step.peer)
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => topology.close(&link()),
-                    ControlAction::Relink => {
+                    ControlAction::Close => {
+                        topology.acting_as(position, || topology.close(&link()))
+                    }
+                    ControlAction::Relink => topology.acting_as(position, || {
                         let link = link();
                         topology.link(link.dialer, link.listener);
-                    }
+                    }),
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => topology.flood(&step.peer, &generators),
+                    ControlAction::Flood => {
+                        topology.acting_as(position, || topology.flood(&step.peer, &generators))
+                    }
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
                             .pop_front()
                             .expect("each churn step has its own task");
+                        let position = position.expect("a churn is a script step");
                         // The churn task gives up at a shutdown, which can be
                         // picked while this step waits in the queue. Its
                         // mirror then has nothing left to churn.
-                        let _ = start.send(index).await;
+                        let _ = start.send((index, position)).await;
                     }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
@@ -2201,7 +2229,7 @@ impl ActionSource for Control {
                     };
                     self.queued.set(self.queued.get() + 1);
                     self.to_task
-                        .try_send(step)
+                        .try_send((None, step))
                         .expect("recovery relinks only once the task took every step");
                     return;
                 }
@@ -2280,11 +2308,12 @@ impl ActionSource for Control {
         }
         if step.action == ControlAction::Shutdown {
             self.shut_down = true;
-            self.topology.expect_shutdown();
+            self.topology
+                .acting_as(Some(index), || self.topology.expect_shutdown());
         }
         self.queued.set(self.queued.get() + 1);
         self.to_task
-            .try_send(step)
+            .try_send((Some(index), step))
             .expect("the channel holds the whole script, and the task outlives the run");
     }
 }

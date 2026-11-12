@@ -716,14 +716,25 @@ impl TapShutdown {
     }
 
     /// Records that the harness's `action` on `peer` ends `connection`, or
-    /// every connection for a shutdown, as [`super::ends`] describes. Call
-    /// it where the harness acts, before the action takes effect.
-    pub fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
-        self.0.ends.record(EndFact::Environment {
-            peer: peer.to_owned(),
-            connection,
-            action,
-        });
+    /// every connection for a shutdown, as [`super::ends`] describes, made
+    /// by the control script's step at position `control`, if a scripted
+    /// step made it. Call it where the harness acts, before the action
+    /// takes effect.
+    pub fn environment(
+        &self,
+        peer: &str,
+        connection: Option<u64>,
+        action: EnvironmentAction,
+        control: Option<usize>,
+    ) {
+        self.0.ends.record_caused(
+            EndFact::Environment {
+                peer: peer.to_owned(),
+                connection,
+                action,
+            },
+            control,
+        );
     }
 
     /// Whether the stop is done: it began, and the reactor dropped its

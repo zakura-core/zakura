@@ -2946,6 +2946,110 @@ mod tests {
         );
     }
 
+    /// Each control step's effect is the fact its own execution recorded,
+    /// on a link the `sessions` store shows opened, in its turn. The
+    /// committed close-and-relink history's four steps each name their
+    /// own fact, so it's complete. Controls: a churn of `mirror-1` put
+    /// ahead of the script relinks it twice, and the script's later
+    /// `Relink` of it records nothing, so the churn's spare relink can't
+    /// stand for it. With the `Relink`'s own fact back, it's complete. A
+    /// relink naming a connection never opened to its peer, or one an
+    /// earlier relink named, and a close recorded after the next step's
+    /// relink each leave the run incomplete.
+    #[test]
+    fn each_control_effect_joins_its_own_step() {
+        let trace = crate::trace::TraceReader::open(storage_recording()).expect("it reads");
+        let report = full_report(storage_recording()).expect("the recording has its report");
+        let judged =
+            |trace: &Trace, report: &FullReport| actions(trace, report, &End::Completed, false);
+        assert_eq!(judged(&trace, &report), Actions::Complete);
+        // `report` with `name`'s store text rewritten by `edit`.
+        let edited = |report: &FullReport, name: &str, edit: &dyn Fn(&str) -> String| {
+            let mut report = report.clone();
+            for store in report
+                .snapshot
+                .as_mut()
+                .and_then(Value::as_array_mut)
+                .expect("a node run keeps its stores")
+            {
+                if store["store"] != name {
+                    continue;
+                }
+                let text = if name == "sessions" {
+                    &mut store["snapshot"]["facts"]
+                } else {
+                    &mut store["snapshot"]
+                };
+                let before = text.as_str().expect("a Debug snapshot").to_owned();
+                let after = edit(&before);
+                assert_ne!(before, after, "the edit applies to {name}");
+                *text = Value::String(after);
+            }
+            report
+        };
+        let relink =
+            "(21, Environment { peer: \"mirror-1\", connection: Some(4), action: Relink })";
+        let causes = "causes: [(4, 0), (12, 1), (18, 2), (21, 3)]";
+
+        // A churn of mirror-1 first, its pick ahead of the script's.
+        let mut churned = trace.clone();
+        churned.meta.scenario["controls"]
+            .as_array_mut()
+            .expect("the scenario lists its controls")
+            .insert(
+                0,
+                serde_json::json!({ "peer": "mirror-1", "action": "churn" }),
+            );
+        let first = churned
+            .steps
+            .iter()
+            .position(|step| step.pick.starts_with("peer:"))
+            .expect("the history picks a control step");
+        let mut pick = churned.steps[first].clone();
+        pick.pick = "peer:mirror-1:churn".into();
+        churned.steps.insert(first, pick);
+        let churn = |relink_by: usize| {
+            let report = edited(&report, "ends", &|text| {
+                text.replace(
+                    relink,
+                    &format!(
+                        "(5, Environment {{ peer: \"mirror-1\", connection: Some(9), action: Relink }}), {relink}"
+                    ),
+                )
+                .replace(
+                    causes,
+                    &format!("causes: [(4, 1), (5, 0), (12, 2), (18, 3), (21, {relink_by})]"),
+                )
+            });
+            edited(&report, "sessions", &|text| {
+                text.replacen(
+                    "LinkOpened",
+                    "LinkOpened { peer: \"mirror-1\", connection: 9, session_id: 9, dialer: \"node\" }, LinkOpened",
+                    1,
+                )
+            })
+        };
+        // The script's Relink is position 4, the churn 0.
+        assert_eq!(judged(&churned, &churn(0)), Actions::Incomplete);
+        assert_eq!(judged(&churned, &churn(4)), Actions::Complete);
+
+        for connection in ["Some(9)", "Some(3)"] {
+            let changed = edited(&report, "ends", &|text| {
+                text.replace(relink, &relink.replace("Some(4)", connection))
+            });
+            assert_eq!(
+                judged(&trace, &changed),
+                Actions::Incomplete,
+                "{connection}"
+            );
+        }
+        let late = edited(&report, "ends", &|text| {
+            text.replace("(18, Environment", "(30, Environment")
+                .replace("(18, 2)", "(30, 2)")
+        });
+        assert_eq!(judged(&trace, &late), Actions::Incomplete);
+    }
+
     /// An execution is read from a real machine trace: its reports, end,
     /// actions, leak count and digest. A machine trace, input and no
     /// control list, is a whole completed run, as a machine baseline must

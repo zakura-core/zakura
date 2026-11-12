@@ -237,8 +237,10 @@ pub enum Task {
         harness: String,
         /// The property whose witness the recording runs.
         property: String,
-        /// `--expect`'s value for that witness, or `None` to record with no
-        /// witness.
+        /// `--expect`'s value for that witness: `holds` for a `Holds`, and
+        /// `not-applicable` for a `StaysNotApplicable`, whose target stays
+        /// `NotApplicable` while its trigger history is reached. `None`
+        /// records with no witness, which shows no trigger.
         expect: Option<String>,
         /// Its witness test's package.
         package: String,
@@ -429,11 +431,11 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             Expected::Holds {
                 property, history, ..
             } => tasks.push(history_task(id, property, history, Some("holds"))),
-            // A target that stays NotApplicable has no witness expectation
-            // to record it under, so its trigger history isn't shown.
+            // A target that stays NotApplicable records its trigger history
+            // under the `not-applicable` expectation.
             Expected::StaysNotApplicable {
                 property, history, ..
-            } => tasks.push(history_task(id, property, history, None)),
+            } => tasks.push(history_task(id, property, history, Some("not-applicable"))),
             Expected::Caught {
                 case,
                 harness,
@@ -3261,6 +3263,51 @@ mod tests {
             };
             assert!(plan(&both, repo.path()).is_err(), "{refused}");
         }
+    }
+
+    /// Each history task records its target's witness: a `Holds` under
+    /// `holds`, and a `StaysNotApplicable` under `not-applicable`, so its
+    /// trigger history is recorded beside its target's `NotApplicable`.
+    /// A `not-applicable` witness of the task's own property supplies its
+    /// trigger, and one recorded under `holds` doesn't.
+    #[test]
+    fn a_stays_not_applicable_task_records_its_trigger() {
+        let manifest = Manifest::committed();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&manifest, &repo).expect("the committed manifest plans");
+        let mut stays = 0;
+        for task in &plan.tasks {
+            if let Task::History {
+                expected, expect, ..
+            } = task
+            {
+                let wanted = match expected {
+                    ExpectedId::StaysNotApplicable { .. } => {
+                        stays += 1;
+                        "not-applicable"
+                    }
+                    _ => "holds",
+                };
+                assert_eq!(expect.as_deref(), Some(wanted), "{expected:?}");
+            }
+        }
+        assert_eq!(stays, 2);
+        let read = |expect: &str| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            let witness =
+                serde_json::json!({ "property": "p/a", "expect": expect, "passed": true });
+            history_task_dir(dir.path(), Some(witness));
+            history_execution(
+                dir.path(),
+                history_run(),
+                NODE,
+                ("p/a", Some("not-applicable")),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        assert!(read("not-applicable").trigger);
+        assert!(!read("holds").trigger);
     }
 
     /// An artifacts directory counts only for the run of S it names: one

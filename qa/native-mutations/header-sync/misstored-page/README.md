@@ -1,5 +1,12 @@
 # Misstored page
 
+Retired as a duplicate of the planted case
+`qa/planted/header-sync/commit-only-authorized/stored-order`, which reverses
+the page one call down, in `WorkPolicy::stage_page`, so the round stores the
+same headers. On that case's forks-sharing-a-header input both first violate
+`header-sync/commit-only-authorized` at step 709 with the same `UnstagedPage`
+finding. The witness below is the retired mutation's own.
+
 `misstored-page.patch` has `PeerWorkQueue::stage_page` add a page's headers to
 its round in reverse order. The round holds as many headers as it staged, so
 only what it stored differs, and the check fires at staging, before any

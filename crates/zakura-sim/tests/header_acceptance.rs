@@ -1808,10 +1808,7 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "late-fault-unpenalized",
         NativePin::Move("header-sync/header-fault-penalized", "hdr-14.4"),
     ),
-    (
-        "misstored-page",
-        NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),
-    ),
+    ("misstored-page", NativePin::Retired),
     (
         "own9-join",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.1a"),

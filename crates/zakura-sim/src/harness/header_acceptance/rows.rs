@@ -2982,7 +2982,15 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "late-fault-unpenalized",
         },
     },
-    to_move("misstored-page", COMMIT, "hdr-9c.1a"),
+    NativeMutation {
+        patch: "misstored-page",
+        class: NativeClass::Retired {
+            reason: "a duplicate of the planted case commit-only-authorized/stored-order, which \
+                     reverses the same page one call down, in WorkPolicy::stage_page, and on the \
+                     forks-sharing-a-header input first fails with the same UnstagedPage at step \
+                     709",
+        },
+    },
     to_move("own9-join", COMMIT, "hdr-9c.1a"),
     NativeMutation {
         patch: "owner-swap",

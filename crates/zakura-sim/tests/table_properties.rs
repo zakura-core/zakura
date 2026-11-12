@@ -526,17 +526,25 @@ fn every_unjustified_punishment_is_a_violation() {
     assert_eq!(
         violations(&report, id),
         [
-            violation(
-                id,
-                (1, &[1]),
-                "connection 1's judged frames are all conformant, so no punishment",
-                close
+            punished(
+                violation(
+                    id,
+                    (1, &[1]),
+                    "connection 1's judged frames are all conformant, so no punishment",
+                    close
+                ),
+                1,
+                5
             ),
-            violation(
-                id,
-                (1, &[1]),
-                "connection 2's judged frames are all conformant, so no punishment",
-                close
+            punished(
+                violation(
+                    id,
+                    (1, &[1]),
+                    "connection 2's judged frames are all conformant, so no punishment",
+                    close
+                ),
+                2,
+                6
             ),
         ]
     );
@@ -581,6 +589,19 @@ fn violations<'r>(report: &'r RunReport, id: &str) -> &'r [Violation] {
         .find(|p| p.property == id)
         .unwrap_or_else(|| panic!("{id} is registered"))
         .violations
+}
+
+/// `violation` about the punishment of `connection` by the observation at
+/// `event` in the run's log, these tests' frames naming no QUIC stream.
+fn punished(violation: Violation, connection: u64, event: u64) -> Violation {
+    Violation {
+        subject: Some(zakura_sim::FindingSubject::Punishment {
+            connection,
+            event,
+            frame: None,
+        }),
+        ..violation
+    }
 }
 
 /// A violation of `property` at `step`, with `witness`, `expected` and
@@ -656,17 +677,25 @@ fn every_cadence_punishment_at_a_boundary_is_reported() {
     assert_eq!(
         violations(&report, id),
         [
-            violation(
-                id,
-                (2, &[2]),
-                "connection 1's judged frames are all conformant, so no punishment",
-                "a close with cause request_protocol_reject"
+            punished(
+                violation(
+                    id,
+                    (2, &[2]),
+                    "connection 1's judged frames are all conformant, so no punishment",
+                    "a close with cause request_protocol_reject"
+                ),
+                1,
+                5
             ),
-            violation(
-                id,
-                (2, &[2]),
-                "connection 2's judged frames are all conformant, so no punishment",
-                "a Misbehavior"
+            punished(
+                violation(
+                    id,
+                    (2, &[2]),
+                    "connection 2's judged frames are all conformant, so no punishment",
+                    "a Misbehavior"
+                ),
+                2,
+                6
             ),
         ]
     );

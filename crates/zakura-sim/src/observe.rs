@@ -2127,10 +2127,24 @@ pub struct KindLoad {
     pub raw_held: u64,
     /// The raw gate's capacity, as the gate reports it.
     pub raw_capacity: u64,
+    /// The raw gate's free bytes above its capacity: bytes released more
+    /// often than granted. The row omits it while it is 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub raw_excess: u64,
     /// Queued output frame bytes the kind's frames hold.
     pub output_held: u64,
     /// The output gate's capacity, as the gate reports it.
     pub output_capacity: u64,
+    /// The output gate's free bytes above its capacity. The row omits it
+    /// while it is 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub output_excess: u64,
+}
+
+/// Whether `bytes` is 0, so a row omits the field and an honest run's log
+/// keeps its form.
+fn is_zero(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].

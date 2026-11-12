@@ -33,9 +33,10 @@ pub const CREDIT_ISOLATED: &str = "session/credit-isolated";
 pub const SEND_ISOLATED: &str = "session/send-isolated";
 
 /// Each service's frame gates on a connection grant no more than that
-/// service's shares. The check reads the gates' own grants, so a frame a
-/// service keeps after its grant ends, or a grant released twice, is out of
-/// its reach.
+/// service's shares, and free no more than their capacities. The check
+/// reads the gates' own grants and free bytes, so a frame a service keeps
+/// after its grant ends is out of its reach. A grant released twice leaves
+/// its gate's free bytes above the capacity, which the check reads.
 pub const CONNECTION_SHARES_BOUND: &str = "session/connection-shares-bound";
 
 /// The production limits the properties judge against: the node's, and the
@@ -152,14 +153,15 @@ where
             id: PropertyId::new(CONNECTION_SHARES_BOUND),
             claim: "on every connection, each service's raw inbound frame gate grants no more \
                     than its receive share and its output frame gate no more than its output \
-                    share, as the node's reactor shares declare them",
+                    share, as the node's reactor shares declare them, and neither gate frees \
+                    more bytes than its capacity",
             kind: Kind::Safety,
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
             needs: &[Source::View, Source::Datagrams],
             status: Status::Active,
             check: check_connection_shares_bound::<S>,
-            witness: Some(TriggerHistory::View(held_past_another_share::<S>)),
+            witness: Some(TriggerHistory::View(shares_bound_triggered::<S>)),
         },
     ]
 }
@@ -228,6 +230,9 @@ struct ConnectionFold {
     holding: BTreeMap<u64, u16>,
     /// Each node connection's raw bytes held per kind at its last load.
     held: BTreeMap<(u64, u16), u64>,
+    /// Each node connection's raw and output gates' free bytes per kind at
+    /// its last load.
+    free: BTreeMap<(u64, u16), (u64, u64)>,
     /// Each peer connection's saturation at its last load.
     saturated: BTreeMap<PeerConn, bool>,
     /// Each peer connection's pending writes, by stream and sequence.
@@ -238,6 +243,9 @@ struct ConnectionFold {
     /// Whether a service held more received frame bytes than another
     /// service's receive share on its connection.
     held_past_another_share: bool,
+    /// Whether a gate's free bytes rose between two loads of its
+    /// connection: a grant returned bytes.
+    grant_returned: bool,
     /// Whether a write that started under saturation reached the node
     /// after other services' frames.
     written_under_saturation: bool,
@@ -404,15 +412,38 @@ impl ConnectionFold {
         for load in kinds {
             let share = shares.share(load.kind);
             self.held.insert((connection, load.kind), load.raw_held);
+            let free = (
+                load.raw_capacity
+                    .saturating_sub(load.raw_held)
+                    .saturating_add(load.raw_excess),
+                load.output_capacity
+                    .saturating_sub(load.output_held)
+                    .saturating_add(load.output_excess),
+            );
+            if let Some(last) = self.free.insert((connection, load.kind), free) {
+                self.grant_returned |= free.0 > last.0 || free.1 > last.1;
+            }
             self.held_past_another_share |= kinds.iter().any(|other| {
                 other.kind != load.kind && load.raw_held > shares.share(other.kind).receive
             });
             if load.raw_held > handshake {
                 self.holding.insert(connection, load.kind);
             }
-            for (what, held, bound) in [
-                ("raw inbound gate", load.raw_held, share.receive),
-                ("output gate", load.output_held, share.output),
+            for (what, held, bound, excess, capacity) in [
+                (
+                    "raw inbound gate",
+                    load.raw_held,
+                    share.receive,
+                    load.raw_excess,
+                    load.raw_capacity,
+                ),
+                (
+                    "output gate",
+                    load.output_held,
+                    share.output,
+                    load.output_excess,
+                    load.output_capacity,
+                ),
             ] {
                 if held > bound {
                     self.findings.shares.violations.push((
@@ -420,6 +451,18 @@ impl ConnectionFold {
                         format!(
                             "kind {}'s {what} granted {held} bytes on connection {connection}, \
                              above its share of {bound}",
+                            load.kind
+                        ),
+                    ));
+                }
+                // Only a grant released more than once frees bytes past the
+                // capacity, and the held bytes then read as too few.
+                if excess > 0 {
+                    self.findings.shares.violations.push((
+                        format!("each service's {what} on a connection frees within its capacity"),
+                        format!(
+                            "kind {}'s {what} freed {excess} bytes above its capacity of \
+                             {capacity} on connection {connection}",
                             load.kind
                         ),
                     ));
@@ -629,8 +672,9 @@ where
 /// [`CONNECTION_SHARES_BOUND`]'s trigger history: a service on a
 /// connection held more received frame bytes than another service's
 /// receive share there, so a gate the two shared would have let one take
-/// the other's share.
-fn held_past_another_share<S>(view: &S::View, log: &ObservationLog) -> bool
+/// the other's share; or a gate's free bytes rose between two loads, so a
+/// grant returned bytes and a second return would free them twice.
+fn shares_bound_triggered<S>(view: &S::View, log: &ObservationLog) -> bool
 where
     S: HasView,
     S::View: WireView,
@@ -638,7 +682,7 @@ where
     view.wire().is_some_and(|wire| {
         let mut fold = wire.fold.borrow_mut();
         fold.advance(&wire.bounds, log);
-        fold.held_past_another_share
+        fold.held_past_another_share || fold.grant_returned
     })
 }
 

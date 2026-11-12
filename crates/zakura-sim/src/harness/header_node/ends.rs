@@ -59,6 +59,13 @@ pub enum EndFact {
         /// What it did.
         action: EnvironmentAction,
     },
+    /// The reactor reported call `call` dropped (`CallEnded` `Dropped`),
+    /// recorded as the tap saw it, so its stamp orders the drop against a
+    /// `Shutdown`'s.
+    CallDropped {
+        /// The reactor's call number.
+        call: u64,
+    },
     /// The reactor's task ended without the harness stopping it and
     /// without unwinding.
     ReactorExited {
@@ -139,7 +146,7 @@ impl EndEvidence {
         self.with(|store| {
             store.facts.iter().find_map(|(_, fact)| match fact {
                 EndFact::ReactorExited { step } => Some(*step),
-                EndFact::Environment { .. } => None,
+                EndFact::Environment { .. } | EndFact::CallDropped { .. } => None,
             })
         })
     }

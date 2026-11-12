@@ -882,6 +882,15 @@ impl TapState {
         // The session view sees every event and picks what its rules read,
         // so no second list here can drift from them.
         if in_run {
+            // A drop's stamp orders it against the harness's `Shutdown`,
+            // which decides whether it clears a failed reply (`fault`).
+            if let ReactorEvent::CallEnded {
+                call,
+                end: CallEnd::Dropped,
+            } = &event
+            {
+                state.ends.record(EndFact::CallDropped { call: *call });
+            }
             state.sessions.reactor(&event);
             let on_reactor = state.on_reactor();
             let stale_handler = {

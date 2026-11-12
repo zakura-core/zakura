@@ -42,8 +42,8 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
-        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests,
-        ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
+        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
+        ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},

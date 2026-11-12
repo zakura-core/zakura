@@ -222,8 +222,9 @@ pub(crate) enum RecordBody {
         /// bounds the node's answer. Not logged.
         asks: Option<Asked>,
     },
-    /// [`Observation::PeerWritten`].
-    Written { seq: u64 },
+    /// [`Observation::PeerWritten`]. Every frame of one `write_all` shares
+    /// its `order` stamp.
+    Written { seq: u64, order: u64 },
     /// [`Observation::PeerClosed`].
     Closed,
     /// [`Observation::ActRan`].
@@ -239,6 +240,7 @@ pub(crate) enum RecordBody {
         credit: Option<PeerCredit>,
         frame: Frame,
         at: Duration,
+        order: u64,
     },
 }
 
@@ -543,10 +545,11 @@ impl WireEvidence {
                 }
                 frame
             }
-            RecordBody::Written { seq } => Observation::PeerWritten {
+            RecordBody::Written { seq, order } => Observation::PeerWritten {
                 connection,
                 quic_stream,
                 seq,
+                order,
             },
             RecordBody::Closed => Observation::PeerClosed {
                 connection,
@@ -569,6 +572,7 @@ impl WireEvidence {
                 credit,
                 frame,
                 at,
+                order,
             } => {
                 let received = Observation::PeerReceived {
                     connection,
@@ -577,6 +581,7 @@ impl WireEvidence {
                     message_type,
                     payload,
                     credit,
+                    order,
                 };
                 let sent = match self.discovery_sender.as_mut() {
                     Some(sender) if Some(stream) == self.discovery => {
@@ -1157,7 +1162,7 @@ mod tests {
         Rc::new(RefCell::new(VecDeque::from([PeerRecord {
             remote: remote(0),
             quic_stream: 4,
-            body: RecordBody::Written { seq: 0 },
+            body: RecordBody::Written { seq: 0, order: 1 },
         }])))
     }
 
@@ -1181,6 +1186,7 @@ mod tests {
                 credit: None,
                 frame: frame.clone(),
                 at: Duration::ZERO,
+                order: 1,
             },
         }])));
         let mut log = ObservationLog::default();
@@ -1377,7 +1383,10 @@ mod tests {
         let written = |n, seq| PeerRecord {
             remote: remote(n),
             quic_stream: 4,
-            body: RecordBody::Written { seq },
+            body: RecordBody::Written {
+                seq,
+                order: seq + 1,
+            },
         };
         let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
             log.entries()
@@ -1464,7 +1473,10 @@ mod tests {
         let written = |n, seq| PeerRecord {
             remote: remote(n),
             quic_stream: 4,
-            body: RecordBody::Written { seq },
+            body: RecordBody::Written {
+                seq,
+                order: seq + 1,
+            },
         };
         let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
             log.entries()

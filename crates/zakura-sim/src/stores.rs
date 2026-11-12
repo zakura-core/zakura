@@ -400,32 +400,33 @@ impl WeakEvidenceStores {
 }
 
 /// Checks that the store `make` builds keeps `write` before its handle
-/// freezes and drops it after: before the freeze the write changes the
-/// store's `facts`, and after it the same write changes neither them nor
-/// the handle's snapshot. Each store type's post-freeze unit test calls it
-/// with a representative write through the store's own record path.
+/// freezes and drops it after. The control is a live store, on which the
+/// write changes the store's `facts`. The check is a second store, frozen
+/// before any write, on which the same write changes neither its facts
+/// nor its handle's snapshot. Since the frozen store never took the write,
+/// an idempotent one that the freeze let through would still change it.
+/// Each store type's post-freeze unit test calls it with a representative
+/// write through the store's own record path.
 #[cfg(test)]
 pub(crate) fn assert_freeze_drops_writes<S, F: PartialEq + Debug>(
-    make: impl FnOnce(&EvidenceStores) -> S,
+    make: impl Fn(&EvidenceStores) -> S,
     write: impl Fn(&S),
     facts: impl Fn(&S) -> F,
 ) {
+    let control = make(&EvidenceStores::default());
+    let before = facts(&control);
+    write(&control);
+    assert_ne!(
+        facts(&control),
+        before,
+        "the control: a write on a live store lands"
+    );
     let stores = EvidenceStores::default();
     let store = make(&stores);
-    let before = facts(&store);
-    write(&store);
-    let written = facts(&store);
-    assert_ne!(
-        written, before,
-        "the control: a write before the freeze lands"
-    );
+    assert_eq!(facts(&store), before, "both stores start alike");
     stores.freeze();
     write(&store);
-    assert_eq!(
-        facts(&store),
-        written,
-        "a write after the freeze is dropped"
-    );
+    assert_eq!(facts(&store), before, "a write after the freeze is dropped");
     assert_eq!(stores.drift(), None, "and leaves the snapshot as it froze");
 }
 

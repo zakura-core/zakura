@@ -58,7 +58,13 @@
 //!   <expect>` and, if its `beside` isn't empty, `--also-violates <beside,
 //!   comma-separated>`: `violated` beside the case's `also_violates`, or
 //!   `violated-set` with a nested case's exact `set`. With the runs come
-//!   [`VERDICT_FILE`], [`TARGET_FILE`] and [`PROVENANCE_FILE`] as before.
+//!   [`PROVENANCE_FILE`] as before, [`VERDICT_FILE`], a [`VerdictCheck`]
+//!   naming the `baseline` and `patched` traces it judged by SHA-256, and
+//!   [`TARGET_FILE`], a [`TargetCheck`] naming the `source` of the patched
+//!   build it ran, which must be the provenance check's, and, with a
+//!   target, the SHA-256 of the committed input it ran (`input_sha256`) and
+//!   of its own patched run's trace (`trace`), copied whole to
+//!   [`CONFIRMATION_DIR`], whose meta must name that source and input.
 //!   A node case's task names `draft`, its set: then `<i>/draft` is
 //!   recorded by the case's own rebuilt binary with `zakura-sim record
 //!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
@@ -234,6 +240,9 @@ pub const TARGET_FILE: &str = "target.json";
 /// A planted case's artifact: the planted runner's own verdict on it, which
 /// covers its campaign as well as its two traces.
 pub const VERDICT_FILE: &str = "verdict.json";
+/// A planted case's artifact: the patched run its `--targets` confirmation
+/// recorded, copied whole, which its [`TARGET_FILE`] names.
+pub const CONFIRMATION_DIR: &str = "confirmation";
 
 /// One thing the acceptance tool runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,6 +747,12 @@ pub struct VerdictCheck {
     pub property: String,
     /// The case's name.
     pub name: String,
+    /// The SHA-256 of the baseline `trace.jsonl` the verdict judged, which
+    /// must be the case's `baseline` run's.
+    pub baseline: String,
+    /// The SHA-256 of the patched `trace.jsonl` it judged, which must be
+    /// the case's `patched` run's.
+    pub patched: String,
     /// Why the planted runner didn't report the case caught, or `None` if
     /// it did.
     pub refused: Option<String>,
@@ -754,6 +769,15 @@ pub struct TargetCheck {
     /// The fuzz target the case runs on, or `None` if none runs its
     /// harness.
     pub target: Option<String>,
+    /// The source digest of the patched build the confirmation ran, which
+    /// must be the one the case's provenance check measured.
+    pub source: String,
+    /// The SHA-256 of the input the confirmation ran on its target, which
+    /// must be the case's committed input, or `None` with no target.
+    pub input_sha256: Option<String>,
+    /// The SHA-256 of the confirmation run's `trace.jsonl`, which must be
+    /// the one in [`CONFIRMATION_DIR`], or `None` with no target.
+    pub trace: Option<String>,
     /// Why the case wasn't confirmed through its target, or `None` if it
     /// was or has none.
     pub refused: Option<String>,
@@ -1407,7 +1431,9 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 // campaign, and item 9 runs `--targets` for a case with a
                 // fuzz target, so its catch needs both, through the target
                 // the committed mapping gives its harness.
-                if let Some(why) = mapped_case_refusal(&targets, &dir, property, name, harness) {
+                if let Some(why) =
+                    mapped_case_refusal(&targets, repo, &dir, (property, name), harness, input)
+                {
                     fail(&mut patched, why);
                 }
                 match (machine, draft) {
@@ -1725,45 +1751,134 @@ fn credit_sources(
     }
 }
 
-/// Why the planted runner didn't credit case `name` of `property`: it
-/// didn't report it caught, or it wasn't confirmed through `target`, the
-/// fuzz target its harness maps to, if any, or either check is missing,
-/// names another case or names another target.
-fn case_refusal(dir: &Path, property: &str, name: &str, target: Option<&str>) -> Option<String> {
-    let other =
-        |p: &str, n: &str| (p != property || n != name).then(|| format!("it judges {p}/{n}"));
-    let verdict = match read_json::<VerdictCheck>(&dir.join(VERDICT_FILE)) {
-        Some(check) => other(&check.property, &check.name).or(check.refused),
-        None => Some("no planted verdict".to_owned()),
-    };
-    verdict.or_else(|| match read_json::<TargetCheck>(&dir.join(TARGET_FILE)) {
-        Some(check) => other(&check.property, &check.name)
-            .or_else(|| {
-                (check.target.as_deref() != target).then(|| {
-                    format!(
-                        "its target confirmation names {:?}, and its harness maps to {target:?}",
-                        check.target
-                    )
-                })
-            })
-            .or(check.refused),
-        None => Some("no target confirmation".to_owned()),
-    })
+/// Why the planted runner didn't credit case `name` of `property` in `dir`:
+/// it didn't report it caught, or it wasn't confirmed through `target`,
+/// the fuzz target its harness maps to, if any, or either check is
+/// missing, names another case or another target, or judged runs other
+/// than this attempt's ([`verdict_refusal`], [`target_refusal`]).
+fn case_refusal(
+    repo: &Path,
+    dir: &Path,
+    (property, name): (&str, &str),
+    target: Option<&str>,
+    input: &CaseInput,
+) -> Option<String> {
+    verdict_refusal(dir, property, name)
+        .or_else(|| target_refusal(repo, dir, (property, name), target, input))
 }
 
-/// [`case_refusal`] for case `name` of `property` on `harness`, through the
-/// target `targets`, the committed mapping, gives its harness. A mapping
-/// that can't be read refuses every case, so a confirmation naming no
-/// target never stands in for one the mapping would require.
+/// Why `dir`'s [`VERDICT_FILE`] isn't the planted runner's catch of case
+/// `name` of `property` on `dir`'s own runs: it's missing, refused, names
+/// another case, or judged a baseline or patched trace other than the one
+/// beside it, such as an older attempt's.
+fn verdict_refusal(dir: &Path, property: &str, name: &str) -> Option<String> {
+    let Some(check) = read_json::<VerdictCheck>(&dir.join(VERDICT_FILE)) else {
+        return Some("no planted verdict".to_owned());
+    };
+    if check.property != property || check.name != name {
+        return Some(format!("it judges {}/{}", check.property, check.name));
+    }
+    for (run, judged) in [("baseline", &check.baseline), ("patched", &check.patched)] {
+        let trace = digest(&dir.join(run).join("trace.jsonl"));
+        if trace == "missing" || *judged != trace {
+            return Some(format!(
+                "its planted verdict judged the {run} trace {judged}, and the case's is {trace}"
+            ));
+        }
+    }
+    check.refused
+}
+
+/// Why `dir`'s [`TARGET_FILE`] isn't case `name` of `property`'s
+/// confirmation through `target`: it's missing, refused, names another case
+/// or target, or ran a build other than the one the case's provenance check
+/// measured. With a target, it must also name the case's committed `input`
+/// and its own run in [`CONFIRMATION_DIR`] ([`judged_refusal`]), which must
+/// have run that input. Without one, it names no input or run.
+fn target_refusal(
+    repo: &Path,
+    dir: &Path,
+    (property, name): (&str, &str),
+    target: Option<&str>,
+    input: &CaseInput,
+) -> Option<String> {
+    let artifact = read_json::<Value>(&dir.join(TARGET_FILE));
+    let Some(check) = artifact
+        .clone()
+        .and_then(|artifact| serde_json::from_value::<TargetCheck>(artifact).ok())
+    else {
+        return Some("no target confirmation".to_owned());
+    };
+    if check.property != property || check.name != name {
+        return Some(format!("it judges {}/{}", check.property, check.name));
+    }
+    if check.target.as_deref() != target {
+        return Some(format!(
+            "its target confirmation names {:?}, and its harness maps to {target:?}",
+            check.target
+        ));
+    }
+    if let Some(why) = check.refused {
+        return Some(why);
+    }
+    let measured = read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)).map(|c| c.source);
+    if !known(Some(&check.source)) || measured.as_ref() != Some(&check.source) {
+        return Some(format!(
+            "its target confirmation ran a build of {}, and the measured patched checkout is \
+             {measured:?}",
+            check.source
+        ));
+    }
+    let (Some(_), Some(trace), Some(ran)) = (target, &check.trace, &check.input_sha256) else {
+        return (target.is_some() || check.trace.is_some() || check.input_sha256.is_some()).then(
+            || {
+                format!(
+                    "its target confirmation names the run {:?} on the input {:?} for the \
+                     target {target:?}",
+                    check.trace, check.input_sha256
+                )
+            },
+        );
+    };
+    let CaseInput::Fuzz { input } = input else {
+        return Some("a typed case has no fuzz input for its target to run".to_owned());
+    };
+    let committed = digest(&repo.join(input));
+    if *ran != committed {
+        return Some(format!(
+            "its target confirmation ran the input {ran}, and {input} is {committed}"
+        ));
+    }
+    let run = dir.join(CONFIRMATION_DIR);
+    if let Some(why) = artifact.and_then(|artifact| judged_refusal(&run, &artifact)) {
+        return Some(format!(
+            "its target confirmation isn't its run {trace}'s: {why}"
+        ));
+    }
+    input_refusal(repo, input, &run)
+}
+
+/// [`case_refusal`] for case `case`, `(property, name)`, of `input` on
+/// `harness`, through the target `targets`, the committed mapping, gives
+/// its harness. A mapping that can't be read refuses every case, so a
+/// confirmation naming no target never stands in for one the mapping would
+/// require.
 fn mapped_case_refusal(
     targets: &Result<BTreeMap<String, String>, String>,
+    repo: &Path,
     dir: &Path,
-    property: &str,
-    name: &str,
+    case: (&str, &str),
     harness: &str,
+    input: &CaseInput,
 ) -> Option<String> {
     match targets {
-        Ok(targets) => case_refusal(dir, property, name, target_of(targets, harness).as_deref()),
+        Ok(targets) => case_refusal(
+            repo,
+            dir,
+            case,
+            target_of(targets, harness).as_deref(),
+            input,
+        ),
         Err(why) => Some(format!("the fuzz-target mapping can't be read: {why}")),
     }
 }
@@ -2620,6 +2735,7 @@ fn links(
                             format!("{index}/{PROVENANCE_FILE}"),
                             format!("{index}/{VERDICT_FILE}"),
                             format!("{index}/{TARGET_FILE}"),
+                            format!("{index}/{CONFIRMATION_DIR}/trace.jsonl"),
                         ]);
                         artifacts
                     },
@@ -3535,86 +3651,228 @@ mod tests {
         );
     }
 
+    /// The machine case's committed input, as a task names it.
+    const MACHINE_INPUT: &str = "crates/zakura-sim/tests/fixtures/header-reactor-policy.bin";
+
+    /// A case directory as the runner leaves one for a machine case run at
+    /// the subject built as `subject` and its patched checkout built as
+    /// `patched`: its baseline and patched runs, its target confirmation's
+    /// run in [`CONFIRMATION_DIR`], each recorded, and its provenance check.
+    fn case_dir(subject: &str, patched: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        for (run, source) in [
+            ("baseline", subject),
+            ("patched", patched),
+            (CONFIRMATION_DIR, patched),
+        ] {
+            record_into(&dir.path().join(run), source);
+        }
+        let check = ProvenanceCheck {
+            source: patched.into(),
+            patch_sha256: String::new(),
+            refused: None,
+        };
+        fs::write(
+            dir.path().join(PROVENANCE_FILE),
+            serde_json::to_string(&check).expect("a check serializes"),
+        )
+        .expect("the temp dir is writable");
+        dir
+    }
+
+    /// The verdict and target checks the runner writes for `case`'s own
+    /// runs, confirming it through `target`, if any.
+    fn case_checks(case: &Path, target: Option<&str>) -> (VerdictCheck, TargetCheck) {
+        let trace = |run: &str| digest(&case.join(run).join("trace.jsonl"));
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verdict = VerdictCheck {
+            property: "p".into(),
+            name: "a".into(),
+            baseline: trace("baseline"),
+            patched: trace("patched"),
+            refused: None,
+        };
+        let confirmation = TargetCheck {
+            property: "p".into(),
+            name: "a".into(),
+            target: target.map(str::to_owned),
+            source: read_json::<ProvenanceCheck>(&case.join(PROVENANCE_FILE))
+                .expect("the case has a provenance check")
+                .source,
+            input_sha256: target.map(|_| digest(&repo.join(MACHINE_INPUT))),
+            trace: target.map(|_| trace(CONFIRMATION_DIR)),
+            refused: None,
+        };
+        (verdict, confirmation)
+    }
+
+    /// Writes `verdict` and `target` into `case`.
+    fn write_checks(case: &Path, verdict: &VerdictCheck, target: &TargetCheck) {
+        for (file, check) in [
+            (VERDICT_FILE, serde_json::to_value(verdict)),
+            (TARGET_FILE, serde_json::to_value(target)),
+        ] {
+            fs::write(
+                case.join(file),
+                check.expect("a check serializes").to_string(),
+            )
+            .expect("the temp dir is writable");
+        }
+    }
+
     /// A case is credited only when the planted runner reported it caught
     /// and, if it has a fuzz target, confirmed it there, each check naming
     /// this case. Each check refused, missing or naming another case on its
     /// own is a reason to fail its patched run.
     #[test]
     fn a_case_needs_its_runner_verdict_and_target_confirmation() {
-        type Check<'a> = Option<(&'a str, &'a str, Option<&'a str>)>;
-        let read = |verdict: Check, target: Check, target_name: Option<&str>| {
-            let dir = tempfile::tempdir().expect("a temp dir can be created");
-            if let Some((property, name, refused)) = verdict {
-                let check = VerdictCheck {
-                    property: property.into(),
-                    name: name.into(),
-                    refused: refused.map(str::to_owned),
-                };
-                fs::write(
-                    dir.path().join(VERDICT_FILE),
-                    serde_json::to_string(&check).expect("a check serializes"),
-                )
-                .expect("the temp dir is writable");
-            }
-            if let Some((property, name, refused)) = target {
-                let check = TargetCheck {
-                    property: property.into(),
-                    name: name.into(),
-                    target: target_name.map(str::to_owned),
-                    refused: refused.map(str::to_owned),
-                };
-                fs::write(
-                    dir.path().join(TARGET_FILE),
-                    serde_json::to_string(&check).expect("a check serializes"),
-                )
-                .expect("the temp dir is writable");
-            }
-            case_refusal(dir.path(), "p", "a", Some("fuzz_a"))
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
         };
-        let mine = Some(("p", "a", None));
-        assert_eq!(read(mine, mine, Some("fuzz_a")), None);
+        let case = case_dir("s", "patched");
+        let (mine, confirmed) = case_checks(case.path(), Some("fuzz_a"));
+        let read = |verdict: Option<&VerdictCheck>, target: Option<&TargetCheck>| {
+            for (file, check) in [
+                (VERDICT_FILE, verdict.map(serde_json::to_value)),
+                (TARGET_FILE, target.map(serde_json::to_value)),
+            ] {
+                let path = case.path().join(file);
+                match check {
+                    Some(check) => fs::write(&path, check.expect("a check serializes").to_string())
+                        .expect("the temp dir is writable"),
+                    None => {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+            case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input)
+        };
+        assert_eq!(read(Some(&mine), Some(&confirmed)), None);
         // Confirmed through no target, or another one, while the harness
         // maps to `fuzz_a`.
-        assert!(read(mine, mine, None).is_some());
-        assert!(read(mine, mine, Some("fuzz_b")).is_some());
+        for target in [None, Some("fuzz_b".to_owned())] {
+            let other = TargetCheck {
+                target,
+                ..confirmed.clone()
+            };
+            assert!(read(Some(&mine), Some(&other)).is_some(), "{other:?}");
+        }
         // The runner's verdict refused, or missing.
-        assert!(read(
-            Some(("p", "a", Some("the campaign failed"))),
-            mine,
-            Some("fuzz_a")
-        )
-        .is_some());
-        assert!(read(None, mine, Some("fuzz_a")).is_some());
+        let refused = VerdictCheck {
+            refused: Some("the campaign failed".into()),
+            ..mine.clone()
+        };
+        assert!(read(Some(&refused), Some(&confirmed)).is_some());
+        assert!(read(None, Some(&confirmed)).is_some());
         // The target confirmation refused, or missing.
-        assert!(read(mine, Some(("p", "a", Some("it held"))), Some("fuzz_a")).is_some());
-        assert!(read(mine, None, Some("fuzz_a")).is_some());
+        let held = TargetCheck {
+            refused: Some("it held".into()),
+            ..confirmed.clone()
+        };
+        assert!(read(Some(&mine), Some(&held)).is_some());
+        assert!(read(Some(&mine), None).is_some());
         // Either check for another case, one field off.
-        for other in [("q", "a", None), ("p", "a-b", None)] {
-            assert!(
-                read(Some(other), mine, Some("fuzz_a")).is_some(),
-                "{other:?}"
-            );
-            assert!(
-                read(mine, Some(other), Some("fuzz_a")).is_some(),
-                "{other:?}"
-            );
+        for (property, name) in [("q", "a"), ("p", "a-b")] {
+            let verdict = VerdictCheck {
+                property: property.into(),
+                name: name.into(),
+                ..mine.clone()
+            };
+            let target = TargetCheck {
+                property: property.into(),
+                name: name.into(),
+                ..confirmed.clone()
+            };
+            assert!(read(Some(&verdict), Some(&confirmed)).is_some(), "{name}");
+            assert!(read(Some(&mine), Some(&target)).is_some(), "{name}");
         }
         // A harness no target runs needs a check naming none.
-        let dir = tempfile::tempdir().expect("a temp dir can be created");
-        for (file, value) in [
+        let (verdict, untargeted) = case_checks(case.path(), None);
+        write_checks(case.path(), &verdict, &untargeted);
+        assert_eq!(
+            case_refusal(&repo, case.path(), ("p", "a"), None, &input),
+            None
+        );
+        assert!(case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input).is_some());
+    }
+
+    /// Sol P2: an older attempt's checks for the same case never count
+    /// beside this attempt's runs. A verdict that judged an older baseline
+    /// or patched trace is refused, and so is a target confirmation that
+    /// ran an older patched build, another input, or names a run other
+    /// than the one beside it, even when that run and its check agree.
+    #[test]
+    fn an_older_attempt_s_case_checks_are_refused() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let current = case_dir("s", "patched");
+        let older = case_dir("s-before", "patched-before");
+        let (mine, confirmed) = case_checks(current.path(), Some("fuzz_a"));
+        let (old_verdict, old_target) = case_checks(older.path(), Some("fuzz_a"));
+        let refusal = |verdict: &VerdictCheck, target: &TargetCheck| {
+            write_checks(current.path(), verdict, target);
+            case_refusal(&repo, current.path(), ("p", "a"), Some("fuzz_a"), &input)
+        };
+        assert_eq!(refusal(&mine, &confirmed), None);
+        let substitutes = [
+            ("the older verdict", old_verdict.clone(), confirmed.clone()),
             (
-                VERDICT_FILE,
-                serde_json::json!({"property": "p", "name": "a", "refused": null}),
+                "a verdict on an older baseline",
+                VerdictCheck {
+                    baseline: old_verdict.baseline.clone(),
+                    ..mine.clone()
+                },
+                confirmed.clone(),
             ),
             (
-                TARGET_FILE,
-                serde_json::json!({"property": "p", "name": "a", "target": null, "refused": null}),
+                "a verdict on an older patched run",
+                VerdictCheck {
+                    patched: old_verdict.patched.clone(),
+                    ..mine.clone()
+                },
+                confirmed.clone(),
             ),
-        ] {
-            fs::write(dir.path().join(file), value.to_string()).expect("the temp dir is writable");
+            (
+                "the older target confirmation",
+                mine.clone(),
+                old_target.clone(),
+            ),
+            (
+                "a confirmation from the older build",
+                mine.clone(),
+                TargetCheck {
+                    source: old_target.source.clone(),
+                    ..confirmed.clone()
+                },
+            ),
+            (
+                "a confirmation on another input",
+                mine.clone(),
+                TargetCheck {
+                    input_sha256: Some("00".repeat(32)),
+                    ..confirmed.clone()
+                },
+            ),
+            (
+                "a confirmation naming the older run",
+                mine.clone(),
+                TargetCheck {
+                    trace: old_target.trace.clone(),
+                    ..confirmed.clone()
+                },
+            ),
+        ];
+        for (substitute, verdict, target) in substitutes {
+            assert!(refusal(&verdict, &target).is_some(), "{substitute}");
         }
-        assert_eq!(case_refusal(dir.path(), "p", "a", None), None);
-        assert!(case_refusal(dir.path(), "p", "a", Some("fuzz_a")).is_some());
+        // The older attempt's confirmation run copied in with its own check,
+        // which agree with each other, still isn't from the measured build.
+        fs::remove_dir_all(current.path().join(CONFIRMATION_DIR)).expect("it exists");
+        record_into(&current.path().join(CONFIRMATION_DIR), "patched-before");
+        assert!(refusal(&mine, &old_target).is_some());
     }
 
     /// The committed fuzz-target mapping is read from the fuzz package, as
@@ -3655,28 +3913,21 @@ mod tests {
         // committed mapping, which gives its harness one, and under one that
         // can't be read, and accepted only for a harness a valid mapping
         // gives none.
-        let case = tempfile::tempdir().expect("a temp dir can be created");
-        for (file, value) in [
-            (
-                VERDICT_FILE,
-                serde_json::json!({"property": "p", "name": "a", "refused": null}),
-            ),
-            (
-                TARGET_FILE,
-                serde_json::json!({"property": "p", "name": "a", "target": null, "refused": null}),
-            ),
-        ] {
-            fs::write(case.path().join(file), value.to_string()).expect("the temp dir is writable");
-        }
+        let case = case_dir("s", "patched");
+        let (verdict, untargeted) = case_checks(case.path(), None);
+        write_checks(case.path(), &verdict, &untargeted);
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let refusal = |targets: &Result<BTreeMap<String, String>, String>, harness: &str| {
+            mapped_case_refusal(targets, &repo, case.path(), ("p", "a"), harness, &input)
+        };
         let storage = "header-sync/storage";
         let committed = Ok(targets);
-        assert!(mapped_case_refusal(&committed, case.path(), "p", "a", storage).is_some());
+        assert!(refusal(&committed, storage).is_some());
         let unreadable = fuzz_targets(Path::new("/no/such/repo"));
-        assert!(mapped_case_refusal(&unreadable, case.path(), "p", "a", storage).is_some());
-        assert_eq!(
-            mapped_case_refusal(&committed, case.path(), "p", "a", "header-sync/wire"),
-            None
-        );
+        assert!(refusal(&unreadable, storage).is_some());
+        assert_eq!(refusal(&committed, "header-sync/wire"), None);
     }
 
     /// A machine trace counts for a case only if it ran the case's committed

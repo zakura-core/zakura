@@ -20,7 +20,10 @@
 
 use serde_json::Value;
 
-use super::evaluate::{Actions, End};
+use super::{
+    evaluate::{Actions, End},
+    refs::{joined, ControlRef, LinkRef},
+};
 use crate::{
     harness::{
         header_node::ControlAction,
@@ -215,6 +218,34 @@ struct Fact {
     control: Option<usize>,
 }
 
+impl Fact {
+    /// The control step whose execution recorded it, with the peer and
+    /// action it names, if a step did.
+    fn cause(&self) -> Option<ControlRef> {
+        Some(ControlRef {
+            control: self.control?,
+            peer: self.peer.clone(),
+            action: self.action.clone(),
+        })
+    }
+
+    /// The link it names, if it's a relink.
+    fn relink(&self) -> Option<LinkRef> {
+        (self.action == "Relink").then_some(LinkRef {
+            peer: self.peer.clone(),
+            connection: self.connection?,
+        })
+    }
+
+    /// The link it names, if it's a close naming one.
+    fn closes(&self) -> Option<LinkRef> {
+        (self.action == "Close").then_some(LinkRef {
+            peer: self.peer.clone(),
+            connection: self.connection?,
+        })
+    }
+}
+
 /// The stores' snapshots in `report`, by name.
 fn snapshot<'a>(report: &'a FullReport, name: &str) -> Option<&'a Value> {
     report
@@ -292,9 +323,8 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
 }
 
 /// Every link the full report's `sessions` store shows with `fact`, which
-/// is `LinkOpened` or `LinkClosed`, as its peer and connection, in the
-/// store's order.
-fn session_links(report: &FullReport, fact: &str) -> Vec<(String, u64)> {
+/// is `LinkOpened` or `LinkClosed`, in the store's order.
+fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
     let Some(facts) = snapshot(report, "sessions")
         .and_then(|sessions| sessions.get("facts"))
         .and_then(Value::as_str)
@@ -307,7 +337,10 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<(String, u64)> {
         .filter_map(|fact| {
             let (peer, rest) = fact.split_once('"')?;
             let (_, id) = rest.split_once("connection: ")?;
-            Some((peer.to_owned(), leading_number(id)?))
+            Some(LinkRef {
+                peer: peer.to_owned(),
+                connection: leading_number(id)?,
+            })
         })
         .collect()
 }
@@ -321,34 +354,36 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<(String, u64)> {
 fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
     let opened = session_links(report, "LinkOpened");
     let closed = session_links(report, "LinkClosed");
-    let relinked = |peer: &str, id: u64| {
-        facts
-            .iter()
-            .any(|fact| fact.action == "Relink" && fact.peer == peer && fact.connection == Some(id))
-    };
+    let relinked = |link: &LinkRef| !joined(facts, Fact::relink, link).is_empty();
     let mut current = std::collections::BTreeMap::new();
-    for (peer, id) in &opened {
-        if !current.contains_key(peer) && !relinked(peer, *id) {
-            current.insert(peer.clone(), Some(*id));
+    for link in &opened {
+        if !current.contains_key(&link.peer) && !relinked(link) {
+            current.insert(link.peer.clone(), Some(link.clone()));
         }
     }
     facts
         .iter()
-        .map(|fact| match (fact.action.as_str(), fact.connection) {
-            ("Shutdown", None) => true,
-            ("Relink", Some(id)) => {
-                let link = (fact.peer.clone(), id);
-                current.insert(fact.peer.clone(), Some(id));
+        .map(|fact| match (fact.action.as_str(), fact.relink(), fact.closes()) {
+            ("Shutdown", ..) => fact.connection.is_none(),
+            (_, Some(link), _) => {
+                current.insert(link.peer.clone(), Some(link.clone()));
                 opened.contains(&link)
             }
-            ("Close", Some(id)) => {
-                let link = (fact.peer.clone(), id);
-                let was = current.insert(fact.peer.clone(), None).flatten();
-                was == Some(id) && opened.contains(&link) && closed.contains(&link)
+            (_, _, Some(link)) => {
+                let was = current.insert(link.peer.clone(), None).flatten();
+                was.as_ref() == Some(&link) && opened.contains(&link) && closed.contains(&link)
             }
             _ => false,
         })
         .collect()
+}
+
+/// The first of `facts` that `cause`'s own execution recorded and that
+/// names the link it acted on, by `named` ([`names_its_link`]).
+fn own_effect<'a>(facts: &'a [Fact], named: &[bool], cause: &ControlRef) -> Option<&'a Fact> {
+    let named = facts.iter().zip(named).filter(|(_, named)| **named);
+    let named: Vec<&Fact> = named.map(|(fact, _)| fact).collect();
+    joined(named, Fact::cause, cause).first().copied()
 }
 
 /// Whether `run`, a node history's recording that ended `end`, carried
@@ -425,13 +460,13 @@ pub fn judge(
                 action,
                 in_turn,
             } => {
-                let own = facts.iter().zip(&named).find_map(|(fact, named)| {
-                    (fact.control.is_some()
-                        && fact.control == declared.control
-                        && fact.peer == *peer
-                        && fact.action == *action
-                        && *named)
-                        .then_some(fact)
+                let own = declared.control.and_then(|control| {
+                    let cause = ControlRef {
+                        control,
+                        peer: peer.clone(),
+                        action: (*action).to_owned(),
+                    };
+                    own_effect(&facts, &named, &cause)
                 });
                 match own {
                     Some(fact) if *in_turn && fact.stamp <= turn => false,
@@ -469,6 +504,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
 
     /// A two-mirror storage history that closes `mirror-0`, relinks it and
     /// closes it again, recorded with no Plan bytes: its trace and full
@@ -559,5 +595,29 @@ mod tests {
             judged(&edited(&report, "sessions", Some("facts"), closed, "")),
             Actions::Incomplete
         );
+    }
+
+    /// Each control step's effect joins on its whole cause: the fact its
+    /// own step recorded is found, and its cause with only its position,
+    /// peer or action moved finds none (Rule 25's template).
+    #[test]
+    fn a_control_effect_joins_its_whole_cause() {
+        let (_, report, declared) = close_relink_close();
+        let facts = environment_facts(&report);
+        let named = names_its_link(&facts, &report);
+        let mut joined = 0;
+        for declared in &declared {
+            let Effect::Environment { peer, action, .. } = &declared.effect else {
+                continue;
+            };
+            let cause = ControlRef {
+                control: declared.control.expect("a control step has its position"),
+                peer: peer.clone(),
+                action: (*action).to_owned(),
+            };
+            assert_one_key_off(&cause, |cause| own_effect(&facts, &named, cause).is_some());
+            joined += 1;
+        }
+        assert_eq!(joined, 3);
     }
 }

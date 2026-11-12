@@ -1019,4 +1019,122 @@ mod tests {
             assert!(findings(&full, other).violations.is_empty(), "{other}");
         }
     }
+
+    /// Adoption evidence whose run settles with what it published unread:
+    /// it hands the run's end to the store and reports each queue's watch
+    /// rule's end findings, as the flood harness does
+    /// ([`watch_end_violations`]).
+    #[derive(Clone, Default)]
+    struct SettledAdoptions(Adoptions);
+
+    impl crate::domain::header_sync::AdoptionView for SettledAdoptions {
+        fn adoption(&self) -> &AdoptionEvidence {
+            &self.0 .0
+        }
+    }
+
+    impl crate::property::HasView for SettledAdoptions {
+        type View = SettledAdoptions;
+
+        /// A copy sharing the store.
+        fn view(&self) -> SettledAdoptions {
+            self.clone()
+        }
+
+        /// Hands the end to the store, so it knows the run settled.
+        fn ended(&self, end: &RunEnd) {
+            self.0 .0.end(end);
+        }
+
+        /// Each queue's watch rule's end findings, with no shutdown begun.
+        fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+            [EventQueue::Wire, EventQueue::Lifecycle]
+                .into_iter()
+                .flat_map(|queue| watch_end_violations(&self.0 .0, queue, false))
+                .collect()
+        }
+
+        /// The store, as a node harness reports its own.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            self.0.snapshot()
+        }
+    }
+
+    impl crate::harness::scripted::Script for SettledAdoptions {
+        const NAME: &'static str = "test/two-unread-at-a-settled-end";
+        type Case = ();
+
+        /// Both watch rules.
+        fn properties(
+        ) -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<SettledAdoptions>>>
+        {
+            vec![
+                crate::domain::header_sync::watch_observed_under_flood(),
+                crate::domain::header_sync::watch_observed_under_lifecycle_flood(),
+            ]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> crate::property::Sources {
+            use crate::property::Source;
+            crate::property::Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// At step 1: states 2 and 3 published back to back, and no event
+        /// taken or watch read after them.
+        fn observe(&self, (): &(), log: &mut crate::ObservationLog) {
+            if log.step() == 1 {
+                for version in [2, 3] {
+                    self.0 .0.record(Duration::ZERO, commit(version));
+                }
+            }
+        }
+    }
+
+    /// C21 through the sidecar at a settled end, for each watch rule: two
+    /// states published and both unread when the run settles are two end
+    /// findings of that rule, each naming its own publication, in the full
+    /// report recorded beside the trace and its fresh replay
+    /// ([`a_settled_end_names_every_unread_publication`] judges the same
+    /// rule on the store alone).
+    #[test]
+    fn every_unread_publication_at_a_settled_end_reaches_the_sidecar() {
+        use crate::{
+            check::FindingSubject,
+            domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+            harness::scripted::{findings, sidecar},
+        };
+        let full = sidecar::<SettledAdoptions>(&(), &[]);
+        let publication = |version: u64| {
+            Some(FindingSubject::Publication {
+                state_version: format!("{:?}", StateVersion::new(version)),
+            })
+        };
+        for (property, queue) in [
+            (WATCH_OBSERVED_UNDER_FLOOD, EventQueue::Wire),
+            (WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD, EventQueue::Lifecycle),
+        ] {
+            let found = findings(&full, property);
+            let subjects: Vec<_> = found
+                .violations
+                .iter()
+                .map(|violation| violation.subject.clone())
+                .collect();
+            assert_eq!(subjects, [publication(2), publication(3)], "{property}");
+            for (violation, version) in found.violations.iter().zip([2, 3]) {
+                assert!(
+                    violation.actual.contains(&format!(
+                        "state {:?} published and unread",
+                        StateVersion::new(version)
+                    )) && violation.actual.contains(&format!("{queue:?} events")),
+                    "{property}: {violation:?}"
+                );
+            }
+            assert!(
+                matches!(found.outcome, crate::PropertyOutcome::Violated { .. }),
+                "{property}: {:?}",
+                found.outcome
+            );
+        }
+    }
 }

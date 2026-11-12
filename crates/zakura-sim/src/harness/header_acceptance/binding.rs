@@ -229,6 +229,22 @@ pub const REPLAY_LOG: Kind = Kind {
     closed: true,
 };
 
+/// A witness test's declaration's `history.json`
+/// ([`DeclaredHistory`](super::history::DeclaredHistory)), which the
+/// declaring test stamps with the run, task and role the runner ran it for
+/// ([`HISTORIES_FOR_VAR`](super::history::HISTORIES_FOR_VAR)), as the
+/// runner's own artifacts name them ([`TEST`]).
+pub const DECLARATION: Kind = Kind {
+    name: "history.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+    ],
+    required: &[Field::RunId, Field::TaskIndex, Field::Role],
+    closed: false,
+};
+
 /// A declaration's `ran.json` ([`Ran`](super::history::Ran)).
 pub const RAN: Kind = Kind {
     name: "ran.json",
@@ -567,6 +583,19 @@ pub fn read(kind: &Kind, path: &Path, expect: &Expect) -> Result<Value, String> 
         .ok_or_else(|| format!("no readable {}", kind.name))?;
     check(kind, &artifact, expect)?;
     Ok(artifact)
+}
+
+/// The declaration in `dir`: its [`DECLARATION`] file, if it's bound to
+/// what `expect` names ([`check`]), and the JSON text of the scenario the
+/// same test wrote beside it, in the directory only that test created
+/// ([`declare_into`](super::history::declare_into)), or why not.
+pub fn read_declaration(dir: &Path, expect: &Expect) -> Result<(Value, String), String> {
+    use super::history::{HISTORY_FILE, SCENARIO_FILE};
+    let history = read(&DECLARATION, &dir.join(HISTORY_FILE), expect)?;
+    let path = dir.join(SCENARIO_FILE);
+    let scenario =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok((history, scenario))
 }
 
 /// The `meta` line of the trace in `dir`, read without checking the rest

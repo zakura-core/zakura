@@ -1020,7 +1020,10 @@ const C15_PROVING: &[TestRef] = &[
 /// C21's proving tests: for each `header-sync` check the header node
 /// harnesses register that can find two failures at one boundary, two
 /// distinct ones there surviving into the run's report and the full report
-/// recorded beside its trace, which a fresh replay sends again. The
+/// recorded beside its trace, which a fresh replay sends again. The watch
+/// rules find theirs both at the boundary of a third event and at a
+/// settled end, so each path has its test, and the settled end's
+/// store-level regression stays beside them. The
 /// claim-reading checks share one test, and `commit-only-authorized` and
 /// `header-fault-penalized` are C22's and C13's. `honest-progress` and
 /// `bounded-adversary-progress` find at most one failure in a run, as their
@@ -1060,6 +1063,14 @@ const C21_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_node/adoption.rs",
         "harness::header_node::adoption::tests::every_unread_publication_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::a_settled_end_names_every_unread_publication",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::every_unread_publication_at_a_settled_end_reaches_the_sidecar",
     ),
     sim_test(
         "src/harness/header_sync.rs",
@@ -1380,9 +1391,13 @@ pub fn contract_table() -> Vec<Contract> {
                 "Evan",
                 "The witness judge rejects any unrelated NotApplicable whose reason isn't \
                  benign, except StoppedByViolation under the expected stop, or a missing \
-                 report, and judges a nested case's exact set in both runs, or on its Draft run \
-                 for a set that breaks only after the case's own break, each nested finding \
-                 from the case's own break: the same peer and the same punished event or frame.",
+                 report, and judges a nested case's exact set. A set the patched run breaks is \
+                 judged in both runs, each nested finding joined to the case's own break by \
+                 subject: the same peer and the same punished event or frame. A set that \
+                 breaks only after the case's own break is judged on its Draft run as a \
+                 counterfactual of its baseline: every member breaks there and none in the \
+                 baseline, which proves each member depends on the patch, not that it shares \
+                 the case's peer or punished event or frame.",
                 C6_PROVING,
                 "E2, with Rule 25's subject joins",
             )

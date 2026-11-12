@@ -294,18 +294,28 @@ fn a_declared_history_records_through_the_contracts_arguments() {
     let root = tempfile::tempdir().expect("a temp dir can be created");
     let scenario = StorageScenario::default();
     let storage = "header-sync/storage";
+    let at = tool::TaskAt {
+        run_id: "r",
+        index: 0,
+    };
     history::declare_into(
         root.path(),
+        &history::DeclaredFor {
+            run_id: at.run_id.to_owned(),
+            index: at.index,
+            role: String::new(),
+        },
         storage,
         "only",
         &scenario,
         &PlanInput::Bytes(vec![7, 1]),
     )
     .expect("the temp dir is writable");
-    let declaration = root.path().join("0");
+    let declared = at.declared(root.path(), "").expect("it's this task's");
+    let declaration = declared[0].dir().to_owned();
     let out = root.path().join("run");
     let mut args = vec!["record".to_owned()];
-    args.extend(tool::record_args(storage, &declaration).expect("it names one Plan"));
+    args.extend(tool::record_args(storage, &declared[0]).expect("it names one Plan"));
     args.extend(["--out".to_owned(), out.display().to_string()]);
     let (ok, log) = sim(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(ok, "{log}");

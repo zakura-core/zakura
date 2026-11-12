@@ -19,7 +19,6 @@ mod support;
 
 use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
 
-use serde::{Deserialize, Serialize};
 use support::{
     byte_inputs, inputs,
     one_key_off::assert_one_key_off,
@@ -28,7 +27,7 @@ use support::{
 use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
-    refs::{joined, Ref, WorkRef},
+    refs::{joined, CallOpRef, DispatchRef, ReleaseRef, StaleCallRef, WorkRef},
 };
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
@@ -167,43 +166,10 @@ fn mixed_resources() -> StorageScenario {
     }
 }
 
-/// A reactor call's dispatch of a prepare: the call and the prepare's
-/// owner.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Dispatch {
-    call: u64,
-    owner: WorkOwner,
-}
-impl Ref for Dispatch {}
-
-/// A reactor call paired with the storage operation it submitted.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Paired {
-    call: u64,
-    op: u64,
-}
-impl Ref for Paired {}
-
-/// A stale window: its call, and whether it was an apply's.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct StaleCall {
-    call: u64,
-    apply: bool,
-}
-impl Ref for StaleCall {}
-
 /// `bytes` in lowercase hex, as a peer's key.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-/// A round's release, by its peer, in hex, and incarnation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Release {
-    peer: String,
-    incarnation: u64,
-}
-impl Ref for Release {}
 
 /// One run of the scenario and the evidence its node left.
 struct Run {
@@ -328,7 +294,7 @@ impl Selected {
     }
 
     /// Whether a reactor call dispatched `want`.
-    fn dispatched(&self, want: &Dispatch) -> bool {
+    fn dispatched(&self, want: &DispatchRef) -> bool {
         let of = |obs: &Observation| match obs {
             Observation::Reactor {
                 event:
@@ -337,7 +303,7 @@ impl Selected {
                         port: ReactorCall::Prepare { owner, .. },
                     },
                 ..
-            } => Some(Dispatch {
+            } => Some(DispatchRef {
                 call: *call,
                 owner: owner.clone(),
             }),
@@ -348,20 +314,20 @@ impl Selected {
 
     /// The position of the first observation of a call ending paired with
     /// its operation, `want`.
-    fn ended(&self, want: &Paired) -> Option<usize> {
+    fn ended(&self, want: &CallOpRef) -> Option<usize> {
         self.obs.iter().position(|obs| match obs {
             Observation::Reactor {
                 event: ReactorFact::CallEnded { call, op, .. },
                 ..
-            } => op.map(|op| Paired { call: *call, op }).as_ref() == Some(want),
+            } => op.map(|op| CallOpRef { call: *call, op }).as_ref() == Some(want),
             _ => false,
         })
     }
 
     /// Whether `want`'s stale window ended at a step's drain.
-    fn ended_stale(&self, want: &StaleCall) -> bool {
+    fn ended_stale(&self, want: &StaleCallRef) -> bool {
         let of = |window: &StaleWindow| {
-            Some(StaleCall {
+            Some(StaleCallRef {
                 call: window.call,
                 apply: window.apply,
             })
@@ -389,7 +355,7 @@ impl Selected {
 
     /// The round a reservation backs for `want`, by its peer and
     /// incarnation.
-    fn reserved(&self, want: &WorkRef) -> Option<Release> {
+    fn reserved(&self, want: &WorkRef) -> Option<ReleaseRef> {
         let of = |event: &ReactorEvent| match event {
             ReactorEvent::ReservationBound { request, .. } => Some(WorkRef {
                 owner: work_owner(request.owner),
@@ -401,7 +367,7 @@ impl Selected {
         joined(&self.accounting, of, want)
             .into_iter()
             .find_map(|event| match event {
-                ReactorEvent::ReservationBound { request, .. } => Some(Release {
+                ReactorEvent::ReservationBound { request, .. } => Some(ReleaseRef {
                     peer: hex(request.peer.as_bytes()),
                     incarnation: request.incarnation,
                 }),
@@ -410,11 +376,11 @@ impl Selected {
     }
 
     /// Whether the queue released `want`.
-    fn released(&self, want: &Release) -> bool {
+    fn released(&self, want: &ReleaseRef) -> bool {
         let of = |event: &ReactorEvent| match event {
             ReactorEvent::RoundReleased {
                 peer, incarnation, ..
-            } => Some(Release {
+            } => Some(ReleaseRef {
                 peer: hex(peer.as_bytes()),
                 incarnation: *incarnation,
             }),
@@ -426,24 +392,24 @@ impl Selected {
     /// Checks the scenario's held first prepare is the one that ended stale
     /// and whose round was released, joined through its identities, each a
     /// whole ref: its storage operation, submitted by a reactor call that
-    /// dispatched a prepare for the same owner ([`Dispatch`]) and ended
-    /// paired with that operation ([`Paired`]), a stale window of that
-    /// prepare call ([`StaleCall`]), the round of that same owner, in full
+    /// dispatched a prepare for the same owner ([`DispatchRef`]) and ended
+    /// paired with that operation ([`CallOpRef`]), a stale window of that
+    /// prepare call ([`StaleCallRef`]), the round of that same owner, in full
     /// ([`WorkRef`]), retired before the call ended and backed by a
-    /// reservation, and the queue's release of that round ([`Release`]).
+    /// reservation, and the queue's release of that round ([`ReleaseRef`]).
     fn held_prepare_joined(&self) -> Result<(), String> {
         let (op, call, owner) = self.held_prepare()?;
-        let dispatch = Dispatch {
+        let dispatch = DispatchRef {
             call,
             owner: owner.clone(),
         };
         if !self.dispatched(&dispatch) {
             return Err(format!("no call dispatched {dispatch:?}"));
         }
-        let ended = self.ended(&Paired { call, op }).ok_or(format!(
+        let ended = self.ended(&CallOpRef { call, op }).ok_or(format!(
             "call {call} never ended paired with operation {op}"
         ))?;
-        if !self.ended_stale(&StaleCall { call, apply: false }) {
+        if !self.ended_stale(&StaleCallRef { call, apply: false }) {
             return Err(format!(
                 "prepare call {call} didn't end stale: {:?}",
                 self.stale
@@ -676,15 +642,15 @@ fn the_mixed_joins_fail_one_identity_off() {
         .expect("the committed reply crosses");
     let (op, call, owner) = selected.held_prepare().expect("a prepare was submitted");
 
-    let dispatch = Dispatch {
+    let dispatch = DispatchRef {
         call,
         owner: owner.clone(),
     };
-    assert_one_key_off(&dispatch, |dispatch| selected.dispatched(dispatch));
-    let paired = Paired { call, op };
+    assert_one_key_off::<DispatchRef>(&dispatch, |dispatch| selected.dispatched(dispatch));
+    let paired = CallOpRef { call, op };
     let ended = selected.ended(&paired).expect("the call ended paired");
-    assert_one_key_off(&paired, |paired| selected.ended(paired).is_some());
-    assert_one_key_off(&StaleCall { call, apply: false }, |stale| {
+    assert_one_key_off::<CallOpRef>(&paired, |paired| selected.ended(paired).is_some());
+    assert_one_key_off::<StaleCallRef>(&StaleCallRef { call, apply: false }, |stale| {
         selected.ended_stale(stale)
     });
     let round = WorkRef {
@@ -692,10 +658,10 @@ fn the_mixed_joins_fail_one_identity_off() {
         request_id: owner.request_id,
         owner,
     };
-    assert_one_key_off(&round, |round| selected.retired_before(round, ended));
+    assert_one_key_off::<WorkRef>(&round, |round| selected.retired_before(round, ended));
     let release = selected.reserved(&round).expect("a reservation backs it");
     assert_one_key_off(&round, |round| selected.reserved(round).is_some());
-    assert_one_key_off(&release, |release| selected.released(release));
+    assert_one_key_off::<ReleaseRef>(&release, |release| selected.released(release));
 
     let (apply, ..) = selected
         .first_submitted(|request| match request {

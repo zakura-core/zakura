@@ -111,6 +111,9 @@ const VERDICT_FILE: &str = "verdict.json";
 /// The variable a counted witness test declares its histories under, as
 /// the reader's `HISTORIES_VAR` names it.
 const HISTORIES_VAR: &str = "ZAKURA_SIM_HISTORIES";
+/// The variable naming the run, task and role each declaration carries, as
+/// the reader's `HISTORIES_FOR_VAR` names it.
+const HISTORIES_FOR_VAR: &str = "ZAKURA_SIM_HISTORIES_FOR";
 /// The task a directory is for, as the reader's `TASK_FILE` names it.
 const TASK_FILE: &str = "task.json";
 /// A planted case's confirmation run, as the reader's `CONFIRMATION_DIR`
@@ -1065,7 +1068,9 @@ fn verdict_line<'a>(log: &'a str, property: &str, name: &str) -> Option<&'a str>
 /// `targets`, and writes `test.json`: whether the child exited 0, since the
 /// reader counts an `ok` only if it did, and whether the test binary embeds
 /// `source`. With `histories`, the test runs with the reader's
-/// `HISTORIES_VAR` set to it, so it declares every history it runs there.
+/// `HISTORIES_VAR` set to it, so it declares every history it runs there,
+/// and `HISTORIES_FOR_VAR` naming task `id`'s run at `role`, which each
+/// declaration carries.
 /// With `sim`, it builds and runs under the simulator's flags, and without,
 /// as a plain build. `test.json` names task `id`'s run at `role` and the
 /// SHA-256 of the executable it ran. Returns the executable it ran, if it
@@ -1166,7 +1171,8 @@ pub(crate) fn run_test(
         run.env("RUSTFLAGS", SIM_RUSTFLAGS);
     }
     if let Some(histories) = histories {
-        run.env(HISTORIES_VAR, histories);
+        run.env(HISTORIES_VAR, histories)
+            .env(HISTORIES_FOR_VAR, id.name(role, json!({})).to_string());
     }
     let ended = child(&mut run, &log, options.deadline);
     stop_if_interrupted()?;
@@ -1564,15 +1570,17 @@ fn name_replay(run: &Path, id: TaskId<'_>, role: &str) -> Result<(), BoxError> {
 }
 
 /// Records into `out`, with `sim`, the one history the witness test `test`
-/// declared under `declared` as `case` on `harness`, with the arguments
-/// S's `tool` gives it (`header-acceptance record-args`, the reader's
-/// `record_args`), and `witness`, a property and its `--expect`, if any.
+/// declared under `declared` as `case` on `harness`, run for task `id` at
+/// `role`, with the arguments S's `tool` gives it (`header-acceptance
+/// record-args`, the reader's `record_args`), and `witness`, a property and
+/// its `--expect`, if any.
 /// A declaration the reader wouldn't take leaves `out` missing, with why in
 /// `<out>.log`. Returns whether it recorded.
 fn record_declared(
     options: &Options,
     (tool, sim): (&Path, &Path),
     (declared, harness, test, case): (&Path, &str, &str, &str),
+    (id, role): (TaskId<'_>, &str),
     out: &Path,
     witness: Option<(&str, &str)>,
 ) -> Result<bool, BoxError> {
@@ -1588,6 +1596,12 @@ fn record_declared(
             test,
             "--case",
             case,
+            "--run-id",
+            id.run_id,
+            "--index",
+            &id.index.to_string(),
+            "--role",
+            role,
             "--out",
         ])
         .arg(&file);
@@ -1644,6 +1658,7 @@ fn run_history(
         options,
         (&tools.tool, &tools.sim),
         named,
+        (id, ""),
         &run,
         expect.map(|expect| (property.as_str(), expect)),
     )? {
@@ -1948,6 +1963,7 @@ fn run_integrity(
                 options,
                 (&tools.tool, &sim),
                 (&declared, &harness, &test, &case),
+                (id, run),
                 &out.join("history"),
                 None,
             )?;
@@ -2632,8 +2648,8 @@ mod tests {
     }
 
     /// A declared history is recorded with the arguments S's tool gives
-    /// it, then the task's witness. A declaration the tool refuses isn't
-    /// recorded at all.
+    /// it for the task's run at its role, then the task's witness. A
+    /// declaration the tool refuses isn't recorded at all.
     #[cfg(unix)]
     #[test]
     fn a_declared_history_records_with_the_tool_s_arguments() {
@@ -2645,6 +2661,8 @@ mod tests {
             "out=; prev=\n\
              for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
              [ \"$9\" = c ] || exit 1\n\
+             [ \"${10} ${11} ${12} ${13} ${14} ${15}\" = '--run-id r --index 3 --role patched' ] \
+             || exit 1\n\
              printf '[\"--sim\",\"h\",\"--scenario\",\"{}\",\"--plan\",\"p.bin\"]' > \"$out\"",
         );
         let options = Options {
@@ -2654,9 +2672,19 @@ mod tests {
         let declared = dir.path().join("declared");
         let run = dir.path().join("run");
         let named = (declared.as_path(), "h", "t", "c");
-        assert!(
-            record_declared(&options, (&tool, &sim), named, &run, Some(("p/x", "holds"))).unwrap()
-        );
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        assert!(record_declared(
+            &options,
+            (&tool, &sim),
+            named,
+            (id, "patched"),
+            &run,
+            Some(("p/x", "holds"))
+        )
+        .unwrap());
         assert_eq!(
             fs::read_to_string(run.join("args")).unwrap(),
             format!(
@@ -2667,7 +2695,15 @@ mod tests {
         );
         let other = dir.path().join("other");
         let refused = (declared.as_path(), "h", "t", "d");
-        assert!(!record_declared(&options, (&tool, &sim), refused, &other, None).unwrap());
+        assert!(!record_declared(
+            &options,
+            (&tool, &sim),
+            refused,
+            (id, "patched"),
+            &other,
+            None
+        )
+        .unwrap());
         assert!(!other.exists());
     }
 

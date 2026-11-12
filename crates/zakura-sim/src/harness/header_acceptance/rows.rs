@@ -3680,6 +3680,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_narrowing_rules_match_their_pin",
     "identity_refs_are_defined_only_in_refs",
     "every_artifact_read_goes_through_binding",
+    "every_ref_has_a_one_key_off_control",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

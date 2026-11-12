@@ -4823,6 +4823,20 @@ fn the_evaluator_accepts_genuine_results() {
         held(),
         Report::Violated
     )));
+    // The same Draft run with no trigger, as a failed witness leaves it,
+    // blocks however its reports read.
+    let mut file = results();
+    let (baseline, patched, draft, _) = caught_runs(&mut file, END_CASE);
+    baseline.reports.insert("t/b".into(), held());
+    patched.end = End::Violation {
+        property: "t/a".into(),
+    };
+    patched.actions = Actions::Prefix;
+    patched.reports.insert("t/b".into(), held());
+    draft.reports.insert("t/b".into(), Report::Violated);
+    draft.meta.draft_override = vec!["t/a".into(), "t/b".into()];
+    draft.trigger = false;
+    assert!(blocked(&state(&later, &file, &late)));
 }
 
 /// An unpatched storage history and a release-wake history that pass, on
@@ -6741,10 +6755,12 @@ fn identity_part(ty: &syn::Type) -> Option<bool> {
 
 /// Each identity definition the Rust source `text`, the file `file`,
 /// makes, in order: a struct, enum, union, trait or type alias named
-/// `*Ref`, and a type alias for an identity tuple a join could key on,
-/// two or more [`identity_part`]s, at least one a number. It finds them at
-/// any depth, in test code and function bodies too. An associated type in
-/// an `impl` or trait isn't a definition of its own.
+/// `*Ref`, a type alias for an identity tuple a join could key on,
+/// two or more [`identity_part`]s, at least one a number, and an
+/// implementation of Rule 25's `Ref` trait by any path, as `impl Ref for
+/// <type>`, whatever the type is named. It finds them at any depth, in
+/// test code and function bodies too. An associated type in an `impl` or
+/// trait isn't a definition of its own.
 fn defined_refs(text: &str, file: &str) -> Vec<String> {
     use syn::visit::Visit;
     /// Collects the definitions' names.
@@ -6778,6 +6794,26 @@ fn defined_refs(text: &str, file: &str) -> Vec<String> {
         fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
             self.named(&item.ident);
             syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let implements_ref = item
+                .trait_
+                .as_ref()
+                .and_then(|(_, path, _)| path.segments.last())
+                .is_some_and(|last| last.ident == "Ref");
+            if implements_ref {
+                let ty = match &*item.self_ty {
+                    syn::Type::Path(path) => path
+                        .path
+                        .segments
+                        .last()
+                        .map_or_else(String::new, |last| last.ident.to_string()),
+                    _ => "a type with no path".to_owned(),
+                };
+                self.0.push(format!("impl Ref for {ty}"));
+            }
+            syn::visit::visit_item_impl(self, item);
         }
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
@@ -6838,10 +6874,13 @@ fn refs_outside_refs() -> BTreeSet<(String, String)> {
 
 /// Rule 25's source scan: no identity a join could key on is defined
 /// outside `refs.rs`, in the crate's `src` or `tests`, apart from the
-/// reasoned [`OUTSIDE_REFS`], which must each still be there. The control
-/// shows the scan finds a planted local `*Ref`, at the top level, in a
-/// test module and in a function body, and a tuple alias, and leaves an
-/// associated type and a one-type alias alone.
+/// reasoned [`OUTSIDE_REFS`], which must each still be there, and nothing
+/// outside `refs.rs` implements `Ref`, however the trait or the type is
+/// named. The control shows the scan finds a planted local `*Ref`, at the
+/// top level, in a test module and in a function body, a tuple alias, and
+/// a `Ref` implementation for a type of any name by the trait's bare,
+/// module or crate path, and leaves an associated type, a one-type alias
+/// and another trait's implementation alone.
 #[test]
 fn identity_refs_are_defined_only_in_refs() {
     let allowed: BTreeSet<(String, String)> = OUTSIDE_REFS
@@ -6871,7 +6910,11 @@ fn identity_refs_are_defined_only_in_refs() {
                    type Unit = ();\n\
                    type Names = (&'static str, String);\n\
                    type Seed = (&'static str, Scenario, usize);\n\
-                   struct Ref;\n";
+                   struct Ref;\n\
+                   impl Ref for Dispatch {}\n\
+                   impl refs::Ref for Paired {}\n\
+                   fn u() { impl zakura_sim::harness::header_acceptance::refs::Ref for Release {} }\n\
+                   impl Serialize for Release {}\n";
     assert_eq!(
         defined_refs(planted, "t.rs"),
         [
@@ -6880,9 +6923,255 @@ fn identity_refs_are_defined_only_in_refs() {
             "SessionRef",
             "LocalRef",
             "Pair",
-            "Slot"
+            "Slot",
+            "impl Ref for Dispatch",
+            "impl Ref for Paired",
+            "impl Ref for Release",
         ]
     );
+}
+
+/// Rule 25's registered one-key-off controls, one per type `refs.rs`
+/// implements `Ref` for: the type, and the test, by its file relative to
+/// the crate and its name, whose `assert_one_key_off::<type>` runs that
+/// type's control on a real join.
+const REF_CONTROLS: &[(&str, &str, &str)] = &[
+    (
+        "FrameRef",
+        "src/harness/header_acceptance/refs.rs",
+        "the_template_moves_every_key",
+    ),
+    (
+        "PageRef",
+        "src/harness/header_acceptance/refs.rs",
+        "the_template_moves_every_key",
+    ),
+    (
+        "StreamRef",
+        "src/harness/header_acceptance/companions.rs",
+        "the_rejected_page_s_session_joins_its_stream",
+    ),
+    (
+        "ReadRef",
+        "src/harness/header_acceptance/companions.rs",
+        "the_staged_page_joins_the_rejected_frame",
+    ),
+    (
+        "SubscriptionRef",
+        "src/harness/header_acceptance/companions.rs",
+        "the_staged_page_joins_the_rejected_frame",
+    ),
+    (
+        "FindingRef",
+        "src/harness/header_acceptance/companions.rs",
+        "the_path_break_names_the_sent_page",
+    ),
+    (
+        "SessionRef",
+        "src/harness/header_acceptance/actions.rs",
+        "a_session_end_joins_its_admission_by_its_whole_ref",
+    ),
+    (
+        "ControlRef",
+        "src/harness/header_acceptance/actions.rs",
+        "a_control_effect_joins_its_whole_cause",
+    ),
+    (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "a_link_act_joins_its_whole_link",
+    ),
+    (
+        "TriggerRef",
+        "src/harness/header_acceptance/tool.rs",
+        "a_witness_judges_its_whole_trigger",
+    ),
+    (
+        "FindingSubject",
+        "src/witness.rs",
+        "a_member_at_the_break_s_step_joins_by_its_punishment",
+    ),
+    (
+        "WorkRef",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "DispatchRef",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "CallOpRef",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "StaleCallRef",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "ReleaseRef",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+];
+
+/// Every typed one-key-off control in the Rust source `text`, the file
+/// `file`, that a test run executes, as `(test, type)`: each call of
+/// `assert_one_key_off::<type>`, outside any macro, which `syn` doesn't
+/// parse, inside a `#[test]` function that isn't
+/// `#[ignore]`d, with no enclosing item compiled out by a `cfg` other than
+/// `test` or `zakura_sim`, by the type's last path segment.
+fn typed_controls(text: &str, file: &str) -> BTreeSet<(String, String)> {
+    use syn::visit::Visit;
+    /// Whether `attrs` compile their item out of a test run: a `cfg` that
+    /// isn't `test` or `zakura_sim`.
+    fn compiled_out(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr.meta.require_list().is_ok_and(|list| {
+                    let tokens = list.tokens.to_string();
+                    tokens != "test" && tokens != "zakura_sim"
+                })
+        })
+    }
+    /// Collects the controls, by enclosing running test.
+    #[derive(Default)]
+    struct Controls {
+        test: Option<String>,
+        found: BTreeSet<(String, String)>,
+    }
+    impl<'ast> Visit<'ast> for Controls {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !compiled_out(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if compiled_out(&item.attrs) {
+                return;
+            }
+            let runs = item.attrs.iter().any(|attr| attr.path().is_ident("test"))
+                && !item.attrs.iter().any(|attr| attr.path().is_ident("ignore"));
+            let outer = self.test.take();
+            if runs && outer.is_none() {
+                self.test = Some(item.sig.ident.to_string());
+            }
+            syn::visit::visit_item_fn(self, item);
+            self.test = outer;
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let (Some(test), syn::Expr::Path(path)) = (&self.test, &*call.func) {
+                let last = path.path.segments.last();
+                let typed = last
+                    .filter(|last| last.ident == "assert_one_key_off")
+                    .and_then(|last| match &last.arguments {
+                        syn::PathArguments::AngleBracketed(args) => args.args.first(),
+                        _ => None,
+                    })
+                    .and_then(|arg| match arg {
+                        syn::GenericArgument::Type(syn::Type::Path(ty)) => ty.path.segments.last(),
+                        _ => None,
+                    });
+                if let Some(ty) = typed {
+                    self.found.insert((test.clone(), ty.ident.to_string()));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut controls = Controls::default();
+    controls.visit_file(&parsed);
+    controls.found
+}
+
+/// The types `refs.rs`, as `text`, implements `Ref` for ([`defined_refs`]).
+fn ref_impls(text: &str) -> BTreeSet<String> {
+    defined_refs(text, "refs.rs")
+        .into_iter()
+        .filter_map(|found| found.strip_prefix("impl Ref for ").map(str::to_owned))
+        .collect()
+}
+
+/// Rule 25's completeness check: every type `refs.rs` implements `Ref`
+/// for is registered once in [`REF_CONTROLS`], and nothing else is, and
+/// each registered test runs that type's typed one-key-off control
+/// ([`typed_controls`]), so a new `Ref` without a control fails. The
+/// controls show a planted `Ref` with no registration, a registered test
+/// whose control isn't typed, that's `#[ignore]`d, that isn't a test or
+/// that's compiled out, and a registration naming a test that's gone, each
+/// fail it.
+#[test]
+fn every_ref_has_a_one_key_off_control() {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |file: &str| std::fs::read_to_string(krate.join(file)).expect("a source file reads");
+    let refs = read("src/harness/header_acceptance/refs.rs");
+    let registered: BTreeSet<String> = REF_CONTROLS
+        .iter()
+        .map(|(name, ..)| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        registered.len(),
+        REF_CONTROLS.len(),
+        "a type is listed twice"
+    );
+    assert_eq!(ref_impls(&refs), registered);
+    let missing = |sources: &BTreeMap<&str, String>| -> Vec<&str> {
+        REF_CONTROLS
+            .iter()
+            .filter(|(name, file, test)| {
+                !typed_controls(&sources[file], file)
+                    .contains(&((*test).to_owned(), (*name).to_owned()))
+            })
+            .map(|(name, ..)| *name)
+            .collect()
+    };
+    let sources: BTreeMap<&str, String> = REF_CONTROLS
+        .iter()
+        .map(|(_, file, _)| (*file, read(file)))
+        .collect();
+    assert_eq!(missing(&sources), Vec::<&str>::new());
+
+    let planted = format!(
+        "{refs}
+pub struct NewRef;
+impl Ref for NewRef {{}}
+"
+    );
+    assert!(ref_impls(&planted).contains("NewRef"));
+    assert_ne!(ref_impls(&planted), registered);
+    let tool = "src/harness/header_acceptance/tool.rs";
+    let typed = "assert_one_key_off::<TriggerRef>(";
+    assert_eq!(sources[tool].matches(typed).count(), 1);
+    for broken in [
+        sources[tool].replace(typed, "assert_one_key_off("),
+        sources[tool].replace(
+            "fn a_witness_judges_its_whole_trigger",
+            "fn a_witness_judges_its_whole_trigger_gone",
+        ),
+        sources[tool].replace(
+            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
+            "    #[test]\n    #[ignore]\n    fn a_witness_judges_its_whole_trigger",
+        ),
+        sources[tool].replace(
+            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
+            "    fn a_witness_judges_its_whole_trigger",
+        ),
+        sources[tool].replace(
+            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
+            "    #[test]\n    #[cfg(any())]\n    fn a_witness_judges_its_whole_trigger",
+        ),
+    ] {
+        assert_ne!(broken, sources[tool]);
+        let mut sources = sources.clone();
+        sources.insert(tool, broken);
+        assert_eq!(missing(&sources), ["TriggerRef"]);
+    }
 }
 
 /// The acceptance tool's source directory, relative to the crate.
@@ -6923,19 +7212,6 @@ const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
         "tool.rs",
         "native_dirs",
         "the committed native-mutation tree at S",
-    ),
-    (
-        "tool.rs",
-        "record_args",
-        "the runner's recorder arguments for a declaration, which judge nothing: the \
-         recording they make is bound to the same declaration's files by \
-         `binding::scenario_expect` and `binding::RAN`",
-    ),
-    (
-        "history.rs",
-        "declared",
-        "which declaration a witness test made is which, by its own history file; the one \
-         counted is then bound to its recording by its scenario, Plan and steps",
     ),
     (
         "companions.rs",

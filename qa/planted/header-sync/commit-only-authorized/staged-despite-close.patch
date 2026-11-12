@@ -1,0 +1,65 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/peer.rs b/crates/zakura-network/src/zakura/header_sync/peer.rs
+index 730bf23d81..3a446bc8cd 100644
+--- a/crates/zakura-network/src/zakura/header_sync/peer.rs
++++ b/crates/zakura-network/src/zakura/header_sync/peer.rs
+@@ -68,6 +68,12 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
+                         result.map_err(|error| SinkReject::local(error.to_string()))?;
+                     }
+                 }
++                // Mutation: the page went to the reactor, and only now does
++                // the reader raise its deferred fault and close.
++                let deferred = session.subscriber().take_deferred();
++                if let Some(fault) = deferred {
++                    return Err(violation(&handle, &session, fault.label(), fault));
++                }
+             }
+         }
+     }
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
+index 2d56e5ce39..33f5ae1529 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
+@@ -416,6 +416,11 @@ impl Subscriber {
+             .map_err(SubscriberFault::counted)
+     }
+ 
++    /// Mutation: the page fault the last admitted page deferred.
++    pub(crate) fn take_deferred(&mut self) -> Option<SubscriberFault> {
++        self.state.deferred.take()
++    }
++
+     /// Check a terminal outcome against its subscription's window, and end the
+     /// subscription.
+     pub(crate) fn receive_outcome(
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 380293f644..c8a9abc1ee 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -94,6 +94,8 @@ pub(super) struct SubscriberState {
+     next_id: u64,
+     /// The network's encoded header size, which fixes the smallest page.
+     header_bytes: usize,
++    /// Mutation: a page fault found but not returned.
++    pub(super) deferred: Option<SubscriberFault>,
+     /// Where the credit this subscriber gives reports, once the reactor
+     /// admitted its session with an observer.
+     #[cfg(any(test, zakura_sim))]
+@@ -108,6 +110,7 @@ impl SubscriberState {
+             live: None,
+             next_id: 1,
+             header_bytes,
++            deferred: None,
+             #[cfg(any(test, zakura_sim))]
+             credit: None,
+         }
+@@ -355,7 +358,9 @@ impl SubscriberState {
+         let mut previous_hash = parent.hash;
+         for (index, entry) in page.entries.iter().enumerate() {
+             if entry.header.previous_block_hash != previous_hash {
+-                return Err(SubscriberFault::Linkage);
++                // Mutation: the subscriber admits the page and keeps its
++                // linkage fault for the reader to raise after forwarding it.
++                self.deferred.get_or_insert(SubscriberFault::Linkage);
+             }
+             if !live.reached && index > 0 {
+                 if previous_hash == live.target {

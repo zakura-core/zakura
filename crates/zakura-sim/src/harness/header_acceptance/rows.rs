@@ -146,6 +146,9 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
 /// The file of `header-sync/wire`'s generated witnesses.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
+/// The file of the despite-close case's companion tests.
+const DESPITE_CLOSE_TESTS: &str = "tests/header_despite_close.rs";
+
 /// The file of `header-sync/wire`'s receiver-direction table checks, whose
 /// per-row content tests carry the fault close a content rejection owes.
 const TABLE_TESTS: &str = "tests/header_wire_table.rs";
@@ -1911,6 +1914,24 @@ fn hand_written_rows() -> Vec<Row> {
             index == 0,
         ));
     }
+    // Gap 6: a page staged despite its connection's fault close, judged on
+    // the case's Draft run by its three companions (`companions`).
+    let despite = super::companions::DESPITE_CLOSE;
+    commit.push(result(
+        vec![Key::Case {
+            property: despite.property.to_owned(),
+            name: despite.name.to_owned(),
+        }],
+        G23,
+        Expected::Caught {
+            case: despite,
+            harness: WIRE,
+            set: &[COMMIT],
+            found: Found::AtStep,
+            companions: super::companions::COMPANIONS,
+            not_applicable: &[],
+        },
+    ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
@@ -2669,31 +2690,31 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-2/despite-close/caught",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CAUGHT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_path_break_needs_a_retained_violation",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/close-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_fault_close_holds_on_the_unpatched_rejection",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/staging-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_staging_companion_needs_the_rejected_page_staged",
+            ),
         },
     },
     GateRequirement {

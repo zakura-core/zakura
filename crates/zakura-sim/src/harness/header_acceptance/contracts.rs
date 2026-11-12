@@ -716,7 +716,8 @@ const C18_PROVING: &[TestRef] = &[
 
 /// C5's proving tests: a stale-binary control for a catch, whose baseline
 /// must come from S's build and its patched run from the checkout its
-/// provenance check measured, one for a standalone witness history, whose
+/// provenance check measured, one for a catch's rebuild, which must be of S
+/// itself with the case's patch, one for a standalone witness history, whose
 /// trace and witness test must both come from S's build, one for an
 /// integrity catch, whose patched test and history must come from the
 /// measured build of S with the mutation's committed patch, and one for a
@@ -729,6 +730,10 @@ const C5_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_acceptance/tool.rs",
         "harness::header_acceptance::tool::tests::each_case_trace_comes_from_its_credited_binary",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_planted_build_from_another_base_is_refused",
     ),
     sim_test(
         "src/harness/header_acceptance/tool.rs",

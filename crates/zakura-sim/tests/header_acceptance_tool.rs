@@ -539,6 +539,7 @@ fn two_planted_cases_run_through_the_tool() {
             (
                 "provenance.json",
                 serde_json::json!({
+                    "base": run.subject,
                     "source": source,
                     "patch_sha256": digest(&repo.join(patch)),
                     "refused": null,

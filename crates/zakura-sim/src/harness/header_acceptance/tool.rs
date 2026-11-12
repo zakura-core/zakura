@@ -58,7 +58,11 @@
 //!   <expect>` and, if its `beside` isn't empty, `--also-violates <beside,
 //!   comma-separated>`: `violated` beside the case's `also_violates`, or
 //!   `violated-set` with a nested case's exact `set`. With the runs come
-//!   [`PROVENANCE_FILE`] as before, [`VERDICT_FILE`], a [`VerdictCheck`]
+//!   [`PROVENANCE_FILE`], a [`ProvenanceCheck`] naming the `base` commit
+//!   the rebuild's checkout was made from, which must be S, the SHA-256 of
+//!   the patch it applied (`patch_sha256`), which must be the task's
+//!   `patch` at S, and the `source` it measured there, [`VERDICT_FILE`], a
+//!   [`VerdictCheck`]
 //!   naming the `baseline` and `patched` traces it judged by SHA-256, and
 //!   [`TARGET_FILE`], a [`TargetCheck`] naming the `source` of the patched
 //!   build it ran, which must be the provenance check's, and, with a
@@ -730,6 +734,8 @@ pub struct PatchedBuild {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceCheck {
+    /// The commit the patched checkout was made from, which must be S.
+    pub base: String,
     /// The patched checkout's source digest.
     pub source: String,
     /// The SHA-256 of the patch the rebuild applied, which must be the
@@ -1424,7 +1430,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                     &witness.beside,
                 );
                 credit_sources(&dir, subject_source, &mut baseline, &mut patched);
-                if let Some(why) = patch_refusal(repo, patch, &dir) {
+                if let Some(why) = rebuild_refusal(repo, patch, subject, &dir) {
                     fail(&mut patched, why);
                 }
                 // The runner's own verdict covers what the traces don't, its
@@ -1975,10 +1981,12 @@ fn patched_build_refusal(
     None
 }
 
-/// Why case `dir`'s provenance check isn't for its committed patch at
-/// `patch` (a path under `repo`): its recorded SHA-256 is another patch's,
-/// or either can't be read.
-fn patch_refusal(repo: &Path, patch: &str, dir: &Path) -> Option<String> {
+/// Why case `dir`'s provenance check isn't for S, `subject`, with its
+/// committed patch at `patch` (a path under `repo`) applied: its checkout
+/// was made from another commit, its recorded SHA-256 is another patch's,
+/// or either can't be read. An older checkout with the same patch then
+/// never counts as S's catch.
+fn rebuild_refusal(repo: &Path, patch: &str, subject: &str, dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let Ok(bytes) = fs::read(repo.join(patch)) else {
         return Some(format!("the committed patch {patch} can't be read"));
@@ -1988,6 +1996,10 @@ fn patch_refusal(repo: &Path, patch: &str, dir: &Path) -> Option<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     match read_json::<ProvenanceCheck>(&dir.join(PROVENANCE_FILE)) {
+        Some(check) if check.base != subject => Some(format!(
+            "its rebuild's checkout was made from {}, not S, {subject}",
+            check.base
+        )),
         Some(check) if check.patch_sha256 == committed => None,
         Some(check) => Some(format!(
             "its rebuild applied a patch with SHA-256 {}, and {patch} is {committed}",
@@ -3606,6 +3618,7 @@ mod tests {
         };
         let passed = |source: &str| {
             Some(ProvenanceCheck {
+                base: "s".into(),
                 source: source.into(),
                 patch_sha256: String::new(),
                 refused: None,
@@ -3635,6 +3648,7 @@ mod tests {
         );
         // A refused or missing provenance check.
         let refused = Some(ProvenanceCheck {
+            base: "s".into(),
             source: "patched".into(),
             patch_sha256: String::new(),
             refused: Some("it embeds S".into()),
@@ -3668,6 +3682,7 @@ mod tests {
             record_into(&dir.path().join(run), source);
         }
         let check = ProvenanceCheck {
+            base: "s".into(),
             source: patched.into(),
             patch_sha256: String::new(),
             refused: None,
@@ -3873,6 +3888,64 @@ mod tests {
         fs::remove_dir_all(current.path().join(CONFIRMATION_DIR)).expect("it exists");
         record_into(&current.path().join(CONFIRMATION_DIR), "patched-before");
         assert!(refusal(&mine, &old_target).is_some());
+    }
+
+    /// C5: a planted catch counts only from a rebuild of S itself with the
+    /// case's committed patch. A rebuild from an older checkout with the
+    /// same patch, whose patched run, confirmation and checks all name the
+    /// source it measured, and whose baseline is S's, is refused for its
+    /// base alone.
+    #[test]
+    fn a_planted_build_from_another_base_is_refused() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let patch = "qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch";
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let case = case_dir("s", "patched");
+        let (verdict, target) = case_checks(case.path(), Some("fuzz_a"));
+        write_checks(case.path(), &verdict, &target);
+        let rebuilt_from = |base: &str| {
+            let check = ProvenanceCheck {
+                base: base.into(),
+                source: "patched".into(),
+                patch_sha256: digest(&repo.join(patch)),
+                refused: None,
+            };
+            fs::write(
+                case.path().join(PROVENANCE_FILE),
+                serde_json::to_string(&check).expect("a check serializes"),
+            )
+            .expect("the temp dir is writable");
+            // Every measured-source join and case check holds.
+            let read = |run: &str| {
+                execution(
+                    &case.path().join(run),
+                    history_run(),
+                    MACHINE,
+                    RunBy::Planted,
+                )
+            };
+            let (mut baseline, mut patched) = (read("baseline"), read("patched"));
+            credit_sources(case.path(), "s", &mut baseline, &mut patched);
+            assert_eq!(
+                (baseline.end, patched.end),
+                (End::Completed, End::Completed)
+            );
+            assert_eq!(
+                case_refusal(&repo, case.path(), ("p", "a"), Some("fuzz_a"), &input),
+                None
+            );
+            rebuild_refusal(&repo, patch, "s", case.path())
+        };
+        assert_eq!(rebuilt_from("s"), None);
+        let older = rebuilt_from("older");
+        assert!(
+            older
+                .as_deref()
+                .is_some_and(|why| why.contains("made from older")),
+            "{older:?}"
+        );
     }
 
     /// The committed fuzz-target mapping is read from the fuzz package, as
@@ -4099,6 +4172,7 @@ mod tests {
         fs::write(
             case.path().join(PROVENANCE_FILE),
             serde_json::to_string(&ProvenanceCheck {
+                base: "s".into(),
                 source: "patched".into(),
                 patch_sha256: String::new(),
                 refused: None,
@@ -4426,6 +4500,7 @@ mod tests {
         let case = tempfile::tempdir().expect("a temp dir can be created");
         let check = |sha: String| {
             let check = ProvenanceCheck {
+                base: "s".into(),
                 source: "patched".into(),
                 patch_sha256: sha,
                 refused: None,
@@ -4443,11 +4518,11 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
         check(committed);
-        assert_eq!(patch_refusal(&repo, patch, case.path()), None);
+        assert_eq!(rebuild_refusal(&repo, patch, "s", case.path()), None);
         check("00".repeat(32));
-        assert!(patch_refusal(&repo, patch, case.path()).is_some());
+        assert!(rebuild_refusal(&repo, patch, "s", case.path()).is_some());
         fs::remove_file(case.path().join(PROVENANCE_FILE)).expect("the file exists");
-        assert!(patch_refusal(&repo, patch, case.path()).is_some());
+        assert!(rebuild_refusal(&repo, patch, "s", case.path()).is_some());
     }
 
     /// A record names artifacts under its own directory relative to it, and

@@ -1146,8 +1146,8 @@ async fn unconditional_peer_name_dials_past_an_address_on_a_full_ip() {
     assert_eq!(dialer.dial_addrs(), vec![peer_addr("192.0.2.2:8233")]);
 }
 
-/// Zakura only takes the first addresses of a long lookup answer, and never this node's
-/// own listener.
+/// Zakura only takes the first distinct addresses of a long lookup answer, and never
+/// this node's own listener.
 #[tokio::test(start_paused = true)]
 async fn unconditional_peer_name_addresses_are_limited_and_exclude_this_node() {
     let _init_guard = zakura_test::init();
@@ -1163,8 +1163,9 @@ async fn unconditional_peer_name_addresses_are_limited_and_exclude_this_node() {
         UnconditionalPeerDial::Fail,
     );
 
+    // The answer lists every address twice. A repeat does not use up the limit.
     let many: Vec<String> = (1..=constants::MAX_UNCONDITIONAL_PEER_RESOLVED_ADDRS + 4)
-        .map(|host| format!("192.0.2.{host}"))
+        .flat_map(|host| [format!("192.0.2.{host}"), format!("192.0.2.{host}")])
         .collect();
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
     dialer.set_resolved("many.example.com", &many);

@@ -796,8 +796,9 @@ pub fn contract_table() -> Vec<Contract> {
             "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
              conclude under C1's drain.",
             "hf-4, after E1",
-            "hf-4's owed-penalty and node-abandonment cases at the drain's end, which it left \
-             to planted cases, and a teardown cut on the wire and release-wake harnesses",
+            "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty and \
+             node-abandonment cases at the drain's end are both planted case \
+             header-fault-penalized/idle-exit-drops-fault",
         ),
         Contract {
             id: C3,

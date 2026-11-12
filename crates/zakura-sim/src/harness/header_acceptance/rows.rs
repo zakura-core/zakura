@@ -2703,6 +2703,17 @@ fn hand_written_rows() -> Vec<Row> {
             name == "late-fault-unpenalized",
         ));
     }
+    // C2's owed penalty concluding violated at the drain's end, through a
+    // node-side abandonment: the reactor's own exit drops the call holding
+    // the failed reply, and the end replay keeps it as a `DroppedFault`.
+    fault.extend(caught(
+        WIRE,
+        case(penalized, "idle-exit-drops-fault"),
+        &[PENALIZED],
+        Found::AtEnd,
+        G2,
+        false,
+    ));
     rows.push(sim_row(penalized, &[WIRE], fault));
 
     let honest = HONEST;

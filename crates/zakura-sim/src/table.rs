@@ -29,7 +29,7 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 use crate::{
     downstream,
     model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
-    observe::{Entry, StreamId},
+    observe::{Entry, RowAt, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
@@ -588,13 +588,16 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 /// A receiver template's trigger is the node judging a frame its row's rule
 /// covers, with the template's label: a `<label>-closes` ID's label on its
 /// row (any row for `undeclared-type`), a conformant frame on the stream for
-/// `conformant-never-closes`, on each punished connection the property
-/// counts as well ([`punishments_follow_conformant`]), a frame into an empty cadence bucket on the row
-/// for `cadence-never-closes`, any frame on the row for
+/// `conformant-never-closes`, a frame into an empty cadence bucket on the
+/// row for `cadence-never-closes`, any frame on the row for
 /// `receiver-work-authorized` and `receiver-serving-bounded`, and a page of
 /// the subscription on a connection the node granted it credit on for
-/// `receiver-credit-conserved`, where the grant's key is the page's. A
-/// sender template's is in [`sender::trigger`].
+/// `receiver-credit-conserved`, where the grant's key is the page's. For
+/// `conformant-never-closes` it's on each punished connection the property
+/// counts as well ([`punishments_follow_conformant`]), and for the three
+/// downstream templates on each effect's own identity
+/// ([`effects_follow_trigger`]). A sender template's is in
+/// [`sender::trigger`].
 pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLog) -> bool {
     let Some(id) = GeneratedId::parse(id.as_str()) else {
         return false;
@@ -612,44 +615,128 @@ pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLo
         | Template::SenderWithinLive
         | Template::SenderWithinCredit
         | Template::SenderCadence => sender::trigger(layout, &id, entries),
-        Template::ConformantNeverCloses
-        | Template::Closes(_)
-        | Template::CadenceNeverCloses
-        | Template::WorkAuthorized
-        | Template::CreditConserved
-        | Template::ServingBounded => {
-            entries.iter().enumerate().any(|(at, entry)| {
-                let Observation::FrameJudged {
-                    connection,
-                    stream,
-                    quic_stream,
-                    seq,
-                } = entry.obs
-                else {
-                    return false;
-                };
-                let before = &entries[..at];
-                // What came before the peer sent the frame, which `sent`
-                // checked appears exactly once.
-                let sent_before = before
-                    .iter()
-                    .rposition(|entry| {
-                        matches!(&entry.obs, Observation::PeerFrame {
-                        connection: c,
-                        stream: s,
-                        quic_stream: q,
-                        seq: n,
-                        ..
-                    } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
-                    })
-                    .map_or(before, |sent_at| &before[..sent_at]);
-                sent(before, connection, stream, quic_stream, seq).is_ok_and(|frame| {
-                    receiver_reached(layout, &id, sent_before, connection, &frame)
-                })
-            }) && (id.template != Template::ConformantNeverCloses
-                || punishments_follow_conformant(&id, entries))
+        Template::Closes(_) | Template::CadenceNeverCloses => {
+            judged_reaches(layout, &id, entries, None, |_, _| true)
+        }
+        Template::ConformantNeverCloses => {
+            judged_reaches(layout, &id, entries, None, |_, _| true)
+                && punishments_follow_conformant(&id, entries)
+        }
+        Template::WorkAuthorized | Template::CreditConserved | Template::ServingBounded => {
+            judged_reaches(layout, &id, entries, None, |_, _| true)
+                && effects_follow_trigger(layout, &id, entries)
         }
     }
+}
+
+/// True if the node judged a frame in `entries`, on `connection` if it's
+/// given and with `key` true of its sequence number and the frame the peer
+/// sent, that reaches receiver template `id`'s trigger
+/// ([`receiver_reached`]).
+fn judged_reaches(
+    layout: &[Stream],
+    id: &GeneratedId<'_>,
+    entries: &[Entry],
+    on: Option<u64>,
+    key: impl Fn(u64, &Sent<'_>) -> bool,
+) -> bool {
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        if on.is_some_and(|on| on != connection) {
+            return false;
+        }
+        let before = &entries[..at];
+        // What came before the peer sent the frame, which `sent` checked
+        // appears exactly once.
+        let sent_before = before
+            .iter()
+            .rposition(|entry| {
+                matches!(&entry.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
+            })
+            .map_or(before, |sent_at| &before[..sent_at]);
+        sent(before, connection, stream, quic_stream, seq).is_ok_and(|frame| {
+            key(seq, &frame) && receiver_reached(layout, id, sent_before, connection, &frame)
+        })
+    })
+}
+
+/// True if each effect in `entries` that downstream template `id` checks
+/// ([`crate::downstream`]) came after a frame the node judged on the
+/// effect's connection that reaches `id`'s trigger on the effect's own
+/// identity: the work's source frame, by stream and sequence number, for
+/// `receiver-work-authorized`; a page with the work's subscription key for
+/// `receiver-credit-conserved`; and a request with the serving owner's or
+/// output's key for `receiver-serving-bounded`. So a violation's trigger
+/// history is its own, not another connection's, frame's or exchange's,
+/// and an effect with no such frame reaches nothing.
+fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[Entry]) -> bool {
+    let Some(row) = id.row else {
+        return false;
+    };
+    let on_row = |at: &RowAt| at.stream == id.stream && at.row == row;
+    entries.iter().enumerate().all(|(at, entry)| {
+        // The effect's connection, then its source frame or its key.
+        let (connection, source, exchange) = match (&entry.obs, id.template) {
+            (
+                Observation::WorkAdmitted {
+                    connection,
+                    frame,
+                    seq,
+                    ..
+                },
+                Template::WorkAuthorized,
+            ) if on_row(frame) => (*connection, Some((frame.stream, *seq)), None),
+            (
+                Observation::WorkAdmitted {
+                    connection,
+                    request,
+                    exchange,
+                    ends: false,
+                    ..
+                },
+                Template::CreditConserved,
+            ) if on_row(request) => (*connection, None, Some(*exchange)),
+            (
+                Observation::Serving {
+                    connection,
+                    request,
+                    exchange,
+                }
+                | Observation::NodeOutput {
+                    connection,
+                    request,
+                    exchange,
+                    ..
+                },
+                Template::ServingBounded,
+            ) if on_row(request) => (*connection, None, Some(*exchange)),
+            _ => return true,
+        };
+        judged_reaches(
+            layout,
+            id,
+            &entries[..at],
+            Some(connection),
+            |seq, frame| {
+                source.is_none_or(|source| source == (frame.stream, seq))
+                    && exchange.is_none_or(|exchange| frame.exchange == Some(exchange))
+            },
+        )
+    })
 }
 
 /// True if each punishment in `entries` that `conformant-never-closes`

@@ -585,3 +585,92 @@ mod sched_mapping {
         }));
     }
 }
+
+mod schedule_agreement {
+    use serde_json::json;
+    use zakura_sim::sim_acceptance::agreement::{
+        agreement, first_differing_step, HunkMap, Site, StepView,
+    };
+
+    /// A patch that removes three lines (10 to 12) of `src/peer.rs`.
+    const PATCH: &str = "--- a/src/peer.rs\n+++ b/src/peer.rs\n@@ -10,3 +10,0 @@\n-a\n-b\n-c\n";
+
+    fn reach(step: u64, pick: &str, site: &str) -> StepView {
+        StepView {
+            step,
+            pick: pick.to_owned(),
+            draws: Vec::new(),
+            obs: vec![json!({ "obs": "task-reached", "task": "t", "at": "lock#1", "site": site })],
+        }
+    }
+
+    #[test]
+    fn lines_shift_past_a_hunk_and_vanish_inside_it() {
+        let map = HunkMap::parse(PATCH).unwrap();
+        assert_eq!(map.map("src/peer.rs", 5), Some(5));
+        assert_eq!(map.map("src/peer.rs", 11), None);
+        assert_eq!(map.map("src/peer.rs", 20), Some(17));
+        assert_eq!(map.map("src/other.rs", 20), Some(20));
+    }
+
+    /// Raw equality would split at the first lock, whose line the removed
+    /// lines move. The hunk map lines it up, and the runs first differ at
+    /// the declared site.
+    #[test]
+    fn a_moved_line_agrees_and_the_first_difference_is_at_the_site() {
+        let map = HunkMap::parse(PATCH).unwrap();
+        let before = [
+            reach(1, "task:t", "src/peer.rs:20"),
+            reach(2, "task:t", "src/peer.rs:30"),
+        ];
+        let after = [
+            reach(1, "task:t", "src/peer.rs:17"),
+            reach(2, "task:t", "src/peer.rs:40"),
+        ];
+        assert_eq!(
+            first_differing_step(&before, &after, &HunkMap::default()),
+            Some(1)
+        );
+        let site = Site {
+            at: "src/peer.rs:40".to_owned(),
+        };
+        assert_eq!(agreement(&before, &after, &map, &site), Ok(2));
+    }
+
+    /// An earlier change in the same function, to the same kind of
+    /// operation, makes the runs differ before the site, which fails.
+    #[test]
+    fn an_earlier_difference_than_the_site_fails() {
+        let map = HunkMap::parse(PATCH).unwrap();
+        let before = [
+            reach(1, "task:t", "src/peer.rs:20"),
+            reach(2, "task:t", "src/peer.rs:30"),
+        ];
+        let after = [
+            reach(1, "task:t", "src/peer.rs:18"),
+            reach(2, "task:t", "src/peer.rs:40"),
+        ];
+        let site = Site {
+            at: "src/peer.rs:40".to_owned(),
+        };
+        assert!(agreement(&before, &after, &map, &site).is_err());
+    }
+
+    /// A line a hunk replaced never matches, so a step there differs.
+    #[test]
+    fn a_line_inside_a_hunk_never_matches() {
+        let map = HunkMap::parse(PATCH).unwrap();
+        let before = [reach(1, "task:t", "src/peer.rs:11")];
+        let after = [reach(1, "task:t", "src/peer.rs:11")];
+        assert_eq!(first_differing_step(&before, &after, &map), Some(1));
+    }
+
+    #[test]
+    fn runs_that_never_differ_fail() {
+        let before = [reach(1, "task:t", "src/x.rs:1")];
+        let site = Site {
+            at: "src/x.rs:1".to_owned(),
+        };
+        assert!(agreement(&before, &before.clone(), &HunkMap::default(), &site).is_err());
+    }
+}

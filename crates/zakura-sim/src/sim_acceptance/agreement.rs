@@ -148,7 +148,9 @@ fn reached(obs: &Value) -> Option<String> {
 /// `--observe` log a fresh replay wrote beside it. The log must be bound
 /// to the trace: one line per step from 0 for setup, each
 /// `{"step":<n>,"obs":<obs>}` for its own step, with `<obs>` hashing to
-/// the observation digest the trace records for that step.
+/// the observation digest the trace records for that step. `init`'s digest
+/// is taken before the setup tasks' spawns land in step 0, so line 0 binds
+/// when a prefix of its observations hashes to it.
 pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
     use sha2::{Digest as _, Sha256};
     let trace = crate::trace::TraceReader::open(dir)
@@ -173,16 +175,12 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
             .strip_prefix(&format!(r#"{{"step":{n},"obs":"#))
             .and_then(|rest| rest.strip_suffix('}'))
             .ok_or_else(|| format!("{}: log line {n} isn't step {n}'s", dir.display()))?;
-        let hashed: String = Sha256::digest(text.as_bytes())[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        if digest.as_deref() != Some(hashed.as_str()) {
-            return Err(format!(
-                "{}: log line {n} doesn't match the trace's observation digest",
-                dir.display()
-            ));
-        }
+        let hash = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
         let parsed: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
         let Value::Array(items) = parsed else {
             return Err(format!(
@@ -190,6 +188,19 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
                 dir.display()
             ));
         };
+        let bound = if n == 0 {
+            array_prefixes(text)
+                .iter()
+                .any(|prefix| digest.as_deref() == Some(hash(prefix.as_bytes()).as_str()))
+        } else {
+            digest.as_deref() == Some(hash(text.as_bytes()).as_str())
+        };
+        if !bound {
+            return Err(format!(
+                "{}: log line {n} doesn't match the trace's observation digest",
+                dir.display()
+            ));
+        }
         obs.push(items);
     }
     let mut obs = obs.into_iter();
@@ -208,6 +219,33 @@ pub fn step_views(dir: &std::path::Path) -> Result<Vec<StepView>, String> {
         });
     }
     Ok(views)
+}
+
+/// Each prefix of the JSON array `text`, as its own array text with the
+/// original bytes of its elements: `[]`, `[a]`, `[a,b]` and so on. Only
+/// top-level commas, outside strings and nested values, split elements.
+fn array_prefixes(text: &str) -> Vec<String> {
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_default();
+    let mut prefixes = vec!["[]".to_owned()];
+    let (mut depth, mut in_string, mut escaped) = (0u32, false, false);
+    for (index, byte) in inner.bytes().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
+            b',' if !in_string && depth == 0 => prefixes.push(format!("[{}]", &inner[..index])),
+            _ => {}
+        }
+    }
+    if !inner.is_empty() {
+        prefixes.push(format!("[{inner}]"));
+    }
+    prefixes
 }
 
 /// `views` without each observation's `site`, for two runs whose fix is a
@@ -349,5 +387,17 @@ mod tests {
         assert_eq!(back.map("peer.rs", 85), Some(85));
         assert_eq!(map.map("peer.rs", 97), None);
         assert_eq!(back.map("peer.rs", 90), None);
+    }
+
+    /// Each prefix keeps its elements' bytes, and commas inside strings or
+    /// nested values don't split.
+    #[test]
+    fn array_prefixes_split_only_top_level_elements() {
+        let text = r#"[{"a":"x,y"},{"b":[1,2]}]"#;
+        assert_eq!(
+            super::array_prefixes(text),
+            ["[]", r#"[{"a":"x,y"}]"#, r#"[{"a":"x,y"},{"b":[1,2]}]"#]
+        );
+        assert_eq!(super::array_prefixes("[]"), ["[]"]);
     }
 }

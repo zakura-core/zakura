@@ -1761,4 +1761,19 @@ pub(crate) mod tests {
         adopt(&adoption, 4);
         assert_eq!(answer(), FactAnswer::Discharges, "the successor");
     }
+
+    /// A recovery started, and a hostile event spent, after the node's stores froze are dropped.
+    #[test]
+    fn frozen_recovery_stores_drop_a_start_and_a_spend() {
+        crate::stores::assert_freeze_drops_writes(
+            RecoveryEvidence::new,
+            |recovery| recovery.start("mirror-0".into(), at(0), chain(3, 0, 0)),
+            RecoveryEvidence::get,
+        );
+        crate::stores::assert_freeze_drops_writes(
+            |stores| Prefix::bounded(stores),
+            |prefix| prefix.spend(1, Hostile::Step(0)),
+            Prefix::events,
+        );
+    }
 }

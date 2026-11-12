@@ -1754,4 +1754,20 @@ mod tests {
                 if matches!(breaks.as_slice(), [why] if why.starts_with("ReadmittedInCooldown"))
         ));
     }
+
+    /// A cooldown fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_cooldown_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            CooldownEvidence::new,
+            |cooldowns| {
+                cooldowns.record(CooldownFact::Admitted {
+                    peer: "mirror-0".to_owned(),
+                    session_id: 1,
+                    at: Duration::ZERO,
+                });
+            },
+            CooldownEvidence::facts,
+        );
+    }
 }

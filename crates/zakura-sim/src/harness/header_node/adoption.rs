@@ -777,4 +777,14 @@ mod tests {
             assert!(violates(&broken.generation(), "StaleGeneration"));
         }
     }
+
+    /// An adoption fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_adoption_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            super::AdoptionEvidence::new,
+            |adoption| adoption.record(Duration::ZERO, commit(1)),
+            super::AdoptionEvidence::facts,
+        );
+    }
 }

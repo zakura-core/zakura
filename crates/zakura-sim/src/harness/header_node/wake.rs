@@ -539,4 +539,14 @@ mod tests {
             [found(discharged(&first, 3)), found(discharged(&second, 4))]
         );
     }
+
+    /// A wake fact kept after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_wake_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            |stores| WakeEvidence::new(stores, None),
+            |wake| wake.push(opened(&peer_id([7; 32], 0), 1)),
+            WakeEvidence::facts,
+        );
+    }
 }

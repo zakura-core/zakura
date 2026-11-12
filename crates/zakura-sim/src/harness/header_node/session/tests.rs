@@ -532,3 +532,13 @@ fn a_refused_session_joins_its_own9_row() {
     let why = broken(&own9(), &[refused(6)]).expect("no row has session 6");
     assert!(why.starts_with("Own9Join:"), "{why}");
 }
+
+/// A reactor event fed after the node's stores froze changes no fact.
+#[test]
+fn a_frozen_session_view_drops_an_event() {
+    crate::stores::assert_freeze_drops_writes(
+        SessionEvidence::new,
+        |view| view.reactor(&admitted(5, None, None)),
+        SessionEvidence::facts,
+    );
+}

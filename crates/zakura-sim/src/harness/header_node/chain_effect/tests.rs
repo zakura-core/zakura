@@ -199,3 +199,15 @@ fn an_unsubmitted_apply_is_missing_evidence() {
         );
     }
 }
+
+/// A drain's applicability noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_chain_effect_store_drops_its_applicability() {
+    crate::stores::assert_freeze_drops_writes(
+        ChainEffectEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.applicable = Some(1));
+        },
+        ChainEffectEvidence::any,
+    );
+}

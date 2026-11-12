@@ -2293,3 +2293,25 @@ impl HeaderNode {
         self.shutdown.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Effects;
+    use crate::stores::assert_freeze_drops_writes;
+
+    /// A session end recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_session_ends_store_drops_an_end() {
+        assert_freeze_drops_writes(
+            Effects::new,
+            |effects| {
+                effects
+                    .ended
+                    .write(|ended| ended.0.insert(1, Duration::ZERO));
+            },
+            |effects| effects.ended.read(|ended| ended.0.clone()),
+        );
+    }
+}

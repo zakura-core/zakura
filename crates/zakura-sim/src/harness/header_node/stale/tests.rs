@@ -444,3 +444,23 @@ fn a_stale_faults_penalty_is_allowed() {
     let (mut check, _) = fed(events);
     assert_eq!(check.drain(1), Vec::<String>::new());
 }
+
+/// A stale window kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_stale_store_drops_a_window() {
+    crate::stores::assert_freeze_drops_writes(
+        StaleEvidence::new,
+        |stale| {
+            stale.change(|windows| {
+                windows.push(StaleWindow {
+                    call: 1,
+                    apply: false,
+                    why: Staleness::RoundRetired,
+                    step: None,
+                    handled: false,
+                });
+            });
+        },
+        StaleEvidence::windows,
+    );
+}

@@ -377,4 +377,14 @@ mod tests {
             []
         );
     }
+
+    /// A boundary noted after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_capacity_store_drops_a_boundary() {
+        crate::stores::assert_freeze_drops_writes(
+            super::CapacityEvidence::new,
+            |capacity| capacity.unread(1, super::BoundaryRead::UnreadQuiet),
+            |capacity| capacity.boundary(1),
+        );
+    }
 }

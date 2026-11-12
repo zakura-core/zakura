@@ -1096,3 +1096,19 @@ fn the_owners_replacement_answers_a_hand_off() {
         crate::property::FactAnswer::Discharges
     ));
 }
+
+/// A hand-off fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_retirement_store_drops_a_fact() {
+    let peer = ZakuraPeerId::new(vec![1; 32]).expect("32 bytes is a valid peer ID");
+    crate::stores::assert_freeze_drops_writes(
+        RetirementEvidence::new,
+        |evidence| {
+            evidence.push(HandoffFact::Ready {
+                owner: (peer.clone(), 1),
+                taker: (peer.clone(), 2),
+            });
+        },
+        RetirementEvidence::facts,
+    );
+}

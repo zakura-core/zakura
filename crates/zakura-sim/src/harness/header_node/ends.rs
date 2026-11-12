@@ -182,4 +182,14 @@ mod tests {
             "and takes no stamp"
         );
     }
+
+    /// An end fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_end_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            EndEvidence::new,
+            |ends| ends.record(EndFact::ReactorExited { step: 1 }),
+            EndEvidence::facts,
+        );
+    }
 }

@@ -261,3 +261,19 @@ fn a_failed_undelivered_or_unnamed_read_opens_nothing() {
     assert!(evidence.facts().is_empty());
     assert!(unnamed.facts().is_empty());
 }
+
+/// A hold-wake fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_hold_wake_store_drops_a_fact() {
+    crate::stores::assert_freeze_drops_writes(
+        HoldWakeEvidence::armed,
+        |evidence| {
+            evidence.push(HoldWakeFact::Opened {
+                call: 1,
+                op: 2,
+                at: SimInstant::ZERO,
+            });
+        },
+        HoldWakeEvidence::facts,
+    );
+}

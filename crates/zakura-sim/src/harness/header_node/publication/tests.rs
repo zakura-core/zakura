@@ -487,3 +487,26 @@ fn a_store_must_be_the_whole_record() {
     assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(breaks[0].contains("whose engine record is"), "{breaks:?}");
 }
+
+/// A publication fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_publication_store_drops_a_fact() {
+    crate::stores::assert_freeze_drops_writes(
+        |stores| {
+            PublicationEvidence::armed(
+                stores,
+                Arming {
+                    armed: true,
+                    status: false,
+                },
+            )
+        },
+        |evidence| {
+            evidence.keep(PublicationFact::Committed {
+                state_version: 1,
+                at: SimInstant::ZERO,
+            });
+        },
+        PublicationEvidence::facts,
+    );
+}

@@ -1419,3 +1419,15 @@ fn a_shutdown_judges_no_repair_context_read_by_age() {
         "{found:?}"
     );
 }
+
+/// A row's peak noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_outstanding_store_drops_a_peak() {
+    crate::stores::assert_freeze_drops_writes(
+        OutstandingEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.peaks.insert("row", 3));
+        },
+        OutstandingEvidence::peaks,
+    );
+}

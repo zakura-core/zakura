@@ -128,4 +128,19 @@ mod tests {
 
         assert_eq!(evidence.facts(), [opened, ended]);
     }
+
+    /// An accounting fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_reservation_store_drops_a_fact() {
+        let event = ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 2,
+            cause: ReservationEnd::Cancelled,
+        };
+        crate::stores::assert_freeze_drops_writes(
+            ReservationEvidence::new,
+            |reservations| reservations.record(&event),
+            ReservationEvidence::facts,
+        );
+    }
 }

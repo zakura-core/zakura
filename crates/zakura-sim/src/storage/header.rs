@@ -931,4 +931,14 @@ mod tests {
         assert!(!succeeds(&ordinary, Outcome::Rejected));
         assert!(succeeds(&[Outcome::Rejected], Outcome::Rejected));
     }
+
+    /// An attribution inserted after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_attribution_store_drops_a_blame() {
+        crate::stores::assert_freeze_drops_writes(
+            super::FaultAttributions::new,
+            |attributions| attributions.insert(0, 1, super::Blame::None),
+            super::FaultAttributions::all,
+        );
+    }
 }

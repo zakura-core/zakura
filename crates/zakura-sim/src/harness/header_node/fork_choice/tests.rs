@@ -441,3 +441,15 @@ fn the_seed_waits_for_step_one() {
     assert_eq!(check.drain(1).expect("no evidence is missing").len(), 1);
     assert!(evidence.applicable_by(1));
 }
+
+/// A settled point counted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_fork_choice_store_drops_a_settled_point() {
+    crate::stores::assert_freeze_drops_writes(
+        ForkChoiceEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.settled_points += 1);
+        },
+        ForkChoiceEvidence::settled_points,
+    );
+}

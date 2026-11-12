@@ -376,3 +376,43 @@ impl ClaimEvidence {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence};
+    use crate::stores::assert_freeze_drops_writes;
+
+    /// A settlement recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_settlement_store_drops_a_row() {
+        let row = Settlement {
+            step: 1,
+            released: 1,
+            unsettled: 0,
+            stuck: 0,
+            tainted: 0,
+            shutdown: false,
+            settled: false,
+        };
+        assert_freeze_drops_writes(
+            SettlementEvidence::new,
+            |rounds| rounds.record(row),
+            SettlementEvidence::rows,
+        );
+    }
+
+    /// A claim break recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_claim_store_drops_a_break() {
+        let record = ClaimRecord {
+            step: 1,
+            claim: Claim::OverBudget,
+            detail: "OverBudget: test".to_owned(),
+        };
+        assert_freeze_drops_writes(
+            ClaimEvidence::new,
+            |claims| claims.record(record.clone()),
+            ClaimEvidence::records,
+        );
+    }
+}

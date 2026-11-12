@@ -1533,3 +1533,15 @@ fn a_v1_page_is_charged_its_auxiliary_records() {
         "{found:?}"
     );
 }
+
+/// A drain's applicability noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_authority_store_drops_its_applicability() {
+    crate::stores::assert_freeze_drops_writes(
+        AuthorityEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.applicable = Some(1));
+        },
+        AuthorityEvidence::any,
+    );
+}

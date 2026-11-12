@@ -156,6 +156,10 @@ const TOOL_TESTS: &str = "tests/header_acceptance_tool.rs";
 /// per-row content tests carry the fault close a content rejection owes.
 const TABLE_TESTS: &str = "tests/header_wire_table.rs";
 
+/// The file of gate 3's crossing histories on `header-sync/wire`, each a
+/// `subscribe-headers` update that crosses the node's ending.
+const CROSSING_TESTS: &str = "tests/header_wire_crossing.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
 /// names its passing history, the gates it serves, and its catch.
 struct Generated {
@@ -3110,31 +3114,22 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(CROSSING_TESTS, "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished"),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/crossing-close",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_CROSSING_CLOSE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(CROSSING_TESTS, "a_crossing_close_is_conformant_and_unpunished"),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/over-window-grant",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_OVER_WINDOW_GRANT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(CROSSING_TESTS, "an_over_window_crossing_grant_is_bad_cursor_and_closed"),
         },
     },
     GateRequirement {

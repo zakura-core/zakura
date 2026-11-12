@@ -852,7 +852,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
             },
         );
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
-            *until = Some("hdr-14.6");
+            *until = Some("hdr-14.7b");
         }
     });
     // The retired mutation's catch of another failure than its pinned
@@ -3011,7 +3011,6 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 const OPEN_PRS: &[&str] = &[
     "hdr-14.4",
     "hdr-14.5",
-    "hdr-14.6",
     "hdr-14.7b",
     "hdr-14.8",
     "hf-1",
@@ -3171,6 +3170,30 @@ fn the_gate_requirements_match_their_obligations() {
         name: "gate-3/crossing/crossing-close".into(),
     };
     assert!(!crossing.covers(&standing.expected, NARROWING));
+    // Each crossing requirement is its own history's test. Another
+    // history's test doesn't satisfy it, nor does its old transitional
+    // Open: a conformant crossing isn't the over-window Grant's close.
+    for (name, own) in CROSSINGS {
+        let key = Key::Requirement {
+            name: format!("gate-3/crossing/{name}"),
+        };
+        assert!(
+            key.covers(&Expected::Passes { test: own }, NARROWING),
+            "{name}"
+        );
+        for (other, test) in CROSSINGS {
+            if other != name {
+                assert!(!key.covers(&Expected::Passes { test }, NARROWING), "{name}");
+            }
+        }
+        let transitional = Expected::Open {
+            reason: "a crossed update, labelled and judged",
+            owner: "Adam's side",
+            approval: Approval::Pending,
+            until: Some("hdr-14.6"),
+        };
+        assert!(!key.covers(&transitional, NARROWING), "{name}");
+    }
     // Each row's bad-content requirement is that row's fault-close test,
     // since a content rejection owes the close. Another row's test doesn't
     // satisfy it, nor does its old transitional Open, nor the
@@ -3254,6 +3277,31 @@ const BAD_CONTENT_CLOSES: [(&str, TestRef); 4] = [
         sim_test(
             "tests/header_wire_table.rs",
             "headers_outcome_bad_content_closes_with_a_fault",
+        ),
+    ),
+];
+
+/// Each gate-3 crossing history's test, by requirement name.
+const CROSSINGS: [(&str, TestRef); 3] = [
+    (
+        "unretained-open-then-outcome",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "crossing-close",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        ),
+    ),
+    (
+        "over-window-grant",
+        sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
         ),
     ),
 ];

@@ -24,6 +24,7 @@ use support::{
     storage_witnesses::{hold, mirror, step, NODE, SOURCE},
 };
 use zakura_network::zakura::observe::ReactorEvent;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync::{
@@ -175,6 +176,15 @@ struct Run {
 /// Runs `scenario` under `input`, which must end with no violation and no
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
+    run_into(scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> Run {
     let ports = Storage::prepare(scenario);
     let (rounds, stale, sessions, ends, reservations) = (
         ports.rounds.clone(),
@@ -192,14 +202,8 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
         }
         None
     });
-    let report = run_prepared::<Storage>(
-        scenario,
-        ports,
-        input,
-        &mut MemorySink::default(),
-        Some(&mut checker),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<Storage>(scenario, ports, input, sink, Some(&mut checker))
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
         (&report.end.violation, &report.end.harness),
         (&None, &None),
@@ -512,7 +516,16 @@ fn the_mixed_fixture_holds_every_resource_rule() {
         committed_plan(),
         "run `regenerate_mixed_resources_fixture`"
     );
-    witnessed(STEM, &run(&committed, Plan::from_fuzz(&plan)));
+    // The run is the manifest history `STEM`, which the acceptance tool
+    // records from this declaration (C18).
+    let ran = run_declared(
+        Storage::NAME,
+        STEM,
+        &committed,
+        Plan::from_fuzz(&plan),
+        run_into,
+    );
+    witnessed(STEM, &ran);
 }
 
 /// The scenario is the mixed witness under generated plans too, so no

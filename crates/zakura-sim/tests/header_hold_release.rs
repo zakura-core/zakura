@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -53,9 +54,18 @@ fn run(fixture: LivenessScenario, input: PlanInput) -> RunReport {
 
 /// [`run`], with what [`Reading`] keeps.
 fn run_reading(fixture: LivenessScenario, input: PlanInput) -> (RunReport, Reading) {
+    run_reading_into(fixture, input, &mut MemorySink::default())
+}
+
+/// [`run_reading`], recording into `sink`.
+fn run_reading_into(
+    fixture: LivenessScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, Reading) {
     let ports = Liveness::prepare(&fixture);
     let (hold_wake, ends) = (ports.hold_wake.clone(), ports.ends.clone());
-    let report = run_prepared::<Liveness>(&fixture, ports, input, &mut MemorySink::default(), None)
+    let report = run_prepared::<Liveness>(&fixture, ports, input, sink, None)
         .unwrap_or_else(|error| panic!("{fixture:?}: {error}"));
     assert!(
         matches!(report.end.outcome, Outcome::Idle { .. }),
@@ -302,7 +312,15 @@ fn the_committed_fixtures_match_their_names() {
             committed_plan(),
             "{name}: run `regenerate_hold_fixtures`"
         );
-        let report = run(fixture, zakura_sim::Plan::from_fuzz(&plan));
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let report = run_declared(
+            Liveness::NAME,
+            &format!("header-hold-{name}"),
+            &fixture,
+            zakura_sim::Plan::from_fuzz(&plan),
+            |fixture, input, sink| run_reading_into(*fixture, input, sink).0,
+        );
         assert!(
             matches!(
                 outcome(&report, HOLD_RELEASE_WAKES),

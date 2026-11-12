@@ -16,6 +16,7 @@ use support::{
     script::{run_scripted, run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::v9::RegtestMessage;
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::{
@@ -42,7 +43,7 @@ use zakura_sim::{
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source},
     table::{sender_properties, table_properties, GeneratedId, Template},
     witness::{judge_report, Expect},
-    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, Violation,
+    Observation, Plan, PlanInput, PropertyOutcome, RunReport, Violation,
 };
 
 /// Header sync's stream at the version it tables.
@@ -194,16 +195,38 @@ fn act_witness(act: Act) -> WireScenario {
     scenario
 }
 
-/// Runs `scenario` under the default plan, and returns the report even of
-/// a run that ended in a harness failure.
-fn run(scenario: &WireScenario) -> RunReport {
-    run_plan(scenario, Plan::from_fuzz(&[]))
+/// Runs `scenario` under the default plan as the manifest history `case`,
+/// which the acceptance tool records from this declaration (C18), and
+/// returns the report even of a run that ended in a harness failure.
+fn run_case(case: &str, scenario: &WireScenario) -> RunReport {
+    run_declared(
+        HeaderWire::NAME,
+        case,
+        scenario,
+        Plan::from_fuzz(&[]),
+        run_plan_into,
+    )
 }
 
-/// Runs `scenario` under `plan`, as [`run`] does.
-fn run_plan(scenario: &WireScenario, plan: PlanInput) -> RunReport {
+/// `act`'s history's case: the generated ID it reaches, less the family's
+/// prefix.
+fn act_case(act: Act) -> String {
+    let reached = reached(act);
+    reached
+        .strip_prefix(&id(""))
+        .unwrap_or_else(|| panic!("{reached} is a generated ID"))
+        .to_owned()
+}
+
+/// Runs `scenario` under `plan`, recording into `sink`, and returns the
+/// report even of a run that ended in a harness failure.
+fn run_plan_into(
+    scenario: &WireScenario,
+    plan: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> RunReport {
     let ports = HeaderWire::prepare(scenario);
-    let ran = run_prepared::<HeaderWire>(scenario, ports, plan, &mut MemorySink::default(), None);
+    let ran = run_prepared::<HeaderWire>(scenario, ports, plan, sink, None);
     match ran {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,
@@ -316,7 +339,11 @@ fn apply_on_row(row: &str) {
     let acts: Vec<&Act> = ACTS.iter().filter(on_row).collect();
     assert!(!acts.is_empty());
     for act in acts {
-        witnessed(&run(&act_witness(*act)), act, &[reached(*act)]);
+        witnessed(
+            &run_case(&act_case(*act), &act_witness(*act)),
+            act,
+            &[reached(*act)],
+        );
     }
 }
 
@@ -338,7 +365,7 @@ fn every_generated_property_applies_in_its_witness() {
     assert_eq!(distinct.len(), listed.len(), "{listed:?}");
     assert_eq!(distinct, generated().into_iter().collect());
     let honest: Vec<String> = HONEST.iter().map(|suffix| id(suffix)).collect();
-    witnessed(&run(&both_ways()), "honest", &honest);
+    witnessed(&run_case("both-ways", &both_ways()), "honest", &honest);
 }
 
 /// `undeclared-type-closes` and each `status` ID apply and hold in their
@@ -346,7 +373,7 @@ fn every_generated_property_applies_in_its_witness() {
 #[test]
 fn status_faults_apply_in_their_witnesses() {
     witnessed(
-        &run(&act_witness(ACTS[0])),
+        &run_case(&act_case(ACTS[0]), &act_witness(ACTS[0])),
         ACTS[0],
         &[id("undeclared-type-closes")],
     );
@@ -445,7 +472,8 @@ fn each_invalid_label_witness_has_a_conformant_control() {
     }
     assert_eq!(controls.len(), 6, "{controls:?}");
     for control in controls {
-        let report = run(&act_witness(control));
+        let case = format!("{}/{}", control.row().name(), control.name());
+        let report = run_case(&case, &act_witness(control));
         assert_eq!(report.end.violation, None, "{control:?}: {:?}", report.end);
         assert_eq!(report.end.harness, None, "{control:?}: {:?}", report.end);
         let (connection, quic_stream, seq, label) = act_frame(&report, control);
@@ -543,8 +571,14 @@ fn honest_peer_never_punished() {
         ("bystander", bystander, vec![Plan::from_fuzz(&[])]),
     ];
     for (name, scenario, plans) in cases {
-        for plan in plans {
-            let report = run_plan(&scenario, plan);
+        for (index, plan) in plans.into_iter().enumerate() {
+            let case = match name {
+                "lossy" => format!("lossy plan {index} of inputs(2, 16384)"),
+                name => name.to_owned(),
+            };
+            // Each run is a manifest history, which the acceptance tool
+            // records from this declaration (C18).
+            let report = run_declared(HeaderWire::NAME, &case, &scenario, plan, run_plan_into);
             assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
             assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
             honest_holds(&report, name);

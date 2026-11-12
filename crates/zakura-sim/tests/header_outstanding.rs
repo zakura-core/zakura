@@ -13,6 +13,7 @@ use support::{
     inputs,
     steer::{steer, Rule, Steer},
 };
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::OUTSTANDING_WORK_BOUNDED,
@@ -59,14 +60,18 @@ fn scenario(stem: &str) -> StorageScenario {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure.
 fn run(stem: &str, scenario: &StorageScenario, input: PlanInput) -> RunReport {
-    let report = run_prepared::<Storage>(
-        scenario,
-        Storage::prepare(scenario),
-        input,
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{stem}: {error}"));
+    run_into(stem, scenario, input, &mut MemorySink::default())
+}
+
+/// [`run`], recording into `sink`.
+fn run_into(
+    stem: &str,
+    scenario: &StorageScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> RunReport {
+    let report = run_prepared::<Storage>(scenario, Storage::prepare(scenario), input, sink, None)
+        .unwrap_or_else(|error| panic!("{stem}: {error}"));
     assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
     assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
     report
@@ -93,7 +98,15 @@ fn the_committed_witnesses_hold_outstanding_work_bounded() {
     for stem in WITNESSES {
         let plan =
             fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-        let report = run(stem, &scenario(stem), Plan::from_fuzz(&plan));
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let report = run_declared(
+            Storage::NAME,
+            stem,
+            &scenario(stem),
+            Plan::from_fuzz(&plan),
+            |scenario, input, sink| run_into(stem, scenario, input, sink),
+        );
         held(stem, &report);
     }
 }

@@ -37,10 +37,13 @@
 //!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`,
 //!   so `<i>/declared` holds what it declared ([`super::history`]). Then
 //!   `<i>/run`, the declaration whose case is the task's `case`, recorded by
-//!   S's `zakura-sim record --sim <harness> --scenario <its scenario.json>
-//!   (--plan <its plan.bin> | --script <its script.json>)`, with
-//!   `--witness <property> --expect <expect>` when the task names `expect`,
-//!   and its fresh replay.
+//!   S's `zakura-sim record` with [`record_args`]: `--sim <harness>
+//!   --scenario <scenario>`, where `<scenario>` is the JSON text its
+//!   `scenario.json` holds, passed as one argument (the CLI parses
+//!   `--scenario`'s value as JSON, not as a path), then `--plan <path of its
+//!   plan.bin>` or `--script <path of its script.json>`, with `--witness
+//!   <property> --expect <expect>` when the task names `expect`, and its
+//!   fresh replay.
 //! * `case`: the planted runner's `baseline` and `patched` recorded runs,
 //!   copied whole, with the fresh replays it made of them (C4), and
 //!   [`VERDICT_FILE`], [`TARGET_FILE`] and [`PROVENANCE_FILE`] as before.
@@ -49,7 +52,8 @@
 //!   --sim <harness> <its input> --draft <set, comma-separated>` (C9),
 //!   where its input is `--input <input>`, `--scenario <scenario> --plan
 //!   <plan>` or `--scenario <scenario> --script <script>` as [`CaseInput`]
-//!   names it, with its fresh replay by the same binary. A case whose task
+//!   names it, `--scenario` again taking the scenario file's JSON text and
+//!   the others paths, with its fresh replay by the same binary. A case whose task
 //!   names `companions` gets [`COMPANIONS_FILE`] in `<i>/draft` from the
 //!   same rebuilt checkout's `header-acceptance companions --trace <i>/draft
 //!   --out <i>/draft/companions.json`, a [`CompanionsRun`].
@@ -78,7 +82,7 @@ use super::{
         evaluate, Actions, Actual, Companion, End, Evaluation, ExecMeta, Execution,
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
-    history::{declared, DeclaredHistory, PLAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
+    history::{declared, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -233,8 +237,10 @@ pub enum Task {
         harness: String,
         /// The property whose witness the recording runs.
         property: String,
-        /// `--expect`'s value for that witness, or `None` to record with no
-        /// witness.
+        /// `--expect`'s value for that witness: `holds` for a `Holds`, and
+        /// `not-applicable` for a `StaysNotApplicable`, whose target stays
+        /// `NotApplicable` while its trigger history is reached. `None`
+        /// records with no witness, which shows no trigger.
         expect: Option<String>,
         /// Its witness test's package.
         package: String,
@@ -425,11 +431,11 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             Expected::Holds {
                 property, history, ..
             } => tasks.push(history_task(id, property, history, Some("holds"))),
-            // A target that stays NotApplicable has no witness expectation
-            // to record it under, so its trigger history isn't shown.
+            // A target that stays NotApplicable records its trigger history
+            // under the `not-applicable` expectation.
             Expected::StaysNotApplicable {
                 property, history, ..
-            } => tasks.push(history_task(id, property, history, None)),
+            } => tasks.push(history_task(id, property, history, Some("not-applicable"))),
             Expected::Caught {
                 case,
                 harness,
@@ -704,21 +710,28 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-/// A run's declared actions, by its harness and how it ended. A machine's
-/// driver runs its whole input and stops only at its first model mismatch
-/// (Rule 17's machine histories end as their driver does), so a completed
-/// machine run carried out its input, a stopped one a prefix of it, and any
-/// other end none it can show. A node history's actions, its scripted acts
-/// and control steps, must each be derived from its bound scenario and shown
-/// from the trace to reach their documented effect, not just picked
-/// (item 0, "each history's declared actions must run"). No node harness
-/// derives them yet, so a node run is `Incomplete`, and its result blocks.
-fn actions(harness: &str, end: &End) -> Actions {
-    let machine = crate::harness::find(harness).is_ok_and(|entry| entry.machine);
-    match (machine, end) {
-        (true, End::Completed) => Actions::Complete,
-        (true, End::Violation { .. }) => Actions::Prefix,
-        _ => Actions::Incomplete,
+/// A run's declared actions, from its recorded `trace` and `full` report
+/// and how it ended. A machine's driver runs its whole input and stops only
+/// at its first model mismatch (Rule 17's machine histories end as their
+/// driver does), so a completed machine run carried out its input, a
+/// stopped one a prefix of it, and any other end none it can show. A node
+/// run's actions are derived from its bound scenario and judged on its
+/// trace and stores ([`super::actions`]); `witnessed` says whether a
+/// witness judgement of this trace passed. A harness neither knows is
+/// `Incomplete`, so its result blocks.
+fn actions(trace: &Trace, full: &FullReport, end: &End, witnessed: bool) -> Actions {
+    let harness = trace.meta.sim.as_str();
+    match crate::harness::find(harness).map(|entry| entry.machine) {
+        Ok(true) => match end {
+            End::Completed => Actions::Complete,
+            End::Violation { .. } => Actions::Prefix,
+            _ => Actions::Incomplete,
+        },
+        Ok(false) => match super::actions::declared(harness, &trace.meta.scenario) {
+            Ok(declared) => super::actions::judge(&declared, trace, full, end, witnessed),
+            Err(_) => Actions::Incomplete,
+        },
+        Err(_) => Actions::Incomplete,
     }
 }
 
@@ -838,8 +851,13 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
         },
         OutcomeKind::Idle | OutcomeKind::Budget => End::Completed,
     };
-    let actions = actions(&recorded.meta.sim, &end_kind);
     let witness: Option<Value> = read_json(&dir.join("witness.json"));
+    let witnessed = witness
+        .as_ref()
+        .and_then(|w| w.get("passed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let actions = actions(&recorded, &full, &end_kind, witnessed);
     Execution {
         trace,
         run,
@@ -855,11 +873,7 @@ fn execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> Execution 
             .iter()
             .map(|found| (found.property.clone(), report(&found.outcome)))
             .collect(),
-        trigger: witness
-            .as_ref()
-            .and_then(|w| w.get("passed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        trigger: witnessed,
         // A usize count always fits in a u64 on supported targets.
         leaked: end.cleanup.leaked as u64,
         actions,
@@ -1154,17 +1168,19 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             Task::History {
                 expected,
                 harness,
+                property,
+                expect,
                 package,
                 file,
                 test,
                 case,
-                ..
             } => Actual::Run(history_execution(
                 &dir,
                 history_of(expected)
                     .expect("a history task's result names its history")
                     .clone(),
                 harness,
+                (property, expect.as_deref()),
                 (package, file, test, case),
                 subject_source,
             )),
@@ -1413,17 +1429,33 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
 /// package, file, name and case) must have passed at S from a binary
 /// embedding S, and declared the history once ([`declaration`]); then
 /// `dir/run`, S's recording of that declaration, must bind to it (C18) and
-/// come from S's build.
+/// come from S's build. Its trigger comes only from a `witness.json` that
+/// judges the task's own `witness`, its property and expectation, as a
+/// planted run's must ([`CaseChecks::planted`]): one judging another
+/// property or expectation fails the run, and a task with no expectation
+/// shows no trigger.
 fn history_execution(
     dir: &Path,
     run: RunId,
     harness: &str,
+    witness: (&str, Option<&str>),
     test: (&str, &str, &str, &str),
     subject_source: &str,
 ) -> Execution {
     let (package, file, name, case) = test;
     let recording = dir.join("run");
     let mut execution = execution(&recording, run, harness, RunBy::Tool);
+    match witness {
+        (property, Some(expect)) if !witness_judges(&recording, property, expect) => {
+            execution.trigger = false;
+            fail(
+                &mut execution,
+                format!("its witness file doesn't judge {property} expecting {expect}"),
+            );
+        }
+        (_, None) => execution.trigger = false,
+        _ => {}
+    }
     let passed = read_json::<TestRun>(&dir.join(TEST_FILE)).is_some_and(|ran| {
         ran.package == package
             && ran.file == file
@@ -1445,6 +1477,14 @@ fn history_execution(
             }
         }
         Err(why) => fail(&mut execution, why),
+    }
+    let errors = inventory_errors(
+        &inventory_cases(package, file, name),
+        &declared(&dir.join("declared")),
+        name,
+    );
+    if !errors.is_empty() {
+        fail(&mut execution, errors.join("; "));
     }
     if trace_source(&recording).as_deref() != Some(subject_source) {
         fail(
@@ -1701,21 +1741,113 @@ fn declaration(
     }
 }
 
+/// Every counted history the committed inventory
+/// ([`counted_histories`](super::rows::counted_histories)) names for the
+/// witness test `test` in `package`'s `file`, as its harness and case.
+pub fn inventory_cases(package: &str, file: &str, test: &str) -> BTreeSet<(String, String)> {
+    super::rows::counted_histories()
+        .into_iter()
+        .filter(|history| {
+            (
+                history.witness.package,
+                history.witness.file,
+                history.witness.test,
+            ) == (package, file, test)
+        })
+        .map(|history| (history.harness.to_owned(), history.case.to_owned()))
+        .collect()
+}
+
+/// Why the declarations a counted witness test made under
+/// `ZAKURA_SIM_HISTORIES`, `declared`, aren't exactly `inventory`, the
+/// counted histories the committed inventory names for it
+/// ([`inventory_cases`]): one it names that the test didn't declare, one
+/// the test declared that it doesn't name or declared twice, or one
+/// another test declared. Empty when they match, or when the inventory
+/// names no history for the test, which then counts none.
+pub fn inventory_errors(
+    inventory: &BTreeSet<(String, String)>,
+    declared: &[(std::path::PathBuf, DeclaredHistory)],
+    test: &str,
+) -> Vec<String> {
+    if inventory.is_empty() {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, history) in declared {
+        let key = (history.harness.clone(), history.case.clone());
+        if !libtest_names(&history.test, test) {
+            errors.push(format!(
+                "{} declared {} on {}, inside {test}'s run",
+                history.test, history.case, history.harness
+            ));
+        } else if !inventory.contains(&key) {
+            errors.push(format!(
+                "{test} declared {} on {}, which the inventory doesn't count",
+                history.case, history.harness
+            ));
+        } else if !seen.insert(key) {
+            errors.push(format!(
+                "{test} declared {} on {} twice",
+                history.case, history.harness
+            ));
+        }
+    }
+    for (harness, case) in inventory.difference(&seen) {
+        errors.push(format!(
+            "{test} didn't declare its counted history {case} on {harness}"
+        ));
+    }
+    errors
+}
+
 /// Whether libtest's thread name `thread` names the test `test`: the test
 /// itself, or a path ending in it within its file's crate.
 fn libtest_names(thread: &str, test: &str) -> bool {
     thread == test || thread.ends_with(&format!("::{test}"))
 }
 
+/// The declaration in `declaration`'s one Plan file and whether it's a
+/// script, or why it names neither or both forms.
+fn declared_plan(declaration: &Path) -> Result<(std::path::PathBuf, bool), String> {
+    let (plan, script) = (declaration.join(PLAN_FILE), declaration.join(SCRIPT_FILE));
+    match (plan.exists(), script.exists()) {
+        (true, false) => Ok((plan, false)),
+        (false, true) => Ok((script, true)),
+        _ => Err("its declaration names neither or both Plan forms".to_owned()),
+    }
+}
+
+/// The `zakura-sim record` arguments, before `--out` and any witness, that
+/// record the declaration in `declaration` on `harness`, as the runner's
+/// contract gives them: `--sim`, then `--scenario` with the JSON text its
+/// [`SCENARIO_FILE`] holds as one argument, since the CLI parses that value
+/// as JSON, and `--plan` or `--script` with its Plan file's path.
+pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, String> {
+    let (file, script) = declared_plan(declaration)?;
+    let scenario_file = declaration.join(SCENARIO_FILE);
+    let scenario = fs::read_to_string(&scenario_file)
+        .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+    Ok(vec![
+        "--sim".to_owned(),
+        harness.to_owned(),
+        "--scenario".to_owned(),
+        scenario,
+        if script { "--script" } else { "--plan" }.to_owned(),
+        file.display().to_string(),
+    ])
+}
+
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
 /// on `harness`: its scenario and its Plan bytes or script, by digest
-/// (C18).
+/// (C18), or its steps aren't the ones the declaring test's own run took,
+/// its [`RAN_FILE`] ([`super::history::run_declared`]). A declaration with
+/// no such file wasn't run where it was declared, so it names no history.
 fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
-    let (plan, script) = (declaration.join(PLAN_FILE), declaration.join(SCRIPT_FILE));
-    let (file, script) = match (plan.exists(), script.exists()) {
-        (true, false) => (plan, false),
-        (false, true) => (script, true),
-        _ => return Some("its declaration names neither or both Plan forms".to_owned()),
+    let (file, script) = match declared_plan(declaration) {
+        Ok(found) => found,
+        Err(why) => return Some(why),
     };
     typed_refusal(
         harness,
@@ -1724,6 +1856,18 @@ fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<Str
         script,
         dir,
     )
+    .or_else(|| {
+        let Some(ran) = read_json::<Ran>(&declaration.join(RAN_FILE)) else {
+            return Some("its declaration has no steps from its test's own run".to_owned());
+        };
+        let recorded = crate::trace::TraceReader::open(dir).ok()?;
+        (Ran::of(&recorded.steps) != ran).then(|| {
+            format!(
+                "its recording took other steps than its test's own run, which took {}",
+                ran.steps
+            )
+        })
+    })
 }
 
 /// Whether `dir`'s `witness.json` judges `property` expecting `expect`
@@ -2543,23 +2687,98 @@ mod tests {
 
     /// A machine run's actions follow its driver: completed is its whole
     /// input, stopped at a violation a prefix, anything else none. A node
-    /// run's actions need effect evidence the tool doesn't have yet, so
-    /// they're incomplete however it ends or whatever it picked.
+    /// run's actions come from its bound scenario: the committed
+    /// close-and-relink history picks its four control steps in order and
+    /// the `ends` store shows each one acted, so it's complete, and a run a
+    /// violation stopped is judged as a prefix. Controls: a declared step
+    /// that was never picked, one picked whose effect the store doesn't
+    /// show, a picked peer action the scenario doesn't declare, and a later
+    /// step the scenario holds that a hand list of the first four would
+    /// leave out, ending before it's picked, each make the run incomplete.
     #[test]
     fn a_run_s_actions_follow_its_harness() {
-        assert!(crate::harness::find(MACHINE).is_ok_and(|entry| entry.machine));
-        assert!(crate::harness::find(NODE).is_ok_and(|entry| !entry.machine));
         let violation = End::Violation {
             property: "t/a".into(),
         };
-        assert_eq!(actions(MACHINE, &End::Completed), Actions::Complete);
-        assert_eq!(actions(MACHINE, &violation), Actions::Prefix);
-        assert_eq!(actions(MACHINE, &End::Killed), Actions::Incomplete);
-        assert_eq!(actions(NODE, &End::Completed), Actions::Incomplete);
-        assert_eq!(actions(NODE, &violation), Actions::Incomplete);
+        let machine = crate::trace::TraceReader::open(recorded().path()).expect("it reads");
+        let machine_report = full_report(recorded().path()).unwrap_or_else(|_| FullReport {
+            properties: Vec::new(),
+            snapshot: None,
+        });
+        let judged =
+            |trace: &Trace, report: &FullReport, end: &End| actions(trace, report, end, false);
         assert_eq!(
-            actions("no/such-harness", &End::Completed),
+            judged(&machine, &machine_report, &End::Completed),
+            Actions::Complete
+        );
+        assert_eq!(
+            judged(&machine, &machine_report, &violation),
+            Actions::Prefix
+        );
+        assert_eq!(
+            judged(&machine, &machine_report, &End::Killed),
             Actions::Incomplete
+        );
+
+        let trace = crate::trace::TraceReader::open(storage_recording()).expect("it reads");
+        let report = full_report(storage_recording()).expect("the recording has its report");
+        assert_eq!(judged(&trace, &report, &End::Completed), Actions::Complete);
+        assert_eq!(judged(&trace, &report, &violation), Actions::Prefix);
+        assert_eq!(judged(&trace, &report, &End::Killed), Actions::Incomplete);
+
+        let last = "peer:mirror-1:relink";
+        let mut unpicked = trace.clone();
+        unpicked.steps.retain(|step| step.pick != last);
+        assert_eq!(
+            judged(&unpicked, &report, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut unshown = report.clone();
+        for store in unshown
+            .snapshot
+            .as_mut()
+            .and_then(Value::as_array_mut)
+            .expect("a node run keeps its stores")
+        {
+            if store["store"] == "ends" {
+                let text = store["snapshot"].as_str().expect("a Debug snapshot");
+                let relinked =
+                    "Environment { peer: \"mirror-1\", connection: Some(4), action: Relink }";
+                assert!(text.contains(relinked), "{text}");
+                store["snapshot"] = Value::String(text.replace(relinked, "Dropped"));
+            }
+        }
+        assert_eq!(
+            judged(&trace, &unshown, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut undeclared = trace.clone();
+        let mut extra = undeclared.steps[0].clone();
+        extra.pick = "peer:mirror-0:grow".to_owned();
+        undeclared.steps.push(extra);
+        assert_eq!(
+            judged(&undeclared, &report, &End::Completed),
+            Actions::Incomplete
+        );
+
+        let mut later = trace.clone();
+        later.meta.scenario["controls"]
+            .as_array_mut()
+            .expect("the scenario lists its controls")
+            .push(serde_json::json!({ "peer": "mirror-0", "action": "close" }));
+        assert_eq!(
+            judged(&later, &report, &End::Completed),
+            Actions::Incomplete
+        );
+        let declared = super::super::actions::declared(NODE, &later.meta.scenario)
+            .expect("the scenario derives");
+        assert_eq!(declared.len(), 5);
+        assert_eq!(
+            super::super::actions::judge(&declared[..4], &later, &report, &End::Completed, false),
+            Actions::Complete,
+            "a hand list of the first four steps would have passed it"
         );
     }
 
@@ -3129,6 +3348,51 @@ mod tests {
         }
     }
 
+    /// Each history task records its target's witness: a `Holds` under
+    /// `holds`, and a `StaysNotApplicable` under `not-applicable`, so its
+    /// trigger history is recorded beside its target's `NotApplicable`.
+    /// A `not-applicable` witness of the task's own property supplies its
+    /// trigger, and one recorded under `holds` doesn't.
+    #[test]
+    fn a_stays_not_applicable_task_records_its_trigger() {
+        let manifest = Manifest::committed();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&manifest, &repo).expect("the committed manifest plans");
+        let mut stays = 0;
+        for task in &plan.tasks {
+            if let Task::History {
+                expected, expect, ..
+            } = task
+            {
+                let wanted = match expected {
+                    ExpectedId::StaysNotApplicable { .. } => {
+                        stays += 1;
+                        "not-applicable"
+                    }
+                    _ => "holds",
+                };
+                assert_eq!(expect.as_deref(), Some(wanted), "{expected:?}");
+            }
+        }
+        assert_eq!(stays, 2);
+        let read = |expect: &str| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            let witness =
+                serde_json::json!({ "property": "p/a", "expect": expect, "passed": true });
+            history_task_dir(dir.path(), Some(witness));
+            history_execution(
+                dir.path(),
+                history_run(),
+                NODE,
+                ("p/a", Some("not-applicable")),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        assert!(read("not-applicable").trigger);
+        assert!(!read("holds").trigger);
+    }
+
     /// An artifacts directory counts only for the run of S it names: one
     /// with no `run.json`, or another subject's, gives no result, so every
     /// obligation blocks. A case's provenance check must be for its
@@ -3659,6 +3923,13 @@ mod tests {
             serde_json::to_string(&history).expect("it serializes"),
         )
         .expect("the temp dir is writable");
+        let recorded =
+            crate::trace::TraceReader::open(storage_recording()).expect("the recording reads back");
+        fs::write(
+            declared.join("0").join(RAN_FILE),
+            serde_json::to_string(&Ran::of(&recorded.steps)).expect("it serializes"),
+        )
+        .expect("the temp dir is writable");
         let recording = dir.join("history");
         fs::create_dir_all(&recording).expect("the temp dir is writable");
         for file in ["trace.jsonl", FULL_REPORT_FILE] {
@@ -3673,6 +3944,198 @@ mod tests {
                 end["harness"] = Value::String(failure.to_owned());
             }
         });
+    }
+
+    /// A declaration binds to the run its test made through
+    /// [`run_declared_in`](super::super::history::run_declared_in): the
+    /// tool's recording of the declared scenario and Plan takes the steps the
+    /// test's own run took. A test whose run used a Plan one byte off from
+    /// the one it declared is refused, and so is a declaration no run
+    /// followed.
+    #[test]
+    fn a_declaration_binds_to_the_run_its_test_made() {
+        use super::super::history::run_declared_in;
+        let entry = crate::harness::find(NODE).expect("the storage harness is registered");
+        let (scenario, plan) = storage_history();
+        let mut off = plan.clone();
+        off[0] = off[0].wrapping_add(1);
+        let declared = |ran: Option<Vec<u8>>| {
+            let root = tempfile::tempdir().expect("a temp dir can be created");
+            let declared = plan.clone();
+            run_declared_in(
+                Some(root.path()),
+                NODE,
+                "plan 0",
+                &scenario,
+                crate::PlanInput::Bytes(declared),
+                |scenario, declared, sink| {
+                    let Some(ran) = ran else {
+                        return;
+                    };
+                    let input = match ran.as_slice() == plan.as_slice() {
+                        true => declared,
+                        false => crate::PlanInput::Bytes(ran),
+                    };
+                    (entry.run)(scenario, input, sink).expect("the history runs");
+                },
+            );
+            let out = root.path().join("run");
+            crate::harness::record(
+                entry,
+                crate::harness::RecordInput::Plan {
+                    scenario: &scenario,
+                    plan: &plan,
+                },
+                &out,
+            )
+            .expect("the declaration records");
+            declared_refusal(NODE, &root.path().join("0"), &out)
+        };
+        assert_eq!(declared(Some(plan.clone())), None);
+        let one_off = declared(Some(off));
+        assert!(
+            one_off
+                .as_ref()
+                .is_some_and(|why| why.contains("other steps")),
+            "{one_off:?}"
+        );
+        let unrun = declared(None);
+        assert!(
+            unrun.as_ref().is_some_and(|why| why.contains("no steps")),
+            "{unrun:?}"
+        );
+    }
+
+    /// Writes into `dir` what the runner leaves for a history task whose
+    /// test `test` declared [`storage_history`] as `plan 0`: the test's
+    /// passing artifact from a binary embedding `s`, its declaration, and
+    /// S's recording of it in `dir/run` with `witness` as its witness file.
+    fn history_task_dir(dir: &Path, witness: Option<Value>) {
+        declare_and_record(dir, "test", "plan 0", "s", None);
+        fs::rename(dir.join("history"), dir.join("run")).expect("the temp dir is writable");
+        let ran = TestRun {
+            package: "zakura-sim".into(),
+            file: "tests/header_node.rs".into(),
+            tests: vec![("test".into(), "ok".into())],
+            killed: false,
+            exited_ok: true,
+            log: String::new(),
+            binary_source: Some("s".into()),
+            checkout_source: Some("s".into()),
+        };
+        fs::write(
+            dir.join(TEST_FILE),
+            serde_json::to_string(&ran).expect("a test run serializes"),
+        )
+        .expect("the temp dir is writable");
+        if let Some(witness) = witness {
+            fs::write(dir.join("run/witness.json"), witness.to_string())
+                .expect("the temp dir is writable");
+        }
+    }
+
+    /// A counted witness test's declarations must be exactly the counted
+    /// histories the committed inventory names for it. The storage
+    /// witness's 32 plans declared once each pass. One missing, one extra,
+    /// one declared twice and one declared by another test each fail, and a
+    /// test the inventory names nothing for isn't checked.
+    #[test]
+    fn a_counted_test_declares_exactly_its_inventory() {
+        let (file, test) = (
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        );
+        let inventory = inventory_cases("zakura-sim", file, test);
+        assert_eq!(inventory.len(), 32, "{inventory:?}");
+        let declare = |cases: &[(&str, &str)]| -> Vec<(std::path::PathBuf, DeclaredHistory)> {
+            cases
+                .iter()
+                .map(|(by, case)| {
+                    (
+                        std::path::PathBuf::new(),
+                        DeclaredHistory {
+                            test: format!("a::{by}"),
+                            harness: NODE.to_owned(),
+                            case: (*case).to_owned(),
+                        },
+                    )
+                })
+                .collect()
+        };
+        let all: Vec<(&str, &str)> = inventory
+            .iter()
+            .map(|(_, case)| (test, case.as_str()))
+            .collect();
+        assert_eq!(
+            inventory_errors(&inventory, &declare(&all), test),
+            Vec::<String>::new()
+        );
+        let errors =
+            |cases: Vec<(&str, &str)>| inventory_errors(&inventory, &declare(&cases), test);
+        let missing = errors(all[1..].to_vec());
+        assert!(
+            missing.len() == 1 && missing[0].contains("didn't declare"),
+            "{missing:?}"
+        );
+        let mut extra = all.clone();
+        extra.push((test, "plan 32 of inputs(32, 256)"));
+        let extra = errors(extra);
+        assert!(
+            extra.len() == 1 && extra[0].contains("doesn't count"),
+            "{extra:?}"
+        );
+        let mut twice = all.clone();
+        twice.push(all[0]);
+        let twice = errors(twice);
+        assert!(twice.len() == 1 && twice[0].contains("twice"), "{twice:?}");
+        let mut other = all.clone();
+        other[0].0 = "another_test";
+        let other = errors(other);
+        assert!(
+            other.iter().any(|error| error.contains("another_test")),
+            "{other:?}"
+        );
+        assert!(inventory_cases("zakura-sim", file, "not_counted").is_empty());
+        assert_eq!(
+            inventory_errors(&BTreeSet::new(), &declare(&all), "not_counted"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A history's trigger comes only from a witness file judging the
+    /// task's own property and expectation. One a single field off, its
+    /// property or its expectation, fails the run and shows no trigger, and
+    /// a task with no expectation shows none from a stray passing file.
+    #[test]
+    fn a_history_s_trigger_comes_from_its_own_witness() {
+        let read = |witness: Value, expect: Option<&str>| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            history_task_dir(dir.path(), Some(witness));
+            history_execution(
+                dir.path(),
+                history_run(),
+                NODE,
+                ("p/a", expect),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        let judged = |property: &str, expect: &str| serde_json::json!({ "property": property, "expect": expect, "passed": true });
+        let own = read(judged("p/a", "holds"), Some("holds"));
+        assert!(own.trigger, "{:?}", own.end);
+        assert!(!matches!(own.end, End::Failed { .. }), "{:?}", own.end);
+        for other in [judged("p/b", "holds"), judged("p/a", "applicable")] {
+            let run = read(other.clone(), Some("holds"));
+            assert!(!run.trigger, "{other}");
+            assert!(
+                matches!(&run.end, End::Failed { why } if why.contains("doesn't judge p/a")),
+                "{other}: {:?}",
+                run.end
+            );
+        }
+        let unexpected = read(judged("p/a", "holds"), None);
+        assert!(!unexpected.trigger);
+        assert!(!matches!(unexpected.end, End::Failed { .. }));
     }
 
     /// Each integrity run's end is read from its test artifact: passing

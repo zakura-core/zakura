@@ -335,14 +335,65 @@ impl crate::record::RecordSink for KeepReport {
 /// `commit-only-authorized` as `Draft`, as the case's `Draft` run does, and
 /// returns what [`judge`] reads. An error says why the run gave none.
 pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
+    use crate::harness::{header_sync::HeaderWire, Subsystem};
+    let entry = crate::harness::find(HeaderWire::NAME).map_err(|error| error.to_string())?;
+    let plan = crate::Plan::from_fuzz(&input[entry.scenario_bytes.min(input.len())..]);
+    draft_run(&entry.scenario(input), plan).map(|(evidence, _)| evidence)
+}
+
+/// Judges each of [`COMPANIONS`] on the case's recorded `Draft` run in
+/// `dir` (C9), as [`judge`] does. The trace must be `header-sync/wire`'s
+/// with `commit-only-authorized` as its whole `Draft` override. It's rerun
+/// here following the trace's own picks and draws, and the rerun's full
+/// report, every violation and the stores' snapshot, must equal the one
+/// recorded beside the trace, so what's judged is that run. So this must
+/// run in the build that recorded the trace, the case's own patched one,
+/// where a patched behavior replays. An error says why there's no verdict.
+pub fn judge_trace(
+    dir: &std::path::Path,
+) -> Result<Vec<(&'static str, Result<(), String>)>, String> {
+    use crate::harness::{header_sync::HeaderWire, Subsystem};
+    let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
+    if trace.meta.sim != HeaderWire::NAME {
+        return Err(format!(
+            "the trace ran {}, not {}",
+            trace.meta.sim,
+            HeaderWire::NAME
+        ));
+    }
+    if trace.meta.draft != [COMMIT] {
+        return Err(format!(
+            "the trace's Draft override is {:?}, not [{COMMIT}]",
+            trace.meta.draft
+        ));
+    }
+    let script = crate::plan::TraceScript::new(&trace, false).map_err(|error| error.to_string())?;
+    let (evidence, rerun) = draft_run(&trace.meta.scenario, crate::PlanInput::Trace(script))?;
+    let recorded = std::fs::read_to_string(dir.join(crate::record::FULL_REPORT_FILE))
+        .map_err(|error| format!("its full report: {error}"))
+        .and_then(|text| {
+            serde_json::from_str::<crate::record::FullReport>(&text)
+                .map_err(|error| format!("its full report: {error}"))
+        })?;
+    if rerun.as_ref() != Some(&recorded) {
+        return Err("the rerun's full report isn't the recorded one".to_owned());
+    }
+    Ok(judge(&evidence))
+}
+
+/// Runs `scenario` on `header-sync/wire` under `plan` with
+/// `commit-only-authorized` as `Draft`, and returns what [`judge`] reads
+/// with the run's full report.
+fn draft_run(
+    scenario: &Value,
+    plan: crate::PlanInput,
+) -> Result<(DraftEvidence, Option<crate::record::FullReport>), String> {
     use crate::harness::{
         header_sync::{HeaderWire, WireScenario},
         run_prepared, with_draft, HarnessError, Subsystem,
     };
-    let entry = crate::harness::find(HeaderWire::NAME).map_err(|error| error.to_string())?;
     let scenario: WireScenario =
-        serde_json::from_value(entry.scenario(input)).map_err(|error| error.to_string())?;
-    let plan = crate::Plan::from_fuzz(&input[entry.scenario_bytes.min(input.len())..]);
+        serde_json::from_value(scenario.clone()).map_err(|error| error.to_string())?;
     let ports = HeaderWire::prepare(&scenario);
     let reservations = ports.reservations.clone();
     let mut sink = KeepReport::default();
@@ -355,7 +406,8 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
     })?;
     let claims = sink
         .0
-        .and_then(|full| full.snapshot)
+        .as_ref()
+        .and_then(|full| full.snapshot.as_ref())
         .and_then(|snapshot| {
             snapshot.as_array().and_then(|stores| {
                 stores
@@ -365,7 +417,7 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
             })
         })
         .unwrap_or(Value::Null);
-    Ok(DraftEvidence {
+    let evidence = DraftEvidence {
         observations: report
             .log
             .entries()
@@ -379,7 +431,8 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
             .collect(),
         properties: report.properties,
         claims,
-    })
+    };
+    Ok((evidence, sink.0))
 }
 
 #[cfg(test)]
@@ -475,6 +528,67 @@ mod tests {
             ..PropertyReport::new(COMMIT, PropertyOutcome::Violated { witness: vec![9] })
         };
         (claims, vec![report])
+    }
+
+    /// The case's committed input recorded as its `Draft` run, unpatched,
+    /// into a fresh directory.
+    fn draft_recording() -> tempfile::TempDir {
+        let input = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/header-wire-bad-content.bin"),
+        )
+        .expect("the committed input is readable");
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::with_draft(&[COMMIT.to_owned()], || {
+            crate::harness::record(
+                crate::harness::find("header-sync/wire").expect("the wire harness is registered"),
+                crate::harness::RecordInput::Input(&input),
+                dir.path(),
+            )
+        })
+        .expect("the Draft run records");
+        dir
+    }
+
+    /// The trace judge reruns a recorded `Draft` run and judges the same
+    /// evidence the in-process run gives: unpatched, the subscriber refuses
+    /// the page and closes its connection, so only the fault close holds.
+    /// It refuses a
+    /// trace whose recorded full report isn't the rerun's, and one recorded
+    /// without the case's override.
+    #[test]
+    fn the_trace_judge_judges_the_recorded_draft_run() {
+        let dir = draft_recording();
+        let verdicts = judge_trace(dir.path()).expect("the recorded Draft run reruns");
+        let names: Vec<&str> = verdicts.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, COMPANIONS);
+        let input = std::fs::read(dir.path().join(crate::trace::INPUT_FILE))
+            .expect("record keeps the input");
+        let direct = judge(&run_draft(&input).expect("the input runs"));
+        assert_eq!(verdicts, direct);
+        // The unpatched node closes the rejected page's connection with its
+        // fault, and stages nothing.
+        assert!(
+            verdicts[0].1.is_ok() && verdicts[1].1.is_err(),
+            "{verdicts:?}"
+        );
+
+        let path = dir.path().join(crate::record::FULL_REPORT_FILE);
+        let mut report: crate::record::FullReport =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("it exists"))
+                .expect("it reads");
+        report.snapshot = Some(json!([]));
+        std::fs::write(&path, report.to_line()).expect("the temp dir is writable");
+        assert!(judge_trace(dir.path()).is_err());
+
+        let plain = tempfile::tempdir().expect("a temp dir can be created");
+        crate::harness::record(
+            crate::harness::find("header-sync/wire").expect("the wire harness is registered"),
+            crate::harness::RecordInput::Input(&input),
+            plain.path(),
+        )
+        .expect("the run records");
+        assert!(judge_trace(plain.path()).is_err());
     }
 
     /// The fault-close companion joins the rejected frame's connection: a

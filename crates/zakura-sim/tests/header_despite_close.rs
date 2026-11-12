@@ -89,7 +89,7 @@ fn the_staging_companion_needs_the_rejected_page_staged() {
     assert!(evidence.staged.is_empty(), "{:?}", evidence.staged);
     assert!(staged_page(&evidence.staged, &page).is_err());
     let own = staged(page.session, page.subscription, page.frame);
-    assert_eq!(staged_page(&[own.clone()], &page), Ok(own));
+    assert_eq!(staged_page(std::slice::from_ref(&own), &page), Ok(own));
     assert!(staged_page(
         &[staged(page.session, page.subscription, page.frame + 1)],
         &page

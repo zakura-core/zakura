@@ -256,7 +256,7 @@ pub fn path_break(
             frame: staged.frame,
         },
     })
-    .expect("an attribution holds only strings and integers");
+    .map_err(|error| format!("the expected attribution doesn't serialize: {error}"))?;
     let records = claims
         .as_array()
         .ok_or("the claim store's snapshot isn't a list")?;

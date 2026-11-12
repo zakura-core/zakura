@@ -1681,13 +1681,13 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#10"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#7"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#2"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#10"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#9"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#7"
     },
     {
       "pick": "deliver:10.0.0.1:4000->10.1.0.1:4000:4"
@@ -1696,7 +1696,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#13"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#2"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#9"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#34"
@@ -1720,100 +1720,88 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#26"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#11"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#1"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#27"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#10"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#5"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#1"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#2"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#36"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#5"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#6"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#20"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#2"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#3"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#21"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#6"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#7"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:store#4"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#3"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#11"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#37"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#7"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:send#7"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#22"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#12"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#1"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:send#7"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#2"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#1"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#3"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#14"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#2"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#1"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#38"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#3"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#4"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#39"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#1"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#40"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#4"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#23"
-    },
-    {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#12"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#40"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#2"
@@ -1822,10 +1810,22 @@
       "draw": "0x0"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#12"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#23"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:sleep#4"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#12"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#4"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#12"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:recv#5"
     },
     {
       "pick": "deliver:10.0.0.1:4000->10.1.0.1:4000:5"
@@ -1834,28 +1834,16 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#15"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#4"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:send#8"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#41"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:recv#5"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#42"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:send#8"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#28"
-    },
-    {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:recv#6"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#29"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#42"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:recv#7"
@@ -1864,37 +1852,37 @@
       "pick": "task:peer.1/quic.endpoint.1:poll#7"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#30"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:send#11"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:select#15"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#9"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#43"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#13"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#43"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#24"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#14"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:poll#6"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#13"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#15"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#16"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#13"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:rmw#9"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:send#11"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#16"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:rmw#10"
@@ -1906,31 +1894,31 @@
       "pick": "task:peer.1/quic.endpoint.1:send#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#24"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#45"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#16"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#13"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#28"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#17"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:release#13"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#29"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:load#18"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#17"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#30"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:rmw#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#45"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#9"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:rmw#12"
@@ -1942,34 +1930,46 @@
       "pick": "task:peer.1/quic.endpoint.1:send#9"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#31"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:poll#6"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:lock#10"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#32"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:select#13"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:release#10"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#33"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:rmw#18"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:select#16"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#10"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:rmw#19"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:recv#22"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#47"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:store#3"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1:recv#23"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#33"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:poll#6"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:rmw#20"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#17"
     },
     {
       "pick": "task:peer.1:poll#7"
@@ -2125,7 +2125,7 @@
       "pick": "task:peer.1:poll#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#48"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#47"
     },
     {
       "pick": "task:peer.1:send#9"
@@ -2158,31 +2158,31 @@
       "draw": "0x0"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#49"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#48"
     },
     {
       "pick": "task:peer.1:recv#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#50"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#49"
     },
     {
       "pick": "task:peer.1:recv#9"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#34"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#31"
     },
     {
       "pick": "task:peer.1:sleep#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#35"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#32"
     },
     {
       "pick": "task:peer.1:watch#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#36"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#33"
     },
     {
       "pick": "task:peer.1:watch#3"
@@ -2191,13 +2191,13 @@
       "pick": "task:peer.1/peer_header.1:poll#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#11"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#10"
     },
     {
       "pick": "task:peer.1/peer_header.1:send#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#51"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#50"
     },
     {
       "pick": "task:peer.1/peer_header.1:recv#1"
@@ -2275,7 +2275,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1:recv#26"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#52"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#51"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1:recv#27"
@@ -2305,31 +2305,31 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:rmw#4"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#53"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#52"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:acquire#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#54"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#53"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#37"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#34"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:cancelled#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#38"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#35"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#39"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#36"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#6"
@@ -2338,13 +2338,13 @@
       "draw": "0x0"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#12"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#11"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:sleep#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#55"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#54"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:poll#9"
@@ -2368,7 +2368,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:poll#6"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#56"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#55"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:select#7"
@@ -2401,64 +2401,64 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#7"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#57"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#56"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#8"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#58"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#57"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#10"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#37"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#40"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#38"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#12"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#39"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#12"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#41"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#13"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#42"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#13"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#13"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#12"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:watch#9"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#59"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#58"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#14"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#13"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:poll#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#15"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#14"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:spawn#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#14"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#13"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:select#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#16"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#15"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:cancelled#1"
@@ -2470,13 +2470,13 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:cancelled#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#15"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#14"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:recv#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#17"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#16"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1:recv#2"
@@ -2491,7 +2491,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1/stream_reader.1:select#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#16"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:lock#15"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1/stream_reader.1:cancelled#1"
@@ -2515,7 +2515,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1/stream_reader.1:cancelled#3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#18"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1:release#17"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1/stream_reader.1:select#2"
@@ -2827,7 +2827,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:select#3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#60"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#59"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:cancelled#2"
@@ -2845,7 +2845,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:recv#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#61"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#60"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:lock#1"
@@ -2857,7 +2857,7 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:release#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#62"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#61"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:select#4"
@@ -2890,31 +2890,31 @@
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:cancelled#4"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#63"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#62"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:cancel#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#64"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#63"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:rmw#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#43"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#40"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:notify#1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#44"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#41"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:release#2"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#45"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#42"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/header_sync_pipe.1:recv#3"
@@ -2926,7 +2926,7 @@
       "pick": "task:header_sync_reactor.1:poll#3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#14"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#13"
     },
     {
       "pick": "task:header_sync_reactor.1:select#4"
@@ -2959,43 +2959,43 @@
       "pick": "task:header_sync_reactor.1:release#3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#65"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#64"
     },
     {
       "pick": "task:header_sync_reactor.1:release#4"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#66"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#65"
     },
     {
       "pick": "task:header_sync_reactor.1:lock#4"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#46"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#43"
     },
     {
       "pick": "task:header_sync_reactor.1:release#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#47"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#44"
     },
     {
       "pick": "task:header_sync_reactor.1:lock#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#48"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#45"
     },
     {
       "pick": "task:header_sync_reactor.1:release#6"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#15"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#14"
     },
     {
       "pick": "task:header_sync_reactor.1:acquire#5"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#67"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#66"
     },
     {
       "pick": "task:header_sync_reactor.1:cancelled#5"
@@ -3247,7 +3247,7 @@
       "draw": "0x1"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#68"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#67"
     },
     {
       "pick": "peer:peer-0:reserved-flags"
@@ -3283,31 +3283,31 @@
       "pick": "task:peer.1:recv#10"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#69"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#68"
     },
     {
       "pick": "task:peer.1:recv#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#70"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#69"
     },
     {
       "pick": "task:peer.1:recv#12"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#49"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#46"
     },
     {
       "pick": "task:peer.1:recv#13"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#50"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#47"
     },
     {
       "pick": "task:peer.1:send#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#51"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:watch#48"
     },
     {
       "pick": "task:peer.1:select#4"
@@ -3316,13 +3316,13 @@
       "draw": "0x3"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#16"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:notified#15"
     },
     {
       "pick": "task:peer.1:watch#6"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#71"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#70"
     },
     {
       "pick": "task:peer.1:watch#7"
@@ -3341,9 +3341,6 @@
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:send#21"
-    },
-    {
-      "pick": "peer:peer-0:reserved-flags"
     },
     {
       "pick": "task:peer.1:sleep#4"
@@ -3367,16 +3364,16 @@
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:lock#15"
     },
     {
-      "pick": "task:peer.1:recv#16"
-    },
-    {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:release#15"
     },
     {
       "pick": "deliver:10.1.0.1:4000->10.0.0.1:4000:9"
     },
     {
-      "pick": "task:peer.1:send#12"
+      "pick": "peer:peer-0:reserved-flags"
+    },
+    {
+      "pick": "task:peer.1:poll#11"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:select#22"
@@ -3391,121 +3388,163 @@
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#58"
     },
     {
-      "pick": "task:peer.1:recv#17"
+      "pick": "task:peer.1:recv#16"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#59"
     },
     {
-      "pick": "task:peer.1:sleep#5"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:send#22"
-    },
-    {
-      "pick": "task:peer.1:watch#8"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#60"
-    },
-    {
-      "pick": "task:peer.1:watch#9"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:rmw#35"
-    },
-    {
-      "pick": "task:peer.1:recv#18"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:lock#16"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1:poll#11"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:release#16"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1:select#24"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:select#23"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1:load#26"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#61"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1:load#27"
-    },
-    {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#62"
-    },
-    {
-      "pick": "task:wire-node.1/quic.endpoint.1:load#28"
+      "pick": "task:peer.1:send#12"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#34"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1:rmw#18"
+      "pick": "task:peer.1:select#7"
+    },
+    {
+      "draw": "0x2"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#35"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1:rmw#19"
+      "pick": "task:peer.1:sleep#5"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#36"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1:send#10"
+      "pick": "task:peer.1:watch#8"
     },
     {
       "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:notified#11"
     },
     {
-      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#63"
+      "pick": "task:peer.1:watch#9"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:poll#12"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#60"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#29"
+      "pick": "task:wire-node.1/quic.endpoint.1:poll#11"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#39"
+      "pick": "task:peer.1:recv#17"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#40"
+      "pick": "task:wire-node.1/quic.endpoint.1:select#24"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#72"
+      "pick": "task:peer.1:recv#18"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:poll#10"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:load#26"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:select#23"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:load#27"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:send#22"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:load#28"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#61"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:rmw#18"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:rmw#35"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:rmw#19"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:lock#16"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1:send#10"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:release#16"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1:lock#20"
     },
     {
-      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#41"
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:select#24"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1:release#20"
     },
     {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#62"
+    },
+    {
       "pick": "task:wire-node.1/quic.endpoint.1:select#25"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#63"
     },
     {
       "pick": "task:wire-node.1/quic.endpoint.1:recv#30"
     },
     {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#37"
+    },
+    {
       "pick": "task:wire-node.1/quic.endpoint.1:recv#31"
     },
     {
-      "pick": "deliver:10.1.0.1:4000->10.0.0.1:4000:10"
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:poll#12"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#38"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:select#29"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:watch#39"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#39"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:notified#12"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#40"
+    },
+    {
+      "pick": "task:peer.1/quic.endpoint.1/quic.connection.1:recv#64"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:recv#71"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:rmw#41"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:send#19"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:send#20"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.inbound_handshake.1/service_session.1/stream_reader.1:poll#2"
+    },
+    {
+      "pick": "task:wire-node.1/quic.endpoint.1/quic.connection.1:lock#20"
     }
   ]
 }

@@ -1073,20 +1073,6 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
     held.peers[0].script.clear();
     let mut serving = act_scenario(Act::ExtraEnding);
     serving.peers[0].script.clear();
-    let reserved = Act::ReservedFlags {
-        row: Row::Status,
-        bit: 0,
-    };
-    let mut twice = act_scenario(reserved);
-    twice.peers[0].script = vec![PeerAction::Act { act: reserved }; 2];
-    // Fixed and in order, so the script alone decides when each frame
-    // arrives.
-    twice.net.default_link = LinkSpec {
-        min_delay_ms: 0,
-        max_delay_ms: 0,
-        reorder: false,
-        ..twice.net.default_link
-    };
     vec![
         act(
             "status-bad-content",
@@ -1165,7 +1151,7 @@ fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
         ("serving-adversary", serving),
         ("held-subscription", held),
         ("served-subscription", served_subscription()),
-        ("status-reserved-flags-twice", twice),
+        ("status-reserved-flags-twice", reserved_flags_twice()),
     ]
 }
 
@@ -1190,6 +1176,172 @@ fn served_subscription() -> WireScenario {
         policy: Policy::converging(),
         ..WireScenario::default()
     }
+}
+
+/// Two reserved flags `Status` frames from one adversary holding the
+/// node's chain, over fixed 0 ms links, so the script alone decides when
+/// each frame arrives: the two-finding case's scenario.
+fn reserved_flags_twice() -> WireScenario {
+    let reserved = Act::ReservedFlags {
+        row: Row::Status,
+        bit: 0,
+    };
+    let mut twice = act_scenario(reserved);
+    twice.peers[0].script = vec![PeerAction::Act { act: reserved }; 2];
+    twice.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        ..twice.net.default_link
+    };
+    twice
+}
+
+/// The two-finding case's committed script.
+const RESERVED_FLAGS_TWICE_SCRIPT: &str =
+    "header-wire-planted-status-reserved-flags-twice.script.json";
+
+/// The adversary's datagram link to the node, as `deliver:` names it.
+const PEER_TO_NODE: &str = "10.1.0.1:4000->10.0.0.1:4000";
+
+/// Whether `identity`, as the next pick after `log`, would let the two
+/// reserved flags frames reach the node's reader together:
+///
+/// - the second act, while no datagram has left the peer since the first
+///   act ran, so both frames would ride one packet;
+/// - the delivery of a datagram the peer sent after its second act, while
+///   the node's reader hasn't judged the first frame, so both would be
+///   judged at one step.
+fn joins_the_frames(log: &[zakura_sim::observe::Entry], identity: &str) -> bool {
+    let position = |found: &dyn Fn(&Observation) -> bool| -> Vec<usize> {
+        log.iter()
+            .enumerate()
+            .filter(|(_, entry)| found(&entry.obs))
+            .map(|(at, _)| at)
+            .collect()
+    };
+    let ran =
+        position(&|obs| matches!(obs, Observation::ActRan { act, .. } if act == "reserved-flags"));
+    let started = log.iter().any(|entry| {
+        matches!(
+            entry.obs,
+            Observation::PeerFrame {
+                label: Label::ReservedFlags,
+                ..
+            }
+        )
+    });
+    let sent_after = |at: usize| {
+        log[at..].iter().any(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Datagram { link, outcome: zakura_sim::observe::DatagramOutcome::Sent, .. }
+                    if link == PEER_TO_NODE
+            )
+        })
+    };
+    if identity == "peer:peer-0:reserved-flags" {
+        return started && ran.first().is_none_or(|&first| !sent_after(first));
+    }
+    let Some(id) = identity
+        .strip_prefix(&format!("deliver:{PEER_TO_NODE}:"))
+        .and_then(|id| id.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let Some(&second) = ran.get(1) else {
+        return false;
+    };
+    let carries_second = log[second..].iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::Datagram { id: sent, link, .. } if *sent == id && link == PEER_TO_NODE
+        )
+    });
+    let first_frame = log.iter().find_map(|entry| match entry.obs {
+        Observation::PeerFrame {
+            seq,
+            label: Label::ReservedFlags,
+            ..
+        } => Some(seq),
+        _ => None,
+    });
+    let judged = log.iter().any(|entry| {
+        matches!(entry.obs, Observation::FrameJudged { seq, .. } if Some(seq) == first_frame)
+    });
+    carries_second && !judged
+}
+
+/// The default Plan on `header-sync/wire`, steered over
+/// [`reserved_flags_twice`] so the two frames ride two packets and the
+/// node's reader judges them at two steps ([`joins_the_frames`]): the
+/// script the two-finding case runs.
+fn reserved_flags_twice_script() -> Plan {
+    use support::steer::{before, steer, Steer};
+    use zakura_sim::{Checker, MemorySink};
+    let scenario = reserved_flags_twice();
+    let rule = |cx: &zakura_sim::StepCtx<'_>| -> Result<Steer, String> {
+        let log = before(cx);
+        if !joins_the_frames(log, &cx.pick.to_string()) {
+            return Ok(Steer::Fine);
+        }
+        cx.enabled
+            .iter()
+            .map(|enabled| enabled.identity.to_string())
+            .find(|identity| !joins_the_frames(log, identity))
+            .map(Steer::Pick)
+            .ok_or_else(|| "every enabled pick joins the frames".to_owned())
+    };
+    let mut run = |plan: PlanInput, checker: &mut dyn Checker| {
+        let mut sink = MemorySink::default();
+        let report = match run_prepared::<HeaderWire>(
+            &scenario,
+            HeaderWire::prepare(&scenario),
+            plan,
+            &mut sink,
+            Some(checker),
+        ) {
+            Ok(report) => report,
+            Err(HarnessError::Run { report, .. }) => *report,
+            Err(error) => panic!("{error}"),
+        };
+        (report, sink.lines())
+    };
+    let (_, plan, _) = steer(Plan::from_fuzz(&[]), &rule, &mut run);
+    let PlanInput::Script(plan) = plan else {
+        panic!("the default Plan sends both frames in one packet, so steering scripts it");
+    };
+    plan
+}
+
+/// The two-finding case's committed script is what its builder gives.
+///
+/// This fails if the `header-sync/wire` schedule moves; after a deliberate
+/// change, run `regenerate_reserved_flags_twice_script`.
+#[test]
+fn the_reserved_flags_twice_script_matches_its_builder() {
+    let committed: Plan = serde_json::from_str(
+        &std::fs::read_to_string(fixture_file(RESERVED_FLAGS_TWICE_SCRIPT))
+            .expect("the script reads"),
+    )
+    .expect("a scripted Plan");
+    assert_eq!(
+        committed,
+        reserved_flags_twice_script(),
+        "run `regenerate_reserved_flags_twice_script`"
+    );
+}
+
+/// Rewrites the two-finding case's script from its builder. Run it with
+/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
+/// header_wire_witness -- --ignored regenerate_reserved_flags_twice_script`.
+#[test]
+#[ignore = "rewrites the committed two-finding script"]
+fn regenerate_reserved_flags_twice_script() {
+    let json =
+        serde_json::to_string_pretty(&reserved_flags_twice_script()).expect("Plans serialize");
+    std::fs::write(fixture_file(RESERVED_FLAGS_TWICE_SCRIPT), json + "\n")
+        .expect("the fixture directory exists");
 }
 
 /// The committed fixture file `name`.

@@ -714,6 +714,34 @@ const C18_PROVING: &[TestRef] = &[
     ),
 ];
 
+/// C5's proving tests: a stale-binary control for a catch, whose baseline
+/// must come from S's build and its patched run from the checkout its
+/// provenance check measured, one for a standalone witness history, whose
+/// trace and witness test must both come from S's build, and one for a
+/// contract test, C5's own, whose binary must embed the subject's source,
+/// each with an unknown digest matching nothing, even on both sides, and a
+/// dirty checkout's agreeing digests anchoring nothing. Each runs in a
+/// `zakura-sim` test binary, which embeds the source digest the evaluator
+/// bootstraps C5 from.
+const C5_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::each_case_trace_comes_from_its_credited_binary",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_history_from_a_stale_binary_is_refused",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_applies_contracts_and_narrowing",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_binds_runners_and_traces",
+    ),
+];
+
 /// C13's proving tests: the fault store's four histories through a
 /// recorded run's full report and its sidecar, each replayed fresh (two
 /// untaken replies at the end, two breaks at one step, a break beside an
@@ -1074,8 +1102,8 @@ const fn satisfied(
 }
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
-/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
+/// delivered on `main`, C20 by hdr-14.3, C1, C4, C5, C7, C8, C9 and C12 by
+/// E1 to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
 /// stores, C13 by hf-1 to hf-3, and C21 and C22 by hf-8 and hf-9 with E4's
 /// sidecar. Every other row's deliveries landed, and its state names the
 /// proving test still missing.
@@ -1119,14 +1147,13 @@ pub fn contract_table() -> Vec<Contract> {
             C4_PROVING,
             "E6",
         ),
-        waiting(
+        satisfied(
             C5,
             "Evan",
             "Every executed binary's source digest is computed and equals the checkout it \
              should come from, and unknown never matches.",
+            C5_PROVING,
             "E7",
-            "a stale-binary control for a standalone witness history the tool records, beside \
-             the catch and contract-test controls",
         ),
         waiting(
             C6,

@@ -117,7 +117,15 @@ fn peer(seed: u8) -> String {
 #[test]
 fn node_syncs_from_a_mirror_on_controlled_storage() {
     let scenario = StorageScenario::default();
-    for input in inputs(32, 256) {
+    for (index, input) in inputs(32, 256).into_iter().enumerate() {
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        zakura_sim::harness::header_acceptance::history::declare(
+            Storage::NAME,
+            &format!("plan {index} of inputs(32, 256)"),
+            &scenario,
+            &input,
+        );
         let (report, ports) = run(&scenario, input);
         for property in [OPERATION_IDS, DIRECT_DISPATCH] {
             assert!(

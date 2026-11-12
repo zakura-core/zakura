@@ -34,7 +34,9 @@
 pub mod companions;
 pub mod contracts;
 pub mod evaluate;
+pub mod history;
 pub mod inventory;
+pub mod not_applicable;
 pub mod reasons;
 pub mod required;
 pub mod rows;
@@ -141,8 +143,9 @@ pub const fn sim_test(file: &'static str, test: &'static str) -> TestRef {
 
 /// One acceptance history: a run of a registered harness on one committed
 /// scenario and input, named by the witness test that builds it and, where
-/// that test runs several, the case it names. hdr-14.7b binds each to the
-/// digest of its recorded scenario and input (C18).
+/// that test runs several, the case it names. The test declares each case's
+/// scenario and Plan ([`history::declare`]), and the acceptance tool records
+/// that declaration and binds the trace to it by digest (C18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HistoryRef {
     /// The registered harness it runs on.

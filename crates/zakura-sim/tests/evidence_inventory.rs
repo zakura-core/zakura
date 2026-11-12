@@ -87,6 +87,16 @@ const fn store(
 /// Every registered store the scan finds.
 const REGISTERED: &[Store] = &[
     store(
+        "src/peer/evidence.rs",
+        "SentPages",
+        "0",
+        &[TransportNode],
+        (
+            "header_despite_close",
+            "the_staging_companion_needs_the_rejected_page_staged",
+        ),
+    ),
+    store(
         "src/harness/header_node/ends.rs",
         "EndEvidence",
         "0",

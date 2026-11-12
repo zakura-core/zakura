@@ -198,7 +198,11 @@ mod tests {
         ends.record_caused(close.clone(), Some(0));
         assert_eq!(stamps.next(), 2, "another store's fact");
         ends.record(EndFact::ReactorExited { step: 9 });
-        assert_eq!(ends.causes(), [(1, 0)], "only a control step's fact names it");
+        assert_eq!(
+            ends.causes(),
+            [(1, 0)],
+            "only a control step's fact names it"
+        );
         assert_eq!(
             ends.facts(),
             [(1, close.clone()), (3, EndFact::ReactorExited { step: 9 })]

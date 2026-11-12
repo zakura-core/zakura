@@ -24,8 +24,8 @@ use zakura_chain::{
 
 use crate::{
     peer::{ConnectedClient, LoadTrackedClient, MinimumPeerVersion},
-    peer_set::{inventory_registry::InventoryStatus, PeerSet},
-    protocol::external::{InventoryHash, Message},
+    peer_set::{inventory_registry::InventoryStatus, InventoryChange, PeerSet},
+    protocol::external::{types::PeerServices, InventoryHash, Message},
     BoxError, PeerSocketAddr, Request, Response,
 };
 
@@ -48,15 +48,26 @@ struct TestPeer {
 
 impl TestPeer {
     fn spawn(port: u16) -> Self {
+        Self::spawn_with_services(port, PeerServices::NODE_NETWORK, None)
+    }
+
+    fn spawn_with_services(
+        port: u16,
+        services: PeerServices,
+        inventory: Option<tokio::sync::broadcast::Sender<InventoryChange>>,
+    ) -> Self {
         let addr: PeerSocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .expect("test peer address is valid");
         let ConnectedClient {
-            client,
+            mut client,
             peer_inbound,
             peer_outbound,
             inbound_service,
-        } = ConnectedClient::spawn(addr);
+        } = ConnectedClient::spawn_with_services(addr, services);
+        if let Some(inventory) = inventory {
+            client.inv_collector = inventory;
+        }
 
         TestPeer {
             addr,
@@ -129,6 +140,205 @@ fn discover(peers: Vec<(PeerSocketAddr, LoadTrackedClient)>) -> TestDiscover {
 
 /// The peer discovery stream used by these tests.
 type TestDiscover = BoxStream<'static, Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>;
+
+/// An archive and a pruned peer connected through the real request/response machinery.
+struct StoragePeers {
+    set: PeerSet<TestDiscover, MockChainTip>,
+    _guard: PeerSetGuard,
+    archive: TestPeer,
+    pruned: TestPeer,
+    inventory: tokio::sync::broadcast::Sender<InventoryChange>,
+}
+
+impl StoragePeers {
+    async fn new() -> Self {
+        let (inventory, receiver) = tokio::sync::broadcast::channel(16);
+        let mut archive =
+            TestPeer::spawn_with_services(1, PeerServices::NODE_NETWORK, Some(inventory.clone()));
+        let mut pruned = TestPeer::spawn_with_services(
+            2,
+            PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+            Some(inventory.clone()),
+        );
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let mut builder = PeerSetBuilder::new();
+        builder.inv_stream = Some(receiver);
+        let (mut set, guard) = builder
+            .with_discover(discover(vec![archive.discovered(), pruned.discovered()]))
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(2)
+            .build();
+        set.ready().await.expect("both peers are ready");
+        assert_eq!(set.ready_services.len(), 2);
+        Self {
+            set,
+            _guard: guard,
+            archive,
+            pruned,
+            inventory,
+        }
+    }
+
+    async fn next_message(peer: &mut TestPeer) -> Message {
+        tokio::time::timeout(Duration::from_secs(1), peer.peer_outbound.next())
+            .await
+            .expect("the selected peer receives the request promptly")
+            .expect("the connection stays open")
+    }
+
+    fn block_request() -> Request {
+        Request::BlocksByHash(iter::once(BLOCK_HASH).collect())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_prefers_archive_without_an_advertiser() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    let _response = peers.set.call(StoragePeers::block_request());
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![BLOCK_HASH.into()])
+    );
+    assert_eq!(peers.pruned.written_now().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_falls_back_without_an_archive() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    peers
+        .set
+        .call(Request::DisconnectPeer(peers.archive.addr))
+        .await
+        .unwrap();
+    peers.set.ready().await.unwrap();
+    let _response = peers.set.call(StoragePeers::block_request());
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetData(vec![BLOCK_HASH.into()])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_preserves_advertiser_and_known_source_priority() {
+    let _init_guard = zakura_test::init();
+    for advertised in [false, true] {
+        let mut peers = StoragePeers::new().await;
+        if advertised {
+            peers
+                .inventory
+                .send(InventoryStatus::new_available(
+                    BLOCK_HASH.into(),
+                    peers.pruned.addr,
+                ))
+                .unwrap();
+        }
+        let request = if advertised {
+            StoragePeers::block_request()
+        } else {
+            Request::BlocksByHashFrom {
+                hashes: iter::once(BLOCK_HASH).collect(),
+                source: crate::PeerSource::LegacySocket(peers.pruned.addr),
+            }
+        };
+        let _response = peers.set.ready().await.unwrap().call(request);
+        assert_eq!(
+            StoragePeers::next_message(&mut peers.pruned).await,
+            Message::GetData(vec![BLOCK_HASH.into()])
+        );
+        assert_eq!(peers.archive.written_now().await, None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_notfound_excludes_archive_but_keeps_connection() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    let response = peers.set.call(StoragePeers::block_request());
+    StoragePeers::next_message(&mut peers.archive).await;
+    peers
+        .archive
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+    assert!(response.await.is_err());
+    let _retry = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request());
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetData(vec![BLOCK_HASH.into()])
+    );
+    assert!(
+        peers.set.ready_services.contains_key(&peers.archive.addr),
+        "notfound does not disconnect the archive"
+    );
+    assert_eq!(peers.archive.written_now().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_findblocks_prefers_archive_and_falls_back() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    let request = Request::FindBlocks {
+        known_blocks: vec![BLOCK_HASH],
+        stop: None,
+    };
+    let archive_response = peers.set.call(request.clone());
+    assert!(matches!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetBlocks { .. }
+    ));
+    peers
+        .archive
+        .peer_inbound
+        .send(Ok(Message::Inv(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+    archive_response.await.unwrap();
+    peers.set.ready().await.unwrap();
+    peers
+        .set
+        .call(Request::DisconnectPeer(peers.archive.addr))
+        .await
+        .unwrap();
+    peers.set.ready().await.unwrap();
+    let _pruned_response = peers.set.call(request);
+    assert!(matches!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetBlocks { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_transactions_still_use_pruned_advertisers() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    let txid = test_transaction().id();
+    peers
+        .inventory
+        .send(InventoryStatus::new_available(
+            txid.into(),
+            peers.pruned.addr,
+        ))
+        .unwrap();
+    let _response = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionsById(iter::once(txid).collect()));
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetData(vec![txid.into()])
+    );
+    assert_eq!(peers.archive.written_now().await, None);
+}
 
 /// One source: the only advertiser of a block is awaiting a transaction response.
 ///

@@ -18,7 +18,7 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
-    protocol::external::{canonical_socket_addr, types::Version},
+    protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
 };
 
 static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -84,6 +84,11 @@ impl LoadTrackedClient {
     /// Retrieve the peer's reported protocol version.
     pub fn remote_version(&self) -> Version {
         self.connection_info.remote.version
+    }
+
+    /// Returns the peer's self-reported services from its handshake.
+    pub(crate) fn remote_services(&self) -> PeerServices {
+        self.connection_info.remote.services
     }
 
     /// Returns true if the connection would write a request sent now, rather than leave it queued

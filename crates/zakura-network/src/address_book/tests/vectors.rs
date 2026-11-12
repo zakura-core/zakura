@@ -113,6 +113,33 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     );
 }
 
+/// Both service flags preserve discovery, restart caching, and outbound eligibility.
+#[test]
+fn pruned_peers_remain_dialable_cacheable_and_gossipable() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let addr = "192.0.2.1:8233".parse().unwrap();
+    let services = PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED;
+    book.update(MetaAddr::new_connected(addr, &services, false));
+    book.update(MetaAddr::new_responded(addr, None));
+    let peer = book.get(addr).unwrap();
+    assert!(peer.last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(peer.sanitize(&Mainnet).unwrap().services, Some(services));
+    assert!(book
+        .cacheable(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr));
+    assert!(book
+        .sanitized(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr && peer.services == Some(services)));
+}
+
 /// Known non-nodes remain recorded at runtime but are not saved for restart.
 #[test]
 fn peer_cache_excludes_known_non_node_services() {

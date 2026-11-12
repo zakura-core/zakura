@@ -948,25 +948,47 @@ where
     /// unanswered (and any `getheaders` during its initial block download), so the request would
     /// hold the sidecar's only connection until it times out, and the block `inv`s the sidecar
     /// follows would queue behind it.
-    fn select_ready_p2c_peer(&self, is_find_request: bool) -> Option<D::Key> {
+    fn select_ready_p2c_peer(&self, is_find_request: bool, prefer_archive: bool) -> Option<D::Key> {
         let tip_height = self
             .minimum_peer_version
             .chain_tip()
             .best_tip_height()
             .unwrap_or(block::Height(0));
 
-        self.select_p2c_peer_from_list(
-            &self
-                .ready_services
-                .iter()
-                .filter(|(_, service)| {
-                    !(is_find_request
-                        && self.is_zcashd_compat_peer(service)
-                        && service.remote_start_height() <= tip_height)
+        let candidates = self
+            .ready_services
+            .iter()
+            .filter(|(_, service)| {
+                !(is_find_request
+                    && self.is_zcashd_compat_peer(service)
+                    && service.remote_start_height() <= tip_height)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if prefer_archive {
+            self.select_archive_or_pruned_peer(&candidates)
+        } else {
+            self.select_p2c_peer_from_list(&candidates)
+        }
+    }
+
+    /// Prefers peers without the pruned hint, falling back to pruned peers when needed.
+    ///
+    /// Absence of the hint is not proof of retained history: older peers do not report it.
+    fn select_archive_or_pruned_peer(&self, candidates: &HashSet<D::Key>) -> Option<D::Key> {
+        let archives = candidates
+            .iter()
+            .filter(|key| {
+                self.ready_services.get(key).is_some_and(|service| {
+                    !service
+                        .remote_services()
+                        .contains(crate::types::PeerServices::NODE_PRUNED)
                 })
-                .map(|(key, _)| *key)
-                .collect(),
-        )
+            })
+            .copied()
+            .collect();
+        self.select_p2c_peer_from_list(&archives)
+            .or_else(|| self.select_p2c_peer_from_list(candidates))
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
@@ -1115,7 +1137,8 @@ where
             Request::FindBlocks { .. } | Request::FindHeaders { .. }
         );
 
-        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request) {
+        let prefer_archive = matches!(&req, Request::FindBlocks { .. });
+        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request, prefer_archive) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1289,7 +1312,11 @@ where
         };
 
         // Security: choose a random, less-loaded peer that might have the inventory.
-        let peer = self.select_p2c_peer_from_list(&maybe_peer_list);
+        let peer = if matches!(hash, InventoryHash::Block(_)) {
+            self.select_archive_or_pruned_peer(&maybe_peer_list)
+        } else {
+            self.select_p2c_peer_from_list(&maybe_peer_list)
+        };
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");

@@ -7,15 +7,20 @@ The droplet timer for mutation plan mut-4.6. Once a day it runs
 2. runs the full planted sim suite (`cargo test -p zakura-sim --profile
    planted`);
 3. runs `cargo xtask planted loop` with generator lanes on the cases a change
-   since the last report's pin affects, or on every case the first time;
+   since the last pin affects, or on every case the first time;
 4. with `--libfuzzer-seconds`, runs the libFuzzer lane on the same cases;
-5. diffs the new report against the last one into `joint-diff.json`.
+5. diffs each new report against its cumulative report into
+   `joint-diff.json`, then merges it in. `<state>/cumulative.json` holds
+   every case's latest generator-lane result and every property finding so
+   far, and `<state>/cumulative-libfuzzer.json` holds the libFuzzer lane's.
+   A `--changed-since` report holds only the cases it reran, so diffing it
+   against the last report alone would list every unchanged survivor again.
 
 Each run writes under `<state>/runs/<UTC time>-<commit>/`: one log per step,
 the loop's report under `loop/`, the diff beside it, and `routine.json` with
-each step's exit status. `<state>/latest.json` names the last report. The
-unit fails when a step fails or when the diff lists a new survivor, a newly
-failing baseline or a new property finding. `untriaged` in the diff lists
+each step's exit status. `<state>/latest.json` names the last pin. The
+unit fails when a step fails or when either diff lists a new survivor, a
+newly failing baseline or a new property finding. `untriaged` in the diff lists
 the lanes that still need a record in `qa/native-mutations/triage.toml`.
 
 Install it as root on the host with `deploy/mutation-joint/install.sh`, then

@@ -298,6 +298,7 @@ fn campaign() -> CampaignFacts {
         applied: true,
         runs: 1000,
         applicable_runs: 600,
+        incomplete_runs: 0,
         millis: 600_000,
         ..CampaignFacts::default()
     }
@@ -495,6 +496,7 @@ fn discovery_rejects_incomplete_observations() {
             CampaignFacts {
                 applied: false,
                 applicable_runs: 0,
+                incomplete_runs: 0,
                 ..campaign()
             },
             None

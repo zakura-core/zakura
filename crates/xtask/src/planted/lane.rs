@@ -17,7 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::pilot::INTERRUPTED_ERROR;
+use super::{outcome::NaReason, pilot::INTERRUPTED_ERROR};
 use crate::{
     sim_minimize::{run_child, ChildEnd, INTERRUPTED},
     BoxError,
@@ -370,6 +370,9 @@ pub(in crate::planted) struct CampaignFacts {
     pub(in crate::planted) runs: u64,
     /// Inputs where the intended property applied, in complete processes.
     pub(in crate::planted) applicable_runs: u64,
+    /// Inputs where the intended property ended `not-applicable` for an
+    /// incomplete reason, such as `assumption-lost`, in complete processes.
+    pub(in crate::planted) incomplete_runs: u64,
     /// How long the workers ran, in milliseconds.
     pub(in crate::planted) millis: u64,
     /// The first saved input that violates the intended property, relative
@@ -552,6 +555,16 @@ pub(in crate::planted) fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0),
         applicable_runs: counts("complete_totals", "held") + counts("complete_totals", "violated"),
+        incomplete_runs: evidence
+            .pointer("/complete_totals/properties")
+            .and_then(|properties| properties.get(property))
+            .and_then(|counts| counts.get("not_applicable"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(reason, _)| !NaReason::is_benign_name(reason))
+            .filter_map(|(_, runs)| runs.as_u64())
+            .sum(),
         millis: end
             .and_then(|end| end.get("workers"))
             .and_then(Value::as_array)

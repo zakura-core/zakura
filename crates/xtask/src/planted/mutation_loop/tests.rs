@@ -21,9 +21,10 @@ use super::{
     },
     generate::{
         baseline_lane, campaign_class, co_violations, confirmed, judge_unpatched,
-        no_generator as no_generator_of, plan, unpatched_class, write_exclusions, FollowUp,
-        GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill,
-        Lanes, OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
+        no_generator as no_generator_of, plan, shrink_wall, unpatched_class, write_exclusions,
+        FollowUp, GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure,
+        GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched, PropertyFinding, Search, Searched,
+        Unpatched, UnpatchedCheck,
     },
     parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
     BuildIdentity, CaseReport, GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
@@ -1249,18 +1250,19 @@ fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
     assert_eq!(confirmed(result.clone(), &kept), result);
 }
 
-/// The unpatched build's replay of a shrunk kill decides whether the kill
-/// stands (mut-5): a violation there too is a property finding and makes
-/// the lane `baseline-fails`; a hold or a replay that judged nothing
-/// leaves the kill.
+/// The unpatched build's replays of a kill decide whether the kill stands
+/// (mut-5): a violation on the confirmed trace too makes the lane
+/// `baseline-fails`; a violation on either trace is a property finding;
+/// a violation on the shrunk trace alone, a hold, or a replay that judged
+/// nothing leaves the kill.
 #[test]
-fn a_shrunk_kill_that_fails_unpatched_is_a_property_finding() {
+fn a_kill_that_fails_unpatched_is_a_property_finding() {
     let report = |violations: &str| {
         format!(
             r#"{{"properties":[{{"property":"{NAMED}","outcome":"held","violations":{violations},"end_found":0}}],"snapshot":null}}"#
         )
     };
-    let judged = |line: Option<&str>| judge_unpatched(NAMED, line, "exited 1").0;
+    let judged = |line: Option<&str>| judge_unpatched(NAMED, KillTrace::Shrunk, line, "exited 1").0;
     assert_eq!(judged(Some(&report("[]"))), OnUnpatched::Holds);
     assert_eq!(
         judged(Some(&report(r#"[{"step":3}]"#))),
@@ -1269,22 +1271,44 @@ fn a_shrunk_kill_that_fails_unpatched_is_a_property_finding() {
     assert_eq!(judged(None), OnUnpatched::Undecided);
     assert_eq!(judged(Some("not json")), OnUnpatched::Undecided);
     assert_eq!(
-        judge_unpatched(OTHER, Some(&report("[]")), "exited 1").0,
+        judge_unpatched(OTHER, KillTrace::Shrunk, Some(&report("[]")), "exited 1").0,
         OnUnpatched::Undecided,
         "a report without the ID judges nothing"
     );
 
     let killed = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
-    let check = |outcome| UnpatchedCheck {
+    let check = |trace, outcome| UnpatchedCheck {
+        trace,
         outcome,
-        detail: "the shrunk trace violates it on the unpatched build too".to_owned(),
-        log: "mutants/x/unpatched-replay.log".into(),
+        detail: "the trace violates it on the unpatched build too".to_owned(),
+        log: format!("mutants/x/unpatched-{trace:?}-replay.log").into(),
     };
     for kept in [OnUnpatched::Holds, OnUnpatched::Undecided] {
-        assert_eq!(unpatched_class(killed.clone(), Some(&check(kept))), killed);
+        assert_eq!(
+            unpatched_class(
+                killed.clone(),
+                &[
+                    check(KillTrace::Confirmed, kept),
+                    check(KillTrace::Shrunk, kept)
+                ]
+            ),
+            killed
+        );
     }
-    assert_eq!(unpatched_class(killed.clone(), None), killed);
-    let failed = unpatched_class(killed.clone(), Some(&check(OnUnpatched::Violated)));
+    assert_eq!(unpatched_class(killed.clone(), &[]), killed);
+    let shrunk_only = [
+        check(KillTrace::Confirmed, OnUnpatched::Holds),
+        check(KillTrace::Shrunk, OnUnpatched::Violated),
+    ];
+    assert_eq!(
+        unpatched_class(killed.clone(), &shrunk_only),
+        killed,
+        "the shrink kept the ID, not the mutant's part in it"
+    );
+    let failed = unpatched_class(
+        killed.clone(),
+        &[check(KillTrace::Confirmed, OnUnpatched::Violated)],
+    );
     assert_eq!((failed.class, failed.reason), (Class::BaselineFails, None));
     assert!(failed.detail.contains("unpatched build too"));
 
@@ -1292,14 +1316,37 @@ fn a_shrunk_kill_that_fails_unpatched_is_a_property_finding() {
         GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
     lane.violated = Some(NAMED.to_owned());
     assert_eq!(lane.finding(), None, "no replay ran");
-    lane.unpatched = Some(check(OnUnpatched::Holds));
+    lane.unpatched = vec![check(KillTrace::Confirmed, OnUnpatched::Holds)];
     assert_eq!(lane.finding(), None);
-    lane.unpatched = Some(check(OnUnpatched::Violated));
+    lane.unpatched = shrunk_only.to_vec();
     let finding = lane.finding().unwrap();
     assert_eq!(finding.property.as_deref(), Some(NAMED));
     assert_eq!(
         finding.log,
-        std::path::PathBuf::from("mutants/x/unpatched-replay.log")
+        std::path::PathBuf::from("mutants/x/unpatched-Shrunk-replay.log")
+    );
+    lane.unpatched = vec![
+        check(KillTrace::Confirmed, OnUnpatched::Violated),
+        check(KillTrace::Shrunk, OnUnpatched::Undecided),
+    ];
+    assert_eq!(
+        lane.finding().unwrap().log,
+        std::path::PathBuf::from("mutants/x/unpatched-Confirmed-replay.log"),
+        "an unshrunk violation is a finding too"
+    );
+}
+
+/// A kill's shrink gets ten of its search's runs, and at least two minutes.
+#[test]
+fn a_slow_harness_gets_a_longer_shrink() {
+    assert_eq!(shrink_wall(Duration::ZERO), Duration::from_secs(120));
+    assert_eq!(
+        shrink_wall(Duration::from_millis(500)),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        shrink_wall(Duration::from_secs(96)),
+        Duration::from_secs(960)
     );
 }
 
@@ -1439,6 +1486,7 @@ fn a_campaign_lane_gets_the_same_classes() {
         applied,
         runs: 1000,
         applicable_runs: if applied { 10 } else { 0 },
+        incomplete_runs: 0,
         ..CampaignFacts::default()
     };
     let class = |also: &[&str], facts: &CampaignFacts| {
@@ -1469,6 +1517,24 @@ fn a_campaign_lane_gets_the_same_classes() {
     assert_eq!(
         class(&[], &facts(&[], false)),
         (Class::Survived, Some(Reason::NotApplicable), None)
+    );
+    let lost = CampaignFacts {
+        incomplete_runs: 4,
+        ..facts(&[], false)
+    };
+    assert_eq!(
+        class(&[], &lost),
+        (Class::Survived, Some(Reason::Incomplete), None)
+    );
+    let evidence = serde_json::json!({
+        "complete_totals": {"properties": {NAMED: {"not_applicable": {
+            "never-applied": 7, "assumption-lost": 3, "unsettled:watch-open": 2
+        }}}},
+    });
+    assert_eq!(
+        campaign_facts(NAMED, None, &evidence, 0).incomplete_runs,
+        5,
+        "a benign reason isn't incomplete"
     );
     let timed_out = CampaignFacts {
         killed: vec!["artifacts/timeout-1".to_owned()],
@@ -2041,7 +2107,10 @@ reason = "stale"
     let mut cases = vec![witness(Class::Survived)];
     assert_eq!(triage::untriaged(&cases), 4);
     let stale = triage::apply(&mut cases, &records);
-    assert_eq!(stale, vec![&records[2]]);
+    assert!(
+        stale.is_empty(),
+        "gone.patch didn't run, so it isn't judged"
+    );
     let case = &cases[0];
     assert_eq!(
         case.triage.as_ref().unwrap().stage,
@@ -2067,9 +2136,12 @@ reason = "stale"
     );
     assert_eq!(triage::untriaged(&cases), 1, "block-sync/wire seed 11");
 
-    // A kill by the named rule needs no triage, so its record is stale.
+    // A kill by the named rule needs no triage, so its records are stale.
     let mut killed = vec![witness(Class::KilledByNamedRule)];
     killed[0].generator.clear();
-    assert_eq!(triage::apply(&mut killed, &records).len(), 3);
+    assert_eq!(
+        triage::apply(&mut killed, &records),
+        vec![&records[0], &records[1]]
+    );
     assert_eq!(killed[0].triage, None);
 }

@@ -1011,6 +1011,29 @@ const fn waiting(
     }
 }
 
+/// A delivered contract whose proving tests `proving` pass but don't yet
+/// prove it, waiting for `missing`. The tests stay named, so only the gap
+/// stands between it and [`satisfied`].
+const fn proved_short(
+    id: ContractId,
+    owner: &'static str,
+    statement: &'static str,
+    proving: &'static [TestRef],
+    delivery: &'static str,
+    missing: &'static str,
+) -> Contract {
+    Contract {
+        id,
+        owner,
+        statement,
+        proving,
+        state: ContractState::Blocked {
+            waiting_for: missing,
+        },
+        delivery,
+    }
+}
+
 /// A delivered contract, proved by `proving`.
 const fn satisfied(
     id: ContractId,
@@ -1030,11 +1053,11 @@ const fn satisfied(
 }
 
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, C20 by hdr-14.3, C1, C4, C7, C8, C9 and C12 by E1
-/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
-/// stores, C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every
-/// other row's deliveries landed, and its state names the proving test
-/// still missing.
+/// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
+/// E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's stores,
+/// C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every other
+/// row's deliveries landed, and its state names what's still missing: C4's
+/// proving tests pass, but none can be credited yet.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1067,13 +1090,16 @@ pub fn contract_table() -> Vec<Contract> {
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        satisfied(
+        proved_short(
             C4,
             "Evan (xt/planted.rs)",
             "The planted runner classifies baseline and patched runs, replays every catch \
              fresh, puts a deadline on every run and judges nested cases by their set.",
             C4_PROVING,
             "E6",
+            "provenance for its `xtask` proving tests: the acceptance runner credits a test \
+             only from a binary embedding the subject's source digest, and `xtask`'s test \
+             binary embeds none",
         ),
         waiting(
             C5,

@@ -519,6 +519,7 @@ fn run_at(
             "agreement" => ctx.agreement(fields)?,
             "planted" => ctx.planted(fields)?,
             "target" => ctx.target(fields)?,
+            "minimize" => ctx.minimize(fields)?,
             "command" => ctx.command(fields)?,
             "measure" => ctx.measure(fields)?,
             other => return Err(format!("the plan has an unknown task kind `{other}`").into()),
@@ -928,28 +929,9 @@ impl Ctx<'_> {
             .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &planted_runs)
             .current_dir(self.root);
         self.record(&mut verdict, "planted", json!({}))?;
-        let index = self
-            .binding
-            .get("task")
-            .and_then(Value::as_u64)
-            .ok_or("a task's binding names its index")?;
-        let work = self.run.out.join("planted").join(index.to_string());
-        let src = work.join("src");
-        add_worktree(self.root, self.run, &src, "HEAD")?;
-        let mut apply = Command::new("git");
-        apply
-            .arg("apply")
-            .arg(self.root.join(field(task, "patch")?))
-            .current_dir(&src);
-        self.record(&mut apply, "apply", json!({}))?;
-        let applied = fs::read_to_string(self.dir.join("apply.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|apply| apply.get("exited_ok")?.as_bool())
-            == Some(true);
-        if !applied {
+        let Some((work, src)) = self.patched_worktree(field(task, "patch")?)? else {
             return Ok(());
-        }
+        };
         let mut build = cargo(&src, &work.join("target"));
         build.args([
             "build",
@@ -1015,6 +997,64 @@ impl Ctx<'_> {
                 true,
             )?;
         }
+        Ok(())
+    }
+
+    /// A worktree of S under `<run>/planted/<task>/src` with `patch`
+    /// applied, recorded in `apply.json`, and the task's work directory, or
+    /// `None` if the patch didn't apply.
+    fn patched_worktree(&self, patch: &str) -> Result<Option<(PathBuf, PathBuf)>, BoxError> {
+        let index = self
+            .binding
+            .get("task")
+            .and_then(Value::as_u64)
+            .ok_or("a task's binding names its index")?;
+        let work = self.run.out.join("planted").join(index.to_string());
+        let src = work.join("src");
+        add_worktree(self.root, self.run, &src, "HEAD")?;
+        let mut apply = Command::new("git");
+        apply
+            .arg("apply")
+            .arg(self.root.join(patch))
+            .current_dir(&src);
+        self.record(&mut apply, "apply", json!({}))?;
+        let applied = fs::read_to_string(self.dir.join("apply.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|apply| apply.get("exited_ok")?.as_bool())
+            == Some(true);
+        Ok(applied.then_some((work, src)))
+    }
+
+    /// The header minimization: `cargo xtask sim-minimize` on the planted
+    /// case's committed input through its fuzz target, in a worktree of S
+    /// with the case's patch, with every run it makes, at any depth,
+    /// writing its records under `runs/` and its report under `minimize/`.
+    fn minimize(&self, task: &Value) -> Result<(), BoxError> {
+        let Some((_, src)) = self.patched_worktree(field(task, "patch")?)? else {
+            return Ok(());
+        };
+        let runs = self.dir.join("runs");
+        fs::create_dir_all(&runs)?;
+        let cargo_path = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut minimize = Command::new(&cargo_path);
+        minimize
+            .args(["xtask", "sim-minimize", field(task, "target")?])
+            .arg(self.root.join(field(task, "input")?))
+            .args(["--property", field(task, "property")?, "--out"])
+            .arg(self.dir.join("minimize"))
+            .args([
+                "--runs",
+                "2000",
+                "--wall-secs",
+                "1800",
+                "--child-secs",
+                "120",
+            ])
+            .env_remove("RUSTFLAGS")
+            .env("ZAKURA_SIM_ACCEPTANCE_RUNS", &runs)
+            .current_dir(&src);
+        self.record(&mut minimize, "minimize", json!({}))?;
         Ok(())
     }
 

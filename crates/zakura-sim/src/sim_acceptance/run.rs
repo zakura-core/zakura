@@ -172,6 +172,26 @@ pub enum Task {
         /// runs the target must make, each at least once.
         seeds: Vec<String>,
     },
+    /// The header minimization (M7.4): `cargo xtask sim-minimize` on a
+    /// `header-sync/storage` planted case's committed input through its
+    /// fuzz target, in S with the case's patch, writing `minimize/` and
+    /// every run's records under `runs/`.
+    Minimize {
+        /// The expected result it produces.
+        expected: String,
+        /// The case's property.
+        property: String,
+        /// The case's harness.
+        harness: String,
+        /// The fuzz target that runs it.
+        target: String,
+        /// The committed input, relative to the repository's root.
+        input: String,
+        /// Its SHA-256.
+        input_sha256: String,
+        /// The case's patch, relative to the repository's root.
+        patch: String,
+    },
     /// One S4.6 command, which writes `command.json`.
     Command {
         /// The expected result it produces.
@@ -211,6 +231,7 @@ impl Task {
             | Task::Agreement { expected, .. }
             | Task::Planted { expected, .. }
             | Task::Target { expected, .. }
+            | Task::Minimize { expected, .. }
             | Task::Command { expected, .. }
             | Task::Measure { expected, .. } => expected,
         }
@@ -501,7 +522,16 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                         harness,
                     })
                 }),
-                Expected::Planted(_) | Expected::Minimize(_) | Expected::Agreement(_) => {
+                Expected::Minimize(harness) => manifest.as_ref().and_then(|m| {
+                    let target = m
+                        .targets
+                        .iter()
+                        .find(|row| row.harness.as_deref() == Some(*harness))?
+                        .name
+                        .clone();
+                    minimize_task(repo, &id, harness, target)
+                }),
+                Expected::Planted(_) | Expected::Agreement(_) => {
                     plan.unsupported
                         .push((id.clone(), "the tool can't run this result yet".to_owned()));
                     None
@@ -515,7 +545,6 @@ pub fn plan(repo: &Path) -> Sim7Plan {
                         | Expected::EndRecord { .. }
                         | Expected::Planted(_)
                         | Expected::Target(_)
-                        | Expected::Minimize(_)
                         | Expected::Agreement(_)
                 ) => {}
                 None => plan
@@ -525,6 +554,54 @@ pub fn plan(repo: &Path) -> Sim7Plan {
         }
     }
     plan
+}
+
+/// The minimization's task: the first header-sync planted case, in path
+/// order under `qa/planted/header-sync/` at `repo`, whose committed input
+/// runs on `harness` (the plan's "one `header-sync/storage` planted
+/// catch").
+fn minimize_task(repo: &Path, expected: &str, harness: &str, target: String) -> Option<Task> {
+    let root = repo.join("qa/planted");
+    let mut cases = Vec::new();
+    let mut pending = vec![root.join("header-sync")];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "toml") {
+                cases.push(path);
+            }
+        }
+    }
+    cases.sort();
+    cases.into_iter().find_map(|case| {
+        let toml: toml::Value = toml::from_str(&fs::read_to_string(&case).ok()?).ok()?;
+        let input = toml.get("input")?.as_str()?.to_owned();
+        let sidecar: toml::Value = toml::from_str(
+            &fs::read_to_string(repo.join(Path::new(&input).with_extension("toml"))).ok()?,
+        )
+        .ok()?;
+        if sidecar.get("harness")?.as_str()? != harness {
+            return None;
+        }
+        let property = case
+            .parent()?
+            .strip_prefix(&root)
+            .ok()?
+            .to_str()?
+            .to_owned();
+        let patch = case.with_extension("patch");
+        Some(Task::Minimize {
+            expected: expected.to_owned(),
+            property,
+            harness: harness.to_owned(),
+            target: target.clone(),
+            input_sha256: crate::seed::sha256(&fs::read(repo.join(&input)).ok()?),
+            input,
+            patch: patch.strip_prefix(repo).ok()?.to_str()?.to_owned(),
+        })
+    })
 }
 
 /// The discovery planted case's task, from its `.toml` at `repo`: its
@@ -912,6 +989,20 @@ fn task_binaries(task: &Task, dir: &Path, binding: &TaskBinding) -> Vec<String> 
                 TraceReader::open(&dir.join(side))
                     .ok()
                     .map(|trace| trace.meta.build.binary)
+            })
+            .collect(),
+        // `sim-minimize` pins the simulator and fuzz target it ran under
+        // `minimize/bin/`.
+        Task::Minimize { .. } => fs::read_dir(dir.join("minimize").join("bin"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                crate::trace::read::read_bounded(&entry.path(), header::MAX_ARTIFACT_BYTES)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| sha256_hex(&bytes))
             })
             .collect(),
         Task::Target { .. } => json("fuzz-binary.json")
@@ -1407,6 +1498,16 @@ struct RunRecord {
 /// each end its begin, and the two must name the same harness, input and
 /// phase.
 fn run_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
+    run_records_allowing(dir, |_| false)
+}
+
+/// [`run_records`], with a begin record that has no end allowed where
+/// `unended` says its phase may leave one, such as a minimizer's search
+/// candidate that crashed.
+fn run_records_allowing(
+    dir: &Path,
+    unended: impl Fn(&str) -> bool,
+) -> Result<Vec<RunRecord>, String> {
     let entries = fs::read_dir(dir).map_err(|_| "the tool left no run records".to_owned())?;
     let read = |path: &Path| -> Option<Value> {
         serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
@@ -1423,8 +1524,16 @@ fn run_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
             return Err(format!("{file} isn't a run record"));
         }
     }
-    if let Some(stem) = begins.keys().find(|stem| !ends.contains_key(*stem)) {
-        return Err(format!("run {stem} began but never ended"));
+    for (stem, path) in &begins {
+        if ends.contains_key(stem) {
+            continue;
+        }
+        let phase = read(path)
+            .and_then(|begin| begin.get("phase")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        if !unended(&phase) {
+            return Err(format!("run {stem} began but never ended"));
+        }
     }
     let mut runs = Vec::new();
     for (stem, path) in &ends {
@@ -1453,6 +1562,96 @@ fn run_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
         });
     }
     Ok(runs)
+}
+
+/// The minimization's verdict (Rule 11): `sim-minimize` reported a
+/// minimized candidate of the case's own input, property and harness, and
+/// for the original and the minimized input each, the fuzz target's run,
+/// every run inside `zakura-sim confirm` and the fresh `zakura-sim replay`
+/// all violate the property and pass through [`owned_run_passes`]. The
+/// search's runs are accounted for but needn't pass, and may crash before
+/// their end. Any run in another phase blocks.
+fn judge_minimize(
+    dir: &Path,
+    binding: &TaskBinding,
+    property: &str,
+    harness: &str,
+    input: &str,
+) -> Verdict {
+    let blocked = |why: String| Verdict::Blocked { why };
+    if !exited(runner_json(dir, "minimize.json", binding)) {
+        return blocked("`cargo xtask sim-minimize` didn't exit 0".to_owned());
+    }
+    let Some(report) = fs::read_to_string(dir.join("minimize").join("report.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return blocked("sim-minimize left no report".to_owned());
+    };
+    let text = |pointer: &str| report.pointer(pointer).and_then(Value::as_str);
+    if text("/status") != Some("minimized")
+        || text("/property") != Some(property)
+        || text("/harness") != Some(harness)
+        || text("/original/sha256") != Some(input)
+    {
+        return blocked("sim-minimize didn't minimize the case's own input".to_owned());
+    }
+    let Some(minimized) = text("/minimized/sha256").map(str::to_owned) else {
+        return blocked("sim-minimize's report names no minimized input".to_owned());
+    };
+    let runs = match run_records_allowing(&dir.join("runs"), |phase| phase == "search") {
+        Ok(runs) => runs,
+        Err(why) => return blocked(why),
+    };
+    let Ok(entry) = crate::harness::find(harness) else {
+        return blocked(format!("{harness} isn't a harness at S"));
+    };
+    let properties = (entry.properties)();
+    let registered = Registered {
+        ids: properties.iter().map(|p| p.id.clone()).collect(),
+        tolerated: properties
+            .iter()
+            .filter(|p| matches!(p.status, Status::Known { .. } | Status::Draft))
+            .map(|p| p.id.clone())
+            .collect(),
+    };
+    let expect = RunExpect::Violates {
+        property: property.to_owned(),
+        also: Vec::new(),
+    };
+    let mut seen = BTreeSet::new();
+    for run in &runs {
+        if run.phase == "search" {
+            continue;
+        }
+        let checked = ["confirm-target", "confirm", "replay"]
+            .iter()
+            .find_map(|phase| {
+                let sha = run.phase.strip_prefix(&format!("{phase}:"))?;
+                (sha == input || sha == minimized).then(|| (*phase, sha.to_owned()))
+            });
+        let Some(checked) = checked else {
+            return blocked(format!(
+                "run {} is in an unaccounted phase {}",
+                run.stem, run.phase
+            ));
+        };
+        if run.harness != harness {
+            return blocked(format!("run {} isn't a run of {harness}", run.stem));
+        }
+        if let Err(why) = owned_run_passes(&run.end, &registered, &expect) {
+            return blocked(format!("run {} ({}): {why}", run.stem, run.phase));
+        }
+        seen.insert(checked);
+    }
+    for sha in [input, minimized.as_str()] {
+        for phase in ["confirm-target", "confirm", "replay"] {
+            if !seen.contains(&(phase, sha.to_owned())) {
+                return blocked(format!("no {phase} run confirmed input {sha}"));
+            }
+        }
+    }
+    Verdict::Verified
 }
 
 /// A fuzz target's verdict (Rule 11): `zakura-sim targets` reported it
@@ -1829,6 +2028,12 @@ fn judge_task(
             seeds,
             ..
         } => judge_target(dir, binding, bound, name, harness, seeds),
+        Task::Minimize {
+            property,
+            harness,
+            input_sha256,
+            ..
+        } => judge_minimize(dir, binding, property, harness, input_sha256),
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)
                 if command.get("args") != Some(&serde_json::json!(args))

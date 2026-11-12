@@ -960,6 +960,10 @@ pub(super) struct BuildRecord {
     pub(super) generator: Option<u64>,
 }
 
+/// The variable that names a child's phase in its runs' acceptance records
+/// (`zakura_sim::acceptance_runs::PHASE_VAR`).
+const PHASE_VAR: &str = "ZAKURA_SIM_ACCEPTANCE_PHASE";
+
 /// `report.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Report {
@@ -1138,10 +1142,13 @@ fn reduce(
     fs::create_dir_all(&tmin_dir)?;
     let log = Path::new(LOGS_DIR).join("tmin.log");
     let mut command = (tools.tmin)(&out.join(&report.original.path), &tmin_dir);
-    command.env(EXPECT_VAR, &request.property).env(
-        "ZAKURA_SIM_ARTIFACTS",
-        out.join(LOGS_DIR).join("sim-artifacts"),
-    );
+    command
+        .env(EXPECT_VAR, &request.property)
+        .env(
+            "ZAKURA_SIM_ARTIFACTS",
+            out.join(LOGS_DIR).join("sim-artifacts"),
+        )
+        .env(PHASE_VAR, "search");
     crate::print_command(&command);
     let tmin_started = Instant::now();
     let end = run_child(
@@ -1417,8 +1424,13 @@ impl Checker<'_> {
         let fuzz_log = dir.join("fuzz.log");
         let crashes = dir.join("fuzz-artifacts");
         fs::create_dir_all(&crashes)?;
+        // Each child's runs carry the phase and the input they confirm, so
+        // sim-7's acceptance tool can tell one confirmation's runs from
+        // another's and from the search (the sim-7 plan's Rule 11).
+        let sha = sha256_file(&input)?;
         let mut fuzz = Command::new(&self.tools.fuzz);
         fuzz.env(EXPECT_VAR, &self.request.property)
+            .env(PHASE_VAR, format!("confirm-target:{sha}"))
             .env("ZAKURA_SIM_ARTIFACTS", dir.join("sim-artifacts"))
             .arg(format!("-timeout={}", child.as_secs().max(1)))
             .arg(format!("-artifact_prefix={}/", crashes.display()))
@@ -1472,6 +1484,7 @@ impl Checker<'_> {
         let confirm_log = dir.join("confirm.log");
         let mut confirm = Command::new(&self.tools.sim);
         confirm
+            .env(PHASE_VAR, format!("confirm:{sha}"))
             .arg("confirm")
             .arg("--sim")
             .arg(&self.request.harness)
@@ -1556,7 +1569,10 @@ impl Checker<'_> {
 
         let replay_log = dir.join("replay.log");
         let mut replay = Command::new(&self.tools.sim);
-        replay.arg("replay").arg(&trace);
+        replay
+            .env(PHASE_VAR, format!("replay:{sha}"))
+            .arg("replay")
+            .arg(&trace);
         let replayed = run_child(&mut replay, &replay_log, Some(child), self.interrupt)?;
         let rejection = match replayed {
             ChildEnd::Interrupted => return Ok(None),

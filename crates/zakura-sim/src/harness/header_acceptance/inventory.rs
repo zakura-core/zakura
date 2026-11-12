@@ -362,8 +362,12 @@ mod tests {
             .iter()
             .position(|m| m.patch == "readmission-unchecked")
             .expect("the retired mutation is classified");
+        let NativeClass::Retired { witness, .. } = native[at].class else {
+            panic!("readmission-unchecked is retired");
+        };
         native[at].class = NativeClass::Retired {
             reason: "another reason",
+            witness,
         };
         let reclassified = Lists {
             native: &native,

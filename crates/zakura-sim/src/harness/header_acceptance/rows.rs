@@ -1217,19 +1217,6 @@ pub fn native_open(until: &'static str) -> Expected {
     )
 }
 
-/// A retired native mutation's transitional `Open`: its witness is a test
-/// outside the simulator, which the runner doesn't run yet, so its key
-/// blocks until hdr-14.7b runs it unpatched, patched (with the required
-/// failure its README names) and restored.
-pub fn retired_open() -> Expected {
-    transitional(
-        "a retired native mutation's witness runs outside the simulator, which the runner can't \
-         run yet",
-        "the acceptance runner",
-        "hdr-14.7b",
-    )
-}
-
 /// `key`'s expected result with the gates `gates`: the transitional `Open`
 /// [`owed_open`] writes for it.
 fn owed(key: Key, gates: &[Gate]) -> ExpectedResult {
@@ -3217,6 +3204,18 @@ pub fn requirement_results() -> Vec<ExpectedResult> {
         .collect()
 }
 
+/// A retired native mutation's witness test outside the simulator, and the
+/// failure its README requires of the patched run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitWitness {
+    /// The test, by its full libtest name.
+    pub test: TestRef,
+    /// The assertion message the patched run must fail with.
+    pub failure: &'static str,
+    /// What that assertion's `left` value must show, in order.
+    pub shows: &'static [&'static str],
+}
+
 /// What a native mutation under `qa/native-mutations/header-sync/` is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeClass {
@@ -3247,10 +3246,14 @@ pub enum NativeClass {
         /// The planted case it became.
         case: &'static str,
     },
-    /// It stays outside the simulator.
+    /// It stays outside the simulator, caught by `witness`, a test run
+    /// unpatched, patched and restored as a plain build: a `UnitCaught`
+    /// for gate 6.
     Retired {
         /// Why.
         reason: &'static str,
+        /// The test that catches it and the failure it must show.
+        witness: UnitWitness,
     },
     /// It's a duplicate of the existing planted case `case` under
     /// `property`, an approved retirement. Its directory stays, so its key
@@ -3380,6 +3383,19 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         class: NativeClass::Retired {
             reason: "its README says the simulator can't reach the readmission check, so it \
                      stays a zakura-network unit test",
+            // The README requires the 60 s cooldown's event assertion to
+            // fail, seeing `SessionAdmitted` for session 2 after
+            // `CooldownStarted`.
+            witness: UnitWitness {
+                test: TestRef {
+                    package: "zakura-network",
+                    file: "src/zakura/header_sync/reactor/tests/observer.rs",
+                    test: "zakura::header_sync::reactor::tests::observer::\
+                           a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
+                },
+                failure: "assertion `left == right` failed: cooldown 60s",
+                shows: &["CooldownStarted", "SessionAdmitted", "session_id: 2"],
+            },
         },
     },
     NativeMutation {
@@ -3483,8 +3499,8 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
-/// a transitional `Open` until the PR that moves it or, for a retired one,
-/// until its witness runs, or, for a duplicate, the `Caught` among
+/// a transitional `Open` until the PR that moves it, for a retired one the
+/// `UnitCaught` of its witness, or, for a duplicate, the `Caught` among
 /// `expected` of the planted case covering it, on gate 6. A moved one has
 /// no key, and nor has a duplicate whose case no `Caught` names, so its key
 /// blocks.
@@ -3507,7 +3523,10 @@ pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
                     diagnostic,
                     not_applicable,
                 },
-                NativeClass::Retired { .. } => retired_open(),
+                NativeClass::Retired { witness, .. } => Expected::UnitCaught {
+                    patch: mutation.patch,
+                    witness,
+                },
                 NativeClass::Duplicate { property, case } => expected
                     .iter()
                     .find(|result| {

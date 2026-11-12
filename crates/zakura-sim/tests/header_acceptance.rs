@@ -855,8 +855,8 @@ fn every_required_key_is_covered_once_with_its_gates() {
             *until = Some("hdr-14.6");
         }
     });
-    // The retired mutation's Open with another reason, or a ToMove's Open,
-    // isn't its own.
+    // The retired mutation's catch of another failure than its pinned
+    // witness's, or any Open, such as a ToMove's, isn't its own.
     refused(&|m| {
         let at = covering(
             m,
@@ -864,8 +864,8 @@ fn every_required_key_is_covered_once_with_its_gates() {
                 patch: "readmission-unchecked".into(),
             },
         );
-        if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
-            *reason = "covered by a zakura-network unit test";
+        if let Expected::UnitCaught { witness, .. } = &mut m.expected[at].expected {
+            witness.failure = "assertion `left == right` failed: cooldown 0ns";
         }
     });
     refused(&|m| {
@@ -1795,9 +1795,12 @@ fn native_errors(
                     errors.push(format!("{}: no diagnostic", mutation.patch));
                 }
             }
-            NativeClass::Retired { reason } => {
+            NativeClass::Retired { reason, witness } => {
                 if reason.is_empty() {
                     errors.push(format!("{}: no reason", mutation.patch));
+                }
+                if witness.failure.is_empty() || witness.shows.is_empty() {
+                    errors.push(format!("{}: no required failure", mutation.patch));
                 }
             }
             NativeClass::Duplicate { property, case } => {
@@ -1825,8 +1828,9 @@ enum NativePin {
     /// It stays native as an integrity mutation on this history, caught
     /// with this diagnostic.
     Integrity(HistoryRef, &'static str),
-    /// It's retired.
-    Retired,
+    /// It's retired, caught by this test outside the simulator, by its
+    /// full libtest name.
+    Retired(&'static str),
     /// It's retired as a duplicate of this planted case: its property,
     /// then its name.
     Duplicate(&'static str, &'static str),
@@ -1891,7 +1895,13 @@ const NATIVE_PINS: &[(&str, NativePin)] = &[
         "raw-budget-reservation",
         NativePin::Integrity(PROBE_ACCOUNTING, "ReservedMismatch"),
     ),
-    ("readmission-unchecked", NativePin::Retired),
+    (
+        "readmission-unchecked",
+        NativePin::Retired(
+            "zakura::header_sync::reactor::tests::observer::\
+             a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
+        ),
+    ),
     (
         "reordered-payload",
         NativePin::Move("header-sync/commit-only-authorized", "hdr-9c.2a"),
@@ -1976,7 +1986,9 @@ fn native_pin_errors(mutations: &[rows::NativeMutation]) -> Vec<String> {
                 },
                 Some(NativePin::Integrity(pinned, pinned_diagnostic)),
             ) => history == pinned && diagnostic == pinned_diagnostic,
-            (NativeClass::Retired { .. }, Some(NativePin::Retired)) => true,
+            (NativeClass::Retired { witness, .. }, Some(NativePin::Retired(test))) => {
+                witness.test.test == test
+            }
             (NativeClass::Duplicate { property, case }, Some(NativePin::Duplicate(p, c))) => {
                 property == p && case == c
             }
@@ -2018,11 +2030,20 @@ fn every_native_mutation_is_classified() {
         .find(|m| m.patch == "raw-budget-lease")
         .unwrap()
         .class;
+    let retired = NATIVE_MUTATIONS
+        .iter()
+        .find(|m| m.patch == "readmission-unchecked")
+        .unwrap()
+        .class;
+    let NativeClass::Retired { witness, .. } = retired else {
+        panic!("readmission-unchecked is retired");
+    };
     for (patch, class) in [
         (
             "raw-budget-reservation",
             NativeClass::Retired {
                 reason: "no longer reachable",
+                witness,
             },
         ),
         ("readmission-unchecked", integrity),
@@ -2061,20 +2082,20 @@ fn every_native_mutation_is_classified() {
                 (NativeClass::Integrity { .. }, Expected::IntegrityCaught { .. })
                 | (NativeClass::ToMove { .. }, Expected::Open { until: Some(_), .. }) => {}
                 (
-                    NativeClass::Retired { .. },
-                    Expected::Open {
-                        until: Some("hdr-14.7b"),
-                        ..
+                    NativeClass::Retired { witness, .. },
+                    Expected::UnitCaught {
+                        patch: p,
+                        witness: w,
                     },
-                ) => {}
+                ) if p == patch && *w == witness => {}
                 (NativeClass::Duplicate { property, case }, Expected::Caught { case: c, .. })
                     if c.property == property && c.name == case => {}
                 (class, expected) => panic!("{patch}: {class:?} as {:?}", expected.kind()),
             }
         }
     }
-    // A retired mutation stays a required key, blocked by its transitional
-    // Open until its witness runs.
+    // A retired mutation stays a required key, on gate 6, which only its
+    // witness's catch verifies.
     assert_eq!(
         committed_required(&manifest).get(&Key::Native {
             patch: "readmission-unchecked".into(),
@@ -2123,6 +2144,7 @@ fn every_native_mutation_is_classified() {
     for class in [
         NativeClass::Retired {
             reason: "a duplicate",
+            witness,
         },
         NativeClass::Duplicate {
             property: "header-sync/commit-only-authorized",

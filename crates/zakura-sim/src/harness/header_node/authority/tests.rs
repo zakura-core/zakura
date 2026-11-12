@@ -17,6 +17,7 @@ use zakura_network::zakura::{
     AuxSchema, Credit, HeaderEntry,
 };
 
+use super::finding::ledger_attribution;
 use super::*;
 use crate::domain::header_sync::AUTHORITY_CLAIMS;
 use crate::harness::header_node::{

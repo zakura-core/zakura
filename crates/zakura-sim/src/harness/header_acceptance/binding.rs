@@ -63,6 +63,12 @@ pub enum Field {
     Scenario,
     /// The Plan a run took its choices from, other than a fuzz input.
     Plan,
+    /// Where in its task's directory the run an artifact is about sits:
+    /// the run's subdirectory, such as `patched` or `draft`, or empty for
+    /// the task's own.
+    Role,
+    /// The SHA-256 of the executable a run ran.
+    Executable,
 }
 
 impl Field {
@@ -89,6 +95,8 @@ impl Field {
             Field::Target => "names the target",
             Field::Scenario => "ran the scenario",
             Field::Plan => "ran the Plan",
+            Field::Role => "names the role",
+            Field::Executable => "ran the executable",
         }
     }
 
@@ -138,6 +146,69 @@ pub const COMPANIONS: Kind = Kind {
     name: "companions.json",
     carries: &[(Field::Trace, "/trace"), (Field::Source, "/source")],
     required: &[Field::Trace, Field::Source],
+    closed: false,
+};
+
+/// A test's `test.json` ([`TestRun`](super::tool::TestRun)), which the
+/// runner writes for the run, task and role it ran, with the executable it
+/// ran.
+pub const TEST: Kind = Kind {
+    name: "test.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+        (Field::Executable, "/executable_sha256"),
+    ],
+    required: &[Field::RunId, Field::TaskIndex, Field::Role],
+    closed: false,
+};
+
+/// A unit witness run's `build.json` ([`UnitBuild`](super::tool::UnitBuild)),
+/// which the runner writes for the run, task and role it measured. Its
+/// `source` and executable are measurements, which its reader holds its
+/// test to.
+pub const UNIT_BUILD: Kind = Kind {
+    name: "build.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+        (Field::Base, "/base"),
+        (Field::PatchSha256, "/patch_sha256"),
+        (Field::Source, "/source"),
+        (Field::Executable, "/executable_sha256"),
+    ],
+    required: &[
+        Field::RunId,
+        Field::TaskIndex,
+        Field::Role,
+        Field::Base,
+        Field::PatchSha256,
+    ],
+    closed: false,
+};
+
+/// A fresh replay's `replay.json` ([`ReplayRun`](super::tool::ReplayRun)),
+/// which the runner writes for the run, task and role whose recording it
+/// replayed: that recording's trace, and the source of the build that
+/// replayed it, as that build's own report names it.
+pub const REPLAY: Kind = Kind {
+    name: "replay.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+        (Field::Trace, "/trace"),
+        (Field::Source, "/source"),
+    ],
+    required: &[
+        Field::RunId,
+        Field::TaskIndex,
+        Field::Role,
+        Field::Trace,
+        Field::Source,
+    ],
     closed: false,
 };
 

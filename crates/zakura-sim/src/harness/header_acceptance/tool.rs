@@ -42,9 +42,15 @@
 //! same binary that recorded the run: the replay's own `full-report.json`,
 //! which names the replayed trace and that binary's source as the
 //! recording's does, and [`REPLAY_FILE`], a [`ReplayRun`] holding how that
-//! child ended and its output.
+//! child ended and its output, beside the run's ID, the task's index, the
+//! recorded run's *role* (its directory in the task's, such as `run` or
+//! `draft`), the replayed trace's SHA-256 and the replaying build's source
+//! as its own report names it ([`binding::REPLAY`]).
 //!
-//! * `test`: [`TEST_FILE`], a [`TestRun`] of the exact-name filter.
+//! * `test`: [`TEST_FILE`], a [`TestRun`] of the exact-name filter, naming
+//!   the run's ID, the task's index, its role (empty here, and the run's
+//!   directory for a task's `unpatched`, `patched` and `restored` runs)
+//!   and the SHA-256 of the executable it ran ([`binding::TEST`]).
 //! * `history`: the witness test run as for `test`, with
 //!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`,
 //!   so `<i>/declared` holds what it declared ([`super::history`]). Then
@@ -103,8 +109,9 @@
 //! * `unit`: for each of `unpatched`, `patched` and `restored`, the task's
 //!   test as for `test` in `<i>/<run>`, built and run as a plain build, with
 //!   no simulator cfg, and [`PATCHED_BUILD_FILE`], a [`UnitBuild`]: the
-//!   build's own provenance, since a plain binary embeds no source digest
-//!   ([`unit_refusal`]).
+//!   build's own provenance, since a plain binary embeds no source digest,
+//!   naming its run, task and role as its test does ([`unit_refusal`],
+//!   [`binding::UNIT_BUILD`]).
 //!
 //! Every recorded run's report and store snapshot come from its
 //! `full-report.json`, never from the trace's `end` record, which keeps no
@@ -175,6 +182,43 @@ fn task_bound(artifacts: &Path, run_id: &str, index: usize, task: &Task) -> bool
     binding::read(&binding::TASK, &path, &expect).is_ok()
 }
 
+/// The task whose directory a reader reads: the ID of the run that wrote
+/// it and the task's index, which every artifact the runner writes there
+/// names beside its role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskAt<'a> {
+    /// The run's ID.
+    pub run_id: &'a str,
+    /// The task's index in its plan.
+    pub index: usize,
+}
+
+impl TaskAt<'_> {
+    /// The artifact of `kind` at `path`, as `T`, if it's this task's run at
+    /// `role` and bound to whatever else `expect` names ([`binding::read`]),
+    /// or why not.
+    fn read<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: &binding::Kind,
+        path: &Path,
+        role: &str,
+        expect: Expect,
+    ) -> Result<T, String> {
+        let expect = expect
+            .with(Field::RunId, self.run_id)
+            .with(Field::TaskIndex, self.index)
+            .with(Field::Role, role);
+        let artifact = binding::read(kind, path, &expect)?;
+        serde_json::from_value(artifact).map_err(|error| format!("{}: {error}", kind.name))
+    }
+
+    /// The [`TestRun`] in `dir`, this task's run at `role`
+    /// ([`binding::TEST`]), or why not.
+    fn test(&self, dir: &Path, role: &str) -> Result<TestRun, String> {
+        self.read(&binding::TEST, &dir.join(TEST_FILE), role, Expect::new())
+    }
+}
+
 /// What an artifacts directory says of the run that wrote it, at its root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,6 +274,17 @@ pub use crate::record::FULL_REPORT_FILE;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayRun {
+    /// The ID of the run whose runner made the replay.
+    pub run_id: String,
+    /// The index of the task whose recording it replayed.
+    pub index: usize,
+    /// That recording's role in the task's directory.
+    pub role: String,
+    /// The SHA-256 of the trace it replayed.
+    pub trace: String,
+    /// The source of the build that replayed it, as the replay's own full
+    /// report names it, or `None` if it wrote none.
+    pub source: Option<String>,
     /// Whether the child exited 0, which `zakura-sim replay` does only for a
     /// verified replay.
     pub exited_ok: bool,
@@ -772,6 +827,16 @@ fn native_patch(repo: &Path, patch: &str) -> Result<String, String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestRun {
+    /// The ID of the run whose runner ran it.
+    pub run_id: String,
+    /// Its task's index.
+    pub index: usize,
+    /// Its run's role in the task's directory: empty for a test or history
+    /// task's own, or `unpatched`, `patched` or `restored`.
+    pub role: String,
+    /// The SHA-256 of the test executable it ran, or `None` if the runner
+    /// found none.
+    pub executable_sha256: Option<String>,
     /// The package xtask ran the filter in.
     pub package: String,
     /// The test file whose binary xtask ran.
@@ -878,14 +943,14 @@ pub struct TargetCheck {
     pub refused: Option<String>,
 }
 
-/// A test result from its artifact: every test libtest reported, in the
-/// package and file xtask ran, with the sources of its binary and of the
-/// checkout it ran in, both of which the evaluator requires to be S's. A
-/// killed child fails every test it ran, a child that didn't exit 0 fails
-/// every test it reported `ok`, and an unreadable artifact is a result that
-/// ran nothing.
-fn test_actual(dir: &Path) -> Actual {
-    let Some(run) = read_json::<TestRun>(&dir.join(TEST_FILE)) else {
+/// A test result from its artifact, the task `at`'s own: every test
+/// libtest reported, in the package and file xtask ran, with the sources
+/// of its binary and of the checkout it ran in, both of which the evaluator
+/// requires to be S's. A killed child fails every test it ran, a child that
+/// didn't exit 0 fails every test it reported `ok`, and an artifact that
+/// can't be read or isn't this task's is a result that ran nothing.
+fn test_actual(dir: &Path, at: &TaskAt<'_>) -> Actual {
+    let Ok(run) = at.test(dir, "") else {
         return Actual::Test {
             ran: Vec::new(),
             binary_source: None,
@@ -1124,18 +1189,25 @@ pub fn read_execution(dir: &Path, run: RunId, harness: &str, run_by: RunBy) -> E
     execution(dir, run, harness, run_by)
 }
 
-/// The fresh replay (C3, C8) of the recorded run `run` in `dir`, from its
-/// [`REPLAY_DIR`]: it's exact only if its child exited 0, wasn't killed
-/// and said it replayed this trace with every pick, draw and observation
-/// matched ([`binding::REPLAY_LOG`]). Its full report, which must report `dir`'s trace
+/// The fresh replay (C3, C8) of the recorded run `run` in `dir`, task
+/// `at`'s run at `role`, from its [`REPLAY_DIR`]: its [`REPLAY_FILE`] must
+/// name that task's run at that role, `dir`'s trace and the build the
+/// trace names ([`binding::REPLAY`]), or there's no fresh replay. It's
+/// exact only if its child exited 0, wasn't killed and said it replayed
+/// this trace with every pick, draw and observation matched
+/// ([`binding::REPLAY_LOG`]). Its full report, which must report `dir`'s trace
 /// ([`bound_report`]), is compared with the recording's, outcomes and
 /// violations apart from the store snapshot, so a changed stored fact fails
 /// it even when every report is the same. Its meta is the recording's: the
 /// replay reruns the meta's harness with its `Draft` override.
-fn replay_actual(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
+fn replay_actual(dir: &Path, (at, role): (&TaskAt<'_>, &str), run: RunId, run_by: RunBy) -> Actual {
     let of = digest(&dir.join("trace.jsonl"));
     let replay = dir.join(REPLAY_DIR);
-    let ran = read_json::<ReplayRun>(&replay.join(REPLAY_FILE));
+    let ran = Expect::of_trace(dir)
+        .and_then(|expect| {
+            at.read::<ReplayRun>(&binding::REPLAY, &replay.join(REPLAY_FILE), role, expect)
+        })
+        .ok();
     let recorded = recorded(dir).ok();
     let meta = ExecMeta {
         harness: recorded
@@ -1225,7 +1297,7 @@ fn reports_diagnostic(log: &str, diagnostic: &str) -> bool {
 /// incomplete. Its trigger history is the test's own assertions, which
 /// passed only if it did.
 fn integrity_execution(
-    dir: &Path,
+    (dir, at, role): (&Path, &TaskAt<'_>, &str),
     run: RunId,
     input: &RunId,
     harness: &str,
@@ -1249,7 +1321,7 @@ fn integrity_execution(
     else {
         unreachable!("an integrity run's input is a history");
     };
-    let artifact = read_json::<TestRun>(&dir.join(TEST_FILE));
+    let artifact = at.test(dir, role).ok();
     let mut end = match &artifact {
         Some(test) if test.killed => End::Killed,
         // The artifact must be the history's own witness test, by package,
@@ -1397,6 +1469,10 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
     let bound = |index: usize, task: &Task| task_bound(artifacts, &run.run_id, index, task);
     for (index, task) in plan.tasks.iter().enumerate() {
         let dir = artifacts.join(index.to_string());
+        let at = TaskAt {
+            run_id: &run.run_id,
+            index,
+        };
         // A directory the runner didn't write for this task gives it no
         // result, so it blocks.
         if !bound(index, task) {
@@ -1404,9 +1480,9 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
         }
         let actual = match task {
             Task::Unit { .. } => Actual::UnitCaught {
-                refused: unit_refusal(repo, (subject, subject_source), task, &dir),
+                refused: unit_refusal(repo, (subject, subject_source), task, (&dir, &at)),
             },
-            Task::Test { .. } => test_actual(&dir),
+            Task::Test { .. } => test_actual(&dir, &at),
             Task::History {
                 expected,
                 harness,
@@ -1417,7 +1493,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 test,
                 case,
             } => Actual::Run(history_execution(
-                &dir,
+                (&dir, &at),
                 history_of(expected)
                     .expect("a history task's result names its history")
                     .clone(),
@@ -1524,7 +1600,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 };
                 let read = |name: &str, which| {
                     integrity_execution(
-                        &dir.join(name),
+                        (&dir.join(name), &at, name),
                         run(which),
                         &input,
                         harness,
@@ -1534,7 +1610,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 };
                 let mut patched = read("patched", CaseRun::Patched);
                 if let Some(why) =
-                    patched_build_refusal(repo, patch_file, subject, &dir.join("patched"))
+                    patched_build_refusal(repo, patch_file, subject, (&dir.join("patched"), &at))
                 {
                     fail(&mut patched, why);
                 }
@@ -1578,6 +1654,13 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
             commit: subject.to_owned(),
             actual: replay_actual(
                 &artifacts.join(index.to_string()).join(role),
+                (
+                    &TaskAt {
+                        run_id: &run.run_id,
+                        index,
+                    },
+                    role,
+                ),
                 replayed.clone(),
                 run_by,
             ),
@@ -1785,7 +1868,7 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
 /// judging another property or expectation fails the run, and a task with
 /// no expectation shows no trigger.
 fn history_execution(
-    dir: &Path,
+    (dir, at): (&Path, &TaskAt<'_>),
     run: RunId,
     harness: &str,
     witness: (&str, Option<&str>),
@@ -1806,7 +1889,7 @@ fn history_execution(
         (_, None) => execution.trigger = false,
         _ => {}
     }
-    let passed = read_json::<TestRun>(&dir.join(TEST_FILE)).is_some_and(|ran| {
+    let passed = at.test(dir, "").is_ok_and(|ran| {
         ran.package == package
             && ran.file == file
             && !ran.killed
@@ -2117,7 +2200,7 @@ fn patched_build_refusal(
     repo: &Path,
     patch_file: &str,
     subject: &str,
-    dir: &Path,
+    (dir, at): (&Path, &TaskAt<'_>),
 ) -> Option<String> {
     let expect = Expect::new().with(Field::Base, subject).with_read(
         Field::PatchSha256,
@@ -2142,8 +2225,8 @@ fn patched_build_refusal(
         }
     };
     let measured = Some(build.source.as_str());
-    let test = read_json::<TestRun>(&dir.join(TEST_FILE));
-    let ran = test.as_ref().is_some_and(|test| {
+    let test = at.test(dir, "patched");
+    let ran = test.as_ref().is_ok_and(|test| {
         test.binary_source.as_deref() == measured && test.checkout_source.as_deref() == measured
     });
     let recorded = binding::check_trace(
@@ -2165,6 +2248,12 @@ fn patched_build_refusal(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnitBuild {
+    /// The ID of the run whose runner measured it.
+    pub run_id: String,
+    /// Its task's index.
+    pub index: usize,
+    /// Its run's role: `unpatched`, `patched` or `restored`.
+    pub role: String,
     /// The commit the checkout was made from, which must be S.
     pub base: String,
     /// The SHA-256 of the mutation's patch, which must be its committed
@@ -2178,12 +2267,15 @@ pub struct UnitBuild {
     pub executable_sha256: Option<String>,
 }
 
-/// Why the unit witness task's runs in `dir`, at S (`subject`, whose source
-/// digest is `subject_source`), aren't its mutation caught: each of
-/// `unpatched`, `patched` and `restored` must have run exactly the task's
-/// test, unkilled, in the task's package and file, from a checkout made
-/// from S whose measured source its [`TestRun`] names too, with the
-/// committed patch's digest. The unpatched and restored runs must pass at
+/// Why the unit witness task's runs in `dir`, task `at`'s, at S
+/// (`subject`, whose source digest is `subject_source`), aren't its
+/// mutation caught: each of `unpatched`, `patched` and `restored` must have
+/// a [`TestRun`] and a [`UnitBuild`] naming this task's run at that role
+/// ([`binding::TEST`], [`binding::UNIT_BUILD`]), the build made from S with
+/// the committed patch's digest and the test naming the executable the
+/// build measured. Each must have run exactly the task's test, unkilled,
+/// in the task's package and file, from a checkout whose measured source
+/// its [`TestRun`] names too. The unpatched and restored runs must pass at
 /// S's source. The patched run must fail at another source, from an
 /// executable other than the unpatched run's, with the task's `failure`
 /// as its assertion message and a `left` value showing each of `shows` in
@@ -2193,7 +2285,7 @@ pub fn unit_refusal(
     repo: &Path,
     (subject, subject_source): (&str, &str),
     task: &Task,
-    dir: &Path,
+    (dir, at): (&Path, &TaskAt<'_>),
 ) -> Option<String> {
     let Task::Unit {
         patch_file,
@@ -2207,30 +2299,33 @@ pub fn unit_refusal(
     else {
         return Some("not a unit witness task".to_owned());
     };
-    let committed = digest(&repo.join(patch_file));
-    if committed == "missing" {
+    let Some(committed) = file_digest(&repo.join(patch_file)) else {
         return Some(format!("the committed patch {patch_file} can't be read"));
-    }
+    };
     let mut executables = BTreeMap::new();
     for run in ["unpatched", "patched", "restored"] {
-        let at = dir.join(run);
-        let Some(ran) = read_json::<TestRun>(&at.join(TEST_FILE)) else {
-            return Some(format!("{run}: no test artifact"));
+        let in_run = dir.join(run);
+        let expect = Expect::new()
+            .with(Field::Base, subject)
+            .with(Field::PatchSha256, &committed);
+        let build = match at.read::<UnitBuild>(
+            &binding::UNIT_BUILD,
+            &in_run.join(PATCHED_BUILD_FILE),
+            run,
+            expect,
+        ) {
+            Ok(build) => build,
+            Err(why) => return Some(format!("{run}: no build measurement of S: {why}")),
         };
-        let Some(build) = read_json::<UnitBuild>(&at.join(PATCHED_BUILD_FILE)) else {
-            return Some(format!("{run}: no build measurement"));
+        let expect = Expect::new().with(Field::Executable, &build.executable_sha256);
+        let ran = match at.read::<TestRun>(&binding::TEST, &in_run.join(TEST_FILE), run, expect) {
+            Ok(ran) => ran,
+            Err(why) => return Some(format!("{run}: no test artifact of its build: {why}")),
         };
         if ran.killed || ran.package != *package || ran.file != *file {
             return Some(format!(
                 "{run}: it ran {}/{} (killed: {})",
                 ran.package, ran.file, ran.killed
-            ));
-        }
-        if build.base != subject || build.patch_sha256 != committed {
-            return Some(format!(
-                "{run}: its checkout was made from {} with the patch {}, not S {subject} with \
-                 {committed}",
-                build.base, build.patch_sha256
             ));
         }
         let patched = run == "patched";
@@ -2824,10 +2919,11 @@ pub fn a_a_and_a_b_a(
     }
 }
 
-/// The fresh replay of the recorded run `run` in `dir`, by `run_by`, as
-/// [`assemble`] reads a `Replays` result from the runner's artifacts.
-pub fn read_replay(dir: &Path, run: RunId, run_by: RunBy) -> Actual {
-    replay_actual(dir, run, run_by)
+/// The fresh replay of the recorded run `run` in `dir`, task `at.0`'s run
+/// at role `at.1`, by `run_by`, as [`assemble`] reads a `Replays` result
+/// from the runner's artifacts.
+pub fn read_replay(dir: &Path, at: (&TaskAt<'_>, &str), run: RunId, run_by: RunBy) -> Actual {
+    replay_actual(dir, at, run, run_by)
 }
 
 /// Where one obligation's evidence is.
@@ -3347,6 +3443,13 @@ fn evaluate_against(
 mod tests {
     use super::*;
 
+    /// The task every test artifact here names, at its own role unless a
+    /// test says otherwise.
+    const AT: TaskAt<'static> = TaskAt {
+        run_id: "r",
+        index: 0,
+    };
+
     /// The committed rows list `honest-progress` as the one `Draft`, owned
     /// by Evan. A `Draft` registration whose row is gone, isn't `Draft`, or
     /// names no promotion is an error instead.
@@ -3738,7 +3841,8 @@ mod tests {
 
     /// Writes `dir`'s fresh replay as the runner does: the replay's own full
     /// report from an in-process replay of the trace, and its child's end
-    /// with `log`.
+    /// with `log`, named as [`AT`]'s run at its own role, of that trace by
+    /// the build it records.
     fn replay_into(dir: &Path, exited_ok: bool, log: &str) {
         let trace = crate::trace::TraceReader::open(dir).expect("the trace reads");
         let replayed = crate::trace::replay(&trace, crate::trace::ReplayOptions::default())
@@ -3754,6 +3858,11 @@ mod tests {
         fs::write(replay.join(FULL_REPORT_FILE), report.to_line())
             .expect("the temp dir is writable");
         let ran = ReplayRun {
+            run_id: AT.run_id.to_owned(),
+            index: AT.index,
+            role: String::new(),
+            trace: trace.id.clone(),
+            source: Some(trace.meta.build.source.clone()),
             exited_ok,
             killed: false,
             log: log.to_owned(),
@@ -3779,7 +3888,7 @@ mod tests {
             "replayed trace {of}: idle after 3 steps; every pick, draw and observation matched"
         );
         replay_into(dir.path(), true, &matched);
-        let read = |dir: &Path| match replay_actual(dir, history_run(), RunBy::Tool) {
+        let read = |dir: &Path| match replay_actual(dir, (&AT, ""), history_run(), RunBy::Tool) {
             Actual::Replay {
                 exact,
                 reports_equal,
@@ -3817,6 +3926,49 @@ mod tests {
         assert_eq!(read(dir.path()), (true, true, false, true));
         let dir = recorded();
         assert_eq!(read(dir.path()), (false, false, false, false));
+    }
+
+    /// F3: a replay counts only as this run's own task's replay of this
+    /// trace by the build that recorded it ([`binding::REPLAY`]). The same
+    /// replay naming another run, as an earlier attempt's replay of the
+    /// same trace bytes does, another task or role, another trace or
+    /// another build, or naming none of them, is no fresh replay, so it
+    /// isn't exact either.
+    #[test]
+    fn an_earlier_attempt_s_replay_is_refused() {
+        let dir = recorded();
+        let of = digest(&dir.path().join("trace.jsonl"));
+        let matched = format!(
+            "replayed trace {of}: idle after 3 steps; every pick, draw and observation matched"
+        );
+        replay_into(dir.path(), true, &matched);
+        let read = || match replay_actual(dir.path(), (&AT, ""), history_run(), RunBy::Tool) {
+            Actual::Replay { exact, fresh, .. } => (exact, fresh),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(read(), (true, true));
+        let file = dir.path().join(REPLAY_DIR).join(REPLAY_FILE);
+        let fresh: Value =
+            serde_json::from_str(&fs::read_to_string(&file).expect("it exists")).expect("JSON");
+        for (key, moved) in [
+            ("run_id", Value::from("earlier")),
+            ("index", Value::from(1)),
+            ("role", Value::from("draft")),
+            ("trace", Value::from("0".repeat(64))),
+            ("source", Value::from("other")),
+            ("source", Value::Null),
+        ] {
+            let mut stale = fresh.clone();
+            stale[key] = moved;
+            fs::write(&file, stale.to_string()).expect("the temp dir is writable");
+            assert_eq!(read(), (false, false), "{key}");
+        }
+        let mut unnamed = fresh.clone();
+        for key in ["run_id", "index", "role", "trace", "source"] {
+            unnamed.as_object_mut().expect("an object").remove(key);
+        }
+        fs::write(&file, unnamed.to_string()).expect("the temp dir is writable");
+        assert_eq!(read(), (false, false));
     }
 
     /// A typed case's trace binds to its committed scenario and Plan (C18):
@@ -4856,7 +5008,7 @@ mod tests {
                 serde_json::json!({ "property": "p/a", "expect": expect, "passed": true });
             history_task_dir(dir.path(), Some(witness));
             history_execution(
-                dir.path(),
+                (dir.path(), &AT),
                 history_run(),
                 NODE,
                 ("p/a", Some("not-applicable")),
@@ -5370,6 +5522,10 @@ mod tests {
             let at = dir.join(run);
             fs::create_dir_all(&at).unwrap();
             let ran = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: run.to_owned(),
+                executable_sha256: Some(exe.to_owned()),
                 package: package.clone(),
                 file: file.clone(),
                 tests: vec![(test.clone(), result.to_owned())],
@@ -5381,6 +5537,9 @@ mod tests {
             };
             fs::write(at.join(TEST_FILE), serde_json::to_string(&ran).unwrap()).unwrap();
             let build = UnitBuild {
+                run_id: "r".into(),
+                index: 0,
+                role: run.to_owned(),
                 base: "s".to_owned(),
                 patch_sha256: patch.clone(),
                 source: source.to_owned(),
@@ -5399,7 +5558,7 @@ mod tests {
             let (source, exe, result, log) = patched;
             write(dir.path(), "patched", source, exe, result, log);
             write(dir.path(), "restored", "src-s", "exe-s", restored, "");
-            unit_refusal(&repo, (base, "src-s"), &task, dir.path())
+            unit_refusal(&repo, (base, "src-s"), &task, (dir.path(), &AT))
         };
         let required_failure = ("src-p", "exe-p", "FAILED", required);
         assert_eq!(caught(required_failure, "ok", "s"), None);
@@ -5425,6 +5584,112 @@ mod tests {
         }
     }
 
+    /// F3: the unit witness's runs count only as this run's own task's
+    /// ([`binding::TEST`], [`binding::UNIT_BUILD`]). The caught pair naming
+    /// this task's run at each role, its test naming the executable its
+    /// build measured, counts. The same pairs naming another run, as an
+    /// earlier attempt's identical pairs copied into a new task directory
+    /// do, another task or role, or nothing, don't, and neither does a test
+    /// naming another executable than its build.
+    #[test]
+    fn an_earlier_attempt_s_unit_runs_are_refused() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let task = plan
+            .tasks
+            .iter()
+            .find(
+                |task| matches!(task, Task::Unit { patch, .. } if patch == "readmission-unchecked"),
+            )
+            .expect("the retired mutation's witness is planned")
+            .clone();
+        let Task::Unit {
+            patch_file,
+            package,
+            file,
+            test,
+            failure,
+            shows,
+            ..
+        } = &task
+        else {
+            unreachable!("found as a unit task");
+        };
+        let log = format!("{failure}\n  left: {}\n", shows.join(" "));
+        let caught = |edit: &dyn Fn(&str, &mut Value, &mut Value)| {
+            let dir = tempfile::tempdir().unwrap();
+            for (run, source, exe, result) in [
+                ("unpatched", "src-s", "exe-s", "ok"),
+                ("patched", "src-p", "exe-p", "FAILED"),
+                ("restored", "src-s", "exe-s", "ok"),
+            ] {
+                let at = dir.path().join(run);
+                fs::create_dir_all(&at).unwrap();
+                let mut ran = serde_json::json!({
+                    "run_id": AT.run_id,
+                    "index": AT.index,
+                    "role": run,
+                    "executable_sha256": exe,
+                    "package": package,
+                    "file": file,
+                    "tests": [[test, result]],
+                    "killed": false,
+                    "exited_ok": result == "ok",
+                    "log": log,
+                    "binary_source": NOT_EMBEDDED,
+                    "checkout_source": source,
+                });
+                let mut build = serde_json::json!({
+                    "run_id": AT.run_id,
+                    "index": AT.index,
+                    "role": run,
+                    "base": "s",
+                    "patch_sha256": digest(&repo.join(patch_file)),
+                    "source": source,
+                    "executable_sha256": exe,
+                });
+                edit(run, &mut ran, &mut build);
+                fs::write(at.join(TEST_FILE), ran.to_string()).unwrap();
+                fs::write(at.join(PATCHED_BUILD_FILE), build.to_string()).unwrap();
+            }
+            unit_refusal(&repo, ("s", "src-s"), &task, (dir.path(), &AT))
+        };
+        assert_eq!(caught(&|_, _, _| {}), None);
+        for (key, moved) in [
+            ("run_id", Value::from("earlier")),
+            ("index", Value::from(1)),
+            ("role", Value::from("restored")),
+        ] {
+            let both = |run: &str, ran: &mut Value, build: &mut Value| {
+                if run == "patched" {
+                    ran[key] = moved.clone();
+                    build[key] = moved.clone();
+                }
+            };
+            assert!(caught(&both).is_some(), "{key}");
+            let test_only = |run: &str, ran: &mut Value, _: &mut Value| {
+                if run == "patched" {
+                    ran[key] = moved.clone();
+                }
+            };
+            assert!(caught(&test_only).is_some(), "{key} on the test");
+        }
+        let unnamed = |_: &str, ran: &mut Value, build: &mut Value| {
+            for artifact in [ran, build] {
+                for key in ["run_id", "index", "role"] {
+                    artifact.as_object_mut().unwrap().remove(key);
+                }
+            }
+        };
+        assert!(caught(&unnamed).is_some());
+        let other_executable = |run: &str, ran: &mut Value, _: &mut Value| {
+            if run == "patched" {
+                ran["executable_sha256"] = Value::from("exe-other");
+            }
+        };
+        assert!(caught(&other_executable).is_some());
+    }
+
     /// A digest the evaluator would accept as naming an execution.
     fn usable_digest(trace: &str) -> bool {
         trace.len() == 64 && trace.chars().all(|c| c.is_ascii_hexdigit())
@@ -5438,6 +5703,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir can be created");
         let write = |killed: bool, exited_ok: bool| {
             let run = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: String::new(),
+                executable_sha256: None,
                 package: "zakura-sim".into(),
                 file: "tests/t.rs".into(),
                 tests: vec![("a".into(), "ok".into()), ("b".into(), "ignored".into())],
@@ -5459,7 +5728,7 @@ mod tests {
         };
         write(false, true);
         assert_eq!(
-            outcomes(test_actual(dir.path())),
+            outcomes(test_actual(dir.path(), &AT)),
             [TestOutcome::Passed, TestOutcome::Skipped]
         );
         // It carries both measured sources for the evaluator to judge.
@@ -5467,7 +5736,7 @@ mod tests {
             binary_source,
             checkout_source,
             ..
-        } = test_actual(dir.path())
+        } = test_actual(dir.path(), &AT)
         else {
             unreachable!("a test artifact reads as a test result");
         };
@@ -5478,16 +5747,16 @@ mod tests {
         // `ok` and then a nonzero exit or a signal isn't a pass.
         write(false, false);
         assert_eq!(
-            outcomes(test_actual(dir.path())),
+            outcomes(test_actual(dir.path(), &AT)),
             [TestOutcome::Failed, TestOutcome::Skipped]
         );
         write(true, false);
         assert_eq!(
-            outcomes(test_actual(dir.path())),
+            outcomes(test_actual(dir.path(), &AT)),
             [TestOutcome::Failed, TestOutcome::Failed]
         );
         let empty = tempfile::tempdir().expect("a temp dir can be created");
-        assert!(outcomes(test_actual(empty.path())).is_empty());
+        assert!(outcomes(test_actual(empty.path(), &AT)).is_empty());
     }
 
     /// A storage history the integrity fixtures declare and record: the
@@ -5586,6 +5855,10 @@ mod tests {
             declare_and_record(dir.path(), "a_test", "plan 0", "subject", None);
             edit(&dir.path().join("history"));
             let artifact = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: String::new(),
+                executable_sha256: None,
                 package: "zakura-sim".into(),
                 file: "tests/header_node.rs".into(),
                 tests: vec![("a_test".into(), "ok".into())],
@@ -5601,7 +5874,7 @@ mod tests {
             )
             .expect("the temp dir is writable");
             integrity_execution(
-                dir.path(),
+                (dir.path(), &AT, ""),
                 RunId::native("raw-budget-lease", CaseRun::Unpatched),
                 &input,
                 NODE,
@@ -5705,6 +5978,10 @@ mod tests {
         declare_and_record(dir, "test", "plan 0", "s", None);
         fs::rename(dir.join("history"), dir.join("run")).expect("the temp dir is writable");
         let ran = TestRun {
+            run_id: "r".into(),
+            index: 0,
+            role: String::new(),
+            executable_sha256: None,
             package: "zakura-sim".into(),
             file: "tests/header_node.rs".into(),
             tests: vec![("test".into(), "ok".into())],
@@ -5764,7 +6041,7 @@ mod tests {
                         .expect("the temp dir is writable");
                 }
                 history_execution(
-                    dir.path(),
+                    (dir.path(), &AT),
                     history_run(),
                     NODE,
                     ("p/a", None),
@@ -5879,7 +6156,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("a temp dir can be created");
             history_task_dir(dir.path(), Some(witness));
             history_execution(
-                dir.path(),
+                (dir.path(), &AT),
                 history_run(),
                 NODE,
                 ("p/a", expect),
@@ -5913,7 +6190,7 @@ mod tests {
             fs::write(dir.path().join("run/witness.json"), witness.to_string())
                 .expect("the temp dir is writable");
             history_execution(
-                dir.path(),
+                (dir.path(), &AT),
                 history_run(),
                 NODE,
                 ("p/a", Some("holds")),
@@ -5962,6 +6239,10 @@ mod tests {
                 declare_and_record(dir.path(), "a_test", "plan 0", source, failure);
                 let (package, file, name) = test;
                 let artifact = TestRun {
+                    run_id: "r".into(),
+                    index: 0,
+                    role: String::new(),
+                    executable_sha256: None,
                     package: package.into(),
                     file: file.into(),
                     tests: vec![(name.into(), result.into())],
@@ -5977,7 +6258,7 @@ mod tests {
                 )
                 .expect("the temp dir is writable");
                 integrity_execution(
-                    dir.path(),
+                    (dir.path(), &AT, ""),
                     RunId::native("raw-budget-lease", run),
                     &input,
                     NODE,
@@ -6026,7 +6307,7 @@ mod tests {
         // patched one didn't happen.
         let reread = |dir: &Path, run: CaseRun| {
             integrity_execution(
-                dir,
+                (dir, &AT, ""),
                 RunId::native("raw-budget-lease", run),
                 &input,
                 NODE,
@@ -6082,6 +6363,10 @@ mod tests {
                 );
                 declare_and_record(dir.path(), "a_test", "plan 0", source, failure);
                 let artifact = TestRun {
+                    run_id: "r".into(),
+                    index: 0,
+                    role: String::new(),
+                    executable_sha256: None,
                     package: own.0.into(),
                     file: own.1.into(),
                     tests: vec![(own.2.into(), result.into())],
@@ -6114,6 +6399,10 @@ mod tests {
             let dir = tempfile::tempdir().expect("a temp dir can be created");
             declare_and_record(dir.path(), "a_test", "plan 0", "patched", failure);
             let artifact = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: String::new(),
+                executable_sha256: None,
                 package: own.0.into(),
                 file: own.1.into(),
                 tests: vec![(own.2.into(), "FAILED".into())],
@@ -6135,6 +6424,10 @@ mod tests {
         // `ok` with a nonzero exit isn't completed.
         let dir = tempfile::tempdir().expect("a temp dir can be created");
         let artifact = TestRun {
+            run_id: "r".into(),
+            index: 0,
+            role: String::new(),
+            executable_sha256: None,
             package: own.0.into(),
             file: own.1.into(),
             tests: vec![(own.2.into(), "ok".into())],
@@ -6151,7 +6444,15 @@ mod tests {
         .expect("the temp dir is writable");
         let run = RunId::native("raw-budget-lease", CaseRun::Unpatched);
         assert!(failed(
-            integrity_execution(dir.path(), run, &input, NODE, "OwnedMismatch", "subject").end
+            integrity_execution(
+                (dir.path(), &AT, ""),
+                run,
+                &input,
+                NODE,
+                "OwnedMismatch",
+                "subject"
+            )
+            .end
         ));
         // Another diagnostic, or a panic that only mentions this one.
         assert!(failed(
@@ -6295,6 +6596,10 @@ mod tests {
                     format!("storage:header's evidence failed: {diagnostic}: at a quiet boundary");
                 declare_and_record(&at, test, case, source, failed.then_some(&failure));
                 let artifact = TestRun {
+                    run_id: run.run_id.clone(),
+                    index,
+                    role: name.to_owned(),
+                    executable_sha256: None,
                     package: package.clone(),
                     file: file.clone(),
                     tests: vec![(test.clone(), result.into())],

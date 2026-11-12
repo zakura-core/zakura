@@ -23,7 +23,7 @@ use zakura_sim::{
             contracts::RunBy,
             evaluate::{Actual, End},
             sim_test,
-            tool::{self, ReplayRun, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
+            tool::{self, ReplayRun, TaskAt, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
             HistoryRef, RunId,
         },
         RecordInput,
@@ -50,9 +50,23 @@ fn sim(args: &[&str]) -> (bool, String) {
     (output.status.success(), log)
 }
 
-/// Writes `dir`'s fresh replay as the runner does: a separate `zakura-sim
-/// replay --report` child, and its end as [`REPLAY_FILE`].
+/// The task the fixtures' replays are named for.
+const AT: TaskAt<'static> = TaskAt {
+    run_id: "t",
+    index: 0,
+};
+
+/// Writes `dir`'s fresh replay as the runner does, for [`AT`]'s own run
+/// ([`replay_as`]).
 fn replay(dir: &Path) {
+    replay_as(dir, &AT, "");
+}
+
+/// Writes `dir`'s fresh replay as the runner does: a separate `zakura-sim
+/// replay --report` child, and its end as [`REPLAY_FILE`], named as task
+/// `at`'s run at `role`, with `dir`'s trace and the source the replay's own
+/// report names.
+fn replay_as(dir: &Path, at: &TaskAt<'_>, role: &str) {
     let replay = dir.join(REPLAY_DIR);
     std::fs::create_dir_all(&replay).expect("the temp dir is writable");
     let report = replay.join(FULL_REPORT_FILE);
@@ -62,7 +76,16 @@ fn replay(dir: &Path) {
         "--report",
         report.to_str().expect("the path is UTF-8"),
     ]);
+    let source = std::fs::read_to_string(&report)
+        .ok()
+        .and_then(|text| serde_json::from_str::<FullReport>(&text).ok())
+        .and_then(|report| report.source);
     let ran = ReplayRun {
+        run_id: at.run_id.to_owned(),
+        index: at.index,
+        role: role.to_owned(),
+        trace: digest(&dir.join("trace.jsonl")),
+        source,
         exited_ok,
         killed: false,
         log,
@@ -151,7 +174,7 @@ fn a_changed_stored_fact_fails_the_replay_comparison() {
     let dir = tempfile::tempdir().expect("a temp dir can be created");
     recorded(dir.path());
     replay(dir.path());
-    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let read = |dir: &Path| flags(tool::read_replay(dir, (&AT, ""), history(), RunBy::Tool));
     assert_eq!(read(dir.path()), (true, true, true, true));
 
     edit_report(
@@ -222,7 +245,7 @@ fn another_run_s_full_reports_beside_a_trace_are_refused() {
     };
     let execution =
         |dir: &Path| tool::read_execution(dir, history(), "header-sync/storage", RunBy::Tool).end;
-    let read = |dir: &Path| flags(tool::read_replay(dir, history(), RunBy::Tool));
+    let read = |dir: &Path| flags(tool::read_replay(dir, (&AT, ""), history(), RunBy::Tool));
     let a = recorded(1);
     let b = recorded(2);
     let (a_full, b_full) = (full(a.path()), full(b.path()));
@@ -552,7 +575,11 @@ fn two_planted_cases_run_through_the_tool() {
             args.extend(extra.iter().map(|arg| (*arg).to_owned()));
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             sim(&args);
-            replay(&dir.join(out));
+            let at = TaskAt {
+                run_id: &run.run_id,
+                index,
+            };
+            replay_as(&dir.join(out), &at, out);
         };
         record("baseline", &["--witness", property, "--expect", "holds"]);
         // The patched run expects what the case's task names, as the

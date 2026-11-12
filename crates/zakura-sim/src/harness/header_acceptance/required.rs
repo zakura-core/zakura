@@ -192,10 +192,6 @@ pub const GATE_5_BOUND_TABLE: &str =
                      one-over-denied and release-then-reuse fixture, its cleanup or \
                      conservation witness, or its exclusion";
 
-/// Why `gate-5/mixed-witness` is open until hdr-14.8.
-pub const GATE_5_MIXED_WITNESS: &str =
-    "one storage scenario running all four Sim resource IDs together";
-
 /// Every gate obligation no row owns, with its gates and what may satisfy
 /// it, written from the spec's gate table.
 pub static GATE_OBLIGATIONS: &[GateObligation] = &[
@@ -406,14 +402,16 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
             reason: GATE_5_BOUND_TABLE,
         },
     },
+    // The one storage history running all four Sim resource IDs together,
+    // with its Shutdown and StopStorage picked and the node settled at its
+    // reactor's exit. Its four whole-report passes are history keys.
     GateObligation {
         name: "gate-5/mixed-witness",
         gates: &[Gate::G5],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.8",
-            reason: GATE_5_MIXED_WITNESS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+        )),
     },
 ];
 

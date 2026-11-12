@@ -174,6 +174,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_mixed_resources.rs"
+test = "regenerate_mixed_resources_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed mixed resource fixture from its builder"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
 test = "regenerate_late_fault_fixture"
 run = false

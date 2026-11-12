@@ -23,7 +23,8 @@ use crate::{
 ///
 /// Every entry is exempt from scoring and bans. An entry that names one address or one
 /// DNS name is also dialed, see [`dial_addrs`](Self::dial_addrs) and
-/// [`dial_hosts`](Self::dial_hosts). A range has no single address to dial.
+/// [`dial_hosts`](Self::dial_hosts). A range of several addresses has no single address
+/// to dial.
 ///
 /// This type holds the configured entries only. A DNS name's exemption covers the
 /// addresses it resolves to while the node runs, which
@@ -124,8 +125,8 @@ impl UnconditionalPeers {
     /// Returns the addresses Zakura dials to stay connected to its unconditional peers.
     ///
     /// Every entry that names one address is dialed, on `default_port` unless the entry
-    /// gives its own port. A range is never dialed. Addresses are canonical, in config
-    /// order, with duplicates removed.
+    /// gives its own port. A range of several addresses is never dialed. Addresses are
+    /// canonical, in config order, with duplicates removed.
     pub fn dial_addrs(&self, default_port: u16) -> Vec<PeerSocketAddr> {
         let mut dial_addrs = Vec::new();
 

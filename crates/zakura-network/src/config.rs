@@ -383,11 +383,11 @@ pub struct Config {
     ///
     /// Zakura also dials every entry that names one address or one DNS name, and dials
     /// it again whenever no connection to that peer is open, in either direction. An IP
-    /// address without a port is dialed on the network's default port. A CIDR range has
-    /// no single address, so it is never dialed. A dial to a peer that accepts no
-    /// connections fails quietly and is retried about once a minute. Zakura keeps at
-    /// most `max_connections_per_ip` connections to one IP, so it does not dial further
-    /// entries on that IP.
+    /// address without a port is dialed on the network's default port. A CIDR range is
+    /// only dialed when it covers a single address, such as `"192.0.2.1/32"`. A dial to
+    /// a peer that accepts no connections fails quietly and is retried about once a
+    /// minute. Zakura keeps at most `max_connections_per_ip` connections to one IP, so it
+    /// does not dial further entries on that IP.
     ///
     /// Zakura looks a DNS name up again at the start of every dial, so it follows a peer
     /// whose name moves to a new address. The exemption covers the addresses the name

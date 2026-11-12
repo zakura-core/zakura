@@ -34,7 +34,7 @@ withholder can gain. A body that arrives after the window takes a fresh order,
 as if it had never been announced. The 2 second value is an estimate of honest
 full-block delivery. The `sync.block.announcement_claim` counter and the
 `sync.block.announcement_claim.age.seconds` histogram record how claims
-resolve.
+resolve, labelled by announcement source and block size.
 
 For example, A is announced before B, but B's smaller body arrives and
 validates first. Mining uses B until A validates. If A's body arrived within

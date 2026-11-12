@@ -55,8 +55,9 @@ pub use block::check::difficulty_is_valid;
 pub use checkpoint::CheckpointVerifier;
 
 pub use block::{
-    subsidy::funding_stream_address, AnnouncementClaims, PreparedCandidateSource, ReceiptClaim,
-    Request, VerifyBlockError, ANNOUNCEMENT_PRIORITY_WINDOW, MAX_BLOCK_SIGOPS,
+    subsidy::funding_stream_address, AnnouncementClaims, AnnouncementSource,
+    PreparedCandidateSource, ReceiptClaim, Request, VerifyBlockError, ANNOUNCEMENT_PRIORITY_WINDOW,
+    MAX_BLOCK_SIGOPS,
 };
 pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 pub use config::Config;

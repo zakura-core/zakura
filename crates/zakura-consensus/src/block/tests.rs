@@ -4350,7 +4350,7 @@ async fn an_announced_block_keeps_its_place_only_inside_the_window() {
             );
 
             // A is announced first, but B's body arrives and commits while A's is in transit.
-            let claim = ReceiptClaim::announce(a.hash());
+            let claim = ReceiptClaim::announce(a.hash(), AnnouncementSource::Advertisement);
             verifier
                 .call(Request::Commit(b.clone().into()))
                 .await

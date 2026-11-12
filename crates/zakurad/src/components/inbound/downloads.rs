@@ -898,8 +898,12 @@ where
 
         // An advertised block keeps this place in receipt order if its body follows promptly, so
         // a larger body is not overtaken by a smaller one advertised later.
-        let claim = matches!(kind, DownloadKind::Advertised)
-            .then(|| zakura_consensus::ReceiptClaim::announce(hash));
+        let claim = matches!(kind, DownloadKind::Advertised).then(|| {
+            zakura_consensus::ReceiptClaim::announce(
+                hash,
+                zakura_consensus::AnnouncementSource::Advertisement,
+            )
+        });
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();

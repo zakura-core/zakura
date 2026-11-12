@@ -16,7 +16,7 @@ use std::{
 };
 
 use tokio::time::Instant;
-use zakura_chain::block;
+use zakura_chain::{block, serialization::ZcashSerialize};
 use zakura_node_services::block_memory::BlockHandle;
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
@@ -50,6 +50,24 @@ pub const ANNOUNCEMENT_PRIORITY_WINDOW: Duration = Duration::from_secs(2);
 /// [`ANNOUNCEMENT_PRIORITY_WINDOW`], so the oldest is dropped first.
 const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
 
+/// How a block was first announced to this node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnnouncementSource {
+    /// A legacy peer advertised the block's hash.
+    Advertisement,
+    /// A native peer sent the block's header, and it passed its proof-of-work checks.
+    Header,
+}
+
+impl AnnouncementSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Advertisement => "advertisement",
+            Self::Header => "header",
+        }
+    }
+}
+
 /// A place in receipt order reserved when a block was first announced.
 ///
 /// The block hash commits to the header and its proof of work, so a claim cannot be made for a
@@ -58,15 +76,17 @@ const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptClaim {
     hash: block::Hash,
+    source: AnnouncementSource,
     order: u64,
     claimed_at: Instant,
 }
 
 impl ReceiptClaim {
     /// Reserves the next place in receipt order for the block announced as `hash`.
-    pub fn announce(hash: block::Hash) -> Self {
+    pub fn announce(hash: block::Hash, source: AnnouncementSource) -> Self {
         Self {
             hash,
+            source,
             order: next_receipt_order(&NEXT_RECEIPT_ORDER),
             claimed_at: Instant::now(),
         }
@@ -91,7 +111,7 @@ pub struct AnnouncementClaims(Arc<Mutex<VecDeque<ReceiptClaim>>>);
 
 impl AnnouncementClaims {
     /// Records the first announcement of `hash`. Later announcements keep the first claim.
-    pub fn announce(&self, hash: block::Hash) {
+    pub fn announce(&self, hash: block::Hash, source: AnnouncementSource) {
         let mut claims = self
             .0
             .lock()
@@ -102,7 +122,7 @@ impl AnnouncementClaims {
         if claims.len() >= MAX_ANNOUNCEMENT_CLAIMS {
             claims.pop_front();
         }
-        claims.push_back(ReceiptClaim::announce(hash));
+        claims.push_back(ReceiptClaim::announce(hash, source));
     }
 
     /// Removes and returns the claim for `hash`, once its body is ready for the verifier.
@@ -162,7 +182,8 @@ impl ReceiptRegistry {
         block: &BlockHandle,
         claim: Option<&ReceiptClaim>,
     ) -> ReceiptGuard {
-        let new_order = || new_receipt_order(hash, claim, Instant::now());
+        let new_order =
+            || new_receipt_order(hash, claim, block.zcash_serialized_size(), Instant::now());
         let mut active = self
             .0
             .lock()
@@ -195,20 +216,50 @@ impl ReceiptRegistry {
     }
 }
 
-/// The order for a body received at `now` that shares no active receipt.
-fn new_receipt_order(hash: block::Hash, claim: Option<&ReceiptClaim>, now: Instant) -> u64 {
+/// The order for a body of `bytes` serialized bytes, received at `now`, that shares no active
+/// receipt.
+fn new_receipt_order(
+    hash: block::Hash,
+    claim: Option<&ReceiptClaim>,
+    bytes: usize,
+    now: Instant,
+) -> u64 {
     let claimed = claim.and_then(|claim| claim.order_at(hash, now));
     let outcome = match (claim, claimed) {
         (None, _) => "none",
         (Some(_), Some(_)) => "used",
         (Some(_), None) => "expired",
     };
-    metrics::counter!("sync.block.announcement_claim", "outcome" => outcome).increment(1);
+    let source = claim.map_or("none", |claim| claim.source.label());
+    let size = size_label(bytes);
+    metrics::counter!(
+        "sync.block.announcement_claim",
+        "outcome" => outcome,
+        "source" => source,
+        "size" => size,
+    )
+    .increment(1);
     if let Some(claim) = claim {
-        metrics::histogram!("sync.block.announcement_claim.age.seconds")
-            .record(claim.age_at(now).as_secs_f64());
+        metrics::histogram!(
+            "sync.block.announcement_claim.age.seconds",
+            "source" => source,
+            "size" => size,
+        )
+        .record(claim.age_at(now).as_secs_f64());
     }
     claimed.unwrap_or_else(|| next_receipt_order(&NEXT_RECEIPT_ORDER))
+}
+
+/// The metric label for a block of `bytes` serialized bytes.
+///
+/// Transfer time grows with size, so the claim metrics are split by it.
+fn size_label(bytes: usize) -> &'static str {
+    match bytes {
+        0..100_000 => "under_100kB",
+        100_000..500_000 => "under_500kB",
+        500_000..1_000_000 => "under_1MB",
+        _ => "1MB_or_more",
+    }
 }
 
 impl Drop for ReceiptGuard {
@@ -252,13 +303,13 @@ mod tests {
     #[test]
     fn a_claim_inside_the_window_keeps_its_announcement_order() {
         let hash = block::Hash([1; 32]);
-        let claim = ReceiptClaim::announce(hash);
+        let claim = ReceiptClaim::announce(hash, AnnouncementSource::Advertisement);
         let later_body = next_receipt_order(&NEXT_RECEIPT_ORDER);
         assert!(claim.order < later_body);
 
         let at_the_bound = claim.claimed_at + ANNOUNCEMENT_PRIORITY_WINDOW;
         assert_eq!(
-            new_receipt_order(hash, Some(&claim), at_the_bound),
+            new_receipt_order(hash, Some(&claim), 0, at_the_bound),
             claim.order
         );
     }
@@ -266,14 +317,14 @@ mod tests {
     #[test]
     fn an_expired_or_mismatched_claim_takes_the_next_order() {
         let hash = block::Hash([2; 32]);
-        let claim = ReceiptClaim::announce(hash);
+        let claim = ReceiptClaim::announce(hash, AnnouncementSource::Advertisement);
         let competitor = next_receipt_order(&NEXT_RECEIPT_ORDER);
 
         let past_the_bound =
             claim.claimed_at + ANNOUNCEMENT_PRIORITY_WINDOW + Duration::from_millis(1);
-        assert!(new_receipt_order(hash, Some(&claim), past_the_bound) > competitor);
+        assert!(new_receipt_order(hash, Some(&claim), 0, past_the_bound) > competitor);
         assert!(
-            new_receipt_order(block::Hash([3; 32]), Some(&claim), claim.claimed_at) > competitor,
+            new_receipt_order(block::Hash([3; 32]), Some(&claim), 0, claim.claimed_at) > competitor,
             "a claim only reserves priority for the hash it announced",
         );
     }
@@ -284,7 +335,7 @@ mod tests {
         let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
-        let claim = ReceiptClaim::announce(block.hash());
+        let claim = ReceiptClaim::announce(block.hash(), AnnouncementSource::Header);
         let handle = BlockHandle::from(block.clone());
         let claimed = registry.register(block.hash(), &handle, Some(&claim));
         assert_eq!(claimed.order, claim.order);
@@ -300,13 +351,13 @@ mod tests {
             block::Hash(bytes)
         };
 
-        claims.announce(hash(1));
-        claims.announce(hash(1));
+        claims.announce(hash(1), AnnouncementSource::Header);
+        claims.announce(hash(1), AnnouncementSource::Header);
         let first = claims.take(hash(1)).expect("the block was announced");
         assert!(claims.take(hash(1)).is_none(), "a claim is taken once");
 
         for index in 0..=MAX_ANNOUNCEMENT_CLAIMS {
-            claims.announce(hash(index));
+            claims.announce(hash(index), AnnouncementSource::Header);
         }
         assert!(
             claims.take(hash(0)).is_none(),
@@ -316,6 +367,15 @@ mod tests {
             .take(hash(MAX_ANNOUNCEMENT_CLAIMS))
             .expect("the newest claim is kept");
         assert!(first.order < newest.order);
+    }
+
+    #[test]
+    fn size_labels_split_at_their_bounds() {
+        assert_eq!(size_label(99_999), "under_100kB");
+        assert_eq!(size_label(100_000), "under_500kB");
+        assert_eq!(size_label(499_999), "under_500kB");
+        assert_eq!(size_label(999_999), "under_1MB");
+        assert_eq!(size_label(1_000_000), "1MB_or_more");
     }
 
     #[test]

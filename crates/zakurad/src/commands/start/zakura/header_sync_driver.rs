@@ -722,7 +722,7 @@ where
     // These headers have valid proof of work, so their blocks keep this place in receipt order
     // if block sync delivers the bodies promptly.
     for header in batch.headers() {
-        announced_blocks.announce(header.hash);
+        announced_blocks.announce(header.hash, zakura_consensus::AnnouncementSource::Header);
     }
 
     Ok(port::PreparedHeaderTarget::from_insert(

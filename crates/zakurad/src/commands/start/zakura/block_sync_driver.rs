@@ -2079,9 +2079,10 @@ mod tests {
                 .expect("the verifier is still alive")
         };
 
-        handoff
-            .announced_blocks()
-            .announce(mainnet_block(&BLOCK_MAINNET_1_BYTES).hash());
+        handoff.announced_blocks().announce(
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            zakura_consensus::AnnouncementSource::Header,
+        );
         submit_checkpoint(&driver, 1).await;
         assert!(next_claimed().await, "an announced body carries its claim");
 

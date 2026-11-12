@@ -40,7 +40,9 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
-pub use receipt::{AnnouncementClaims, ReceiptClaim, ANNOUNCEMENT_PRIORITY_WINDOW};
+pub use receipt::{
+    AnnouncementClaims, AnnouncementSource, ReceiptClaim, ANNOUNCEMENT_PRIORITY_WINDOW,
+};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]

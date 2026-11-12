@@ -17,6 +17,12 @@
 //! and even the connection's teardown. So [`CrossingJoin`] keeps every
 //! partial fact for the whole run and reports a crossing when its last fact
 //! arrives, whichever that is.
+//!
+//! Its work stays linear in the run's frames. A node frame enters only if
+//! its message type is the ending's. A peer frame's write and judgment wait
+//! by identity until its `PeerFrame`, which the peer records first, says
+//! whether it's an update, and are dropped if it isn't. A completed fact
+//! then looks only at the candidates of its own subscription on its stream.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,8 +31,19 @@ use crate::{model::Label, observe::TransportFact, Observation};
 /// The row of a node frame that ends a subscription.
 const ENDING_ROW: &str = "headers-outcome";
 
+/// The message type of a node frame that ends a subscription, which
+/// `frame-written` and `peer-received` carry before the `NodeFrame` names
+/// its row.
+const ENDING_TYPE: u16 = 4;
+
 /// The row of a peer's subscription update.
 const UPDATE_ROW: &str = "subscribe-headers";
+
+/// A frame: its connection, QUIC stream and sequence on that stream.
+type FrameKey = (u64, u64, u64);
+
+/// A subscription on a stream: connection, QUIC stream and subscription.
+type SubscriptionKey = (u64, u64, u64);
 
 /// One crossed update: the update's identity and the label the peer's
 /// model gave it.
@@ -44,7 +61,7 @@ pub struct Crossed {
     pub label: Label,
 }
 
-/// What the join knows of one node frame on a stream.
+/// What the join knows of one node frame of the ending's message type.
 #[derive(Clone, Copy, Debug, Default)]
 struct Ending {
     /// Its `frame-written` stamp.
@@ -55,31 +72,53 @@ struct Ending {
     read: Option<u64>,
 }
 
-/// What the join knows of one peer frame on a stream.
-#[derive(Clone, Copy, Debug, Default)]
+/// What the join knows of one peer update.
+#[derive(Clone, Copy, Debug)]
 struct Update {
-    /// The subscription and label, once its `PeerFrame` shows it's an
-    /// update.
-    frame: Option<(u64, Label)>,
+    /// The subscription it names.
+    subscription: u64,
+    /// Its label.
+    label: Label,
     /// Its `peer-written` stamp.
     written: Option<u64>,
     /// Whether the node judged it.
     judged: bool,
 }
 
+/// A peer frame's facts that arrived before its `PeerFrame` classified it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Unclassified {
+    /// Its `peer-written` stamp.
+    written: Option<u64>,
+    /// Whether the node judged it.
+    judged: bool,
+}
+
+/// One subscription's candidates on a stream, by frame sequence.
+#[derive(Debug, Default)]
+struct Candidates {
+    /// The node's endings of it.
+    endings: BTreeSet<u64>,
+    /// The peer's updates to it.
+    updates: BTreeSet<u64>,
+}
+
 /// The incremental crossing join. Feed it every observation of a run, in
 /// log order, through [`CrossingJoin::observe`]. It holds at most one entry
-/// per frame the run wrote on a QUIC stream, and starts empty for each run.
+/// per ending-typed node frame and per peer frame on a QUIC stream, and
+/// starts empty for each run.
 #[derive(Debug, Default)]
 pub struct CrossingJoin {
-    /// The node's frames, by connection, QUIC stream and the node's frame
-    /// sequence.
-    endings: BTreeMap<(u64, u64), BTreeMap<u64, Ending>>,
-    /// The peers' frames, by connection, QUIC stream and the peer's frame
-    /// sequence.
-    updates: BTreeMap<(u64, u64), BTreeMap<u64, Update>>,
+    /// The node's ending-typed frames.
+    endings: BTreeMap<FrameKey, Ending>,
+    /// The peers' updates.
+    updates: BTreeMap<FrameKey, Update>,
+    /// Peer frames whose `PeerFrame` hasn't come yet.
+    unclassified: BTreeMap<FrameKey, Unclassified>,
+    /// Each subscription's classified endings and updates.
+    candidates: BTreeMap<SubscriptionKey, Candidates>,
     /// The updates already reported, so each crosses once.
-    reported: BTreeSet<(u64, u64, u64)>,
+    reported: BTreeSet<FrameKey>,
 }
 
 impl CrossingJoin {
@@ -92,13 +131,26 @@ impl CrossingJoin {
                     TransportFact::FrameWritten {
                         quic_stream,
                         seq,
+                        message_type: ENDING_TYPE,
                         order,
-                        ..
                     },
                 ..
             } => {
-                self.ending(connection, quic_stream, seq).written = Some(order);
-                self.complete_ending(connection, quic_stream, seq)
+                let key = (connection, quic_stream, seq);
+                self.endings.entry(key).or_default().written = Some(order);
+                self.complete_ending(key)
+            }
+            Observation::PeerReceived {
+                connection,
+                quic_stream,
+                seq,
+                message_type: ENDING_TYPE,
+                order,
+                ..
+            } => {
+                let key = (connection, quic_stream, seq);
+                self.endings.entry(key).or_default().read = Some(order);
+                self.complete_ending(key)
             }
             Observation::NodeFrame {
                 connection,
@@ -108,18 +160,14 @@ impl CrossingJoin {
                 exchange: Some(subscription),
                 ..
             } if row.as_deref() == Some(ENDING_ROW) => {
-                self.ending(connection, quic_stream, seq).subscription = Some(subscription);
-                self.complete_ending(connection, quic_stream, seq)
-            }
-            Observation::PeerReceived {
-                connection,
-                quic_stream,
-                seq,
-                order,
-                ..
-            } => {
-                self.ending(connection, quic_stream, seq).read = Some(order);
-                self.complete_ending(connection, quic_stream, seq)
+                let key = (connection, quic_stream, seq);
+                self.endings.entry(key).or_default().subscription = Some(subscription);
+                self.candidates
+                    .entry((connection, quic_stream, subscription))
+                    .or_default()
+                    .endings
+                    .insert(seq);
+                self.complete_ending(key)
             }
             Observation::PeerFrame {
                 connection,
@@ -127,11 +175,29 @@ impl CrossingJoin {
                 seq,
                 ref row,
                 label,
-                exchange: Some(subscription),
+                exchange,
                 ..
-            } if row.as_deref() == Some(UPDATE_ROW) => {
-                self.update(connection, quic_stream, seq).frame = Some((subscription, label));
-                self.complete_update(connection, quic_stream, seq)
+            } => {
+                let key = (connection, quic_stream, seq);
+                let early = self.unclassified.remove(&key).unwrap_or_default();
+                let (Some(subscription), Some(UPDATE_ROW)) = (exchange, row.as_deref()) else {
+                    return Vec::new();
+                };
+                self.updates.insert(
+                    key,
+                    Update {
+                        subscription,
+                        label,
+                        written: early.written,
+                        judged: early.judged,
+                    },
+                );
+                self.candidates
+                    .entry((connection, quic_stream, subscription))
+                    .or_default()
+                    .updates
+                    .insert(seq);
+                self.complete_update(key)
             }
             Observation::PeerWritten {
                 connection,
@@ -139,8 +205,15 @@ impl CrossingJoin {
                 seq,
                 order,
             } => {
-                self.update(connection, quic_stream, seq).written = Some(order);
-                self.complete_update(connection, quic_stream, seq)
+                let key = (connection, quic_stream, seq);
+                match self.updates.get_mut(&key) {
+                    Some(update) => update.written = Some(order),
+                    None => {
+                        self.unclassified.entry(key).or_default().written = Some(order);
+                        return Vec::new();
+                    }
+                }
+                self.complete_update(key)
             }
             Observation::FrameJudged {
                 connection,
@@ -148,88 +221,81 @@ impl CrossingJoin {
                 seq,
                 ..
             } => {
-                self.update(connection, quic_stream, seq).judged = true;
-                self.complete_update(connection, quic_stream, seq)
+                let key = (connection, quic_stream, seq);
+                match self.updates.get_mut(&key) {
+                    Some(update) => update.judged = true,
+                    None => {
+                        self.unclassified.entry(key).or_default().judged = true;
+                        return Vec::new();
+                    }
+                }
+                self.complete_update(key)
             }
             _ => Vec::new(),
         }
     }
 
-    /// The node frame `seq` on `connection`'s `quic_stream`.
-    fn ending(&mut self, connection: u64, quic_stream: u64, seq: u64) -> &mut Ending {
-        self.endings
-            .entry((connection, quic_stream))
-            .or_default()
-            .entry(seq)
-            .or_default()
-    }
-
-    /// The peer frame `seq` on `connection`'s `quic_stream`.
-    fn update(&mut self, connection: u64, quic_stream: u64, seq: u64) -> &mut Update {
-        self.updates
-            .entry((connection, quic_stream))
-            .or_default()
-            .entry(seq)
-            .or_default()
-    }
-
-    /// The crossings node frame `seq` completes with the stream's updates.
-    fn complete_ending(&mut self, connection: u64, quic_stream: u64, seq: u64) -> Vec<Crossed> {
-        let stream = (connection, quic_stream);
-        let Some(ending) = self
+    /// The crossings ending `key` completes with its subscription's
+    /// updates.
+    fn complete_ending(&mut self, key: FrameKey) -> Vec<Crossed> {
+        let (connection, quic_stream, _) = key;
+        let Some(subscription) = self
             .endings
-            .get(&stream)
-            .and_then(|frames| frames.get(&seq))
+            .get(&key)
+            .and_then(|ending| ending.subscription)
         else {
             return Vec::new();
         };
-        let ending = *ending;
         let updates: Vec<u64> = self
-            .updates
-            .get(&stream)
-            .map(|frames| frames.keys().copied().collect())
+            .candidates
+            .get(&(connection, quic_stream, subscription))
+            .map(|candidates| candidates.updates.iter().copied().collect())
             .unwrap_or_default();
         updates
             .into_iter()
-            .filter_map(|update| self.cross(stream, ending, update))
+            .filter_map(|update| self.cross(key, (connection, quic_stream, update)))
             .collect()
     }
 
-    /// The crossing peer frame `seq` completes with one of the stream's
+    /// The crossing update `key` completes with one of its subscription's
     /// endings, if any.
-    fn complete_update(&mut self, connection: u64, quic_stream: u64, seq: u64) -> Vec<Crossed> {
-        let stream = (connection, quic_stream);
-        let endings: Vec<Ending> = self
-            .endings
-            .get(&stream)
-            .map(|frames| frames.values().copied().collect())
+    fn complete_update(&mut self, key: FrameKey) -> Vec<Crossed> {
+        let (connection, quic_stream, _) = key;
+        let Some(subscription) = self.updates.get(&key).map(|update| update.subscription) else {
+            return Vec::new();
+        };
+        let endings: Vec<u64> = self
+            .candidates
+            .get(&(connection, quic_stream, subscription))
+            .map(|candidates| candidates.endings.iter().copied().collect())
             .unwrap_or_default();
         endings
             .into_iter()
-            .find_map(|ending| self.cross(stream, ending, seq))
+            .find_map(|ending| self.cross((connection, quic_stream, ending), key))
             .into_iter()
             .collect()
     }
 
-    /// The crossing of `ending` and peer frame `seq` on `stream`, if every
-    /// fact is in, they name one subscription, the ending was written
-    /// before the update's write returned and read after it, and the update
-    /// hasn't crossed already.
-    fn cross(&mut self, stream: (u64, u64), ending: Ending, seq: u64) -> Option<Crossed> {
-        let update = *self.updates.get(&stream)?.get(&seq)?;
-        let (subscription, label) = update.frame?;
-        let (written, read, ended) = (ending.written?, ending.read?, ending.subscription?);
-        let sent = update.written?;
-        let crossed = update.judged && ended == subscription && written < sent && sent < read;
-        if !crossed || !self.reported.insert((stream.0, stream.1, seq)) {
+    /// The crossing of `ending` and `update`, if every fact is in, they
+    /// name one subscription, the ending was written before the update's
+    /// write returned and read after it, the node judged the update, and
+    /// the update hasn't crossed already.
+    fn cross(&mut self, ending: FrameKey, update: FrameKey) -> Option<Crossed> {
+        let end = *self.endings.get(&ending)?;
+        let up = *self.updates.get(&update)?;
+        let (written, read, ended) = (end.written?, end.read?, end.subscription?);
+        let sent = up.written?;
+        let crossed = up.judged && ended == up.subscription && written < sent && sent < read;
+        if !crossed || !self.reported.insert(update) {
             return None;
         }
+        let (connection, quic_stream, seq) = update;
         Some(Crossed {
-            connection: stream.0,
-            quic_stream: stream.1,
+            connection,
+            quic_stream,
             seq,
-            subscription,
-            label,
+            subscription: up.subscription,
+            label: up.label,
         })
     }
 }
@@ -520,5 +586,64 @@ mod tests {
             panic!("one crossing");
         };
         assert_eq!(crossing.label, Label::BadCursor);
+    }
+
+    /// A long run of ordinary traffic keeps nothing: pages and status frames
+    /// from the node aren't the ending's type, and the peer's non-update
+    /// frames drop their early facts once their `PeerFrame` arrives. So
+    /// each fact costs a map lookup, not a scan.
+    #[test]
+    fn ordinary_traffic_leaves_no_candidates() {
+        let mut join = CrossingJoin::default();
+        for seq in 0..10_000 {
+            let page = Observation::Transport {
+                instance: 0,
+                seq,
+                node: "node".to_owned(),
+                connection: Some(C),
+                remote: "10.0.0.2:4000".to_owned(),
+                event: TransportFact::FrameWritten {
+                    quic_stream: Q,
+                    seq,
+                    message_type: 3,
+                    order: 2 * seq + 1,
+                },
+            };
+            let status = Observation::PeerFrame {
+                connection: C,
+                stream: STREAM,
+                quic_stream: Some(Q),
+                seq,
+                row: Some("status".to_owned()),
+                rule_stream: STREAM,
+                label: Label::Conformant,
+                exhausted: false,
+                exchange: None,
+                payload: 9,
+            };
+            for obs in [page, judged(seq), peer_wrote(seq, 2 * seq + 2), status] {
+                assert_eq!(join.observe(&obs), Vec::new());
+            }
+        }
+        assert!(join.endings.is_empty(), "{:?}", join.endings.len());
+        assert!(join.updates.is_empty());
+        assert!(join.unclassified.is_empty());
+        assert!(join.candidates.is_empty());
+    }
+
+    /// An update whose write and judgment are logged before its `PeerFrame`
+    /// still crosses: the early facts wait by identity.
+    #[test]
+    fn an_update_classified_late_keeps_its_early_facts() {
+        let [received, node_frame] = peer_read(0, 12, SUB);
+        let log = [
+            node_wrote(0, 10),
+            peer_wrote(1, 11),
+            judged(1),
+            received,
+            node_frame,
+            update(1, Label::Conformant),
+        ];
+        assert_eq!(crossings(&log), crossed());
     }
 }

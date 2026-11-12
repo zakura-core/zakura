@@ -8,7 +8,9 @@
 
 mod support;
 
-use std::{cell::Cell, fs, path::PathBuf, time::Duration};
+use std::{cell::Cell, fs, path::PathBuf, process::Command, time::Duration};
+
+use tempfile::TempDir;
 
 use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
 
@@ -22,6 +24,7 @@ use zakura_sim::{
         session::HONEST_NEVER_PUNISHED,
     },
     harness::{
+        self,
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Chain, Policy,
@@ -29,7 +32,7 @@ use zakura_sim::{
         header_sync::{HeaderWire, WirePorts, WireScenario},
         run_prepared,
         wire_plans::SavedPlan,
-        HarnessError, Subsystem,
+        HarnessError, RecordInput, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{
@@ -41,7 +44,9 @@ use zakura_sim::{
         honest::HonestSpec,
         peer_addr, PeerAction, PeerSpec, NODE_ADDR,
     },
-    seed, Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    seed,
+    trace::{replay_with, ReplayOptions, TraceReader},
+    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
 
@@ -879,27 +884,7 @@ fn saved_plans_replay_their_end_records() {
                 assert_eq!(first.0, second.0, "{}: one connection", plan.name());
                 assert_ne!(first.1, second.1, "{}: two QUIC streams", plan.name());
             }
-            SavedPlan::OldPageAfterReopen => {
-                let [(_, first), (reopened, second), ..] = header_sessions(&report)[..] else {
-                    panic!("{}: two header sessions", plan.name());
-                };
-                assert_eq!(first.0, second.0, "{}: one connection", plan.name());
-                let late = report.log.entries()[reopened..].iter().any(|entry| {
-                    matches!(
-                        entry.obs,
-                        Observation::FrameJudged {
-                            connection,
-                            quic_stream: Some(quic_stream),
-                            ..
-                        } if (connection, quic_stream) == first
-                    )
-                });
-                assert!(
-                    late,
-                    "{}: no frame of the first session was judged after the reopen",
-                    plan.name()
-                );
-            }
+            SavedPlan::OldPageAfterReopen => old_page_judged_after_reopen(&report),
         }
         assert_eq!(
             end,
@@ -908,6 +893,162 @@ fn saved_plans_replay_their_end_records() {
             plan.name()
         );
     }
+}
+
+/// The old-page history, from `report`'s logged facts: the node admits a
+/// second header session on the first one's connection; the first
+/// preparation's submission comes before that admission and its completion
+/// after; and after the admission the node judges, on the first session's
+/// stream, a `headers` page that peer sent.
+fn old_page_judged_after_reopen(report: &RunReport) {
+    let entries = report.log.entries();
+    let [(_, first), (reopened, second), ..] = header_sessions(report)[..] else {
+        panic!("old-page-after-reopen: two header sessions");
+    };
+    assert_eq!(first.0, second.0, "one connection");
+    let (submitted, prepare) = entries
+        .iter()
+        .enumerate()
+        .find_map(|(at, entry)| match &entry.obs {
+            Observation::Storage {
+                instance: 0,
+                fact:
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::PrepareHeaderTarget { .. },
+                        ..
+                    },
+                ..
+            } => Some((at, *id)),
+            _ => None,
+        })
+        .expect("the node submits a preparation");
+    let completed = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Storage {
+                    instance: 0,
+                    fact: StorageFact::Completed { id, .. },
+                    ..
+                } if *id == prepare
+            )
+        })
+        .expect("the held preparation completes");
+    assert!(
+        submitted < reopened && reopened < completed,
+        "the first preparation spans the reopen: submitted {submitted}, reopened {reopened}, \
+         completed {completed}"
+    );
+    let pages: Vec<u64> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::PeerFrame {
+                connection,
+                quic_stream: Some(quic_stream),
+                seq,
+                row: Some(row),
+                ..
+            } if (*connection, *quic_stream) == first && row == "headers" => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    let late = entries[reopened..].iter().any(|entry| {
+        matches!(
+            entry.obs,
+            Observation::FrameJudged {
+                connection,
+                quic_stream: Some(quic_stream),
+                seq,
+                ..
+            } if (connection, quic_stream) == first && pages.contains(&seq)
+        )
+    });
+    assert!(
+        late,
+        "no page of the first session was judged after the reopen"
+    );
+}
+
+/// fuzz-13's saved Plans.
+const FUZZ_13: [SavedPlan; 3] = [
+    SavedPlan::Reopen,
+    SavedPlan::OldPageAfterReopen,
+    SavedPlan::Act(Act::OutcomeCrossing),
+];
+
+/// Every record a run of committed input `input` writes, observations and
+/// their stamps included.
+fn records(input: &[u8]) -> Vec<String> {
+    let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
+    let mut sink = MemorySink::default();
+    let run = (entry.run_bytes)(input, &mut sink, None);
+    match run.result {
+        Ok(_) | Err(HarnessError::Run { .. }) => {}
+        Err(error) => panic!("{error}"),
+    }
+    sink.lines()
+}
+
+/// Each of fuzz-13's saved Plans writes the same records every time: A
+/// twice, then another plan B, then A again, in one process.
+#[test]
+fn fuzz_13_saved_plans_repeat_a_a_and_a_b_a() {
+    for (index, plan) in FUZZ_13.into_iter().enumerate() {
+        let other = FUZZ_13[(index + 1) % FUZZ_13.len()];
+        let (a, _) = committed(plan);
+        let (b, _) = committed(other);
+        let first = records(&a);
+        assert_eq!(records(&a), first, "{}: A/A", plan.name());
+        assert_ne!(records(&b), first, "{}: B differs", plan.name());
+        assert_eq!(records(&a), first, "{}: A/B/A", plan.name());
+    }
+}
+
+/// The variable naming the traces a fresh-process replay child reads.
+const FUZZ_13_CHILD: &str = "ZAKURA_SIM_FUZZ_13_TRACES";
+
+/// Each of fuzz-13's saved Plans, recorded from its committed input,
+/// replays Exact in a fresh process: every pick, draw and observation,
+/// stamps included.
+#[test]
+fn fuzz_13_saved_plans_replay_exact_in_a_fresh_process() {
+    let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
+    if let Some(dir) = std::env::var_os(FUZZ_13_CHILD) {
+        for plan in FUZZ_13 {
+            let trace = TraceReader::open(&PathBuf::from(&dir).join(plan.name()))
+                .expect("the parent recorded the trace");
+            replay_with(&trace, entry, ReplayOptions::default())
+                .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
+        }
+        return;
+    }
+    let dir = TempDir::new().expect("a temporary directory");
+    for plan in FUZZ_13 {
+        let (input, _) = committed(plan);
+        harness::record(
+            entry,
+            RecordInput::Input(&input),
+            &dir.path().join(plan.name()),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
+    }
+    let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
+        .args([
+            "--exact",
+            "fuzz_13_saved_plans_replay_exact_in_a_fresh_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FUZZ_13_CHILD, dir.path())
+        .output()
+        .expect("the test binary runs");
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
 }
 
 /// Each header-sync session the node admitted in `report`, in log order:

@@ -18,18 +18,28 @@
 //! partial fact for the whole run and reports a crossing when its last fact
 //! arrives, whichever that is.
 //!
-//! Its work stays linear in the run's frames, and it keeps nothing for
-//! ordinary traffic. A node frame enters only if it's on a header-sync
-//! stream, which the node's `Session` row names before anything is written
-//! on it, and has the ending's message type, which other streams reuse. A
-//! peer frame enters only once its `PeerFrame` shows it's a header update.
-//! On a header stream its write and judgment always come after that: a peer
-//! records a frame's `PeerFrame` before its write and `peer-written` after
-//! ([`crate::peer`]'s `PeerTask::write`), and the wire evidence fails a run
-//! whose node reads a frame with no `PeerFrame` (`UnlabelledFrame`). Only
-//! discovery frames have their `PeerFrame` withheld until they settle, and
-//! none of them is a header update. A completed fact then looks only at the
-//! candidates of its own subscription on its stream.
+//! Every frame is classified by its actual message type on an admitted
+//! header-sync stream, from the fact that carries it at its source, never
+//! by a row or label: a row names the rule that judges a frame, and an
+//! over-credit `Headers` page is judged by `subscribe-headers`'s. The
+//! header-sync streams come from the node's `Session` rows, which are
+//! logged before anything is written on the stream. An ending is a node
+//! frame whose `frame-written` and `peer-received` carry the ending's type,
+//! with the subscription from its `NodeFrame`. An update is a peer frame
+//! the node's `header-read` shows has the update's type, with the
+//! subscription and label from its `PeerFrame`.
+//!
+//! What it keeps: one entry per header-sync stream, per ending-typed node
+//! frame on one, per update-typed read, and per peer frame whose `PeerFrame`
+//! names the update's row, each for the run. Ordinary pages and status
+//! frames leave nothing. A peer frame's write and judgment attach only to a
+//! frame already kept: on a header stream a peer records a frame's
+//! `PeerFrame` before its write and `peer-written` after ([`crate::peer`]'s
+//! `PeerTask::write`), and the wire evidence fails a run whose node reads a
+//! frame with no `PeerFrame` (`UnlabelledFrame`). Only discovery frames have
+//! their `PeerFrame` withheld until they settle, and none is a header
+//! update. Each fact costs a map lookup, and a completed fact also looks at
+//! the candidates of its own subscription on its stream.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,6 +58,10 @@ const ENDING_TYPE: u16 = 4;
 
 /// The row of a peer's subscription update.
 const UPDATE_ROW: &str = "subscribe-headers";
+
+/// The message type of a peer's subscription update, which the node's
+/// `header-read` carries.
+const UPDATE_TYPE: u16 = 2;
 
 /// A frame: its connection, QUIC stream and sequence on that stream.
 type FrameKey = (u64, u64, u64);
@@ -115,8 +129,10 @@ pub struct CrossingJoin {
     header_streams: BTreeSet<(u64, u64)>,
     /// The node's ending-typed frames.
     endings: BTreeMap<FrameKey, Ending>,
-    /// The peers' updates.
+    /// The peer frames whose `PeerFrame` names the update's row.
     updates: BTreeMap<FrameKey, Update>,
+    /// The peer frames the node read with the update's message type.
+    typed: BTreeSet<FrameKey>,
     /// Each subscription's classified endings and updates.
     candidates: BTreeMap<SubscriptionKey, Candidates>,
     /// The updates already reported, so each crosses once.
@@ -179,6 +195,23 @@ impl CrossingJoin {
                     .endings
                     .insert(seq);
                 self.complete_ending(key)
+            }
+            Observation::Transport {
+                connection: Some(connection),
+                event:
+                    TransportFact::HeaderRead {
+                        quic_stream,
+                        seq,
+                        message_type: UPDATE_TYPE,
+                        ..
+                    },
+                ..
+            } if self.header_streams.contains(&(connection, quic_stream)) => {
+                // The node's tap can log a read before the evidence places
+                // the frame's `PeerFrame` in the same batch.
+                let key = (connection, quic_stream, seq);
+                self.typed.insert(key);
+                self.complete_update(key)
             }
             Observation::PeerFrame {
                 connection,
@@ -282,16 +315,21 @@ impl CrossingJoin {
             .collect()
     }
 
-    /// The crossing of `ending` and `update`, if every fact is in, they
-    /// name one subscription, the ending was written before the update's
-    /// write returned and read after it, the node judged the update, and
-    /// the update hasn't crossed already.
+    /// The crossing of `ending` and `update`, if every fact is in, the
+    /// node read the update with the update's type, they name one
+    /// subscription, the ending was written before the update's write
+    /// returned and read after it, the node judged the update, and the
+    /// update hasn't crossed already.
     fn cross(&mut self, ending: FrameKey, update: FrameKey) -> Option<Crossed> {
         let end = *self.endings.get(&ending)?;
         let up = *self.updates.get(&update)?;
         let (written, read, ended) = (end.written?, end.read?, end.subscription?);
         let sent = up.written?;
-        let crossed = up.judged && ended == up.subscription && written < sent && sent < read;
+        let crossed = self.typed.contains(&update)
+            && up.judged
+            && ended == up.subscription
+            && written < sent
+            && sent < read;
         if !crossed || !self.reported.insert(update) {
             return None;
         }
@@ -414,6 +452,25 @@ mod tests {
         }
     }
 
+    /// The node read the header of the peer's frame `seq`, of
+    /// `message_type`.
+    fn read_header(seq: u64, message_type: u16) -> Observation {
+        Observation::Transport {
+            instance: 0,
+            seq: 50 + seq,
+            node: "node".to_owned(),
+            connection: Some(C),
+            remote: "10.0.0.2:4000".to_owned(),
+            event: TransportFact::HeaderRead {
+                quic_stream: Q,
+                seq,
+                message_type,
+                flags: 0,
+                payload_len: 52,
+            },
+        }
+    }
+
     /// The node judged the peer's frame `seq`.
     fn judged(seq: u64) -> Observation {
         Observation::FrameJudged {
@@ -458,6 +515,7 @@ mod tests {
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
             node_frame,
@@ -489,6 +547,7 @@ mod tests {
             update(1, Label::Conformant),
             peer_wrote(1, 10),
             node_wrote(0, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
             node_frame,
@@ -511,6 +570,7 @@ mod tests {
             node_wrote(1, 12),
             update(1, Label::Conformant),
             peer_wrote(1, 13),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             other_received,
             other_frame,
@@ -546,6 +606,7 @@ mod tests {
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 12),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
             node_frame,
@@ -564,6 +625,7 @@ mod tests {
             update(1, Label::Conformant),
             node_wrote(0, 10),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
             node_frame,
@@ -582,6 +644,7 @@ mod tests {
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
         ] {
@@ -600,6 +663,7 @@ mod tests {
             node_wrote(0, 10),
             update(1, Label::Conformant),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             torn_down(),
             received,
@@ -618,9 +682,11 @@ mod tests {
             node_wrote(0, 10),
             update(1, Label::BadCursor),
             peer_wrote(1, 11),
+            read_header(1, UPDATE_TYPE),
             judged(1),
             received,
             node_frame,
+            read_header(1, UPDATE_TYPE),
             judged(1),
         ];
         let [crossing] = crossings(&log)[..] else {
@@ -704,12 +770,39 @@ mod tests {
             };
             // A peer's frame in the order the peer records it: its
             // `PeerFrame`, its write, then the node's judgment.
-            for obs in [page, status, peer_wrote(seq, 2 * seq + 2), judged(seq)] {
+            for obs in [
+                page,
+                read_header(seq, 1),
+                status,
+                peer_wrote(seq, 2 * seq + 2),
+                judged(seq),
+            ] {
                 assert_eq!(join.observe(&obs), Vec::new());
             }
         }
         assert!(join.endings.is_empty(), "{:?}", join.endings.len());
         assert!(join.updates.is_empty());
+        assert!(join.typed.is_empty());
         assert!(join.candidates.is_empty());
+    }
+
+    /// Negative 5: an over-credit `Headers` page is judged by the
+    /// `subscribe-headers` rule, so its `PeerFrame` names that row, and here
+    /// its subscription number matches the ending's. The node read it as a
+    /// page, so it's no update and doesn't cross.
+    #[test]
+    fn an_over_credit_page_is_no_update() {
+        let [received, node_frame] = peer_read(0, 12, SUB);
+        let log = [
+            session(),
+            node_wrote(0, 10),
+            update(1, Label::OverCredit),
+            peer_wrote(1, 11),
+            read_header(1, 3),
+            judged(1),
+            received,
+            node_frame,
+        ];
+        assert_eq!(crossings(&log), Vec::new());
     }
 }

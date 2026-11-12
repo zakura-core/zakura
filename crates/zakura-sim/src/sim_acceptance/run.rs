@@ -1411,10 +1411,27 @@ fn judge_planted(
             return blocked("`cargo xtask planted` recorded no runs".to_owned())
         }
         Ok(runs) => {
-            if let Some((run, fault)) = runs.iter().find_map(|run| {
-                super::judge::cleanup_fault(&run.end.cleanup).map(|fault| (run, fault))
-            }) {
-                return blocked(format!("a planted run ({}): {fault}", run.stem));
+            // The case is sim-7's own, so each of its runs passes through the
+            // one judge: as a run that held, or one its property's
+            // violation stopped.
+            let property = DISCOVERY_CASE.0.to_owned();
+            for run in &runs {
+                let Ok(entry) = crate::harness::find(&run.harness) else {
+                    return blocked(format!("{} isn't a harness at S", run.harness));
+                };
+                let registered = registered(entry);
+                let held = owned_run_passes(&run.end, &registered, &RunExpect::Passes);
+                let caught = owned_run_passes(
+                    &run.end,
+                    &registered,
+                    &RunExpect::Violates {
+                        property: property.clone(),
+                        also: Vec::new(),
+                    },
+                );
+                if let (Err(why), Err(_)) = (held, caught) {
+                    return blocked(format!("a planted run ({}): {why}", run.stem));
+                }
             }
         }
         Err(why) => return blocked(why),
@@ -1632,6 +1649,43 @@ fn registered(entry: &crate::harness::HarnessEntry) -> Registered {
     }
 }
 
+/// Why the minimization's pinned build doesn't count, if it doesn't: both
+/// executables `sim-minimize` ran, kept under `minimize/bin/`, must hash to
+/// the digests its report pins, and the simulator must be a build of S's
+/// commit with a change applied, the case's patch.
+fn minimize_build_refusal(dir: &Path, bound: &Bound<'_>, target: &str) -> Option<String> {
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("minimize").join("report.json")).ok()?)
+            .ok()?;
+    let pinned = |field: &str| {
+        report
+            .pointer(&format!("/build/{field}"))
+            .and_then(Value::as_str)
+    };
+    for (file, field) in [("zakura-sim", "sim_binary"), (target, "fuzz_binary")] {
+        let kept = crate::trace::read::read_bounded(
+            &dir.join("minimize").join("bin").join(file),
+            header::MAX_ARTIFACT_BYTES,
+        )
+        .ok()
+        .flatten()
+        .map(|bytes| sha256_hex(&bytes));
+        if kept.is_none() || kept.as_deref() != pinned(field) {
+            return Some(format!(
+                "minimize/bin/{file} isn't the build sim-minimize pinned"
+            ));
+        }
+    }
+    let built = |field: &str| report.pointer(&format!("/build/sim_build/{field}"));
+    if built("git").and_then(Value::as_str) != Some(bound.commit)
+        || built("dirty").and_then(Value::as_bool) != Some(true)
+        || built("binary").and_then(Value::as_str) != pinned("sim_binary")
+    {
+        return Some("the minimizer's simulator isn't S with the case's patch".to_owned());
+    }
+    None
+}
+
 /// The minimization's verdict (Rule 11): `sim-minimize` reported a
 /// minimized candidate of the case's own input, property and harness, and
 /// for the original and the minimized input each, the fuzz target's run,
@@ -1642,13 +1696,16 @@ fn registered(entry: &crate::harness::HarnessEntry) -> Registered {
 fn judge_minimize(
     dir: &Path,
     binding: &TaskBinding,
-    property: &str,
-    harness: &str,
+    bound: &Bound<'_>,
+    (property, harness, target): (&str, &str, &str),
     input: &str,
 ) -> Verdict {
     let blocked = |why: String| Verdict::Blocked { why };
     if !exited(runner_json(dir, "minimize.json", binding)) {
         return blocked("`cargo xtask sim-minimize` didn't exit 0".to_owned());
+    }
+    if let Some(why) = minimize_build_refusal(dir, bound, target) {
+        return blocked(why);
     }
     let Some(report) = fs::read_to_string(dir.join("minimize").join("report.json"))
         .ok()
@@ -1679,35 +1736,59 @@ fn judge_minimize(
         property: property.to_owned(),
         also: Vec::new(),
     };
-    let mut seen = BTreeSet::new();
+    // Inputs `sim-minimize` checked and rejected on the way are accounted
+    // for but not judged, like the search's runs.
+    let rejected: BTreeSet<String> = report
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.get("sha256")?.as_str().map(str::to_owned))
+        .filter(|sha| sha != input && *sha != minimized)
+        .collect();
+    let mut seen: BTreeMap<(&str, String), usize> = BTreeMap::new();
     for run in &runs {
         if run.phase == "search" {
             continue;
         }
-        let checked = ["confirm-target", "confirm", "replay"]
+        let Some((phase, sha)) = ["confirm-target", "confirm", "replay"]
             .iter()
-            .find_map(|phase| {
-                let sha = run.phase.strip_prefix(&format!("{phase}:"))?;
-                (sha == input || sha == minimized).then(|| (*phase, sha.to_owned()))
-            });
-        let Some(checked) = checked else {
+            .find_map(|phase| Some((*phase, run.phase.strip_prefix(&format!("{phase}:"))?)))
+        else {
             return blocked(format!(
                 "run {} is in an unaccounted phase {}",
                 run.stem, run.phase
             ));
         };
+        if rejected.contains(sha) {
+            continue;
+        }
+        if sha != input && sha != minimized {
+            return blocked(format!(
+                "run {} confirms an input sim-minimize never named",
+                run.stem
+            ));
+        }
+        // A run that names its input must be of the input its phase confirms.
+        if run.input.as_deref().is_some_and(|named| named != sha) {
+            return blocked(format!("run {} is of another input than {sha}", run.stem));
+        }
         if run.harness != harness {
             return blocked(format!("run {} isn't a run of {harness}", run.stem));
         }
         if let Err(why) = owned_run_passes(&run.end, &registered, &expect) {
             return blocked(format!("run {} ({}): {why}", run.stem, run.phase));
         }
-        seen.insert(checked);
+        *seen.entry((phase, sha.to_owned())).or_default() += 1;
     }
+    // Each confirmation is one fuzz-target run, the four runs inside
+    // `zakura-sim confirm` (its input run, witness rerun, recording and that
+    // recording's replay) and one fresh replay, each exactly once.
     for sha in [input, minimized.as_str()] {
-        for phase in ["confirm-target", "confirm", "replay"] {
-            if !seen.contains(&(phase, sha.to_owned())) {
-                return blocked(format!("no {phase} run confirmed input {sha}"));
+        for (phase, want) in [("confirm-target", 1), ("confirm", 4), ("replay", 1)] {
+            let got = seen.get(&(phase, sha.to_owned())).copied().unwrap_or(0);
+            if got != want {
+                return blocked(format!("input {sha} has {got} {phase} runs, not {want}"));
             }
         }
     }
@@ -2145,9 +2226,16 @@ fn judge_task(
         Task::Minimize {
             property,
             harness,
+            target,
             input_sha256,
             ..
-        } => judge_minimize(dir, binding, property, harness, input_sha256),
+        } => judge_minimize(
+            dir,
+            binding,
+            bound,
+            (property, harness, target),
+            input_sha256,
+        ),
         Task::Command { args, sim, .. } => match json("command.json") {
             Some(command)
                 if command.get("args") != Some(&serde_json::json!(args))

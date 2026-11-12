@@ -1771,7 +1771,7 @@ pub(crate) mod tests {
             RecoveryEvidence::get,
         );
         crate::stores::assert_freeze_drops_writes(
-            |stores| Prefix::bounded(stores),
+            Prefix::bounded,
             |prefix| prefix.spend(1, Hostile::Step(0)),
             Prefix::events,
         );

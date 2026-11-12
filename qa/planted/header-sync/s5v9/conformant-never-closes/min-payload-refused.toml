@@ -1,0 +1,17 @@
+# The frame filter's minimum-length check is off by one, so it refuses a
+# payload of exactly its row's minimum as short. A `Status` payload has
+# one fixed size, so the adversary's first `Status`, a conformant frame,
+# is refused and the node closes the connection with
+# `ordered_read_rejected`. Its input is a quiet adversary: a peer holding
+# the node's 50 headers that takes no act and that the scenario doesn't
+# mark honest, so `session/honest-never-punished` doesn't apply, so
+# `header-sync/s5v9/conformant-never-closes` is the only ID it breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-quiet-adversary.json"
+plan = "crates/zakura-sim/tests/fixtures/header-wire-default.plan"

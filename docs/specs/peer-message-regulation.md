@@ -812,8 +812,9 @@ there.
   - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MUST send at most one `Status` every 30 seconds, including range corrections, with one
-exception. A `Status` that announces a new tip, meaning a higher `servable_high` or a different
-`tip_hash` at the same height, MAY follow the previous `Status` after one second. It MAY do so only
+exception. A `Status` that announces a new tip, meaning a higher `servable_high`, MAY follow the
+previous `Status` after one second. A different `tip_hash` at the same height is not a new tip:
+receivers do not act on it, so it keeps the 30-second interval. It MAY do so only
 while the sender's own copy of the receiver's bucket, charged one token for every `Status` it
 queues, holds more than half the capacity. Range corrections, such as a pruned low end or a lower
 tip, keep the 30-second interval. It MAY send one immediate `Status` when the connection opens. The

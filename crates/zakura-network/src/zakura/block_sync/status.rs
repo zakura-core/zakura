@@ -13,7 +13,7 @@ pub(super) struct StatusDelivery {
     last_queued: Option<BlockSyncStatus>,
     retry_at: Instant,
     /// The Status a cadence deferral held back, and when. A Status with a
-    /// different tip is due at once, since the connection's cadence may send a
+    /// higher tip is due at once, since the connection's cadence may send a
     /// new tip early.
     deferred: Option<(BlockSyncStatus, Instant)>,
 }

@@ -30,17 +30,18 @@ const STATUS_BUCKET_CAPACITY: u32 = match RULES[0].role {
 const TIP_RESERVE_TOKENS: u32 = STATUS_BUCKET_CAPACITY / 2;
 
 /// Whether `latest` announces blocks that `previous` did not: a higher
-/// servable tip, or a different tip block at the same height. A lower tip or
-/// a pruned low end is a correction and keeps the Status interval.
+/// servable tip. A lower tip or a pruned low end is a correction and keeps
+/// the Status interval.
+///
+/// A different tip block at the same height is not a new tip. Receivers do not
+/// act on `tip_hash`, but every Status they apply still makes their reactor
+/// recompute candidate state, so sending hash-only changes early would cost
+/// peers work for nothing.
 pub(in crate::zakura::block_sync) fn announces_new_tip(
     previous: Option<&BlockSyncStatus>,
     latest: &BlockSyncStatus,
 ) -> bool {
-    previous.is_none_or(|previous| {
-        latest.servable_high > previous.servable_high
-            || (latest.servable_high == previous.servable_high
-                && latest.tip_hash != previous.tip_hash)
-    })
+    previous.is_none_or(|previous| latest.servable_high > previous.servable_high)
 }
 
 /// What one attempt did with the latest local Status.
@@ -347,25 +348,18 @@ mod tests {
             BlockSyncMessage::Status(at(11, 2))
         );
 
-        // A different block at the same height is a new tip.
+        // A different block at the same height, a lower tip and a pruned low
+        // end announce no new height, so they wait for the interval.
+        let due = StatusSend::Deferred(tip_at + Duration::from_secs(30));
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(
-            sender.try_send(at(11, 3), &send).unwrap(),
-            StatusSend::Queued
-        );
-        recv.recv().await.unwrap();
-        let reorg_at = Instant::now();
-
-        // A lower tip and a pruned low end are corrections, paced as before.
+        assert_eq!(sender.try_send(at(11, 3), &send).unwrap(), due);
         tokio::time::advance(Duration::from_secs(5)).await;
-        let due = StatusSend::Deferred(reorg_at + Duration::from_secs(30));
         assert_eq!(sender.try_send(at(10, 1), &send).unwrap(), due);
         let pruned = BlockSyncStatus {
             servable_low: block::Height(5),
             ..at(11, 3)
         };
         assert_eq!(sender.try_send(pruned, &send).unwrap(), due);
-        assert!(tip_at < reorg_at);
         assert!(recv.try_recv().is_err());
     }
 

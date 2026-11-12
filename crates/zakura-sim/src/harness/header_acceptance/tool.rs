@@ -1560,9 +1560,9 @@ fn companions_of(dir: &Path, draft: &Execution, declared: &[String]) -> Vec<Comp
     if !known(Some(&run.source)) || measured.map(|check| check.source) != Some(run.source.clone()) {
         return Vec::new();
     }
-    if read_json::<Value>(&file).map_or(true, |artifact| {
-        judged_refusal(&dir.join("draft"), &artifact).is_some()
-    }) {
+    if read_json::<Value>(&file)
+        .is_none_or(|artifact| judged_refusal(&dir.join("draft"), &artifact).is_some())
+    {
         return Vec::new();
     }
     run.companions

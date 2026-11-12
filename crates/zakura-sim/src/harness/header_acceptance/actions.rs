@@ -367,7 +367,7 @@ pub fn judge(
     if facts
         .iter()
         .filter(|fact| fact.action == "Relink")
-        .any(|fact| fact.connection.map_or(true, |id| !relinked.insert(id)))
+        .any(|fact| fact.connection.is_none_or(|id| !relinked.insert(id)))
     {
         return Actions::Incomplete;
     }

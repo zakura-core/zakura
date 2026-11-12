@@ -527,6 +527,7 @@ mod tests {
         );
         let report = sim.run(&mut checker, &mut MemorySink::default());
         let found = |expected: String| Violation {
+            subject: None,
             property: CAPACITY_RELEASE_WAKES.to_owned(),
             step: 2,
             witness: vec![1, 2],
@@ -584,6 +585,7 @@ mod tests {
         let full = sidecar::<Wakes>(&vec![(0, 3), (1, 4)], &[]);
         let found = findings(&full, CAPACITY_RELEASE_WAKES);
         let violation = |expected: String| Violation {
+            subject: None,
             property: CAPACITY_RELEASE_WAKES.to_owned(),
             step: 2,
             witness: vec![1, 2],

@@ -592,6 +592,7 @@ fn violation(
     actual: &str,
 ) -> Violation {
     Violation {
+        subject: None,
         property: property.to_owned(),
         step,
         witness: witness.to_vec(),

@@ -29,6 +29,26 @@ pub struct Violation {
     pub expected: String,
     /// What the run did.
     pub actual: String,
+    /// What an end finding is about, when its rule names it, so a nested
+    /// case's finding can be joined to the case's own break by subject
+    /// (C6). `None` for a step's finding and for an end rule that names
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EndSubject>,
+}
+
+/// The subject an end rule's finding names (C6): what it found wrong, so
+/// two findings of different rules about the same subject can be told from
+/// two about different ones.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum EndSubject {
+    /// A state the node published on its committed watch that the run
+    /// loop never read, by its state version as its `Debug` form spells it.
+    Publication {
+        /// The state version.
+        state_version: String,
+    },
 }
 
 /// One property's outcome over a whole run (properties.md, Verdicts and

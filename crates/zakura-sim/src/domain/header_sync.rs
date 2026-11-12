@@ -1037,6 +1037,7 @@ pub fn publication_end_violations(publication: &PublicationEvidence) -> Vec<EndV
     publication
         .unpublished_at_settled_end()
         .map(|tip| EndViolation {
+            subject: None,
             property: PropertyId::new(STATE_PUBLICATION_CONSISTENT),
             expected: "every adopted tip is published before the run comes to rest".to_owned(),
             actual: format!(
@@ -1619,6 +1620,7 @@ pub fn retirement_end_violations(retirement: &RetirementEvidence) -> Vec<EndViol
         .settled_breaks()
         .into_iter()
         .map(|actual| EndViolation {
+            subject: None,
             property: PropertyId::new(PEER_RETIREMENT_PROGRESS),
             expected: "no work outlives its departed session".to_owned(),
             actual,
@@ -1776,8 +1778,10 @@ where
     }
 }
 
-/// The watch property for the flooded `queue`'s violation at the run's end:
-/// a publication still unread when the run settled
+/// The watch property for the flooded `queue`'s violation at the run's end,
+/// naming the unread publication as its subject
+/// ([`AdoptionEvidence::unread_publication`]): a publication still unread
+/// when the run settled
 /// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
 /// stop the node (`stopping`). A correct loop with an unread publication
 /// always has its watch arm ready, so it can't settle with one. Only a
@@ -1797,7 +1801,15 @@ pub fn watch_end_violations(
         EventQueue::Wire => WATCH_OBSERVED_UNDER_FLOOD,
         EventQueue::Lifecycle => WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
     };
+    // Under a wedged loop the same publication is unread under both
+    // queues' rules, so each finding names it.
+    let subject = adoption.unread_publication(queue).map(|state_version| {
+        crate::check::EndSubject::Publication {
+            state_version: format!("{state_version:?}"),
+        }
+    });
     vec![EndViolation {
+        subject,
         property: PropertyId::new(property),
         expected: "each published state is read from the committed watch before the run \
                    settles"
@@ -1845,6 +1857,7 @@ pub fn teardown_end_violations(rounds: &SettlementEvidence) -> Vec<EndViolation>
     rounds
         .stuck()
         .map(|last| EndViolation {
+            subject: None,
             property: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
             expected: "a released round settles before the run comes to rest".to_owned(),
             actual: format!(
@@ -1865,6 +1878,7 @@ pub fn outstanding_end_violations(evidence: &OutstandingEvidence) -> Vec<EndViol
         return Vec::new();
     }
     vec![EndViolation {
+        subject: None,
         property: PropertyId::new(OUTSTANDING_WORK_BOUNDED),
         expected: "a run at rest runs no publisher for a session that ended".to_owned(),
         actual: format!(
@@ -2633,6 +2647,7 @@ mod tests {
         for (property, id, claims, expected, [first, second]) in cases {
             let report = run_property(property, &[Scripted::Breaks(claims)]);
             let found = |actual: &str| Violation {
+                subject: None,
                 property: id.to_owned(),
                 step: 1,
                 witness: vec![1],

@@ -7,7 +7,9 @@
 //! frame, its connection, stream, direction and sequence ([`FrameRef`],
 //! and [`ReadRef`] as its session's reader names it); for a subscription event, its peer, session and
 //! subscription ([`SubscriptionRef`], and [`PageRef`] for a page staged on
-//! one); and for work, its full owner ([`WorkRef`]). A finding is named by
+//! one); for work, its full owner ([`WorkRef`]); and for an end rule's
+//! finding, its subject ([`EndSubject`](crate::check::EndSubject)). A
+//! finding is named by
 //! its step ([`FindingRef`]), within a run every artifact names by its
 //! trace's digest ([`super::binding`]). A join is [`joined`]:
 //! every item whose ref equals the one wanted. Each ref kind's negative
@@ -146,6 +148,11 @@ pub struct LinkRef {
     pub connection: u64,
 }
 impl Ref for LinkRef {}
+
+/// What an end rule's finding is about ([`crate::check::EndSubject`]),
+/// which the witness judge joins a nested case's end finding to its own
+/// break by (C6).
+impl Ref for crate::check::EndSubject {}
 
 /// What a witness judged: its property, what it expected and the other
 /// IDs it allowed to break beside it, in order.

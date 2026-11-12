@@ -861,6 +861,7 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         .find(|property| property.property == HONEST_NEVER_PUNISHED)
         .expect("registered");
     let found = |expected: &str, actual: &str| Violation {
+        subject: None,
         property: "session/honest-never-punished".to_owned(),
         step: 2,
         witness: vec![2],

@@ -95,6 +95,8 @@ pub struct EndViolation {
     pub expected: String,
     /// What the run did.
     pub actual: String,
+    /// What it's about, if the rule names it ([`EndSubject`]).
+    pub subject: Option<crate::check::EndSubject>,
 }
 
 /// When a view's state was captured.
@@ -382,6 +384,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// A violation at this step, with this step as its witness.
     fn violation(&self, expected: String, actual: String) -> Violation {
         Violation {
+            subject: None,
             property: self.id().to_string(),
             step: self.step.step,
             witness: vec![self.step.step],

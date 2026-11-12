@@ -377,13 +377,15 @@ pub struct Config {
     /// Zakura ignores misbehavior reports for these peers, so their
     /// misbehavior score stays at zero and Zakura never bans their IP address. Tip lag,
     /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
-    /// mempool cooldowns and their disconnects.
+    /// mempool cooldowns and their disconnects, and from the wait that Zakura imposes
+    /// between inbound connections from one IP.
     ///
     /// Zakura also dials every entry that names one address, and dials it again whenever
     /// no connection to that peer is open, in either direction. An entry without a port
     /// is dialed on the network's default port. A CIDR range has no single address, so
     /// it is never dialed. A dial to a peer that accepts no connections fails quietly and
-    /// is retried about once a minute.
+    /// is retried about once a minute. Zakura keeps at most `max_connections_per_ip`
+    /// connections to one IP, so it does not dial further entries on that IP.
     ///
     /// Each dialed address gets its own connection slot, outside the outbound connection
     /// limit. Zakura still applies the inbound and per-IP connection limits to these

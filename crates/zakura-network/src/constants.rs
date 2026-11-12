@@ -273,6 +273,14 @@ pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1)
 /// The longest delay between two dials to the same unconditional peer, before jitter.
 pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(60);
 
+/// The longest random delay that Zakura adds before it dials an unconditional peer
+/// again.
+///
+/// Two nodes that list each other would otherwise redial at the same moment after
+/// their connection drops, and each could keep the dial that the other one drops.
+/// The delay must be much longer than a round trip between two such nodes.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_JITTER: Duration = Duration::from_secs(2);
+
 /// How long a connection to an unconditional peer must last to reset its redial delay.
 ///
 /// A peer that keeps dropping new connections is dialed at the maximum delay, instead of

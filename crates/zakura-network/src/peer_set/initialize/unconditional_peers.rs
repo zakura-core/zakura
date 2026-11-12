@@ -1,8 +1,8 @@
 //! Keeps connections open to the configured unconditional peers.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
-use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, StreamExt};
+use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand_10::RngExt;
 use tokio::time::{sleep, Instant, MissedTickBehavior};
 use tower::{Service, ServiceExt};
@@ -28,17 +28,33 @@ struct RedialState {
     /// The address Zakura dials.
     addr: PeerSocketAddr,
 
-    /// The earliest time of the next dial.
-    next_dial: Instant,
+    /// The earliest time of the next attempt.
+    next_attempt: Instant,
 
-    /// The number of dials since this peer last had a healthy connection.
+    /// The number of attempts since this peer last had a healthy connection.
     attempts: u32,
 
-    /// Whether a dial to this peer is in flight.
-    is_dialing: bool,
+    /// Whether an attempt to connect to this peer is in flight.
+    is_attempting: bool,
+
+    /// Whether this peer has been attempted before. Every attempt but the first waits
+    /// a random delay, see [`redial_jitter`].
+    has_attempted: bool,
 
     /// When this peer was first seen connected, if it still is.
     connected_since: Option<Instant>,
+}
+
+/// A finished step of an attempt to connect to the peer at `index`.
+enum AttemptEvent {
+    /// The random delay before the dial is over.
+    Delayed { index: usize },
+
+    /// The dial finished.
+    Dialed {
+        index: usize,
+        result: Result<DiscoveredPeer, BoxError>,
+    },
 }
 
 /// Returns the addresses that Zakura dials to stay connected to its unconditional peers.
@@ -126,8 +142,8 @@ fn is_connected(
     connections_to_ip >= max_connections_per_ip
 }
 
-/// Returns the delay before the dial that follows `attempts` dials without a healthy
-/// connection.
+/// Returns the delay before the attempt that follows `attempts` attempts without a
+/// healthy connection.
 fn redial_delay(attempts: u32) -> Duration {
     constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY
         .checked_mul(2u32.saturating_pow(attempts))
@@ -135,27 +151,57 @@ fn redial_delay(attempts: u32) -> Duration {
         .min(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY)
 }
 
-/// Returns `delay` plus a random extra of up to a quarter of it.
+/// Returns a random delay of up to [`constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER`].
 ///
-/// Two nodes that list each other dial at the same moment after their connection drops.
-/// With one connection per IP, each node can keep the dial that the other one drops.
-/// The random extra lets one dial land first on a later round.
-fn with_jitter(delay: Duration) -> Duration {
-    let max_jitter_millis = u64::try_from(delay.as_millis() / 4).unwrap_or(u64::MAX);
+/// Two nodes that list each other both redial when their connection drops. When the
+/// two dials start within about half a round trip of each other, each node keeps its
+/// own dial and drops the other's, and both connections close. Independent random
+/// delays make that rare, and separate the two nodes on the next round when it happens.
+fn redial_jitter() -> Duration {
+    let max_jitter_millis =
+        u64::try_from(constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER.as_millis())
+            .unwrap_or(u64::MAX);
 
-    delay.saturating_add(Duration::from_millis(
-        rand_10::rng().random_range(0..=max_jitter_millis),
-    ))
+    Duration::from_millis(rand_10::rng().random_range(0..=max_jitter_millis))
+}
+
+/// Warns about each IP that more of `dial_addrs` name than `max_connections_per_ip`
+/// allows connections to.
+///
+/// [`is_connected`] counts such an address as connected once the IP is at its limit,
+/// so Zakura never dials it. Without this line, nothing would tell the operator.
+fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Config) {
+    let mut addrs_by_ip: HashMap<_, usize> = HashMap::new();
+    for addr in dial_addrs {
+        *addrs_by_ip.entry(canonical_ip(addr.ip())).or_default() += 1;
+    }
+
+    for addr in dial_addrs {
+        if let Some(addrs) = addrs_by_ip.remove(&canonical_ip(addr.ip())) {
+            if addrs > config.max_connections_per_ip {
+                warn!(
+                    peer = %addr.addr_label(config.expose_peer_addresses),
+                    addrs,
+                    max_connections_per_ip = config.max_connections_per_ip,
+                    "unconditional peer addresses share an IP beyond max_connections_per_ip, \
+                     so only that many of them are kept connected"
+                );
+            }
+        }
+    }
 }
 
 /// Dials each address in `dial_addrs`, and dials it again whenever no connection to that
 /// peer is open, see [`is_connected`]. Sends each new connection to `peerset_tx`.
 ///
-/// A dial that does not lead to a lasting connection doubles the peer's redial delay,
-/// from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
+/// An attempt that does not lead to a lasting connection doubles the peer's redial
+/// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
 /// [`constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`]. A connection that lasts
-/// [`constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION`] resets it, so the peer is dialed
-/// as soon as that connection drops.
+/// [`constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION`] resets it, so the peer is
+/// attempted at the next check after that connection drops.
+///
+/// Every attempt but a peer's first waits [`redial_jitter`], then dials only if the
+/// peer is still not connected.
 ///
 /// These dials use their own connection counter, so the outbound connection limit never
 /// blocks them. [`Config::unconditional_peer_connection_limit`] adds their slots to the
@@ -183,6 +229,11 @@ where
     let expose_peer_addresses = config.expose_peer_addresses;
 
     if expose_peer_addresses {
+        // `PeerSocketAddr`'s `Debug` redacts the address, so log the labels.
+        let dial_addrs: Vec<_> = dial_addrs
+            .iter()
+            .map(|addr| addr.addr_label(true))
+            .collect();
         info!(
             ?dial_addrs,
             "keeping connections open to unconditional peers"
@@ -193,6 +244,7 @@ where
             "keeping connections open to unconditional peers"
         );
     }
+    warn_about_addrs_over_the_ip_limit(&dial_addrs, &config);
 
     let mut active_connections = ActiveConnectionCounter::new_counter_with(
         dial_addrs.len(),
@@ -204,16 +256,16 @@ where
         .into_iter()
         .map(|addr| RedialState {
             addr,
-            next_dial: start,
+            next_attempt: start,
             attempts: 0,
-            is_dialing: false,
+            is_attempting: false,
+            has_attempted: false,
             connected_since: None,
         })
         .collect();
 
     // Each dial runs in its own task, so it makes progress while this task sleeps.
-    let mut dials: FuturesUnordered<BoxFuture<'static, (usize, Result<DiscoveredPeer, BoxError>)>> =
-        FuturesUnordered::new();
+    let mut events: FuturesUnordered<BoxFuture<'static, AttemptEvent>> = FuturesUnordered::new();
 
     let mut check_timer = tokio::time::interval(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL);
     // A late check must not be followed by a burst of catch-up checks.
@@ -223,57 +275,101 @@ where
         tokio::select! {
             biased;
 
-            // An empty pool yields `None`, which disables this branch until the next dial.
-            Some((index, dial_result)) = dials.next() => {
-                let peer: &mut RedialState = peers
-                    .get_mut(index)
-                    .expect("dial indexes come from the peer list, which never shrinks");
-                peer.is_dialing = false;
+            // An empty pool yields `None`, which disables this branch until the next
+            // attempt.
+            Some(event) = events.next() => match event {
+                AttemptEvent::Delayed { index } => {
+                    let peer: &mut RedialState = peers
+                        .get_mut(index)
+                        .expect("event indexes come from the peer list, which never shrinks");
 
-                match dial_result {
-                    Ok((addr, client)) => {
-                        info!(
-                            peer = %addr.addr_label(expose_peer_addresses),
-                            "connected to an unconditional peer"
-                        );
-
-                        // The peer set channel has room for every connection slot,
-                        // so this send doesn't block.
-                        peerset_tx.send((addr, client)).await?;
+                    // The peer may have dialed in while this attempt waited.
+                    if is_connected(
+                        peer.addr,
+                        &peer_registry.connection_addrs(),
+                        config.max_connections_per_ip,
+                    ) {
+                        peer.is_attempting = false;
+                        continue;
                     }
-                    Err(error) => {
-                        metrics::counter!("peer.unconditional.dial.failed.total").increment(1);
 
-                        // Only the first failure since the last healthy connection is
-                        // worth an operator's attention: a peer without a listener
-                        // fails every dial.
-                        let addr_label = peer.addr.addr_label(expose_peer_addresses);
-                        if peer.attempts <= 1 {
+                    metrics::counter!("peer.unconditional.dial.total").increment(1);
+
+                    // Drain the close notifications, so the counter's channel stays
+                    // small.
+                    active_connections.update_count();
+                    let request = OutboundConnectorRequest {
+                        addr: peer.addr,
+                        connection_tracker: active_connections.track_connection(),
+                    };
+                    let outbound_connector = outbound_connector.clone();
+
+                    events.push(
+                        tokio::spawn(erased(
+                            async move {
+                                AttemptEvent::Dialed {
+                                    index,
+                                    result: outbound_connector.oneshot(request).await,
+                                }
+                            }
+                            .in_current_span(),
+                        ))
+                        .wait_for_panics(),
+                    );
+
+                    // Security: start outbound connections at least this far apart,
+                    // like the crawler does.
+                    sleep(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+                }
+
+                AttemptEvent::Dialed { index, result } => {
+                    let peer: &mut RedialState = peers
+                        .get_mut(index)
+                        .expect("event indexes come from the peer list, which never shrinks");
+                    peer.is_attempting = false;
+
+                    match result {
+                        Ok((addr, client)) => {
                             info!(
-                                peer = %addr_label,
-                                ?error,
-                                "failed to connect to an unconditional peer, retrying with backoff"
+                                peer = %addr.addr_label(expose_peer_addresses),
+                                "connected to an unconditional peer"
                             );
-                        } else {
-                            debug!(
-                                peer = %addr_label,
-                                ?error,
-                                attempts = peer.attempts,
-                                "failed to connect to an unconditional peer"
-                            );
+
+                            // The peer set channel has room for every connection slot,
+                            // so this send doesn't block.
+                            peerset_tx.send((addr, client)).await?;
+                        }
+                        Err(error) => {
+                            metrics::counter!("peer.unconditional.dial.failed.total").increment(1);
+
+                            // Only the first failure since the last healthy connection
+                            // is worth an operator's attention: a peer without a
+                            // listener fails every dial.
+                            let addr_label = peer.addr.addr_label(expose_peer_addresses);
+                            if peer.attempts <= 1 {
+                                info!(
+                                    peer = %addr_label,
+                                    ?error,
+                                    "failed to connect to an unconditional peer, retrying with backoff"
+                                );
+                            } else {
+                                debug!(
+                                    peer = %addr_label,
+                                    ?error,
+                                    attempts = peer.attempts,
+                                    "failed to connect to an unconditional peer"
+                                );
+                            }
                         }
                     }
                 }
-            }
+            },
 
             _ = check_timer.tick() => {
-                // Drain the close notifications, so the counter's channel stays small.
-                active_connections.update_count();
-
                 let connections = peer_registry.connection_addrs();
 
                 for (index, peer) in peers.iter_mut().enumerate() {
-                    if peer.is_dialing {
+                    if peer.is_attempting {
                         continue;
                     }
 
@@ -290,32 +386,28 @@ where
                     }
                     peer.connected_since = None;
 
-                    if now < peer.next_dial {
+                    if now < peer.next_attempt {
                         continue;
                     }
 
-                    peer.is_dialing = true;
-                    peer.next_dial = now + with_jitter(redial_delay(peer.attempts));
-                    peer.attempts = peer.attempts.saturating_add(1);
-                    metrics::counter!("peer.unconditional.dial.total").increment(1);
-
-                    let request = OutboundConnectorRequest {
-                        addr: peer.addr,
-                        connection_tracker: active_connections.track_connection(),
+                    let delay = if peer.has_attempted {
+                        redial_jitter()
+                    } else {
+                        Duration::ZERO
                     };
-                    let outbound_connector = outbound_connector.clone();
 
-                    dials.push(
-                        tokio::spawn(erased(
-                            async move { (index, outbound_connector.oneshot(request).await) }
-                                .in_current_span(),
-                        ))
-                        .wait_for_panics(),
+                    peer.is_attempting = true;
+                    peer.has_attempted = true;
+                    peer.next_attempt = now + redial_delay(peer.attempts);
+                    peer.attempts = peer.attempts.saturating_add(1);
+
+                    events.push(
+                        async move {
+                            sleep(delay).await;
+                            AttemptEvent::Delayed { index }
+                        }
+                        .boxed(),
                     );
-
-                    // Security: start outbound connections at least this far apart,
-                    // like the crawler does.
-                    sleep(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
                 }
             }
         }

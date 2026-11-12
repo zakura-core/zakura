@@ -946,7 +946,9 @@ where
                 active_zcashd_compat_connections.track_connection()
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                || recent_inbound_connections.is_past_limit_or_add(addr.ip())
+                // An unconditional peer that lost its connection may reconnect at once.
+                || (!config.unconditional_peers.contains(addr.ip())
+                    && recent_inbound_connections.is_past_limit_or_add(addr.ip()))
             {
                 // Too many open inbound connections or pending handshakes already.
                 // Close the connection.

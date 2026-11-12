@@ -436,6 +436,7 @@ async fn unconditional_peers_are_dialed_once_while_they_stay_connected() {
     let config: Config =
         toml::from_str("unconditional_peers = ['192.0.2.1', '192.0.2.2:18233', '198.51.100.0/24']")
             .unwrap();
+    let started = tokio::time::Instant::now();
     let mut dialer = spawn_unconditional_peer_dialer(
         config,
         PeerRegistry::default(),
@@ -450,6 +451,10 @@ async fn unconditional_peers_are_dialed_once_while_they_stay_connected() {
         "each address is dialed once, in config order",
     );
     let dial_times = dialer.dial_times();
+    assert_eq!(
+        dial_times[0], started,
+        "the first dial to a peer does not wait"
+    );
     assert!(
         dial_times[1] - dial_times[0] >= constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL,
         "dials start at least the minimum outbound connection interval apart",
@@ -494,7 +499,7 @@ async fn unconditional_peer_is_redialed_when_its_connection_closes() {
     dialer.set_dial(UnconditionalPeerDial::Fail);
     let closed_at = tokio::time::Instant::now();
     dialer.close_connections();
-    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 4).await;
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 8).await;
 
     let dial_times = dialer.dial_times();
     let redials = &dial_times[failed_dials + 1..];
@@ -503,15 +508,98 @@ async fn unconditional_peer_is_redialed_when_its_connection_closes() {
         "the closed connection is redialed without waiting out the old delay: {redials:?}",
     );
     assert!(
-        redials[0] - closed_at <= constants::UNCONDITIONAL_PEER_CHECK_INTERVAL,
-        "the closed connection is redialed at the next check",
+        redials[0] - closed_at
+            <= constants::UNCONDITIONAL_PEER_CHECK_INTERVAL
+                + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER,
+        "the closed connection is redialed after the next check and its random delay",
     );
     assert!(
         redials[1] - redials[0]
             <= constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY
-                + constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY / 4
+                + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER
                 + constants::UNCONDITIONAL_PEER_CHECK_INTERVAL,
         "a healthy connection resets the redial delay",
+    );
+}
+
+/// Every dial but a peer's first waits a random delay of at most the maximum jitter, so
+/// two nodes that list each other rarely redial at the same moment.
+#[tokio::test(start_paused = true)]
+async fn unconditional_peer_redials_wait_a_random_delay() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str("unconditional_peers = ['192.0.2.1']").unwrap();
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        PeerRegistry::default(),
+        UnconditionalPeerDial::ConnectAndStayOpen,
+    );
+
+    let mut delays = Vec::new();
+    for _ in 0..8 {
+        tokio::time::sleep(constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION * 2).await;
+
+        let dials = dialer.dial_times().len();
+        let closed_at = tokio::time::Instant::now();
+        dialer.close_connections();
+        tokio::time::sleep(
+            constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2
+                + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER,
+        )
+        .await;
+
+        let dial_times = dialer.dial_times();
+        assert_eq!(dial_times.len(), dials + 1, "the peer is redialed once");
+
+        // The redial waits for the next check, then for its random delay.
+        let delay = dial_times[dials] - closed_at;
+        assert!(
+            delay
+                <= constants::UNCONDITIONAL_PEER_CHECK_INTERVAL
+                    + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER,
+            "unexpected redial delay {delay:?}",
+        );
+        delays.push(delay);
+    }
+
+    // Without the random delay, every redial would start at a check, and the checks are
+    // a whole number of intervals apart, like the sleeps above.
+    assert!(
+        delays.iter().any(|delay| *delay != delays[0]),
+        "redial delays are random: {delays:?}",
+    );
+}
+
+/// Zakura does not dial a peer that connected while the dial waited out its random
+/// delay. Here each peer dials in as soon as the other one is dialed.
+#[tokio::test(start_paused = true)]
+async fn unconditional_peer_is_not_dialed_when_it_connects_during_the_delay() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config =
+        toml::from_str("unconditional_peers = ['192.0.2.1', '192.0.2.2']").unwrap();
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        PeerRegistry::default(),
+        UnconditionalPeerDial::ConnectAndStayOpen,
+    );
+
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION * 2).await;
+    assert_eq!(dialer.dial_times().len(), 2);
+
+    // Both connections close, and both peers become due for a redial at the next check.
+    dialer.set_other_peers_dial_in(true);
+    dialer.close_connections();
+    tokio::time::sleep(
+        constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 4
+            + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER,
+    )
+    .await;
+
+    assert_eq!(
+        dialer.dial_times().len(),
+        3,
+        "only the peer whose delay ends first is dialed",
     );
 }
 
@@ -544,10 +632,13 @@ async fn unconditional_peer_redials_back_off() {
                 ))
                 .min(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY);
 
-            // The dial starts at the first check after the delay and its jitter.
+            // Each dial starts at the first check after the delay, plus its own random
+            // delay. A dial that is still waiting when the delay ends holds the next
+            // one back by up to a check interval.
+            let jitter = constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER;
+            let check = constants::UNCONDITIONAL_PEER_CHECK_INTERVAL;
             assert!(
-                gap >= delay
-                    && gap <= delay + delay / 4 + constants::UNCONDITIONAL_PEER_CHECK_INTERVAL,
+                gap + jitter >= delay && gap <= delay.max(jitter + check) + jitter + check,
                 "{dial:?}: unexpected gap {gap:?} after {previous_dials} earlier dials, \
                  the delay is {delay:?}",
             );
@@ -702,6 +793,12 @@ struct UnconditionalPeerDialer {
     /// The connections that the fake connector holds open.
     open_connections: Arc<std::sync::Mutex<Vec<(PeerRegistryGuard, ConnectionTracker)>>>,
 
+    /// Whether a dial to one peer makes every other listed peer dial in.
+    other_peers_dial_in: Arc<AtomicBool>,
+
+    /// The inbound connections that other peers opened, see `other_peers_dial_in`.
+    inbound_connections: Arc<std::sync::Mutex<Vec<PeerRegistryGuard>>>,
+
     /// The peers that the dialer sent to the peer set.
     peerset_rx: mpsc::Receiver<DiscoveredPeer>,
 
@@ -735,9 +832,17 @@ impl UnconditionalPeerDialer {
             .collect()
     }
 
-    /// Closes every connection that the fake connector holds open.
+    /// Makes a later dial to one peer open an inbound connection from every other
+    /// listed peer, as nodes that list each other do.
+    fn set_other_peers_dial_in(&self, other_peers_dial_in: bool) {
+        self.other_peers_dial_in
+            .store(other_peers_dial_in, Ordering::SeqCst);
+    }
+
+    /// Closes every connection that the fake connector holds open, in both directions.
     fn close_connections(&self) {
         self.open_connections.lock().unwrap().clear();
+        self.inbound_connections.lock().unwrap().clear();
     }
 }
 
@@ -751,11 +856,19 @@ fn spawn_unconditional_peer_dialer(
     let dial = Arc::new(std::sync::Mutex::new(dial));
     let dials = Arc::new(std::sync::Mutex::new(Vec::new()));
     let open_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let other_peers_dial_in = Arc::new(AtomicBool::new(false));
+    let inbound_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dial_addrs = config
+        .unconditional_peers
+        .dial_addrs(config.network.default_port());
 
     let connector = {
         let dial = dial.clone();
         let dials = dials.clone();
         let open_connections = open_connections.clone();
+        let other_peers_dial_in = other_peers_dial_in.clone();
+        let inbound_connections = inbound_connections.clone();
+        let dial_addrs = dial_addrs.clone();
         let peer_registry = peer_registry.clone();
 
         service_fn(move |request: OutboundConnectorRequest| {
@@ -792,6 +905,16 @@ fn spawn_unconditional_peer_dialer(
                         .unwrap()
                         .push((connection, connection_tracker));
 
+                    if other_peers_dial_in.load(Ordering::SeqCst) {
+                        for other_addr in dial_addrs.iter().filter(|other| **other != addr) {
+                            // An inbound connection comes from an ephemeral port.
+                            let inbound_addr = SocketAddr::new(other_addr.ip(), 50_000).into();
+                            let (connection, _updater) =
+                                peer_registry.register_legacy(connected_peer(inbound_addr, true));
+                            inbound_connections.lock().unwrap().push(connection);
+                        }
+                    }
+
                     Ok((addr, ClientTestHarness::build().finish().0))
                 }
             };
@@ -802,9 +925,6 @@ fn spawn_unconditional_peer_dialer(
 
     let (peerset_tx, peerset_rx) =
         mpsc::channel::<DiscoveredPeer>(config.peerset_total_connection_limit());
-    let dial_addrs = config
-        .unconditional_peers
-        .dial_addrs(config.network.default_port());
 
     let dialer_task = tokio::spawn(keep_unconditional_peers_connected(
         config,
@@ -818,6 +938,8 @@ fn spawn_unconditional_peer_dialer(
         dial,
         dials,
         open_connections,
+        other_peers_dial_in,
+        inbound_connections,
         peerset_rx,
         _dialer_task: tokio_util::task::AbortOnDropHandle::new(dialer_task),
     }
@@ -2140,6 +2262,85 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
 
     std::mem::drop(first_connection);
     std::mem::drop(second_connection);
+}
+
+/// The listener lets an unconditional peer reconnect at once, and makes any other peer
+/// wait before a second connection from its IP.
+#[tokio::test]
+async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
+    let _init_guard = zakura_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    for (unconditional_peers, expected_connections) in [("[]", 1), ("['127.0.0.1']", 2)] {
+        let success_disconnect_inbound_handshaker =
+            service_fn(|req: HandshakeRequest<TcpStream>| async move {
+                let HandshakeRequest {
+                    data_stream: tcp_stream,
+                    connected_addr,
+                    connection_tracker,
+                } = req;
+
+                let (fake_client, _harness) = ClientTestHarness::build()
+                    .with_connected_addr(connected_addr)
+                    .finish();
+
+                std::mem::drop(connection_tracker);
+                std::mem::drop(tcp_stream);
+                tokio::task::yield_now().await;
+
+                Ok(fake_client)
+            });
+
+        let mut config = Config {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            peerset_initial_target_size: 1,
+            max_connections_per_ip: 1,
+            unconditional_peers: toml::from_str::<Config>(&format!(
+                "unconditional_peers = {unconditional_peers}"
+            ))
+            .unwrap()
+            .unconditional_peers,
+            ..test_defaults()
+        };
+        let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+        config.listen_addr = listen_addr;
+
+        let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(2);
+
+        let listen_fut = accept_inbound_connections(
+            config,
+            tcp_listener,
+            MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+            tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
+            peerset_tx,
+            BannedIps::default(),
+            Vec::new(),
+        );
+        let listen_task_handle = tokio::spawn(listen_fut);
+
+        let first_connection = connect_from(Ipv4Addr::LOCALHOST, listen_addr).await;
+        tokio::time::sleep(MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS * 2).await;
+        let second_connection = connect_from(Ipv4Addr::LOCALHOST, listen_addr).await;
+
+        tokio::time::sleep(ZCASHD_COMPAT_LISTENER_TEST_DURATION).await;
+
+        listen_task_handle.abort();
+        tokio::task::yield_now().await;
+        assert_listener_task_cancelled(listen_task_handle);
+
+        assert_eq!(
+            drain_discovered_peers(&mut peerset_rx),
+            expected_connections,
+            "unexpected connections with unconditional_peers = {unconditional_peers}",
+        );
+
+        std::mem::drop(first_connection);
+        std::mem::drop(second_connection);
+    }
 }
 
 /// Test configured zcashd-compat reconnects bypass the normal

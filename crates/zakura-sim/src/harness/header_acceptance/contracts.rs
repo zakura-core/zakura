@@ -1055,9 +1055,9 @@ const fn satisfied(
 /// The contracts table, one row per contract. C3, C10 and C16 are
 /// delivered on `main`, C20 by hdr-14.3, C1, C7, C8, C9 and C12 by E1 to
 /// E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's stores,
-/// C13 by hf-1 to hf-3, and C22 by hf-9 with E4's sidecar. Every other
-/// row's deliveries landed, and its state names what's still missing: C4's
-/// proving tests pass, but none can be credited yet.
+/// and C13 by hf-1 to hf-3. Every other row's deliveries landed, and its
+/// state names what's still missing: C4's and C22's proving tests pass,
+/// but don't yet prove them.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
@@ -1249,12 +1249,16 @@ pub fn contract_table() -> Vec<Contract> {
             "a two-finding report and sidecar test for every header check, those hdr-9, \
              hdr-10 and hdr-12 added after hf-8 included",
         ),
-        satisfied(
+        proved_short(
             C22,
             "Adam's harness",
             "Each commit-only-authorized finding names its rule kind and its actual subject.",
             C22_PROVING,
             "hf-9, and E4 for its proving test",
+            "the two-page and initial-Open overgrant cases through the real reactor tap, with \
+             each finding and its full attribution in the report and the sidecar. The \
+             sidecar test's `ClaimRun` inserts its claim records itself, and the real header \
+             run finds no authority break",
         ),
     ]
 }

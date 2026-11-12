@@ -1726,7 +1726,8 @@ fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), Strin
 }
 
 /// A `Caught`'s `Draft` run, the one Draft-set judge: a completed counted
-/// run with the set as its override, judged as a counterfactual of the
+/// run with the set as its override and its trigger history, a passing
+/// witness of the case's property, judged as a counterfactual of the
 /// case's `baseline` on one input (Adam, 2026-11-12). The set passes only
 /// if all of these hold:
 ///
@@ -1744,10 +1745,13 @@ fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), Strin
 ///
 /// The runs are deterministic and differ only by the patch, so a member
 /// the `Draft` run breaks and the baseline doesn't is the patch's doing,
-/// however late it breaks, and needs no subject joining it to the case's
-/// own break. An independent bug would break it in the baseline too, and
-/// fail rule 3. The planted runner's `classify_draft_set` applies the same
-/// rule to its own runs.
+/// however late it breaks. An independent bug would break it in the
+/// baseline too, and fail rule 3. That's all this judge proves:
+/// counterfactual dependence on the patch. It doesn't show a member
+/// shares the case's peer or punished event or frame, which only a set
+/// judged in its patched run proves, by the witness judge's subject join
+/// of each nested finding to the case's own break (C6). The planted
+/// runner's `classify_draft_set` applies the same rule to its own runs.
 fn caught_draft(
     manifest: &Manifest,
     baseline: &Execution,
@@ -1759,6 +1763,9 @@ fn caught_draft(
 ) -> Result<(), String> {
     same_run(manifest, run, &RunId::case(case, CaseRun::Draft), harness)?;
     completed(run)?;
+    if !run.trigger {
+        return Err("its Draft run lost the trigger history".into());
+    }
     inventory(manifest, run, harness)?;
     if let Some(member) = violated(baseline).find(|id| set.contains(id)) {
         return Err(format!(

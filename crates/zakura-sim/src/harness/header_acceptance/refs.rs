@@ -9,7 +9,9 @@
 //! session reads, its connection, kind, version and QUIC stream
 //! ([`StreamRef`]); for a subscription event, its peer, session and
 //! subscription ([`SubscriptionRef`], and [`PageRef`] for a page staged on
-//! one); for work, its full owner ([`WorkRef`]); and for a finding, its
+//! one); for work, its full owner ([`WorkRef`]), and a reactor call's
+//! dispatch, operation, stale window and release of it ([`DispatchRef`],
+//! [`CallOpRef`], [`StaleCallRef`], [`ReleaseRef`]); and for a finding, its
 //! subject ([`FindingSubject`](crate::check::FindingSubject)), such as the
 //! punished connection, event and frame. A
 //! finding is named by
@@ -88,7 +90,8 @@ impl Ref for ReadRef {}
 /// One session of one peer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
-    /// The peer, in hex as findings spell it.
+    /// The peer, as the evidence it's read from spells it: in hex in
+    /// findings, and by harness name in the `sessions` store.
     pub peer: String,
     /// The session.
     pub session: u64,
@@ -156,6 +159,48 @@ pub struct ControlRef {
 }
 impl Ref for ControlRef {}
 
+/// A reactor call's dispatch of a prepare: the call and the prepare's
+/// full owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchRef {
+    /// The reactor call.
+    pub call: u64,
+    /// The prepare's owner, every field of its typed form.
+    pub owner: WorkOwner,
+}
+impl Ref for DispatchRef {}
+
+/// A reactor call paired with the storage operation it submitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallOpRef {
+    /// The reactor call.
+    pub call: u64,
+    /// The storage operation.
+    pub op: u64,
+}
+impl Ref for CallOpRef {}
+
+/// A stale window: its reactor call, and whether it was an apply's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleCallRef {
+    /// The reactor call.
+    pub call: u64,
+    /// Whether the call was an apply's, rather than a prepare's.
+    pub apply: bool,
+}
+impl Ref for StaleCallRef {}
+
+/// A round's release from the work queue: its peer, in hex, and the
+/// peer's incarnation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRef {
+    /// The peer, in hex.
+    pub peer: String,
+    /// The peer's incarnation.
+    pub incarnation: u64,
+}
+impl Ref for ReleaseRef {}
+
 /// One link to a peer: the peer and the connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkRef {
@@ -208,7 +253,8 @@ mod tests {
         };
         let staged = [page.clone()];
         let joins = |want: &PageRef| joined(&staged, |page| Some(page.clone()), want).len() == 1;
-        assert_eq!(assert_one_key_off(&page, joins), 6);
+        let keys = assert_one_key_off::<PageRef>(&page, joins);
+        assert_eq!(keys, 6);
         let frame = FrameRef {
             connection: 1,
             kind: 5,
@@ -217,6 +263,7 @@ mod tests {
             inbound: true,
             seq: 3,
         };
-        assert_eq!(assert_one_key_off(&frame, |want| *want == frame), 6);
+        let keys = assert_one_key_off::<FrameRef>(&frame, |want| *want == frame);
+        assert_eq!(keys, 6);
     }
 }

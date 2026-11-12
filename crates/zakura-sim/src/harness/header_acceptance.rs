@@ -198,8 +198,11 @@ pub enum Found {
     /// At a step, by the case's own ID alone: the run stops at the case's
     /// own break, before the rest of its set breaks. The set is judged on
     /// the case's `Draft` run instead, which goes on past the break, as a
-    /// counterfactual of its baseline (Adam, 2026-11-12): see
-    /// `evaluate::caught_draft` for the rule.
+    /// counterfactual of its baseline (Adam, 2026-11-12). That proves each
+    /// member depends on the patch, not that it shares the case's peer or
+    /// punished event or frame, which only a set judged in its patched run
+    /// shows, by the witness judge's join of each nested finding to the
+    /// case's own break: see `evaluate::caught_draft` for the rule.
     AtStepSetOnDraft,
 }
 

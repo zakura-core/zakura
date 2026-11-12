@@ -8,7 +8,7 @@
 //!     --containment <subreaper|best-effort> --out <dir>
 //! header-acceptance companions --trace <dir> --out <companions.json>
 //! header-acceptance record-args --declared <dir> --harness <name> --test <name>
-//!     --case <case> --out <args.json>
+//!     --case <case> --run-id <id> --index <task> --role <role> --out <args.json>
 //! ```
 //!
 //! `plan` writes the tasks xtask runs. `evaluate` reads their artifacts,
@@ -19,7 +19,9 @@
 //! it from the case's own patched build, the one that recorded the trace.
 //! `record-args` writes, as a JSON list, the `zakura-sim record` arguments
 //! for the one history a witness test declared under `--declared` as
-//! `--case` on `--harness`, so the runner records it as the reader binds it.
+//! `--case` on `--harness`, for the run `--run-id`, task `--index` and role
+//! `--role` (empty for the task's own), so the runner records it as the
+//! reader binds it.
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 
@@ -62,7 +64,8 @@ mod cli {
                          --run-id <id> --containment <subreaper|best-effort> --out <dir>\n       \
                          header-acceptance companions --trace <dir> --out <companions.json>\n       \
                          header-acceptance record-args --declared <dir> --harness <name> \
-                         --test <name> --case <case> --out <args.json>";
+                         --test <name> --case <case> --run-id <id> --index <task> \
+                         --role <role> --out <args.json>";
 
     /// Reads `--flag value` pairs, refusing an unknown or repeated flag.
     fn flags(args: &[String], known: &[&str]) -> Result<BTreeMap<String, String>, String> {
@@ -201,10 +204,26 @@ mod cli {
             "record-args" => {
                 let flags = flags(
                     rest,
-                    &["--declared", "--harness", "--test", "--case", "--out"],
+                    &[
+                        "--declared",
+                        "--harness",
+                        "--test",
+                        "--case",
+                        "--run-id",
+                        "--index",
+                        "--role",
+                        "--out",
+                    ],
                 )?;
+                let at = tool::TaskAt {
+                    run_id: &flags["--run-id"],
+                    index: flags["--index"]
+                        .parse()
+                        .map_err(|e| format!("{USAGE}\n--index: {e}"))?,
+                };
                 let args = tool::declared_record_args(
                     &PathBuf::from(&flags["--declared"]),
+                    (at, &flags["--role"]),
                     &flags["--harness"],
                     &flags["--test"],
                     &flags["--case"],

@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{joined, ControlRef, LinkRef},
+    refs::{joined, ControlRef, LinkRef, SessionRef},
 };
 use crate::{
     harness::{
@@ -413,6 +413,8 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
 struct Sessions {
     /// Each peer's links, in first-admission order.
     links: std::collections::BTreeMap<String, Vec<u64>>,
+    /// Each admitted session and its link, in the store's order.
+    admitted: Vec<(SessionRef, u64)>,
     /// Each ended session's link and reason, in the store's order.
     ended: Vec<(LinkRef, String)>,
 }
@@ -427,7 +429,6 @@ impl Sessions {
         else {
             return sessions;
         };
-        let mut admitted: Vec<(String, u64, u64)> = Vec::new();
         let field = |fact: &str, name: &str| -> Option<u64> {
             let (_, rest) = fact.split_once(&format!("{name}: "))?;
             leading_number(rest)
@@ -455,20 +456,28 @@ impl Sessions {
                 if !links.contains(&link) {
                     links.push(link);
                 }
-                admitted.push((peer, session, link));
+                sessions.admitted.push((SessionRef { peer, session }, link));
             } else if fact.starts_with("Ended {") {
-                let (Some(reason), Some(&(_, _, connection))) = (
-                    quoted(fact, "reason"),
-                    admitted
-                        .iter()
-                        .find(|(at, id, _)| *at == peer && *id == session),
-                ) else {
+                let ended = SessionRef { peer, session };
+                let (Some(reason), Some(connection)) =
+                    (quoted(fact, "reason"), sessions.admitted_on(&ended))
+                else {
                     continue;
                 };
+                let peer = ended.peer;
                 sessions.ended.push((LinkRef { peer, connection }, reason));
             }
         }
         sessions
+    }
+
+    /// The link the node first admitted `session` on, joined by its whole
+    /// ref, its peer and session ID, so an end never takes the link of
+    /// another peer's session with the same ID.
+    fn admitted_on(&self, session: &SessionRef) -> Option<u64> {
+        joined(&self.admitted, |(at, _)| Some(at.clone()), session)
+            .first()
+            .map(|(_, link)| *link)
     }
 
     /// `peer`'s `link`th link, if the node admitted that many.
@@ -785,7 +794,9 @@ mod tests {
                 peer: peer.clone(),
                 action: (*action).to_owned(),
             };
-            assert_one_key_off(&cause, |cause| own_effect(&facts, &named, cause).is_some());
+            assert_one_key_off::<ControlRef>(&cause, |cause| {
+                own_effect(&facts, &named, cause).is_some()
+            });
             joined += 1;
         }
         assert_eq!(joined, 3);
@@ -868,6 +879,35 @@ mod tests {
         }
     }
 
+    /// A session's end takes the link its admission names, joined by the
+    /// whole session ref (Rule 25's template): in the close-relink-close
+    /// history's store, which admits `mirror-0` again on each relink beside
+    /// `mirror-1`'s sessions, every admitted session's ref finds its own
+    /// link, and the same ref with its peer or its session moved finds
+    /// none. The store's ends were each found this way.
+    #[test]
+    fn a_session_end_joins_its_admission_by_its_whole_ref() {
+        let (_, report, _) = close_relink_close();
+        let sessions = Sessions::of(&report);
+        let peers: std::collections::BTreeSet<&str> = sessions
+            .admitted
+            .iter()
+            .map(|(session, _)| session.peer.as_str())
+            .collect();
+        assert!(
+            sessions.admitted.len() > peers.len() && peers.len() > 1,
+            "{:?}",
+            sessions.admitted
+        );
+        assert!(!sessions.ended.is_empty(), "{sessions:?}");
+        for (own, link) in &sessions.admitted {
+            let keys = assert_one_key_off::<SessionRef>(own, |session| {
+                sessions.admitted_on(session) == Some(*link)
+            });
+            assert_eq!(keys, 2);
+        }
+    }
+
     /// Each wire link act joins the node's session facts on its whole link
     /// (Rule 25's template): the late fault's disconnect on `peer-0`'s
     /// first connection is shown, and the same act with only its peer or
@@ -880,7 +920,7 @@ mod tests {
         let link = sessions
             .link("peer-0", 0)
             .expect("the node admitted peer-0");
-        assert_one_key_off(&link, |link| sessions.show(link, LinkShows::Ended, 0));
+        assert_one_key_off::<LinkRef>(&link, |link| sessions.show(link, LinkShows::Ended, 0));
         assert!(!sessions.show(&link, LinkShows::Ended, 1));
         let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
         assert_eq!(judged(&report), Actions::Complete);

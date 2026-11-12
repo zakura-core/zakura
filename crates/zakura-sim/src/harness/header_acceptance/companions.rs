@@ -941,7 +941,7 @@ mod tests {
     fn the_rejected_page_s_session_joins_its_stream() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let stream = StreamRef::from(&page.frame);
-        let keys = assert_one_key_off(&stream, |stream| {
+        let keys = assert_one_key_off::<StreamRef>(&stream, |stream| {
             let mut moved = log(1, 1, "service_protocol_reject");
             moved[0] = Observation::Session {
                 connection: stream.connection,
@@ -981,7 +981,8 @@ mod tests {
     /// The staging companion joins the page staged from the rejected frame:
     /// that page holds, and the same fact with any one key of its page
     /// moved, its peer, session, subscription, frame or a header, doesn't
-    /// (Rule 25's template). A frame that staged nothing, or two pages,
+    /// (Rule 25's template), nor with a key of its read or its
+    /// subscription moved on its own. A frame that staged nothing, or two pages,
     /// doesn't either.
     #[test]
     fn the_staged_page_joins_the_rejected_frame() {
@@ -995,6 +996,22 @@ mod tests {
             staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
         });
         assert_eq!(keys, 6);
+        // The frame's read, and the page's subscription, each on its own.
+        let read = own.read().expect("it names its frame");
+        assert_one_key_off::<ReadRef>(&read, |read| {
+            let moved = StagedPage {
+                session: read.session,
+                frame: Some(read.frame),
+                ..own.clone()
+            };
+            staged_page(&[moved], &page, &sent()).is_ok()
+        });
+        let subscription = own.page().expect("it names its frame").subscription;
+        assert_one_key_off::<SubscriptionRef>(&subscription, |subscription| {
+            let mut staged = own.page().expect("it names its frame");
+            staged.subscription = subscription.clone();
+            staged_page(&[staged_from(&staged)], &page, &sent()).is_ok()
+        });
         assert!(staged_page(&[], &page, &sent()).is_err());
         let mut twice = own.clone();
         twice.subscription += 1;
@@ -1021,7 +1038,7 @@ mod tests {
             step: violation.step,
             detail: violation.actual.clone(),
         };
-        assert_one_key_off(&finding, |finding| {
+        assert_one_key_off::<FindingRef>(&finding, |finding| {
             let mut properties = properties.clone();
             properties[0].violations[0].step = finding.step;
             properties[0].violations[0].actual = finding.detail.clone();

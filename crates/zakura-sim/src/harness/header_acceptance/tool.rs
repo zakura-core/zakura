@@ -52,8 +52,11 @@
 //!   directory for a task's `unpatched`, `patched` and `restored` runs)
 //!   and the SHA-256 of the executable it ran ([`binding::TEST`]).
 //! * `history`: the witness test run as for `test`, with
-//!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`,
-//!   so `<i>/declared` holds what it declared ([`super::history`]). Then
+//!   [`HISTORIES_VAR`](super::history::HISTORIES_VAR) set to `<i>/declared`
+//!   and [`HISTORIES_FOR_VAR`](super::history::HISTORIES_FOR_VAR) naming
+//!   the run, task and role it ran for, so `<i>/declared` holds what it
+//!   declared, each declaration stamped with them ([`super::history`],
+//!   [`binding::DECLARATION`]). Then
 //!   `<i>/run`, the declaration whose case is the task's `case`, recorded by
 //!   S's `zakura-sim record` with [`record_args`]: `--sim <harness>
 //!   --scenario <scenario>`, where `<scenario>` is the JSON text its
@@ -135,7 +138,7 @@ use super::{
         evaluate, Actions, Actual, Companion, End, Evaluation, ExecMeta, Execution,
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
-    history::{declared, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
+    history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
     refs::TriggerRef,
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
@@ -216,6 +219,17 @@ impl TaskAt<'_> {
     /// ([`binding::TEST`]), or why not.
     fn test(&self, dir: &Path, role: &str) -> Result<TestRun, String> {
         self.read(&binding::TEST, &dir.join(TEST_FILE), role, Expect::new())
+    }
+
+    /// Every declaration a witness test made under `declared_dir`, each
+    /// this task's test at `role` ([`super::history::declared`],
+    /// [`binding::DECLARATION`]), or why not.
+    pub fn declared(&self, declared_dir: &Path, role: &str) -> Result<Vec<Declaration>, String> {
+        let expect = Expect::new()
+            .with(Field::RunId, self.run_id)
+            .with(Field::TaskIndex, self.index)
+            .with(Field::Role, role);
+        super::history::declared(declared_dir, &expect)
     }
 }
 
@@ -1360,8 +1374,9 @@ fn integrity_execution(
     let mut actions = Actions::Incomplete;
     if matches!(end, End::Completed | End::HarnessFailure { .. }) {
         let history = dir.join("history");
-        let bound = declaration(&dir.join("declared"), harness, name, case).and_then(|at| {
-            match declared_refusal(harness, &at, &history) {
+        let bound = at.declared(&dir.join("declared"), role).and_then(|all| {
+            let found = declaration(&all, harness, name, case)?;
+            match declared_refusal(harness, found, &history) {
                 Some(why) => Err(why),
                 None => Ok(()),
             }
@@ -1740,7 +1755,7 @@ impl CaseChecks<'_> {
     /// The case's `Draft` run, as `run`, which the tool records itself with
     /// the case's rebuilt binary (C9): it must have run the committed input,
     /// with a witness file judging the case's property as the task's
-    /// `draft_witness` expects ([`witness_judges`]), from the binary the
+    /// `draft_witness` expects ([`witness_judges`]) that passed, from the binary the
     /// provenance check measured, which must have passed, and be its
     /// baseline's counterfactual ([`counterfactual_refusal`]). Its override
     /// is read from its meta, and the evaluator judges its set
@@ -1763,6 +1778,14 @@ impl CaseChecks<'_> {
                     "its witness file doesn't judge {} as {:?} expects",
                     self.property, self.draft_witness
                 ),
+            );
+        } else if !execution.trigger {
+            // A run with no scripted acts is complete whatever its witness
+            // found, so only the witness's own verdict shows its trigger.
+            execution.actions = Actions::Incomplete;
+            fail(
+                &mut execution,
+                format!("its witness of {} didn't pass", self.property),
             );
         }
         let rebuild = self.rebuild();
@@ -1917,21 +1940,26 @@ fn history_execution(
             format!("its witness test {package}/{file}::{name} didn't pass at S"),
         );
     }
-    match declaration(&dir.join("declared"), harness, name, case) {
-        Ok(at) => {
-            if let Some(why) = declared_refusal(harness, &at, &recording) {
-                fail(&mut execution, why);
+    match at.declared(&dir.join("declared"), "") {
+        Ok(all) => {
+            match declaration(&all, harness, name, case) {
+                Ok(found) => {
+                    if let Some(why) = declared_refusal(harness, found, &recording) {
+                        fail(&mut execution, why);
+                    }
+                }
+                Err(why) => fail(&mut execution, why),
+            }
+            let errors = inventory_errors(
+                &inventory_cases(package, file, name),
+                all.iter().map(Declaration::history),
+                name,
+            );
+            if !errors.is_empty() {
+                fail(&mut execution, errors.join("; "));
             }
         }
         Err(why) => fail(&mut execution, why),
-    }
-    let errors = inventory_errors(
-        &inventory_cases(package, file, name),
-        &declared(&dir.join("declared")),
-        name,
-    );
-    if !errors.is_empty() {
-        fail(&mut execution, errors.join("; "));
     }
     if let Err(why) = binding::check_trace(
         &recording,
@@ -2516,29 +2544,33 @@ fn case_input_refusal(repo: &Path, harness: &str, input: &CaseInput, dir: &Path)
     }
 }
 
-/// The one declaration under `declared_dir` of `harness`'s history `case`
-/// by `test` ([`super::history`]), or why there isn't exactly one. A
-/// declaration by another test, or of the case on another harness, isn't
-/// it.
-fn declaration(
-    declared_dir: &Path,
+/// The one declaration of `all`, a task's bound declarations
+/// ([`TaskAt::declared`]), of `harness`'s history `case` by `test`
+/// ([`super::history`]), or why there isn't exactly one. A declaration by
+/// another test, or of the case on another harness, isn't it.
+fn declaration<'a>(
+    all: &'a [Declaration],
     harness: &str,
     test: &str,
     case: &str,
-) -> Result<std::path::PathBuf, String> {
-    let all = declared(declared_dir);
-    let named: Vec<&(std::path::PathBuf, DeclaredHistory)> = all
+) -> Result<&'a Declaration, String> {
+    let named: Vec<&Declaration> = all
         .iter()
-        .filter(|(_, history)| history.case == case)
+        .filter(|declaration| declaration.history().case == case)
         .collect();
     match named.as_slice() {
-        [(dir, history)] if history.harness == harness && libtest_names(&history.test, test) => {
-            Ok(dir.clone())
+        [found]
+            if found.history().harness == harness && libtest_names(&found.history().test, test) =>
+        {
+            Ok(found)
         }
-        [(_, history)] => Err(format!(
-            "its witness test declared {case} as {}'s on {}, not {test}'s on {harness}",
-            history.test, history.harness
-        )),
+        [found] => {
+            let history = found.history();
+            Err(format!(
+                "its witness test declared {case} as {}'s on {}, not {test}'s on {harness}",
+                history.test, history.harness
+            ))
+        }
         [] => Err(format!(
             "its witness test declared no history named {case} among {} declarations",
             all.len()
@@ -2574,9 +2606,9 @@ pub fn inventory_cases(package: &str, file: &str, test: &str) -> BTreeSet<(Strin
 /// the test declared that it doesn't name or declared twice, or one
 /// another test declared. Empty when they match, or when the inventory
 /// names no history for the test, which then counts none.
-pub fn inventory_errors(
+pub fn inventory_errors<'a>(
     inventory: &BTreeSet<(String, String)>,
-    declared: &[(std::path::PathBuf, DeclaredHistory)],
+    declared: impl IntoIterator<Item = &'a DeclaredHistory>,
     test: &str,
 ) -> Vec<String> {
     if inventory.is_empty() {
@@ -2584,7 +2616,7 @@ pub fn inventory_errors(
     }
     let mut errors = Vec::new();
     let mut seen = BTreeSet::new();
-    for (_, history) in declared {
+    for history in declared {
         let key = (history.harness.clone(), history.case.clone());
         if !libtest_names(&history.test, test) {
             errors.push(format!(
@@ -2629,36 +2661,37 @@ fn declared_plan(declaration: &Path) -> Result<(std::path::PathBuf, bool), Strin
 }
 
 /// The `zakura-sim record` arguments, before `--out` and any witness, that
-/// record the declaration in `declaration` on `harness`, as the runner's
-/// contract gives them: `--sim`, then `--scenario` with the JSON text its
-/// [`SCENARIO_FILE`] holds as one argument, since the CLI parses that value
-/// as JSON, and `--plan` or `--script` with its Plan file's path.
-pub fn record_args(harness: &str, declaration: &Path) -> Result<Vec<String>, String> {
-    let (file, script) = declared_plan(declaration)?;
-    let scenario_file = declaration.join(SCENARIO_FILE);
-    let scenario = fs::read_to_string(&scenario_file)
-        .map_err(|error| format!("{}: {error}", scenario_file.display()))?;
+/// record `declaration`, read bound to its run ([`TaskAt::declared`]), on
+/// `harness`, as the runner's contract gives them: `--sim`, then
+/// `--scenario` with the JSON text its [`SCENARIO_FILE`] holds as one
+/// argument, since the CLI parses that value as JSON, and `--plan` or
+/// `--script` with its Plan file's path.
+pub fn record_args(harness: &str, declaration: &Declaration) -> Result<Vec<String>, String> {
+    let (file, script) = declared_plan(declaration.dir())?;
     Ok(vec![
         "--sim".to_owned(),
         harness.to_owned(),
         "--scenario".to_owned(),
-        scenario,
+        declaration.scenario().to_owned(),
         if script { "--script" } else { "--plan" }.to_owned(),
         file.display().to_string(),
     ])
 }
 
-/// The [`record_args`] of the one declaration under `declared_dir` of
-/// `harness`'s history `case` by `test`, found as [`assemble`] finds it
-/// ([`declaration`]), or why there isn't exactly one. The runner records
-/// each history task's run, and each integrity run's history, from these.
+/// The [`record_args`] of the one declaration under `declared_dir`, made
+/// by task `at`'s test at `role`, of `harness`'s history `case` by `test`,
+/// found as [`assemble`] finds it ([`TaskAt::declared`], [`declaration`]),
+/// or why there isn't exactly one. The runner records each history task's
+/// run, and each integrity run's history, from these.
 pub fn declared_record_args(
     declared_dir: &Path,
+    (at, role): (TaskAt<'_>, &str),
     harness: &str,
     test: &str,
     case: &str,
 ) -> Result<Vec<String>, String> {
-    record_args(harness, &declaration(declared_dir, harness, test, case)?)
+    let all = at.declared(declared_dir, role)?;
+    record_args(harness, declaration(&all, harness, test, case)?)
 }
 
 /// Why the trace in `dir` isn't the declaration in `declaration` recorded
@@ -2666,7 +2699,8 @@ pub fn declared_record_args(
 /// (C18), or its steps aren't the ones the declaring test's own run took,
 /// its [`RAN_FILE`] ([`super::history::run_declared`], [`binding::RAN`]). A declaration with
 /// no such file wasn't run where it was declared, so it names no history.
-fn declared_refusal(harness: &str, declaration: &Path, dir: &Path) -> Option<String> {
+fn declared_refusal(harness: &str, declaration: &Declaration, dir: &Path) -> Option<String> {
+    let declaration = declaration.dir();
     let (file, script) = match declared_plan(declaration) {
         Ok(found) => found,
         Err(why) => return Some(why),
@@ -3468,6 +3502,15 @@ mod tests {
         run_id: "r",
         index: 0,
     };
+
+    /// [`AT`] at its own role, as a declaring test's runner names it.
+    fn at_for() -> super::super::history::DeclaredFor {
+        super::super::history::DeclaredFor {
+            run_id: AT.run_id.to_owned(),
+            index: AT.index,
+            role: String::new(),
+        }
+    }
 
     /// The committed patch the test cases' provenance checks name.
     const TEST_PATCH: &str = "qa/planted/header-sync/stale-completion-inert/stale-charge.patch";
@@ -4638,6 +4681,41 @@ mod tests {
         assert!(!witness_judges(dir.path(), MACHINE, "violated", &[]));
     }
 
+    /// A witness judges a run's trigger only on its whole [`TriggerRef`]
+    /// (Rule 25's template): a bound witness of the case's property
+    /// expecting `violated` beside two companions joins that ref, and the
+    /// ref with its property, its expectation or either companion moved
+    /// joins nothing.
+    #[test]
+    fn a_witness_judges_its_whole_trigger() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let dir = recorded();
+        let trigger = TriggerRef {
+            property: MACHINE.to_owned(),
+            expect: "violated".to_owned(),
+            also_violates: vec!["p/b".to_owned(), "p/c".to_owned()],
+        };
+        write_witness(
+            dir.path(),
+            serde_json::json!({
+                "passed": true,
+                "property": trigger.property,
+                "expect": trigger.expect,
+                "also_violates": trigger.also_violates,
+                "error": null,
+            }),
+        );
+        let keys = assert_one_key_off::<TriggerRef>(&trigger, |want| {
+            witness_judges(
+                dir.path(),
+                &want.property,
+                &want.expect,
+                &want.also_violates,
+            )
+        });
+        assert_eq!(keys, 4);
+    }
+
     /// A planted case's patched witness is the one the planted runner
     /// records: the nested `target-page-refused` and `wedged-run-loop` cases
     /// name a `set`, so their tasks expect `violated-set` with exactly that
@@ -4945,6 +5023,66 @@ mod tests {
             same_run_input(&baseline, &moved).is_ok()
         });
         assert!(keys >= 3, "{keys}");
+    }
+
+    /// A `Draft` run counts only with a passing witness. A machine run has
+    /// no scripted acts, so its actions are complete whatever its witness
+    /// says, like a held node case such as `page-past-credit`'s: the
+    /// witness's own `passed` is all that tells the two apart. The same
+    /// bound witness judging the case's property as its task expects, with
+    /// `passed: false`, fails the run and shows no trigger.
+    #[test]
+    fn a_failed_draft_witness_fails_its_run() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let case = case_dir("s", "patched");
+        let draft_dir = case.path().join("draft");
+        record_into(&draft_dir, "patched");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let expected = PatchedWitness {
+            expect: "violated".into(),
+            beside: Vec::new(),
+        };
+        let checks = CaseChecks {
+            repo: &repo,
+            dir: case.path(),
+            property: MACHINE,
+            harness: MACHINE,
+            input: &input,
+            subject_source: "s",
+            draft_witness: Some(&expected),
+            subject: "s",
+            patch: TEST_PATCH,
+        };
+        let draft_run = |passed: bool| {
+            write_witness(
+                &draft_dir,
+                serde_json::json!({
+                    "property": MACHINE,
+                    "expect": "violated",
+                    "also_violates": [],
+                    "passed": passed,
+                    "error": (!passed).then_some("the property held"),
+                }),
+            );
+            checks.draft(RunId::Case {
+                property: MACHINE.into(),
+                name: "a".into(),
+                run: CaseRun::Draft,
+            })
+        };
+        let caught = draft_run(true);
+        assert_eq!(caught.end, End::Completed);
+        assert!(caught.trigger);
+        assert_eq!(caught.actions, Actions::Complete);
+        let failed = draft_run(false);
+        assert!(!failed.trigger);
+        assert!(
+            matches!(&failed.end, End::Failed { why } if why.contains("didn't pass")),
+            "{:?}",
+            failed.end
+        );
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task
@@ -5853,15 +5991,29 @@ mod tests {
             .path()
     }
 
-    /// Writes into `dir` what the runner leaves for an integrity run whose
-    /// test `test` declared [`storage_history`] as `case`: the declaration,
-    /// and that history recorded by the build with source `source`, ending
-    /// in the harness failure `failure` when one is given.
+    /// [`declare_and_record_for`] [`AT`]'s own role.
     fn declare_and_record(dir: &Path, test: &str, case: &str, source: &str, failure: Option<&str>) {
+        declare_and_record_for(dir, &at_for(), test, case, source, failure);
+    }
+
+    /// Writes into `dir` what the runner leaves for an integrity run whose
+    /// test `test` declared [`storage_history`] as `case`, for the run,
+    /// task and role `declared_for` names: the declaration, and that
+    /// history recorded by the build with source `source`, ending in the
+    /// harness failure `failure` when one is given.
+    fn declare_and_record_for(
+        dir: &Path,
+        declared_for: &super::super::history::DeclaredFor,
+        test: &str,
+        case: &str,
+        source: &str,
+        failure: Option<&str>,
+    ) {
         let (scenario, plan) = storage_history();
         let declared = dir.join("declared");
         super::super::history::declare_into(
             &declared,
+            declared_for,
             NODE,
             case,
             &scenario,
@@ -5987,7 +6139,7 @@ mod tests {
             let root = tempfile::tempdir().expect("a temp dir can be created");
             let declared = plan.clone();
             run_declared_in(
-                Some(root.path()),
+                Some((root.path(), &at_for())),
                 NODE,
                 "plan 0",
                 &scenario,
@@ -6013,7 +6165,10 @@ mod tests {
                 &out,
             )
             .expect("the declaration records");
-            declared_refusal(NODE, &root.path().join("0"), &out)
+            let all = AT
+                .declared(root.path(), "")
+                .expect("the declaration is AT's");
+            declared_refusal(NODE, &all[0], &out)
         };
         assert_eq!(declared(Some(plan.clone())), None);
         let one_off = declared(Some(off));
@@ -6058,6 +6213,121 @@ mod tests {
         .expect("the temp dir is writable");
         if let Some(witness) = witness {
             write_witness(&dir.join("run"), witness);
+        }
+    }
+
+    /// A witness test's declaration counts only for the run, task and role
+    /// its reader reads: an earlier attempt's declaration, otherwise the
+    /// same, left in a history task's directory fails its run, and in an
+    /// integrity run's fails the patched run and claims no history for the
+    /// others. So do one naming another task or role, and the runner's
+    /// arguments for it are refused too.
+    #[test]
+    fn an_earlier_attempt_s_declaration_is_refused() {
+        let restamp = |dir: &Path, key: &str, value: Value| {
+            let path = dir
+                .join("declared/0")
+                .join(super::super::history::HISTORY_FILE);
+            let mut history: Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                    .expect("it's JSON");
+            history[key] = value;
+            fs::write(&path, history.to_string()).expect("the temp dir is writable");
+        };
+        let stale = [
+            ("run_id", serde_json::json!("an earlier attempt")),
+            ("index", serde_json::json!(1)),
+            ("role", serde_json::json!("patched")),
+        ];
+        let history = |edit: Option<&(&str, Value)>| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            history_task_dir(dir.path(), None);
+            if let Some((key, value)) = edit {
+                restamp(dir.path(), key, value.clone());
+            }
+            let run = history_execution(
+                (dir.path(), &AT),
+                history_run(),
+                NODE,
+                ("p/a", None),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            );
+            let args = declared_record_args(
+                &dir.path().join("declared"),
+                (AT, ""),
+                NODE,
+                "test",
+                "plan 0",
+            );
+            (run.end, args.is_ok())
+        };
+        let (own, args) = history(None);
+        assert!(!matches!(own, End::Failed { .. }), "{own:?}");
+        assert!(args);
+        for edit in &stale {
+            let (end, args) = history(Some(edit));
+            assert!(
+                matches!(&end, End::Failed { why } if why.contains("history.json")),
+                "{}: {end:?}",
+                edit.0
+            );
+            assert!(!args, "{}", edit.0);
+        }
+        let integrity = |run: CaseRun, edit: Option<&(&str, Value)>| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            let source = if run == CaseRun::Patched {
+                "patched"
+            } else {
+                "subject"
+            };
+            declare_and_record(dir.path(), "a_test", "plan 0", source, None);
+            if let Some((key, value)) = edit {
+                restamp(dir.path(), key, value.clone());
+            }
+            let artifact = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: String::new(),
+                executable_sha256: None,
+                package: "zakura-sim".into(),
+                file: "tests/header_node.rs".into(),
+                tests: vec![("a_test".into(), "ok".into())],
+                killed: false,
+                exited_ok: true,
+                log: String::new(),
+                binary_source: Some(source.into()),
+                checkout_source: Some(source.into()),
+            };
+            fs::write(
+                dir.path().join(TEST_FILE),
+                serde_json::to_string(&artifact).expect("a test run serializes"),
+            )
+            .expect("the temp dir is writable");
+            integrity_execution(
+                (dir.path(), &AT, ""),
+                RunId::native("raw-budget-lease", run),
+                &history_run(),
+                NODE,
+                "OwnedMismatch",
+                "subject",
+            )
+        };
+        for run in [CaseRun::Unpatched, CaseRun::Patched] {
+            let own = integrity(run, None);
+            assert!(own.meta.input.is_some(), "{run:?}: {own:?}");
+            for edit in &stale {
+                let refused = integrity(run, Some(edit));
+                assert_eq!(refused.meta.input, None, "{run:?} {}", edit.0);
+                if run == CaseRun::Patched {
+                    assert!(
+                        matches!(&refused.end, End::Failed { why } if why.contains("history.json")),
+                        "{}: {:?}",
+                        edit.0,
+                        refused.end
+                    );
+                }
+            }
         }
     }
 
@@ -6148,18 +6418,16 @@ mod tests {
         );
         let inventory = inventory_cases("zakura-sim", file, test);
         assert_eq!(inventory.len(), 32, "{inventory:?}");
-        let declare = |cases: &[(&str, &str)]| -> Vec<(std::path::PathBuf, DeclaredHistory)> {
+        let declare = |cases: &[(&str, &str)]| -> Vec<DeclaredHistory> {
             cases
                 .iter()
-                .map(|(by, case)| {
-                    (
-                        std::path::PathBuf::new(),
-                        DeclaredHistory {
-                            test: format!("a::{by}"),
-                            harness: NODE.to_owned(),
-                            case: (*case).to_owned(),
-                        },
-                    )
+                .map(|(by, case)| DeclaredHistory {
+                    run_id: AT.run_id.to_owned(),
+                    index: AT.index,
+                    role: String::new(),
+                    test: format!("a::{by}"),
+                    harness: NODE.to_owned(),
+                    case: (*case).to_owned(),
                 })
                 .collect()
         };
@@ -6654,7 +6922,19 @@ mod tests {
                 let failed = result == "FAILED";
                 let failure =
                     format!("storage:header's evidence failed: {diagnostic}: at a quiet boundary");
-                declare_and_record(&at, test, case, source, failed.then_some(&failure));
+                let declared_for = super::super::history::DeclaredFor {
+                    run_id: run.run_id.clone(),
+                    index,
+                    role: name.to_owned(),
+                };
+                declare_and_record_for(
+                    &at,
+                    &declared_for,
+                    test,
+                    case,
+                    source,
+                    failed.then_some(&failure),
+                );
                 let artifact = TestRun {
                     run_id: run.run_id.clone(),
                     index,

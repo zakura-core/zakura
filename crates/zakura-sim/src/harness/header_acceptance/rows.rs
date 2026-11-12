@@ -3115,21 +3115,30 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: G3,
         expected: Expected::Passes {
-            test: sim_test(CROSSING_TESTS, "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished"),
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/crossing-close",
         gates: G3,
         expected: Expected::Passes {
-            test: sim_test(CROSSING_TESTS, "a_crossing_close_is_conformant_and_unpunished"),
+            test: sim_test(
+                CROSSING_TESTS,
+                "a_crossing_close_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/over-window-grant",
         gates: G3,
         expected: Expected::Passes {
-            test: sim_test(CROSSING_TESTS, "an_over_window_crossing_grant_is_bad_cursor_and_closed"),
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+            ),
         },
     },
     GateRequirement {

@@ -1751,6 +1751,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "reordered-payload",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "sealed-batch-truncated",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -2984,7 +2990,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
                      stays a zakura-network unit test",
         },
     },
-    to_move("reordered-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "reordered-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "reordered-payload",
+        },
+    },
     to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
     NativeMutation {
         patch: "session-view",

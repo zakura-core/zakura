@@ -1,0 +1,13 @@
+# `begin_prepare` swaps the first two of a round's staged headers in the
+# prepare it sends, keeping their count, the target and the last header,
+# so only the sequence differs. The required failure is `WrongPayload`.
+# `swapped-payload` changes the last header instead. The witness's rounds
+# prepare more than two headers. The reactor, the subscriber and the queue
+# decide how they stage and prepare, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

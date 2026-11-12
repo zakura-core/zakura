@@ -14,7 +14,7 @@ use std::path::Path;
 use zakura_sim::{
     harness::header_acceptance::companions::{
         fault_close, judge, path_break, rejected_page, run_draft, staged_page, DraftEvidence,
-        StagedPage, FAULT_CLOSE, PATH_BREAK, STAGED,
+        StagedPage, CONTENT_FAULT, FAULT_CLOSE, PATH_BREAK, STAGED,
     },
     Observation,
 };
@@ -43,10 +43,12 @@ fn staged(session: u64, subscription: u64, frame: u64) -> StagedPage {
     }
 }
 
-/// Unpatched, the node judges the unlinked page and closes its connection
-/// with a fault, so the fault-close companion holds, and nothing stages, so
-/// the other two don't: the catch needs the patch. The companion joins the
-/// page's connection, so the same close moved to another connection fails.
+/// Unpatched, the node judges the unlinked page, its reader refuses it for
+/// linkage and closes its connection with a fault, so the fault-close
+/// companion holds, and nothing stages, so the other two don't: the catch
+/// needs the patch. The companion joins the page's connection and its
+/// content refusal, so the same close moved to another connection fails,
+/// and so does the same close after a refusal for another fault.
 #[test]
 fn the_fault_close_holds_on_the_unpatched_rejection() {
     let evidence = evidence();
@@ -76,7 +78,18 @@ fn the_fault_close_holds_on_the_unpatched_rejection() {
             obs
         })
         .collect();
-    assert!(fault_close(&moved, &page).is_err());
+    assert!(fault_close(&moved, &evidence.refusals, &page).is_err());
+
+    let [refusal] = &evidence.refusals[..] else {
+        panic!("one refusal: {:?}", evidence.refusals);
+    };
+    assert_eq!(
+        (refusal.session, refusal.reason.as_str()),
+        (page.session, CONTENT_FAULT)
+    );
+    let mut other = evidence.refusals.clone();
+    other[0].reason = "over_credit".into();
+    assert!(fault_close(&evidence.observations, &other, &page).is_err());
 }
 
 /// Unpatched, the rejected page never stages. A page staged from its

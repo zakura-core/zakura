@@ -10,7 +10,9 @@
 //!
 //! - [`FAULT_CLOSE`]: the node closed the rejected frame's connection with a
 //!   cause in [`FAULT_CAUSES`](crate::model::FAULT_CAUSES), after it judged
-//!   that frame. It joins on the connection.
+//!   that frame, and the session's reader refused a frame for the page's
+//!   content fault, [`CONTENT_FAULT`]. It joins on the connection and the
+//!   session, so a close for another fault doesn't count.
 //! - [`STAGED`]: exactly one `PageStaged` came from that frame. It joins on
 //!   the session the frame's connection and QUIC stream carry, the
 //!   subscription the frame names, and the frame's position among the
@@ -52,6 +54,41 @@ pub const STAGED: &str = "rejected-page-staged";
 pub const PATH_BREAK: &str = "rejected-page-path-break";
 /// The case's companions, in the order its row names them.
 pub const COMPANIONS: &[&str] = &[FAULT_CLOSE, STAGED, PATH_BREAK];
+
+/// The subscriber's fault for the case's unlinked page, as the reader names
+/// it when it refuses the frame.
+pub const CONTENT_FAULT: &str = "linkage";
+
+/// A frame a session's reader refused as a protocol violation, as its
+/// `FrameRefused` reports it, with the peer in hex as findings spell it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The peer.
+    pub peer: String,
+    /// The session the reader read it on.
+    pub session: u64,
+    /// The fault, such as `linkage`.
+    pub reason: String,
+}
+
+impl Refusal {
+    /// The refusal `event` reports, if it's a `FrameRefused`.
+    pub fn of(event: &ReactorEvent) -> Option<Refusal> {
+        let ReactorEvent::FrameRefused {
+            peer,
+            session_id,
+            reason,
+        } = event
+        else {
+            return None;
+        };
+        Some(Refusal {
+            peer: crate::harness::header_node::tap::peer(peer),
+            session: *session_id,
+            reason: (*reason).to_owned(),
+        })
+    }
+}
 
 /// The rejected page's frame, as the run's log names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,8 +210,14 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
 }
 
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
-/// after it judged `page`'s frame, with a fault cause.
-pub fn fault_close(observations: &[Observation], page: &RejectedPage) -> Result<(), String> {
+/// after it judged `page`'s frame, with a fault cause, and `refusals` hold
+/// exactly one of `page`'s session, for [`CONTENT_FAULT`]. A reader ends its
+/// session at its first refusal, so that one is the close's.
+pub fn fault_close(
+    observations: &[Observation],
+    refusals: &[Refusal],
+    page: &RejectedPage,
+) -> Result<(), String> {
     let judged = observations
         .iter()
         .position(|obs| {
@@ -203,7 +246,19 @@ pub fn fault_close(observations: &[Observation], page: &RejectedPage) -> Result<
             "connection {} closed with {cause}, not a fault cause",
             page.connection
         )),
-        Some(_) => Ok(()),
+        Some(_) => {
+            let of_session: Vec<&Refusal> = refusals
+                .iter()
+                .filter(|refusal| refusal.session == page.session)
+                .collect();
+            match of_session[..] {
+                [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
+                _ => Err(format!(
+                    "session {}'s reader refused {of_session:?}, not one frame for {CONTENT_FAULT}",
+                    page.session
+                )),
+            }
+        }
     }
 }
 
@@ -287,6 +342,8 @@ pub struct DraftEvidence {
     pub observations: Vec<Observation>,
     /// Every `PageStaged` the node's work queue reported, in order.
     pub staged: Vec<StagedPage>,
+    /// Every frame the node's session readers refused, in order.
+    pub refusals: Vec<Refusal>,
     /// Each property's report.
     pub properties: Vec<PropertyReport>,
     /// The claim store's snapshot, `Null` if the run kept none.
@@ -307,7 +364,7 @@ pub fn judge(evidence: &DraftEvidence) -> Vec<(&'static str, Result<(), String>)
             FAULT_CLOSE,
             page.as_ref()
                 .map_err(Clone::clone)
-                .and_then(|page| fault_close(&evidence.observations, page)),
+                .and_then(|page| fault_close(&evidence.observations, &evidence.refusals, page)),
         ),
         (STAGED, staged.clone().map(|_| ())),
         (
@@ -376,6 +433,11 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
             .facts()
             .iter()
             .filter_map(StagedPage::of)
+            .collect(),
+        refusals: reservations
+            .facts()
+            .iter()
+            .filter_map(Refusal::of)
             .collect(),
         properties: report.properties,
         claims,
@@ -477,11 +539,23 @@ mod tests {
         (claims, vec![report])
     }
 
-    /// The fault-close companion joins the rejected frame's connection: a
-    /// fault close there holds, and the same close of another connection,
-    /// or a close there with a cause that isn't a fault, doesn't.
+    /// The reader's refusal of session 11's frame for `reason`.
+    fn refused(reason: &str) -> Vec<Refusal> {
+        vec![Refusal {
+            peer: "ab".into(),
+            session: 11,
+            reason: reason.into(),
+        }]
+    }
+
+    /// The fault-close companion joins the rejected frame's connection and
+    /// its content refusal: a fault close there after the session's reader
+    /// refused a frame for linkage holds, and the same close of another
+    /// connection, a close there with a cause that isn't a fault, or a close
+    /// after a refusal for another fault, or none, doesn't.
     #[test]
     fn the_fault_close_joins_the_rejected_frames_connection() {
+        let linkage = refused(CONTENT_FAULT);
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         assert_eq!(
             page,
@@ -493,12 +567,17 @@ mod tests {
                 subscription: 7,
             }
         );
-        assert_eq!(
-            fault_close(&log(1, 1, "service_protocol_reject"), &page),
-            Ok(())
-        );
-        assert!(fault_close(&log(1, 2, "service_protocol_reject"), &page).is_err());
-        assert!(fault_close(&log(1, 1, "service_local_shutdown"), &page).is_err());
+        let closed = log(1, 1, "service_protocol_reject");
+        assert_eq!(fault_close(&closed, &linkage, &page), Ok(()));
+        assert!(fault_close(&log(1, 2, "service_protocol_reject"), &linkage, &page).is_err());
+        assert!(fault_close(&log(1, 1, "service_local_shutdown"), &linkage, &page).is_err());
+        // Another fault's refusal closes the same connection.
+        assert!(fault_close(&closed, &refused("over_credit"), &page).is_err());
+        assert!(fault_close(&closed, &[], &page).is_err());
+        // The linkage refusal of another session isn't this page's.
+        let mut other = linkage.clone();
+        other[0].session = 12;
+        assert!(fault_close(&closed, &other, &page).is_err());
     }
 
     /// The staging companion joins the page's session, subscription and
